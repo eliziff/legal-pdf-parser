@@ -312,9 +312,18 @@ pub static GLYPH_TO_UNICODE: LazyLock<HashMap<&'static str, char>> = LazyLock::n
 
 /// Convert a glyph name to its Unicode character
 pub fn glyph_to_char(name: &str) -> Option<char> {
-    // First check our mapping
+    // First check our mapping with the full name
     if let Some(&c) = GLYPH_TO_UNICODE.get(name) {
         return Some(c);
+    }
+
+    // Per Adobe Glyph List spec, strip the suffix after '.' to get the base glyph name.
+    // E.g., "zero.tf" → "zero", "a.ss01" → "a", "hyphen.case" → "hyphen"
+    if let Some(dot_pos) = name.find('.') {
+        let base = &name[..dot_pos];
+        if let Some(&c) = GLYPH_TO_UNICODE.get(base) {
+            return Some(c);
+        }
     }
 
     // Try to parse uniXXXX format

@@ -5,6 +5,7 @@
 //! - Direct text extraction from text-based PDFs
 //! - Markdown conversion with structure detection
 
+pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;

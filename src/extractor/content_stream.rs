@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
-    get_operand_bytes,
+    get_font_file2_obj_num, get_operand_bytes,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, multiply_matrices};
@@ -53,11 +53,13 @@ pub(crate) fn extract_page_text_items(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        // Track ToUnicode object reference
+        // Track ToUnicode object reference, with FontFile2 fallback for Identity-H/V
         if let Ok(tounicode) = font_dict.get(b"ToUnicode") {
             if let Ok(obj_ref) = tounicode.as_reference() {
                 font_tounicode_refs.insert(resource_name, obj_ref.0);
             }
+        } else if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
+            font_tounicode_refs.insert(resource_name, ff2_obj_num);
         }
     }
 

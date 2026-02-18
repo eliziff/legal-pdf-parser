@@ -530,6 +530,48 @@ pub(crate) fn parse_encoding_dictionary(
     }
 }
 
+/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
+/// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
+/// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
+/// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
+pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
+    // Must be Identity-H or Identity-V encoding
+    let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
+    if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        return None;
+    }
+    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
+    let desc_fonts = resolve_array(doc, desc_fonts_obj)?;
+    if desc_fonts.is_empty() {
+        return None;
+    }
+    let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
+    let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
+    let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+
+    // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
+    if let Some(ff_ref) = font_descriptor
+        .get(b"FontFile2")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .or_else(|| {
+            font_descriptor
+                .get(b"FontFile3")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+        })
+    {
+        return Some(ff_ref.0);
+    }
+
+    // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
+    if let Object::Reference(r) = &desc_fonts[0] {
+        return Some(r.0);
+    }
+
+    None
+}
+
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
@@ -543,9 +585,41 @@ pub(crate) fn extract_text_from_operand(
         // Look up CMap by ToUnicode object reference
         if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
             if let Some(cmap) = font_cmaps.get_by_obj(obj_num) {
-                let decoded = cmap.decode_cids(bytes);
-                if !decoded.is_empty() {
-                    return Some(decoded);
+                // For single-byte CMaps, merge CMap + Differences at the byte level:
+                // try CMap first, then Differences, then Latin-1 fallback per byte.
+                // This prevents partial CMap results from blocking the Differences path.
+                if cmap.code_byte_length == 1 {
+                    let encoding_map = font_encodings.get(current_font);
+                    let lookups = cmap.lookup_bytes(bytes);
+                    let decoded: String = lookups
+                        .iter()
+                        .filter_map(|&(b, ref cmap_result)| {
+                            // 1. CMap mapped it? Use CMap result
+                            if let Some(s) = cmap_result {
+                                return Some(s.clone());
+                            }
+                            // 2. Differences mapped it? Use Differences result
+                            if let Some(map) = encoding_map {
+                                if let Some(&ch) = map.get(&b) {
+                                    return Some(ch.to_string());
+                                }
+                            }
+                            // 3. Printable ASCII/Latin-1 fallback
+                            if b >= 0x20 {
+                                return Some((b as char).to_string());
+                            }
+                            None
+                        })
+                        .collect();
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
+                } else {
+                    // 2-byte CMap: use standard decode_cids path
+                    let decoded = cmap.decode_cids(bytes);
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
                 }
             }
         }

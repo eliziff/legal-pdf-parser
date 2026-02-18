@@ -342,6 +342,20 @@ impl ToUnicodeCMap {
         None
     }
 
+    /// Per-byte CMap lookup without Latin-1 fallback.
+    /// Returns `(raw_byte, Option<cmap_result>)` for each byte.
+    /// Only meaningful for single-byte (code_byte_length==1) CMaps.
+    pub fn lookup_bytes(&self, bytes: &[u8]) -> Vec<(u8, Option<String>)> {
+        bytes
+            .iter()
+            .map(|&b| {
+                let code = b as u16;
+                let result = self.lookup(code).filter(|s| !s.contains('\u{FFFD}'));
+                (b, result)
+            })
+            .collect()
+    }
+
     /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
         let mut result = String::new();
@@ -430,6 +444,94 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
     }
 }
 
+/// Build a ToUnicodeCMap from an embedded TrueType font's cmap table.
+///
+/// For Identity-H CID fonts, CID == GID. The TrueType cmap maps Unicode→GID,
+/// so we reverse it to get GID→Unicode (i.e. CID→Unicode).
+pub fn build_cmap_from_truetype(font_data: &[u8]) -> Option<ToUnicodeCMap> {
+    let face = ttf_parser::Face::parse(font_data, 0).ok()?;
+
+    let mut gid_to_unicode: HashMap<u16, char> = HashMap::new();
+
+    // Iterate all Unicode codepoints that have a glyph mapping.
+    // For each codepoint, the face gives us a GlyphId; reverse that to GID→Unicode.
+    // We prefer the first (lowest) codepoint for each GID to handle duplicates.
+    for subtable in face.tables().cmap.iter().flat_map(|cmap| cmap.subtables) {
+        if !subtable.is_unicode() {
+            continue;
+        }
+        subtable.codepoints(|cp| {
+            if let Some(ch) = char::from_u32(cp) {
+                if let Some(gid) = subtable.glyph_index(cp) {
+                    let gid_val = gid.0;
+                    // Keep the lowest codepoint per GID
+                    gid_to_unicode.entry(gid_val).or_insert(ch);
+                }
+            }
+        });
+    }
+
+    if gid_to_unicode.is_empty() {
+        return None;
+    }
+
+    debug!(
+        "TrueType cmap: {} GID→Unicode entries",
+        gid_to_unicode.len()
+    );
+
+    let mut cmap = ToUnicodeCMap::new();
+    for (gid, ch) in &gid_to_unicode {
+        cmap.char_map.insert(*gid, ch.to_string());
+    }
+    cmap.code_byte_length = 2; // Identity-H uses 2-byte CIDs
+
+    Some(cmap)
+}
+
+/// Build a ToUnicodeCMap from predefined CID→Unicode mapping based on CIDSystemInfo.
+///
+/// Supports Adobe-Korea1 (Korean) character collection. Can be extended for
+/// Adobe-Japan1, Adobe-GB1, Adobe-CNS1 in the future.
+fn build_cmap_from_cid_system_info(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<ToUnicodeCMap> {
+    let csi_obj = cid_font_dict.get(b"CIDSystemInfo").ok()?;
+    let csi_dict = match csi_obj {
+        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
+        Object::Dictionary(d) => d,
+        _ => return None,
+    };
+    let ordering = csi_dict.get(b"Ordering").ok().and_then(|o| {
+        if let Object::String(bytes, _) = o {
+            Some(String::from_utf8_lossy(bytes).to_string())
+        } else {
+            None
+        }
+    })?;
+
+    match ordering.as_str() {
+        "Korea1" => {
+            use crate::adobe_korea1::ADOBE_KOREA1_CID_TO_UNICODE;
+            let mut cmap = ToUnicodeCMap::new();
+            for &(cid, unicode) in ADOBE_KOREA1_CID_TO_UNICODE.iter() {
+                if let Some(ch) = char::from_u32(unicode as u32) {
+                    cmap.char_map.insert(cid, ch.to_string());
+                }
+            }
+            cmap.code_byte_length = 2;
+            debug!(
+                "Adobe-Korea1 predefined CMap: {} entries",
+                cmap.char_map.len()
+            );
+            Some(cmap)
+        }
+        // Future: "Japan1", "GB1", "CNS1"
+        _ => None,
+    }
+}
+
 /// Collection of ToUnicode CMaps indexed by ToUnicode stream object number
 #[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
@@ -458,11 +560,14 @@ impl FontCMaps {
     }
 
     /// Parse ToUnicode CMaps from a set of font dictionaries.
+    /// Also handles Identity-H/V CID fonts without ToUnicode by parsing
+    /// the embedded TrueType cmap from FontFile2.
     fn collect_cmaps_from_fonts(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, ToUnicodeCMap>,
     ) {
+        // First pass: collect ToUnicode CMaps
         for font_dict in fonts.values() {
             let obj_ref = match font_dict
                 .get(b"ToUnicode")
@@ -493,6 +598,114 @@ impl FontCMaps {
                     cmap.ranges.len()
                 );
                 by_obj_num.insert(obj_num, cmap);
+            }
+        }
+
+        // Second pass: Identity-H/V fonts without ToUnicode
+        // Try: (1) embedded TrueType/OpenType cmap, (2) predefined CID→Unicode mapping
+        for font_dict in fonts.values() {
+            if font_dict.get(b"ToUnicode").is_ok() {
+                continue;
+            }
+            let encoding = match font_dict
+                .get(b"Encoding")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+            {
+                Some(name) => name,
+                None => continue,
+            };
+            if encoding != b"Identity-H" && encoding != b"Identity-V" {
+                continue;
+            }
+            // Navigate: DescendantFonts[0]
+            let desc_fonts_obj = match font_dict.get(b"DescendantFonts").ok() {
+                Some(obj) => obj,
+                None => continue,
+            };
+            let desc_fonts = match desc_fonts_obj {
+                Object::Array(arr) => arr.clone(),
+                Object::Reference(r) => match doc.get_object(*r) {
+                    Ok(Object::Array(arr)) => arr.clone(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if desc_fonts.is_empty() {
+                continue;
+            }
+            let cid_font_dict = match &desc_fonts[0] {
+                Object::Reference(r) => match doc.get_dictionary(*r) {
+                    Ok(d) => d,
+                    _ => continue,
+                },
+                Object::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            // Try to build CMap from embedded font (FontFile2 or FontFile3)
+            let font_descriptor = cid_font_dict
+                .get(b"FontDescriptor")
+                .ok()
+                .and_then(|o| match o {
+                    Object::Reference(r) => doc.get_dictionary(*r).ok(),
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                });
+
+            let mut resolved = false;
+
+            // Determine the font file reference (FontFile2 or FontFile3)
+            let font_file_ref = font_descriptor.and_then(|fd| {
+                fd.get(b"FontFile2")
+                    .ok()
+                    .and_then(|o| o.as_reference().ok())
+                    .or_else(|| {
+                        fd.get(b"FontFile3")
+                            .ok()
+                            .and_then(|o| o.as_reference().ok())
+                    })
+            });
+
+            // The lookup key must match what get_font_file2_obj_num() returns:
+            // font file obj_num if present, else CIDFont dict obj_num
+            let lookup_key = font_file_ref
+                .map(|r| r.0)
+                .unwrap_or_else(|| match &desc_fonts[0] {
+                    Object::Reference(r) => r.0,
+                    _ => 0,
+                });
+            if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
+                continue;
+            }
+
+            // Try parsing embedded TrueType/OpenType cmap
+            if let Some(ff_ref) = font_file_ref {
+                if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
+                    if let Ok(data) = stream.decompressed_content() {
+                        if let Some(cmap) = build_cmap_from_truetype(&data) {
+                            debug!(
+                                "TrueType CMap obj={:<6} (embedded font) char_map={}",
+                                lookup_key,
+                                cmap.char_map.len()
+                            );
+                            by_obj_num.insert(lookup_key, cmap);
+                            resolved = true;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: predefined CID→Unicode mapping from CIDSystemInfo
+            if !resolved {
+                if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
+                    debug!(
+                        "Predefined CMap obj={:<6} (CIDSystemInfo) char_map={}",
+                        lookup_key,
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(lookup_key, cmap);
+                }
             }
         }
     }
