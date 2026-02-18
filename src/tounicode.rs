@@ -3,6 +3,7 @@
 //! This module parses ToUnicode CMaps to convert CID-encoded text to Unicode.
 
 use flate2::read::ZlibDecoder;
+use log::debug;
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -598,6 +599,18 @@ impl FontCMaps {
 
         // Copy the by_obj map
         let by_obj_num = cmaps_by_obj;
+
+        for (name, cmap) in &by_name {
+            if !name.contains('_') || name.ends_with(|c: char| c.is_ascii_digit()) {
+                debug!(
+                    "CMap font={:30} code_byte_length={} char_map={} ranges={}",
+                    name,
+                    cmap.code_byte_length,
+                    cmap.char_map.len(),
+                    cmap.ranges.len()
+                );
+            }
+        }
 
         FontCMaps {
             by_name,

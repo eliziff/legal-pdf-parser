@@ -2,6 +2,7 @@
 
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
+use log::debug;
 
 /// Represents a column region on a page
 #[derive(Debug, Clone)]
@@ -169,6 +170,16 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     if valid_valleys.is_empty() {
         return vec![ColumnRegion { x_min, x_max }];
     }
+
+    debug!(
+        "page {}: {} columns detected (boundaries: {:?})",
+        page,
+        valid_valleys.len() + 1,
+        valid_valleys
+            .iter()
+            .map(|(s, e)| x_min + ((*s + *e) as f32 / 2.0) * BIN_WIDTH)
+            .collect::<Vec<_>>()
+    );
 
     // Limit to at most 3 gutters (4 columns) — keep the widest if more found
     if valid_valleys.len() > 3 {
@@ -401,6 +412,39 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
                 col_buckets[best_col].push(item.clone());
             }
 
+            debug!(
+                "page {}: {} columns, {} spanning items",
+                page,
+                columns.len(),
+                spanning_items.len()
+            );
+            for (ci, col) in columns.iter().enumerate() {
+                debug!(
+                    "  col {}: x=[{:.0}..{:.0}] {} items",
+                    ci,
+                    col.x_min,
+                    col.x_max,
+                    col_buckets[ci].len()
+                );
+            }
+            if log::log_enabled!(log::Level::Trace) {
+                for (ci, bucket) in col_buckets.iter().enumerate() {
+                    for item in bucket {
+                        log::trace!(
+                            "  col {} <- x={:7.1} y={:7.1} {:?}",
+                            ci,
+                            item.x,
+                            item.y,
+                            if item.text.len() > 60 {
+                                &item.text[..60]
+                            } else {
+                                &item.text
+                            }
+                        );
+                    }
+                }
+            }
+
             let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
             for col_items in col_buckets {
                 let lines = group_single_column(col_items);
@@ -410,7 +454,14 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
             // Process spanning items as their own group
             let spanning_lines = group_single_column(spanning_items);
 
-            if is_newspaper_layout(&per_column_lines) {
+            let is_newspaper = is_newspaper_layout(&per_column_lines);
+            debug!(
+                "page {}: layout={}",
+                page,
+                if is_newspaper { "newspaper" } else { "tabular" }
+            );
+
+            if is_newspaper {
                 // Newspaper: columns are independent text flows.
                 // 1. Split each column into its densest cluster (core) and stragglers
                 // 2. Use core columns to determine the above/below threshold
@@ -630,6 +681,8 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
     for line in &mut lines {
         sort_line_items(&mut line.items);
     }
+
+    debug!("group_single_column: {} lines", lines.len());
 
     lines
 }

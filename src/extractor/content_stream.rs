@@ -9,6 +9,7 @@ use crate::text_utils::{
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PdfRect, TextItem};
 use crate::PdfError;
+use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -100,6 +101,7 @@ pub(crate) fn extract_page_text_items(
     let mut actual_text_start_tm: Option<[f32; 6]> = None; // text matrix at BDC entry
 
     for op in &content.operations {
+        trace!("{} {:?}", op.operator, op.operands);
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state

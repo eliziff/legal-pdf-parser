@@ -47,15 +47,6 @@ src/
   bin/
     pdf2md.rs                     — CLI: PDF → Markdown
     detect_pdf.rs                 — CLI: detect PDF type
-    debug_spaces.rs               — Debug: dump text items with x/y/width per page
-    dump_ops.rs                   — Debug: dump raw PDF content stream operators
-    debug_ygaps.rs                — Debug: Y-gap analysis between lines
-    debug_fonts.rs                — Debug: font information
-    debug_ligatures.rs            — Debug: ligature expansion
-    debug_order.rs                — Debug: reading order
-    debug_pages.rs                — Debug: page-level info
-    detection_report.rs           — Batch detection report on PDF directory
-    profile_stages.rs             — Performance profiling of pipeline stages
 ```
 
 ## Data Flow
@@ -119,6 +110,23 @@ cargo clippy -- -D warnings        # Lint (enforced in CI)
 cargo fmt --check                  # Format check
 cargo run --release --bin pdf2md -- <file.pdf>   # Smoke test
 ```
+
+## Debugging with RUST_LOG
+
+All debug output uses structured logging via the `log` crate. Set `RUST_LOG` to control output:
+
+```bash
+RUST_LOG=pdf_inspector::extractor::content_stream=trace  # raw PDF operators
+RUST_LOG=pdf_inspector::extractor::fonts=debug           # font metadata + encodings
+RUST_LOG=pdf_inspector::tounicode=debug                  # CMap parsing
+RUST_LOG=pdf_inspector::extractor=debug                  # text items per page
+RUST_LOG=pdf_inspector::extractor::layout=debug          # columns, reading order
+RUST_LOG=pdf_inspector::markdown::analysis=debug         # Y-gaps, paragraph threshold
+RUST_LOG=pdf_inspector::tables=debug                     # table detection
+RUST_LOG=pdf_inspector=debug                             # everything
+```
+
+Example: `RUST_LOG=pdf_inspector::extractor::fonts=debug cargo run --bin pdf2md -- file.pdf > /dev/null`
 
 ## Common Tasks
 

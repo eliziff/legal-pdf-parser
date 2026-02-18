@@ -150,7 +150,7 @@ src/
   extractor/            — Text extraction pipeline
   tables/               — Table detection and formatting
   markdown/             — Markdown conversion and structure detection
-  bin/                  — CLI tools and debug utilities
+  bin/                  — CLI tools (pdf2md, detect_pdf)
 ```
 
 ## How classification works
@@ -226,14 +226,34 @@ The converter handles:
 | Drop caps | Large initial letters merged with following text |
 | Dot leaders | TOC-style dots collapsed to " ... " |
 
-## Debug tools
+## Debugging with RUST_LOG
+
+Structured logging via `RUST_LOG` replaces the former debug binaries. Set the environment variable to control which sections emit debug output on stderr:
 
 ```bash
-cargo run --bin debug_spaces -- file.pdf     # Text items with x/y/width per page
-cargo run --bin dump_ops -- file.pdf         # Raw PDF content stream operators
-cargo run --bin debug_ygaps -- file.pdf      # Y-gap analysis between lines
-cargo run --bin debug_fonts -- file.pdf      # Font information
-cargo run --bin debug_order -- file.pdf      # Reading order visualization
+# Raw PDF content stream operators (replaces dump_ops)
+RUST_LOG=pdf_inspector::extractor::content_stream=trace cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Font metadata, encodings, ligatures (replaces debug_fonts / debug_ligatures)
+RUST_LOG=pdf_inspector::extractor::fonts=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# ToUnicode CMap parsing
+RUST_LOG=pdf_inspector::tounicode=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Text items per page with x/y/width (replaces debug_spaces / debug_pages)
+RUST_LOG=pdf_inspector::extractor=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Column detection and reading order (replaces debug_order)
+RUST_LOG=pdf_inspector::extractor::layout=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Y-gap analysis and paragraph thresholds (replaces debug_ygaps)
+RUST_LOG=pdf_inspector::markdown::analysis=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Table detection
+RUST_LOG=pdf_inspector::tables=debug cargo run --bin pdf2md -- file.pdf > /dev/null
+
+# Everything
+RUST_LOG=pdf_inspector=debug cargo run --bin pdf2md -- file.pdf > /dev/null
 ```
 
 ## Use case: smart PDF routing

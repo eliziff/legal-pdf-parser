@@ -2,6 +2,7 @@
 
 use crate::text_utils::is_rtl_text;
 use crate::types::TextItem;
+use log::debug;
 
 use super::financial::try_split_financial_item;
 use super::grid::{
@@ -577,6 +578,13 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     if is_paragraph_content(&cells) {
         return None;
     }
+
+    debug!(
+        "table detected: {} rows x {} cols, {} items",
+        rows.len(),
+        columns.len(),
+        item_indices.len()
+    );
 
     Some(Table {
         columns,

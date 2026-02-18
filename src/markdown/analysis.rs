@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::types::{TextItem, TextLine};
+use log::debug;
 
 /// Font statistics for a document
 pub(crate) struct FontStats {
@@ -118,13 +119,85 @@ pub(crate) fn compute_paragraph_threshold(lines: &[TextLine], base_size: f32) ->
 
     let median = gaps[gaps.len() / 2];
 
-    // The paragraph threshold should be larger than the typical line spacing.
-    // Use 1.3x the median gap. This means:
-    // - Single-spaced (median ~14pt for 12pt font): threshold = 18.2pt
-    // - Double-spaced (median ~28pt for 12pt font): threshold = 36.4pt
-    // Also ensure it's at least base_size * 1.5 to avoid false paragraph breaks
-    // in tightly-spaced documents.
-    (median * 1.3).max(base_size * 1.5)
+    let threshold = (median * 1.3).max(base_size * 1.5);
+
+    debug!(
+        "paragraph_threshold: base_size={:.1} median_gap={:.1} threshold={:.1} ({} gaps sampled)",
+        base_size,
+        median,
+        threshold,
+        gaps.len()
+    );
+
+    if log::log_enabled!(log::Level::Debug) {
+        // Gap histogram
+        let buckets: &[f32] = &[0.0, 0.5, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0, 5.0, 10.0];
+        for i in 0..buckets.len() - 1 {
+            let count = gaps
+                .iter()
+                .filter(|&&g| {
+                    let r = g / base_size;
+                    r >= buckets[i] && r < buckets[i + 1]
+                })
+                .count();
+            if count > 0 {
+                debug!(
+                    "  gap_ratio {:.1}-{:.1}: {}",
+                    buckets[i],
+                    buckets[i + 1],
+                    count
+                );
+            }
+        }
+        let over = gaps.iter().filter(|&&g| g / base_size >= 10.0).count();
+        if over > 0 {
+            debug!("  gap_ratio 10.0+: {}", over);
+        }
+    }
+
+    // Per-line detail: Y position, gap, ratio, bold, text preview, paragraph marker
+    if log::log_enabled!(log::Level::Trace) {
+        let mut prev: Option<(u32, f32)> = None;
+        for line in lines {
+            let font_size = line.items.first().map(|i| i.font_size).unwrap_or(0.0);
+            let is_bold = line.items.first().map(|i| i.is_bold).unwrap_or(false);
+            let text = line.text();
+            let display: String = text.chars().take(80).collect();
+
+            let (gap_str, ratio_str, marker) = if let Some((pp, py)) = prev {
+                if pp == line.page {
+                    let gap = py - line.y;
+                    let ratio = gap / base_size;
+                    let is_para = gap > threshold;
+                    (
+                        format!("{:8.1}", gap),
+                        format!("{:8.2}", ratio),
+                        if is_para { " <<PARA>>" } else { "" },
+                    )
+                } else {
+                    ("     ---".to_string(), "     ---".to_string(), "")
+                }
+            } else {
+                ("     ---".to_string(), "     ---".to_string(), "")
+            };
+
+            log::trace!(
+                "  p={} y={:8.1} gap={} ratio={} fs={:5.1} {}  {}{}",
+                line.page,
+                line.y,
+                gap_str,
+                ratio_str,
+                font_size,
+                if is_bold { "B" } else { " " },
+                display,
+                marker
+            );
+
+            prev = Some((line.page, line.y));
+        }
+    }
+
+    threshold
 }
 
 /// Discover distinct heading font-size tiers in the document.

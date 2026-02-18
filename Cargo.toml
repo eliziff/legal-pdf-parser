@@ -23,6 +23,7 @@ rayon = "1.10"
 
 # Logging
 log = "0.4"
+env_logger = "0.11"
 
 # Text processing
 regex = "1.10"
@@ -43,22 +44,3 @@ name = "detect-pdf"
 path = "src/bin/detect_pdf.rs"
 
 
-[[bin]]
-name = "debug_ygaps"
-path = "src/bin/debug_ygaps.rs"
-
-[[bin]]
-name = "debug_pages"
-path = "src/bin/debug_pages.rs"
-
-[[bin]]
-name = "debug_fonts"
-path = "src/bin/debug_fonts.rs"
-
-[[bin]]
-name = "dump_ops"
-path = "src/bin/dump_ops.rs"
-
-[[bin]]
-name = "debug_spaces"
-path = "src/bin/debug_spaces.rs"

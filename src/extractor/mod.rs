@@ -12,6 +12,7 @@ use crate::text_utils::is_rtl_text;
 use crate::tounicode::FontCMaps;
 use crate::types::{PdfRect, TextItem};
 use crate::PdfError;
+use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -145,6 +146,30 @@ fn extract_positioned_text_from_doc(
             }
         }
         let (items, rects) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        debug!(
+            "page {}: {} text items, {} rects",
+            page_num,
+            items.len(),
+            rects.len()
+        );
+        if log::log_enabled!(log::Level::Trace) {
+            for item in &items {
+                log::trace!(
+                    "  p={} x={:7.1} y={:7.1} w={:7.1} fs={:5.1} font={:6} {:?}",
+                    page_num,
+                    item.x,
+                    item.y,
+                    item.width,
+                    item.font_size,
+                    item.font,
+                    if item.text.len() > 80 {
+                        &item.text[..80]
+                    } else {
+                        &item.text
+                    }
+                );
+            }
+        }
         all_items.extend(items);
         all_rects.extend(rects);
 

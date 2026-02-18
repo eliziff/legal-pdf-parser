@@ -3,6 +3,7 @@
 use crate::glyph_names::glyph_to_char;
 use crate::tounicode::FontCMaps;
 use crate::types::{FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths};
+use log::debug;
 use lopdf::{Document, Encoding, Object};
 use std::collections::HashMap;
 
@@ -42,6 +43,37 @@ pub(crate) fn build_font_widths(
 
     for (font_name, font_dict) in fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
+
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).to_string())
+            .unwrap_or_default();
+        let base_font = font_dict
+            .get(b"BaseFont")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).to_string())
+            .unwrap_or_default();
+        let has_tounicode = font_dict.get(b"ToUnicode").is_ok();
+        let has_descendants = font_dict.get(b"DescendantFonts").is_ok();
+        let encoding_str = font_dict
+            .get(b"Encoding")
+            .ok()
+            .map(|o| match o {
+                Object::Name(n) => String::from_utf8_lossy(n).to_string(),
+                Object::Reference(_) => "ref(dict)".to_string(),
+                Object::Dictionary(_) => "dict".to_string(),
+                _ => format!("{:?}", o),
+            })
+            .unwrap_or_else(|| "none".to_string());
+
+        debug!(
+            "font {:<10} sub={:<12} base={:<45} toUni={:<6} enc={:<20} cid={}",
+            resource_name, subtype, base_font, has_tounicode, encoding_str, has_descendants
+        );
+
         if let Some(info) = parse_font_widths(doc, font_dict) {
             widths.insert(resource_name, info);
         }
@@ -452,6 +484,7 @@ pub(crate) fn parse_encoding_dictionary(
 
     let mut encoding_map = FontEncodingMap::new();
     let mut current_code: u8 = 0;
+    let mut ligature_count = 0u32;
 
     for item in diff_array {
         match item {
@@ -462,6 +495,17 @@ pub(crate) fn parse_encoding_dictionary(
             Object::Name(name) => {
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
+                if glyph_name == "fi"
+                    || glyph_name == "fl"
+                    || glyph_name == "ffi"
+                    || glyph_name == "ffl"
+                {
+                    debug!(
+                        "  Differences: code=0x{:02X} glyph={:?} (ligature)",
+                        current_code, glyph_name
+                    );
+                    ligature_count += 1;
+                }
                 if let Some(ch) = glyph_to_char(&glyph_name) {
                     encoding_map.insert(current_code, ch);
                 }
@@ -469,6 +513,14 @@ pub(crate) fn parse_encoding_dictionary(
             }
             _ => {}
         }
+    }
+
+    if ligature_count > 0 {
+        debug!(
+            "  Differences: {} total entries, {} ligatures",
+            encoding_map.len(),
+            ligature_count
+        );
     }
 
     if encoding_map.is_empty() {
