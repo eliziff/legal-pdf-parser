@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use log::debug;
+
 use crate::types::{PdfRect, TextItem};
 
 use super::Table;
@@ -121,6 +123,13 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
         page_rects.push((x, y, w, h));
     }
 
+    debug!(
+        "page {}: {} rects after size filter (from {} raw)",
+        page,
+        page_rects.len(),
+        rects.iter().filter(|r| r.page == page).count(),
+    );
+
     // Need a reasonable number of cell rects to form a table
     if page_rects.len() < 6 {
         return vec![];
@@ -128,6 +137,7 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
 
     // Cluster spatially connected rects into groups
     let clusters = cluster_rects(&page_rects, 3.0, 6);
+    debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
 
     let mut tables = Vec::new();
     for cluster_indices in &clusters {
@@ -160,11 +170,15 @@ pub(crate) fn detect_table_from_rect_group(
         y_edges.push(y + h);
     }
 
-    let x_edges = snap_edges(&x_edges, 2.0);
-    let y_edges = snap_edges(&y_edges, 2.0);
+    let x_edges = snap_edges(&x_edges, 6.0);
+    let y_edges = snap_edges(&y_edges, 6.0);
 
     if x_edges.len() < 3 || y_edges.len() < 4 {
-        // Need at least 2 columns (3 edges) and 3 rows (4 edges)
+        debug!(
+            "  rejected: {} x-edges, {} y-edges (need >=3, >=4)",
+            x_edges.len(),
+            y_edges.len()
+        );
         return None;
     }
 
@@ -198,7 +212,7 @@ pub(crate) fn detect_table_from_rect_group(
             let x_right = col_edges[col + 1];
             // Check if any rect approximately covers this cell
             let cell_covered = group_rects.iter().any(|&(rx, ry, rw, rh)| {
-                let tol = 3.0;
+                let tol = 6.0;
                 rx <= x_left + tol
                     && (rx + rw) >= x_right - tol
                     && ry <= y_top + tol
@@ -213,8 +227,14 @@ pub(crate) fn detect_table_from_rect_group(
     let total_cells = (num_cols * num_rows) as f32;
     let fill_ratio = filled_cells as f32 / total_cells;
 
+    debug!(
+        "  grid: {}x{} = {} cells, {} filled, ratio={:.2}",
+        num_rows, num_cols, total_cells as u32, filled_cells, fill_ratio
+    );
+
     // Require at least 30% of cells to be backed by rects
     if fill_ratio < 0.3 {
+        debug!("  rejected: fill ratio {:.2} < 0.30", fill_ratio);
         return None;
     }
 
@@ -231,6 +251,7 @@ pub(crate) fn detect_table_from_rect_group(
 
     // Skip if no text was assigned
     if item_indices.is_empty() {
+        debug!("  rejected: no text items assigned to grid");
         return None;
     }
 
@@ -240,6 +261,7 @@ pub(crate) fn detect_table_from_rect_group(
         .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
         .count();
     if non_empty_rows < 2 {
+        debug!("  rejected: only {} non-empty rows", non_empty_rows);
         return None;
     }
 
@@ -252,6 +274,10 @@ pub(crate) fn detect_table_from_rect_group(
         .count();
     let content_ratio = non_empty_cells as f32 / total_cells;
     if content_ratio < 0.25 {
+        debug!(
+            "  rejected: content ratio {:.2} < 0.25 ({} non-empty / {} total)",
+            content_ratio, non_empty_cells, total_cells as u32
+        );
         return None;
     }
 
@@ -261,6 +287,7 @@ pub(crate) fn detect_table_from_rect_group(
             .iter()
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
+            debug!("  rejected: column {} is completely empty", col);
             return None;
         }
     }
