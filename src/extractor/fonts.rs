@@ -535,51 +535,18 @@ pub(crate) fn extract_text_from_operand(
     obj: &Object,
     current_font: &str,
     font_cmaps: &FontCMaps,
-    font_base_names: &std::collections::HashMap<String, String>,
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
     font_encodings: &PageFontEncodings,
     encoding_cache: &HashMap<String, Encoding<'_>>,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
-        // First, try to look up CMap by ToUnicode object reference (most reliable)
-        // This handles cases where multiple fonts have the same BaseFont but different ToUnicode
+        // Look up CMap by ToUnicode object reference
         if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
             if let Some(cmap) = font_cmaps.get_by_obj(obj_num) {
                 let decoded = cmap.decode_cids(bytes);
                 if !decoded.is_empty() {
                     return Some(decoded);
                 }
-            }
-        }
-
-        // Fall back to base name lookup with object number
-        if let (Some(base_name), Some(&obj_num)) = (
-            font_base_names.get(current_font),
-            font_tounicode_refs.get(current_font),
-        ) {
-            if let Some(cmap) = font_cmaps.get_with_obj(base_name, obj_num) {
-                let decoded = cmap.decode_cids(bytes);
-                if !decoded.is_empty() {
-                    return Some(decoded);
-                }
-            }
-        }
-
-        // Try base name only (legacy fallback)
-        if let Some(base_name) = font_base_names.get(current_font) {
-            if let Some(cmap) = font_cmaps.get(base_name) {
-                let decoded = cmap.decode_cids(bytes);
-                if !decoded.is_empty() {
-                    return Some(decoded);
-                }
-            }
-        }
-
-        // Also try looking up by resource name directly
-        if let Some(cmap) = font_cmaps.get(current_font) {
-            let decoded = cmap.decode_cids(bytes);
-            if !decoded.is_empty() {
-                return Some(decoded);
             }
         }
 

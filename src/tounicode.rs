@@ -2,10 +2,9 @@
 //!
 //! This module parses ToUnicode CMaps to convert CID-encoded text to Unicode.
 
-use flate2::read::ZlibDecoder;
 use log::debug;
-use std::collections::HashMap;
-use std::io::Read;
+use lopdf::{Document, Object, ObjectId};
+use std::collections::{HashMap, HashSet};
 
 /// A parsed ToUnicode CMap mapping CIDs to Unicode strings
 #[derive(Debug, Default, Clone)]
@@ -352,15 +351,16 @@ impl ToUnicodeCMap {
             // Single-byte codes: each byte is a code
             for &b in bytes {
                 let code = b as u16;
-                if let Some(s) = self.lookup(code) {
-                    result.push_str(&s);
-                } else {
-                    // For single-byte unmapped codes, try as Latin-1
-                    // (the byte IS the character code in most legacy encodings)
-                    if b >= 0x20 {
-                        result.push(b as char);
+                match self.lookup(code) {
+                    Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                    _ => {
+                        // For single-byte unmapped codes, try as Latin-1
+                        // (the byte IS the character code in most legacy encodings)
+                        if b >= 0x20 {
+                            result.push(b as char);
+                        }
+                        unmapped_count += 1;
                     }
-                    unmapped_count += 1;
                 }
             }
         } else {
@@ -368,13 +368,14 @@ impl ToUnicodeCMap {
             for chunk in bytes.chunks(2) {
                 if chunk.len() == 2 {
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
-                    if let Some(s) = self.lookup(cid) {
-                        result.push_str(&s);
-                    } else {
-                        // Do NOT blindly interpret CIDs as Unicode codepoints.
-                        // CIDs are font-internal indices, not Unicode values.
-                        // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
-                        unmapped_count += 1;
+                    match self.lookup(cid) {
+                        Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                        _ => {
+                            // Do NOT blindly interpret CIDs as Unicode codepoints.
+                            // CIDs are font-internal indices, not Unicode values.
+                            // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
+                            unmapped_count += 1;
+                        }
                     }
                 }
             }
@@ -429,274 +430,165 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
     }
 }
 
-/// Extract a stream from raw PDF bytes by object number
-/// This handles linearized PDFs where lopdf may not properly load stream content
-pub fn extract_stream_from_raw_pdf(pdf_bytes: &[u8], obj_num: u32) -> Option<Vec<u8>> {
-    // Search for "N 0 obj" where N is the object number
-    let pattern = format!("{} 0 obj", obj_num);
-    let pattern_bytes = pattern.as_bytes();
-
-    // Find the object definition
-    let obj_start = find_pattern(pdf_bytes, pattern_bytes)?;
-
-    // Find "stream" keyword after the object start
-    let search_start = obj_start + pattern_bytes.len();
-    let stream_keyword = find_pattern(&pdf_bytes[search_start..], b"stream")?;
-    let stream_start = search_start + stream_keyword + 6; // "stream" is 6 chars
-
-    // Skip newline after "stream"
-    let mut content_start = stream_start;
-    if pdf_bytes.get(content_start) == Some(&b'\r') {
-        content_start += 1;
-    }
-    if pdf_bytes.get(content_start) == Some(&b'\n') {
-        content_start += 1;
-    }
-
-    // Find "endstream"
-    let stream_end = find_pattern(&pdf_bytes[content_start..], b"endstream")?;
-    let content_end = content_start + stream_end;
-
-    // Handle trailing newline before endstream
-    let mut actual_end = content_end;
-    if actual_end > content_start && pdf_bytes.get(actual_end - 1) == Some(&b'\n') {
-        actual_end -= 1;
-    }
-    if actual_end > content_start && pdf_bytes.get(actual_end - 1) == Some(&b'\r') {
-        actual_end -= 1;
-    }
-
-    let stream_data = &pdf_bytes[content_start..actual_end];
-
-    // Check if we need to decompress (look for /Filter in the object dict)
-    let dict_region = &pdf_bytes[obj_start..stream_start];
-    let needs_decompress = find_pattern(dict_region, b"FlateDecode").is_some();
-
-    if needs_decompress {
-        // Decompress using zlib/flate
-        let mut decoder = ZlibDecoder::new(stream_data);
-        let mut decompressed = Vec::new();
-        if decoder.read_to_end(&mut decompressed).is_ok() {
-            return Some(decompressed);
-        }
-        // If decompression fails, return raw data
-        Some(stream_data.to_vec())
-    } else {
-        Some(stream_data.to_vec())
-    }
-}
-
-/// Find a byte pattern in a slice, returning the offset
-fn find_pattern(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Extract all ToUnicode CMaps from a PDF's raw bytes
-/// Returns a map of object number -> ToUnicodeCMap
-pub fn extract_tounicode_cmaps(pdf_bytes: &[u8]) -> HashMap<u32, ToUnicodeCMap> {
-    let mut cmaps = HashMap::new();
-
-    // Find all ToUnicode references
-    // Pattern: /ToUnicode N 0 R
-    let mut pos = 0;
-    while let Some(idx) = find_pattern(&pdf_bytes[pos..], b"/ToUnicode") {
-        let ref_start = pos + idx + 10; // "/ToUnicode" is 10 chars
-
-        // Skip whitespace
-        let mut p = ref_start;
-        while p < pdf_bytes.len()
-            && (pdf_bytes[p] == b' ' || pdf_bytes[p] == b'\n' || pdf_bytes[p] == b'\r')
-        {
-            p += 1;
-        }
-
-        // Read object number
-        let mut num_str = String::new();
-        while p < pdf_bytes.len() && pdf_bytes[p].is_ascii_digit() {
-            num_str.push(pdf_bytes[p] as char);
-            p += 1;
-        }
-
-        if let Ok(obj_num) = num_str.parse::<u32>() {
-            if let std::collections::hash_map::Entry::Vacant(e) = cmaps.entry(obj_num) {
-                if let Some(stream_data) = extract_stream_from_raw_pdf(pdf_bytes, obj_num) {
-                    if let Some(cmap) = ToUnicodeCMap::parse(&stream_data) {
-                        e.insert(cmap);
-                    }
-                }
-            }
-        }
-
-        pos = ref_start;
-    }
-
-    cmaps
-}
-
-/// Collection of ToUnicode CMaps indexed by font name
+/// Collection of ToUnicode CMaps indexed by ToUnicode stream object number
 #[derive(Debug, Default, Clone)]
 pub struct FontCMaps {
-    /// Map of font name (e.g., "FNotoSans0") to ToUnicodeCMap
-    pub by_name: HashMap<String, ToUnicodeCMap>,
-    /// Map of ToUnicode object number to CMap (for direct lookup)
-    pub by_obj_num: HashMap<u32, ToUnicodeCMap>,
+    /// Map of ToUnicode object number to CMap
+    by_obj_num: HashMap<u32, ToUnicodeCMap>,
 }
 
 impl FontCMaps {
-    /// Extract all font CMaps from raw PDF bytes
-    pub fn from_pdf_bytes(pdf_bytes: &[u8]) -> Self {
-        let mut by_name = HashMap::new();
+    /// Build FontCMaps from a lopdf Document model.
+    ///
+    /// Iterates every page, collects fonts (including Form XObject fonts),
+    /// and parses any `/ToUnicode` streams via lopdf's decompression.
+    pub fn from_doc(doc: &Document) -> Self {
+        let mut by_obj_num: HashMap<u32, ToUnicodeCMap> = HashMap::new();
 
-        // Find font definitions with ToUnicode references
-        // Pattern: /F<name> ... /ToUnicode N 0 R
-        // This is a simplified approach - find /BaseFont and nearby /ToUnicode
+        for (_page_num, &page_id) in doc.get_pages().iter() {
+            // Page-level fonts (includes inherited parent resources)
+            let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+            Self::collect_cmaps_from_fonts(&fonts, doc, &mut by_obj_num);
 
-        // First, extract all ToUnicode streams by object number
-        let cmaps_by_obj = extract_tounicode_cmaps(pdf_bytes);
-
-        // Now find font name -> ToUnicode object mappings
-        // Look for patterns like: << /Type /Font ... /BaseFont /SomeFont ... /ToUnicode N 0 R >>
-        let mut pos = 0;
-        while pos < pdf_bytes.len() {
-            // Find next font dictionary
-            if let Some(idx) = find_pattern(&pdf_bytes[pos..], b"/Type /Font") {
-                let font_start = pos + idx;
-
-                // Search backwards and forwards for << and >>
-                let dict_start = find_dict_start(&pdf_bytes[..font_start]);
-                let dict_end =
-                    find_pattern(&pdf_bytes[font_start..], b">>").map(|e| font_start + e + 2);
-
-                if let (Some(start), Some(end)) = (dict_start, dict_end) {
-                    let dict_region = &pdf_bytes[start..end];
-
-                    // Find font name (could be /BaseFont /Name or just the resource name)
-                    if let Some(font_name) = extract_font_name(dict_region) {
-                        // Find ToUnicode reference
-                        if let Some(tounicode_idx) = find_pattern(dict_region, b"/ToUnicode") {
-                            let ref_part = &dict_region[tounicode_idx + 10..];
-                            if let Some(obj_num) = extract_obj_reference(ref_part) {
-                                if let Some(cmap) = cmaps_by_obj.get(&obj_num) {
-                                    // Use combined key to handle multiple fonts with same BaseFont
-                                    let unique_key = format!("{}_{}", font_name, obj_num);
-                                    by_name.insert(unique_key, cmap.clone());
-                                    // Also keep base font name for backwards compatibility
-                                    // (last one wins, but that's better than nothing)
-                                    by_name.insert(font_name, cmap.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                pos = font_start + 10;
-            } else {
-                break;
-            }
+            // Fonts inside Form XObjects referenced by this page
+            Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
         }
 
-        // Copy the by_obj map
-        let by_obj_num = cmaps_by_obj;
+        FontCMaps { by_obj_num }
+    }
 
-        for (name, cmap) in &by_name {
-            if !name.contains('_') || name.ends_with(|c: char| c.is_ascii_digit()) {
+    /// Parse ToUnicode CMaps from a set of font dictionaries.
+    fn collect_cmaps_from_fonts(
+        fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+        doc: &Document,
+        by_obj_num: &mut HashMap<u32, ToUnicodeCMap>,
+    ) {
+        for font_dict in fonts.values() {
+            let obj_ref = match font_dict
+                .get(b"ToUnicode")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+            {
+                Some(r) => r,
+                None => continue,
+            };
+            let obj_num = obj_ref.0;
+            if by_obj_num.contains_key(&obj_num) {
+                continue;
+            }
+            let stream = match doc.get_object(obj_ref).and_then(Object::as_stream) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let data = match stream.decompressed_content() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(
-                    "CMap font={:30} code_byte_length={} char_map={} ranges={}",
-                    name,
+                    "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
+                    obj_num,
                     cmap.code_byte_length,
                     cmap.char_map.len(),
                     cmap.ranges.len()
                 );
+                by_obj_num.insert(obj_num, cmap);
             }
-        }
-
-        FontCMaps {
-            by_name,
-            by_obj_num,
         }
     }
 
-    /// Get a CMap for a font name (exact match only)
-    pub fn get(&self, font_name: &str) -> Option<&ToUnicodeCMap> {
-        self.by_name.get(font_name)
+    /// Walk Form XObjects in a page's resources and collect their font CMaps.
+    fn collect_cmaps_from_xobjects(
+        doc: &Document,
+        page_id: ObjectId,
+        by_obj_num: &mut HashMap<u32, ToUnicodeCMap>,
+    ) {
+        let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut visited = HashSet::new();
+
+        if let Some(resources) = resource_dict {
+            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+        }
+        for resource_id in resource_ids {
+            if let Ok(resources) = doc.get_dictionary(resource_id) {
+                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            }
+        }
+    }
+
+    /// Recursively collect font CMaps from XObjects in a resource dictionary.
+    fn walk_xobject_fonts(
+        resources: &lopdf::Dictionary,
+        doc: &Document,
+        by_obj_num: &mut HashMap<u32, ToUnicodeCMap>,
+        visited: &mut HashSet<ObjectId>,
+    ) {
+        let xobject_dict = match resources.get(b"XObject") {
+            Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+            Ok(Object::Dictionary(dict)) => Some(dict),
+            _ => None,
+        };
+        let xobject_dict = match xobject_dict {
+            Some(d) => d,
+            None => return,
+        };
+
+        for (_name, value) in xobject_dict.iter() {
+            let id = match value {
+                Object::Reference(id) => *id,
+                _ => continue,
+            };
+            if !visited.insert(id) {
+                continue;
+            }
+            let stream = match doc.get_object(id).and_then(Object::as_stream) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let is_form = stream
+                .dict
+                .get(b"Subtype")
+                .and_then(|o| o.as_name())
+                .is_ok_and(|n| n == b"Form");
+            if !is_form {
+                continue;
+            }
+            // Collect fonts from this Form XObject's Resources
+            if let Ok(form_resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
+                // Extract font dict from the Form's resources
+                let font_dict_obj = match form_resources.get(b"Font") {
+                    Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+                    Ok(Object::Dictionary(dict)) => Some(dict),
+                    _ => None,
+                };
+                if let Some(font_dict) = font_dict_obj {
+                    let mut fonts = std::collections::BTreeMap::new();
+                    for (name, value) in font_dict.iter() {
+                        let font = match value {
+                            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                            Object::Dictionary(dict) => Some(dict),
+                            _ => None,
+                        };
+                        if let Some(font) = font {
+                            fonts.insert(name.clone(), font);
+                        }
+                    }
+                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                }
+                // Recurse into nested XObjects
+                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+            }
+        }
     }
 
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&ToUnicodeCMap> {
         self.by_obj_num.get(&obj_num)
     }
-
-    /// Get a CMap for a base font name with specific ToUnicode object number
-    pub fn get_with_obj(&self, font_name: &str, obj_num: u32) -> Option<&ToUnicodeCMap> {
-        // Try the unique key first
-        let unique_key = format!("{}_{}", font_name, obj_num);
-        if let Some(cmap) = self.by_name.get(&unique_key) {
-            return Some(cmap);
-        }
-        // Fall back to direct object lookup
-        self.by_obj_num.get(&obj_num)
-    }
-}
-
-/// Find the start of a dictionary (<<) searching backwards from a position
-fn find_dict_start(data: &[u8]) -> Option<usize> {
-    // Search backwards for <<
-    for i in (1..data.len()).rev() {
-        if data[i - 1] == b'<' && data[i] == b'<' {
-            return Some(i - 1);
-        }
-    }
-    None
-}
-
-/// Extract font name from a font dictionary region
-fn extract_font_name(dict: &[u8]) -> Option<String> {
-    // Look for /BaseFont /Name
-    if let Some(idx) = find_pattern(dict, b"/BaseFont") {
-        let after = &dict[idx + 9..]; // "/BaseFont" is 9 chars
-                                      // Skip whitespace
-        let mut p = 0;
-        while p < after.len() && (after[p] == b' ' || after[p] == b'\n' || after[p] == b'\r') {
-            p += 1;
-        }
-        // Expect /Name
-        if p < after.len() && after[p] == b'/' {
-            p += 1;
-            let mut name = String::new();
-            while p < after.len()
-                && !after[p].is_ascii_whitespace()
-                && after[p] != b'/'
-                && after[p] != b'>'
-            {
-                name.push(after[p] as char);
-                p += 1;
-            }
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Extract object reference number from "N 0 R" pattern
-fn extract_obj_reference(data: &[u8]) -> Option<u32> {
-    // Skip whitespace
-    let mut p = 0;
-    while p < data.len() && (data[p] == b' ' || data[p] == b'\n' || data[p] == b'\r') {
-        p += 1;
-    }
-
-    // Read number
-    let mut num_str = String::new();
-    while p < data.len() && data[p].is_ascii_digit() {
-        num_str.push(data[p] as char);
-        p += 1;
-    }
-
-    num_str.parse().ok()
 }
 
 #[cfg(test)]

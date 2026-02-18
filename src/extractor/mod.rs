@@ -74,12 +74,9 @@ pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
-    // Read the raw PDF bytes for ToUnicode extraction
-    let pdf_bytes = std::fs::read(path.as_ref())?;
-    crate::validate_pdf_bytes(&pdf_bytes)?;
-    let font_cmaps = FontCMaps::from_pdf_bytes(&pdf_bytes);
-
-    let doc = Document::load_mem(&pdf_bytes)?;
+    crate::validate_pdf_file(&path)?;
+    let doc = Document::load(path)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
     extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
 }
 
@@ -103,10 +100,8 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
-    // Extract ToUnicode CMaps from raw PDF bytes
-    let font_cmaps = FontCMaps::from_pdf_bytes(buffer);
-
     let doc = Document::load_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
     extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
 }
 
@@ -120,17 +115,6 @@ fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
-    // If raw byte scanning found no CMaps, populate from the document model.
-    // This handles PDFs with compressed object streams where raw scanning fails.
-    let mut font_cmaps_owned;
-    let font_cmaps = if font_cmaps.by_obj_num.is_empty() {
-        font_cmaps_owned = font_cmaps.clone();
-        populate_cmaps_from_doc(doc, &mut font_cmaps_owned);
-        &font_cmaps_owned
-    } else {
-        font_cmaps
-    };
-
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
@@ -183,54 +167,6 @@ fn extract_positioned_text_from_doc(
     all_items.extend(form_items);
 
     Ok((all_items, all_rects))
-}
-
-/// Populate FontCMaps from the lopdf document model for ToUnicode streams
-/// that weren't found by raw byte scanning (e.g. in compressed object streams).
-fn populate_cmaps_from_doc(doc: &Document, font_cmaps: &mut FontCMaps) {
-    use crate::tounicode::ToUnicodeCMap;
-
-    for (_page_num, &page_id) in doc.get_pages().iter() {
-        let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
-        for (font_name, font_dict) in &fonts {
-            if let Ok(tounicode_ref) = font_dict.get(b"ToUnicode") {
-                if let Ok(obj_ref) = tounicode_ref.as_reference() {
-                    let obj_num = obj_ref.0;
-                    if font_cmaps.by_obj_num.contains_key(&obj_num) {
-                        continue;
-                    }
-                    // Try to get the stream content via lopdf
-                    if let Ok(stream) = doc.get_object(obj_ref) {
-                        if let Ok(stream) = stream.as_stream() {
-                            if let Ok(data) = stream.decompressed_content() {
-                                if let Some(cmap) = ToUnicodeCMap::parse(&data) {
-                                    let resource_name =
-                                        String::from_utf8_lossy(font_name).to_string();
-                                    let base_name = font_dict
-                                        .get(b"BaseFont")
-                                        .ok()
-                                        .and_then(|o| o.as_name().ok())
-                                        .map(|n| String::from_utf8_lossy(n).to_string());
-
-                                    // Store by object number
-                                    font_cmaps.by_obj_num.insert(obj_num, cmap.clone());
-                                    // Store by resource name
-                                    font_cmaps
-                                        .by_name
-                                        .insert(resource_name.clone(), cmap.clone());
-                                    if let Some(base) = base_name {
-                                        let unique_key = format!("{}_{}", base, obj_num);
-                                        font_cmaps.by_name.insert(unique_key, cmap.clone());
-                                        font_cmaps.by_name.insert(base, cmap);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
