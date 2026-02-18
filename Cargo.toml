@@ -43,4 +43,8 @@ path = "src/bin/pdf2md.rs"
 name = "detect-pdf"
 path = "src/bin/detect_pdf.rs"
 
+[[bin]]
+name = "dump_ops"
+path = "src/bin/dump_ops.rs"
+
 

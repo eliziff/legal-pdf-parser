@@ -31,9 +31,3 @@ scripts/
 # Test output
 test_output/
 
-# Debug/diagnostic binaries
-src/bin/debug_*.rs
-src/bin/dump_*.rs
-src/bin/profile_*.rs
-src/bin/detection_report.rs
-REPORT.md
