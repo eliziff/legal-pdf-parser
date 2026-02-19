@@ -242,7 +242,11 @@ pub(crate) fn detect_table_from_rect_group(
     }
 
     // Build table: assign text items to cells
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+
+    // Consolidate vertically-merged cells: rects spanning multiple grid rows
+    // should have their text collected into the first sub-row.
+    propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects);
 
     // Compute column centers and row centers for the Table struct
     let columns: Vec<f32> = (0..num_cols)
@@ -384,4 +388,62 @@ pub(crate) fn assign_items_to_grid(
     }
 
     (cells, indices)
+}
+
+/// Consolidate text in vertically-merged cells.
+///
+/// When a single rect spans multiple grid rows (e.g. a "Classification" label
+/// covering several price sub-rows), text ends up in only one sub-row while the
+/// others have an empty cell.  This function detects such spans and moves all
+/// text into the first sub-row, clearing the rest so that downstream
+/// continuation-merge in `clean_table_cells` collapses sub-rows correctly.
+fn propagate_merged_cells(
+    cells: &mut [Vec<String>],
+    col_edges: &[f32],
+    row_edges: &[f32],
+    group_rects: &[(f32, f32, f32, f32)],
+) {
+    let num_cols = col_edges.len() - 1;
+    let num_rows = row_edges.len() - 1;
+    let tol = 6.0;
+
+    for col in 0..num_cols {
+        for rect in group_rects {
+            let (rx, ry, rw, rh) = *rect;
+
+            // Rect must cover this column
+            if rx > col_edges[col] + tol || (rx + rw) < col_edges[col + 1] - tol {
+                continue;
+            }
+
+            // Find first and last grid rows that the rect spans
+            let first_row = (0..num_rows)
+                .find(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
+            let last_row = (0..num_rows)
+                .rfind(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
+
+            let (first, last) = match (first_row, last_row) {
+                (Some(f), Some(l)) if l > f => (f, l),
+                _ => continue, // Single row or no match — skip
+            };
+
+            // Collect all text from sub-rows within the merged range
+            let mut combined = String::new();
+            for row in cells.iter().take(last + 1).skip(first) {
+                let text = row[col].trim();
+                if !text.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push(' ');
+                    }
+                    combined.push_str(text);
+                }
+            }
+
+            // Place combined text in the first sub-row, clear the rest
+            cells[first][col] = combined;
+            for row in cells.iter_mut().take(last + 1).skip(first + 1) {
+                row[col] = String::new();
+            }
+        }
+    }
 }

@@ -88,7 +88,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // Check if this is a continuation row (first column is empty but others have content)
         let is_continuation = first_cell.is_empty()
             && row.iter().skip(1).any(|c| !c.trim().is_empty())
-            && !cleaned.is_empty();
+            && cleaned.len() > 1; // Don't merge into the first row (header)
 
         if is_continuation {
             // Merge with previous row

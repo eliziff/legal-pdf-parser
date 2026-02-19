@@ -28,12 +28,13 @@ R E V I E W 8 5
 
 -800
 
-| 1982                                          | 1986 Apartment | Industrial  | 1994                                          | 1998 Office-CBD | 2002       | 2006 Retail |
-| --------------------------------------------- | -------------- | ----------- | --------------------------------------------- | --------------- | ---------- | ----------- |
-| Table II: Correlationsofspreadsbypropertytype |                | Multifamily | Correlation of Cap Rate Spreads Over Treasury | Industrial      | CBD Office |             |
-| Industrial                                    |                | 0.937       |                                               |                 |            |             |
-| CBDOffice                                     |                | 0.924       |                                               |                 |            |             |
-| Retail                                        |                | 0.922       |                                               | 0.969           | 0.964      |             |
+| 1982                                          | 1986      |             | 1994                                          | 1998       | 2002       | 2006   |
+| --------------------------------------------- | --------- | ----------- | --------------------------------------------- | ---------- | ---------- | ------ |
+|                                               | Apartment | Industrial  |                                               | Office-CBD |            | Retail |
+| Table II: Correlationsofspreadsbypropertytype |           | Multifamily | Correlation of Cap Rate Spreads Over Treasury | Industrial | CBD Office |        |
+| Industrial                                    |           | 0.937       |                                               |            |            |        |
+| CBDOffice                                     |           | 0.924       |                                               |            |            |        |
+| Retail                                        |           | 0.922       |                                               | 0.969      | 0.964      |        |
 
 1982 1986 1990 1994 1998 2002 2006
 
