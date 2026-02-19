@@ -215,7 +215,7 @@ pub fn to_markdown_from_items_with_rects(
         let mut rect_claimed: HashSet<usize> = HashSet::new();
 
         // Try rectangle-based table detection first
-        let rect_tables = detect_tables_from_rects(&page_items, rects, page);
+        let (rect_tables, hint_regions) = detect_tables_from_rects(&page_items, rects, page);
         for table in &rect_tables {
             for &idx in &table.item_indices {
                 rect_claimed.insert(idx);
@@ -231,43 +231,16 @@ pub fn to_markdown_from_items_with_rects(
                 .push((table_y, table_md));
         }
 
-        // Run heuristic detection on unclaimed items only
-        if rect_claimed.is_empty() {
-            // No rect tables — run heuristic on all items
-            let tables = detect_tables(&page_items, base_size, false);
-            for table in tables {
-                for &idx in &table.item_indices {
-                    if let Some(&(global_idx, _)) = group.get(idx) {
-                        table_items.insert(global_idx);
-                    }
+        // Helper: run heuristic on a subset of items, remapping indices back to page-space
+        let mut run_heuristic =
+            |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
+                if subset_items.len() < min_items {
+                    return;
                 }
-                let table_y = table.rows.first().copied().unwrap_or(0.0);
-                let table_md = table_to_markdown(&table);
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push((table_y, table_md));
-            }
-        } else {
-            // Rect tables found — run heuristic on unclaimed items
-            let unclaimed_items: Vec<TextItem> = page_items
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| !rect_claimed.contains(idx))
-                .map(|(_, item)| item.clone())
-                .collect();
-            if unclaimed_items.len() >= 6 {
-                let tables = detect_tables(&unclaimed_items, base_size, false);
+                let tables = detect_tables(subset_items, base_size, false);
                 for table in tables {
-                    // Remap indices from unclaimed-space back to page-space
-                    let unclaimed_map: Vec<usize> = page_items
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| !rect_claimed.contains(idx))
-                        .map(|(idx, _)| idx)
-                        .collect();
                     for &idx in &table.item_indices {
-                        if let Some(&page_idx) = unclaimed_map.get(idx) {
+                        if let Some(&page_idx) = index_map.get(idx) {
                             if let Some(&(global_idx, _)) = group.get(page_idx) {
                                 table_items.insert(global_idx);
                             }
@@ -280,7 +253,50 @@ pub fn to_markdown_from_items_with_rects(
                         .or_default()
                         .push((table_y, table_md));
                 }
+            };
+
+        // Run heuristic detection on unclaimed items
+        if rect_claimed.is_empty() && hint_regions.is_empty() {
+            // No rect tables or hints — run heuristic on all items
+            let identity_map: Vec<usize> = (0..page_items.len()).collect();
+            run_heuristic(&page_items, &identity_map, 6);
+        } else if rect_claimed.is_empty() && !hint_regions.is_empty() {
+            // No rect tables but hint regions exist — run heuristic separately
+            // on items inside each hint region and on items outside all hints.
+            // This prevents graph labels from being merged into nearby tables.
+            let padding = 15.0; // include header lines slightly above rects
+            for hint in &hint_regions {
+                let (inside_items, inside_map): (Vec<TextItem>, Vec<usize>) = page_items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        item.y >= hint.y_bottom - padding && item.y <= hint.y_top + padding
+                    })
+                    .map(|(idx, item)| (item.clone(), idx))
+                    .unzip();
+                run_heuristic(&inside_items, &inside_map, 6);
+                // Mark hint-region items as claimed so they aren't re-processed
+                for &page_idx in &inside_map {
+                    rect_claimed.insert(page_idx);
+                }
             }
+            // Run heuristic on remaining items outside all hint regions
+            let (outside_items, outside_map): (Vec<TextItem>, Vec<usize>) = page_items
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !rect_claimed.contains(idx))
+                .map(|(idx, item)| (item.clone(), idx))
+                .unzip();
+            run_heuristic(&outside_items, &outside_map, 6);
+        } else {
+            // Rect tables found — run heuristic on unclaimed items
+            let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = page_items
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !rect_claimed.contains(idx))
+                .map(|(idx, item)| (item.clone(), idx))
+                .unzip();
+            run_heuristic(&unclaimed_items, &unclaimed_map, 6);
         }
     }
 

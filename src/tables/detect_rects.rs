@@ -97,13 +97,36 @@ pub(crate) fn cluster_rects(
     result.into_iter().map(|(_, g)| g).collect()
 }
 
+/// A bounding box hint from cell-border rects that failed full grid validation.
+///
+/// When a rect cluster contains cell-sized borders but they don't form a valid
+/// grid (e.g. only horizontal row borders with no vertical column dividers),
+/// the bounding box of those cell-sized rects can still be used to scope
+/// heuristic table detection, preventing unrelated items (graph labels, etc.)
+/// from being merged into the table.
+#[derive(Debug, Clone)]
+pub struct RectHintRegion {
+    /// Y coordinate of the top edge (highest value in PDF space)
+    pub y_top: f32,
+    /// Y coordinate of the bottom edge (lowest value in PDF space)
+    pub y_bottom: f32,
+}
+
 /// Detect tables from explicit rectangle (`re`) operators in the PDF.
 ///
 /// Many PDFs draw cell borders using `re` (rectangle) operators.  Table pages
 /// typically have 100-200+ rects while non-table pages have < 30.  This function
 /// clusters spatially connected rectangles into groups, then identifies grids of
 /// cell-sized rectangles within each cluster and assigns text items to cells.
-pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<Table> {
+///
+/// Also returns hint regions: bounding boxes of cell-sized rects from clusters
+/// that failed full grid validation.  These can be used to scope heuristic
+/// detection and prevent unrelated items from being merged into tables.
+pub fn detect_tables_from_rects(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+) -> (Vec<Table>, Vec<RectHintRegion>) {
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
     for r in rects {
@@ -133,25 +156,90 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
         rects.iter().filter(|r| r.page == page).count(),
     );
 
-    // Need a reasonable number of cell rects to form a table
-    if page_rects.len() < 6 {
-        return vec![];
-    }
-
-    // Cluster spatially connected rects into groups
-    let clusters = cluster_rects(&page_rects, 3.0, 6);
-    debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
-
     let mut tables = Vec::new();
-    for cluster_indices in &clusters {
-        let group_rects: Vec<(f32, f32, f32, f32)> =
-            cluster_indices.iter().map(|&i| page_rects[i]).collect();
-        if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
-            tables.push(table);
+    let mut hint_regions = Vec::new();
+
+    // Full grid detection requires ≥ 6 rects
+    if page_rects.len() >= 6 {
+        let clusters = cluster_rects(&page_rects, 3.0, 6);
+        debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
+
+        for cluster_indices in &clusters {
+            let group_rects: Vec<(f32, f32, f32, f32)> =
+                cluster_indices.iter().map(|&i| page_rects[i]).collect();
+            if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
+                tables.push(table);
+            }
         }
     }
 
-    tables
+    // On rect-sparse pages (≤ 6 rects), a few cell-border rects may define the
+    // table region even though they can't form a full grid (e.g. only horizontal
+    // row borders, no column dividers).  Extract a hint region so the heuristic
+    // detector can be scoped to just that area, preventing nearby graph labels
+    // or other content from being merged into the table.
+    if tables.is_empty() && page_rects.len() >= 4 && page_rects.len() <= 6 {
+        let clusters = cluster_rects(&page_rects, 3.0, 4);
+        for cluster_indices in &clusters {
+            let group_rects: Vec<(f32, f32, f32, f32)> =
+                cluster_indices.iter().map(|&i| page_rects[i]).collect();
+            if let Some(hint) = extract_hint_region(&group_rects) {
+                debug!(
+                    "page {}: hint region y={:.1}..{:.1}",
+                    page, hint.y_bottom, hint.y_top
+                );
+                hint_regions.push(hint);
+            }
+        }
+    }
+
+    (tables, hint_regions)
+}
+
+/// Extract a hint region from a rect cluster that failed grid validation.
+///
+/// Only produces hints from small clusters (≤ 8 rects) where a few cell-border
+/// rects define a table's row boundaries.  Large clusters (form-style decorative
+/// rects) are not suitable for hint regions since they typically span the whole page.
+///
+/// Filters out oversized "bounding box" rects (height > 4× the median height),
+/// then computes the Y bounding box of the remaining cell-sized rects.
+fn extract_hint_region(group_rects: &[(f32, f32, f32, f32)]) -> Option<RectHintRegion> {
+    // Only produce hints from small clusters — large clusters that fail grid
+    // validation are likely form-style decorative rects, not table cell borders.
+    if group_rects.len() < 2 || group_rects.len() > 8 {
+        return None;
+    }
+
+    // Compute median height to identify cell-sized rects
+    let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_h = heights[heights.len() / 2];
+
+    // Keep only cell-sized rects (height ≤ 4× median)
+    let cell_rects: Vec<&(f32, f32, f32, f32)> = group_rects
+        .iter()
+        .filter(|(_, _, _, h)| *h <= median_h * 4.0)
+        .collect();
+
+    if cell_rects.len() < 2 {
+        return None;
+    }
+
+    // Compute Y bounding box of cell-sized rects
+    let y_bottom = cell_rects.iter().map(|(_, y, _, _)| *y).reduce(f32::min)?;
+    let y_top = cell_rects
+        .iter()
+        .map(|(_, y, _, h)| *y + *h)
+        .reduce(f32::max)?;
+
+    // The region must have meaningful height but not span an unreasonable area
+    let region_height = y_top - y_bottom;
+    if !(10.0..=300.0).contains(&region_height) {
+        return None;
+    }
+
+    Some(RectHintRegion { y_top, y_bottom })
 }
 
 /// Detect a single table from a cluster of spatially connected rects.

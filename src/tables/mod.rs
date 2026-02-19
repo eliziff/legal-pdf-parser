@@ -9,7 +9,7 @@ mod format;
 mod grid;
 
 pub use detect_heuristic::detect_tables;
-pub use detect_rects::detect_tables_from_rects;
+pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 pub use format::table_to_markdown;
 
 /// Detection mode controls thresholds for table validation.

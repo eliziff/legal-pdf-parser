@@ -28,21 +28,25 @@ R E V I E W 8 5
 
 -800
 
-| 1982                                          | 1986      |             | 1994                                          | 1998       | 2002       | 2006   |
-| --------------------------------------------- | --------- | ----------- | --------------------------------------------- | ---------- | ---------- | ------ |
-|                                               | Apartment | Industrial  |                                               | Office-CBD |            | Retail |
-| Table II: Correlationsofspreadsbypropertytype |           | Multifamily | Correlation of Cap Rate Spreads Over Treasury | Industrial | CBD Office |        |
-| Industrial                                    |           | 0.937       |                                               |            |            |        |
-| CBDOffice                                     |           | 0.924       |                                               |            |            |        |
-| Retail                                        |           | 0.922       |                                               | 0.969      | 0.964      |        |
+| 1982 | 1986      | 1990       | 1998       | 2006   |
+| ---- | --------- | ---------- | ---------- | ------ |
+|      | Apartment | Industrial | Office-CBD | Retail |
 
 1982 1986 1990 1994 1998 2002 2006
 
-more about investing in tax losses than real estate cash streams. When tax laws dramatically changed in 1986, cap rate spreads rose, though they generally remained negative due to the availability of excess leverage through 1990 and pro- jections of strong cash flow growth, in spite of weak fundamentals. Throughout the first two-thirds of the 1990s, spreads substantially widened as capital abandoned real estate. Spreads fur- ther widened in the latter part of the 1990s, as investors scorned cash flow dur- ing the tech bubble and treasury rates drifted downward. As the tech bubble
+**Table II: Correlationsofspreadsbypropertytype**
+
+**Correlation of Cap Rate Spreads Over Treasury** **Multifamily Industrial CBD Office**
+
+|            | Multifamily | Industrial | CBD Office |
+| ---------- | ----------- | ---------- | ---------- |
+| Industrial | 0.937       |            |            |
+| CBDOffice  | 0.924       |            |            |
+| Retail     | 0.922       | 0.969      | 0.964      |
+
+more about investing in tax losses than burst, cap rates spreads steadily com- real estate cash streams. When tax laws pressed, recently falling to approximately dramatically changed in 1986, cap rate zero. And if NOI cap rate spreads are spreads rose, though they generally roughly zero, cash flow cap rate spreads remained negative due to the availability (after reserves for tenant improvements, of excess leverage through 1990 and pro-leasing commissions, and capital expendi- jections of strong cash flow growth, in tures) are well below zero. spite of weak fundamentals. This compression of cap rates and cap Throughout the first two-thirds of the rate spreads over the past five years has 1990s, spreads substantially widened as generated enormous wealth for real estate capital abandoned real estate. Spreads fur-owners. In fact, the combination of cheap ther widened in the latter part of the debt and cap rate compression covered a 1990s, as investors scorned cash flow dur-multitude of property underwriting ing the tech bubble and treasury rates errors made during the past five years, as drifted downward. As the tech bubble neither cap rate compression nor narrow-
 
 8 6 Z E L L / L U R I E R E A L E S T A T E C E N T E R
-
-burst, cap rates spreads steadily com- pressed, recently falling to approximately zero. And if NOI cap rate spreads are roughly zero, cash flow cap rate spreads (after reserves for tenant improvements, leasing commissions, and capital expendi- tures) are well below zero. This compression of cap rates and cap rate spreads over the past five years has generated enormous wealth for real estate owners. In fact, the combination of cheap debt and cap rate compression covered a multitude of property underwriting errors made during the past five years, as neither cap rate compression nor narrow-
 
 ingdebtspreadswerepartoforiginalpro formamodels.Thiscapratespreadcom- pressionoffsetweakcashflowsinapost- recessionary economy from 2002 to 2005, while continued compression, combined with improved cash flows, pushed property values skyward in 2006 throughmid-2007. Cap rate compression reduced the importance of the ability to add value. After all, if all you had to do to make moneywastoleveragetothehiltwhilecap ratesfell,whytakeontheextraworkand riskofattemptingtoaddvalue?Stateddif- ferently: Why print money if it is laying everywhereonthestreets? In Tables III and IV, we demonstrate thepowerofcapratecompressionviavery simple pro forma cash flow analyses that assume Year 1 NOI of $100; a going-in cap rate of 9 percent; an LTV of 70 per- cent; and an interest rate of 7 percent. Withineachfigure,wedisplaytwoscenar- ios, which vary based on NOI growth assumptions.ScenarioIassumesthatNOI growsby3percentperyear,whileScenario IIassumesavalue-addNOIgrowthof20 percentbetweenyearstwoandthree. The only other difference between TablesIIIandIVisinresidualcaprates, which are assumed to be 6 percent and 9 percent, respectively. Based on these assumptions, we calculate the equity IRRs. It is clear that cap rate compres- sion is a significant factor in driving
 
