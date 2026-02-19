@@ -6,8 +6,33 @@ use pdf_inspector::{
 };
 use std::collections::HashSet;
 use std::env;
+use std::fmt::Write;
 use std::fs;
 use std::process;
+
+/// Escape a string for embedding in a JSON string value.
+///
+/// Handles all characters that the JSON spec requires to be escaped:
+/// backslash, double-quote, and control characters U+0000..U+001F.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if c < '\x20' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Parse a page specification like "1,3,5-10,20" into a HashSet of page numbers.
 fn parse_page_spec(spec: &str) -> Result<HashSet<u32>, String> {
@@ -185,11 +210,7 @@ fn main() {
                 let md_escaped = result
                     .markdown
                     .as_ref()
-                    .map(|m| {
-                        m.replace('\\', "\\\\")
-                            .replace('"', "\\\"")
-                            .replace('\n', "\\n")
-                    })
+                    .map(|m| json_escape(m))
                     .unwrap_or_default();
 
                 let ocr_pages: Vec<String> = result

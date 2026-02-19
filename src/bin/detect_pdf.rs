@@ -5,8 +5,30 @@ use pdf_inspector::{
     ProcessMode,
 };
 use std::env;
+use std::fmt::Write;
 use std::process;
 use std::time::Instant;
+
+/// Escape a string for embedding in a JSON string value.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if c < '\x20' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 fn main() {
     env_logger::init();
@@ -152,7 +174,7 @@ fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
                     result
                         .title
                         .as_ref()
-                        .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
+                        .map(|t| format!("\"{}\"", json_escape(t)))
                         .unwrap_or_else(|| "null".to_string()),
                     result.ocr_recommended,
                     ocr_pages.join(","),
