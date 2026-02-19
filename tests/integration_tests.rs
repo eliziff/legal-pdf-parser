@@ -948,6 +948,7 @@ fn test_pages_needing_ocr_field_accessible() {
         pages_needing_ocr: vec![1, 3],
         title: None,
         confidence: 1.0,
+        layout: pdf_inspector::LayoutComplexity::default(),
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }

@@ -23,6 +23,7 @@ use links::{extract_form_fields, extract_page_links};
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
+pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
 
 // ---------------------------------------------------------------------------

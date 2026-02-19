@@ -1,6 +1,8 @@
 //! CLI tool for PDF to Markdown conversion
 
-use pdf_inspector::{process_pdf_with_config_pages, DetectionConfig, MarkdownOptions, PdfType};
+use pdf_inspector::{
+    process_pdf_with_config_pages, DetectionConfig, LayoutComplexity, MarkdownOptions, PdfType,
+};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -40,6 +42,20 @@ fn parse_page_spec(spec: &str) -> Result<HashSet<u32>, String> {
         }
     }
     Ok(pages)
+}
+
+fn print_layout_info(layout: &LayoutComplexity) {
+    if layout.is_complex {
+        eprintln!("Layout: COMPLEX");
+        if !layout.pages_with_tables.is_empty() {
+            eprintln!("  Pages with tables: {:?}", layout.pages_with_tables);
+        }
+        if !layout.pages_with_columns.is_empty() {
+            eprintln!("  Pages with columns: {:?}", layout.pages_with_columns);
+        }
+    } else {
+        eprintln!("Layout: simple");
+    }
 }
 
 fn main() {
@@ -119,8 +135,20 @@ fn main() {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let table_pages: Vec<String> = result
+                    .layout
+                    .pages_with_tables
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                let col_pages: Vec<String> = result
+                    .layout
+                    .pages_with_columns
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -132,6 +160,9 @@ fn main() {
                     result.processing_time_ms,
                     result.markdown.as_ref().map(|m| m.len()).unwrap_or(0),
                     ocr_pages.join(","),
+                    result.layout.is_complex,
+                    table_pages.join(","),
+                    col_pages.join(","),
                     md_escaped
                 );
             } else if raw_output {
@@ -159,6 +190,7 @@ fn main() {
                         eprintln!("Type: TEXT-BASED (direct extraction)");
                         eprintln!("Pages: {}", result.page_count);
                         eprintln!("Processing time: {}ms", result.processing_time_ms);
+                        print_layout_info(&result.layout);
 
                         if let Some(markdown) = &result.markdown {
                             if let Some(output) = output_file {
@@ -194,6 +226,7 @@ fn main() {
                         eprintln!("Type: MIXED (partial text extraction)");
                         eprintln!("Pages: {}", result.page_count);
                         eprintln!("Processing time: {}ms", result.processing_time_ms);
+                        print_layout_info(&result.layout);
 
                         if let Some(markdown) = &result.markdown {
                             eprintln!();

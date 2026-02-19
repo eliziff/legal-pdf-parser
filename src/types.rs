@@ -55,6 +55,20 @@ pub enum ItemType {
     FormField,
 }
 
+/// Layout complexity analysis result.
+///
+/// Callers can use this to decide whether the extracted markdown is reliable
+/// or whether the PDF should be routed to an OCR pipeline instead.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutComplexity {
+    /// True if any page has tables or multi-column text.
+    pub is_complex: bool,
+    /// 1-indexed pages where table borders were detected (rect count > 6).
+    pub pages_with_tables: Vec<u32>,
+    /// 1-indexed pages where 2+ text columns were detected.
+    pub pages_with_columns: Vec<u32>,
+}
+
 /// A rectangle from a PDF `re` operator (cell boundary, border, etc.)
 #[derive(Debug, Clone)]
 pub struct PdfRect {

@@ -23,7 +23,7 @@ pub use extractor::{extract_text, extract_text_with_positions, extract_text_with
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
-pub use types::{PdfRect, TextItem};
+pub use types::{LayoutComplexity, PdfRect, TextItem};
 
 use std::path::Path;
 
@@ -46,6 +46,8 @@ pub struct PdfProcessResult {
     pub title: Option<String>,
     /// Detection confidence score (0.0 - 1.0)
     pub confidence: f32,
+    /// Layout complexity analysis (tables, multi-column detection).
+    pub layout: LayoutComplexity,
 }
 
 /// Process a PDF file with smart detection and extraction
@@ -71,6 +73,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
         PdfType::TextBased => {
             // Step 2: Full extraction with position-aware reading order
             let (items, rects) = extractor::extract_text_with_positions_and_rects(&path, None)?;
+            let layout = compute_layout_complexity(&items, &rects);
             let markdown =
                 to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
 
@@ -83,6 +86,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => {
@@ -96,14 +100,24 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout: LayoutComplexity::default(),
             }
         }
         PdfType::Mixed => {
             // Try to extract what we can with position-aware reading order
-            let result = extractor::extract_text_with_positions_and_rects(&path, None).ok();
-            let markdown = result.map(|(items, rects)| {
-                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects)
-            });
+            let extracted = extractor::extract_text_with_positions_and_rects(&path, None).ok();
+            let (markdown, layout) = match extracted {
+                Some((items, rects)) => {
+                    let layout = compute_layout_complexity(&items, &rects);
+                    let md = to_markdown_from_items_with_rects(
+                        items,
+                        MarkdownOptions::default(),
+                        &rects,
+                    );
+                    (Some(md), layout)
+                }
+                None => (None, LayoutComplexity::default()),
+            };
 
             PdfProcessResult {
                 pdf_type,
@@ -114,6 +128,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
     };
@@ -155,6 +170,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
         PdfType::TextBased => {
             let (items, rects) =
                 extractor::extract_text_with_positions_and_rects(&path, page_filter)?;
+            let layout = compute_layout_complexity(&items, &rects);
             let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
 
             PdfProcessResult {
@@ -166,6 +182,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
@@ -177,12 +194,20 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
             pages_needing_ocr,
             title,
             confidence,
+            layout: LayoutComplexity::default(),
         },
         PdfType::Mixed => {
-            let result = extractor::extract_text_with_positions_and_rects(&path, page_filter).ok();
-            let markdown = result.map(|(items, rects)| {
-                to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects)
-            });
+            let extracted =
+                extractor::extract_text_with_positions_and_rects(&path, page_filter).ok();
+            let (markdown, layout) = match extracted {
+                Some((items, rects)) => {
+                    let layout = compute_layout_complexity(&items, &rects);
+                    let md =
+                        to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects);
+                    (Some(md), layout)
+                }
+                None => (None, LayoutComplexity::default()),
+            };
 
             PdfProcessResult {
                 pdf_type,
@@ -193,6 +218,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
     };
@@ -219,6 +245,7 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
             // Step 2: Full extraction with position-aware reading order
             let (items, rects) =
                 extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
+            let layout = compute_layout_complexity(&items, &rects);
             let markdown =
                 to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
 
@@ -231,6 +258,7 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
@@ -242,12 +270,22 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
             pages_needing_ocr,
             title,
             confidence,
+            layout: LayoutComplexity::default(),
         },
         PdfType::Mixed => {
-            let result = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
-            let markdown = result.map(|(items, rects)| {
-                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects)
-            });
+            let extracted = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
+            let (markdown, layout) = match extracted {
+                Some((items, rects)) => {
+                    let layout = compute_layout_complexity(&items, &rects);
+                    let md = to_markdown_from_items_with_rects(
+                        items,
+                        MarkdownOptions::default(),
+                        &rects,
+                    );
+                    (Some(md), layout)
+                }
+                None => (None, LayoutComplexity::default()),
+            };
 
             PdfProcessResult {
                 pdf_type,
@@ -258,6 +296,7 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
     };
@@ -286,6 +325,7 @@ pub fn process_pdf_mem_with_config(
         PdfType::TextBased => {
             let (items, rects) =
                 extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
+            let layout = compute_layout_complexity(&items, &rects);
             let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
 
             PdfProcessResult {
@@ -297,6 +337,7 @@ pub fn process_pdf_mem_with_config(
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
@@ -308,12 +349,19 @@ pub fn process_pdf_mem_with_config(
             pages_needing_ocr,
             title,
             confidence,
+            layout: LayoutComplexity::default(),
         },
         PdfType::Mixed => {
-            let result = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
-            let markdown = result.map(|(items, rects)| {
-                to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects)
-            });
+            let extracted = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
+            let (markdown, layout) = match extracted {
+                Some((items, rects)) => {
+                    let layout = compute_layout_complexity(&items, &rects);
+                    let md =
+                        to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects);
+                    (Some(md), layout)
+                }
+                None => (None, LayoutComplexity::default()),
+            };
 
             PdfProcessResult {
                 pdf_type,
@@ -324,11 +372,55 @@ pub fn process_pdf_mem_with_config(
                 pages_needing_ocr,
                 title,
                 confidence,
+                layout,
             }
         }
     };
 
     Ok(result)
+}
+
+/// Analyse extracted items and rects for layout complexity.
+fn compute_layout_complexity(
+    items: &[types::TextItem],
+    rects: &[types::PdfRect],
+) -> LayoutComplexity {
+    use std::collections::HashMap;
+
+    // --- Tables: count significant rects per page (w>=5, h>=5), flag pages with >6 ---
+    let mut rect_counts: HashMap<u32, usize> = HashMap::new();
+    for r in rects {
+        if r.width.abs() >= 5.0 && r.height.abs() >= 5.0 {
+            *rect_counts.entry(r.page).or_default() += 1;
+        }
+    }
+    let mut pages_with_tables: Vec<u32> = rect_counts
+        .into_iter()
+        .filter(|&(_, count)| count > 6)
+        .map(|(page, _)| page)
+        .collect();
+    pages_with_tables.sort();
+
+    // --- Columns: run detect_columns() per page, flag pages with 2+ columns ---
+    let mut seen_pages: Vec<u32> = items.iter().map(|i| i.page).collect();
+    seen_pages.sort();
+    seen_pages.dedup();
+
+    let mut pages_with_columns: Vec<u32> = Vec::new();
+    for page in seen_pages {
+        let cols = extractor::detect_columns(items, page);
+        if cols.len() >= 2 {
+            pages_with_columns.push(page);
+        }
+    }
+
+    let is_complex = !pages_with_tables.is_empty() || !pages_with_columns.is_empty();
+
+    LayoutComplexity {
+        is_complex,
+        pages_with_tables,
+        pages_with_columns,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
