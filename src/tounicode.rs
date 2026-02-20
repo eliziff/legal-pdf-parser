@@ -408,6 +408,55 @@ impl ToUnicodeCMap {
 
         result
     }
+
+    /// Get the minimum source CID across all mappings (char_map + ranges).
+    fn min_source_cid(&self) -> Option<u16> {
+        let char_min = self.char_map.keys().copied().min();
+        let range_min = self.ranges.iter().map(|&(start, _, _)| start).min();
+        match (char_min, range_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a @ Some(_), None) => a,
+            (None, b @ Some(_)) => b,
+            (None, None) => None,
+        }
+    }
+
+    /// Remap a CMap that references pre-subsetting GIDs to sequential post-subsetting GIDs.
+    /// Collects all source CIDs, sorts them, and reassigns to 1, 2, 3, ...
+    pub fn remap_to_sequential(&self) -> ToUnicodeCMap {
+        let mut cid_to_unicode: HashMap<u16, String> = HashMap::new();
+
+        // Expand ranges first
+        for &(start, end, base) in &self.ranges {
+            for cid in start..=end {
+                let unicode_cp = base + (cid - start) as u32;
+                if let Some(ch) = char::from_u32(unicode_cp) {
+                    cid_to_unicode.insert(cid, ch.to_string());
+                }
+            }
+        }
+
+        // char_map entries override range entries
+        for (&cid, unicode) in &self.char_map {
+            cid_to_unicode.insert(cid, unicode.clone());
+        }
+
+        // Sort old CIDs ascending
+        let mut old_cids: Vec<u16> = cid_to_unicode.keys().copied().collect();
+        old_cids.sort_unstable();
+
+        // Build new CMap with sequential CIDs starting at 1
+        let mut new_cmap = ToUnicodeCMap::new();
+        for (i, &old_cid) in old_cids.iter().enumerate() {
+            let new_cid = (i + 1) as u16; // GID 0 is .notdef, content CIDs start at 1
+            if let Some(unicode) = cid_to_unicode.get(&old_cid) {
+                new_cmap.char_map.insert(new_cid, unicode.clone());
+            }
+        }
+        new_cmap.code_byte_length = self.code_byte_length;
+
+        new_cmap
+    }
 }
 
 /// Parse a hex string to u16
@@ -442,6 +491,119 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
     } else {
         Some(result)
     }
+}
+
+/// Navigate to the first DescendantFont dictionary of a Type0 font.
+fn get_descendant_cid_font<'a>(
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<&'a lopdf::Dictionary> {
+    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
+    let arr = match desc_fonts_obj {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Array(arr)) => arr,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if arr.is_empty() {
+        return None;
+    }
+    match &arr[0] {
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        Object::Dictionary(d) => Some(d),
+        _ => None,
+    }
+}
+
+/// Check if a CIDFont has an explicit (non-Identity) CIDToGIDMap.
+fn has_explicit_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    match cid_font_dict.get(b"CIDToGIDMap").ok() {
+        None => false,
+        Some(Object::Name(n)) => n.as_slice() != b"Identity",
+        Some(Object::Reference(r)) => match doc.get_object(*r) {
+            Ok(Object::Name(n)) => n.as_slice() != b"Identity",
+            Ok(Object::Stream(_)) => true,
+            _ => false,
+        },
+        Some(_) => true,
+    }
+}
+
+/// Get the starting CID from a CIDFont's W (widths) array.
+fn get_w_array_start_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<u16> {
+    let w_obj = cid_font_dict.get(b"W").ok()?;
+    let arr = match w_obj {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Array(arr)) => arr,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if arr.is_empty() {
+        return None;
+    }
+    match &arr[0] {
+        Object::Integer(n) => Some(*n as u16),
+        Object::Reference(r) => match doc.get_object(*r) {
+            Ok(Object::Integer(n)) => Some(*n as u16),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Detect and fix broken ToUnicode CMaps from subset fonts with GID mismatch.
+///
+/// Some PDF generators subset-embed fonts by renumbering GIDs sequentially (1, 2, 3...)
+/// but fail to update the ToUnicode CMap, which still references original GID values.
+/// This detects the mismatch and remaps the CMap to sequential positions.
+fn try_remap_subset_cmap(
+    cmap: ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+) -> ToUnicodeCMap {
+    // Only applies to Identity-H/V CID fonts
+    let encoding = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|o| o.as_name().ok());
+    if encoding != Some(b"Identity-H") && encoding != Some(b"Identity-V") {
+        return cmap;
+    }
+
+    // CMap's minimum source CID must be > 2 (indicating old, non-sequential GIDs)
+    let min_cid = match cmap.min_source_cid() {
+        Some(c) if c > 2 => c,
+        _ => return cmap,
+    };
+
+    // Navigate to DescendantFonts[0]
+    let cid_font_dict = match get_descendant_cid_font(font_dict, doc) {
+        Some(d) => d,
+        None => return cmap,
+    };
+
+    // Must not have an explicit CIDToGIDMap (absent or /Identity is OK)
+    if has_explicit_cid_to_gid_map(cid_font_dict, doc) {
+        return cmap;
+    }
+
+    // W array must start at a low CID (≤ 2), indicating sequential post-subset GIDs
+    let w_start = match get_w_array_start_cid(cid_font_dict, doc) {
+        Some(c) if c <= 2 => c,
+        _ => return cmap,
+    };
+
+    debug!(
+        "Subset GID mismatch detected for obj={}: W starts at CID {}, CMap min CID {}. Remapping to sequential.",
+        obj_num, w_start, min_cid
+    );
+
+    cmap.remap_to_sequential()
 }
 
 /// Build a ToUnicodeCMap from an embedded TrueType font's cmap table.
@@ -597,6 +759,7 @@ impl FontCMaps {
                     cmap.char_map.len(),
                     cmap.ranges.len()
                 );
+                let cmap = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
                 by_obj_num.insert(obj_num, cmap);
             }
         }
@@ -917,6 +1080,89 @@ endbfrange
         assert_eq!(cmap.lookup(0x0003), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0004), Some("B".to_string()));
         assert_eq!(cmap.lookup(0x0005), Some("C".to_string()));
+    }
+
+    #[test]
+    fn test_remap_to_sequential() {
+        // Simulate a broken CMap where GIDs are from pre-subsetting:
+        // Old GID 3 → space, old GID 36 → 'A', old GID 37 → 'B'
+        // The subset font has sequential GIDs: 1=space, 2='A', 3='B'
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+3 beginbfchar
+<0003> <0020>
+<0024> <0041>
+<0025> <0042>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        // Original CMap: CID 3 → space, CID 36 → 'A', CID 37 → 'B'
+        assert_eq!(cmap.lookup(0x0003), Some(" ".to_string()));
+        assert_eq!(cmap.lookup(0x0024), Some("A".to_string()));
+        assert_eq!(cmap.lookup(0x0025), Some("B".to_string()));
+        assert_eq!(cmap.lookup(0x0001), None);
+        assert_eq!(cmap.lookup(0x0002), None);
+
+        // After remapping: CID 1 → space, CID 2 → 'A', CID 3 → 'B'
+        let remapped = cmap.remap_to_sequential();
+        assert_eq!(remapped.lookup(0x0001), Some(" ".to_string()));
+        assert_eq!(remapped.lookup(0x0002), Some("A".to_string()));
+        assert_eq!(remapped.lookup(0x0003), Some("B".to_string()));
+        assert_eq!(remapped.lookup(0x0024), None);
+        assert_eq!(remapped.lookup(0x0025), None);
+    }
+
+    #[test]
+    fn test_remap_to_sequential_with_ranges() {
+        // CMap with a bfrange: old GIDs 100-102 → 'X', 'Y', 'Z'
+        // Plus a bfchar: old GID 50 → space
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 beginbfchar
+<0032> <0020>
+endbfchar
+1 beginbfrange
+<0064> <0066> <0058>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+
+        assert_eq!(cmap.lookup(0x0032), Some(" ".to_string())); // CID 50
+        assert_eq!(cmap.lookup(0x0064), Some("X".to_string())); // CID 100
+        assert_eq!(cmap.lookup(0x0065), Some("Y".to_string())); // CID 101
+        assert_eq!(cmap.lookup(0x0066), Some("Z".to_string())); // CID 102
+
+        let remapped = cmap.remap_to_sequential();
+        // Sorted old CIDs: 50, 100, 101, 102 → new CIDs: 1, 2, 3, 4
+        assert_eq!(remapped.lookup(0x0001), Some(" ".to_string()));
+        assert_eq!(remapped.lookup(0x0002), Some("X".to_string()));
+        assert_eq!(remapped.lookup(0x0003), Some("Y".to_string()));
+        assert_eq!(remapped.lookup(0x0004), Some("Z".to_string()));
+        // Ranges should be cleared (all in char_map now)
+        assert!(remapped.ranges.is_empty());
+    }
+
+    #[test]
+    fn test_min_source_cid() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+2 beginbfchar
+<0003> <0020>
+<0024> <0041>
+endbfchar
+1 beginbfrange
+<0030> <0032> <0058>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.min_source_cid(), Some(3));
     }
 
     #[test]
