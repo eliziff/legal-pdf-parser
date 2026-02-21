@@ -851,6 +851,15 @@ pub(crate) fn extract_text_from_operand(
             }
         }
 
+        // Check for UTF-8 encoded strings before single-byte encoding decoding.
+        // Some PDFs incorrectly embed UTF-8 bytes in single-byte encoded fonts
+        // (e.g. "José" as UTF-8 [C3 A9] instead of WinAnsi [E9]).
+        if bytes.iter().any(|&b| b > 0x7F) {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return Some(text.to_string());
+            }
+        }
+
         // Try to decode using cached font encoding from lopdf
         if let Some(encoding) = encoding_cache.get(current_font) {
             if let Ok(text) = Document::decode_text(encoding, bytes) {

@@ -4569,6 +4569,12 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
     // Try to parse uniXXXX format
     if name.starts_with("uni") && name.len() >= 7 {
         if let Ok(code) = u32::from_str_radix(&name[3..7], 16) {
+            // Strip PUA F000 offset: uniF0XX → U+00XX (Windows Symbol encoding convention)
+            let code = if (0xF000..=0xF0FF).contains(&code) {
+                code - 0xF000
+            } else {
+                code
+            };
             return char::from_u32(code);
         }
     }
