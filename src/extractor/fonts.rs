@@ -806,23 +806,6 @@ pub(crate) fn extract_text_from_operand(
             }
         }
 
-        // Try to decode using cached font encoding from lopdf
-        if let Some(encoding) = encoding_cache.get(current_font) {
-            if let Ok(text) = Document::decode_text(encoding, bytes) {
-                if text.contains('\u{FFFD}') {
-                    debug!(
-                        "decode_text produced replacement for font={} bytes_len={}",
-                        current_font,
-                        bytes.len()
-                    );
-                    if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
-                        return Some(symbol_text);
-                    }
-                }
-                return Some(text);
-            }
-        }
-
         // Fallback: try UTF-16BE then Latin-1
         if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
             let utf16: Vec<u16> = bytes[2..]
@@ -838,6 +821,48 @@ pub(crate) fn extract_text_from_operand(
                 );
             }
             return Some(text);
+        }
+
+        // Heuristic UTF-16BE decode when bytes look like UTF-16 (even length, null-heavy)
+        if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+            let nulls = bytes.iter().filter(|&&b| b == 0).count();
+            if nulls * 4 > bytes.len() {
+                let utf16: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                let text = String::from_utf16_lossy(&utf16);
+                if score_text(&text) > 0 {
+                    return Some(text);
+                }
+            }
+        }
+
+        // Try to decode using cached font encoding from lopdf
+        if let Some(encoding) = encoding_cache.get(current_font) {
+            if let Ok(text) = Document::decode_text(encoding, bytes) {
+                if text.contains('\u{FFFD}') {
+                    debug!(
+                        "decode_text produced replacement for font={} bytes_len={}",
+                        current_font,
+                        bytes.len()
+                    );
+                    if bytes.len() <= 8 {
+                        let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+                        debug!(
+                            "decode_text replacement bytes font={} base={:?} hex={}",
+                            current_font, base_font_name, hex
+                        );
+                    }
+                    if bytes.iter().all(|&b| b >= 0x20 && b <= 0x7E) {
+                        return Some(bytes.iter().map(|&b| b as char).collect());
+                    }
+                    if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
+                        return Some(symbol_text);
+                    }
+                }
+                return Some(text);
+            }
         }
 
         if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
