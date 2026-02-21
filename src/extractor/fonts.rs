@@ -674,21 +674,29 @@ pub(crate) fn extract_text_from_operand(
             // This prevents partial CMap results from blocking the Differences path.
             if entry.primary.code_byte_length == 1 {
                 let encoding_map = font_encodings.get(current_font);
-                let lookups = entry.primary.lookup_bytes(bytes);
-                let decoded: String = lookups
+                let decoded: String = bytes
                     .iter()
-                    .filter_map(|&(b, ref cmap_result)| {
-                        // 1. CMap mapped it? Use CMap result
-                        if let Some(s) = cmap_result {
-                            return Some(s.clone());
+                    .filter_map(|&b| {
+                        let code = b as u16;
+                        // 1. Primary CMap
+                        if let Some(s) = entry.primary.lookup(code) {
+                            if !s.contains('\u{FFFD}') {
+                                return Some(s);
+                            }
                         }
-                        // 2. Differences mapped it? Use Differences result
+                        // 2. Fallback CMap (embedded font cmap)
+                        if let Some(fb) = entry.fallback.as_ref().and_then(|c| c.lookup(code)) {
+                            if !fb.contains('\u{FFFD}') {
+                                return Some(fb);
+                            }
+                        }
+                        // 3. Differences mapped it? Use Differences result
                         if let Some(map) = encoding_map {
                             if let Some(&ch) = map.get(&b) {
                                 return Some(ch.to_string());
                             }
                         }
-                        // 3. Printable ASCII/Latin-1 fallback
+                        // 4. Printable ASCII/Latin-1 fallback
                         if b >= 0x20 {
                             return Some((b as char).to_string());
                         }

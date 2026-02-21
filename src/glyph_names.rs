@@ -1725,7 +1725,7 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("controlRS", '\x1E');
     m.insert("controlSI", '');
     m.insert("controlSO", '');
-    m.insert("controlSOT", '');
+    m.insert("controlSOT", '˜');
     m.insert("controlSTX", '');
     m.insert("controlSUB", '');
     m.insert("controlSYN", '');
@@ -4544,6 +4544,9 @@ static GLYPH_TO_UNICODE: LazyLock<HashMap<&'static str, char>> = LazyLock::new(|
     // Local overrides for non-standard glyph names seen in PDFs.
     m.insert("C21", '≥');
     m.insert("C25", '≈');
+    // Some Type1 fonts use custom glyph names for ASCII tilde.
+    m.insert("C19", '~');
+    m.insert("C24", '~');
     m
 });
 

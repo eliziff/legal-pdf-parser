@@ -758,6 +758,22 @@ fn build_simple_cmap_from_truetype(font_data: &[u8]) -> Option<ToUnicodeCMap> {
             cmap.char_map.insert(gid, ch.to_string());
         }
     }
+    // Fill missing single-byte codes from glyph names (helps with ligatures like "t_i").
+    for gid in 0..face.number_of_glyphs() {
+        let gid = ttf_parser::GlyphId(gid);
+        let gid_val = gid.0;
+        if gid_val > 0xFF || cmap.char_map.contains_key(&gid_val) {
+            continue;
+        }
+        if let Some(name) = face.glyph_name(gid) {
+            if gid_val == 0x1B {
+                debug!("simple cmap glyph gid=0x1B name={:?}", name);
+            }
+            if let Some(s) = glyph_name_to_string(name) {
+                cmap.char_map.insert(gid_val, s);
+            }
+        }
+    }
     if cmap.char_map.is_empty() {
         return None;
     }
@@ -767,6 +783,35 @@ fn build_simple_cmap_from_truetype(font_data: &[u8]) -> Option<ToUnicodeCMap> {
     );
     cmap.code_byte_length = 1;
     Some(cmap)
+}
+
+fn glyph_name_to_string(name: &str) -> Option<String> {
+    let base = name.split('.').next().unwrap_or(name);
+    if let Some(ch) = glyph_to_char(base) {
+        return Some(ch.to_string());
+    }
+    if base.contains('_') {
+        let mut out = String::new();
+        for part in base.split('_') {
+            if part.is_empty() {
+                return None;
+            }
+            if let Some(ch) = glyph_to_char(part) {
+                out.push(ch);
+            } else if part.len() == 1 {
+                out.push(part.chars().next().unwrap());
+            } else {
+                return None;
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    if matches!(base, "ti" | "tt" | "tz") {
+        return Some(base.to_string());
+    }
+    None
 }
 
 /// Build a ToUnicodeCMap from a font's glyph names (post table).
