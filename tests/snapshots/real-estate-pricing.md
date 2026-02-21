@@ -2,7 +2,7 @@
 
 # BePriced?
 
-*Commercial real estate pricing* **C O M M E R C I A L R E A L E S T A T E** pricingisliketheweather:everyonetalks *needs disciplined and systematic*about it, but few understand it. Most observers base "appropriate" real estate *analysis of the data.* pricing on historical norms. The cap rate—anindicatorofvaluerelativetosta- bilized net operating income (NOI) before capital expenditures, tenant improvement,andleasingcommissions— isthemostcommonlyusedmetricofreal estate pricing. But cap rates have been largelyunresponsivetoalternativeratesof return available to investors, with the **P E T E R L I N N E M A N** exception of BBB bonds, throughout
+*Commercial real estate pricing* **C O M M E R C I A L R E A L E S T A T E** pricingisliketheweather:everyonetalks *needs disciplined and systematic*about it, but few understand it. Most observers base “appropriate” real estate *analysis of the data.* pricing on historical norms. The cap rate—anindicatorofvaluerelativetosta- bilized net operating income (NOI) before capital expenditures, tenant improvement,andleasingcommissions— isthemostcommonlyusedmetricofreal estate pricing. But cap rates have been largelyunresponsivetoalternativeratesof return available to investors, with the **P E T E R L I N N E M A N** exception of BBB bonds, throughout
 
 8 4 Z E L L / L U R I E R E A L E S T A T E C E N T E R
 
@@ -17,7 +17,7 @@ Apartment Retail ndustrial 10-yr reasury CBD Office
 
 most of the past twenty-five years (Table presented in Figure 2 with an eighteen-
 
-I). Such a relationship defies investment monthlag.Thisdataprovidesanoverview theory,asrealestatepricingshouldchange ofthepricingofinstitutionalqualityreal as property risks and the returns of alter-estate.Figure2reflectsthesecapratesnet nativeinvestmentschange. of the ten-year Treasury yield. Since cap Figure1displaysNCREIFcapratesby rate spreads are highly correlated across property type compared to the ten-year propertytypes(TableII),wecanspeakof Treasury yield. Because the National "cap rates" without reference to property Council of Real Estate Investment type with little loss of insight. Cap rate Fiduciaries (NCREIF) cap rate data is spreadswerenegativeintheearlytomid- seriouslyflawedduetoappraisallags,itis 1980s, when purchasing real estate was
+I). Such a relationship defies investment monthlag.Thisdataprovidesanoverview theory,asrealestatepricingshouldchange ofthepricingofinstitutionalqualityreal as property risks and the returns of alter-estate.Figure2reflectsthesecapratesnet nativeinvestmentschange. of the ten-year Treasury yield. Since cap Figure1displaysNCREIFcapratesby rate spreads are highly correlated across property type compared to the ten-year propertytypes(TableII),wecanspeakof Treasury yield. Because the National “cap rates” without reference to property Council of Real Estate Investment type with little loss of insight. Cap rate Fiduciaries (NCREIF) cap rate data is spreadswerenegativeintheearlytomid- seriouslyflawedduetoappraisallags,itis 1980s, when purchasing real estate was
 R E V I E W 8 5
 
 **Figure 2:** Capratespreadsover10-yearTreasury
