@@ -854,7 +854,7 @@ pub(crate) fn extract_text_from_operand(
                             current_font, base_font_name, hex
                         );
                     }
-                    if bytes.iter().all(|&b| b >= 0x20 && b <= 0x7E) {
+                    if bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
                         return Some(bytes.iter().map(|&b| b as char).collect());
                     }
                     if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
