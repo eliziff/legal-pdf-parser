@@ -6,8 +6,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-
-
 pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     let mut m = HashMap::with_capacity(4528);
     m.insert("A", 'A');
@@ -1717,18 +1715,14 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("controlESC", '');
     m.insert("controlETB", '');
     m.insert("controlETX", '');
-    m.insert("controlFF", '
-');
-    m.insert("controlFS", '
-');
-    m.insert("controlGS", '
-');
+    m.insert("controlFF", '\x0C');
+    m.insert("controlFS", '\x1C');
+    m.insert("controlGS", '\x1D');
     m.insert("controlHT", '\t');
     m.insert("controlLF", '\n');
     m.insert("controlNAK", '');
-    m.insert("controlNULL", '');
-    m.insert("controlRS", '
-');
+    m.insert("controlNULL", '\x00');
+    m.insert("controlRS", '\x1E');
     m.insert("controlSI", '');
     m.insert("controlSO", '');
     m.insert("controlSOT", '');
@@ -1736,8 +1730,7 @@ pub fn build_glyph_to_unicode_map() -> HashMap<&'static str, char> {
     m.insert("controlSUB", '');
     m.insert("controlSYN", '');
     m.insert("controlUS", '');
-    m.insert("controlVT", '
-');
+    m.insert("controlVT", '\x0B');
     m.insert("coproductdisplay", '∐');
     m.insert("coproducttext", '∐');
     m.insert("copyright", '©');
