@@ -950,6 +950,7 @@ fn test_pages_needing_ocr_field_accessible() {
         title: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
+        has_encoding_issues: false,
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }

@@ -186,7 +186,7 @@ fn main() {
                         .map(|p| p.to_string())
                         .collect();
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}]}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
@@ -194,6 +194,7 @@ fn main() {
                         result.layout.is_complex,
                         table_pages.join(","),
                         col_pages.join(","),
+                        result.has_encoding_issues,
                     );
                 } else {
                     eprintln!("Type: {}", pdf_type_str);
@@ -231,7 +232,7 @@ fn main() {
                     .map(|p| p.to_string())
                     .collect();
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -246,6 +247,7 @@ fn main() {
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),
+                    result.has_encoding_issues,
                     md_escaped
                 );
             } else if raw_output {

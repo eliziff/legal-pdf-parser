@@ -50,6 +50,9 @@ pub struct PdfProcessResult {
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
     pub layout: LayoutComplexity,
+    /// True when broken font encodings are detected (garbled text, replacement
+    /// characters). Clients should fall back to OCR for affected pages.
+    pub has_encoding_issues: bool,
 }
 
 /// Process a PDF file with smart detection and extraction
@@ -78,6 +81,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
             let layout = compute_layout_complexity(&items, &rects);
             let markdown =
                 to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
+            let has_encoding_issues = detect_encoding_issues(&markdown);
 
             PdfProcessResult {
                 pdf_type,
@@ -89,6 +93,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => {
@@ -103,12 +108,13 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 title,
                 confidence,
                 layout: LayoutComplexity::default(),
+                has_encoding_issues: false,
             }
         }
         PdfType::Mixed => {
             // Try to extract what we can with position-aware reading order
             let extracted = extractor::extract_text_with_positions_and_rects(&path, None).ok();
-            let (markdown, layout) = match extracted {
+            let (markdown, layout, has_encoding_issues) = match extracted {
                 Some((items, rects)) => {
                     let layout = compute_layout_complexity(&items, &rects);
                     let md = to_markdown_from_items_with_rects(
@@ -116,9 +122,10 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                         MarkdownOptions::default(),
                         &rects,
                     );
-                    (Some(md), layout)
+                    let enc = detect_encoding_issues(&md);
+                    (Some(md), layout, enc)
                 }
-                None => (None, LayoutComplexity::default()),
+                None => (None, LayoutComplexity::default(), false),
             };
 
             PdfProcessResult {
@@ -131,6 +138,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
     };
@@ -180,6 +188,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
             title,
             confidence,
             layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
         });
     }
 
@@ -198,6 +207,9 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                     &rects,
                 ))
             };
+            let has_encoding_issues = markdown
+                .as_ref()
+                .is_some_and(|md| detect_encoding_issues(md));
 
             PdfProcessResult {
                 pdf_type,
@@ -209,6 +221,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
@@ -221,11 +234,12 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
             title,
             confidence,
             layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
         },
         PdfType::Mixed => {
             let extracted =
                 extractor::extract_text_with_positions_and_rects(&path, page_filter).ok();
-            let (markdown, layout) = match extracted {
+            let (markdown, layout, has_encoding_issues) = match extracted {
                 Some((items, rects)) => {
                     let layout = compute_layout_complexity(&items, &rects);
                     let md = if markdown_options.process_mode == ProcessMode::Analyze {
@@ -237,9 +251,10 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                             &rects,
                         ))
                     };
-                    (md, layout)
+                    let enc = md.as_ref().is_some_and(|m| detect_encoding_issues(m));
+                    (md, layout, enc)
                 }
-                None => (None, LayoutComplexity::default()),
+                None => (None, LayoutComplexity::default(), false),
             };
 
             PdfProcessResult {
@@ -252,6 +267,7 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
     };
@@ -297,6 +313,7 @@ pub fn process_pdf_mem_with_config(
             title,
             confidence,
             layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
         });
     }
 
@@ -315,6 +332,9 @@ pub fn process_pdf_mem_with_config(
                     &rects,
                 ))
             };
+            let has_encoding_issues = markdown
+                .as_ref()
+                .is_some_and(|md| detect_encoding_issues(md));
 
             PdfProcessResult {
                 pdf_type,
@@ -326,6 +346,7 @@ pub fn process_pdf_mem_with_config(
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
         PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
@@ -338,10 +359,11 @@ pub fn process_pdf_mem_with_config(
             title,
             confidence,
             layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
         },
         PdfType::Mixed => {
             let extracted = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
-            let (markdown, layout) = match extracted {
+            let (markdown, layout, has_encoding_issues) = match extracted {
                 Some((items, rects)) => {
                     let layout = compute_layout_complexity(&items, &rects);
                     let md = if markdown_options.process_mode == ProcessMode::Analyze {
@@ -353,9 +375,10 @@ pub fn process_pdf_mem_with_config(
                             &rects,
                         ))
                     };
-                    (md, layout)
+                    let enc = md.as_ref().is_some_and(|m| detect_encoding_issues(m));
+                    (md, layout, enc)
                 }
-                None => (None, LayoutComplexity::default()),
+                None => (None, LayoutComplexity::default(), false),
             };
 
             PdfProcessResult {
@@ -368,11 +391,46 @@ pub fn process_pdf_mem_with_config(
                 title,
                 confidence,
                 layout,
+                has_encoding_issues,
             }
         }
     };
 
     Ok(result)
+}
+
+/// Detect broken font encodings in extracted markdown text.
+///
+/// Two heuristics:
+/// 1. **U+FFFD**: Any replacement character indicates decode failures.
+/// 2. **Dollar-as-space**: Pattern like `Word$Word$Word` where `$` is used as a
+///    word separator due to broken ToUnicode CMaps. Triggers when >50% of `$`
+///    characters appear between letters AND the count exceeds 10.
+fn detect_encoding_issues(markdown: &str) -> bool {
+    // Heuristic 1: U+FFFD replacement characters
+    if markdown.contains('\u{FFFD}') {
+        return true;
+    }
+
+    // Heuristic 2: dollar-as-space pattern
+    let total_dollars = markdown.matches('$').count();
+    if total_dollars > 10 {
+        let bytes = markdown.as_bytes();
+        let mut letter_dollar_letter = 0usize;
+        for i in 1..bytes.len().saturating_sub(1) {
+            if bytes[i] == b'$'
+                && bytes[i - 1].is_ascii_alphabetic()
+                && bytes[i + 1].is_ascii_alphabetic()
+            {
+                letter_dollar_letter += 1;
+            }
+        }
+        if letter_dollar_letter * 2 > total_dollars {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Analyse extracted items and rects for layout complexity.
@@ -572,4 +630,44 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
     let mut buf = [0u8; 1024];
     let n = file.read(&mut buf)?;
     validate_pdf_bytes(&buf[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_encoding_issues_fffd() {
+        assert!(detect_encoding_issues(
+            "Some text with \u{FFFD} replacement"
+        ));
+    }
+
+    #[test]
+    fn test_detect_encoding_issues_dollar_as_space() {
+        // Simulates broken CMap: "$Workshop$on$Chest$Wall$Deformities$and$..."
+        let garbled = "Last$advanced$Book$Programm$3th$Workshop$on$Chest$Wall$Deformities$and$More";
+        assert!(detect_encoding_issues(garbled));
+    }
+
+    #[test]
+    fn test_detect_encoding_issues_financial_text() {
+        // Legitimate dollar signs in financial text should NOT trigger
+        let financial = "Revenue was $100M in Q1, up from $90M. Costs: $50M, $30M, $20M, $15M, $12M, $8M, $5M, $3M, $2M, $1M, $500K.";
+        assert!(!detect_encoding_issues(financial));
+    }
+
+    #[test]
+    fn test_detect_encoding_issues_clean_text() {
+        assert!(!detect_encoding_issues(
+            "Normal markdown text with no issues."
+        ));
+    }
+
+    #[test]
+    fn test_detect_encoding_issues_few_dollars() {
+        // Under threshold of 10 total dollars — should not trigger
+        let text = "a$b c$d e$f";
+        assert!(!detect_encoding_issues(text));
+    }
 }
