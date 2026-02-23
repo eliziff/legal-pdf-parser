@@ -449,4 +449,53 @@ mod tests {
             "Per-character financial table should be detected"
         );
     }
+
+    #[test]
+    fn test_short_subheader_not_merged_as_continuation() {
+        // Simulate a table with section sub-headers (like month names) that have
+        // an empty first column and short text in a single other column.
+        // These should NOT be merged into the previous row as continuation text.
+        let table = Table {
+            columns: vec![50.0, 150.0, 300.0, 450.0],
+            rows: vec![500.0, 480.0, 460.0, 440.0, 420.0, 400.0],
+            cells: vec![
+                // Header row
+                vec!["No.".into(), "Date".into(), "Title".into(), "Amount".into()],
+                // Sub-header: month name in 1 column, rest empty
+                vec!["".into(), "JAN".into(), "".into(), "".into()],
+                // Data row
+                vec!["1".into(), "8/1".into(), "Item A".into(), "100".into()],
+                vec!["2".into(), "15/1".into(), "Item B".into(), "200".into()],
+                // Another sub-header
+                vec!["".into(), "FEB".into(), "".into(), "".into()],
+                // Data row
+                vec!["3".into(), "5/2".into(), "Item C".into(), "300".into()],
+            ],
+            item_indices: vec![],
+        };
+
+        let md = table_to_markdown(&table);
+        // JAN and FEB should be on their own rows, not merged into adjacent rows
+        assert!(
+            md.contains("| JAN"),
+            "JAN should be on its own row, got:\n{}",
+            md
+        );
+        assert!(
+            md.contains("| FEB"),
+            "FEB should be on its own row, got:\n{}",
+            md
+        );
+        // Verify they're NOT merged into data rows
+        assert!(
+            !md.contains("15/1 FEB"),
+            "FEB should not be merged into data row, got:\n{}",
+            md
+        );
+        assert!(
+            !md.contains("8/1 JAN"),
+            "JAN should not be merged into data row, got:\n{}",
+            md
+        );
+    }
 }

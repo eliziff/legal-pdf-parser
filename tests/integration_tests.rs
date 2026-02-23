@@ -921,6 +921,11 @@ fn test_snapshot_real_estate_pricing() {
     assert_snapshot("real-estate-pricing");
 }
 
+#[test]
+fn test_snapshot_2013_app2() {
+    assert_snapshot("2013-app2");
+}
+
 // ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================
