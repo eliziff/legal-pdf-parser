@@ -404,8 +404,10 @@ pub fn process_pdf_mem_with_config(
 /// Two heuristics:
 /// 1. **U+FFFD**: Any replacement character indicates decode failures.
 /// 2. **Dollar-as-space**: Pattern like `Word$Word$Word` where `$` is used as a
-///    word separator due to broken ToUnicode CMaps. Triggers when >50% of `$`
-///    characters appear between letters AND the count exceeds 10.
+///    word separator due to broken ToUnicode CMaps. Triggers when either:
+///    - More than 50% of `$` are between letters (clear substitution pattern), OR
+///    - More than 20 letter-dollar-letter occurrences (even if some `$` are also
+///      used as trailing/leading separators, 20+ is far beyond normal financial text).
 fn detect_encoding_issues(markdown: &str) -> bool {
     // Heuristic 1: U+FFFD replacement characters
     if markdown.contains('\u{FFFD}') {
@@ -425,7 +427,7 @@ fn detect_encoding_issues(markdown: &str) -> bool {
                 letter_dollar_letter += 1;
             }
         }
-        if letter_dollar_letter * 2 > total_dollars {
+        if letter_dollar_letter > 20 || letter_dollar_letter * 2 > total_dollars {
             return true;
         }
     }
