@@ -85,9 +85,19 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             continue;
         }
 
-        // Check if this is a continuation row (first column is empty but others have content)
+        // Check if this is a continuation row (first column is empty but others have content).
+        // A row with only 1 short non-empty cell (besides the first) is more likely a
+        // section sub-header (e.g. "JAN", "FEB") than overflow text — don't merge it.
+        let non_first_cells: Vec<&str> = row
+            .iter()
+            .skip(1)
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
         let is_continuation = first_cell.is_empty()
-            && row.iter().skip(1).any(|c| !c.trim().is_empty())
+            && !non_first_cells.is_empty()
+            && !is_short_subheader
             && cleaned.len() > 1; // Don't merge into the first row (header)
 
         if is_continuation {

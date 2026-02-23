@@ -169,6 +169,8 @@ pub fn detect_tables_from_rects(
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
             if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
                 tables.push(table);
+            } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
+                tables.push(table);
             }
         }
     }
@@ -534,4 +536,266 @@ fn propagate_merged_cells(
             }
         }
     }
+}
+
+/// Check if rects form a row-stripe pattern (full-width horizontal bands).
+///
+/// Row-stripe shading uses rects that all share similar X position and width,
+/// spanning the full table width. This produces only ~2 unique X-edges, which
+/// makes normal grid detection fail (1-column grid).
+fn is_row_stripe_pattern(rects: &[(f32, f32, f32, f32)]) -> bool {
+    if rects.len() < 3 {
+        return false;
+    }
+
+    let mut widths: Vec<f32> = rects.iter().map(|&(_, _, w, _)| w).collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_width = widths[widths.len() / 2];
+
+    // Must be page-spanning (>200pt)
+    if median_width <= 200.0 {
+        return false;
+    }
+
+    // >75% of rects should have width within 10% of median
+    let within_tolerance = rects
+        .iter()
+        .filter(|&&(_, _, w, _)| (w - median_width).abs() <= median_width * 0.10)
+        .count();
+
+    within_tolerance as f32 / rects.len() as f32 > 0.75
+}
+
+/// Detect a table from row-stripe rects by using rect Y-edges for rows
+/// and text X-position clustering for columns.
+fn detect_row_stripe_table(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    if !is_row_stripe_pattern(group_rects) {
+        return None;
+    }
+
+    debug!(
+        "  trying row-stripe detection ({} rects)",
+        group_rects.len()
+    );
+
+    // Extract Y-edges from rects
+    let mut y_edges: Vec<f32> = Vec::new();
+    for &(_, y, _, h) in group_rects {
+        y_edges.push(y);
+        y_edges.push(y + h);
+    }
+    let y_edges = snap_edges(&y_edges, 6.0);
+
+    if y_edges.len() < 4 {
+        debug!("  row-stripe rejected: only {} y-edges", y_edges.len());
+        return None;
+    }
+
+    // Sort row edges top-to-bottom (highest Y first for PDF)
+    let mut row_edges = y_edges;
+    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Compute the bounding box of the stripe region for filtering items
+    let y_top = row_edges[0];
+    let y_bottom = *row_edges.last().unwrap();
+    let x_left = group_rects
+        .iter()
+        .map(|&(x, _, _, _)| x)
+        .reduce(f32::min)
+        .unwrap();
+    let x_right = group_rects
+        .iter()
+        .map(|&(x, _, w, _)| x + w)
+        .reduce(f32::max)
+        .unwrap();
+
+    // Gather page items within the stripe region
+    let page_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page
+                && item.y >= y_bottom - 2.0
+                && item.y <= y_top + 2.0
+                && item.x >= x_left - 5.0
+                && item.x + item.width <= x_right + 5.0
+        })
+        .collect();
+
+    if page_items.is_empty() {
+        return None;
+    }
+
+    // Derive column boundaries from text X-position clustering.
+    // Use a lower threshold than find_column_boundaries (which clamps at 25pt min)
+    // since we already know this is a table from the rects and narrow columns
+    // (e.g. row-number + date at 21pt gap) should stay separate.
+    let columns = cluster_x_positions(&page_items, 15.0);
+
+    if columns.len() < 2 {
+        debug!(
+            "  row-stripe rejected: only {} columns from text clustering",
+            columns.len()
+        );
+        return None;
+    }
+
+    // Convert column centers to column edges (midpoints between adjacent, plus outer edges)
+    let mut col_edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
+
+    // Left edge: minimum item X minus small padding
+    let min_x = page_items
+        .iter()
+        .map(|(_, i)| i.x)
+        .reduce(f32::min)
+        .unwrap();
+    col_edges.push(min_x - 5.0);
+
+    // Midpoints between adjacent column centers
+    for pair in columns.windows(2) {
+        col_edges.push((pair[0] + pair[1]) / 2.0);
+    }
+
+    // Right edge: maximum item right edge plus small padding
+    let max_x_right = page_items
+        .iter()
+        .map(|(_, i)| i.x + i.width)
+        .reduce(f32::max)
+        .unwrap();
+    col_edges.push(max_x_right + 5.0);
+
+    let num_cols = col_edges.len() - 1;
+    let num_rows = row_edges.len() - 1;
+
+    debug!(
+        "  row-stripe grid: {}x{} ({} col edges, {} row edges)",
+        num_rows,
+        num_cols,
+        col_edges.len(),
+        row_edges.len()
+    );
+
+    // Assign items to grid
+    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+
+    if item_indices.is_empty() {
+        debug!("  row-stripe rejected: no items assigned");
+        return None;
+    }
+
+    // Validate: >=2 non-empty rows
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count();
+    if non_empty_rows < 2 {
+        debug!(
+            "  row-stripe rejected: only {} non-empty rows",
+            non_empty_rows
+        );
+        return None;
+    }
+
+    // Content density: >=25%
+    let total_cells = (num_cols * num_rows) as f32;
+    let non_empty_cells = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let content_ratio = non_empty_cells as f32 / total_cells;
+    if content_ratio < 0.25 {
+        debug!(
+            "  row-stripe rejected: content ratio {:.2} < 0.25",
+            content_ratio
+        );
+        return None;
+    }
+
+    // No empty columns
+    for col in 0..num_cols {
+        let col_has_content = cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
+        if !col_has_content {
+            debug!("  row-stripe rejected: column {} is empty", col);
+            return None;
+        }
+    }
+
+    let column_centers: Vec<f32> = (0..num_cols)
+        .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
+        .collect();
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
+
+    debug!(
+        "  row-stripe table accepted: {}x{}, {:.0}% density",
+        num_rows,
+        num_cols,
+        content_ratio * 100.0
+    );
+
+    Some(Table {
+        columns: column_centers,
+        rows: row_centers,
+        cells,
+        item_indices,
+    })
+}
+
+/// Cluster text item X positions into column centers with a given minimum threshold.
+///
+/// Similar to `find_column_boundaries` in grid.rs but with a lower minimum threshold
+/// suitable for rect-backed tables where we already know tabular structure exists
+/// (no need for anti-paragraph safeguards).
+fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<f32> {
+    let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
+    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if x_positions.is_empty() {
+        return vec![];
+    }
+
+    let x_range = x_positions.last().unwrap() - x_positions.first().unwrap();
+    let avg_gap = if x_positions.len() > 1 {
+        x_range / (x_positions.len() - 1) as f32
+    } else {
+        60.0
+    };
+    let cluster_threshold = avg_gap.clamp(min_threshold, 50.0);
+
+    let mut columns = Vec::new();
+    let mut cluster_items: Vec<f32> = vec![x_positions[0]];
+
+    for &x in &x_positions[1..] {
+        let cluster_center = cluster_items.iter().sum::<f32>() / cluster_items.len() as f32;
+        if x - cluster_center > cluster_threshold {
+            columns.push(cluster_center);
+            cluster_items = vec![x];
+        } else {
+            cluster_items.push(x);
+        }
+    }
+    if !cluster_items.is_empty() {
+        columns.push(cluster_items.iter().sum::<f32>() / cluster_items.len() as f32);
+    }
+
+    // Filter: each column needs multiple items
+    let min_items_per_col = (items.len() / columns.len().max(1) / 4).max(2);
+    columns
+        .into_iter()
+        .filter(|&col_x| {
+            items
+                .iter()
+                .filter(|(_, i)| (i.x - col_x).abs() < cluster_threshold)
+                .count()
+                >= min_items_per_col
+        })
+        .collect()
 }
