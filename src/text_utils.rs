@@ -133,6 +133,11 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             '\u{FEFF}' => {}              // BOM / zero-width no-break space
             '\u{200C}' | '\u{200D}' => {} // ZWNJ / ZWJ
             '\u{2060}' => {}              // word joiner
+            // Normalize typographic spaces to ASCII space so downstream
+            // spacing logic (should_join_items) can detect word boundaries.
+            // Excludes NBSP (U+00A0) which is common in PDFs and handled
+            // correctly by existing coordinate-based spacing.
+            '\u{2000}'..='\u{200A}' => result.push(' '), // en/em/thin/hair spaces etc.
             _ => result.push(ch),
         }
     }
@@ -405,5 +410,19 @@ mod tests {
     #[test]
     fn ligatures_still_expand() {
         assert_eq!(expand_ligatures("\u{FB00}\u{FB01}\u{FB02}"), "fffifl");
+    }
+
+    #[test]
+    fn normalize_typographic_spaces() {
+        // EM SPACE, EN SPACE, THIN SPACE → ASCII space
+        assert_eq!(expand_ligatures("•\u{2003}text"), "• text");
+        assert_eq!(expand_ligatures("a\u{2002}b"), "a b");
+        assert_eq!(expand_ligatures("x\u{2009}y"), "x y");
+    }
+
+    #[test]
+    fn nbsp_preserved() {
+        // NBSP (U+00A0) should NOT be normalized
+        assert_eq!(expand_ligatures("a\u{00A0}b"), "a\u{00A0}b");
     }
 }
