@@ -127,6 +127,12 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             '\u{FB03}' => result.push_str("ffi"),
             '\u{FB04}' => result.push_str("ffl"),
             '\u{FB05}' | '\u{FB06}' => result.push_str("st"),
+            // Strip invisible Unicode characters that pollute markdown output
+            '\u{00AD}' => {}              // soft hyphen
+            '\u{200B}' => {}              // zero-width space
+            '\u{FEFF}' => {}              // BOM / zero-width no-break space
+            '\u{200C}' | '\u{200D}' => {} // ZWNJ / ZWJ
+            '\u{2060}' => {}              // word joiner
             _ => result.push(ch),
         }
     }
@@ -364,5 +370,40 @@ pub(crate) fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> b
             // Non-alphabetic: use moderate threshold
             gap < char_width * 0.5
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_soft_hyphen() {
+        assert_eq!(expand_ligatures("con\u{00AD}tent"), "content");
+    }
+
+    #[test]
+    fn strip_zero_width_space() {
+        assert_eq!(expand_ligatures("hello\u{200B}world"), "helloworld");
+    }
+
+    #[test]
+    fn strip_bom() {
+        assert_eq!(expand_ligatures("\u{FEFF}text"), "text");
+    }
+
+    #[test]
+    fn strip_zwnj_zwj_word_joiner() {
+        assert_eq!(expand_ligatures("a\u{200C}b\u{200D}c\u{2060}d"), "abcd");
+    }
+
+    #[test]
+    fn ligature_plus_invisible_chars() {
+        assert_eq!(expand_ligatures("\u{FB01}rst\u{00AD}ly"), "firstly");
+    }
+
+    #[test]
+    fn ligatures_still_expand() {
+        assert_eq!(expand_ligatures("\u{FB00}\u{FB01}\u{FB02}"), "fffifl");
     }
 }

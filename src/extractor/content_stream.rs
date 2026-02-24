@@ -594,7 +594,7 @@ pub(crate) fn extract_page_text_items(
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
                             items.push(TextItem {
-                                text: at,
+                                text: expand_ligatures(&at),
                                 x,
                                 y,
                                 width,
