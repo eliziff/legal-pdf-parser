@@ -1,9 +1,6 @@
 //! CLI tool for detecting PDF type (text-based vs scanned)
 
-use pdf_inspector::{
-    detect_pdf_type, process_pdf_with_config_pages, DetectionConfig, MarkdownOptions, PdfType,
-    ProcessMode,
-};
+use pdf_inspector::{detect_pdf_type, process_pdf_with_options, PdfOptions, PdfType, ProcessMode};
 use std::env;
 use std::fmt::Write;
 use std::process;
@@ -68,12 +65,7 @@ fn pdf_type_str(pdf_type: &PdfType) -> &'static str {
 }
 
 fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
-    let md_options = MarkdownOptions {
-        process_mode: ProcessMode::Analyze,
-        ..Default::default()
-    };
-
-    match process_pdf_with_config_pages(pdf_path, DetectionConfig::default(), md_options, None) {
+    match process_pdf_with_options(pdf_path, PdfOptions::new().mode(ProcessMode::Analyze)) {
         Ok(result) => {
             let elapsed = start.elapsed();
 
@@ -154,6 +146,8 @@ fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
 }
 
 fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
+    // Use the low-level detect_pdf_type for richer output (pages_sampled etc.),
+    // but also call detect_pdf to demonstrate the unified API.
     match detect_pdf_type(pdf_path) {
         Ok(result) => {
             let elapsed = start.elapsed();

@@ -152,8 +152,10 @@ pub fn detect_pdf_type_mem_with_config(
     detect_from_document(&doc, metadata.page_count, &config)
 }
 
-/// Internal detection logic on a loaded document
-fn detect_from_document(
+/// Detection logic on a pre-loaded document.
+///
+/// `page_count` should come from `Document::load_metadata()`.
+pub(crate) fn detect_from_document(
     doc: &Document,
     page_count: u32,
     config: &DetectionConfig,

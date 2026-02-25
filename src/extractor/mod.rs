@@ -134,8 +134,8 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
 // Orchestration
 // ---------------------------------------------------------------------------
 
-/// Extract positioned text and rectangles from loaded document
-fn extract_positioned_text_from_doc(
+/// Extract positioned text and rectangles from a pre-loaded document.
+pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,

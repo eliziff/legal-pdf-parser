@@ -1,9 +1,6 @@
 //! CLI tool for PDF to Markdown conversion
 
-use pdf_inspector::{
-    process_pdf_with_config_pages, DetectionConfig, LayoutComplexity, MarkdownOptions, PdfType,
-    ProcessMode,
-};
+use pdf_inspector::{process_pdf_with_options, LayoutComplexity, PdfOptions, PdfType, ProcessMode};
 use std::collections::HashSet;
 use std::env;
 use std::fmt::Write;
@@ -145,18 +142,13 @@ fn main() {
         ProcessMode::Full
     };
 
-    let md_options = MarkdownOptions {
-        include_page_numbers: page_numbers,
-        process_mode,
-        ..Default::default()
-    };
+    let mut options = PdfOptions::new().mode(process_mode);
+    options.markdown.include_page_numbers = page_numbers;
+    if let Some(pages) = page_filter {
+        options.page_filter = Some(pages);
+    }
 
-    match process_pdf_with_config_pages(
-        pdf_path,
-        DetectionConfig::default(),
-        md_options,
-        page_filter.as_ref(),
-    ) {
+    match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {
             if detect_only || analyze {
                 // Non-full modes: output detection/analysis info
@@ -240,7 +232,7 @@ fn main() {
                         PdfType::Mixed => "mixed",
                     },
                     result.page_count,
-                    result.text.is_some(),
+                    result.markdown.is_some(),
                     result.processing_time_ms,
                     result.markdown.as_ref().map(|m| m.len()).unwrap_or(0),
                     ocr_pages.join(","),

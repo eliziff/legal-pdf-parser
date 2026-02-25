@@ -947,7 +947,6 @@ fn test_pages_needing_ocr_field_accessible() {
 
     let process_result = pdf_inspector::PdfProcessResult {
         pdf_type: PdfType::TextBased,
-        text: None,
         markdown: None,
         page_count: 1,
         processing_time_ms: 0,
