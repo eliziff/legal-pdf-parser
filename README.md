@@ -12,6 +12,8 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Table detection** — Dual-mode: rectangle-based detection from PDF drawing ops, plus heuristic detection from text alignment. Handles financial tables, footnotes, and continuation tables across pages.
 - **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
 - **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
+- **Encoding issue detection** — Automatically flags broken font encodings (garbled text, replacement characters) so callers can fall back to OCR.
+- **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
 
 ## Quick start
@@ -41,49 +43,49 @@ if let Some(markdown) = &result.markdown {
 }
 ```
 
-Or detect without extracting:
+Fast metadata-only detection (no text extraction or markdown generation):
 
 ```rust
-use pdf_inspector::detect_pdf_type;
+use pdf_inspector::detect_pdf;
 
-let detection = detect_pdf_type("document.pdf")?;
+let info = detect_pdf("document.pdf")?;
 
-match detection.pdf_type {
+match info.pdf_type {
     pdf_inspector::PdfType::TextBased => {
         // Extract locally — fast and free
     }
     _ => {
         // Route to OCR service
-        // detection.pages_needing_ocr tells you exactly which pages
+        // info.pages_needing_ocr tells you exactly which pages
     }
 }
 ```
 
-Customize the detection scan strategy:
+Customize processing with `PdfOptions`:
 
 ```rust
-use pdf_inspector::{process_pdf_with_config, DetectionConfig, ScanStrategy};
+use pdf_inspector::{process_pdf_with_options, PdfOptions, ProcessMode, DetectionConfig, ScanStrategy};
 
-// Scan all pages for accurate Mixed vs Scanned classification
-let config = DetectionConfig {
-    strategy: ScanStrategy::Full,
-    ..Default::default()
-};
-let result = process_pdf_with_config("document.pdf", config)?;
+// Analyze layout without generating markdown
+let result = process_pdf_with_options(
+    "document.pdf",
+    PdfOptions::new().mode(ProcessMode::Analyze),
+)?;
 
-// Sample 5 evenly distributed pages (fast for large PDFs)
-let config = DetectionConfig {
-    strategy: ScanStrategy::Sample(5),
-    ..Default::default()
-};
-let result = process_pdf_with_config("large.pdf", config)?;
+// Full extraction with custom detection strategy
+let result = process_pdf_with_options(
+    "large.pdf",
+    PdfOptions::new().detection(DetectionConfig {
+        strategy: ScanStrategy::Sample(5),
+        ..Default::default()
+    }),
+)?;
 
-// Only check specific pages
-let config = DetectionConfig {
-    strategy: ScanStrategy::Pages(vec![1, 5, 10]),
-    ..Default::default()
-};
-let result = process_pdf_with_config("known-layout.pdf", config)?;
+// Process only specific pages
+let result = process_pdf_with_options(
+    "document.pdf",
+    PdfOptions::new().pages([1, 3, 5]),
+)?;
 ```
 
 Process from a byte buffer (no filesystem needed):
@@ -104,9 +106,22 @@ cargo run --bin pdf2md -- document.pdf
 # JSON output (for piping)
 cargo run --bin pdf2md -- document.pdf --json
 
+# Raw markdown only (no headers)
+cargo run --bin pdf2md -- document.pdf --raw
+
+# Insert page break markers (<!-- Page N -->)
+cargo run --bin pdf2md -- document.pdf --pages
+
+# Process only specific pages
+cargo run --bin pdf2md -- document.pdf --select-pages 1,3,5-10
+
 # Detection only (no extraction)
 cargo run --bin detect-pdf -- document.pdf
 cargo run --bin detect-pdf -- document.pdf --json
+
+# Detection + layout analysis (tables, columns)
+cargo run --bin detect-pdf -- document.pdf --analyze
+cargo run --bin detect-pdf -- document.pdf --analyze --json
 ```
 
 ## Architecture
@@ -137,13 +152,16 @@ PDF bytes
                     └─ postprocess  → cleanup → final Markdown
 ```
 
+The document is loaded **once** via `load_document_from_path` / `load_document_from_mem` and shared between the detection and extraction stages, so there's no redundant parsing.
+
 ### Project structure
 
 ```
 src/
-  lib.rs                — Public API, re-exports
+  lib.rs                — Public API, PdfOptions builder, convenience functions
   types.rs              — Shared types: TextItem, TextLine, PdfRect, ItemType
   text_utils.rs         — Character/text helpers (CJK, RTL, ligatures, bold/italic)
+  process_mode.rs       — ProcessMode enum (DetectOnly, Analyze, Full)
   detector.rs           — Fast PDF type detection without full document load
   glyph_names.rs        — Adobe Glyph List → Unicode mapping
   tounicode.rs          — ToUnicode CMap parsing for CID-encoded text
@@ -173,35 +191,46 @@ This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_
 
 ## API
 
+### Processing modes
+
+| Mode | What it does | Returns |
+|---|---|---|
+| `ProcessMode::Full` (default) | Detect + extract + convert to Markdown | Everything populated |
+| `ProcessMode::Analyze` | Detect + extract + layout analysis (no Markdown) | `markdown` is `None`, `layout` is populated |
+| `ProcessMode::DetectOnly` | Classification only (fastest) | `markdown` is `None`, `layout` is default |
+
 ### Functions
 
 | Function | Description |
 |---|---|
-| `process_pdf(path)` | Detect, extract, and convert to Markdown |
-| `process_pdf_with_config(path, config)` | Same, with custom `DetectionConfig` |
-| `process_pdf_mem(bytes)` | Same, from a byte buffer |
-| `process_pdf_mem_with_config(bytes, config)` | Same, from bytes with custom config |
-| `detect_pdf_type(path)` | Classification only (fastest) |
-| `detect_pdf_type_with_config(path, config)` | Classification with custom config |
-| `detect_pdf_type_mem(bytes)` | Classification from bytes |
-| `detect_pdf_type_mem_with_config(bytes, config)` | Classification from bytes with custom config |
+| `process_pdf(path)` | Full processing with defaults |
+| `detect_pdf(path)` | Fast metadata-only detection (no extraction) |
+| `process_pdf_with_options(path, options)` | Process with custom `PdfOptions` |
+| `process_pdf_mem(bytes)` | Full processing from a byte buffer |
+| `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
+| `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
 
+Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
+
 ### Types
 
 | Type | Description |
 |---|---|
+| `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
+| `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full result: markdown, metadata, confidence, timing |
-| `PdfTypeResult` | Detection result: type, confidence, page count, pages needing OCR |
+| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
+| `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
+| `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, and page number |
-| `MarkdownOptions` | Configuration for Markdown conversion |
+| `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
 
 ## Markdown output
