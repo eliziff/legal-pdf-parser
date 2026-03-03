@@ -214,8 +214,9 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     // A line is in the page margin if it's among the first or last N distinct
     // Y positions on that page. This is more robust than a percentage-based zone
     // because it catches actual edge lines regardless of how much content fills
-    // the page. N=3 accommodates multi-line headers/footers (e.g., nav bar + title).
-    const EDGE_LINE_COUNT: usize = 3;
+    // the page. N=4 accommodates multi-line headers/footers and repeated form
+    // column headers that sit just inside the page margin.
+    const EDGE_LINE_COUNT: usize = 4;
 
     /// Returns true if the line is among the first or last N distinct Y positions
     /// on its page.
