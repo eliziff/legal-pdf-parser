@@ -69,6 +69,16 @@ pub struct LayoutComplexity {
     pub pages_with_columns: Vec<u32>,
 }
 
+/// A line segment from PDF path operators (`m`/`l`/`S`).
+#[derive(Debug, Clone)]
+pub struct PdfLine {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub page: u32,
+}
+
 /// A rectangle from a PDF `re` operator (cell boundary, border, etc.)
 #[derive(Debug, Clone)]
 pub struct PdfRect {

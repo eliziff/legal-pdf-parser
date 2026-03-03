@@ -42,7 +42,7 @@ pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfRect, TextItem};
+pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::HashSet;
@@ -351,16 +351,17 @@ fn process_document(
     };
 
     let (markdown, layout, has_encoding_issues) = match extracted {
-        Some((items, rects)) => {
-            let layout = compute_layout_complexity(&items, &rects);
+        Some((items, rects, lines)) => {
+            let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
             } else {
-                Some(to_markdown_from_items_with_rects(
+                Some(markdown::to_markdown_from_items_with_rects_and_lines(
                     items,
                     options.markdown,
                     &rects,
+                    &lines,
                 ))
             };
 
@@ -427,17 +428,23 @@ fn detect_encoding_issues(markdown: &str) -> bool {
 fn compute_layout_complexity(
     items: &[types::TextItem],
     rects: &[types::PdfRect],
+    lines: &[types::PdfLine],
 ) -> LayoutComplexity {
     // --- Collect unique pages ---
     let mut seen_pages: Vec<u32> = items.iter().map(|i| i.page).collect();
     seen_pages.sort();
     seen_pages.dedup();
 
-    // --- Tables: use the real rect-based table detector per page ---
+    // --- Tables: use rect-based then line-based detectors per page ---
     let mut pages_with_tables: Vec<u32> = Vec::new();
     for &page in &seen_pages {
         let (tables, _) = tables::detect_tables_from_rects(items, rects, page);
         if !tables.is_empty() {
+            pages_with_tables.push(page);
+            continue;
+        }
+        let line_tables = tables::detect_tables_from_lines(items, lines, page);
+        if !line_tables.is_empty() {
             pages_with_tables.push(page);
         }
     }

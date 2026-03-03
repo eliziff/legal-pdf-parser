@@ -3,12 +3,14 @@
 //! Detects tabular data in PDF text items and converts to markdown tables.
 
 mod detect_heuristic;
+mod detect_lines;
 mod detect_rects;
 mod financial;
 mod format;
 mod grid;
 
 pub use detect_heuristic::detect_tables;
+pub use detect_lines::detect_tables_from_lines;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 pub use format::table_to_markdown;
 

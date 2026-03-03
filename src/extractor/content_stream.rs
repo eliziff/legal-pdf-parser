@@ -7,7 +7,7 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PdfRect, TextItem};
+use crate::types::{ItemType, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -25,11 +25,17 @@ pub(crate) fn extract_page_text_items(
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
+    let mut lines: Vec<PdfLine> = Vec::new();
+
+    // Path construction state for m/l/h → S/s line extraction
+    let mut path_subpath_start: Option<(f32, f32)> = None;
+    let mut path_current: Option<(f32, f32)> = None;
+    let mut pending_lines: Vec<(f32, f32, f32, f32)> = Vec::new();
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
@@ -632,10 +638,105 @@ pub(crate) fn extract_page_text_items(
                     });
                 }
             }
+            // ── Path construction operators ──────────────────────
+            "m" => {
+                // moveto: start a new subpath
+                if op.operands.len() >= 2 {
+                    let px = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                    path_subpath_start = Some((px, py));
+                    path_current = Some((px, py));
+                }
+            }
+            "l" => {
+                // lineto: add segment from current point
+                if op.operands.len() >= 2 {
+                    if let Some((cx, cy)) = path_current {
+                        let px = get_number(&op.operands[0]).unwrap_or(0.0);
+                        let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                        pending_lines.push((cx, cy, px, py));
+                        path_current = Some((px, py));
+                    }
+                }
+            }
+            "h" => {
+                // closepath: segment back to subpath start
+                if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                    if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                        pending_lines.push((cx, cy, sx, sy));
+                    }
+                    path_current = path_subpath_start;
+                }
+            }
+            // ── Path painting operators ──────────────────────────
+            "S" | "s" => {
+                // stroke / close-and-stroke: emit pending lines
+                if op.operator == "s" {
+                    // close first
+                    if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                        if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                            pending_lines.push((cx, cy, sx, sy));
+                        }
+                    }
+                }
+                for (x1, y1, x2, y2) in pending_lines.drain(..) {
+                    let x1d = x1 * ctm[0] + y1 * ctm[2] + ctm[4];
+                    let y1d = x1 * ctm[1] + y1 * ctm[3] + ctm[5];
+                    let x2d = x2 * ctm[0] + y2 * ctm[2] + ctm[4];
+                    let y2d = x2 * ctm[1] + y2 * ctm[3] + ctm[5];
+                    lines.push(PdfLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        page: page_num,
+                    });
+                }
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "B" | "B*" | "b" | "b*" => {
+                // fill+stroke: emit lines AND clear state
+                if op.operator == "b" || op.operator == "b*" {
+                    // close first
+                    if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
+                        if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
+                            pending_lines.push((cx, cy, sx, sy));
+                        }
+                    }
+                }
+                for (x1, y1, x2, y2) in pending_lines.drain(..) {
+                    let x1d = x1 * ctm[0] + y1 * ctm[2] + ctm[4];
+                    let y1d = x1 * ctm[1] + y1 * ctm[3] + ctm[5];
+                    let x2d = x2 * ctm[0] + y2 * ctm[2] + ctm[4];
+                    let y2d = x2 * ctm[1] + y2 * ctm[3] + ctm[5];
+                    lines.push(PdfLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        page: page_num,
+                    });
+                }
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "f" | "F" | "f*" => {
+                // fill-only: discard path without emitting lines
+                pending_lines.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
+            "n" => {
+                // end path (no-op): discard
+                pending_lines.clear();
+                path_subpath_start = None;
+                path_current = None;
+            }
             _ => {}
         }
     }
 
     let items = super::merge_text_items(items);
-    Ok((items, rects))
+    Ok((items, rects, lines))
 }

@@ -10,7 +10,7 @@ mod xobjects;
 
 use crate::text_utils::is_rtl_text;
 use crate::tounicode::FontCMaps;
-use crate::types::{PdfRect, TextItem};
+use crate::types::{PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -78,7 +78,7 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects) = extract_text_with_positions_and_rects(path, page_filter)?;
+    let (items, _rects, _lines) = extract_text_with_positions_and_rects(path, page_filter)?;
     Ok(items)
 }
 
@@ -86,7 +86,7 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
 pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
     crate::validate_pdf_file(&path)?;
     let doc = match Document::load(&path) {
         Ok(d) => d,
@@ -109,7 +109,7 @@ pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects) = extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
+    let (items, _rects, _lines) = extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
     Ok(items)
 }
 
@@ -117,7 +117,7 @@ pub fn extract_text_with_positions_mem_pages(
 pub(crate) fn extract_text_with_positions_mem_and_rects(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
@@ -134,15 +134,16 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
 // Orchestration
 // ---------------------------------------------------------------------------
 
-/// Extract positioned text and rectangles from a pre-loaded document.
+/// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
+    let mut all_lines = Vec::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -154,12 +155,13 @@ pub(crate) fn extract_positioned_text_from_doc(
                 continue;
             }
         }
-        let (items, rects) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        let (items, rects, lines) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
         debug!(
-            "page {}: {} text items, {} rects",
+            "page {}: {} text items, {} rects, {} lines",
             page_num,
             items.len(),
-            rects.len()
+            rects.len(),
+            lines.len()
         );
         if log::log_enabled!(log::Level::Trace) {
             for item in &items {
@@ -181,6 +183,7 @@ pub(crate) fn extract_positioned_text_from_doc(
         }
         all_items.extend(items);
         all_rects.extend(rects);
+        all_lines.extend(lines);
 
         // Extract hyperlinks from page annotations
         let links = extract_page_links(doc, page_id, *page_num);
@@ -191,7 +194,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     let form_items = extract_form_fields(doc, &page_id_to_num);
     all_items.extend(form_items);
 
-    Ok((all_items, all_rects))
+    Ok((all_items, all_rects, all_lines))
 }
 
 // ---------------------------------------------------------------------------

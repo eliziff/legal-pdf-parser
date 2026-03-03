@@ -141,7 +141,22 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
-    use crate::tables::{detect_tables, detect_tables_from_rects, table_to_markdown};
+    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[])
+}
+
+/// Convert positioned text items to markdown, using rectangles and line segments for table detection.
+///
+/// Line-based detection runs first (strongest structural evidence), then rect-based,
+/// then heuristic fallback on unclaimed items.
+pub(crate) fn to_markdown_from_items_with_rects_and_lines(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+) -> String {
+    use crate::tables::{
+        detect_tables, detect_tables_from_lines, detect_tables_from_rects, table_to_markdown,
+    };
     use crate::types::ItemType;
 
     if items.is_empty() {
@@ -215,10 +230,10 @@ pub fn to_markdown_from_items_with_rects(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
-        // Track which local indices are claimed by rect-based tables
+        // Track which local indices are claimed by structural table detection
         let mut rect_claimed: HashSet<usize> = HashSet::new();
 
-        // Try rectangle-based table detection first
+        // 1. Rect-based detection first (well-tested, high precision)
         let (rect_tables, hint_regions) = detect_tables_from_rects(&page_items, rects, page);
         for table in &rect_tables {
             for &idx in &table.item_indices {
@@ -235,7 +250,26 @@ pub fn to_markdown_from_items_with_rects(
                 .push((table_y, table_md));
         }
 
-        // Helper: run heuristic on a subset of items, remapping indices back to page-space
+        // 2. Line-based detection on unclaimed items (when rects didn't find tables)
+        if rect_claimed.is_empty() {
+            let line_tables = detect_tables_from_lines(&page_items, pdf_lines, page);
+            for table in &line_tables {
+                for &idx in &table.item_indices {
+                    rect_claimed.insert(idx);
+                    if let Some(&(global_idx, _)) = group.get(idx) {
+                        table_items.insert(global_idx);
+                    }
+                }
+                let table_y = table.rows.first().copied().unwrap_or(0.0);
+                let table_md = table_to_markdown(table);
+                page_tables
+                    .entry(page)
+                    .or_default()
+                    .push((table_y, table_md));
+            }
+        }
+
+        // 3. Heuristic fallback on unclaimed items
         let mut run_heuristic =
             |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
                 if subset_items.len() < min_items {
