@@ -1,4 +1,6 @@
-//! Line preprocessing: heading merging and drop cap handling.
+//! Line preprocessing: heading merging, drop cap handling, and repeated line removal.
+
+use std::collections::{HashMap, HashSet};
 
 use crate::types::TextLine;
 
@@ -139,4 +141,178 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
     }
 
     result
+}
+
+/// Normalize whitespace in a string for comparison: trim and collapse internal runs of whitespace.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns true if the line looks like a list item or heading (should not be stripped).
+fn is_structural_line(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with('#')
+        || t.starts_with("- ")
+        || t.starts_with("* ")
+        || t.starts_with("• ")
+        || t.chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+            && (t.contains(". ") || t.contains(") "))
+}
+
+/// Returns true if a line consists entirely of a single repeated character
+/// (e.g., "----------", "**************", "============").
+fn is_decorative_separator(text: &str) -> bool {
+    let mut chars = text.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    chars.all(|c| c == first)
+}
+
+/// Strip lines that repeat on many distinct pages (running headers/footers).
+///
+/// A line is considered a repeated header/footer if:
+/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
+/// 2. It is at least 10 characters long
+/// 3. It doesn't look like a structural element (heading, list item)
+/// 4. It consistently appears in the top or bottom 15% of the page's Y range
+/// 5. Its Y positions across pages have low variance (consistent placement),
+///    distinguishing true headers/footers from table content that happens to
+///    land near page margins
+/// 6. It is not a decorative separator (repeated single character)
+pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
+    if lines.is_empty() || page_count < 3 {
+        return lines;
+    }
+
+    // Compute Y range per page (min_y, max_y)
+    let mut page_y_range: HashMap<u32, (f32, f32)> = HashMap::new();
+    for line in &lines {
+        let entry = page_y_range.entry(line.page).or_insert((line.y, line.y));
+        if line.y < entry.0 {
+            entry.0 = line.y;
+        }
+        if line.y > entry.1 {
+            entry.1 = line.y;
+        }
+    }
+
+    // Build sorted Y values per page, so we can check line rank (position from edge)
+    let mut page_sorted_ys: HashMap<u32, Vec<f32>> = HashMap::new();
+    for line in &lines {
+        page_sorted_ys.entry(line.page).or_default().push(line.y);
+    }
+    for ys in page_sorted_ys.values_mut() {
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ys.dedup();
+    }
+
+    // A line is in the page margin if it's among the first or last N distinct
+    // Y positions on that page. This is more robust than a percentage-based zone
+    // because it catches actual edge lines regardless of how much content fills
+    // the page. N=3 accommodates multi-line headers/footers (e.g., nav bar + title).
+    const EDGE_LINE_COUNT: usize = 3;
+
+    /// Returns true if the line is among the first or last N distinct Y positions
+    /// on its page.
+    fn is_edge_line(line: &TextLine, page_sorted_ys: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
+        let ys = match page_sorted_ys.get(&line.page) {
+            Some(ys) => ys,
+            None => return false,
+        };
+        if ys.len() <= n * 2 {
+            // Page has very few lines — everything is near the edge
+            return true;
+        }
+        // Check if this Y is among the first or last N
+        let pos = match ys.iter().position(|&y| (y - line.y).abs() < 0.1) {
+            Some(p) => p,
+            None => return false,
+        };
+        pos < n || pos >= ys.len() - n
+    }
+
+    // Average page span for normalizing Y variance
+    let avg_span = {
+        let total: f32 = page_y_range.values().map(|(lo, hi)| hi - lo).sum();
+        if page_y_range.is_empty() {
+            1.0
+        } else {
+            (total / page_y_range.len() as f32).max(1.0)
+        }
+    };
+
+    // Build frequency map: only count lines at the page edges
+    // Also collect Y positions for variance check
+    let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
+    for line in &lines {
+        let text = line.text();
+        let normalized = normalize_whitespace(&text);
+        if normalized.len() < 10 {
+            continue;
+        }
+        if is_decorative_separator(&normalized) {
+            continue;
+        }
+        if !is_edge_line(line, &page_sorted_ys, EDGE_LINE_COUNT) {
+            continue;
+        }
+        freq.entry(normalized.clone())
+            .or_default()
+            .insert(line.page);
+        y_positions.entry(normalized).or_default().push(line.y);
+    }
+
+    // Compute threshold
+    let threshold = 3u32.max(page_count * 30 / 100);
+
+    // Check Y-position consistency: headers/footers appear at the same position
+    // on every page, table content varies. Require normalized stddev < 5% of
+    // average page span.
+    let has_consistent_y = |text: &str| -> bool {
+        let positions = match y_positions.get(text) {
+            Some(p) if p.len() >= 2 => p,
+            _ => return true, // single occurrence — allow
+        };
+        let n = positions.len() as f32;
+        let mean = positions.iter().sum::<f32>() / n;
+        let variance = positions.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / n;
+        let stddev = variance.sqrt();
+        stddev / avg_span < 0.05
+    };
+
+    // Collect candidate texts to remove
+    let candidates: HashSet<String> = freq
+        .into_iter()
+        .filter(|(text, pages)| {
+            pages.len() as u32 >= threshold && !is_structural_line(text) && has_consistent_y(text)
+        })
+        .map(|(text, _)| text)
+        .collect();
+
+    if candidates.is_empty() {
+        return lines;
+    }
+
+    // Only strip candidate instances that are in edge positions on their page.
+    // This preserves body content that happens to match a running header/footer
+    // (e.g., "New Britannia Mill" appearing both as a page header and in the
+    // document's subject line).
+    lines
+        .into_iter()
+        .filter(|line| {
+            let text = line.text();
+            let normalized = normalize_whitespace(&text);
+            if !candidates.contains(&normalized) {
+                return true; // not a candidate — keep
+            }
+            // Candidate: only strip if this instance is in an edge position
+            !is_edge_line(line, &page_sorted_ys, EDGE_LINE_COUNT)
+        })
+        .collect()
 }

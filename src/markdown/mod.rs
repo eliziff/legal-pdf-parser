@@ -50,6 +50,8 @@ pub struct MarkdownOptions {
     pub include_links: bool,
     /// Insert page break markers (<!-- Page N -->) between pages
     pub include_page_numbers: bool,
+    /// Strip repeated headers/footers that appear on many pages
+    pub strip_headers_footers: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -67,6 +69,7 @@ impl Default for MarkdownOptions {
             include_images: true,
             include_links: true,
             include_page_numbers: false,
+            strip_headers_footers: true,
         }
     }
 }
@@ -206,6 +209,7 @@ pub fn to_markdown_from_items_with_rects(
 
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
+    let page_count = pages.last().copied().unwrap_or(0) + 1;
 
     for page in pages {
         let group = page_groups.get(&page).unwrap();
@@ -322,6 +326,13 @@ pub fn to_markdown_from_items_with_rects(
     merge_continuation_tables(&mut page_tables, &table_only_pages);
 
     let lines = group_into_lines(non_table_items);
+
+    // Strip repeated headers/footers before conversion
+    let lines = if options.strip_headers_footers {
+        preprocess::strip_repeated_lines(lines, page_count)
+    } else {
+        lines
+    };
 
     // Convert to markdown, inserting tables and images at appropriate positions
     to_markdown_from_lines_with_tables_and_images(lines, options, page_tables, page_images)
