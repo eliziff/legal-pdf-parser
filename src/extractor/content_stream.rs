@@ -180,6 +180,29 @@ pub(crate) fn extract_page_text_items(
                     fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
                 }
             }
+            "sc" | "scn" => {
+                // Set fill color in current color space.
+                // Infer color model from operand count (ignoring trailing
+                // pattern-name operands that are not numbers).
+                // Note: 1-operand form is ambiguous (could be Separation,
+                // ICCBased, etc.) so we only detect white for 3/4 operands
+                // where the color model is almost certainly RGB/CMYK.
+                let nums: Vec<f32> = op.operands.iter().filter_map(get_number).collect();
+                match nums.len() {
+                    3 => {
+                        fill_is_white = nums[0] > 0.95 && nums[1] > 0.95 && nums[2] > 0.95;
+                    }
+                    4 => {
+                        fill_is_white =
+                            nums[0] < 0.05 && nums[1] < 0.05 && nums[2] < 0.05 && nums[3] < 0.05;
+                    }
+                    _ => {
+                        // 1-operand or unknown — could be any color space,
+                        // assume non-white to avoid hiding visible text.
+                        fill_is_white = false;
+                    }
+                }
+            }
             "BT" => {
                 // Begin text block
                 in_text_block = true;

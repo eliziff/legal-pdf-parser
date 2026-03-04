@@ -218,6 +218,19 @@ pub(crate) fn extract_form_xobject_text(
                     fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
                 }
             }
+            "sc" | "scn" => {
+                let nums: Vec<f32> = op.operands.iter().filter_map(get_number).collect();
+                match nums.len() {
+                    3 => {
+                        fill_is_white = nums[0] > 0.95 && nums[1] > 0.95 && nums[2] > 0.95;
+                    }
+                    4 => {
+                        fill_is_white =
+                            nums[0] < 0.05 && nums[1] < 0.05 && nums[2] < 0.05 && nums[3] < 0.05;
+                    }
+                    _ => fill_is_white = false,
+                }
+            }
             "Tj" => {
                 if in_text_block && !op.operands.is_empty() {
                     if fill_is_white {
