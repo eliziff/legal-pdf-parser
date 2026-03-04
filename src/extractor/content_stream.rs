@@ -7,7 +7,7 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PdfLine, PdfRect, TextItem};
+use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -25,7 +25,7 @@ pub(crate) fn extract_page_text_items(
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
+) -> Result<PageExtraction, PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();

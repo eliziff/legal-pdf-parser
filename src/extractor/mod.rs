@@ -10,7 +10,7 @@ mod xobjects;
 
 use crate::text_utils::is_rtl_text;
 use crate::tounicode::FontCMaps;
-use crate::types::{PdfLine, PdfRect, TextItem};
+use crate::types::{PageExtraction, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -86,7 +86,7 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
 pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
+) -> Result<PageExtraction, PdfError> {
     crate::validate_pdf_file(&path)?;
     let doc = match Document::load(&path) {
         Ok(d) => d,
@@ -117,7 +117,7 @@ pub fn extract_text_with_positions_mem_pages(
 pub(crate) fn extract_text_with_positions_mem_and_rects(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
+) -> Result<PageExtraction, PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
@@ -139,7 +139,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
+) -> Result<PageExtraction, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
