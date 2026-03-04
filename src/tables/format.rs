@@ -88,6 +88,8 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // Check if this is a continuation row (first column is empty but others have content).
         // A row with only 1 short non-empty cell (besides the first) is more likely a
         // section sub-header (e.g. "JAN", "FEB") than overflow text — don't merge it.
+        // A row with content in many columns is a real data row with a merged/spanning
+        // first-column cell (e.g. n₂ in a statistical table), not text overflow.
         let non_first_cells: Vec<&str> = row
             .iter()
             .skip(1)
@@ -95,9 +97,31 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .filter(|c| !c.is_empty())
             .collect();
         let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
+        // Rows with multiple short-valued cells (e.g. numeric data in a lookup
+        // table) are data rows with a merged/spanning first column, not text
+        // overflow from the previous row.  Continuation rows typically have
+        // longer descriptive text; data rows have short numeric values.
+        let avg_cell_len = if non_first_cells.is_empty() {
+            0.0
+        } else {
+            non_first_cells.iter().map(|c| c.len()).sum::<usize>() as f32
+                / non_first_cells.len() as f32
+        };
+        let numeric_cells = non_first_cells
+            .iter()
+            .filter(|c| {
+                c.chars().all(|ch| {
+                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                })
+            })
+            .count();
+        let looks_like_data_row = non_first_cells.len() >= 2
+            && avg_cell_len <= 10.0
+            && numeric_cells > non_first_cells.len() / 2;
         let is_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
+            && !looks_like_data_row
             && cleaned.len() > 1; // Don't merge into the first row (header)
 
         if is_continuation {

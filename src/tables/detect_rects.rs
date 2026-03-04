@@ -149,6 +149,62 @@ pub fn detect_tables_from_rects(
         page_rects.push((x, y, w, h));
     }
 
+    // Remove rects that are much wider than typical cell rects — these are
+    // page-spanning clipping paths or row-spanning background fills that
+    // would add spurious X-edges and corrupt the grid.  We use the median
+    // WIDTH (not area) because row-stripe tables have ALL rects at the same
+    // full width, so their median width equals the full table width and none
+    // get filtered.  Cell-grid tables have narrow cell rects, so full-width
+    // background fills stand out clearly.
+    if page_rects.len() >= 6 {
+        let mut widths: Vec<f32> = page_rects.iter().map(|&(_, _, w, _)| w).collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_width = widths[widths.len() / 2];
+        let width_threshold = median_width * 10.0;
+        let before = page_rects.len();
+        page_rects.retain(|&(_, _, w, _)| w <= width_threshold);
+        if page_rects.len() < before {
+            debug!(
+                "page {}: removed {} oversized rects (median_w={:.0}, threshold={:.0})",
+                page,
+                before - page_rects.len(),
+                median_width,
+                width_threshold,
+            );
+        }
+
+        // Deduplicate sub-rects: when a rect is fully contained within a
+        // slightly larger rect (same column, interior Y range), the smaller
+        // one is a cell-internal decoration (e.g. content-area shading
+        // inside the full cell background).  Keeping both creates spurious
+        // Y-edges that split visual rows into thin sub-rows.
+        //
+        // Only remove when the container is a similarly-sized cell (height
+        // ratio < 4×), NOT when the container is a table-wide background
+        // that dwarfs the sub-rect.
+        let before = page_rects.len();
+        let snapshot = page_rects.clone();
+        page_rects.retain(|&(ax, ay, aw, ah)| {
+            let tol = 2.0;
+            !snapshot.iter().any(|&(bx, by, bw, bh)| {
+                // b must strictly contain a (b is larger in area)
+                bw * bh > aw * ah * 1.2
+                    && bh < ah * 4.0 // container must be similarly sized, not a table background
+                    && bx <= ax + tol
+                    && (bx + bw) >= (ax + aw) - tol
+                    && by <= ay + tol
+                    && (by + bh) >= (ay + ah) - tol
+            })
+        });
+        if page_rects.len() < before {
+            debug!(
+                "page {}: removed {} contained sub-rects",
+                page,
+                before - page_rects.len(),
+            );
+        }
+    }
+
     debug!(
         "page {}: {} rects after size filter (from {} raw)",
         page,
@@ -266,6 +322,14 @@ pub(crate) fn detect_table_from_rect_group(
     let x_edges = snap_edges(&x_edges, 6.0);
     let y_edges = snap_edges(&y_edges, 6.0);
 
+    debug!(
+        "  edges: {} x, {} y — grid {}x{}",
+        x_edges.len(),
+        y_edges.len(),
+        y_edges.len().saturating_sub(1),
+        x_edges.len().saturating_sub(1),
+    );
+
     if x_edges.len() < 3 || y_edges.len() < 4 {
         debug!(
             "  rejected: {} x-edges, {} y-edges (need >=3, >=4)",
@@ -288,9 +352,11 @@ pub(crate) fn detect_table_from_rect_group(
         return None;
     }
 
-    // Reject grids that are too large — real tables rarely exceed 12 columns.
-    // Form-style PDFs with scattered field boxes produce huge sparse grids.
-    if num_cols > 12 {
+    // Reject grids that are too large — form-style PDFs with scattered field
+    // boxes produce huge sparse grids.  Statistical lookup tables (e.g. MWU,
+    // chi-square) can legitimately have 20+ columns, so allow up to 25.
+    if num_cols > 25 {
+        debug!("  rejected: {} columns > 25", num_cols);
         return None;
     }
 
@@ -336,7 +402,12 @@ pub(crate) fn detect_table_from_rect_group(
 
     // Consolidate vertically-merged cells: rects spanning multiple grid rows
     // should have their text collected into the first sub-row.
-    propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects);
+    // Skip for wide tables (>10 columns) where spanning rects are typically
+    // background fills rather than true merged cells (e.g. statistical lookup
+    // tables with row-grouping shading).
+    if num_cols <= 10 {
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects);
+    }
 
     // Compute column centers and row centers for the Table struct
     let columns: Vec<f32> = (0..num_cols)
@@ -708,9 +779,9 @@ fn detect_row_stripe_table(
         .filter(|c| !c.trim().is_empty())
         .count();
     let content_ratio = non_empty_cells as f32 / total_cells;
-    if content_ratio < 0.25 {
+    if content_ratio < 0.40 {
         debug!(
-            "  row-stripe rejected: content ratio {:.2} < 0.25",
+            "  row-stripe rejected: content ratio {:.2} < 0.40",
             content_ratio
         );
         return None;
