@@ -10,7 +10,7 @@ repository = "https://github.com/firecrawl/pdf-inspector"
 
 [dependencies]
 # PDF parsing
-lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "df670a5", features = ["rayon"] }
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "dc2887a", features = ["rayon"] }
 
 # Error handling
 thiserror = "2.0"
