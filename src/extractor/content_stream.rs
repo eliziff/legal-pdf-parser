@@ -109,9 +109,8 @@ pub(crate) fn extract_page_text_items(
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
-    let mut fill_is_white = false; // Fill color is white (invisible text)
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
-    let mut gstate_stack: Vec<([f32; 6], bool, i32)> = Vec::new();
+    let mut gstate_stack: Vec<([f32; 6], i32)> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
@@ -131,13 +130,12 @@ pub(crate) fn extract_page_text_items(
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                gstate_stack.push((ctm, fill_is_white, text_rendering_mode));
+                gstate_stack.push((ctm, text_rendering_mode));
             }
             "Q" => {
                 // Restore graphics state
-                if let Some((saved_ctm, saved_fill, saved_tr)) = gstate_stack.pop() {
+                if let Some((saved_ctm, saved_tr)) = gstate_stack.pop() {
                     ctm = saved_ctm;
-                    fill_is_white = saved_fill;
                     text_rendering_mode = saved_tr;
                 }
             }
@@ -153,54 +151,6 @@ pub(crate) fn extract_page_text_items(
                         get_number(&op.operands[5]).unwrap_or(0.0),
                     ];
                     ctm = multiply_matrices(&new_matrix, &ctm);
-                }
-            }
-            "g" => {
-                // Set grayscale fill color (1.0 = white)
-                if let Some(gray) = op.operands.first().and_then(get_number) {
-                    fill_is_white = gray > 0.95;
-                }
-            }
-            "rg" => {
-                // Set RGB fill color
-                if op.operands.len() >= 3 {
-                    let r = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let g = get_number(&op.operands[1]).unwrap_or(0.0);
-                    let b = get_number(&op.operands[2]).unwrap_or(0.0);
-                    fill_is_white = r > 0.95 && g > 0.95 && b > 0.95;
-                }
-            }
-            "k" => {
-                // Set CMYK fill color (0,0,0,0 = white)
-                if op.operands.len() >= 4 {
-                    let c = get_number(&op.operands[0]).unwrap_or(1.0);
-                    let m = get_number(&op.operands[1]).unwrap_or(1.0);
-                    let y = get_number(&op.operands[2]).unwrap_or(1.0);
-                    let k = get_number(&op.operands[3]).unwrap_or(1.0);
-                    fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
-                }
-            }
-            "sc" | "scn" => {
-                // Set fill color in current color space.
-                // Infer color model from operand count (ignoring trailing
-                // pattern-name operands that are not numbers).
-                // Note: 1-operand form is ambiguous (could be Separation,
-                // ICCBased, etc.) so we only detect white for 3/4 operands
-                // where the color model is almost certainly RGB/CMYK.
-                let nums: Vec<f32> = op.operands.iter().filter_map(get_number).collect();
-                match nums.len() {
-                    3 => {
-                        fill_is_white = nums[0] > 0.95 && nums[1] > 0.95 && nums[2] > 0.95;
-                    }
-                    4 => {
-                        fill_is_white =
-                            nums[0] < 0.05 && nums[1] < 0.05 && nums[2] < 0.05 && nums[3] < 0.05;
-                    }
-                    _ => {
-                        // 1-operand or unknown — could be any color space,
-                        // assume non-white to avoid hiding visible text.
-                        fill_is_white = false;
-                    }
                 }
             }
             "BT" => {
@@ -290,8 +240,8 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
-                    // Skip invisible (white/Tr=3) text but still advance text matrix
-                    if fill_is_white || text_rendering_mode == 3 {
+                    // Skip invisible (Tr=3) text but still advance text matrix
+                    if text_rendering_mode == 3 {
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -348,8 +298,7 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
-                        let is_invisible =
-                            fill_is_white || text_rendering_mode == 3 || suppress_glyph_extraction;
+                        let is_invisible = text_rendering_mode == 3 || suppress_glyph_extraction;
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -508,8 +457,7 @@ pub(crate) fn extract_page_text_items(
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
-                if !(fill_is_white
-                    || text_rendering_mode == 3
+                if !(text_rendering_mode == 3
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {

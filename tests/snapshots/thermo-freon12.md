@@ -1,3 +1,5 @@
+**Technical Information**
+
 ## l                                                              T-12  SI
 
 DuPont Fluorochemicals
@@ -10,7 +12,7 @@ DuPont Fluorochemicals
 
 # Freon 12
 
-**(R-12)**
+**(R-12)** **Technical Information** **Technical Information**
 
 **®** **Thermodynamic Properties of Freon 12 Refrigerant** **(R-12)** **SI Units**
 
