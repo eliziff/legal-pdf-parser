@@ -30,6 +30,7 @@ pub(crate) fn extract_page_text_items(
 
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
+    let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
 
     // Path construction state for m/l/h → S/s line extraction
@@ -698,6 +699,60 @@ pub(crate) fn extract_page_text_items(
                 path_subpath_start = None;
                 path_current = None;
             }
+            "W" | "W*" => {
+                // Clip operator: check if pending path forms an axis-aligned rectangle.
+                // Many PDFs define table cells as clipping paths instead of stroked rects.
+                let mut segs: Vec<(f32, f32, f32, f32)> = pending_lines.clone();
+                // If only 3 segments, synthesize closing segment back to subpath start
+                if segs.len() == 3 {
+                    if let Some((sx, sy)) = path_subpath_start {
+                        let (_, _, ex, ey) = segs[2];
+                        if (ex - sx).abs() > 0.01 || (ey - sy).abs() > 0.01 {
+                            segs.push((ex, ey, sx, sy));
+                        }
+                    }
+                }
+                if segs.len() == 4 {
+                    // Collect all endpoints and compute bounding box
+                    let mut xs = Vec::with_capacity(8);
+                    let mut ys = Vec::with_capacity(8);
+                    for &(x1, y1, x2, y2) in &segs {
+                        xs.push(x1);
+                        xs.push(x2);
+                        ys.push(y1);
+                        ys.push(y2);
+                    }
+                    let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let w = max_x - min_x;
+                    let h = max_y - min_y;
+                    // Verify all points lie on bounding box edges (axis-aligned rectangle)
+                    let eps: f32 = 0.5;
+                    let axis_aligned = xs
+                        .iter()
+                        .all(|&x| (x - min_x).abs() < eps || (x - max_x).abs() < eps)
+                        && ys
+                            .iter()
+                            .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
+                    if axis_aligned && w > 1.0 && h > 1.0 {
+                        // Transform to device space using CTM (same as `re` handler)
+                        let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
+                        let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
+                        let w_dev = w * ctm[0];
+                        let h_dev = h * ctm[3];
+                        clip_rects.push(PdfRect {
+                            x: x_dev,
+                            y: y_dev,
+                            width: w_dev,
+                            height: h_dev,
+                            page: page_num,
+                        });
+                    }
+                }
+                // Do NOT clear pending_lines — the following `n` does that
+            }
             "n" => {
                 // end path (no-op): discard
                 pending_lines.clear();
@@ -706,6 +761,12 @@ pub(crate) fn extract_page_text_items(
             }
             _ => {}
         }
+    }
+
+    // Only use clipping-path rects when no `re` rects exist on this page,
+    // to avoid diluting real table rects with decorative clip regions.
+    if rects.is_empty() && !clip_rects.is_empty() {
+        rects = clip_rects;
     }
 
     let items = super::merge_text_items(items);

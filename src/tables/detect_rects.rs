@@ -229,6 +229,38 @@ pub fn detect_tables_from_rects(
                 tables.push(table);
             }
         }
+
+        // Merged-cluster fallback: when per-cluster attempts produce no tables
+        // or only narrow false-positives (≤3 columns from individual column
+        // clusters), merge all cluster rects and try row-stripe strategy with
+        // text-based column detection.
+        let only_narrow = !tables.is_empty() && tables.iter().all(|t| t.columns.len() <= 3);
+        if tables.is_empty() || only_narrow {
+            let total_clustered: usize = clusters.iter().map(|c| c.len()).sum();
+            if clusters.len() >= 3 && total_clustered >= 50 {
+                debug!(
+                    "page {}: trying merged-cluster fallback ({} clusters, {} rects{})",
+                    page,
+                    clusters.len(),
+                    total_clustered,
+                    if only_narrow {
+                        ", replacing narrow tables"
+                    } else {
+                        ""
+                    }
+                );
+                let all_cluster_rects: Vec<(f32, f32, f32, f32)> = clusters
+                    .iter()
+                    .flat_map(|idxs| idxs.iter().map(|&i| page_rects[i]))
+                    .collect();
+                if let Some(table) = detect_merged_cluster_table(items, &all_cluster_rects, page) {
+                    if only_narrow {
+                        tables.clear();
+                    }
+                    tables.push(table);
+                }
+            }
+        }
     }
 
     // On rect-sparse pages (≤ 6 rects), a few cell-border rects may define the
@@ -807,6 +839,174 @@ fn detect_row_stripe_table(
 
     debug!(
         "  row-stripe table accepted: {}x{}, {:.0}% density",
+        num_rows,
+        num_cols,
+        content_ratio * 100.0
+    );
+
+    Some(Table {
+        columns: column_centers,
+        rows: row_centers,
+        cells,
+        item_indices,
+    })
+}
+
+/// Detect a table by merging all cluster rects into one group.
+///
+/// This handles clip-path PDFs where each column's cell rects form a separate
+/// cluster (no spatial overlap between columns). Uses rect Y-edges for rows
+/// and text X-position clustering for columns, similar to `detect_row_stripe_table`
+/// but without the width-uniformity check.
+fn detect_merged_cluster_table(
+    items: &[TextItem],
+    all_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    // Extract Y-edges from all rects
+    let mut y_vals: Vec<f32> = Vec::new();
+    for &(_, y, _, h) in all_rects {
+        y_vals.push(y);
+        y_vals.push(y + h);
+    }
+    let y_edges = snap_edges(&y_vals, 6.0);
+
+    if y_edges.len() < 4 {
+        debug!("  merged-cluster rejected: only {} y-edges", y_edges.len());
+        return None;
+    }
+
+    let mut row_edges = y_edges;
+    row_edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Bounding box of all rects
+    let y_top = row_edges[0];
+    let y_bottom = *row_edges.last().unwrap();
+    let x_left = all_rects
+        .iter()
+        .map(|&(x, _, _, _)| x)
+        .reduce(f32::min)
+        .unwrap();
+    let x_right = all_rects
+        .iter()
+        .map(|&(x, _, w, _)| x + w)
+        .reduce(f32::max)
+        .unwrap();
+
+    // Gather page items within the bounding box
+    let page_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page
+                && item.y >= y_bottom - 2.0
+                && item.y <= y_top + 2.0
+                && item.x >= x_left - 5.0
+                && item.x + item.width <= x_right + 5.0
+        })
+        .collect();
+
+    if page_items.is_empty() {
+        return None;
+    }
+
+    // Derive columns from text X-position clustering
+    let columns = cluster_x_positions(&page_items, 15.0);
+
+    if columns.len() < 2 {
+        debug!(
+            "  merged-cluster rejected: only {} columns from text clustering",
+            columns.len()
+        );
+        return None;
+    }
+
+    // Convert column centers to edges
+    let mut col_edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
+    let min_x = page_items
+        .iter()
+        .map(|(_, i)| i.x)
+        .reduce(f32::min)
+        .unwrap();
+    col_edges.push(min_x - 5.0);
+    for pair in columns.windows(2) {
+        col_edges.push((pair[0] + pair[1]) / 2.0);
+    }
+    let max_x_right = page_items
+        .iter()
+        .map(|(_, i)| i.x + i.width)
+        .reduce(f32::max)
+        .unwrap();
+    col_edges.push(max_x_right + 5.0);
+
+    let num_cols = col_edges.len() - 1;
+    let num_rows = row_edges.len() - 1;
+
+    debug!(
+        "  merged-cluster grid: {}x{} ({} col edges, {} row edges)",
+        num_rows,
+        num_cols,
+        col_edges.len(),
+        row_edges.len()
+    );
+
+    // Assign items to grid
+    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+
+    if item_indices.is_empty() {
+        debug!("  merged-cluster rejected: no items assigned");
+        return None;
+    }
+
+    // Validate: >=2 non-empty rows
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count();
+    if non_empty_rows < 2 {
+        debug!(
+            "  merged-cluster rejected: only {} non-empty rows",
+            non_empty_rows
+        );
+        return None;
+    }
+
+    // Content density: >=40%
+    let total_cells = (num_cols * num_rows) as f32;
+    let non_empty_cells = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let content_ratio = non_empty_cells as f32 / total_cells;
+    if content_ratio < 0.40 {
+        debug!(
+            "  merged-cluster rejected: content ratio {:.2} < 0.40",
+            content_ratio
+        );
+        return None;
+    }
+
+    // No empty columns
+    for col in 0..num_cols {
+        let col_has_content = cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
+        if !col_has_content {
+            debug!("  merged-cluster rejected: column {} is empty", col);
+            return None;
+        }
+    }
+
+    let column_centers: Vec<f32> = (0..num_cols)
+        .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
+        .collect();
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
+
+    debug!(
+        "  merged-cluster table accepted: {}x{}, {:.0}% density",
         num_rows,
         num_cols,
         content_ratio * 100.0
