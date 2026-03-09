@@ -197,7 +197,12 @@ pub(crate) fn detect_from_document(
             pages_actually_sampled += 1;
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
-            if analysis.text_operator_count >= config.min_text_ops_per_page
+            let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
+                config.min_text_ops_per_page.max(10)
+            } else {
+                config.min_text_ops_per_page
+            };
+            if analysis.text_operator_count >= effective_min_ops
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
