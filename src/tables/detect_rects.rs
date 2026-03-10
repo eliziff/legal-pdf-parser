@@ -367,15 +367,20 @@ pub(crate) fn detect_table_from_rect_group(
 ) -> Option<Table> {
     // First, try normal detection with all rects.
     let no_skip: Vec<bool> = vec![false; group_rects.len()];
-    if let Some(table) = try_build_grid(items, group_rects, page, &no_skip, false) {
-        return Some(table);
+    match try_build_grid(items, group_rects, page, &no_skip, false) {
+        GridResult::Ok(table) => return Some(table),
+        GridResult::FewNonEmptyRows => {
+            // propagate_merged_cells likely collapsed text into row 0
+            // due to a full-page background rect — retry below.
+        }
+        GridResult::Failed => return None,
     }
 
-    // If normal detection failed, check if the group contains page-origin
-    // background rects (starting near (0,0), spanning nearly the full group).
-    // If so, retry with those rects excluded from X-edge extraction and
-    // propagate_merged_cells.  This handles PDFs where a full-page background
-    // fill adds spurious margin columns and collapses all rows.
+    // Check if the group contains page-origin background rects (starting
+    // near (0,0), spanning nearly the full group).  If so, retry with those
+    // rects excluded from X-edge extraction and propagate_merged_cells.
+    // This handles PDFs where a full-page background fill adds spurious
+    // margin columns and collapses all rows.
     let origin_tol = 5.0;
     let group_x_min = group_rects
         .iter()
@@ -417,12 +422,23 @@ pub(crate) fn detect_table_from_rect_group(
 
     if is_page_bg.iter().any(|&b| b) && y_edge_count >= 12 {
         debug!("  retrying without page-background rects");
-        if let Some(table) = try_build_grid(items, group_rects, page, &is_page_bg, true) {
+        if let GridResult::Ok(table) = try_build_grid(items, group_rects, page, &is_page_bg, true) {
             return Some(table);
         }
     }
 
     None
+}
+
+/// Result from `try_build_grid` — distinguishes "few non-empty rows"
+/// (fixable by excluding page-background rects) from other failures.
+enum GridResult {
+    Ok(Table),
+    /// Grid was structurally valid but too few rows had content —
+    /// likely caused by `propagate_merged_cells` collapsing text.
+    FewNonEmptyRows,
+    /// Grid failed for structural reasons (bad dimensions, low fill, etc.)
+    Failed,
 }
 
 /// Core grid-building logic.  `skip_rects[i]` marks rects to exclude from
@@ -435,7 +451,7 @@ fn try_build_grid(
     page: u32,
     skip_rects: &[bool],
     strict: bool,
-) -> Option<Table> {
+) -> GridResult {
     // Extract unique X and Y edges from all rects.
     // Skip X edges from marked rects (page backgrounds add page-boundary
     // edges that create empty margin columns).
@@ -467,7 +483,7 @@ fn try_build_grid(
             x_edges.len(),
             y_edges.len()
         );
-        return None;
+        return GridResult::Failed;
     }
 
     // Sort column edges left-to-right, row edges top-to-bottom (highest Y first for PDF)
@@ -480,7 +496,7 @@ fn try_build_grid(
     let num_rows = row_edges.len() - 1;
 
     if num_cols < 2 || num_rows < 2 {
-        return None;
+        return GridResult::Failed;
     }
 
     // Reject grids that are too large — form-style PDFs with scattered field
@@ -488,7 +504,7 @@ fn try_build_grid(
     // chi-square) can legitimately have 20+ columns, so allow up to 25.
     if num_cols > 25 {
         debug!("  rejected: {} columns > 25", num_cols);
-        return None;
+        return GridResult::Failed;
     }
 
     // Verify that cell-sized rects actually fill the grid
@@ -525,7 +541,7 @@ fn try_build_grid(
     // Require at least 30% of cells to be backed by rects
     if fill_ratio < 0.3 {
         debug!("  rejected: fill ratio {:.2} < 0.30", fill_ratio);
-        return None;
+        return GridResult::Failed;
     }
 
     // Build table: assign text items to cells
@@ -551,7 +567,7 @@ fn try_build_grid(
     // Skip if no text was assigned
     if item_indices.is_empty() {
         debug!("  rejected: no text items assigned to grid");
-        return None;
+        return GridResult::Failed;
     }
 
     // Skip tables with too few rows of content.
@@ -567,7 +583,7 @@ fn try_build_grid(
             "  rejected: only {} non-empty rows (need {})",
             non_empty_rows, min_rows
         );
-        return None;
+        return GridResult::FewNonEmptyRows;
     }
 
     // Content density check: reject tables where most cells are empty.
@@ -584,7 +600,7 @@ fn try_build_grid(
             "  rejected: content ratio {:.2} < {:.2} ({} non-empty / {} total)",
             content_ratio, min_content, non_empty_cells, total_cells as u32
         );
-        return None;
+        return GridResult::Failed;
     }
 
     // In strict mode, reject tables where any single cell has very long text —
@@ -601,7 +617,7 @@ fn try_build_grid(
                 "  rejected: max cell length {} > 200 (likely paragraph text)",
                 max_cell_len
             );
-            return None;
+            return GridResult::Failed;
         }
     }
 
@@ -612,11 +628,11 @@ fn try_build_grid(
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
             debug!("  rejected: column {} is completely empty", col);
-            return None;
+            return GridResult::Failed;
         }
     }
 
-    Some(Table {
+    GridResult::Ok(Table {
         columns,
         rows,
         cells,
