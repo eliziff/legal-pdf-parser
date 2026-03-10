@@ -365,12 +365,87 @@ pub(crate) fn detect_table_from_rect_group(
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> Option<Table> {
-    // Extract unique X and Y edges from all rects
+    // First, try normal detection with all rects.
+    let no_skip: Vec<bool> = vec![false; group_rects.len()];
+    if let Some(table) = try_build_grid(items, group_rects, page, &no_skip, false) {
+        return Some(table);
+    }
+
+    // If normal detection failed, check if the group contains page-origin
+    // background rects (starting near (0,0), spanning nearly the full group).
+    // If so, retry with those rects excluded from X-edge extraction and
+    // propagate_merged_cells.  This handles PDFs where a full-page background
+    // fill adds spurious margin columns and collapses all rows.
+    let origin_tol = 5.0;
+    let group_x_min = group_rects
+        .iter()
+        .map(|r| r.0)
+        .fold(f32::INFINITY, f32::min);
+    let group_x_max = group_rects
+        .iter()
+        .map(|r| r.0 + r.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let group_y_min = group_rects
+        .iter()
+        .map(|r| r.1)
+        .fold(f32::INFINITY, f32::min);
+    let group_y_max = group_rects
+        .iter()
+        .map(|r| r.1 + r.3)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let group_w = group_x_max - group_x_min;
+    let group_h = group_y_max - group_y_min;
+
+    let is_page_bg: Vec<bool> = group_rects
+        .iter()
+        .map(|&(x, y, w, h)| {
+            x < origin_tol && y < origin_tol && w >= group_w * 0.95 && h >= group_h * 0.9
+        })
+        .collect();
+
+    // Only retry for groups with enough Y-edges to form a large grid.
+    // Full-page backgrounds are problematic for dense tables (many rows)
+    // but not for small grids where the retry would accept false positives.
+    let y_edge_count = {
+        let mut ys: Vec<f32> = Vec::new();
+        for &(_, y, _, h) in group_rects {
+            ys.push(y);
+            ys.push(y + h);
+        }
+        snap_edges(&ys, 6.0).len()
+    };
+
+    if is_page_bg.iter().any(|&b| b) && y_edge_count >= 12 {
+        debug!("  retrying without page-background rects");
+        if let Some(table) = try_build_grid(items, group_rects, page, &is_page_bg, true) {
+            return Some(table);
+        }
+    }
+
+    None
+}
+
+/// Core grid-building logic.  `skip_rects[i]` marks rects to exclude from
+/// X-edge extraction and propagate_merged_cells (but they're still used for
+/// fill-ratio checking).  When `strict` is true, apply higher thresholds
+/// for non-empty rows and content density to avoid false positives.
+fn try_build_grid(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+    skip_rects: &[bool],
+    strict: bool,
+) -> Option<Table> {
+    // Extract unique X and Y edges from all rects.
+    // Skip X edges from marked rects (page backgrounds add page-boundary
+    // edges that create empty margin columns).
     let mut x_edges: Vec<f32> = Vec::new();
     let mut y_edges: Vec<f32> = Vec::new();
-    for &(x, y, w, h) in group_rects {
-        x_edges.push(x);
-        x_edges.push(x + w);
+    for (i, &(x, y, w, h)) in group_rects.iter().enumerate() {
+        if !skip_rects[i] {
+            x_edges.push(x);
+            x_edges.push(x + w);
+        }
         y_edges.push(y);
         y_edges.push(y + h);
     }
@@ -462,7 +537,7 @@ pub(crate) fn detect_table_from_rect_group(
     // background fills rather than true merged cells (e.g. statistical lookup
     // tables with row-grouping shading).
     if num_cols <= 10 {
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects);
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects);
     }
 
     // Compute column centers and row centers for the Table struct
@@ -479,30 +554,55 @@ pub(crate) fn detect_table_from_rect_group(
         return None;
     }
 
-    // Skip tables with only 1 row of content (header-only)
+    // Skip tables with too few rows of content.
+    // In strict mode (retry without page backgrounds), require at least 50%
+    // of rows to have content to avoid false positives.
     let non_empty_rows = cells
         .iter()
         .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
         .count();
-    if non_empty_rows < 2 {
-        debug!("  rejected: only {} non-empty rows", non_empty_rows);
+    let min_rows = if strict { num_rows / 2 } else { 2 };
+    if non_empty_rows < min_rows {
+        debug!(
+            "  rejected: only {} non-empty rows (need {})",
+            non_empty_rows, min_rows
+        );
         return None;
     }
 
     // Content density check: reject tables where most cells are empty.
-    // Real tables have content in most cells; form layouts produce sparse grids.
+    // In strict mode, require 40% instead of 25%.
     let non_empty_cells = cells
         .iter()
         .flat_map(|row| row.iter())
         .filter(|c| !c.trim().is_empty())
         .count();
     let content_ratio = non_empty_cells as f32 / total_cells;
-    if content_ratio < 0.25 {
+    let min_content = if strict { 0.40 } else { 0.25 };
+    if content_ratio < min_content {
         debug!(
-            "  rejected: content ratio {:.2} < 0.25 ({} non-empty / {} total)",
-            content_ratio, non_empty_cells, total_cells as u32
+            "  rejected: content ratio {:.2} < {:.2} ({} non-empty / {} total)",
+            content_ratio, min_content, non_empty_cells, total_cells as u32
         );
         return None;
+    }
+
+    // In strict mode, reject tables where any single cell has very long text —
+    // this indicates a paragraph was incorrectly captured in the grid.
+    if strict {
+        let max_cell_len = cells
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(0);
+        if max_cell_len > 200 {
+            debug!(
+                "  rejected: max cell length {} > 200 (likely paragraph text)",
+                max_cell_len
+            );
+            return None;
+        }
     }
 
     // Reject tables with any completely empty column — indicates a bad grid.
@@ -619,14 +719,21 @@ fn propagate_merged_cells(
     col_edges: &[f32],
     row_edges: &[f32],
     group_rects: &[(f32, f32, f32, f32)],
+    skip_rects: &[bool],
 ) {
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
     let tol = 6.0;
 
     for col in 0..num_cols {
-        for rect in group_rects {
+        for (rect_idx, rect) in group_rects.iter().enumerate() {
             let (rx, ry, rw, rh) = *rect;
+
+            // Skip rects flagged as page backgrounds — they span all rows
+            // and would collapse all text into the first row.
+            if skip_rects[rect_idx] {
+                continue;
+            }
 
             // Rect must cover this column
             if rx > col_edges[col] + tol || (rx + rw) < col_edges[col + 1] - tol {
