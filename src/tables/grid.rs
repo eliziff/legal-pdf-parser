@@ -306,3 +306,342 @@ pub(crate) fn recover_header_row(
     table.cells.insert(0, header_cells);
     table.item_indices.extend(header_indices);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.len() as f32 * font_size * 0.5,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+        }
+    }
+
+    // --- find_column_index ---
+
+    #[test]
+    fn test_find_column_index_exact_match() {
+        let columns = vec![100.0, 200.0, 300.0];
+        assert_eq!(find_column_index(&columns, 100.0), Some(0));
+        assert_eq!(find_column_index(&columns, 200.0), Some(1));
+        assert_eq!(find_column_index(&columns, 300.0), Some(2));
+    }
+
+    #[test]
+    fn test_find_column_index_closest_within_threshold() {
+        let columns = vec![100.0, 200.0, 300.0];
+        assert_eq!(find_column_index(&columns, 105.0), Some(0));
+        assert_eq!(find_column_index(&columns, 195.0), Some(1));
+    }
+
+    #[test]
+    fn test_find_column_index_outside_threshold() {
+        let columns = vec![100.0, 200.0, 300.0];
+        // Threshold is clamped to min 25, max 50 based on min gap / 2
+        // Min gap = 100, threshold = clamp(50, 25, 50) = 50
+        assert_eq!(find_column_index(&columns, 500.0), None);
+    }
+
+    #[test]
+    fn test_find_column_index_single_column() {
+        let columns = vec![150.0];
+        // Single column → threshold = 50.0
+        assert_eq!(find_column_index(&columns, 150.0), Some(0));
+        assert_eq!(find_column_index(&columns, 170.0), Some(0));
+    }
+
+    #[test]
+    fn test_find_column_index_empty_columns() {
+        let columns: Vec<f32> = vec![];
+        assert_eq!(find_column_index(&columns, 100.0), None);
+    }
+
+    // --- find_row_index ---
+
+    #[test]
+    fn test_find_row_index_exact_match() {
+        let rows = vec![500.0, 480.0, 460.0];
+        assert_eq!(find_row_index(&rows, 500.0), Some(0));
+        assert_eq!(find_row_index(&rows, 480.0), Some(1));
+    }
+
+    #[test]
+    fn test_find_row_index_within_threshold() {
+        let rows = vec![500.0, 480.0, 460.0];
+        assert_eq!(find_row_index(&rows, 505.0), Some(0));
+        assert_eq!(find_row_index(&rows, 475.0), Some(1));
+    }
+
+    #[test]
+    fn test_find_row_index_outside_threshold() {
+        let rows = vec![500.0, 480.0, 460.0];
+        // threshold is 15.0
+        assert_eq!(find_row_index(&rows, 400.0), None);
+    }
+
+    #[test]
+    fn test_find_row_index_single_row() {
+        let rows = vec![500.0];
+        assert_eq!(find_row_index(&rows, 500.0), Some(0));
+        assert_eq!(find_row_index(&rows, 510.0), Some(0));
+    }
+
+    // --- find_column_boundaries ---
+
+    #[test]
+    fn test_find_column_boundaries_empty() {
+        let items: Vec<(usize, &TextItem)> = vec![];
+        assert_eq!(
+            find_column_boundaries(&items, TableDetectionMode::SmallFont),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_find_column_boundaries_two_clusters() {
+        // Items at x=100 and x=200 with enough repetition
+        let items_data: Vec<TextItem> = (0..10)
+            .map(|i| {
+                let x = if i % 2 == 0 { 100.0 } else { 200.0 };
+                make_item("Cell", x, 500.0 - (i as f32 * 20.0), 10.0)
+            })
+            .collect();
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let cols = find_column_boundaries(&items, TableDetectionMode::SmallFont);
+        assert_eq!(cols.len(), 2);
+    }
+
+    #[test]
+    fn test_find_column_boundaries_single_item() {
+        let item = make_item("Solo", 100.0, 500.0, 10.0);
+        let items: Vec<(usize, &TextItem)> = vec![(0, &item)];
+        // Single item won't pass the min_items_per_col filter (needs >=2)
+        let cols = find_column_boundaries(&items, TableDetectionMode::SmallFont);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_find_column_boundaries_body_font_paragraph_rejection() {
+        // All items at same X → >60% in one column → rejected in BodyFont mode
+        let items_data: Vec<TextItem> = (0..10)
+            .map(|i| make_item("Text", 100.0, 500.0 - (i as f32 * 20.0), 10.0))
+            .collect();
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let cols = find_column_boundaries(&items, TableDetectionMode::BodyFont);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_find_column_boundaries_min_items_filter() {
+        // Create 10 items at x=100 and 1 item at x=300
+        // The single outlier should be filtered out
+        let mut items_data: Vec<TextItem> = (0..10)
+            .map(|i| make_item("Cell", 100.0, 500.0 - (i as f32 * 20.0), 10.0))
+            .collect();
+        items_data.push(make_item("Lone", 300.0, 500.0, 10.0));
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let cols = find_column_boundaries(&items, TableDetectionMode::SmallFont);
+        // Only the cluster at x=100 should survive
+        assert!(cols.len() <= 1);
+    }
+
+    // --- find_row_boundaries ---
+
+    #[test]
+    fn test_find_row_boundaries_empty() {
+        let items: Vec<(usize, &TextItem)> = vec![];
+        assert_eq!(find_row_boundaries(&items), vec![]);
+    }
+
+    #[test]
+    fn test_find_row_boundaries_descending_order() {
+        let items_data = vec![
+            make_item("A", 100.0, 500.0, 10.0),
+            make_item("B", 100.0, 480.0, 10.0),
+            make_item("C", 100.0, 460.0, 10.0),
+        ];
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let rows = find_row_boundaries(&items);
+        assert_eq!(rows.len(), 3);
+        // Should be in descending order
+        assert!(rows[0] > rows[1]);
+        assert!(rows[1] > rows[2]);
+    }
+
+    #[test]
+    fn test_find_row_boundaries_clustering() {
+        // Items close together should cluster into one row
+        let items_data = vec![
+            make_item("A", 100.0, 500.0, 10.0),
+            make_item("B", 200.0, 501.0, 10.0),
+            make_item("C", 100.0, 480.0, 10.0),
+        ];
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let rows = find_row_boundaries(&items);
+        assert_eq!(rows.len(), 2); // 500 and 501 cluster together
+    }
+
+    #[test]
+    fn test_find_row_boundaries_single_row() {
+        let items_data = vec![make_item("A", 100.0, 500.0, 10.0)];
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let rows = find_row_boundaries(&items);
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0] - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_find_row_boundaries_items_at_same_y() {
+        let items_data = vec![
+            make_item("A", 100.0, 500.0, 10.0),
+            make_item("B", 200.0, 500.0, 10.0),
+            make_item("C", 300.0, 500.0, 10.0),
+        ];
+        let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
+        let rows = find_row_boundaries(&items);
+        assert_eq!(rows.len(), 1);
+    }
+
+    // --- join_cell_items ---
+
+    #[test]
+    fn test_join_cell_items_single_item() {
+        let item = make_item("Hello", 100.0, 500.0, 10.0);
+        assert_eq!(join_cell_items(&[&item]), "Hello");
+    }
+
+    #[test]
+    fn test_join_cell_items_multiple_spaced() {
+        let a = make_item("Hello", 100.0, 500.0, 10.0);
+        let b = make_item("World", 150.0, 500.0, 10.0);
+        assert_eq!(join_cell_items(&[&a, &b]), "Hello World");
+    }
+
+    #[test]
+    fn test_join_cell_items_hyphen_no_space() {
+        let a = make_item("pre", 100.0, 500.0, 10.0);
+        let b = make_item("-", 120.0, 500.0, 10.0);
+        let c = make_item("fix", 130.0, 500.0, 10.0);
+        assert_eq!(join_cell_items(&[&a, &b, &c]), "pre-fix");
+    }
+
+    #[test]
+    fn test_join_cell_items_subscript_no_space() {
+        let a = make_item("H", 100.0, 500.0, 12.0);
+        let b = make_item("2", 110.0, 497.0, 8.0); // smaller font, Y offset
+        assert_eq!(join_cell_items(&[&a, &b]), "H2");
+    }
+
+    #[test]
+    fn test_join_cell_items_empty_items_skipped() {
+        let a = make_item("Hello", 100.0, 500.0, 10.0);
+        let b = make_item("  ", 120.0, 500.0, 10.0);
+        let c = make_item("World", 150.0, 500.0, 10.0);
+        assert_eq!(join_cell_items(&[&a, &b, &c]), "Hello World");
+    }
+
+    // --- recover_header_row ---
+
+    #[test]
+    fn test_recover_header_row_prepends_header() {
+        let all_items = vec![
+            make_item("Col1", 100.0, 520.0, 12.0), // body font, above table
+            make_item("Col2", 200.0, 520.0, 12.0), // body font, above table
+            make_item("A", 100.0, 500.0, 8.0),     // small font, in table
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0],
+            cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
+            item_indices: vec![2, 3],
+        };
+
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.cells.len(), 3);
+        assert_eq!(table.cells[0], vec!["Col1", "Col2"]);
+    }
+
+    #[test]
+    fn test_recover_header_row_no_candidates() {
+        let all_items = vec![
+            make_item("A", 100.0, 500.0, 8.0),
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0],
+            cells: vec![vec!["A".into(), "B".into()]],
+            item_indices: vec![0, 1],
+        };
+
+        let rows_before = table.rows.len();
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.rows.len(), rows_before);
+    }
+
+    #[test]
+    fn test_recover_header_row_too_far_above() {
+        let all_items = vec![
+            make_item("Col1", 100.0, 600.0, 12.0), // way above
+            make_item("Col2", 200.0, 600.0, 12.0),
+            make_item("A", 100.0, 500.0, 8.0),
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0],
+            cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
+            item_indices: vec![2, 3],
+        };
+
+        let rows_before = table.rows.len();
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.rows.len(), rows_before);
+    }
+
+    #[test]
+    fn test_recover_header_row_single_column_populated() {
+        // Only 1 column populated → not a real header
+        let all_items = vec![
+            make_item("OnlyCol1", 100.0, 520.0, 12.0),
+            make_item("A", 100.0, 500.0, 8.0),
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0],
+            cells: vec![vec!["A".into(), "B".into()]],
+            item_indices: vec![1, 2],
+        };
+
+        let rows_before = table.rows.len();
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.rows.len(), rows_before);
+    }
+
+    #[test]
+    fn test_recover_header_row_empty_table() {
+        let all_items = vec![make_item("Col1", 100.0, 520.0, 12.0)];
+        let mut table = Table {
+            columns: vec![],
+            rows: vec![],
+            cells: vec![],
+            item_indices: vec![],
+        };
+
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert!(table.cells.is_empty());
+    }
+}

@@ -180,3 +180,235 @@ fn is_footnote_row(text: &str) -> bool {
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_footnote_row ---
+
+    #[test]
+    fn test_is_footnote_row_parenthesized_number() {
+        assert!(is_footnote_row("(1)"));
+        assert!(is_footnote_row("(23)"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_number_paren() {
+        assert!(is_footnote_row("1)"));
+        assert!(is_footnote_row("12)"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_note_colon() {
+        assert!(is_footnote_row("Note: some text"));
+        assert!(is_footnote_row("note: lowercase"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_notes_colon() {
+        assert!(is_footnote_row("Notes: multiple"));
+        assert!(is_footnote_row("NOTES: uppercase"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_plain_text_false() {
+        assert!(!is_footnote_row("Regular cell text"));
+        assert!(!is_footnote_row("Amount"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_empty_false() {
+        assert!(!is_footnote_row(""));
+    }
+
+    // --- clean_table_cells ---
+
+    #[test]
+    fn test_clean_table_cells_empty_rows_removed() {
+        let cells = vec![
+            vec!["A".into(), "B".into()],
+            vec!["".into(), "".into()],
+            vec!["C".into(), "D".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(cleaned[0], vec!["A", "B"]);
+        assert_eq!(cleaned[1], vec!["C", "D"]);
+    }
+
+    #[test]
+    fn test_clean_table_cells_footnote_extracted() {
+        let cells = vec![
+            vec!["Header".into(), "Value".into()],
+            vec!["Data".into(), "100".into()],
+            vec!["(1)".into(), "See appendix".into()],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(footnotes.len(), 1);
+        assert!(footnotes[0].contains("(1)"));
+        assert!(footnotes[0].contains("See appendix"));
+    }
+
+    #[test]
+    fn test_clean_table_cells_continuation_row_merged() {
+        let cells = vec![
+            vec!["Header".into(), "Col2".into()],
+            vec!["Row1".into(), "Short".into()],
+            vec!["".into(), "continued text here".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // The continuation row should merge into the previous row
+        assert_eq!(cleaned.len(), 2);
+        assert!(cleaned[1][1].contains("Short"));
+        assert!(cleaned[1][1].contains("continued text here"));
+    }
+
+    #[test]
+    fn test_clean_table_cells_short_subheader_not_merged() {
+        let cells = vec![
+            vec!["Header".into(), "Col2".into()],
+            vec!["Row1".into(), "Data".into()],
+            vec!["".into(), "JAN".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Short subheader (<=5 chars, single non-empty cell) should not merge
+        assert_eq!(cleaned.len(), 3);
+    }
+
+    #[test]
+    fn test_clean_table_cells_numeric_data_row_not_merged() {
+        let cells = vec![
+            vec!["Header".into(), "A".into(), "B".into(), "C".into()],
+            vec!["Row1".into(), "10".into(), "20".into(), "30".into()],
+            vec!["".into(), "40".into(), "50".into(), "60".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Numeric data row with empty first col should not merge
+        assert_eq!(cleaned.len(), 3);
+    }
+
+    #[test]
+    fn test_clean_table_cells_header_row_not_merged() {
+        // Continuation requires cleaned.len() > 1 (don't merge into header)
+        let cells = vec![
+            vec!["Header".into(), "Col2".into()],
+            vec!["".into(), "continuation text goes here".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        // Should not merge into first row (header)
+        assert_eq!(cleaned.len(), 2);
+    }
+
+    #[test]
+    fn test_clean_table_cells_all_empty() {
+        let cells = vec![vec!["".into(), "".into()], vec!["  ".into(), "".into()]];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert!(cleaned.is_empty());
+        assert!(footnotes.is_empty());
+    }
+
+    #[test]
+    fn test_clean_table_cells_mixed_scenario() {
+        let cells = vec![
+            vec!["Name".into(), "Score".into()],
+            vec!["Alice".into(), "95".into()],
+            vec!["".into(), "".into()],
+            vec!["Bob".into(), "87".into()],
+            vec!["Note: graded on curve".into(), "".into()],
+        ];
+        let (cleaned, footnotes) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 3); // header + Alice + Bob (empty row removed)
+        assert_eq!(footnotes.len(), 1);
+        assert!(footnotes[0].contains("Note:"));
+    }
+
+    // --- table_to_markdown ---
+
+    #[test]
+    fn test_table_to_markdown_basic() {
+        let table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Name".into(), "Age".into()],
+                vec!["Alice".into(), "30".into()],
+                vec!["Bob".into(), "25".into()],
+            ],
+            item_indices: vec![],
+        };
+        let md = table_to_markdown(&table);
+        assert!(md.contains("| Name"));
+        assert!(md.contains("| ---"));
+        assert!(md.contains("| Alice"));
+        assert!(md.contains("| Bob"));
+    }
+
+    #[test]
+    fn test_table_to_markdown_single_row() {
+        let table = Table {
+            columns: vec![100.0],
+            rows: vec![500.0],
+            cells: vec![vec!["Only".into(), "Row".into()]],
+            item_indices: vec![],
+        };
+        let md = table_to_markdown(&table);
+        assert!(md.contains("| Only"));
+        assert!(md.contains("| ---"));
+    }
+
+    #[test]
+    fn test_table_to_markdown_empty_table() {
+        let table = Table {
+            columns: vec![],
+            rows: vec![],
+            cells: vec![],
+            item_indices: vec![],
+        };
+        assert_eq!(table_to_markdown(&table), "");
+    }
+
+    #[test]
+    fn test_table_to_markdown_footnotes_appended() {
+        let table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Header".into(), "Value".into()],
+                vec!["Data".into(), "100".into()],
+                vec!["(1)".into(), "Footnote text".into()],
+            ],
+            item_indices: vec![],
+        };
+        let md = table_to_markdown(&table);
+        assert!(md.contains("(1) Footnote text"));
+    }
+
+    #[test]
+    fn test_table_to_markdown_unicode_content() {
+        let table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0],
+            cells: vec![
+                vec!["名前".into(), "年齢".into()],
+                vec!["太郎".into(), "25".into()],
+            ],
+            item_indices: vec![],
+        };
+        let md = table_to_markdown(&table);
+        assert!(md.contains("名前"));
+        assert!(md.contains("太郎"));
+    }
+
+    #[test]
+    fn test_table_to_markdown_empty_first_row() {
+        let table = Table {
+            columns: vec![100.0],
+            rows: vec![500.0],
+            cells: vec![vec![]],
+            item_indices: vec![],
+        };
+        assert_eq!(table_to_markdown(&table), "");
+    }
+}

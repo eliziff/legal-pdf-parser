@@ -1217,3 +1217,581 @@ fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.len() as f32 * font_size * 0.5,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+        }
+    }
+
+    // --- rects_overlap ---
+
+    #[test]
+    fn test_rects_overlap_overlapping() {
+        let a = (0.0, 0.0, 10.0, 10.0);
+        let b = (5.0, 5.0, 10.0, 10.0);
+        assert!(rects_overlap(&a, &b, 0.0));
+    }
+
+    #[test]
+    fn test_rects_overlap_touching() {
+        let a = (0.0, 0.0, 10.0, 10.0);
+        let b = (10.0, 0.0, 10.0, 10.0);
+        // Touching at edge — with 0 tolerance, the right edge of a == left edge of b
+        assert!(rects_overlap(&a, &b, 0.0));
+    }
+
+    #[test]
+    fn test_rects_overlap_separated() {
+        let a = (0.0, 0.0, 10.0, 10.0);
+        let b = (20.0, 20.0, 10.0, 10.0);
+        assert!(!rects_overlap(&a, &b, 0.0));
+    }
+
+    #[test]
+    fn test_rects_overlap_contained() {
+        let a = (0.0, 0.0, 20.0, 20.0);
+        let b = (5.0, 5.0, 5.0, 5.0);
+        assert!(rects_overlap(&a, &b, 0.0));
+    }
+
+    #[test]
+    fn test_rects_overlap_identical() {
+        let a = (10.0, 10.0, 50.0, 50.0);
+        assert!(rects_overlap(&a, &a, 0.0));
+    }
+
+    #[test]
+    fn test_rects_overlap_tolerance_expansion() {
+        let a = (0.0, 0.0, 10.0, 10.0);
+        let b = (15.0, 0.0, 10.0, 10.0);
+        // Gap of 5 — with tol=0 they don't overlap
+        assert!(!rects_overlap(&a, &b, 0.0));
+        // With tol=3, each expands by 3 → they overlap
+        assert!(rects_overlap(&a, &b, 3.0));
+    }
+
+    // --- cluster_rects ---
+
+    #[test]
+    fn test_cluster_rects_empty() {
+        let rects: Vec<(f32, f32, f32, f32)> = vec![];
+        assert!(cluster_rects(&rects, 3.0, 1).is_empty());
+    }
+
+    #[test]
+    fn test_cluster_rects_single_rect() {
+        let rects = vec![(0.0, 0.0, 10.0, 10.0)];
+        // min_size=1 → should return the single rect
+        let groups = cluster_rects(&rects, 3.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec![0]);
+    }
+
+    #[test]
+    fn test_cluster_rects_all_disconnected() {
+        let rects = vec![
+            (0.0, 0.0, 10.0, 10.0),
+            (100.0, 100.0, 10.0, 10.0),
+            (200.0, 200.0, 10.0, 10.0),
+        ];
+        // All separated, min_size=2 → no groups
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_rects_chain_overlap() {
+        // A overlaps B, B overlaps C → all in one group
+        let rects = vec![
+            (0.0, 0.0, 10.0, 10.0),
+            (8.0, 0.0, 10.0, 10.0),
+            (16.0, 0.0, 10.0, 10.0),
+        ];
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+    }
+
+    #[test]
+    fn test_cluster_rects_all_connected() {
+        let rects = vec![
+            (0.0, 0.0, 20.0, 20.0),
+            (5.0, 5.0, 20.0, 20.0),
+            (10.0, 10.0, 20.0, 20.0),
+        ];
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_cluster_rects_min_size_filter() {
+        // Two separate pairs + one lone rect
+        let rects = vec![
+            (0.0, 0.0, 10.0, 10.0),
+            (5.0, 0.0, 10.0, 10.0),
+            (100.0, 100.0, 10.0, 10.0),
+        ];
+        // min_size=2 → only the overlapping pair returned
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    // --- snap_edges ---
+
+    #[test]
+    fn test_snap_edges_empty() {
+        assert!(snap_edges(&[], 6.0).is_empty());
+    }
+
+    #[test]
+    fn test_snap_edges_single_value() {
+        assert_eq!(snap_edges(&[42.0], 6.0), vec![42.0]);
+    }
+
+    #[test]
+    fn test_snap_edges_within_tolerance_deduped() {
+        let edges = snap_edges(&[10.0, 12.0, 14.0, 30.0], 6.0);
+        // 10, 12, 14 are all within 6 of the first → deduplicated
+        assert_eq!(edges.len(), 2);
+        assert!((edges[0] - 10.0).abs() < 0.01);
+        assert!((edges[1] - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_snap_edges_outside_tolerance_kept() {
+        let edges = snap_edges(&[10.0, 20.0, 30.0], 5.0);
+        assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn test_snap_edges_unsorted_input() {
+        let edges = snap_edges(&[30.0, 10.0, 20.0], 5.0);
+        // Should be sorted
+        assert_eq!(edges, vec![10.0, 20.0, 30.0]);
+    }
+
+    // --- assign_items_to_grid ---
+
+    #[test]
+    fn test_assign_items_basic() {
+        let items = vec![
+            make_item("A", 15.0, 85.0, 10.0),
+            make_item("B", 55.0, 85.0, 10.0),
+            make_item("C", 15.0, 55.0, 10.0),
+            make_item("D", 55.0, 55.0, 10.0),
+        ];
+        // 2x2 grid: cols at [10, 50, 90], rows at [90, 70, 50] (top-to-bottom)
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![90.0, 70.0, 40.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0][0], "A");
+        assert_eq!(cells[0][1], "B");
+        assert_eq!(cells[1][0], "C");
+        assert_eq!(cells[1][1], "D");
+        assert_eq!(indices.len(), 4);
+    }
+
+    #[test]
+    fn test_assign_items_outside_grid() {
+        let items = vec![make_item("Outside", 500.0, 500.0, 10.0)];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![90.0, 70.0, 50.0];
+        let (_, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_assign_items_wrong_page_filtered() {
+        let mut item = make_item("A", 15.0, 85.0, 10.0);
+        item.page = 2;
+        let items = vec![item];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![90.0, 70.0, 50.0];
+        let (_, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_assign_items_multiple_same_cell() {
+        let items = vec![
+            make_item("Hello", 15.0, 85.0, 10.0),
+            make_item("World", 20.0, 80.0, 10.0),
+        ];
+        let col_edges = vec![10.0, 50.0];
+        let row_edges = vec![90.0, 70.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices.len(), 2);
+        assert!(cells[0][0].contains("Hello"));
+        assert!(cells[0][0].contains("World"));
+    }
+
+    #[test]
+    fn test_assign_items_boundary_tolerance() {
+        // Item right at edge with ±2pt tolerance
+        let items = vec![make_item("Edge", 9.0, 89.0, 10.0)];
+        let col_edges = vec![10.0, 50.0];
+        let row_edges = vec![90.0, 70.0];
+        let (_, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices.len(), 1);
+    }
+
+    #[test]
+    fn test_assign_items_empty_grid() {
+        let items = vec![make_item("A", 15.0, 85.0, 10.0)];
+        let col_edges = vec![10.0]; // Only 1 edge → 0 columns
+        let row_edges = vec![90.0]; // Only 1 edge → 0 rows
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert!(cells.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_assign_items_all_assigned() {
+        let items = vec![
+            make_item("A", 15.0, 85.0, 10.0),
+            make_item("B", 55.0, 85.0, 10.0),
+        ];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![90.0, 70.0];
+        let (_, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[test]
+    fn test_assign_items_sorted_y_desc_x_asc() {
+        // Two items in same cell — should sort by Y desc, X asc
+        let items = vec![
+            make_item("Bottom", 15.0, 75.0, 10.0),
+            make_item("Top", 15.0, 85.0, 10.0),
+        ];
+        let col_edges = vec![10.0, 50.0];
+        let row_edges = vec![90.0, 70.0];
+        let (cells, _) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(cells[0][0], "Top Bottom");
+    }
+
+    // --- is_row_stripe_pattern ---
+
+    #[test]
+    fn test_is_row_stripe_pattern_too_few_rects() {
+        let rects = vec![(0.0, 0.0, 300.0, 20.0), (0.0, 25.0, 300.0, 20.0)];
+        assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_is_row_stripe_pattern_narrow_rects() {
+        let rects = vec![
+            (0.0, 0.0, 50.0, 20.0),
+            (0.0, 25.0, 50.0, 20.0),
+            (0.0, 50.0, 50.0, 20.0),
+        ];
+        assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_is_row_stripe_pattern_uniform_wide() {
+        let rects = vec![
+            (10.0, 0.0, 500.0, 20.0),
+            (10.0, 25.0, 500.0, 20.0),
+            (10.0, 50.0, 500.0, 20.0),
+            (10.0, 75.0, 500.0, 20.0),
+        ];
+        assert!(is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_is_row_stripe_pattern_mixed_widths() {
+        let rects = vec![
+            (10.0, 0.0, 500.0, 20.0),
+            (10.0, 25.0, 100.0, 20.0), // Very different width
+            (10.0, 50.0, 500.0, 20.0),
+            (10.0, 75.0, 50.0, 20.0), // Very different width
+        ];
+        assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_is_row_stripe_pattern_75_percent_boundary() {
+        // 3 of 4 (75%) within tolerance → should pass (> 0.75)
+        let rects = vec![
+            (10.0, 0.0, 500.0, 20.0),
+            (10.0, 25.0, 505.0, 20.0),
+            (10.0, 50.0, 495.0, 20.0),
+            (10.0, 75.0, 100.0, 20.0), // outlier
+        ];
+        // 3/4 = 0.75 — NOT > 0.75, so false
+        assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    // --- propagate_merged_cells ---
+
+    #[test]
+    fn test_propagate_merged_cells_spanning_rect() {
+        // A rect spanning 2 rows in column 0
+        let col_edges = vec![0.0, 50.0, 100.0];
+        let row_edges = vec![100.0, 80.0, 60.0]; // 2 rows
+        let mut cells = vec![
+            vec!["Top".to_string(), "A".to_string()],
+            vec!["Bottom".to_string(), "B".to_string()],
+        ];
+        // Rect spanning both rows in col 0
+        let group_rects = vec![(0.0, 60.0, 50.0, 40.0)];
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells[0][0], "Top Bottom");
+        assert!(cells[1][0].is_empty());
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_single_row_rect_noop() {
+        // Use well-separated rows so the rect doesn't bleed into adjacent row
+        // via the 6pt tolerance in propagate_merged_cells.
+        let col_edges = vec![0.0, 50.0, 100.0];
+        let row_edges = vec![200.0, 100.0, 0.0];
+        let mut cells = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["C".to_string(), "D".to_string()],
+        ];
+        // Rect clearly inside row 0 only (y=110..190, row 0 is 100..200)
+        // ry=110 > row_edges[1]+tol = 106, so it doesn't span into row 1
+        let group_rects = vec![(0.0, 110.0, 50.0, 80.0)];
+        let skip = vec![false];
+        let cells_before = cells.clone();
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells, cells_before);
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_skip_rects_respected() {
+        let col_edges = vec![0.0, 50.0, 100.0];
+        let row_edges = vec![100.0, 80.0, 60.0];
+        let mut cells = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["C".to_string(), "D".to_string()],
+        ];
+        let group_rects = vec![(0.0, 60.0, 50.0, 40.0)];
+        let skip = vec![true]; // Skip this rect
+        let cells_before = cells.clone();
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells, cells_before);
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_text_in_multiple_sub_rows() {
+        let col_edges = vec![0.0, 50.0];
+        let row_edges = vec![100.0, 80.0, 60.0, 40.0]; // 3 rows
+        let mut cells = vec![
+            vec!["Line1".to_string()],
+            vec!["Line2".to_string()],
+            vec!["Line3".to_string()],
+        ];
+        // Rect spanning all 3 rows
+        let group_rects = vec![(0.0, 40.0, 50.0, 60.0)];
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells[0][0], "Line1 Line2 Line3");
+        assert!(cells[1][0].is_empty());
+        assert!(cells[2][0].is_empty());
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_full_width_spanning() {
+        let col_edges = vec![0.0, 50.0, 100.0];
+        let row_edges = vec![100.0, 80.0, 60.0];
+        let mut cells = vec![
+            vec!["A".to_string(), "X".to_string()],
+            vec!["B".to_string(), "Y".to_string()],
+        ];
+        // Rect spanning both rows but only column 1
+        let group_rects = vec![(50.0, 60.0, 50.0, 40.0)];
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells[0][1], "X Y");
+        assert!(cells[1][1].is_empty());
+        // Column 0 should be unchanged
+        assert_eq!(cells[0][0], "A");
+        assert_eq!(cells[1][0], "B");
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_empty_cells_preserved() {
+        let col_edges = vec![0.0, 50.0];
+        let row_edges = vec![100.0, 80.0, 60.0];
+        let mut cells = vec![vec!["Text".to_string()], vec!["".to_string()]];
+        // Rect spanning both rows
+        let group_rects = vec![(0.0, 60.0, 50.0, 40.0)];
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        // Only "Text" in first row (empty cell contributes nothing)
+        assert_eq!(cells[0][0], "Text");
+        assert!(cells[1][0].is_empty());
+    }
+
+    // --- detect_table_from_rect_group / try_build_grid ---
+
+    // Helper: create a 3-row × 2-col grid of rects with 10pt gaps between rows.
+    // Gaps prevent propagate_merged_cells from collapsing adjacent rows
+    // (shared-edge rects bleed via the 6pt tolerance).
+    // Y layout: row0 y=60..80, row1 y=30..50, row2 y=0..20
+    fn make_grid_rects() -> Vec<(f32, f32, f32, f32)> {
+        vec![
+            (10.0, 60.0, 40.0, 20.0), // row0, col0
+            (50.0, 60.0, 40.0, 20.0), // row0, col1
+            (10.0, 30.0, 40.0, 20.0), // row1, col0
+            (50.0, 30.0, 40.0, 20.0), // row1, col1
+            (10.0, 0.0, 40.0, 20.0),  // row2, col0
+            (50.0, 0.0, 40.0, 20.0),  // row2, col1
+        ]
+    }
+
+    #[test]
+    fn test_try_build_grid_basic_valid() {
+        let items = vec![
+            make_item("H1", 15.0, 70.0, 10.0),
+            make_item("H2", 55.0, 70.0, 10.0),
+            make_item("D1", 15.0, 40.0, 10.0),
+            make_item("D2", 55.0, 40.0, 10.0),
+            make_item("E1", 15.0, 10.0, 10.0),
+            make_item("E2", 55.0, 10.0, 10.0),
+        ];
+        let group_rects = make_grid_rects();
+        let skip = vec![false; 6];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Ok(table) => {
+                assert!(table.columns.len() >= 2);
+                assert!(table.rows.len() >= 2);
+            }
+            other => panic!(
+                "Expected Ok, got {:?}",
+                match other {
+                    GridResult::FewNonEmptyRows => "FewNonEmptyRows",
+                    GridResult::Failed => "Failed",
+                    GridResult::Ok(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_too_few_edges() {
+        // Only 2 rects → not enough edges for a grid
+        let items = vec![make_item("A", 15.0, 85.0, 10.0)];
+        let group_rects = vec![(10.0, 70.0, 40.0, 20.0), (10.0, 50.0, 40.0, 20.0)];
+        let skip = vec![false; 2];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Failed => {}
+            _ => panic!("Expected Failed"),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_strict_rejects_long_text() {
+        let long_text = "a".repeat(250);
+        let mut long_item = make_item(&long_text, 15.0, 70.0, 10.0);
+        // Override width so the item center stays inside the grid cell
+        long_item.width = 20.0;
+        let items = vec![
+            long_item,
+            make_item("H2", 55.0, 70.0, 10.0),
+            make_item("D1", 15.0, 40.0, 10.0),
+            make_item("D2", 55.0, 40.0, 10.0),
+            make_item("E1", 15.0, 10.0, 10.0),
+            make_item("E2", 55.0, 10.0, 10.0),
+        ];
+        let group_rects = make_grid_rects();
+        let skip = vec![false; 6];
+        match try_build_grid(&items, &group_rects, 1, &skip, true) {
+            GridResult::Failed => {}
+            _ => panic!("Expected Failed due to long text in strict mode"),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_empty_column_rejected() {
+        // All items in column 0 only — column 1 is empty
+        let items = vec![
+            make_item("A", 15.0, 70.0, 10.0),
+            make_item("B", 15.0, 40.0, 10.0),
+            make_item("C", 15.0, 10.0, 10.0),
+        ];
+        let group_rects = make_grid_rects();
+        let skip = vec![false; 6];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Failed => {}
+            _ => panic!("Expected Failed due to empty column"),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_no_items() {
+        let items: Vec<TextItem> = vec![];
+        let group_rects = make_grid_rects();
+        let skip = vec![false; 6];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Failed => {}
+            _ => panic!("Expected Failed with no items"),
+        }
+    }
+
+    #[test]
+    fn test_detect_table_from_rect_group_valid() {
+        let items = vec![
+            make_item("H1", 15.0, 70.0, 10.0),
+            make_item("H2", 55.0, 70.0, 10.0),
+            make_item("D1", 15.0, 40.0, 10.0),
+            make_item("D2", 55.0, 40.0, 10.0),
+            make_item("E1", 15.0, 10.0, 10.0),
+            make_item("E2", 55.0, 10.0, 10.0),
+        ];
+        let group_rects = make_grid_rects();
+        let result = detect_table_from_rect_group(&items, &group_rects, 1);
+        assert!(result.is_some());
+    }
+
+    // --- extract_hint_region ---
+
+    #[test]
+    fn test_extract_hint_region_valid_small_cluster() {
+        let rects = vec![
+            (10.0, 100.0, 200.0, 30.0),
+            (10.0, 140.0, 200.0, 30.0),
+            (10.0, 180.0, 200.0, 30.0),
+        ];
+        let hint = extract_hint_region(&rects);
+        assert!(hint.is_some());
+        let hint = hint.unwrap();
+        assert!(hint.y_top > hint.y_bottom);
+    }
+
+    #[test]
+    fn test_extract_hint_region_too_few_rects() {
+        let rects = vec![(10.0, 100.0, 200.0, 30.0)];
+        assert!(extract_hint_region(&rects).is_none());
+    }
+
+    #[test]
+    fn test_extract_hint_region_too_many_rects() {
+        let rects: Vec<(f32, f32, f32, f32)> = (0..10)
+            .map(|i| (10.0, 100.0 + i as f32 * 30.0, 200.0, 25.0))
+            .collect();
+        assert!(extract_hint_region(&rects).is_none());
+    }
+}

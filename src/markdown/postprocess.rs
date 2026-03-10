@@ -273,3 +273,191 @@ fn format_urls(text: &str) -> String {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- collapse_dot_leaders ---
+
+    #[test]
+    fn test_collapse_dot_leaders_four_or_more_dots() {
+        assert_eq!(
+            collapse_dot_leaders("Introduction............................1"),
+            "Introduction ... 1"
+        );
+    }
+
+    #[test]
+    fn test_collapse_dot_leaders_three_dots_unchanged() {
+        assert_eq!(collapse_dot_leaders("wait...what"), "wait...what");
+    }
+
+    #[test]
+    fn test_collapse_dot_leaders_no_dots() {
+        assert_eq!(collapse_dot_leaders("Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn test_collapse_dot_leaders_mixed() {
+        let input = "Chapter 1.......10\nSome text... ok\nChapter 2........20";
+        let result = collapse_dot_leaders(input);
+        assert!(result.contains("Chapter 1 ... 10"));
+        assert!(result.contains("Some text... ok"));
+        assert!(result.contains("Chapter 2 ... 20"));
+    }
+
+    // --- fix_hyphenation ---
+
+    #[test]
+    fn test_fix_hyphenation_spaced_hyphen() {
+        assert_eq!(fix_hyphenation("Limoeiro - Norte"), "Limoeiro-Norte");
+    }
+
+    #[test]
+    fn test_fix_hyphenation_list_item_unchanged() {
+        assert_eq!(
+            fix_hyphenation("- item one\n- item two"),
+            "- item one\n- item two"
+        );
+    }
+
+    #[test]
+    fn test_fix_hyphenation_accented_chars() {
+        assert_eq!(fix_hyphenation("São - Paulo"), "São-Paulo");
+    }
+
+    #[test]
+    fn test_fix_hyphenation_multiple_instances() {
+        assert_eq!(
+            fix_hyphenation("one - two and three - four"),
+            "one-two and three-four"
+        );
+    }
+
+    // --- is_page_number_line ---
+
+    #[test]
+    fn test_is_page_number_digits_1_to_4() {
+        assert!(is_page_number_line("1"));
+        assert!(is_page_number_line("42"));
+        assert!(is_page_number_line("123"));
+        assert!(is_page_number_line("9999"));
+        assert!(!is_page_number_line("12345"));
+    }
+
+    #[test]
+    fn test_is_page_number_page_x() {
+        assert!(is_page_number_line("Page 5"));
+        assert!(is_page_number_line("page 12"));
+    }
+
+    #[test]
+    fn test_is_page_number_page_x_of_y() {
+        assert!(is_page_number_line("Page 3 of 10"));
+        assert!(is_page_number_line("page 1 of 5"));
+    }
+
+    #[test]
+    fn test_is_page_number_x_of_y() {
+        assert!(is_page_number_line("3 of 10"));
+    }
+
+    #[test]
+    fn test_is_page_number_centered_dash() {
+        assert!(is_page_number_line("- 5 -"));
+        assert!(is_page_number_line("-12-"));
+    }
+
+    #[test]
+    fn test_is_page_number_page_of() {
+        assert!(is_page_number_line("Page of"));
+        assert!(is_page_number_line("page of 10"));
+    }
+
+    #[test]
+    fn test_is_page_number_empty() {
+        assert!(!is_page_number_line(""));
+    }
+
+    #[test]
+    fn test_is_page_number_non_match() {
+        assert!(!is_page_number_line("Hello World"));
+        assert!(!is_page_number_line("Chapter 1"));
+        assert!(!is_page_number_line("Total: 500"));
+    }
+
+    // --- remove_page_numbers ---
+
+    #[test]
+    fn test_remove_page_numbers_isolated_number() {
+        let input = "Some text\n\n42\n\nMore text";
+        let result = remove_page_numbers(input);
+        assert!(!result.contains("\n42\n"));
+        assert!(result.contains("Some text"));
+        assert!(result.contains("More text"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_before_break() {
+        let input = "Content\n\n5\n---\nNext page";
+        let result = remove_page_numbers(input);
+        assert!(!result.contains("\n5\n"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_in_context_kept() {
+        let input = "Line A\nLine B\n42\nLine C\nLine D";
+        let result = remove_page_numbers(input);
+        assert!(result.contains("42"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_multiple_patterns() {
+        let input = "\n1\n\nContent\n\n2\n\n---\nMore\n\n3\n";
+        let result = remove_page_numbers(input);
+        assert!(!result.contains("\n1\n"));
+        assert!(!result.contains("\n2\n"));
+        assert!(!result.contains("\n3\n"));
+    }
+
+    #[test]
+    fn test_remove_page_numbers_empty() {
+        assert_eq!(remove_page_numbers(""), "");
+    }
+
+    // --- format_urls ---
+
+    #[test]
+    fn test_format_urls_bare_url() {
+        let result = format_urls("Visit https://example.com for info");
+        assert!(result.contains("[https://example.com](https://example.com)"));
+    }
+
+    #[test]
+    fn test_format_urls_already_linked() {
+        let input = "[click](https://example.com)";
+        assert_eq!(format_urls(input), input);
+    }
+
+    #[test]
+    fn test_format_urls_inside_brackets() {
+        let input = "[https://example.com](https://example.com)";
+        let result = format_urls(input);
+        assert!(!result.contains("[["));
+    }
+
+    #[test]
+    fn test_format_urls_multiple() {
+        let input = "See https://a.com and https://b.com";
+        let result = format_urls(input);
+        assert!(result.contains("[https://a.com](https://a.com)"));
+        assert!(result.contains("[https://b.com](https://b.com)"));
+    }
+
+    #[test]
+    fn test_format_urls_no_urls() {
+        let input = "No links here";
+        assert_eq!(format_urls(input), input);
+    }
+}
