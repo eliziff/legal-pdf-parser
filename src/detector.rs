@@ -186,6 +186,7 @@ pub(crate) fn detect_from_document(
     let mut pages_with_text = 0u32;
     let mut pages_with_images = 0u32;
     let mut pages_with_template_images = 0u32;
+    let mut pages_with_vector_text = 0u32;
     let mut total_text_ops = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
@@ -195,6 +196,13 @@ pub(crate) fn detect_from_document(
         if let Some(&page_id) = pages.get(page_num) {
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
+            log::debug!(
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} path_ops={} vector_text={} image_area={}",
+                page_num, analysis.text_operator_count, analysis.has_images,
+                analysis.image_count, analysis.has_template_image,
+                analysis.unique_text_chars, analysis.path_op_count, analysis.has_vector_text,
+                analysis.total_image_area
+            );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
             let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
@@ -214,6 +222,9 @@ pub(crate) fn detect_from_document(
             }
             if analysis.has_template_image {
                 pages_with_template_images += 1;
+            }
+            if analysis.has_vector_text {
+                pages_with_vector_text += 1;
             }
             total_text_ops += analysis.text_operator_count;
             analysis_cache.insert(*page_num, analysis.clone());
@@ -261,14 +272,15 @@ pub(crate) fn detect_from_document(
     } else if text_ratio >= config.text_page_ratio_threshold {
         ocr_recommended = false;
         (PdfType::TextBased, text_ratio)
-    } else if pages_with_text == 0 && pages_with_images > 0 {
+    } else if pages_with_text == 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
+        // No extractable text but has images or vector-outlined text
         ocr_recommended = true;
-        if total_text_ops == 0 {
+        if total_text_ops == 0 && pages_with_vector_text == 0 {
             (PdfType::Scanned, 0.95)
         } else {
             (PdfType::ImageBased, 0.8)
         }
-    } else if pages_with_text > 0 && pages_with_images > 0 {
+    } else if pages_with_text > 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
         ocr_recommended = true;
         (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
@@ -767,6 +779,7 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
     let mut has_images = false;
     let mut total_area: u64 = 0;
     let mut has_template_image = false;
+    let mut visited: HashSet<ObjectId> = HashSet::new();
 
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
         let resources = match page_dict.get(b"Resources") {
@@ -776,60 +789,111 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
         };
 
         if let Some(resources) = resources {
-            if let Ok(xobject) = resources.get(b"XObject") {
-                let xobject_dict = match xobject {
-                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
-                    Object::Dictionary(dict) => Some(dict),
-                    _ => None,
-                };
-
-                if let Some(xobject_dict) = xobject_dict {
-                    for (_, value) in xobject_dict.iter() {
-                        if let Ok(xobj_ref) = value.as_reference() {
-                            if let Ok(xobj) = doc.get_object(xobj_ref) {
-                                if let Ok(stream) = xobj.as_stream() {
-                                    // Check if it's an Image subtype
-                                    if let Ok(subtype) = stream.dict.get(b"Subtype") {
-                                        if let Ok(name) = subtype.as_name() {
-                                            if name == b"Image" {
-                                                has_images = true;
-
-                                                // Get image dimensions
-                                                let width = stream
-                                                    .dict
-                                                    .get(b"Width")
-                                                    .ok()
-                                                    .and_then(|w| w.as_i64().ok())
-                                                    .unwrap_or(0)
-                                                    as u64;
-                                                let height = stream
-                                                    .dict
-                                                    .get(b"Height")
-                                                    .ok()
-                                                    .and_then(|h| h.as_i64().ok())
-                                                    .unwrap_or(0)
-                                                    as u64;
-
-                                                let area = width * height;
-                                                total_area += area;
-
-                                                // Check if this is a large template image
-                                                if area >= TEMPLATE_IMAGE_THRESHOLD {
-                                                    has_template_image = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            collect_images_from_resources(
+                doc,
+                resources,
+                &mut has_images,
+                &mut total_area,
+                &mut has_template_image,
+                TEMPLATE_IMAGE_THRESHOLD,
+                &mut visited,
+            );
         }
     }
 
     (has_images, total_area, has_template_image)
+}
+
+/// Recursively collect image dimensions from XObject resources,
+/// including images nested inside Form XObjects.
+fn collect_images_from_resources(
+    doc: &Document,
+    resources: &lopdf::Dictionary,
+    has_images: &mut bool,
+    total_area: &mut u64,
+    has_template_image: &mut bool,
+    threshold: u64,
+    visited: &mut HashSet<ObjectId>,
+) {
+    let xobject = match resources.get(b"XObject") {
+        Ok(obj) => obj,
+        _ => return,
+    };
+    let xobject_dict = match xobject {
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        Object::Dictionary(dict) => Some(dict),
+        _ => None,
+    };
+    let Some(xobject_dict) = xobject_dict else {
+        return;
+    };
+
+    for (_, value) in xobject_dict.iter() {
+        let xobj_ref = match value.as_reference() {
+            Ok(r) => r,
+            _ => continue,
+        };
+        if !visited.insert(xobj_ref) {
+            continue;
+        }
+        let xobj = match doc.get_object(xobj_ref) {
+            Ok(o) => o,
+            _ => continue,
+        };
+        let stream = match xobj.as_stream() {
+            Ok(s) => s,
+            _ => continue,
+        };
+        let subtype = match stream.dict.get(b"Subtype") {
+            Ok(s) => s,
+            _ => continue,
+        };
+        let name = match subtype.as_name() {
+            Ok(n) => n,
+            _ => continue,
+        };
+
+        if name == b"Image" {
+            *has_images = true;
+            let width = stream
+                .dict
+                .get(b"Width")
+                .ok()
+                .and_then(|w| w.as_i64().ok())
+                .unwrap_or(0) as u64;
+            let height = stream
+                .dict
+                .get(b"Height")
+                .ok()
+                .and_then(|h| h.as_i64().ok())
+                .unwrap_or(0) as u64;
+            let area = width * height;
+            *total_area += area;
+            if area >= threshold {
+                *has_template_image = true;
+            }
+        } else if name == b"Form" {
+            // Recurse into Form XObject's own Resources
+            if let Ok(form_resources) = stream.dict.get(b"Resources") {
+                let form_res_dict = match form_resources {
+                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                    Object::Dictionary(dict) => Some(dict),
+                    _ => None,
+                };
+                if let Some(form_res) = form_res_dict {
+                    collect_images_from_resources(
+                        doc,
+                        form_res,
+                        has_images,
+                        total_area,
+                        has_template_image,
+                        threshold,
+                        visited,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Get document title from Info dictionary
