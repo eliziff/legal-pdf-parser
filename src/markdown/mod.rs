@@ -127,6 +127,153 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     vec![(x_min, best_split), (best_split, x_max)]
 }
 
+/// Derive a side-by-side split from rect hint regions.
+///
+/// When `split_side_by_side` doesn't detect a gap (e.g. the text gap is too
+/// small), hint regions from large rect clusters can still reveal a left/right
+/// zone layout (calendar months, form sections).  This function checks if hint
+/// regions pair up at the same Y bands and returns `[(x_min, split), (split,
+/// x_max)]` if a consistent split exists.
+fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<(f32, f32)> {
+    use crate::tables::{cluster_rects, RectHintRegion};
+
+    // Quick hint region computation (same logic as detect_tables_from_rects
+    // but without table detection).
+    let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for r in rects {
+        if r.page != page {
+            continue;
+        }
+        let (mut x, mut y, mut w, mut h) = (r.x, r.y, r.width, r.height);
+        if w < 0.0 {
+            x += w;
+            w = -w;
+        }
+        if h < 0.0 {
+            y += h;
+            h = -h;
+        }
+        if w < 5.0 || h < 5.0 {
+            continue;
+        }
+        page_rects.push((x, y, w, h));
+    }
+    if page_rects.len() < 60 {
+        return vec![];
+    }
+
+    // Width outlier filter (same as detect_tables_from_rects)
+    let mut widths: Vec<f32> = page_rects.iter().map(|&(_, _, w, _)| w).collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_width = widths[widths.len() / 2];
+    page_rects.retain(|&(_, _, w, _)| w <= median_width * 10.0);
+
+    let clusters = cluster_rects(&page_rects, 3.0, 6);
+    if clusters.len() < 4 {
+        return vec![];
+    }
+
+    // Build hint regions from large clusters
+    let mut hints: Vec<RectHintRegion> = Vec::new();
+    for cluster_indices in &clusters {
+        let group_rects: Vec<(f32, f32, f32, f32)> =
+            cluster_indices.iter().map(|&i| page_rects[i]).collect();
+        if group_rects.len() < 30 {
+            continue;
+        }
+        let x_left = group_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
+        let x_right = group_rects
+            .iter()
+            .map(|r| r.0 + r.2)
+            .reduce(f32::max)
+            .unwrap();
+        let y_bottom = group_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
+        let y_top = group_rects
+            .iter()
+            .map(|r| r.1 + r.3)
+            .reduce(f32::max)
+            .unwrap();
+        let w = x_right - x_left;
+        let h = y_top - y_bottom;
+        if (30.0..=400.0).contains(&w) && (10.0..=400.0).contains(&h) {
+            hints.push(RectHintRegion {
+                y_top,
+                y_bottom,
+                x_left,
+                x_right,
+                cluster_rects: Vec::new(),
+            });
+        }
+    }
+    if hints.len() < 4 {
+        return vec![];
+    }
+
+    // Check for left/right pairing: hints at the same Y band should split
+    // into distinct X groups.  Count pairs where two hints share a Y band
+    // (>50% overlap) but occupy different X halves.
+    let page_x_mid = {
+        let x_min = items.iter().map(|i| i.x).reduce(f32::min).unwrap_or(0.0);
+        let x_max = items
+            .iter()
+            .map(|i| i.x + i.width)
+            .reduce(f32::max)
+            .unwrap_or(800.0);
+        (x_min + x_max) / 2.0
+    };
+
+    let mut pair_count = 0;
+    for (i, a) in hints.iter().enumerate() {
+        for b in hints.iter().skip(i + 1) {
+            let y_overlap = a.y_top.min(b.y_top) - a.y_bottom.max(b.y_bottom);
+            let y_min_span = (a.y_top - a.y_bottom).min(b.y_top - b.y_bottom);
+            if y_overlap > y_min_span * 0.5 {
+                let a_center = (a.x_left + a.x_right) / 2.0;
+                let b_center = (b.x_left + b.x_right) / 2.0;
+                if (a_center < page_x_mid) != (b_center < page_x_mid) {
+                    pair_count += 1;
+                }
+            }
+        }
+    }
+
+    // Require at least 3 left/right pairs to confirm the layout
+    if pair_count < 3 {
+        return vec![];
+    }
+
+    // Find the split X: midpoint between the rightmost left-zone hint
+    // and the leftmost right-zone hint
+    let max_left_x = hints
+        .iter()
+        .filter(|h| (h.x_left + h.x_right) / 2.0 < page_x_mid)
+        .map(|h| h.x_right)
+        .reduce(f32::max);
+    let min_right_x = hints
+        .iter()
+        .filter(|h| (h.x_left + h.x_right) / 2.0 >= page_x_mid)
+        .map(|h| h.x_left)
+        .reduce(f32::min);
+
+    if let (Some(left_edge), Some(right_edge)) = (max_left_x, min_right_x) {
+        let split_x = (left_edge + right_edge) / 2.0;
+        let x_min = items.iter().map(|i| i.x).reduce(f32::min).unwrap_or(0.0);
+        let x_max = items
+            .iter()
+            .map(|i| i.x + i.width)
+            .reduce(f32::max)
+            .unwrap_or(800.0);
+        log::debug!(
+            "page {}: hint-derived side-by-side split at x={:.1}",
+            page,
+            split_x
+        );
+        vec![(x_min, split_x), (split_x, x_max)]
+    } else {
+        vec![]
+    }
+}
+
 /// Filter rects to those mostly contained within an X band.
 ///
 /// Excludes rects that extend significantly beyond the band (e.g. page-wide
@@ -320,6 +467,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 ) -> String {
     use crate::tables::{
         detect_tables, detect_tables_from_lines, detect_tables_from_rects, table_to_markdown,
+        try_build_rect_guided_table,
     };
     use crate::types::ItemType;
 
@@ -390,12 +538,27 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pages.sort();
     let page_count = pages.last().copied().unwrap_or(0) + 1;
 
+    // Track band splits per page so we can split non-table items later
+    let mut page_band_splits: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
+
     for page in pages {
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
         // Check for side-by-side layout (e.g. two tables placed left and right)
-        let bands = split_side_by_side(&page_items);
+        let mut bands = split_side_by_side(&page_items);
+        // Fallback: use rect hint regions to detect side-by-side layout
+        // when the text gap is too narrow for split_side_by_side to detect
+        // (e.g. calendars with left/right month columns ~10pt apart).
+        if bands.is_empty() {
+            bands = split_from_hint_regions(&page_items, rects, page);
+            // Only track hint-derived splits for non-table line grouping.
+            // split_side_by_side splits already scope table detection and
+            // their non-table items should flow through normal line grouping.
+            if !bands.is_empty() {
+                page_band_splits.insert(page, bands.clone());
+            }
+        }
 
         // Build list of (band_items, band_index_map, band_rects, band_lines).
         // band_index_map[local_band_idx] → page_items index.
@@ -479,7 +642,52 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
 
-            // 3. Heuristic fallback on unclaimed items
+            // 3a. Try rect-guided table construction on hint regions before
+            //     creating the heuristic closure (avoids borrow conflicts).
+            if rect_claimed.is_empty() && !hint_regions.is_empty() {
+                let padding = 15.0;
+                for hint in &hint_regions {
+                    if hint.cluster_rects.is_empty() {
+                        continue;
+                    }
+                    let (inside_items, inside_map): (Vec<TextItem>, Vec<usize>) = band_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| {
+                            item.y >= hint.y_bottom - padding
+                                && item.y <= hint.y_top + padding
+                                && item.x >= hint.x_left - padding
+                                && item.x <= hint.x_right + padding
+                        })
+                        .map(|(idx, item)| (item.clone(), idx))
+                        .unzip();
+
+                    if let Some(table) =
+                        try_build_rect_guided_table(&inside_items, &hint.cluster_rects)
+                    {
+                        for &idx in &table.item_indices {
+                            if let Some(&band_idx) = inside_map.get(idx) {
+                                if let Some(&page_idx) = band_index_map.get(band_idx) {
+                                    if let Some(&(global_idx, _)) = group.get(page_idx) {
+                                        table_items.insert(global_idx);
+                                    }
+                                }
+                            }
+                        }
+                        let table_y = table.rows.first().copied().unwrap_or(0.0);
+                        let table_md = table_to_markdown(&table);
+                        page_tables
+                            .entry(page)
+                            .or_default()
+                            .push((table_y, table_md));
+                        for &band_idx in &inside_map {
+                            rect_claimed.insert(band_idx);
+                        }
+                    }
+                }
+            }
+
+            // 3b. Heuristic fallback on unclaimed items
             let mut run_heuristic =
                 |subset_items: &[TextItem], index_map: &[usize], min_items: usize| {
                     if subset_items.len() < min_items {
@@ -569,7 +777,50 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Merge continuation tables across page breaks, but only for table-only pages
     merge_continuation_tables(&mut page_tables, &table_only_pages);
 
-    let lines = group_into_lines(non_table_items);
+    // Split non-table items by band boundaries before line grouping so that
+    // items from different side-by-side zones (e.g. left/right month columns
+    // in a calendar) don't merge into the same line.
+    let lines = if page_band_splits.is_empty() {
+        group_into_lines(non_table_items)
+    } else {
+        // Separate items into band-split pages and non-split pages
+        let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+        let mut unsplit_items: Vec<TextItem> = Vec::new();
+        for item in non_table_items {
+            if page_band_splits.contains_key(&item.page) {
+                split_page_items.entry(item.page).or_default().push(item);
+            } else {
+                unsplit_items.push(item);
+            }
+        }
+        // Process unsplit pages normally
+        let mut all_lines = group_into_lines(unsplit_items);
+        // Process each split page's bands independently, then interleave
+        // by Y position so paired zones (e.g. left/right months) appear together.
+        let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
+        split_pages.sort();
+        for page in split_pages {
+            let items = split_page_items.remove(&page).unwrap();
+            let bands = &page_band_splits[&page];
+            let mut page_lines: Vec<crate::types::TextLine> = Vec::new();
+            for &(x_lo, x_hi) in bands {
+                let margin = 2.0;
+                let band_items: Vec<TextItem> = items
+                    .iter()
+                    .filter(|i| i.x >= x_lo - margin && i.x < x_hi + margin)
+                    .cloned()
+                    .collect();
+                if !band_items.is_empty() {
+                    page_lines.extend(group_into_lines(band_items));
+                }
+            }
+            // Sort by Y descending (top to bottom) so left and right
+            // band lines interleave in visual reading order.
+            page_lines.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+            all_lines.extend(page_lines);
+        }
+        all_lines
+    };
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
@@ -579,7 +830,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     };
 
     // Convert to markdown, inserting tables and images at appropriate positions
-    to_markdown_from_lines_with_tables_and_images(lines, options, page_tables, page_images)
+    let band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+    to_markdown_from_lines_with_tables_and_images(
+        lines,
+        options,
+        page_tables,
+        page_images,
+        &band_split_page_set,
+    )
 }
 
 #[cfg(test)]
@@ -649,5 +907,54 @@ mod tests {
         let md = to_markdown(text, MarkdownOptions::default());
         assert!(md.contains("- First item"));
         assert!(md.contains("- Second item"));
+    }
+
+    fn make_item(x: f32, y: f32, page: u32) -> TextItem {
+        TextItem {
+            text: "A".into(),
+            x,
+            y,
+            width: 5.0,
+            height: 10.0,
+            font: String::new(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            item_type: crate::types::ItemType::Text,
+        }
+    }
+
+    #[test]
+    fn split_from_hint_regions_too_few_rects() {
+        // Fewer than 60 rects → no split
+        let items = vec![make_item(10.0, 100.0, 1)];
+        let rects: Vec<PdfRect> = (0..30)
+            .map(|i| PdfRect {
+                x: 10.0 + (i % 7) as f32 * 15.0,
+                y: 100.0 + (i / 7) as f32 * 15.0,
+                width: 10.0,
+                height: 10.0,
+                page: 1,
+            })
+            .collect();
+        assert!(split_from_hint_regions(&items, &rects, 1).is_empty());
+    }
+
+    #[test]
+    fn split_from_hint_regions_no_pairs() {
+        // Enough rects but all in one X zone → no left/right pairs → no split
+        let items = vec![make_item(10.0, 100.0, 1)];
+        // 80 rects all in left half
+        let rects: Vec<PdfRect> = (0..80)
+            .map(|i| PdfRect {
+                x: 10.0 + (i % 10) as f32 * 15.0,
+                y: 100.0 + (i / 10) as f32 * 15.0,
+                width: 10.0,
+                height: 10.0,
+                page: 1,
+            })
+            .collect();
+        assert!(split_from_hint_regions(&items, &rects, 1).is_empty());
     }
 }

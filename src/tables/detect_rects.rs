@@ -97,6 +97,71 @@ pub(crate) fn cluster_rects(
     result.into_iter().map(|(_, g)| g).collect()
 }
 
+/// Split a rect cluster at the widest X-gap when detection fails.
+/// Returns sub-groups only if a gap >= `min_gap` exists and both sides have >= `min_group_size` rects.
+#[allow(clippy::type_complexity)]
+fn split_wide_cluster(
+    rects: &[(f32, f32, f32, f32)],
+    min_gap: f32,
+    min_group_size: usize,
+) -> Option<(Vec<(f32, f32, f32, f32)>, Vec<(f32, f32, f32, f32)>)> {
+    if rects.len() < min_group_size * 2 {
+        return None;
+    }
+
+    // Build sorted list of X-intervals (x_left, x_right) from each rect
+    let mut intervals: Vec<(f32, f32)> = rects.iter().map(|&(x, _, w, _)| (x, x + w)).collect();
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Merge overlapping intervals to find contiguous X-bands
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (start, end) in &intervals {
+        if let Some(last) = merged.last_mut() {
+            if *start <= last.1 + 1.0 {
+                last.1 = last.1.max(*end);
+                continue;
+            }
+        }
+        merged.push((*start, *end));
+    }
+
+    if merged.len() < 2 {
+        return None;
+    }
+
+    // Find the widest gap between consecutive merged intervals
+    let mut best_gap = 0.0_f32;
+    let mut best_split_x = 0.0_f32;
+    for i in 1..merged.len() {
+        let gap = merged[i].0 - merged[i - 1].1;
+        if gap > best_gap {
+            best_gap = gap;
+            best_split_x = (merged[i - 1].1 + merged[i].0) / 2.0;
+        }
+    }
+
+    if best_gap < min_gap {
+        return None;
+    }
+
+    let left: Vec<_> = rects
+        .iter()
+        .filter(|&&(x, _, w, _)| x + w / 2.0 < best_split_x)
+        .copied()
+        .collect();
+    let right: Vec<_> = rects
+        .iter()
+        .filter(|&&(x, _, w, _)| x + w / 2.0 >= best_split_x)
+        .copied()
+        .collect();
+
+    if left.len() >= min_group_size && right.len() >= min_group_size {
+        Some((left, right))
+    } else {
+        None
+    }
+}
+
 /// A bounding box hint from cell-border rects that failed full grid validation.
 ///
 /// When a rect cluster contains cell-sized borders but they don't form a valid
@@ -110,6 +175,12 @@ pub struct RectHintRegion {
     pub y_top: f32,
     /// Y coordinate of the bottom edge (lowest value in PDF space)
     pub y_bottom: f32,
+    /// X coordinate of the left edge
+    pub x_left: f32,
+    /// X coordinate of the right edge
+    pub x_right: f32,
+    /// Raw rects from the cluster (x, y, w, h) for rect-guided table building
+    pub cluster_rects: Vec<(f32, f32, f32, f32)>,
 }
 
 /// Detect tables from explicit rectangle (`re`) operators in the PDF.
@@ -227,6 +298,22 @@ pub fn detect_tables_from_rects(
                 tables.push(table);
             } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
                 tables.push(table);
+            } else if let Some((left, right)) = split_wide_cluster(&group_rects, 15.0, 6) {
+                // Cluster was too wide — retry each half independently
+                debug!(
+                    "page {}: splitting cluster of {} rects into {} + {} at x-gap",
+                    page,
+                    group_rects.len(),
+                    left.len(),
+                    right.len()
+                );
+                for sub in [&left, &right] {
+                    if let Some(table) = detect_table_from_rect_group(items, sub, page) {
+                        tables.push(table);
+                    } else if let Some(table) = detect_row_stripe_table(items, sub, page) {
+                        tables.push(table);
+                    }
+                }
             }
         }
 
@@ -287,27 +374,143 @@ pub fn detect_tables_from_rects(
         }
     }
 
-    // On rect-sparse pages (≤ 6 rects), a few cell-border rects may define the
-    // table region even though they can't form a full grid (e.g. only horizontal
-    // row borders, no column dividers).  Extract a hint region so the heuristic
-    // detector can be scoped to just that area, preventing nearby graph labels
-    // or other content from being merged into the table.
-    if tables.is_empty() && page_rects.len() >= 4 && page_rects.len() <= 6 {
-        let clusters = cluster_rects(&page_rects, 3.0, 4);
-        for cluster_indices in &clusters {
-            let group_rects: Vec<(f32, f32, f32, f32)> =
-                cluster_indices.iter().map(|&i| page_rects[i]).collect();
-            if let Some(hint) = extract_hint_region(&group_rects) {
+    if tables.is_empty() {
+        // When no tables detected but clusters exist, generate XY hint regions
+        // from cluster bounding boxes to scope heuristic table detection.
+        // This handles both large decorative-rect clusters (calendars, forms)
+        // and small cell-border clusters on rect-sparse pages.
+        if page_rects.len() >= 6 {
+            let clusters = cluster_rects(&page_rects, 3.0, 6);
+            for cluster_indices in &clusters {
+                let group_rects: Vec<(f32, f32, f32, f32)> =
+                    cluster_indices.iter().map(|&i| page_rects[i]).collect();
+                if group_rects.len() < 30 {
+                    continue;
+                }
+                let x_left = group_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
+                let x_right = group_rects
+                    .iter()
+                    .map(|r| r.0 + r.2)
+                    .reduce(f32::max)
+                    .unwrap();
+                let y_bottom = group_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
+                let y_top = group_rects
+                    .iter()
+                    .map(|r| r.1 + r.3)
+                    .reduce(f32::max)
+                    .unwrap();
+                let w = x_right - x_left;
+                let h = y_top - y_bottom;
+                if (30.0..=400.0).contains(&w) && (10.0..=400.0).contains(&h) {
+                    debug!(
+                        "page {}: hint candidate from {} rects: x={:.1}..{:.1} y={:.1}..{:.1} ({:.0}×{:.0})",
+                        page, group_rects.len(), x_left, x_right, y_bottom, y_top, w, h
+                    );
+                    hint_regions.push(RectHintRegion {
+                        y_top,
+                        y_bottom,
+                        x_left,
+                        x_right,
+                        cluster_rects: group_rects.clone(),
+                    });
+                }
+            }
+            // Deduplicate overlapping hints
+            hint_regions = merge_overlapping_hints(hint_regions);
+            // Require multiple hint regions to confirm a multi-zone layout
+            // (calendars, forms). A single hint is likely a decorative cluster
+            // that would interfere with full-page heuristic detection.
+            if hint_regions.len() < 2 {
+                hint_regions.clear();
+            }
+            if !hint_regions.is_empty() {
                 debug!(
-                    "page {}: hint region y={:.1}..{:.1}",
-                    page, hint.y_bottom, hint.y_top
+                    "page {}: {} XY hint regions from failed clusters",
+                    page,
+                    hint_regions.len()
                 );
-                hint_regions.push(hint);
+            }
+        }
+
+        // On rect-sparse pages (≤ 6 rects), a few cell-border rects may define the
+        // table region even though they can't form a full grid (e.g. only horizontal
+        // row borders, no column dividers).  Extract a hint region so the heuristic
+        // detector can be scoped to just that area.
+        if hint_regions.is_empty() && page_rects.len() >= 4 && page_rects.len() <= 6 {
+            let small_clusters = cluster_rects(&page_rects, 3.0, 4);
+            for cluster_indices in &small_clusters {
+                let group_rects: Vec<(f32, f32, f32, f32)> =
+                    cluster_indices.iter().map(|&i| page_rects[i]).collect();
+                if let Some(hint) = extract_hint_region(&group_rects) {
+                    debug!(
+                        "page {}: hint region y={:.1}..{:.1} x={:.1}..{:.1}",
+                        page, hint.y_bottom, hint.y_top, hint.x_left, hint.x_right
+                    );
+                    hint_regions.push(hint);
+                }
             }
         }
     }
 
     (tables, hint_regions)
+}
+
+/// Merge nearby hint regions that share a Y band.
+///
+/// Two hints merge when they have substantial Y overlap (>50%) AND their X ranges
+/// overlap or are close (gap < 50pt).  This handles calendar-style layouts where a
+/// month zone's decorative rects split into 2-3 adjacent clusters with small X gaps.
+/// Runs iteratively until no more merges occur.
+fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
+    if hints.len() <= 1 {
+        return hints;
+    }
+    loop {
+        hints.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).unwrap());
+        let mut merged: Vec<RectHintRegion> = Vec::new();
+        let mut any_merged = false;
+        for hint in &hints {
+            let mut did_merge = false;
+            for existing in merged.iter_mut() {
+                // Check Y overlap (>50% of smaller span)
+                let y_overlap =
+                    existing.y_top.min(hint.y_top) - existing.y_bottom.max(hint.y_bottom);
+                let y_min_span =
+                    (existing.y_top - existing.y_bottom).min(hint.y_top - hint.y_bottom);
+                if y_overlap <= y_min_span * 0.5 {
+                    continue;
+                }
+                // Check X: overlapping or adjacent (gap < 50pt)
+                let x_gap = existing.x_left.max(hint.x_left) - existing.x_right.min(hint.x_right);
+                if x_gap < 50.0 {
+                    // Don't merge if result would exceed max hint width (400pt)
+                    let merged_left = existing.x_left.min(hint.x_left);
+                    let merged_right = existing.x_right.max(hint.x_right);
+                    if merged_right - merged_left > 400.0 {
+                        continue;
+                    }
+                    existing.x_left = merged_left;
+                    existing.x_right = merged_right;
+                    existing.y_bottom = existing.y_bottom.min(hint.y_bottom);
+                    existing.y_top = existing.y_top.max(hint.y_top);
+                    existing
+                        .cluster_rects
+                        .extend_from_slice(&hint.cluster_rects);
+                    did_merge = true;
+                    any_merged = true;
+                    break;
+                }
+            }
+            if !did_merge {
+                merged.push(hint.clone());
+            }
+        }
+        hints = merged;
+        if !any_merged {
+            break;
+        }
+    }
+    hints
 }
 
 /// Extract a hint region from a rect cluster that failed grid validation.
@@ -340,11 +543,16 @@ fn extract_hint_region(group_rects: &[(f32, f32, f32, f32)]) -> Option<RectHintR
         return None;
     }
 
-    // Compute Y bounding box of cell-sized rects
+    // Compute bounding box of cell-sized rects
     let y_bottom = cell_rects.iter().map(|(_, y, _, _)| *y).reduce(f32::min)?;
     let y_top = cell_rects
         .iter()
         .map(|(_, y, _, h)| *y + *h)
+        .reduce(f32::max)?;
+    let x_left = cell_rects.iter().map(|(x, _, _, _)| *x).reduce(f32::min)?;
+    let x_right = cell_rects
+        .iter()
+        .map(|(x, _, w, _)| *x + *w)
         .reduce(f32::max)?;
 
     // The region must have meaningful height but not span an unreasonable area
@@ -353,7 +561,13 @@ fn extract_hint_region(group_rects: &[(f32, f32, f32, f32)]) -> Option<RectHintR
         return None;
     }
 
-    Some(RectHintRegion { y_top, y_bottom })
+    Some(RectHintRegion {
+        y_top,
+        y_bottom,
+        x_left,
+        x_right,
+        cluster_rects: Vec::new(),
+    })
 }
 
 /// Detect a single table from a cluster of spatially connected rects.
@@ -1793,5 +2007,290 @@ mod tests {
             .map(|i| (10.0, 100.0 + i as f32 * 30.0, 200.0, 25.0))
             .collect();
         assert!(extract_hint_region(&rects).is_none());
+    }
+
+    // --- split_wide_cluster ---
+
+    #[test]
+    fn split_at_wide_gap() {
+        // Left zone: x=10..50, Right zone: x=80..120 → gap of 30pt
+        let mut rects = Vec::new();
+        for i in 0..8 {
+            rects.push((10.0, i as f32 * 20.0, 40.0, 15.0)); // left
+            rects.push((80.0, i as f32 * 20.0, 40.0, 15.0)); // right
+        }
+        let result = split_wide_cluster(&rects, 15.0, 6);
+        assert!(result.is_some());
+        let (left, right) = result.unwrap();
+        assert!(left.iter().all(|&(x, _, _, _)| x < 60.0));
+        assert!(right.iter().all(|&(x, _, _, _)| x >= 60.0));
+    }
+
+    #[test]
+    fn no_split_narrow_gap() {
+        // Left zone: x=10..50, Right zone: x=55..95 → gap of only 5pt
+        let mut rects = Vec::new();
+        for i in 0..8 {
+            rects.push((10.0, i as f32 * 20.0, 40.0, 15.0));
+            rects.push((55.0, i as f32 * 20.0, 40.0, 15.0));
+        }
+        assert!(split_wide_cluster(&rects, 15.0, 6).is_none());
+    }
+
+    #[test]
+    fn no_split_small_subgroup() {
+        // Left zone: 2 rects, Right zone: 8 rects → left too small (< 6)
+        let mut rects = Vec::new();
+        for i in 0..2 {
+            rects.push((10.0, i as f32 * 20.0, 40.0, 15.0));
+        }
+        for i in 0..8 {
+            rects.push((80.0, i as f32 * 20.0, 40.0, 15.0));
+        }
+        // Also fails min total: 10 < 12 (min_group_size * 2 = 12)
+        assert!(split_wide_cluster(&rects, 15.0, 6).is_none());
+    }
+
+    #[test]
+    fn split_preserves_all_rects() {
+        let mut rects = Vec::new();
+        for i in 0..10 {
+            rects.push((10.0, i as f32 * 20.0, 40.0, 15.0));
+            rects.push((80.0, i as f32 * 20.0, 40.0, 15.0));
+        }
+        let (left, right) = split_wide_cluster(&rects, 15.0, 6).unwrap();
+        assert_eq!(left.len() + right.len(), rects.len());
+    }
+
+    #[test]
+    fn no_split_single_band() {
+        // All rects overlap in X → single merged interval, no gap
+        let rects: Vec<(f32, f32, f32, f32)> = (0..12)
+            .map(|i| (10.0 + i as f32 * 5.0, i as f32 * 20.0, 40.0, 15.0))
+            .collect();
+        assert!(split_wide_cluster(&rects, 15.0, 6).is_none());
+    }
+
+    // --- XY hint regions from failed clusters ---
+
+    #[test]
+    fn hint_from_failed_large_clusters() {
+        // Two separate clusters of 36 rects (6×6) each, placed side by side
+        // with a large gap so they form two distinct clusters.
+        // Requires ≥2 qualifying clusters to produce hints (multi-zone layout).
+        let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        // Cluster 1: x=50..120, y=100..170
+        for row in 0..6 {
+            for col in 0..6 {
+                page_rects.push((
+                    50.0 + col as f32 * 12.0,
+                    100.0 + row as f32 * 12.0,
+                    10.0,
+                    10.0,
+                ));
+            }
+        }
+        // Cluster 2: x=250..320, y=100..170 (130pt gap from cluster 1)
+        for row in 0..6 {
+            for col in 0..6 {
+                page_rects.push((
+                    250.0 + col as f32 * 12.0,
+                    100.0 + row as f32 * 12.0,
+                    10.0,
+                    10.0,
+                ));
+            }
+        }
+        let items: Vec<TextItem> = vec![];
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert_eq!(hints.len(), 2);
+        // Cluster 1: x=50..120, y=100..170
+        assert!((hints[0].x_left - 50.0).abs() < 1.0);
+        assert!((hints[0].x_right - 120.0).abs() < 1.0);
+        assert!((hints[0].y_bottom - 100.0).abs() < 1.0);
+        assert!((hints[0].y_top - 170.0).abs() < 1.0);
+        // Cluster 2: x=250..320, y=100..170
+        assert!((hints[1].x_left - 250.0).abs() < 1.0);
+        assert!((hints[1].x_right - 320.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn no_hint_single_large_cluster() {
+        // Single cluster of 36 rects — not enough (need ≥2 zones)
+        let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..6 {
+                page_rects.push((
+                    50.0 + col as f32 * 12.0,
+                    100.0 + row as f32 * 12.0,
+                    10.0,
+                    10.0,
+                ));
+            }
+        }
+        let items: Vec<TextItem> = vec![];
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn no_hint_too_few_rects() {
+        // 5 rects (< 10 threshold for large-cluster hints, also < 6 for clustering)
+        let rects: Vec<crate::types::PdfRect> = (0..5)
+            .map(|i| crate::types::PdfRect {
+                x: 50.0 + i as f32 * 30.0,
+                y: 100.0,
+                width: 20.0,
+                height: 20.0,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&[], &rects, 1);
+        assert!(tables.is_empty());
+        // 5 rects: not enough for ≥6 clustering, and rect-sparse path needs 4-6
+        // but clusters of ≥4 won't form with disconnected rects (30pt gap > 3pt tol)
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn no_hint_page_spanning_width() {
+        // Rects spanning > 400pt width → no hint
+        let mut page_rects = Vec::new();
+        for i in 0..12 {
+            page_rects.push(crate::types::PdfRect {
+                x: i as f32 * 40.0,
+                y: 100.0,
+                width: 38.0,
+                height: 10.0,
+                page: 1,
+            });
+        }
+        let (tables, hints) = detect_tables_from_rects(&[], &page_rects, 1);
+        assert!(tables.is_empty());
+        assert!(hints.is_empty());
+    }
+
+    // --- merge_overlapping_hints ---
+
+    #[test]
+    fn merge_overlapping_hints_dedup() {
+        let hints = vec![
+            RectHintRegion {
+                x_left: 50.0,
+                x_right: 250.0,
+                y_bottom: 100.0,
+                y_top: 200.0,
+                cluster_rects: Vec::new(),
+            },
+            RectHintRegion {
+                x_left: 60.0,
+                x_right: 260.0,
+                y_bottom: 110.0,
+                y_top: 210.0,
+                cluster_rects: Vec::new(),
+            },
+        ];
+        let merged = merge_overlapping_hints(hints);
+        assert_eq!(merged.len(), 1);
+        assert!((merged[0].x_left - 50.0).abs() < 0.01);
+        assert!((merged[0].x_right - 260.0).abs() < 0.01);
+        assert!((merged[0].y_bottom - 100.0).abs() < 0.01);
+        assert!((merged[0].y_top - 210.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn merge_overlapping_hints_disjoint() {
+        let hints = vec![
+            RectHintRegion {
+                x_left: 50.0,
+                x_right: 200.0,
+                y_bottom: 100.0,
+                y_top: 200.0,
+                cluster_rects: Vec::new(),
+            },
+            RectHintRegion {
+                x_left: 350.0,
+                x_right: 500.0,
+                y_bottom: 100.0,
+                y_top: 200.0,
+                cluster_rects: Vec::new(),
+            },
+        ];
+        let merged = merge_overlapping_hints(hints);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_hints_blocked_by_max_width() {
+        // Two hints in the same Y band with small X gap (8pt) but combined
+        // width > 400pt. Simulates left/right calendar month zones that
+        // should NOT merge.
+        let hints = vec![
+            RectHintRegion {
+                x_left: 20.0,
+                x_right: 340.0,
+                y_bottom: 100.0,
+                y_top: 170.0,
+                cluster_rects: Vec::new(),
+            },
+            RectHintRegion {
+                x_left: 348.0,
+                x_right: 668.0,
+                y_bottom: 100.0,
+                y_top: 170.0,
+                cluster_rects: Vec::new(),
+            },
+        ];
+        let merged = merge_overlapping_hints(hints);
+        // Should remain separate: merged width would be 648pt > 400pt
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_hints_adjacent_fragments() {
+        // Two fragments of the same zone with small gap, combined width < 400pt.
+        // Should merge.
+        let hints = vec![
+            RectHintRegion {
+                x_left: 20.0,
+                x_right: 266.0,
+                y_bottom: 100.0,
+                y_top: 170.0,
+                cluster_rects: Vec::new(),
+            },
+            RectHintRegion {
+                x_left: 276.0,
+                x_right: 340.0,
+                y_bottom: 100.0,
+                y_top: 170.0,
+                cluster_rects: Vec::new(),
+            },
+        ];
+        let merged = merge_overlapping_hints(hints);
+        assert_eq!(merged.len(), 1);
+        assert!((merged[0].x_left - 20.0).abs() < 0.01);
+        assert!((merged[0].x_right - 340.0).abs() < 0.01);
     }
 }

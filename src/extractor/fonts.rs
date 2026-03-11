@@ -778,7 +778,9 @@ pub(crate) fn extract_text_from_operand(
                 None
             };
 
+            let mut has_cmap = false;
             if let Some(entry) = inline_cmaps.get(current_font) {
+                has_cmap = true;
                 if let Some(decoded) = decode_with_entry(entry) {
                     return Some(decoded);
                 }
@@ -787,11 +789,17 @@ pub(crate) fn extract_text_from_operand(
             // Look up CMap by ToUnicode object reference
             if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
                 if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
+                    has_cmap = true;
                     if let Some(decoded) = decode_with_entry(entry) {
                         return Some(decoded);
                     }
                 }
             }
+
+            // CID fonts with a CMap that couldn't decode: the CID is genuinely
+            // unmapped. Don't fall through to text-interpretation fallbacks
+            // (Latin-1, UTF-16, etc.) which would misinterpret CID bytes as
+            // character codes (e.g. CID 0x01A9 → Latin-1 "©").
 
             // Try our custom encoding map from Differences arrays.
             // The Differences array overrides specific codes in a base encoding (typically
@@ -883,8 +891,16 @@ pub(crate) fn extract_text_from_operand(
                         if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
                             return Some(symbol_text);
                         }
+                        // For CID fonts (have ToUnicode CMap), the CID is
+                        // genuinely unmapped — return None to avoid Latin-1
+                        // fallback misinterpreting CID bytes as characters.
+                        if has_cmap || font_tounicode_refs.contains_key(current_font) {
+                            return None;
+                        }
+                        // Non-CID fonts: fall through to other methods
+                    } else {
+                        return Some(text);
                     }
-                    return Some(text);
                 }
             }
 

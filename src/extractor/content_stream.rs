@@ -831,15 +831,122 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
-    // Only use clipping-path rects when no `re` rects exist on this page,
-    // to avoid diluting real table rects with decorative clip regions.
-    // Fill-path rects are third priority: only when both `re` and clip rects are empty.
-    if rects.is_empty() && !clip_rects.is_empty() {
-        rects = clip_rects;
-    } else if rects.is_empty() && clip_rects.is_empty() && !fill_rects.is_empty() {
-        rects = fill_rects;
+    // Only use clip/fill rects when no `re` rects exist on this page.
+    // Clip rects take priority over fill rects, but first we deduplicate
+    // them: some PDFs wrap every text block in a full-page W* clip path,
+    // producing thousands of identical rects that yield a degenerate grid.
+    // After dedup, if too few unique clip rects remain we fall through to
+    // fill rects (explicitly drawn visible rectangles).
+    if rects.is_empty() {
+        dedup_rects(&mut clip_rects);
+        if clip_rects.len() >= 4 {
+            rects = clip_rects;
+        } else if !fill_rects.is_empty() {
+            rects = fill_rects;
+        } else if !clip_rects.is_empty() {
+            rects = clip_rects;
+        }
     }
 
     let items = super::merge_text_items(items);
     Ok((items, rects, lines))
+}
+
+/// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).
+/// Some PDFs emit a full-page clip path for every text block, producing
+/// thousands of identical rects. After dedup these collapse to one rect,
+/// which is too few for table detection and gets naturally skipped.
+fn dedup_rects(rects: &mut Vec<PdfRect>) {
+    if rects.len() <= 1 {
+        return;
+    }
+    // Round to 0.5-pt grid for tolerance, then sort and dedup.
+    rects.sort_by(|a, b| {
+        let ak = (
+            a.page,
+            (a.x * 2.0) as i32,
+            (a.y * 2.0) as i32,
+            (a.width * 2.0) as i32,
+            (a.height * 2.0) as i32,
+        );
+        let bk = (
+            b.page,
+            (b.x * 2.0) as i32,
+            (b.y * 2.0) as i32,
+            (b.width * 2.0) as i32,
+            (b.height * 2.0) as i32,
+        );
+        ak.cmp(&bk)
+    });
+    rects.dedup_by(|a, b| {
+        a.page == b.page
+            && ((a.x - b.x).abs() < 0.5)
+            && ((a.y - b.y).abs() < 0.5)
+            && ((a.width - b.width).abs() < 0.5)
+            && ((a.height - b.height).abs() < 0.5)
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32, page: u32) -> PdfRect {
+        PdfRect {
+            x,
+            y,
+            width: w,
+            height: h,
+            page,
+        }
+    }
+
+    #[test]
+    fn test_dedup_rects_identical() {
+        let mut rects = vec![rect(0.0, 0.0, 612.0, 792.0, 1); 3759];
+        dedup_rects(&mut rects);
+        assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn test_dedup_rects_within_tolerance() {
+        let mut rects = vec![
+            rect(10.0, 20.0, 100.0, 50.0, 1),
+            rect(10.2, 20.1, 100.3, 50.4, 1),
+        ];
+        dedup_rects(&mut rects);
+        assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn test_dedup_rects_distinct_kept() {
+        let mut rects = vec![
+            rect(10.0, 20.0, 100.0, 50.0, 1),
+            rect(120.0, 20.0, 100.0, 50.0, 1),
+            rect(10.0, 80.0, 100.0, 50.0, 1),
+        ];
+        dedup_rects(&mut rects);
+        assert_eq!(rects.len(), 3);
+    }
+
+    #[test]
+    fn test_dedup_rects_different_pages_kept() {
+        let mut rects = vec![
+            rect(0.0, 0.0, 612.0, 792.0, 1),
+            rect(0.0, 0.0, 612.0, 792.0, 2),
+        ];
+        dedup_rects(&mut rects);
+        assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_rects_empty_and_single() {
+        let mut empty: Vec<PdfRect> = vec![];
+        dedup_rects(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut single = vec![rect(1.0, 2.0, 3.0, 4.0, 1)];
+        dedup_rects(&mut single);
+        assert_eq!(single.len(), 1);
+    }
 }

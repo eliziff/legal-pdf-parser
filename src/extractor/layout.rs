@@ -121,7 +121,8 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     let y_range = y_max - y_min;
 
     // Validate each valley with vertical consistency
-    let mut valid_valleys: Vec<(usize, usize)> = Vec::new();
+    // Each entry: (start_bin, end_bin, left_count, right_count)
+    let mut valid_valleys: Vec<(usize, usize, usize, usize)> = Vec::new();
     for &(start, end) in &valleys {
         let gutter_left = x_min + start as f32 * BIN_WIDTH;
         let gutter_right = x_min + end as f32 * BIN_WIDTH;
@@ -164,7 +165,7 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
             }
         }
 
-        valid_valleys.push((start, end));
+        valid_valleys.push((start, end, left_items.len(), right_items.len()));
     }
 
     if valid_valleys.is_empty() {
@@ -177,16 +178,21 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
         valid_valleys.len() + 1,
         valid_valleys
             .iter()
-            .map(|(s, e)| x_min + ((*s + *e) as f32 / 2.0) * BIN_WIDTH)
+            .map(|(s, e, _, _)| x_min + ((*s + *e) as f32 / 2.0) * BIN_WIDTH)
             .collect::<Vec<_>>()
     );
 
-    // Limit to at most 3 gutters (4 columns) — keep the widest if more found
+    // Limit to at most 3 gutters (4 columns).
+    // Score = width_in_bins * min(left_count, right_count)
+    // This prefers gutters that separate substantial content on both sides,
+    // rather than just the physically widest gaps (which may be intra-column).
     if valid_valleys.len() > 3 {
         valid_valleys.sort_by(|a, b| {
-            let wa = (a.1 - a.0) as f32;
-            let wb = (b.1 - b.0) as f32;
-            wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+            let score_a = (a.1 - a.0) as f32 * (a.2.min(a.3) as f32);
+            let score_b = (b.1 - b.0) as f32 * (b.2.min(b.3) as f32);
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         valid_valleys.truncate(3);
         // Re-sort by position (left to right)
@@ -196,7 +202,7 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     // Build column regions from gutter boundaries
     let mut columns = Vec::new();
     let mut col_start = x_min;
-    for &(start, end) in &valid_valleys {
+    for &(start, end, _, _) in &valid_valleys {
         let gutter_center = x_min + ((start + end) as f32 / 2.0) * BIN_WIDTH;
         columns.push(ColumnRegion {
             x_min: col_start,
@@ -693,4 +699,121 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
     debug!("group_single_column: {} lines", lines.len());
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::types::ItemType;
+
+    /// Helper: create a TextItem at given position with given width text.
+    fn make_item(page: u32, x: f32, y: f32, text: &str) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: text.len() as f32 * 6.0, // ~6pt per char
+            height: 12.0,
+            font_size: 12.0,
+            font: String::new(),
+            page,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+        }
+    }
+
+    /// Generate dense items in a horizontal zone across many Y positions.
+    /// Items are placed with overlapping coverage so no intra-zone valleys appear.
+    fn fill_zone(page: u32, x_start: f32, x_end: f32, y_start: f32, y_end: f32) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        let item_width = 60.0; // "SomeText__" = 10 chars * 6pt
+        let step = 55.0; // overlap slightly to avoid intra-zone histogram gaps
+        let mut y = y_start;
+        while y >= y_end {
+            let mut x = x_start;
+            while x + item_width <= x_end {
+                items.push(make_item(page, x, y, "SomeText__"));
+                x += step;
+            }
+            y -= 14.0;
+        }
+        items
+    }
+
+    #[test]
+    fn three_zone_layout_detected() {
+        // Left months (x=15..330), right months (x=345..660), sidebar (x=675..800)
+        // Each zone is >100pt wide so min_col_width won't reject any.
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 15.0, 330.0, 750.0, 50.0));
+        items.extend(fill_zone(1, 345.0, 660.0, 750.0, 50.0));
+        items.extend(fill_zone(1, 675.0, 800.0, 750.0, 50.0));
+
+        let cols = detect_columns(&items, 1);
+        assert_eq!(cols.len(), 3, "Expected 3 columns, got {}", cols.len());
+
+        // Gutter 1 should be in the gap between left and middle zones
+        let g1 = cols[0].x_max;
+        assert!(
+            (290.0..=350.0).contains(&g1),
+            "First gutter at {g1}, expected between left and middle zones"
+        );
+
+        // Gutter 2 should be in the gap between middle and right zones
+        let g2 = cols[1].x_max;
+        assert!(
+            (620.0..=680.0).contains(&g2),
+            "Second gutter at {g2}, expected between middle and right zones"
+        );
+    }
+
+    #[test]
+    fn two_column_regression_guard() {
+        // Standard 2-column layout with clear gutter at center
+        let mut items = Vec::new();
+        items.extend(fill_zone(1, 30.0, 280.0, 750.0, 50.0));
+        items.extend(fill_zone(1, 320.0, 570.0, 750.0, 50.0));
+
+        let cols = detect_columns(&items, 1);
+        assert_eq!(cols.len(), 2, "Expected 2 columns, got {}", cols.len());
+
+        let gutter = cols[0].x_max;
+        assert!(
+            (280.0..=320.0).contains(&gutter),
+            "Gutter at {gutter}, expected ~300"
+        );
+    }
+
+    #[test]
+    fn score_prefers_balanced_gutter_over_wide_gap() {
+        // 5 valid valleys: 2 are wide but split sparse content, 2 are narrower
+        // but separate dense zones. The dense-zone gutters should win.
+        let mut items = Vec::new();
+        // Dense left zone
+        items.extend(fill_zone(1, 15.0, 200.0, 750.0, 50.0));
+        // Dense middle zone
+        items.extend(fill_zone(1, 220.0, 400.0, 750.0, 50.0));
+        // Dense right zone
+        items.extend(fill_zone(1, 420.0, 600.0, 750.0, 50.0));
+        // Sparse far-right zone (few items)
+        for y_off in 0..12 {
+            items.push(make_item(
+                1,
+                700.0,
+                750.0 - y_off as f32 * 50.0,
+                "Sparse____",
+            ));
+        }
+
+        let cols = detect_columns(&items, 1);
+        // Should detect the gutters between the 3 dense zones, not the wide gap
+        // before the sparse zone
+        assert!(
+            cols.len() >= 3,
+            "Expected >=3 columns for dense zones, got {}",
+            cols.len()
+        );
+    }
 }

@@ -11,8 +11,250 @@ mod grid;
 
 pub use detect_heuristic::detect_tables;
 pub use detect_lines::detect_tables_from_lines;
+pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 pub use format::table_to_markdown;
+
+use crate::types::TextItem;
+
+/// Try to build a table from items + cluster rects (calendar-style layouts).
+///
+/// Uses rect X positions as column boundaries to directly construct a `Table`,
+/// bypassing heuristic detection. Splits merged multi-number items first.
+pub(crate) fn try_build_rect_guided_table(
+    items: &[TextItem],
+    cluster_rects: &[(f32, f32, f32, f32)],
+) -> Option<Table> {
+    if items.is_empty() || cluster_rects.is_empty() {
+        return None;
+    }
+
+    // 1. Derive column boundaries from rect X positions (snapped to 2pt tolerance)
+    let mut x_lefts: Vec<f32> = cluster_rects.iter().map(|&(x, _, _, _)| x).collect();
+    x_lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Snap: deduplicate within 2pt tolerance
+    let mut col_boundaries: Vec<f32> = Vec::new();
+    for x in &x_lefts {
+        if col_boundaries
+            .last()
+            .is_none_or(|last| (*x - *last).abs() > 2.0)
+        {
+            col_boundaries.push(*x);
+        }
+    }
+
+    if col_boundaries.len() < 5 {
+        return None;
+    }
+
+    // 1b. Interpolate missing boundaries: holidays/non-work days may not have
+    // rects, creating gaps. Fill gaps > 1.5× median spacing with evenly spaced
+    // boundaries so every day gets a column.
+    if col_boundaries.len() >= 2 {
+        let mut spacings: Vec<f32> = col_boundaries.windows(2).map(|w| w[1] - w[0]).collect();
+        spacings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_spacing = spacings[spacings.len() / 2];
+        let threshold = median_spacing * 1.5;
+
+        let mut filled: Vec<f32> = vec![col_boundaries[0]];
+        for i in 1..col_boundaries.len() {
+            let gap = col_boundaries[i] - col_boundaries[i - 1];
+            if gap > threshold {
+                // Insert interpolated boundaries
+                let n = (gap / median_spacing).round() as usize;
+                if n >= 2 {
+                    let step = gap / n as f32;
+                    for j in 1..n {
+                        filled.push(col_boundaries[i - 1] + j as f32 * step);
+                    }
+                }
+            }
+            filled.push(col_boundaries[i]);
+        }
+        col_boundaries = filled;
+    }
+
+    // 2. Split merged multi-number items
+    let mut expanded_items: Vec<(TextItem, usize)> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let splits = split_merged_numbers(item, &col_boundaries);
+        for split_item in splits {
+            expanded_items.push((split_item, idx));
+        }
+    }
+
+    // 3. Derive row boundaries from item Y positions (5pt tolerance)
+    let mut y_values: Vec<f32> = expanded_items.iter().map(|(item, _)| item.y).collect();
+    y_values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
+    let mut row_boundaries: Vec<f32> = Vec::new();
+    for y in &y_values {
+        if row_boundaries
+            .last()
+            .is_none_or(|last| (*last - *y).abs() > 5.0)
+        {
+            row_boundaries.push(*y);
+        }
+    }
+
+    if row_boundaries.is_empty() {
+        return None;
+    }
+
+    // 4. Assign items to cells
+    let n_rows = row_boundaries.len();
+    let n_cols = col_boundaries.len();
+    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
+    let mut used_indices: Vec<usize> = Vec::new();
+
+    // Compute max X to exclude legend text beyond the table area
+    let col_spacing = if col_boundaries.len() >= 2 {
+        (col_boundaries.last().unwrap() - col_boundaries.first().unwrap())
+            / (col_boundaries.len() - 1) as f32
+    } else {
+        20.0
+    };
+    let max_x = col_boundaries.last().unwrap() + col_spacing * 1.5;
+
+    for (item, orig_idx) in &expanded_items {
+        // Skip items beyond the table's rightmost column (legend text)
+        if item.x > max_x {
+            continue;
+        }
+        // Find row (nearest Y within tolerance)
+        let row = row_boundaries
+            .iter()
+            .position(|&ry| (ry - item.y).abs() <= 5.0);
+        // Find column: rightmost boundary ≤ item.x + tolerance.
+        // 4pt tolerance catches annotation items (e.g. "Memorial Day") that sit
+        // slightly before the next column boundary.
+        let col = col_boundaries.iter().rposition(|&cx| item.x >= cx - 4.0);
+
+        if let (Some(r), Some(c)) = (row, col) {
+            let cell = &mut cells[r][c];
+            if !cell.is_empty() {
+                cell.push(' ');
+            }
+            cell.push_str(item.text.trim());
+            used_indices.push(*orig_idx);
+        }
+    }
+
+    // 5. Clean up: strip tilde-leader noise from cells (legend text bleeding
+    //    into the last column from the right side of the page)
+    for row in &mut cells {
+        for cell in row.iter_mut() {
+            if let Some(pos) = cell.find("~~~") {
+                cell.truncate(pos);
+                *cell = cell.trim_end().to_string();
+            }
+        }
+    }
+
+    // 6. Validate: at least one row should have ≥ 5 non-empty cells
+    let best_row_fill = cells
+        .iter()
+        .map(|row| row.iter().filter(|c| !c.is_empty()).count())
+        .max()
+        .unwrap_or(0);
+    if best_row_fill < 5 {
+        return None;
+    }
+
+    // Deduplicate used indices
+    used_indices.sort_unstable();
+    used_indices.dedup();
+
+    Some(Table {
+        columns: col_boundaries,
+        rows: row_boundaries,
+        cells,
+        item_indices: used_indices,
+    })
+}
+
+/// Split a TextItem whose text contains multiple whitespace-separated tokens
+/// (like "10 11 12 ... 31") into individual TextItems, each assigned to the
+/// nearest column boundary.
+fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem> {
+    let tokens: Vec<&str> = item.text.split_whitespace().collect();
+    if tokens.len() <= 1 {
+        return vec![item.clone()];
+    }
+
+    // Count consecutive leading numeric tokens (day numbers like "10 11 12")
+    let leading_numeric = tokens
+        .iter()
+        .take_while(|t| t.chars().all(|c| c.is_ascii_digit()))
+        .count();
+
+    // Need at least one leading number to split
+    if leading_numeric == 0 {
+        return vec![item.clone()];
+    }
+
+    let token_width = item.width / tokens.len() as f32;
+    let mut result = Vec::with_capacity(leading_numeric + 1);
+
+    // Find the enclosing column boundary (rightmost boundary ≤ item.x + 2pt),
+    // then advance through successive boundaries for each leading number.
+    // Using rposition avoids overshooting when item.x sits between boundaries.
+    let start_col = col_boundaries
+        .iter()
+        .rposition(|&cx| cx <= item.x + 2.0)
+        .unwrap_or(0);
+
+    // Split each leading numeric token into its own item at successive columns
+    for (i, token) in tokens.iter().enumerate().take(leading_numeric) {
+        let col_idx = start_col + i;
+        let snapped_x = if col_idx < col_boundaries.len() {
+            col_boundaries[col_idx]
+        } else {
+            // Fallback: distribute evenly if we run out of boundaries
+            let raw_x = item.x + i as f32 * token_width + token_width / 2.0;
+            col_boundaries
+                .iter()
+                .rev()
+                .find(|&&cx| cx <= raw_x + 2.0)
+                .copied()
+                .unwrap_or(raw_x)
+        };
+
+        result.push(TextItem {
+            text: token.to_string(),
+            x: snapped_x,
+            width: token_width,
+            y: item.y,
+            height: item.height,
+            font: item.font.clone(),
+            font_size: item.font_size,
+            page: item.page,
+            is_bold: item.is_bold,
+            is_italic: item.is_italic,
+            item_type: item.item_type.clone(),
+        });
+    }
+
+    // Trailing non-numeric tokens become annotation placed at last numeric column
+    if leading_numeric < tokens.len() {
+        let annotation = tokens[leading_numeric..].join(" ");
+        let last_x = result.last().map(|i| i.x).unwrap_or(item.x);
+        result.push(TextItem {
+            text: annotation,
+            x: last_x,
+            width: token_width,
+            y: item.y,
+            height: item.height,
+            font: item.font.clone(),
+            font_size: item.font_size,
+            page: item.page,
+            is_bold: item.is_bold,
+            is_italic: item.is_italic,
+            item_type: item.item_type.clone(),
+        });
+    }
+
+    result
+}
 
 /// Detection mode controls thresholds for table validation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -499,5 +741,167 @@ mod tests {
             "JAN should not be merged into data row, got:\n{}",
             md
         );
+    }
+
+    // ── Rect-guided table builder tests ─────────────────────────────
+
+    #[test]
+    fn rect_guided_basic() {
+        // 7 column boundaries (like days of week), items "1"-"7" at matching X
+        let col_xs: Vec<f32> = (0..7).map(|i| 50.0 + i as f32 * 30.0).collect();
+        let cluster_rects: Vec<(f32, f32, f32, f32)> =
+            col_xs.iter().map(|&x| (x, 100.0, 28.0, 15.0)).collect();
+        let items: Vec<TextItem> = (1..=7)
+            .map(|i| make_item(&i.to_string(), col_xs[i - 1] + 2.0, 110.0, 7.0))
+            .collect();
+
+        let table = try_build_rect_guided_table(&items, &cluster_rects);
+        assert!(table.is_some(), "Should produce a table from 7 columns");
+        let table = table.unwrap();
+        assert_eq!(table.columns.len(), 7);
+        assert_eq!(table.rows.len(), 1);
+        for (i, cell) in table.cells[0].iter().enumerate() {
+            assert_eq!(cell, &(i + 1).to_string());
+        }
+    }
+
+    #[test]
+    fn rect_guided_split_merged() {
+        // One merged item "10 11 12" spanning 3 column boundaries
+        let col_xs: Vec<f32> = (0..7).map(|i| 50.0 + i as f32 * 30.0).collect();
+        let cluster_rects: Vec<(f32, f32, f32, f32)> =
+            col_xs.iter().map(|&x| (x, 100.0, 28.0, 15.0)).collect();
+        // Single items for cols 0-3, merged "4 5 6" spanning cols 4-6
+        let mut items = vec![
+            make_item("1", col_xs[0] + 2.0, 110.0, 7.0),
+            make_item("2", col_xs[1] + 2.0, 110.0, 7.0),
+            make_item("3", col_xs[2] + 2.0, 110.0, 7.0),
+        ];
+        // Merged item spanning from col 3 to col 5 (width covers 3 columns)
+        let mut merged = make_item("4 5 6", col_xs[3], 110.0, 7.0);
+        merged.width = 3.0 * 30.0; // spans 3 column widths
+        items.push(merged);
+
+        let table = try_build_rect_guided_table(&items, &cluster_rects);
+        assert!(table.is_some(), "Should handle merged number items");
+        let table = table.unwrap();
+        // Check that "4", "5", "6" ended up in separate columns
+        let row = &table.cells[0];
+        assert!(
+            row.contains(&"4".to_string()),
+            "Should have '4' in a cell: {:?}",
+            row
+        );
+        assert!(
+            row.contains(&"5".to_string()),
+            "Should have '5' in a cell: {:?}",
+            row
+        );
+        assert!(
+            row.contains(&"6".to_string()),
+            "Should have '6' in a cell: {:?}",
+            row
+        );
+    }
+
+    #[test]
+    fn rect_guided_with_annotations() {
+        // Day numbers on one row, annotations on a second row
+        let col_xs: Vec<f32> = (0..7).map(|i| 50.0 + i as f32 * 30.0).collect();
+        let cluster_rects: Vec<(f32, f32, f32, f32)> =
+            col_xs.iter().map(|&x| (x, 100.0, 28.0, 15.0)).collect();
+        let mut items: Vec<TextItem> = (1..=7)
+            .map(|i| make_item(&i.to_string(), col_xs[i - 1] + 2.0, 115.0, 7.0))
+            .collect();
+        // Add annotation "Holiday" under day 4
+        items.push(make_item("Holiday", col_xs[3] + 2.0, 105.0, 6.0));
+
+        let table = try_build_rect_guided_table(&items, &cluster_rects);
+        assert!(table.is_some());
+        let table = table.unwrap();
+        assert_eq!(
+            table.rows.len(),
+            2,
+            "Should have 2 rows (days + annotations)"
+        );
+        // The annotation row should have "Holiday" in column 3
+        assert_eq!(table.cells[1][3], "Holiday");
+    }
+
+    #[test]
+    fn rect_guided_too_few_columns() {
+        // Only 3 column boundaries → should return None (need ≥ 5)
+        let cluster_rects = vec![
+            (50.0, 100.0, 28.0, 15.0),
+            (80.0, 100.0, 28.0, 15.0),
+            (110.0, 100.0, 28.0, 15.0),
+        ];
+        let items = vec![
+            make_item("A", 52.0, 110.0, 7.0),
+            make_item("B", 82.0, 110.0, 7.0),
+            make_item("C", 112.0, 110.0, 7.0),
+        ];
+        let table = try_build_rect_guided_table(&items, &cluster_rects);
+        assert!(table.is_none(), "Should reject fewer than 5 columns");
+    }
+
+    #[test]
+    fn split_merged_numbers_single_token() {
+        let col_boundaries = vec![50.0, 80.0, 110.0, 140.0, 170.0];
+        let item = make_item("Holiday", 52.0, 110.0, 7.0);
+        let result = split_merged_numbers(&item, &col_boundaries);
+        assert_eq!(result.len(), 1, "Single-token item should not be split");
+        assert_eq!(result[0].text, "Holiday");
+    }
+
+    #[test]
+    fn split_leading_numbers_with_annotation() {
+        // "11 Veterans Day" → "11" split off, "Veterans Day" as annotation
+        let col_boundaries = vec![50.0, 80.0, 110.0, 140.0, 170.0];
+        let mut item = make_item("11 Veterans Day", 110.0, 110.0, 7.0);
+        item.width = 90.0; // spans 3 tokens
+        let result = split_merged_numbers(&item, &col_boundaries);
+        assert_eq!(result.len(), 2, "Should split into number + annotation");
+        assert_eq!(result[0].text, "11");
+        assert_eq!(result[1].text, "Veterans Day");
+    }
+
+    #[test]
+    fn split_multiple_leading_numbers_with_annotation() {
+        // "24 25 Memorial Day" → "24", "25" split, "Memorial Day" trails
+        let col_xs: Vec<f32> = (0..7).map(|i| 50.0 + i as f32 * 30.0).collect();
+        let mut item = make_item("24 25 Memorial Day", col_xs[3], 110.0, 7.0);
+        item.width = 4.0 * 30.0; // spans 4 tokens
+        let result = split_merged_numbers(&item, &col_xs);
+        assert_eq!(result.len(), 3, "Should split into 2 numbers + annotation");
+        assert_eq!(result[0].text, "24");
+        assert_eq!(result[1].text, "25");
+        assert_eq!(result[2].text, "Memorial Day");
+    }
+
+    #[test]
+    fn split_no_leading_numbers() {
+        // "Memorial Day" → no leading numeric, returned as-is
+        let col_boundaries = vec![50.0, 80.0, 110.0, 140.0, 170.0];
+        let item = make_item("Memorial Day", 52.0, 110.0, 7.0);
+        let result = split_merged_numbers(&item, &col_boundaries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "Memorial Day");
+    }
+
+    #[test]
+    fn rect_guided_tilde_cleanup() {
+        // Items with tilde noise should have it stripped
+        let col_xs: Vec<f32> = (0..7).map(|i| 50.0 + i as f32 * 30.0).collect();
+        let cluster_rects: Vec<(f32, f32, f32, f32)> =
+            col_xs.iter().map(|&x| (x, 100.0, 28.0, 15.0)).collect();
+        let mut items: Vec<TextItem> = (1..=7)
+            .map(|i| make_item(&i.to_string(), col_xs[i - 1] + 2.0, 110.0, 7.0))
+            .collect();
+        // Day 7 has tilde-leader legend text bleeding in
+        items[6] = make_item("7 ~~~~~~~ Legend text here", col_xs[6] + 2.0, 110.0, 7.0);
+
+        let table = try_build_rect_guided_table(&items, &cluster_rects).unwrap();
+        assert_eq!(table.cells[0][6], "7", "Tilde noise should be stripped");
     }
 }

@@ -181,6 +181,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     options: MarkdownOptions,
     page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
     page_images: std::collections::HashMap<u32, Vec<(f32, String)>>,
+    band_split_pages: &HashSet<u32>,
 ) -> String {
     if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
         return String::new();
@@ -210,6 +211,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
+    let mut prev_x = 0.0f32;
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
@@ -274,6 +276,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
             current_page = line.page;
             prev_y = f32::MAX;
+            prev_x = 0.0;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
@@ -317,14 +320,23 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // Paragraph break: large forward Y gap (normal) or large backward jump
         // (newspaper columns emitted sequentially on the same page).
         let y_gap = prev_y - line.y;
+        let line_x = line.items.first().map(|i| i.x).unwrap_or(0.0);
         let is_para_break = y_gap.abs() > para_threshold;
-        if is_para_break && in_paragraph {
+        // Also break when X jumps significantly at the same Y level on
+        // pages with band-split side-by-side layout.  This prevents
+        // interleaved left/right band lines from merging into one paragraph.
+        let is_band_switch = band_split_pages.contains(&line.page)
+            && y_gap.abs() <= para_threshold
+            && (prev_x - line_x).abs() > 50.0
+            && prev_y < f32::MAX;
+        if (is_para_break || is_band_switch) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
         prev_y = line.y;
+        prev_x = line_x;
 
         // Get text with optional bold/italic formatting
         let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
