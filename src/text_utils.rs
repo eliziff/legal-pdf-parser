@@ -5,6 +5,7 @@
 //! and markdown pipelines.
 
 use crate::types::TextItem;
+use unicode_normalization::UnicodeNormalization;
 
 /// Check if a character is CJK (Chinese, Japanese, Korean).
 /// CJK languages don't use spaces between words, so word-boundary
@@ -38,6 +39,12 @@ pub(crate) fn is_rtl_char(c: char) -> bool {
         | '\u{FB50}'..='\u{FDFF}' // Arabic Presentation Forms-A
         | '\u{FE70}'..='\u{FEFF}' // Arabic Presentation Forms-B
     )
+}
+
+fn is_arabic_presentation_form(c: char) -> bool {
+    // U+FEFF is BOM/ZWNJ, not an Arabic presentation form despite falling
+    // in the Presentation Forms-B codepoint range.
+    matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
 }
 
 pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
@@ -105,6 +112,9 @@ pub fn is_italic_font(font_name: &str) -> bool {
 
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
+/// Also applies NFKC normalization (converts Arabic presentation forms to base
+/// characters, decomposes Latin ligatures, etc.) and reverses visual-order
+/// Arabic text back to logical order when presentation forms are detected.
 pub(crate) fn expand_ligatures(text: &str) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
@@ -118,9 +128,26 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
         text.to_string()
     };
 
+    // Detect Arabic presentation forms before normalization — their presence
+    // signals visual-order storage that needs reversal after NFKC.
+    let had_presentation_forms = text.chars().any(is_arabic_presentation_form);
+
+    // Apply NFKC normalization only when Arabic presentation forms are present.
+    // This converts forms (U+FB50-FDFF, U+FE70-FEFF) back to base Arabic
+    // (U+0600-06FF). We avoid broad NFKC on all non-ASCII text because it
+    // would convert NBSP (U+00A0) to regular space, breaking downstream logic.
+    // Latin ligatures are already handled by the explicit match arms below.
+    let text = if had_presentation_forms {
+        text.nfkc().collect::<String>()
+    } else {
+        text
+    };
+
     let mut result = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
+            // Keep explicit ligature expansion as fallback for fonts that bypass
+            // NFKC (e.g. custom ToUnicode mappings to PUA codepoints)
             '\u{FB00}' => result.push_str("ff"),
             '\u{FB01}' => result.push_str("fi"),
             '\u{FB02}' => result.push_str("fl"),
@@ -141,7 +168,72 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             _ => result.push(ch),
         }
     }
+
+    // If the original text had Arabic presentation forms, the characters are in
+    // visual (LTR screen) order. After NFKC normalization, reverse to restore
+    // logical reading order.
+    if had_presentation_forms {
+        result = reverse_visual_arabic(&result);
+    }
+
     result
+}
+
+/// Reverse visual-order Arabic text to logical order.
+///
+/// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
+/// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
+/// runs: run order is reversed, and only non-LTR runs are reversed internally.
+fn reverse_visual_arabic(text: &str) -> String {
+    // Check if there are any LTR runs (ASCII letters or digits)
+    let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
+
+    if !has_ltr {
+        // Pure RTL: simple reversal
+        return text.chars().rev().collect();
+    }
+
+    // Mixed content: split into runs of LTR (ASCII alphanumeric + adjacent
+    // punctuation like '.', ',', '/', '-') vs non-LTR (Arabic + spaces + other).
+    let chars: Vec<char> = text.chars().collect();
+    let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
+
+    let mut i = 0;
+    while i < chars.len() {
+        let is_ltr = chars[i].is_ascii_alphanumeric()
+            || (chars[i].is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+
+        let mut run = String::new();
+        while i < chars.len() {
+            let c = chars[i];
+            let c_is_ltr = c.is_ascii_alphanumeric()
+                || (c.is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+            if c_is_ltr != is_ltr {
+                break;
+            }
+            run.push(c);
+            i += 1;
+        }
+        runs.push((is_ltr, run));
+    }
+
+    // Reverse run order and reverse non-LTR runs internally
+    runs.reverse();
+    let mut result = String::with_capacity(text.len());
+    for (is_ltr, content) in &runs {
+        if *is_ltr {
+            result.push_str(content);
+        } else {
+            result.extend(content.chars().rev());
+        }
+    }
+    result
+}
+
+/// Check if the character at `idx` is adjacent to an ASCII alphanumeric character.
+fn is_adjacent_to_ascii_alnum(chars: &[char], idx: usize) -> bool {
+    (idx > 0 && chars[idx - 1].is_ascii_alphanumeric())
+        || (idx + 1 < chars.len() && chars[idx + 1].is_ascii_alphanumeric())
 }
 
 /// Decode a PDF text string (ActualText, etc.) that may be UTF-16BE (BOM \xFE\xFF)
@@ -424,5 +516,69 @@ mod tests {
     fn nbsp_preserved() {
         // NBSP (U+00A0) should NOT be normalized
         assert_eq!(expand_ligatures("a\u{00A0}b"), "a\u{00A0}b");
+    }
+
+    #[test]
+    fn nfkc_arabic_presentation_forms() {
+        // Arabic Presentation Form-B: FEE1 = MEEM medial, FEF3 = YEH initial
+        // NFKC maps these to base Arabic + reversal restores logical order
+        let input = "\u{FEE1}\u{FEF3}"; // visual order: medial meem, initial yeh
+        let result = expand_ligatures(input);
+        // After NFKC: base Arabic chars; after reversal: logical order
+        assert!(
+            !result.chars().any(is_arabic_presentation_form),
+            "presentation forms should be normalized: {result:?}"
+        );
+        assert!(
+            result.chars().any(|c| matches!(c, '\u{0600}'..='\u{06FF}')),
+            "should contain base Arabic characters: {result:?}"
+        );
+    }
+
+    #[test]
+    fn no_reversal_for_base_arabic() {
+        // Base Arabic already in logical order — no presentation forms means no reversal
+        let input = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
+        let result = expand_ligatures(input);
+        assert_eq!(result, input, "base Arabic should pass through unchanged");
+    }
+
+    #[test]
+    fn latin_text_unaffected() {
+        assert_eq!(expand_ligatures("Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn reverse_visual_arabic_pure_rtl() {
+        // Pure RTL: simple reversal
+        let input = "\u{0628}\u{0627}"; // ba (visual order)
+        let result = reverse_visual_arabic(input);
+        assert_eq!(result, "\u{0627}\u{0628}"); // ab (logical order)
+    }
+
+    #[test]
+    fn reverse_visual_arabic_with_ltr_run() {
+        // Mixed: Arabic + embedded number "123" + Arabic
+        // Visual order: أ 123 ب  → runs: [أ], [123], [ب]
+        // Reversed runs: [ب], [123], [أ]
+        // Non-LTR reversed internally: ب, 123, أ
+        let input = "\u{0623}123\u{0628}";
+        let result = reverse_visual_arabic(input);
+        assert_eq!(result, "\u{0628}123\u{0623}");
+    }
+
+    #[test]
+    fn arabic_presentation_form_detection() {
+        // Presentation Forms-A range
+        assert!(is_arabic_presentation_form('\u{FB50}'));
+        assert!(is_arabic_presentation_form('\u{FDFF}'));
+        // Presentation Forms-B range (excludes U+FEFF which is BOM)
+        assert!(is_arabic_presentation_form('\u{FE70}'));
+        assert!(is_arabic_presentation_form('\u{FEFE}'));
+        assert!(!is_arabic_presentation_form('\u{FEFF}'));
+        // Base Arabic — NOT presentation form
+        assert!(!is_arabic_presentation_form('\u{0645}'));
+        // Latin
+        assert!(!is_arabic_presentation_form('A'));
     }
 }
