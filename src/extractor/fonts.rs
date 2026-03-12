@@ -1010,6 +1010,13 @@ fn score_text(text: &str) -> i32 {
                 digits += 1;
             } else if ch.is_control() || ch == '\u{FFFD}' {
                 other += 3;
+            } else if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+                || ('\u{3040}'..='\u{309F}').contains(&ch)
+                || ('\u{30A0}'..='\u{30FF}').contains(&ch)
+                || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+                || ('\u{F900}'..='\u{FAFF}').contains(&ch)
+            {
+                letters += 1; // CJK ideographs / kana count as valid text
             } else {
                 other += 1;
             }
@@ -1024,4 +1031,46 @@ fn score_text(text: &str) -> i32 {
         score -= 15;
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_text_cjk() {
+        // Correct Japanese text should score well
+        let japanese = "2026年9月期 1Q 業績報告";
+        // Garbled output (random CJK from wrong remap)
+        let garbled = "\u{FFFD}\u{FFFD}\u{FFFD}";
+
+        let s_jp = score_text(japanese);
+        let s_garbled = score_text(garbled);
+        assert!(
+            s_jp > s_garbled,
+            "Japanese text ({s_jp}) should score higher than garbled ({s_garbled})"
+        );
+    }
+
+    #[test]
+    fn score_text_cjk_vs_ascii_garbage() {
+        // Real CJK text
+        let cjk = "株式会社の業績についてご報告いたします";
+        // Ascii garbage of similar length
+        let garbage = "}{|~`^@#$%&*()!<>[];:',./";
+
+        let s_cjk = score_text(cjk);
+        let s_garbage = score_text(garbage);
+        assert!(
+            s_cjk > s_garbage,
+            "CJK text ({s_cjk}) should score higher than garbage ({s_garbage})"
+        );
+    }
+
+    #[test]
+    fn score_text_english_still_works() {
+        let good = "the quick brown fox and the lazy dog";
+        let bad = "###!!!@@@$$$";
+        assert!(score_text(good) > score_text(bad));
+    }
 }

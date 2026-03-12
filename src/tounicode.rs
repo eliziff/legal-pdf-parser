@@ -44,6 +44,26 @@ pub(crate) fn build_cmap_entry_from_stream(
             }
         }
 
+        // When a sequential remap was applied and a TrueType fallback has more
+        // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
+        // Subset fonts number GIDs by document encounter order, so the sorted
+        // sequential remap scrambles characters.  The TrueType cmap table maps
+        // the real GID→Unicode and is authoritative.
+        if remapped.is_some() {
+            if let Some(ref fb) = fallback {
+                let fb_entries = fb.char_map.len() + fb.ranges.len();
+                if fb_entries > primary_entries {
+                    debug!(
+                        "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
+                        obj_num, fb_entries, primary_entries
+                    );
+                    let old_remap = remapped.take().unwrap();
+                    remapped = fallback.take();
+                    fallback = Some(old_remap);
+                }
+            }
+        }
+
         return Some(CMapEntry {
             primary,
             remapped,
@@ -2384,5 +2404,112 @@ endbfchar
             !result.contains('䉹'),
             "Unmapped 2-byte CIDs should not produce CJK"
         );
+    }
+
+    #[test]
+    fn fallback_promotion_when_larger_than_primary() {
+        // Simulate: primary has 5 char_map entries, remapped exists (sequential),
+        // fallback has 20 entries (TrueType cmap).  The fallback should be
+        // promoted to `remapped` and the old remap demoted to `fallback`.
+        let mut primary = ToUnicodeCMap::new();
+        for i in 0..5u16 {
+            primary
+                .char_map
+                .insert(100 + i, char::from(b'A' + i as u8).to_string());
+        }
+        primary.code_byte_length = 2;
+
+        let mut sequential_remap = ToUnicodeCMap::new();
+        for i in 0..5u16 {
+            sequential_remap
+                .char_map
+                .insert(i, char::from(b'A' + i as u8).to_string());
+        }
+        sequential_remap.code_byte_length = 2;
+
+        let mut truetype_fb = ToUnicodeCMap::new();
+        for i in 0..20u16 {
+            truetype_fb
+                .char_map
+                .insert(i, format!("U+{:04X}", 0x4E00 + i));
+        }
+        truetype_fb.code_byte_length = 2;
+
+        let primary_entries = primary.char_map.len() + primary.ranges.len();
+        let mut remapped: Option<ToUnicodeCMap> = Some(sequential_remap);
+        let mut fallback: Option<ToUnicodeCMap> = Some(truetype_fb);
+
+        // Apply the same promotion logic as build_cmap_entry_from_stream
+        if remapped.is_some() {
+            if let Some(ref fb) = fallback {
+                let fb_entries = fb.char_map.len() + fb.ranges.len();
+                if fb_entries > primary_entries {
+                    let old_remap = remapped.take().unwrap();
+                    remapped = fallback.take();
+                    fallback = Some(old_remap);
+                }
+            }
+        }
+
+        // The TrueType fallback (20 entries) should now be in `remapped`
+        let r = remapped.unwrap();
+        assert_eq!(
+            r.char_map.len(),
+            20,
+            "TrueType cmap should be promoted to remapped"
+        );
+
+        // The old sequential remap (5 entries) should now be in `fallback`
+        let f = fallback.unwrap();
+        assert_eq!(
+            f.char_map.len(),
+            5,
+            "Sequential remap should be demoted to fallback"
+        );
+    }
+
+    #[test]
+    fn no_fallback_promotion_when_smaller() {
+        // When fallback has fewer entries than primary, no swap should occur.
+        let mut primary = ToUnicodeCMap::new();
+        for i in 0..50u16 {
+            primary
+                .char_map
+                .insert(100 + i, format!("U+{:04X}", 0x0041 + i));
+        }
+        primary.code_byte_length = 2;
+
+        let mut sequential_remap = ToUnicodeCMap::new();
+        for i in 0..50u16 {
+            sequential_remap
+                .char_map
+                .insert(i, format!("U+{:04X}", 0x0041 + i));
+        }
+        sequential_remap.code_byte_length = 2;
+
+        let mut small_fb = ToUnicodeCMap::new();
+        for i in 0..10u16 {
+            small_fb.char_map.insert(i, format!("U+{:04X}", 0x4E00 + i));
+        }
+        small_fb.code_byte_length = 2;
+
+        let primary_entries = primary.char_map.len() + primary.ranges.len();
+        let mut remapped: Option<ToUnicodeCMap> = Some(sequential_remap);
+        let mut fallback: Option<ToUnicodeCMap> = Some(small_fb);
+
+        if remapped.is_some() {
+            if let Some(ref fb) = fallback {
+                let fb_entries = fb.char_map.len() + fb.ranges.len();
+                if fb_entries > primary_entries {
+                    let old_remap = remapped.take().unwrap();
+                    remapped = fallback.take();
+                    fallback = Some(old_remap);
+                }
+            }
+        }
+
+        // No swap: remapped should still have 50 entries
+        assert_eq!(remapped.unwrap().char_map.len(), 50);
+        assert_eq!(fallback.unwrap().char_map.len(), 10);
     }
 }
