@@ -359,9 +359,9 @@ mod tests {
         };
 
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Header 1"));
-        assert!(md.contains("| ---"));
-        assert!(md.contains("| Cell 1"));
+        assert!(md.contains("|Header 1|"));
+        assert!(md.contains("|---|"));
+        assert!(md.contains("|Cell 1|"));
     }
 
     #[test]
@@ -721,12 +721,12 @@ mod tests {
         let md = table_to_markdown(&table);
         // JAN and FEB should be on their own rows, not merged into adjacent rows
         assert!(
-            md.contains("| JAN"),
+            md.contains("|JAN|"),
             "JAN should be on its own row, got:\n{}",
             md
         );
         assert!(
-            md.contains("| FEB"),
+            md.contains("|FEB|"),
             "FEB should be on its own row, got:\n{}",
             md
         );

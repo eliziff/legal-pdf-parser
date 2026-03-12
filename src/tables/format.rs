@@ -17,33 +17,21 @@ pub fn table_to_markdown(table: &Table) -> String {
     let num_cols = cleaned_cells[0].len();
     let mut output = String::new();
 
-    // Calculate column widths for alignment (capped to avoid massive whitespace padding)
-    const MAX_COL_WIDTH: usize = 40;
-    let col_widths: Vec<usize> = (0..num_cols)
-        .map(|col| {
-            cleaned_cells
-                .iter()
-                .map(|row| row.get(col).map(|c| c.len()).unwrap_or(0))
-                .max()
-                .unwrap_or(3)
-                .clamp(3, MAX_COL_WIDTH)
-        })
-        .collect();
-
-    // Output each row
+    // Compact format: no padding, minimal separators. Optimized for token
+    // efficiency — AI agents are the primary consumer, not human eyes.
     for (row_idx, row) in cleaned_cells.iter().enumerate() {
         output.push('|');
-        for (col_idx, cell) in row.iter().enumerate() {
-            let width = col_widths[col_idx];
-            output.push_str(&format!(" {:width$} |", cell, width = width));
+        for cell in row.iter() {
+            output.push_str(cell);
+            output.push('|');
         }
         output.push('\n');
 
         // Add separator after header row
         if row_idx == 0 {
             output.push('|');
-            for width in &col_widths {
-                output.push_str(&format!(" {} |", "-".repeat(*width)));
+            for _ in 0..num_cols {
+                output.push_str("---|");
             }
             output.push('\n');
         }
@@ -340,10 +328,10 @@ mod tests {
             item_indices: vec![],
         };
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Name"));
-        assert!(md.contains("| ---"));
-        assert!(md.contains("| Alice"));
-        assert!(md.contains("| Bob"));
+        assert!(md.contains("|Name|"));
+        assert!(md.contains("|---|"));
+        assert!(md.contains("|Alice|"));
+        assert!(md.contains("|Bob|"));
     }
 
     #[test]
@@ -355,8 +343,8 @@ mod tests {
             item_indices: vec![],
         };
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Only"));
-        assert!(md.contains("| ---"));
+        assert!(md.contains("|Only|"));
+        assert!(md.contains("|---|"));
     }
 
     #[test]
