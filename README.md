@@ -15,10 +15,70 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Encoding issue detection** — Automatically flags broken font encodings (garbled text, replacement characters) so callers can fall back to OCR.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
+- **Python bindings** — Use from Python via PyO3. Install with `pip install pdf-inspector` or build from source with `maturin`.
 
 ## Quick start
 
-### As a library
+### Python
+
+Install from source (requires Rust toolchain):
+
+```bash
+pip install maturin
+maturin develop --release
+```
+
+Use it:
+
+```python
+import pdf_inspector
+
+# Full processing: detect + extract + convert to Markdown
+result = pdf_inspector.process_pdf("document.pdf")
+print(result.pdf_type)      # "text_based", "scanned", "image_based", "mixed"
+print(result.confidence)     # 0.0 - 1.0
+print(result.page_count)     # number of pages
+print(result.markdown)       # Markdown string or None
+
+# Process specific pages only
+result = pdf_inspector.process_pdf("document.pdf", pages=[1, 3, 5])
+
+# Process from bytes (no filesystem needed)
+with open("document.pdf", "rb") as f:
+    result = pdf_inspector.process_pdf_bytes(f.read())
+
+# Fast detection only (no text extraction)
+result = pdf_inspector.detect_pdf("document.pdf")
+if result.pdf_type == "text_based":
+    print("Can extract locally!")
+else:
+    print(f"Pages needing OCR: {result.pages_needing_ocr}")
+
+# Plain text extraction
+text = pdf_inspector.extract_text("document.pdf")
+
+# Positioned text items with font info
+items = pdf_inspector.extract_text_with_positions("document.pdf")
+for item in items[:5]:
+    print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")
+```
+
+#### Python API reference
+
+| Function | Description |
+|---|---|
+| `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
+| `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
+| `detect_pdf(path)` | Fast detection only |
+| `detect_pdf_bytes(data)` | Fast detection from bytes |
+| `extract_text(path)` | Plain text extraction |
+| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
+
+**`PdfResult` fields:** `pdf_type`, `markdown`, `page_count`, `processing_time_ms`, `pages_needing_ocr`, `title`, `confidence`, `is_complex_layout`, `pages_with_tables`, `pages_with_columns`, `has_encoding_issues`
+
+**`TextItem` fields:** `text`, `x`, `y`, `width`, `height`, `font`, `font_size`, `page`, `is_bold`, `is_italic`, `item_type`
+
+### Rust
 
 Add to your `Cargo.toml`:
 
@@ -159,6 +219,7 @@ The document is loaded **once** via `load_document_from_path` / `load_document_f
 ```
 src/
   lib.rs                — Public API, PdfOptions builder, convenience functions
+  python.rs             — PyO3 Python bindings
   types.rs              — Shared types: TextItem, TextLine, PdfRect, ItemType
   text_utils.rs         — Character/text helpers (CJK, RTL, ligatures, bold/italic)
   process_mode.rs       — ProcessMode enum (DetectOnly, Analyze, Full)
@@ -189,7 +250,7 @@ This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_
 | `Sample(n)` | Sample `n` evenly distributed pages (first, last, middle) | Very large PDFs where speed matters more than precision |
 | `Pages(vec)` | Only scan specific 1-indexed page numbers | When the caller knows which pages to check |
 
-## API
+## Rust API
 
 ### Processing modes
 

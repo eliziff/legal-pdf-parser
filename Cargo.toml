@@ -8,7 +8,14 @@ description = "Fast PDF inspection, classification, and text extraction with sma
 license = "MIT"
 repository = "https://github.com/firecrawl/pdf-inspector"
 
+[lib]
+name = "pdf_inspector"
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
 # PDF parsing
 lopdf = { git = "https://github.com/firecrawl/lopdf", branch = "firecrawl/zlib-checksum-encrypted", features = ["rayon"] }
 
@@ -34,6 +41,7 @@ tempfile = "3.3"
 
 [features]
 default = []
+python = ["pyo3"]
 
 [[bin]]
 name = "pdf2md"
