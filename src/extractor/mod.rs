@@ -25,6 +25,7 @@ pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
 pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
+pub(crate) use layout::group_into_lines_with_thresholds;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -96,7 +97,9 @@ pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
+    let (extraction, _thresholds) =
+        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+    Ok(extraction)
 }
 
 /// Extract text with positions from memory buffer
@@ -127,23 +130,31 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
+    let (extraction, _thresholds) =
+        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+    Ok(extraction)
 }
 
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
+/// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
+pub(crate) type PageThresholds = HashMap<u32, f32>;
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
+///
+/// Also returns per-page adaptive join thresholds for Canva-style pages.
 pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<PageExtraction, PdfError> {
+) -> Result<(PageExtraction, PageThresholds), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
+    let mut page_thresholds: PageThresholds = HashMap::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -155,7 +166,12 @@ pub(crate) fn extract_positioned_text_from_doc(
                 continue;
             }
         }
-        let (items, rects, lines) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        let (mut items, rects, lines) =
+            extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
+        if threshold > 0.10 {
+            page_thresholds.insert(*page_num, threshold);
+        }
         debug!(
             "page {}: {} text items, {} rects, {} lines",
             page_num,
@@ -194,7 +210,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     let form_items = extract_form_fields(doc, &page_id_to_num);
     all_items.extend(form_items);
 
-    Ok((all_items, all_rects, all_lines))
+    Ok(((all_items, all_rects, all_lines), page_thresholds))
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +840,7 @@ mod tests {
         let make_line = |y: f32, x: f32, page: u32| TextLine {
             y,
             page,
+            adaptive_threshold: 0.10,
             items: vec![TextItem {
                 text: "text".into(),
                 x,
@@ -856,6 +873,7 @@ mod tests {
         let make_line = |y: f32, x: f32, page: u32| TextLine {
             y,
             page,
+            adaptive_threshold: 0.10,
             items: vec![TextItem {
                 text: "text".into(),
                 x,
@@ -888,6 +906,7 @@ mod tests {
         let make_line = |y: f32, x: f32, page: u32| TextLine {
             y,
             page,
+            adaptive_threshold: 0.10,
             items: vec![TextItem {
                 text: "text".into(),
                 x,

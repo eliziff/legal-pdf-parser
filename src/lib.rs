@@ -351,7 +351,7 @@ fn process_document(
     };
 
     let (markdown, layout, has_encoding_issues) = match extracted {
-        Some((items, rects, lines)) => {
+        Some(((items, rects, lines), page_thresholds)) => {
             let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
@@ -362,6 +362,7 @@ fn process_document(
                     options.markdown,
                     &rects,
                     &lines,
+                    &page_thresholds,
                 ))
             };
 

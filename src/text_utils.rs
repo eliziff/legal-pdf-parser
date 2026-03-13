@@ -278,12 +278,267 @@ pub(crate) fn is_cid_font(font: &str) -> bool {
     font.starts_with("C2_") || font.starts_with("C0_")
 }
 
+/// Detect and fix Canva-style letter-spacing within text items.
+///
+/// Canva-generated PDFs render text character-by-character with CSS-style
+/// letter-spacing. The TJ handler inserts spaces between each character,
+/// producing items like `"a r i b"` instead of `"arib"`. This function
+/// detects such items by checking if the text follows a strict pattern of
+/// alternating single characters and spaces, then removes the spurious spaces.
+///
+/// Only activates when ≥50% of items on the page are letter-spaced, to avoid
+/// false positives on normal PDFs with short items like `"a b"`.
+///
+/// Returns the adaptive join threshold for this page: DEFAULT (0.10) for normal
+/// pages, or a higher Otsu-derived threshold for Canva-style pages.
+pub(crate) fn fix_letterspaced_items(items: &mut [TextItem]) -> f32 {
+    const DEFAULT: f32 = 0.10;
+
+    if items.is_empty() {
+        return DEFAULT;
+    }
+
+    // Check if the item text matches "x y z" pattern (single chars separated by spaces)
+    fn is_letterspaced(text: &str) -> bool {
+        let trimmed = text.trim();
+        let chars: Vec<char> = trimmed.chars().collect();
+        // Need at least 3 chars: "a b" = ['a', ' ', 'b']
+        if chars.len() < 3 {
+            return false;
+        }
+        // Pattern: non-space, space, non-space, space, ...
+        chars
+            .iter()
+            .enumerate()
+            .all(|(i, &c)| if i % 2 == 0 { c != ' ' } else { c == ' ' })
+    }
+
+    // Count how many items are letter-spaced vs total non-trivial items
+    let mut letterspaced_count = 0u32;
+    let mut total_text_items = 0u32;
+    for item in items.iter() {
+        let trimmed = item.text.trim();
+        if trimmed.is_empty() || trimmed.len() < 3 {
+            continue;
+        }
+        total_text_items += 1;
+        if is_letterspaced(&item.text) {
+            letterspaced_count += 1;
+        }
+    }
+
+    // Only fix if ≥50% of substantial items are letter-spaced
+    if total_text_items < 4 || letterspaced_count * 2 < total_text_items {
+        return DEFAULT;
+    }
+    // Compute threshold BEFORE removing spaces. Since we've confirmed this
+    // is a Canva-style page (≥50% letterspaced), use the ungated variant
+    // that includes all pairs — the char-count guard in the normal function
+    // would filter out long letterspaced items like "i s s i o n" (11 chars).
+    let threshold = compute_canva_join_threshold(items);
+
+    // Remove spaces from letter-spaced items
+    for item in items.iter_mut() {
+        if is_letterspaced(&item.text) {
+            let fixed: String = item.text.chars().filter(|&c| c != ' ').collect();
+            item.text = fixed;
+        }
+    }
+
+    threshold
+}
+
+/// Compute Otsu join threshold for a confirmed Canva-style page.
+///
+/// Like [`compute_single_char_join_threshold`] but without the per-pair
+/// char-count guard, since we already know the page has Canva-style
+/// letter-spacing. Uses all adjacent pairs for maximum sample size.
+fn compute_canva_join_threshold(items: &[TextItem]) -> f32 {
+    const DEFAULT: f32 = 0.10;
+    const MIN_SAMPLES: usize = 8;
+
+    let mut ratios: Vec<f32> = Vec::new();
+    for pair in items.windows(2) {
+        let prev = &pair[0];
+        let curr = &pair[1];
+
+        // Skip CJK pairs
+        let prev_c = prev.text.trim().chars().last();
+        let curr_c = curr.text.trim().chars().next();
+        if prev_c.is_some_and(is_cjk_char) || curr_c.is_some_and(is_cjk_char) {
+            continue;
+        }
+
+        if prev.width <= 0.0 || prev.font_size <= 0.0 {
+            continue;
+        }
+
+        let gap = if prev.x <= curr.x {
+            curr.x - (prev.x + prev.width)
+        } else {
+            prev.x - (curr.x + curr.width)
+        };
+
+        let ratio = gap / prev.font_size;
+
+        if !(0.0..=3.0).contains(&ratio) {
+            continue;
+        }
+
+        ratios.push(ratio);
+    }
+
+    if ratios.len() < MIN_SAMPLES {
+        return DEFAULT;
+    }
+
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // If all gaps are tight (max < 0.40), use default — normal PDF
+    let max_ratio = ratios[ratios.len() - 1];
+    if max_ratio < 0.40 {
+        return DEFAULT;
+    }
+
+    // If the minimum gap is below 0.40, there's a mix of tight and wide gaps,
+    // meaning this isn't a uniform letter-spacing PDF — use default.
+    if ratios[0] < 0.40 {
+        return DEFAULT;
+    }
+
+    // Median-based threshold: for Canva letter-spacing, the median gap ratio
+    // is dominated by the letter-spacing value (~0.55× font_size). Word gaps
+    // are consistently ~1.8× the letter-spacing. Using median × 1.55 places
+    // the threshold between the widest intra-word gaps and the narrowest
+    // inter-word gaps.
+    let median = ratios[ratios.len() / 2];
+    (median * 1.55).clamp(0.50, 2.0)
+}
+
+/// Compute an adaptive join threshold for text items on a line.
+///
+/// Uses Otsu's method on the gap/font_size ratio distribution to find the
+/// natural split between intra-word and inter-word gaps. With per-pair
+/// char-count guard (both items ≥ 5 chars → skip). Used only in tests;
+/// production code uses `compute_canva_join_threshold` via `fix_letterspaced_items`.
+#[cfg(test)]
+fn compute_single_char_join_threshold(items: &[TextItem]) -> f32 {
+    const DEFAULT: f32 = 0.10;
+    const MIN_SAMPLES: usize = 8;
+
+    // Collect gap/font_size ratios for adjacent pairs involving at least one
+    // short fragment (< 5 chars). This detects per-character rendering
+    // (Canva-style) without being fooled by uniform word-level spacing.
+    let mut ratios: Vec<f32> = Vec::new();
+    for pair in items.windows(2) {
+        let prev = &pair[0];
+        let curr = &pair[1];
+
+        let prev_chars = prev.text.trim().chars().count();
+        let curr_chars = curr.text.trim().chars().count();
+
+        // Require at least one item to be a short fragment.
+        // Pairs of long words (both ≥ 5 chars) indicate normal text.
+        if prev_chars >= 5 && curr_chars >= 5 {
+            continue;
+        }
+
+        // Skip CJK pairs
+        let prev_c = prev.text.trim().chars().last();
+        let curr_c = curr.text.trim().chars().next();
+        if prev_c.is_some_and(is_cjk_char) || curr_c.is_some_and(is_cjk_char) {
+            continue;
+        }
+
+        if prev.width <= 0.0 || prev.font_size <= 0.0 {
+            continue;
+        }
+
+        let gap = if prev.x <= curr.x {
+            curr.x - (prev.x + prev.width)
+        } else {
+            prev.x - (curr.x + curr.width)
+        };
+
+        let ratio = gap / prev.font_size;
+
+        // Skip negative gaps and huge gaps (> 3× font_size)
+        if !(0.0..=3.0).contains(&ratio) {
+            continue;
+        }
+
+        ratios.push(ratio);
+    }
+
+    if ratios.len() < MIN_SAMPLES {
+        return DEFAULT;
+    }
+
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // If all gaps are tight (max < 0.40), use default — normal PDF
+    let max_ratio = ratios[ratios.len() - 1];
+    if max_ratio < 0.40 {
+        return DEFAULT;
+    }
+
+    // If the minimum gap is below 0.40, there's a mix of tight and wide gaps,
+    // meaning this isn't a uniform letter-spacing PDF — use default.
+    // Canva-style letter-spacing has min gaps ≈ 0.5× font_size; normal
+    // justified text gaps are ≈ 0.15–0.30× font_size.
+    if ratios[0] < 0.40 {
+        return DEFAULT;
+    }
+
+    // All gaps are wide (≥0.25× font_size) — Canva-style letter-spacing.
+    // Use Otsu to find the split between intra-word and inter-word gaps.
+    let n = ratios.len() as f32;
+    let total_sum: f32 = ratios.iter().sum();
+
+    let mut best_threshold = DEFAULT;
+    let mut best_variance = f32::NEG_INFINITY;
+
+    let mut w0: f32 = 0.0;
+    let mut sum0: f32 = 0.0;
+
+    for i in 0..ratios.len() - 1 {
+        w0 += 1.0;
+        sum0 += ratios[i];
+
+        let w1 = n - w0;
+        if w1 == 0.0 {
+            break;
+        }
+
+        let mean0 = sum0 / w0;
+        let mean1 = (total_sum - sum0) / w1;
+        let variance = w0 * w1 * (mean0 - mean1).powi(2);
+
+        // Only consider thresholds at value boundaries (skip duplicates)
+        if i + 1 < ratios.len() && (ratios[i + 1] - ratios[i]).abs() < 1e-6 {
+            continue;
+        }
+
+        if variance > best_variance {
+            best_variance = variance;
+            // Place threshold midway between the two classes
+            best_threshold = (ratios[i] + ratios[i + 1]) / 2.0;
+        }
+    }
+
+    best_threshold.clamp(0.05, 2.0)
+}
+
 /// Determine if two adjacent text items should be joined without a space
 /// based on their physical positions on the page and character case.
 /// Uses a hybrid approach: position-based with case-aware thresholds.
 /// CID fonts emit one word per text operator with gaps ≈ 0 between words.
 /// Non-CID (Type1/TrueType) fonts emit phrases or fragments.
-pub(crate) fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
+pub(crate) fn should_join_items(
+    prev_item: &TextItem,
+    curr_item: &TextItem,
+    single_char_threshold: f32,
+) -> bool {
     // If either text explicitly has leading/trailing spaces, respect them
     if prev_item.text.ends_with(' ') || curr_item.text.starts_with(' ') {
         return false;
@@ -365,6 +620,12 @@ pub(crate) fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> b
             }
         }
 
+        // When the adaptive threshold indicates Canva-style letter-spacing
+        // (all gaps wide), use it uniformly for all pair types.
+        if single_char_threshold > 0.20 {
+            return gap < font_size * single_char_threshold;
+        }
+
         // Single-character fragment joined to a multi-character item: use a
         // moderately generous threshold to rejoin split words like "b" + "illion"
         // or "C" + "ultural". Gap near 0 = same word; gap ~0.2+ = different words.
@@ -385,7 +646,7 @@ pub(crate) fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> b
                     return gap < font_size * 0.25;
                 }
             }
-            return gap < font_size * 0.10;
+            return gap < font_size * single_char_threshold;
         }
 
         // With accurate widths, a gap < 15% of font size means glyphs are
@@ -473,6 +734,7 @@ pub(crate) fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ItemType;
 
     #[test]
     fn strip_soft_hyphen() {
@@ -580,5 +842,198 @@ mod tests {
         assert!(!is_arabic_presentation_form('\u{0645}'));
         // Latin
         assert!(!is_arabic_presentation_form('A'));
+    }
+
+    /// Helper to create a single-char TextItem at a given x position with width.
+    fn make_char_item(ch: char, x: f32, width: f32, font_size: f32) -> TextItem {
+        TextItem {
+            text: ch.to_string(),
+            x,
+            y: 100.0,
+            width,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+        }
+    }
+
+    #[test]
+    fn otsu_threshold_sec_style_tight_gaps() {
+        // SEC-style: intra-word gaps ≈ 0, word gap ≈ 0.15× font_size
+        // All gaps tight → should return default 0.10
+        let fs = 12.0;
+        let char_w = fs * 0.5;
+        let mut items = Vec::new();
+        // 15 chars with gap ≈ 0 (intra-word)
+        for i in 0..15 {
+            let x = 100.0 + i as f32 * (char_w + fs * 0.01);
+            items.push(make_char_item('a', x, char_w, fs));
+        }
+        // Word gap
+        let word_x = items.last().unwrap().x + char_w + fs * 0.15;
+        items.push(make_char_item('b', word_x, char_w, fs));
+        // 5 more tight chars
+        for i in 1..5 {
+            let x = word_x + i as f32 * (char_w + fs * 0.01);
+            items.push(make_char_item('c', x, char_w, fs));
+        }
+
+        let threshold = compute_single_char_join_threshold(&items);
+        // Max gap is 0.15, but most are 0.01 → max < 0.20 → default
+        assert!(
+            (threshold - 0.10).abs() < 0.01,
+            "SEC-style should return default ~0.10, got {threshold}"
+        );
+    }
+
+    #[test]
+    fn otsu_threshold_canva_style_wide_gaps() {
+        // Canva-style: intra-word gaps ≈ 0.6× font_size, word gaps ≈ 1.2× font_size
+        let fs = 12.0;
+        let char_w = fs * 0.5;
+        let intra_gap = fs * 0.6;
+        let word_gap = fs * 1.2;
+        let mut items = Vec::new();
+
+        // Word 1: 8 chars with intra-word spacing
+        for i in 0..8 {
+            let x = 100.0 + i as f32 * (char_w + intra_gap);
+            items.push(make_char_item('K', x, char_w, fs));
+        }
+        // Word gap
+        let word_x = items.last().unwrap().x + char_w + word_gap;
+        items.push(make_char_item('T', word_x, char_w, fs));
+        // Word 2: 7 more chars
+        for i in 1..7 {
+            let x = word_x + i as f32 * (char_w + intra_gap);
+            items.push(make_char_item('o', x, char_w, fs));
+        }
+
+        let threshold = compute_single_char_join_threshold(&items);
+        // Should find threshold between 0.6 and 1.2 → roughly 0.9
+        assert!(
+            threshold > 0.5 && threshold < 1.1,
+            "Canva-style should find threshold ~0.9, got {threshold}"
+        );
+    }
+
+    #[test]
+    fn otsu_threshold_few_samples_returns_default() {
+        // < 8 single-char pairs → default
+        let fs = 12.0;
+        let char_w = fs * 0.5;
+        let items: Vec<TextItem> = (0..5)
+            .map(|i| make_char_item('x', 100.0 + i as f32 * (char_w + 1.0), char_w, fs))
+            .collect();
+
+        let threshold = compute_single_char_join_threshold(&items);
+        assert!(
+            (threshold - 0.10).abs() < 0.01,
+            "few samples should return default 0.10, got {threshold}"
+        );
+    }
+
+    #[test]
+    fn fix_letterspaced_items_returns_adaptive_threshold() {
+        // Simulate Canva page with many letter-spaced items and word gaps.
+        // Needs ≥8 inter-item gaps for the threshold to be computed.
+        let fs = 12.0;
+        let char_w = fs * 0.5;
+        let letter_gap = fs * 0.6; // 0.6× font_size between items
+        let word_gap = fs * 1.2; // 1.2× font_size between words
+
+        let words: Vec<&str> = vec![
+            "H e l l o",
+            "W o r l d",
+            "F o o",
+            "B a r",
+            "B a z",
+            "Q u x",
+            "T e s t",
+            "D a t a",
+            "M o r e",
+            "T e x t",
+        ];
+
+        let mut items = Vec::new();
+        let mut x = 100.0;
+        for (wi, word) in words.iter().enumerate() {
+            let char_count = word.chars().filter(|c| !c.is_whitespace()).count();
+            let w = char_count as f32 * char_w + (char_count - 1) as f32 * letter_gap;
+            items.push(TextItem {
+                text: word.to_string(),
+                x,
+                y: 100.0,
+                width: w,
+                height: fs,
+                font: "TestFont".to_string(),
+                font_size: fs,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            });
+            // Alternate between letter-gap and word-gap to create bimodal distribution
+            x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
+        }
+
+        let threshold = fix_letterspaced_items(&mut items);
+
+        // Threshold should be above default (Canva-style detected)
+        assert!(
+            threshold > 0.50,
+            "Canva page should get threshold > 0.50, got {threshold}"
+        );
+
+        // Spaces should be removed from letter-spaced items
+        assert_eq!(items[0].text, "Hello");
+        assert_eq!(items[1].text, "World");
+        assert_eq!(items[2].text, "Foo");
+        assert_eq!(items[9].text, "Text");
+    }
+
+    #[test]
+    fn canva_style_items_join_correctly() {
+        // Simulate Canva PDF: "Hello" with 0.6× font_size letter-spacing
+        let fs = 12.0;
+        let char_w = fs * 0.5;
+        let intra_gap = fs * 0.6;
+        let word_gap = fs * 1.2;
+
+        let mut items = Vec::new();
+        let chars = ['H', 'e', 'l', 'l', 'o'];
+        for (i, &ch) in chars.iter().enumerate() {
+            let x = 100.0 + i as f32 * (char_w + intra_gap);
+            items.push(make_char_item(ch, x, char_w, fs));
+        }
+        // Space then "W"
+        let w_x = items.last().unwrap().x + char_w + word_gap;
+        items.push(make_char_item('W', w_x, char_w, fs));
+        let chars2 = ['o', 'r', 'l', 'd'];
+        for (i, &ch) in chars2.iter().enumerate() {
+            let x = w_x + (i + 1) as f32 * (char_w + intra_gap);
+            items.push(make_char_item(ch, x, char_w, fs));
+        }
+
+        let threshold = compute_single_char_join_threshold(&items);
+
+        // Intra-word pairs should join
+        assert!(
+            should_join_items(&items[0], &items[1], threshold),
+            "H+e should join with threshold {threshold}"
+        );
+        assert!(
+            should_join_items(&items[3], &items[4], threshold),
+            "l+o should join with threshold {threshold}"
+        );
+        // Word boundary should NOT join
+        assert!(
+            !should_join_items(&items[4], &items[5], threshold),
+            "o+W (word boundary) should NOT join with threshold {threshold}"
+        );
     }
 }

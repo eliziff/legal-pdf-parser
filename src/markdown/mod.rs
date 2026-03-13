@@ -16,7 +16,7 @@ pub use convert::to_markdown_from_lines;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::extractor::group_into_lines;
+use crate::extractor::group_into_lines_with_thresholds;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
@@ -452,7 +452,7 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
-    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[])
+    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[], &HashMap::new())
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -464,6 +464,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
     pdf_lines: &[crate::types::PdfLine],
+    page_thresholds: &HashMap<u32, f32>,
 ) -> String {
     use crate::tables::{
         detect_tables, detect_tables_from_lines, detect_tables_from_rects, table_to_markdown,
@@ -781,7 +782,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() {
-        group_into_lines(non_table_items)
+        group_into_lines_with_thresholds(non_table_items, page_thresholds)
     } else {
         // Separate items into band-split pages and non-split pages
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -794,7 +795,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines = group_into_lines(unsplit_items);
+        let mut all_lines = group_into_lines_with_thresholds(unsplit_items, page_thresholds);
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
@@ -811,7 +812,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .cloned()
                     .collect();
                 if !band_items.is_empty() {
-                    page_lines.extend(group_into_lines(band_items));
+                    page_lines.extend(group_into_lines_with_thresholds(
+                        band_items,
+                        page_thresholds,
+                    ));
                 }
             }
             // Sort by Y descending (top to bottom) so left and right

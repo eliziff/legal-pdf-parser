@@ -138,6 +138,7 @@ fn test_text_line_text_method() {
         items,
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "Hello World");
 }
@@ -149,6 +150,7 @@ fn test_text_line_single_item() {
         items,
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "Single");
 }
@@ -159,6 +161,7 @@ fn test_text_line_empty() {
         items: vec![],
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "");
 }
@@ -473,11 +476,13 @@ fn test_markdown_from_lines_basic() {
             items: vec![make_text_item("First", 100.0, 700.0, 12.0, 1)],
             y: 700.0,
             page: 1,
+            adaptive_threshold: 0.10,
         },
         TextLine {
             items: vec![make_text_item("Second", 100.0, 680.0, 12.0, 1)],
             y: 680.0,
             page: 1,
+            adaptive_threshold: 0.10,
         },
     ];
     let md = to_markdown_from_lines(lines, MarkdownOptions::default());

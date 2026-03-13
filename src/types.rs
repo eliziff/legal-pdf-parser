@@ -125,6 +125,10 @@ pub struct TextLine {
     pub items: Vec<TextItem>,
     pub y: f32,
     pub page: u32,
+    /// Adaptive join threshold from page-level letter-spacing detection.
+    /// Default 0.10 for normal PDFs; higher for Canva-style PDFs.
+    #[doc(hidden)]
+    pub adaptive_threshold: f32,
 }
 
 impl TextLine {
@@ -137,6 +141,8 @@ impl TextLine {
         if !format_bold && !format_italic {
             return self.text_plain();
         }
+
+        let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
         let mut current_bold = false;
@@ -156,7 +162,7 @@ impl TextLine {
                 false
             } else {
                 let prev_item = &self.items[i - 1];
-                self.needs_space_between(prev_item, item, &result)
+                self.needs_space_between(prev_item, item, &result, single_char_threshold)
             };
 
             // Preserve leading whitespace from the item text.
@@ -211,6 +217,8 @@ impl TextLine {
 
     /// Get plain text without formatting
     fn text_plain(&self) -> String {
+        let single_char_threshold = self.adaptive_threshold;
+
         let mut result = String::new();
         for (i, item) in self.items.iter().enumerate() {
             let text = item.text.as_str();
@@ -218,7 +226,7 @@ impl TextLine {
                 result.push_str(text);
             } else {
                 let prev_item = &self.items[i - 1];
-                if self.needs_space_between(prev_item, item, &result) {
+                if self.needs_space_between(prev_item, item, &result, single_char_threshold) {
                     result.push(' ');
                 }
                 result.push_str(text);
@@ -228,7 +236,13 @@ impl TextLine {
     }
 
     /// Determine if a space is needed between two items
-    fn needs_space_between(&self, prev_item: &TextItem, item: &TextItem, result: &str) -> bool {
+    fn needs_space_between(
+        &self,
+        prev_item: &TextItem,
+        item: &TextItem,
+        result: &str,
+        single_char_threshold: f32,
+    ) -> bool {
         let text = item.text.as_str();
 
         // Don't add space before/after hyphens for hyphenated words
@@ -245,7 +259,7 @@ impl TextLine {
         let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
 
         // Use position-based spacing detection
-        let should_join = should_join_items(prev_item, item);
+        let should_join = should_join_items(prev_item, item, single_char_threshold);
 
         // Check if space already exists
         let prev_ends_with_space = result.ends_with(' ');

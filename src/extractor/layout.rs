@@ -1,5 +1,7 @@
 //! Column detection, line grouping, and reading-order layout.
 
+use std::collections::HashMap;
+
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
 use log::debug;
@@ -367,6 +369,16 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
 }
 
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
+    group_into_lines_with_thresholds(items, &HashMap::new())
+}
+
+/// Group text items into lines, using pre-computed per-page adaptive thresholds
+/// from Canva-style letter-spacing detection. Falls back to computing the
+/// threshold from item gaps when no pre-computed value is available.
+pub(crate) fn group_into_lines_with_thresholds(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -387,12 +399,17 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     for page in pages {
         let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
 
+        // Use pre-computed threshold from fix_letterspaced_items if available
+        // (computed before embedded-space removal, with full signal).
+        // Non-Canva pages use the default 0.10 threshold.
+        let adaptive_threshold = page_thresholds.get(&page).copied().unwrap_or(0.10);
+
         // Detect columns for this page
         let columns = detect_columns(&page_items, page);
 
         if columns.len() <= 1 {
             // Single column - use simple sorting
-            let lines = group_single_column(page_items);
+            let lines = group_single_column(page_items, adaptive_threshold);
             all_lines.extend(lines);
         } else {
             // Multi-column - separate spanning items from column items
@@ -461,12 +478,12 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
 
             let mut per_column_lines: Vec<Vec<TextLine>> = Vec::new();
             for col_items in col_buckets {
-                let lines = group_single_column(col_items);
+                let lines = group_single_column(col_items, adaptive_threshold);
                 per_column_lines.push(lines);
             }
 
             // Process spanning items as their own group
-            let spanning_lines = group_single_column(spanning_items);
+            let spanning_lines = group_single_column(spanning_items, adaptive_threshold);
 
             let is_newspaper = is_newspaper_layout(&per_column_lines);
             debug!(
@@ -618,7 +635,7 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
 
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
-fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
+fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -687,6 +704,7 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
                 items: vec![item],
                 y,
                 page,
+                adaptive_threshold,
             });
         }
     }
