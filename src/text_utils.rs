@@ -329,6 +329,19 @@ pub(crate) fn fix_letterspaced_items(items: &mut [TextItem]) -> f32 {
 
     // Only fix if ≥50% of substantial items are letter-spaced
     if total_text_items < 4 || letterspaced_count * 2 < total_text_items {
+        // Second detection path: per-character rendering without embedded spaces.
+        // Canva sometimes emits each character as a separate TextItem (no "a b c"
+        // pattern within items). Detect by checking if >50% of items are single chars.
+        let single_char_count = items
+            .iter()
+            .filter(|i| i.text.trim().chars().count() == 1)
+            .count();
+        if items.len() >= 10 && single_char_count * 2 >= items.len() {
+            let threshold = compute_canva_join_threshold(items);
+            if threshold > 0.40 {
+                return threshold;
+            }
+        }
         return DEFAULT;
     }
     // Compute threshold BEFORE removing spaces. Since we've confirmed this
@@ -348,21 +361,39 @@ pub(crate) fn fix_letterspaced_items(items: &mut [TextItem]) -> f32 {
     threshold
 }
 
-/// Compute Otsu join threshold for a confirmed Canva-style page.
+/// Compute join threshold for a confirmed Canva-style page.
 ///
-/// Like [`compute_single_char_join_threshold`] but without the per-pair
-/// char-count guard, since we already know the page has Canva-style
-/// letter-spacing. Uses all adjacent pairs for maximum sample size.
+/// Uses `median × 1.55` on the gap/font_size ratio distribution. The page-level
+/// threshold is used for multi-char item pairs; single-char pairs use
+/// character-width–based joining in `should_join_items` instead.
 fn compute_canva_join_threshold(items: &[TextItem]) -> f32 {
     const DEFAULT: f32 = 0.10;
     const MIN_SAMPLES: usize = 8;
 
+    let ratios = collect_gap_ratios(items);
+    if ratios.len() < MIN_SAMPLES {
+        return DEFAULT;
+    }
+
+    let mut sorted: Vec<f32> = ratios;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if sorted[sorted.len() - 1] < 0.40 || sorted[0] < 0.40 {
+        return DEFAULT;
+    }
+
+    let median = sorted[sorted.len() / 2];
+    (median * 1.55).clamp(0.50, 2.0)
+}
+
+/// Collect positive gap/font_size ratios from adjacent item pairs,
+/// filtering out CJK, zero-width, and out-of-range values.
+fn collect_gap_ratios(items: &[TextItem]) -> Vec<f32> {
     let mut ratios: Vec<f32> = Vec::new();
     for pair in items.windows(2) {
         let prev = &pair[0];
         let curr = &pair[1];
 
-        // Skip CJK pairs
         let prev_c = prev.text.trim().chars().last();
         let curr_c = curr.text.trim().chars().next();
         if prev_c.is_some_and(is_cjk_char) || curr_c.is_some_and(is_cjk_char) {
@@ -381,38 +412,11 @@ fn compute_canva_join_threshold(items: &[TextItem]) -> f32 {
 
         let ratio = gap / prev.font_size;
 
-        if !(0.0..=3.0).contains(&ratio) {
-            continue;
+        if (0.0..=3.0).contains(&ratio) {
+            ratios.push(ratio);
         }
-
-        ratios.push(ratio);
     }
-
-    if ratios.len() < MIN_SAMPLES {
-        return DEFAULT;
-    }
-
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // If all gaps are tight (max < 0.40), use default — normal PDF
-    let max_ratio = ratios[ratios.len() - 1];
-    if max_ratio < 0.40 {
-        return DEFAULT;
-    }
-
-    // If the minimum gap is below 0.40, there's a mix of tight and wide gaps,
-    // meaning this isn't a uniform letter-spacing PDF — use default.
-    if ratios[0] < 0.40 {
-        return DEFAULT;
-    }
-
-    // Median-based threshold: for Canva letter-spacing, the median gap ratio
-    // is dominated by the letter-spacing value (~0.55× font_size). Word gaps
-    // are consistently ~1.8× the letter-spacing. Using median × 1.55 places
-    // the threshold between the widest intra-word gaps and the narrowest
-    // inter-word gaps.
-    let median = ratios[ratios.len() / 2];
-    (median * 1.55).clamp(0.50, 2.0)
+    ratios
 }
 
 /// Compute an adaptive join threshold for text items on a line.
@@ -621,8 +625,25 @@ pub(crate) fn should_join_items(
         }
 
         // When the adaptive threshold indicates Canva-style letter-spacing
-        // (all gaps wide), use it uniformly for all pair types.
+        // (all gaps wide), use character-width–based joining.
+        //
+        // Canva renders text character-by-character with CSS-style letter-spacing.
+        // For single-char prev items, gap/char_width gives a clean separation
+        // (~0.9–1.05 for letter gaps, ~1.5+ for word gaps).
+        // For multi-char prev, avg_char_width normalizes for character mix.
+        // Multi→multi pairs use the page-level threshold (gap/font_size).
         if single_char_threshold > 0.20 {
+            if prev_chars == 1 {
+                // Single-char prev: its rendered width is an accurate reference
+                return gap < prev_item.width * 1.25;
+            }
+            if curr_chars == 1 {
+                // Multi→single: avg char width of prev normalises for
+                // wide/narrow character mix (e.g. "ilw" includes i,l,w)
+                let avg_char_width = prev_item.width / prev_chars as f32;
+                return gap < avg_char_width * 1.25;
+            }
+            // Both multi-char: use page-level threshold
             return gap < font_size * single_char_threshold;
         }
 
@@ -1034,6 +1055,98 @@ mod tests {
         assert!(
             !should_join_items(&items[4], &items[5], threshold),
             "o+W (word boundary) should NOT join with threshold {threshold}"
+        );
+    }
+
+    /// Helper to create a multi-char TextItem at a given position.
+    fn make_text_item(text: &str, x: f32, width: f32, font_size: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y: 100.0,
+            width,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+        }
+    }
+
+    #[test]
+    fn canva_width_based_single_char_prev_join() {
+        // Canva-style: single-char prev uses gap/prev.width < 1.25
+        let fs = 12.0;
+        let threshold = 0.90; // Canva page threshold
+
+        // "K" (w=7.9) → "a" (gap=8.12): letter gap, ratio=1.028 → JOIN
+        let k = make_text_item("K", 100.0, 7.9, fs);
+        let a = make_text_item("a", 115.9, 6.0, fs);
+        assert!(
+            should_join_items(&k, &a, threshold),
+            "K→a: gap/width={:.3}, should join",
+            (a.x - (k.x + k.width)) / k.width
+        );
+
+        // "f" (w=4.0) → "K" (gap=10.47): word boundary, ratio=2.618 → SPLIT
+        let f = make_text_item("f", 193.0, 4.0, fs);
+        let k2 = make_text_item("K", 207.47, 7.9, fs);
+        assert!(
+            !should_join_items(&f, &k2, threshold),
+            "f→K: gap/width={:.3}, should split",
+            (k2.x - (f.x + f.width)) / f.width
+        );
+    }
+
+    #[test]
+    fn canva_width_based_multi_to_single_join() {
+        // Multi→single: uses avg_char_width of prev
+        let fs = 12.0;
+        let threshold = 0.90;
+
+        // "ilw" (w=23.6, 3 chars) → "a" (gap=9.42): intra-word, avg=7.87, ratio=1.197 → JOIN
+        let ilw = make_text_item("ilw", 320.0, 23.6, fs);
+        let a = make_text_item("a", 353.0, 6.0, fs);
+        assert!(
+            should_join_items(&ilw, &a, threshold),
+            "ilw→a: avg_ratio={:.3}, should join (intra-word 'railway')",
+            (a.x - (ilw.x + ilw.width)) / (ilw.width / 3.0)
+        );
+
+        // "rich" (w=34.8, 4 chars) → "m" (gap=14.01): word boundary, avg=8.7, ratio=1.610 → SPLIT
+        let rich = make_text_item("rich", 229.0, 34.8, fs);
+        let m = make_text_item("m", 277.8, 10.7, fs);
+        assert!(
+            !should_join_items(&rich, &m, threshold),
+            "rich→m: avg_ratio={:.3}, should split (word boundary)",
+            (m.x - (rich.x + rich.width)) / (rich.width / 4.0)
+        );
+    }
+
+    #[test]
+    fn canva_width_based_multi_to_multi_page_threshold() {
+        // Multi→multi: uses page-level threshold (gap/font_size < threshold)
+        let fs = 12.0;
+        let threshold = 0.90;
+
+        // "rib" (w=25.0) → "ib" (gap=7.01): intra-word, r=0.584 → JOIN
+        let rib = make_text_item("rib", 236.0, 25.0, fs);
+        let ib = make_text_item("ib", 268.0, 14.0, fs);
+        assert!(
+            should_join_items(&rib, &ib, threshold),
+            "rib→ib: ratio={:.3}, should join (intra-word)",
+            (ib.x - (rib.x + rib.width)) / fs
+        );
+
+        // "ized" (w=35.9) → "fo" (gap=13.92): word boundary, r=1.160 → SPLIT
+        let ized = make_text_item("ized", 142.0, 35.9, fs);
+        let fo = make_text_item("fo", 191.8, 13.8, fs);
+        assert!(
+            !should_join_items(&ized, &fo, threshold),
+            "ized→fo: ratio={:.3}, should split (word boundary)",
+            (fo.x - (ized.x + ized.width)) / fs
         );
     }
 }
