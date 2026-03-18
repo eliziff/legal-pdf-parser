@@ -248,7 +248,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
-    let lines = merge_heading_lines(lines, base_size, &heading_tiers);
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers, struct_roles);
 
     // Compute the typical line spacing for paragraph break detection.
     // For double-spaced documents (like legal/government PDFs), the normal
@@ -621,7 +621,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
-    let lines = merge_heading_lines(lines, base_size, &heading_tiers);
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers, None);
 
     // Compute the typical line spacing for paragraph break detection
     let para_threshold = compute_paragraph_threshold(&lines, base_size);

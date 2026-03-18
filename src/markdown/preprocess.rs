@@ -2,9 +2,48 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::structure_tree::StructRole;
 use crate::types::TextLine;
 
 use super::analysis::detect_header_level;
+
+/// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.
+/// Struct-tree headings take priority.
+fn effective_heading_level(
+    line: &TextLine,
+    base_size: f32,
+    heading_tiers: &[f32],
+    struct_roles: Option<&HashMap<u32, HashMap<i64, StructRole>>>,
+) -> Option<usize> {
+    // Check struct-tree role first
+    if let Some(roles) = struct_roles {
+        if let Some(page_roles) = roles.get(&line.page) {
+            for item in &line.items {
+                if let Some(mcid) = item.mcid {
+                    if let Some(role) = page_roles.get(&mcid) {
+                        let level = match role {
+                            StructRole::H => Some(1),
+                            StructRole::H1 => Some(1),
+                            StructRole::H2 => Some(2),
+                            StructRole::H3 => Some(3),
+                            StructRole::H4 => Some(4),
+                            StructRole::H5 => Some(5),
+                            StructRole::H6 => Some(6),
+                            _ => None,
+                        };
+                        if level.is_some() {
+                            return level;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to font-size heuristic
+    let font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
+    detect_header_level(font, base_size, heading_tiers)
+}
 
 /// Merge consecutive heading lines at the same level into a single line.
 ///
@@ -12,10 +51,13 @@ use super::analysis::detect_header_level;
 /// and "Interconnect Company"), each fragment becomes a separate `# Header` in the output.
 /// This function detects consecutive lines at the same heading tier on the same page
 /// with a small Y gap and merges them into one line.
+///
+/// Both font-size heuristic headings and struct-tree tagged headings are considered.
 pub(crate) fn merge_heading_lines(
     lines: Vec<TextLine>,
     base_size: f32,
     heading_tiers: &[f32],
+    struct_roles: Option<&HashMap<u32, HashMap<i64, StructRole>>>,
 ) -> Vec<TextLine> {
     if lines.is_empty() {
         return lines;
@@ -24,19 +66,23 @@ pub(crate) fn merge_heading_lines(
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
     for line in lines {
+        let line_level = effective_heading_level(&line, base_size, heading_tiers, struct_roles);
         let line_font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-        let line_level = detect_header_level(line_font, base_size, heading_tiers);
 
         // Check if the previous line is a heading at the same level on the same page
         let should_merge = if let (Some(prev), Some(curr_level)) = (result.last(), line_level) {
-            let prev_font = prev.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            let prev_level = detect_header_level(prev_font, base_size, heading_tiers);
+            let prev_level = effective_heading_level(prev, base_size, heading_tiers, struct_roles);
             let same_page = prev.page == line.page;
             let same_level = prev_level == Some(curr_level);
             let y_gap = prev.y - line.y;
             // Merge if gap is within ~2x the font size (normal line wrap spacing)
             let close_enough = y_gap > 0.0 && y_gap < line_font * 2.0;
-            same_page && same_level && close_enough
+            // Don't merge if combined text would be too long — real headings are short.
+            // This prevents merging body-text lines that are mis-tagged as headings.
+            let prev_words = prev.text().split_whitespace().count();
+            let curr_words = line.text().split_whitespace().count();
+            let not_too_long = prev_words + curr_words <= 20;
+            same_page && same_level && close_enough && not_too_long
         } else {
             false
         };
@@ -439,4 +485,117 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         .filter(|(idx, _)| !removal_set.contains(idx))
         .map(|(_, line)| line)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn make_item(text: &str, font_size: f32, mcid: Option<i64>) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid,
+        }
+    }
+
+    fn make_line(text: &str, font_size: f32, page: u32, y: f32, mcid: Option<i64>) -> TextLine {
+        TextLine {
+            items: vec![make_item(text, font_size, mcid)],
+            y,
+            page,
+            adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn test_merge_struct_tree_headings() {
+        // Two consecutive lines tagged as H2 via struct tree, same font size as body
+        let lines = vec![
+            make_line(
+                "Historical Context for Operations in Snow",
+                12.0,
+                1,
+                700.0,
+                Some(10),
+            ),
+            make_line("Lake District", 12.0, 1, 686.0, Some(11)),
+            make_line("Body text paragraph.", 12.0, 1, 660.0, Some(12)),
+        ];
+
+        let mut page_roles = HashMap::new();
+        let mut roles = HashMap::new();
+        roles.insert(10i64, StructRole::H2);
+        roles.insert(11i64, StructRole::H2);
+        roles.insert(12i64, StructRole::P);
+        page_roles.insert(1u32, roles);
+
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        assert_eq!(result.len(), 2, "should merge two H2 lines into one");
+        let merged_text = result[0].text();
+        assert!(
+            merged_text.contains("Snow") && merged_text.contains("Lake"),
+            "merged heading should contain both fragments: {merged_text}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_different_struct_levels() {
+        // Two consecutive lines tagged as different heading levels
+        let lines = vec![
+            make_line("Chapter 1", 12.0, 1, 700.0, Some(10)),
+            make_line("Introduction", 12.0, 1, 686.0, Some(11)),
+        ];
+
+        let mut page_roles = HashMap::new();
+        let mut roles = HashMap::new();
+        roles.insert(10i64, StructRole::H1);
+        roles.insert(11i64, StructRole::H2);
+        page_roles.insert(1u32, roles);
+
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        assert_eq!(result.len(), 2, "should not merge different heading levels");
+    }
+
+    #[test]
+    fn test_no_merge_heading_with_body() {
+        // A heading line followed by a body paragraph line
+        let lines = vec![
+            make_line("Introduction", 12.0, 1, 700.0, Some(10)),
+            make_line("This is body text.", 12.0, 1, 686.0, Some(11)),
+        ];
+
+        let mut page_roles = HashMap::new();
+        let mut roles = HashMap::new();
+        roles.insert(10i64, StructRole::H1);
+        roles.insert(11i64, StructRole::P);
+        page_roles.insert(1u32, roles);
+
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        assert_eq!(result.len(), 2, "should not merge heading with body text");
+    }
+
+    #[test]
+    fn test_merge_font_headings_still_works() {
+        // Original font-size based merging should still work without struct roles
+        let lines = vec![
+            make_line("A Very Long Heading That", 18.0, 1, 700.0, None),
+            make_line("Wraps to Next Line", 18.0, 1, 682.0, None),
+            make_line("Body text.", 12.0, 1, 660.0, None),
+        ];
+
+        let heading_tiers = vec![18.0];
+        let result = merge_heading_lines(lines, 12.0, &heading_tiers, None);
+        assert_eq!(result.len(), 2, "should merge font-based heading lines");
+    }
 }
