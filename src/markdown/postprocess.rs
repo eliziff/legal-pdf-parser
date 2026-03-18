@@ -24,6 +24,12 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
         text = format_urls(&text);
     }
 
+    // Collapse consecutive spaces within text lines.
+    // OCR text layers and some PDF producers emit trailing spaces on each
+    // text item, which combine with gap-based space insertion to produce
+    // double spaces ("Vice  President" instead of "Vice President").
+    collapse_consecutive_spaces(&mut text);
+
     // Remove excessive newlines (more than 2 in a row)
     while text.contains("\n\n\n") {
         text = text.replace("\n\n\n", "\n\n");
@@ -34,6 +40,35 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     text.push('\n');
 
     text
+}
+
+/// Collapse runs of 2+ spaces to a single space within each line.
+/// Preserves leading indentation and markdown table pipe alignment.
+fn collapse_consecutive_spaces(text: &mut String) {
+    let mut result = String::with_capacity(text.len());
+    for line in text.split('\n') {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        // Preserve leading whitespace
+        let trimmed = line.trim_start();
+        let leading = &line[..line.len() - trimmed.len()];
+        result.push_str(leading);
+        // Collapse inner runs of spaces to single space
+        let mut prev_space = false;
+        for ch in trimmed.chars() {
+            if ch == ' ' {
+                if !prev_space {
+                    result.push(' ');
+                }
+                prev_space = true;
+            } else {
+                prev_space = false;
+                result.push(ch);
+            }
+        }
+    }
+    *text = result;
 }
 
 /// Collapse dot leaders (runs of 4+ dots) into " ... "

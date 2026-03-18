@@ -1,6 +1,6 @@
 **Technical Information**
 
-## l                                                              T-12  SI
+## l T-12 SI
 
 DuPont Fluorochemicals
 
@@ -16,10 +16,10 @@ DuPont Fluorochemicals
 
 **®** **Thermodynamic Properties of Freon 12 Refrigerant** **(R-12)** **SI Units**
 
-Tables of the thermodynamic **Units** properties of R-12 have been developed and are presented here. P = Pressure in kPa. Absolute This information is based on values calculated using the  NIST  REFPROP T = Temperature in Celcius Database  (McLinden,  M.O., Klein,
+Tables of the thermodynamic **Units** properties of R-12 have been developed and are presented here. P = Pressure in kPa. Absolute This information is based on values calculated using the NIST REFPROP T = Temperature in Celcius Database (McLinden, M.O., Klein,
 
-S.A.,  Lemmon, E.W., and Peskin, Vf = Fluid (liquid) specific volume
-A.P., NIST Standard Reference in cubic meters per kilogram Database 23,  NIST thermodynamic and transport properties of Vg = Vapour (gas) specific volume refrigerants and refrigerant in cubic meters per kilogram mixtures –  REFPROP version 6.01, Standard Reference Data Program, df and dg = Fluid and Vapour National Institute of Standards and (respectively) densities in Technology, 1998). kilograms per cubic meter
+S.A., Lemmon, E.W., and Peskin, Vf = Fluid (liquid) specific volume
+A.P., NIST Standard Reference in cubic meters per kilogram Database 23, NIST thermodynamic and transport properties of Vg = Vapour (gas) specific volume refrigerants and refrigerant in cubic meters per kilogram mixtures – REFPROP version 6.01, Standard Reference Data Program, df and dg = Fluid and Vapour National Institute of Standards and (respectively) densities in Technology, 1998). kilograms per cubic meter
 H = Enthalpy (kJ/kg)
 
 S = Entropy (kJ/kg.K)
