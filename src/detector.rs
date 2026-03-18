@@ -806,6 +806,48 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
                 TEMPLATE_IMAGE_THRESHOLD,
                 &mut visited,
             );
+
+            // Also check Pattern resources: tiling patterns can contain
+            // XObject images (e.g., screenshots pasted into PDFs via
+            // Chrome "Save as PDF").
+            if let Ok(pattern_obj) = resources.get(b"Pattern") {
+                let pattern_dict = match pattern_obj {
+                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                    Object::Dictionary(dict) => Some(dict),
+                    _ => None,
+                };
+                if let Some(pattern_dict) = pattern_dict {
+                    for (_, value) in pattern_dict.iter() {
+                        let pat_ref = match value.as_reference() {
+                            Ok(r) => r,
+                            _ => continue,
+                        };
+                        if !visited.insert(pat_ref) {
+                            continue;
+                        }
+                        if let Ok(Object::Stream(stream)) = doc.get_object(pat_ref) {
+                            if let Ok(pat_resources) = stream.dict.get(b"Resources") {
+                                let pat_res_dict = match pat_resources {
+                                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                                    Object::Dictionary(dict) => Some(dict),
+                                    _ => None,
+                                };
+                                if let Some(pat_res) = pat_res_dict {
+                                    collect_images_from_resources(
+                                        doc,
+                                        pat_res,
+                                        &mut has_images,
+                                        &mut total_area,
+                                        &mut has_template_image,
+                                        TEMPLATE_IMAGE_THRESHOLD,
+                                        &mut visited,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
