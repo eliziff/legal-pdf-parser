@@ -25,6 +25,7 @@ pub(crate) fn extract_page_text_items(
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
+    include_invisible: bool,
 ) -> Result<PageExtraction, PdfError> {
     use lopdf::content::Content;
 
@@ -252,8 +253,10 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
-                    // Skip invisible (Tr=3) text but still advance text matrix
-                    if text_rendering_mode == 3 {
+                    // Skip invisible (Tr=3) text but still advance text matrix.
+                    // For Mixed/template PDFs, include_invisible=true extracts
+                    // the OCR text layer that sits behind scanned images.
+                    if text_rendering_mode == 3 && !include_invisible {
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -311,7 +314,8 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
-                        let is_invisible = text_rendering_mode == 3 || suppress_glyph_extraction;
+                        let is_invisible = (text_rendering_mode == 3 && !include_invisible)
+                            || suppress_glyph_extraction;
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -471,7 +475,7 @@ pub(crate) fn extract_page_text_items(
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
-                if !(text_rendering_mode == 3
+                if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {

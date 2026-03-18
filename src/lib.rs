@@ -342,7 +342,38 @@ fn process_document(
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
-        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, options.page_filter.as_ref())
+        let result = extractor::extract_positioned_text_from_doc(
+            &doc,
+            &font_cmaps,
+            options.page_filter.as_ref(),
+        );
+
+        // For Mixed/template PDFs: if normal extraction produces garbage text
+        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
+        // This unlocks OCR text layers behind scanned images.
+        if pdf_type == PdfType::Mixed {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _)| e) {
+                let sample: String = items.iter().take(200).map(|i| i.text.as_str()).collect();
+                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                    extractor::extract_positioned_text_include_invisible(
+                        &doc,
+                        &font_cmaps,
+                        options.page_filter.as_ref(),
+                    )
+                } else {
+                    result
+                }
+            } else {
+                // Normal extraction failed — try invisible as fallback
+                extractor::extract_positioned_text_include_invisible(
+                    &doc,
+                    &font_cmaps,
+                    options.page_filter.as_ref(),
+                )
+            }
+        } else {
+            result
+        }
     };
 
     // For Mixed PDFs, extraction failure is non-fatal

@@ -150,6 +150,25 @@ pub(crate) fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false)
+}
+
+/// Extract with option to include invisible (Tr=3) text.
+/// Used for Mixed/template PDFs where the OCR text layer is invisible.
+pub(crate) fn extract_positioned_text_include_invisible(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(PageExtraction, PageThresholds), PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, true)
+}
+
+fn extract_positioned_text_impl(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(PageExtraction, PageThresholds), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
@@ -167,7 +186,7 @@ pub(crate) fn extract_positioned_text_from_doc(
             }
         }
         let (mut items, rects, lines) =
-            extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+            extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
