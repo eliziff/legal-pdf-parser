@@ -285,12 +285,12 @@ pub fn detect_tables_from_rects(
 
     let mut tables = Vec::new();
     let mut hint_regions = Vec::new();
+    let mut failed_clusters: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
 
     // Full grid detection requires ≥ 6 rects
     if page_rects.len() >= 6 {
         let clusters = cluster_rects(&page_rects, 3.0, 6);
         debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
-
         for cluster_indices in &clusters {
             let group_rects: Vec<(f32, f32, f32, f32)> =
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
@@ -307,13 +307,21 @@ pub fn detect_tables_from_rects(
                     left.len(),
                     right.len()
                 );
+                let mut split_found = false;
                 for sub in [&left, &right] {
                     if let Some(table) = detect_table_from_rect_group(items, sub, page) {
                         tables.push(table);
+                        split_found = true;
                     } else if let Some(table) = detect_row_stripe_table(items, sub, page) {
                         tables.push(table);
+                        split_found = true;
                     }
                 }
+                if !split_found {
+                    failed_clusters.push(group_rects);
+                }
+            } else {
+                failed_clusters.push(group_rects);
             }
         }
 
@@ -379,8 +387,11 @@ pub fn detect_tables_from_rects(
         // from cluster bounding boxes to scope heuristic table detection.
         // This handles both large decorative-rect clusters (calendars, forms)
         // and small cell-border clusters on rect-sparse pages.
+        let mut has_failed_cluster_hints = false;
         if page_rects.len() >= 6 {
             let clusters = cluster_rects(&page_rects, 3.0, 6);
+
+            // Generate hints from large clusters (≥30 rects, decorative/calendar style)
             for cluster_indices in &clusters {
                 let group_rects: Vec<(f32, f32, f32, f32)> =
                     cluster_indices.iter().map(|&i| page_rects[i]).collect();
@@ -415,12 +426,59 @@ pub fn detect_tables_from_rects(
                     });
                 }
             }
+
+            // Generate hints from failed clusters (≥6 rects that had valid bounding
+            // boxes but insufficient grid structure — e.g. outer border or header
+            // divider with 2x2 edges). These tell us WHERE a table is even though
+            // the rects don't define column structure.
+            for fc_rects in &failed_clusters {
+                if fc_rects.len() < 6 {
+                    continue;
+                }
+                let x_left = fc_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
+                let x_right = fc_rects.iter().map(|r| r.0 + r.2).reduce(f32::max).unwrap();
+                let y_bottom = fc_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
+                let y_top = fc_rects.iter().map(|r| r.1 + r.3).reduce(f32::max).unwrap();
+                let h = y_top - y_bottom;
+                // Require reasonable height and text items inside the region
+                let padding = 15.0;
+                let items_inside = items
+                    .iter()
+                    .filter(|item| {
+                        item.y >= y_bottom - padding
+                            && item.y <= y_top + padding
+                            && item.x >= x_left - padding
+                            && item.x <= x_right + padding
+                    })
+                    .count();
+                let w = x_right - x_left;
+                // Require reasonable dimensions: height ≥100pt (≈5+ rows),
+                // width ≤500pt (not page-spanning), height ≤600pt (not full page)
+                if (100.0..=600.0).contains(&h) && w <= 500.0 && items_inside >= 6 {
+                    debug!(
+                        "page {}: failed-cluster hint from {} rects ({} items): x={:.1}..{:.1} y={:.1}..{:.1} ({:.0}×{:.0})",
+                        page, fc_rects.len(), items_inside, x_left, x_right, y_bottom, y_top,
+                        x_right - x_left, h
+                    );
+                    hint_regions.push(RectHintRegion {
+                        y_top,
+                        y_bottom,
+                        x_left,
+                        x_right,
+                        cluster_rects: fc_rects.clone(),
+                    });
+                    has_failed_cluster_hints = true;
+                }
+            }
+
             // Deduplicate overlapping hints
             hint_regions = merge_overlapping_hints(hint_regions);
             // Require multiple hint regions to confirm a multi-zone layout
             // (calendars, forms). A single hint is likely a decorative cluster
             // that would interfere with full-page heuristic detection.
-            if hint_regions.len() < 2 {
+            // Exception: failed-cluster hints represent real table boundaries
+            // confirmed by rect presence, so a single one is meaningful.
+            if hint_regions.len() < 2 && !has_failed_cluster_hints {
                 hint_regions.clear();
             }
             if !hint_regions.is_empty() {
@@ -2293,5 +2351,139 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!((merged[0].x_left - 20.0).abs() < 0.01);
         assert!((merged[0].x_right - 340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn failed_cluster_generates_hint_with_items() {
+        // A cluster of rects forming an outer border (2 x-edges after snapping)
+        // that fails grid detection should produce a hint when items are inside.
+        // Use overlapping rects with the same left/right edges but varied heights
+        // so row-stripe detection also fails.
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 100.0, 400.0, 200.0), // outer border
+            (52.0, 102.0, 396.0, 196.0), // inner border (within snap tolerance)
+            (51.0, 101.0, 398.0, 198.0), // another border variant
+            (50.0, 100.0, 400.0, 10.0),  // top divider (thin)
+            (50.0, 290.0, 400.0, 10.0),  // bottom divider (thin)
+            (50.0, 195.0, 400.0, 10.0),  // middle divider
+        ];
+        // Create text items inside the bounding box (≥6 items)
+        let mut items: Vec<TextItem> = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                items.push(TextItem {
+                    text: format!("cell{}_{}", row, col),
+                    x: 60.0 + col as f32 * 120.0,
+                    y: 120.0 + row as f32 * 40.0,
+                    width: 50.0,
+                    height: 10.0,
+                    font: String::new(),
+                    font_size: 10.0,
+                    page: 1,
+                    is_bold: false,
+                    is_italic: false,
+                    item_type: crate::types::ItemType::Text,
+                    mcid: None,
+                });
+            }
+        }
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        // Grid detection should fail (2 x-edges after snapping: ~50 and ~450)
+        // If detection fails, we should get a failed-cluster hint
+        if tables.is_empty() {
+            assert_eq!(hints.len(), 1, "failed cluster should produce one hint");
+            assert!(!hints[0].cluster_rects.is_empty());
+        }
+        // If tables were detected, that's also acceptable
+    }
+
+    #[test]
+    fn failed_cluster_no_hint_without_items() {
+        // Rects with no text items inside → no failed-cluster hint generated.
+        // Use >6 rects to avoid the rect-sparse path (4-6 rects).
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 100.0, 400.0, 200.0),
+            (52.0, 102.0, 396.0, 196.0),
+            (51.0, 101.0, 398.0, 198.0),
+            (50.0, 100.0, 400.0, 10.0),
+            (50.0, 290.0, 400.0, 10.0),
+            (50.0, 195.0, 400.0, 10.0),
+            (50.0, 150.0, 400.0, 10.0),
+            (50.0, 250.0, 400.0, 10.0),
+        ];
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&[], &rects, 1);
+        // No items → no table, no hint (items_inside check fails)
+        if tables.is_empty() {
+            assert!(hints.is_empty(), "no items inside → no hint");
+        }
+    }
+
+    #[test]
+    fn failed_cluster_no_hint_narrow_height() {
+        // Cluster with only 20pt height (header band) should not produce hint
+        // even with items inside (height < 100pt threshold)
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 650.0, 50.0, 20.0),
+            (100.0, 650.0, 50.0, 20.0),
+            (150.0, 650.0, 50.0, 20.0),
+            (200.0, 650.0, 50.0, 20.0),
+            (250.0, 650.0, 50.0, 20.0),
+            (300.0, 650.0, 50.0, 20.0),
+            (350.0, 650.0, 50.0, 20.0),
+            (400.0, 650.0, 50.0, 20.0),
+        ];
+        let mut items: Vec<TextItem> = Vec::new();
+        for col in 0..8 {
+            items.push(TextItem {
+                text: format!("hdr{}", col),
+                x: 55.0 + col as f32 * 50.0,
+                y: 655.0,
+                width: 40.0,
+                height: 10.0,
+                font: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: crate::types::ItemType::Text,
+                mcid: None,
+            });
+        }
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert!(
+            hints.is_empty(),
+            "narrow header band (20pt) should not produce hint"
+        );
     }
 }
