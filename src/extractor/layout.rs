@@ -220,6 +220,105 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     columns
 }
 
+/// Identify items that belong to lines spanning across detected columns.
+///
+/// Groups items into rough lines by Y-proximity and marks items whose line's
+/// combined X-span exceeds 1.3× the widest column AND has no gap located at
+/// a detected gutter boundary. Returns a boolean mask parallel to `items`.
+fn identify_spanning_lines(items: &[TextItem], columns: &[ColumnRegion]) -> Vec<bool> {
+    let n = items.len();
+    let mut mask = vec![false; n];
+
+    if n < 3 || columns.len() < 2 {
+        return mask;
+    }
+
+    let max_col_width = columns
+        .iter()
+        .map(|c| c.x_max - c.x_min)
+        .fold(0.0_f32, f32::max);
+    let span_threshold = max_col_width * 1.3;
+
+    // Gutter centers: boundaries between adjacent columns
+    let gutters: Vec<f32> = columns.windows(2).map(|c| c[0].x_max).collect();
+    let gutter_tol = 15.0;
+    let y_tol = 5.0;
+
+    // Build (original_index, y) pairs sorted by Y descending for grouping
+    let mut indexed: Vec<(usize, f32)> =
+        items.iter().enumerate().map(|(i, it)| (i, it.y)).collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Group by Y-proximity into rough lines (as index sets)
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current_group: Vec<usize> = Vec::new();
+    let mut current_y = f32::NAN;
+
+    for (idx, y) in indexed {
+        if current_group.is_empty() || (current_y - y).abs() < y_tol {
+            if current_group.is_empty() {
+                current_y = y;
+            }
+            current_group.push(idx);
+        } else {
+            groups.push(std::mem::take(&mut current_group));
+            current_y = y;
+            current_group.push(idx);
+        }
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+
+    for group in groups {
+        if group.len() < 2 {
+            continue;
+        }
+
+        // Sort group indices by X to compute span
+        let mut sorted_by_x: Vec<usize> = group;
+        sorted_by_x.sort_by(|&a, &b| {
+            items[a]
+                .x
+                .partial_cmp(&items[b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let line_left = items[sorted_by_x[0]].x;
+        let last = *sorted_by_x.last().unwrap();
+        let line_right = items[last].x + effective_width(&items[last]);
+        let span = line_right - line_left;
+
+        if span <= span_threshold {
+            continue;
+        }
+
+        // Check if any inter-item gap falls at a detected gutter boundary.
+        // If so, this is items from different columns at the same Y, not a
+        // true spanning line (like a title or section header).
+        let has_gutter_gap = sorted_by_x.windows(2).any(|pair| {
+            let left_end = items[pair[0]].x + effective_width(&items[pair[0]]);
+            let right_start = items[pair[1]].x;
+            let gap = right_start - left_end;
+            if gap < 5.0 {
+                return false;
+            }
+            // Check if any gutter falls within the gap interval (with tolerance)
+            gutters
+                .iter()
+                .any(|&g| g > left_end - gutter_tol && g < right_start + gutter_tol)
+        });
+
+        if !has_gutter_gap {
+            for &idx in &sorted_by_x {
+                mask[idx] = true;
+            }
+        }
+    }
+
+    mask
+}
+
 /// Determines if a text item spans across multiple column regions (e.g. full-width headers/titles).
 fn spans_multiple_columns(item: &TextItem, columns: &[ColumnRegion]) -> bool {
     let w = effective_width(item);
@@ -469,15 +568,28 @@ pub(crate) fn group_into_lines_with_thresholds(
             let lines = group_single_column(page_items, adaptive_threshold);
             all_lines.extend(lines);
         } else {
-            // Multi-column - separate spanning items from column items
+            // Multi-column detected. Pre-mask lines that span the full page
+            // width (titles, section headers, footers). These multi-item lines
+            // would otherwise be split across column buckets, corrupting
+            // newspaper detection and reading order.
+            let spanning_mask = identify_spanning_lines(&page_items, &columns);
+            let premasked_count = spanning_mask.iter().filter(|&&m| m).count();
+            if premasked_count > 0 {
+                debug!(
+                    "page {}: pre-masked {} spanning-line items",
+                    page, premasked_count
+                );
+            }
+
+            // Partition items preserving original order
             let mut spanning_items: Vec<TextItem> = Vec::new();
             let mut column_items: Vec<TextItem> = Vec::new();
 
-            for item in &page_items {
-                if spans_multiple_columns(item, &columns) {
-                    spanning_items.push(item.clone());
+            for (i, item) in page_items.into_iter().enumerate() {
+                if spanning_mask[i] || spans_multiple_columns(&item, &columns) {
+                    spanning_items.push(item);
                 } else {
-                    column_items.push(item.clone());
+                    column_items.push(item);
                 }
             }
 
@@ -964,5 +1076,116 @@ mod tests {
             !is_newspaper_layout(&[col1, col2], &cols),
             "Equal-width equal-row columns should NOT be newspaper (borderless table)"
         );
+    }
+
+    #[test]
+    fn premask_spanning_title_removed_from_columns() {
+        // Title spans x=30..550 as 5 adjacent items (no gap near gutter at x=300)
+        // Two columns: left (x=0..300), right (x=300..600)
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        let mut items = Vec::new();
+
+        // Spanning title: 5 items at Y=750, each ~100pt wide, gaps ~4pt
+        // No item gap falls near the gutter at x=300
+        for i in 0..5 {
+            items.push(make_item(
+                1,
+                30.0 + i as f32 * 104.0,
+                750.0,
+                "TitleWord_________",
+            ));
+        }
+
+        // Left column body: 20 lines
+        for i in 0..20 {
+            items.push(make_item(1, 30.0, 700.0 - i as f32 * 14.0, "LeftText__"));
+        }
+
+        // Right column body: 20 lines
+        for i in 0..20 {
+            items.push(make_item(1, 320.0, 700.0 - i as f32 * 14.0, "RightText_"));
+        }
+
+        let mask = identify_spanning_lines(&items, &cols);
+        let spanning_count = mask.iter().filter(|&&m| m).count();
+        let non_spanning_count = mask.iter().filter(|&&m| !m).count();
+        assert_eq!(spanning_count, 5, "Title items should be pre-masked");
+        assert_eq!(non_spanning_count, 40, "Column items should remain");
+    }
+
+    #[test]
+    fn premask_does_not_mask_column_items_at_same_y() {
+        // Two items at same Y with gap at gutter → NOT masked
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        let mut items = Vec::new();
+
+        // Items in two columns at same Y — gap center ~305 is near gutter at 300
+        for i in 0..15 {
+            let y = 700.0 - i as f32 * 14.0;
+            items.push(make_item(1, 30.0, y, "LeftText__"));
+            items.push(make_item(1, 320.0, y, "RightText_"));
+        }
+
+        let mask = identify_spanning_lines(&items, &cols);
+        let spanning_count = mask.iter().filter(|&&m| m).count();
+        assert_eq!(
+            spanning_count, 0,
+            "Column items with gap at gutter should NOT be pre-masked"
+        );
+    }
+
+    #[test]
+    fn premask_narrow_line_not_masked() {
+        // Items that form a line spanning only ~40% of column width → not masked
+        let cols = vec![
+            ColumnRegion {
+                x_min: 0.0,
+                x_max: 300.0,
+            },
+            ColumnRegion {
+                x_min: 300.0,
+                x_max: 600.0,
+            },
+        ];
+        let mut items = Vec::new();
+
+        // Narrow header at top (spans ~240pt, max col width = 300, threshold = 390)
+        for i in 0..3 {
+            items.push(make_item(
+                1,
+                180.0 + i as f32 * 84.0,
+                750.0,
+                "SmallHeader___",
+            ));
+        }
+
+        // Two columns below
+        for i in 0..15 {
+            let y = 700.0 - i as f32 * 14.0;
+            items.push(make_item(1, 30.0, y, "LeftText__"));
+            items.push(make_item(1, 400.0, y, "RightText_"));
+        }
+
+        let mask = identify_spanning_lines(&items, &cols);
+        let spanning_count = mask.iter().filter(|&&m| m).count();
+        assert_eq!(spanning_count, 0, "Narrow header should NOT be pre-masked");
     }
 }
