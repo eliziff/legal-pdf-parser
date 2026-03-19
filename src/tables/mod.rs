@@ -267,6 +267,280 @@ pub(crate) enum TableDetectionMode {
     BodyFont,
 }
 
+/// Build a table from layout-detected column boundaries.
+///
+/// When the layout engine detects multiple tabular columns (not newspaper),
+/// this function uses those boundaries to construct a Table directly. This
+/// handles borderless tables (no rects/lines) where columns are defined
+/// purely by text alignment — common in exam/reference tables.
+///
+/// Requires ≥3 columns, ≥3 rows, and ≥40% cell fill rate.
+pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Option<Table> {
+    use crate::extractor::{
+        detect_columns, group_into_lines_with_thresholds, is_newspaper_layout, ColumnRegion,
+    };
+    use std::collections::HashMap;
+
+    let mut columns = detect_columns(items, page);
+    if columns.len() < 4 {
+        return None;
+    }
+
+    // Refine columns: look for header-like rows where multiple items share
+    // the same Y and are evenly spaced. If a wide column contains two header
+    // items, split it at the gap between them.
+    let page_items: Vec<&TextItem> = items.iter().filter(|i| i.page == page).collect();
+    let y_tol = 3.0;
+
+    // Find the top-most row with items in multiple columns (likely the header)
+    let mut ys: Vec<f32> = page_items.iter().map(|i| i.y).collect();
+    ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    ys.dedup_by(|a, b| (*a - *b).abs() < y_tol);
+
+    for &header_y in ys.iter().take(5) {
+        let row_items: Vec<&&TextItem> = page_items
+            .iter()
+            .filter(|i| (i.y - header_y).abs() < y_tol)
+            .collect();
+        if row_items.len() < columns.len() {
+            continue;
+        }
+        // Check if any column contains 2+ items at this Y — needs splitting
+        let mut new_columns = Vec::new();
+        let mut did_split = false;
+        for col in &columns {
+            let col_items: Vec<&&&TextItem> = row_items
+                .iter()
+                .filter(|i| i.x >= col.x_min && i.x < col.x_max)
+                .collect();
+            if col_items.len() >= 2 {
+                // Sort by X and find the split point
+                let mut sorted: Vec<f32> = col_items.iter().map(|i| i.x).collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                // Split at the midpoint between the two items
+                let split_x = (sorted[0]
+                    + col_items.iter().find(|i| i.x == sorted[0]).unwrap().width
+                    + sorted[1])
+                    / 2.0;
+                new_columns.push(ColumnRegion {
+                    x_min: col.x_min,
+                    x_max: split_x,
+                });
+                new_columns.push(ColumnRegion {
+                    x_min: split_x,
+                    x_max: col.x_max,
+                });
+                did_split = true;
+            } else {
+                new_columns.push(col.clone());
+            }
+        }
+        if did_split {
+            log::debug!(
+                "column refinement: {} -> {} columns from header row at y={:.1}",
+                columns.len(),
+                new_columns.len(),
+                header_y
+            );
+            columns = new_columns;
+            break;
+        }
+    }
+
+    // Group items into per-column lines to check newspaper vs tabular
+    let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
+    let mut spanning_items: Vec<TextItem> = Vec::new();
+    for item in items {
+        if item.page != page {
+            continue;
+        }
+        // Check if item spans multiple columns
+        let item_left = item.x;
+        let item_right = item.x + item.width;
+        let mut spans = 0;
+        for col in &columns {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > 0.0 {
+                spans += 1;
+            }
+        }
+        if spans > 1 {
+            spanning_items.push(item.clone());
+            continue;
+        }
+        // Assign to best-overlap column
+        let mut best_col = 0;
+        let mut best_overlap = f32::NEG_INFINITY;
+        for (ci, col) in columns.iter().enumerate() {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_col = ci;
+            }
+        }
+        col_buckets[best_col].push(item.clone());
+    }
+
+    let thresholds = HashMap::new();
+    let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+        .iter()
+        .map(|bucket| group_into_lines_with_thresholds(bucket.clone(), &thresholds))
+        .collect();
+
+    // Must be tabular (not newspaper) layout
+    if is_newspaper_layout(&per_column_lines, &columns) {
+        return None;
+    }
+
+    // Collect all unique Y positions across all columns (row boundaries)
+    let y_tol = 5.0;
+    let mut row_ys: Vec<f32> = Vec::new();
+    for col_lines in &per_column_lines {
+        for line in col_lines {
+            let y = line.y;
+            if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
+                row_ys.push(y);
+            }
+        }
+    }
+    row_ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    if row_ys.len() < 3 || row_ys.len() > 40 {
+        return None;
+    }
+
+    // Build cell grid
+    let col_xs: Vec<f32> = columns.iter().map(|c| c.x_min).collect();
+    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; row_ys.len()];
+    let mut item_indices: Vec<usize> = Vec::new();
+
+    for (item_idx, item) in items.iter().enumerate() {
+        if item.page != page {
+            continue;
+        }
+        // Find column
+        let item_left = item.x;
+        let item_right = item.x + item.width;
+        let mut best_col = None;
+        let mut best_overlap = 0.0f32;
+        let mut span_count = 0;
+        for (ci, col) in columns.iter().enumerate() {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > 0.0 {
+                span_count += 1;
+            }
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_col = Some(ci);
+            }
+        }
+        if span_count > 1 || best_col.is_none() {
+            continue; // spanning item, skip
+        }
+        let col = best_col.unwrap();
+
+        // Find row
+        let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
+        if let Some(row) = row {
+            if !cells[row][col].is_empty() {
+                cells[row][col].push(' ');
+            }
+            cells[row][col].push_str(&item.text);
+            item_indices.push(item_idx);
+        }
+    }
+
+    // Validate: need reasonable fill rate
+    let total_cells = row_ys.len() * columns.len();
+    let filled_cells = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let fill_rate = filled_cells as f32 / total_cells as f32;
+
+    if fill_rate < 0.15 {
+        return None;
+    }
+
+    // Need at least 40% of rows to have content in 2+ columns
+    let multi_col_rows = cells
+        .iter()
+        .filter(|row| row.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
+        .count();
+    // Need majority (>50%) of rows with content in 2+ columns
+    if multi_col_rows * 2 < row_ys.len() {
+        return None;
+    }
+
+    // Reject prose-like content: if cells are too long on average, this is
+    // a multi-column text layout, not a data table. Real table cells are
+    // typically short (≤ 40 chars). Prose paragraphs are much longer.
+    let cell_lengths: Vec<usize> = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.trim().len())
+        .collect();
+    if !cell_lengths.is_empty() {
+        let avg_cell_len = cell_lengths.iter().sum::<usize>() as f32 / cell_lengths.len() as f32;
+        if avg_cell_len > 40.0 {
+            return None;
+        }
+        // Reject if any significant number of cells are long prose (> 80 chars)
+        let long_cells = cell_lengths.iter().filter(|&&len| len > 80).count();
+        if long_cells as f32 / cell_lengths.len() as f32 > 0.10 {
+            return None;
+        }
+    }
+
+    // Reject when cells look like prose sentences: if too many cells contain
+    // sentence-ending punctuation (.!?:) it's prose text, not table data.
+    let prose_cells = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| {
+            let t = c.trim();
+            t.len() > 20
+                && (t.ends_with('.') || t.ends_with('!') || t.ends_with('?') || t.ends_with(':'))
+        })
+        .count();
+    if filled_cells > 0 && prose_cells as f32 / filled_cells as f32 > 0.15 {
+        return None;
+    }
+
+    // Reject when most content is in one column (newspaper-like asymmetry).
+    // Count items per column; if any column has >60% of items, it's likely
+    // a body text column with side annotations, not a data table.
+    let mut items_per_col: Vec<usize> = vec![0; columns.len()];
+    for row in &cells {
+        for (ci, cell) in row.iter().enumerate() {
+            if !cell.trim().is_empty() {
+                items_per_col[ci] += 1;
+            }
+        }
+    }
+    let max_col_items = *items_per_col.iter().max().unwrap_or(&0);
+    if filled_cells > 0 && max_col_items as f32 / filled_cells as f32 > 0.60 {
+        return None;
+    }
+
+    log::debug!(
+        "column-based table: {} cols x {} rows, fill={:.0}%, multi_col_rows={}",
+        columns.len(),
+        row_ys.len(),
+        fill_rate * 100.0,
+        multi_col_rows
+    );
+
+    Some(Table {
+        columns: col_xs,
+        rows: row_ys,
+        cells,
+        item_indices,
+    })
+}
+
 /// A detected table.
 #[derive(Debug, Clone)]
 pub struct Table {

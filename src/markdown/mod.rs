@@ -800,6 +800,35 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .unzip();
                 run_heuristic(&unclaimed_items, &unclaimed_map, 6);
             }
+
+            // 4. Column-based table detection: last resort for borderless tabular
+            //    layouts (e.g. exam/reference grids) when ALL structural methods
+            //    found nothing. Only runs when no rects/lines exist (truly borderless)
+            //    and no other detection method found tables in this band.
+            let band_has_tables = band_items.iter().enumerate().any(|(idx, _)| {
+                band_index_map
+                    .get(idx)
+                    .and_then(|&page_idx| group.get(page_idx))
+                    .is_some_and(|&(global_idx, _)| table_items.contains(&global_idx))
+            });
+            let has_structural_elements = band_rects.len() >= 6 || band_lines.len() >= 4;
+            if !band_has_tables && !has_structural_elements {
+                if let Some(table) = crate::tables::try_build_table_from_columns(band_items, page) {
+                    for &idx in &table.item_indices {
+                        if let Some(&page_idx) = band_index_map.get(idx) {
+                            if let Some(&(global_idx, _)) = group.get(page_idx) {
+                                table_items.insert(global_idx);
+                            }
+                        }
+                    }
+                    let table_y = table.rows.first().copied().unwrap_or(0.0);
+                    let table_md = table_to_markdown(&table);
+                    page_tables
+                        .entry(page)
+                        .or_default()
+                        .push((table_y, table_md));
+                }
+            }
         }
     }
 
