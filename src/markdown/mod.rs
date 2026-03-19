@@ -124,6 +124,51 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
         return vec![];
     }
 
+    // Don't split when the left side is text labels and the right side is numeric
+    // data at matching Y positions — this is a single table (labels + numbers),
+    // not two independent side-by-side regions.
+    // Requires ALL THREE: left side is mostly non-numeric, right side is mostly
+    // numeric, AND high Y-correlation between the two sides.
+    let is_numeric_item = |item: &&&TextItem| -> bool {
+        let text = item.text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        let data_chars = text
+            .chars()
+            .filter(|c| c.is_ascii_digit() || ",.-+%€$£¥()".contains(*c))
+            .count();
+        data_chars as f32 / text.chars().count() as f32 >= 0.6
+    };
+
+    let left_items: Vec<&TextItem> = items
+        .iter()
+        .filter(|i| i.x + i.width / 2.0 < best_split)
+        .collect();
+    let right_items: Vec<&TextItem> = items
+        .iter()
+        .filter(|i| i.x + i.width / 2.0 >= best_split)
+        .collect();
+
+    if !left_items.is_empty() && !right_items.is_empty() {
+        let left_numeric_ratio =
+            left_items.iter().filter(is_numeric_item).count() as f32 / left_items.len() as f32;
+        let right_numeric_ratio =
+            right_items.iter().filter(is_numeric_item).count() as f32 / right_items.len() as f32;
+
+        // Left side is mostly text (< 30% numeric) AND right side is mostly numbers (≥ 70%)
+        if left_numeric_ratio < 0.30 && right_numeric_ratio >= 0.70 {
+            let y_tol = 5.0;
+            let y_matches = right_items
+                .iter()
+                .filter(|ri| left_items.iter().any(|li| (li.y - ri.y).abs() < y_tol))
+                .count();
+            if y_matches as f32 / right_items.len() as f32 >= 0.5 {
+                return vec![];
+            }
+        }
+    }
+
     vec![(x_min, best_split), (best_split, x_max)]
 }
 
@@ -997,5 +1042,34 @@ mod tests {
             })
             .collect();
         assert!(split_from_hint_regions(&items, &rects, 1).is_empty());
+    }
+
+    #[test]
+    fn no_split_label_plus_number_table() {
+        // Balance sheet layout: text labels on left, numbers on right.
+        // Should NOT split because it's one table, not side-by-side regions.
+        let mut items = Vec::new();
+        for row in 0..30 {
+            // Label at x=50
+            let mut label = make_item(50.0, 700.0 - row as f32 * 15.0, 1);
+            label.text = format!("Row label {}", row);
+            label.width = 100.0;
+            items.push(label);
+            // Number at x=400
+            let mut num1 = make_item(400.0, 700.0 - row as f32 * 15.0, 1);
+            num1.text = format!("{},000.0", 100 + row);
+            num1.width = 50.0;
+            items.push(num1);
+            // Number at x=470
+            let mut num2 = make_item(470.0, 700.0 - row as f32 * 15.0, 1);
+            num2.text = format!("{},500.0", 200 + row);
+            num2.width = 50.0;
+            items.push(num2);
+        }
+        let split = split_side_by_side(&items);
+        assert!(
+            split.is_empty(),
+            "label+number table should not be split side-by-side"
+        );
     }
 }

@@ -179,6 +179,14 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             {
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
+                // Try to recover a label column from unclaimed items to the left
+                try_add_label_column(
+                    &mut table,
+                    &table_candidates,
+                    &claimed_indices,
+                    y_min,
+                    y_max,
+                );
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -1072,4 +1080,112 @@ pub(crate) fn find_first_table_row(
     }
 
     (first_table_row, excluded_items)
+}
+
+/// Try to recover a label column for numeric-only tables.
+///
+/// Financial balance sheets often have text labels (row descriptions) to the
+/// left of numeric columns. The label X-positions vary due to indentation,
+/// so they don't form a consistent column cluster and are excluded from the
+/// initial table detection. This function finds unclaimed items at matching
+/// Y-positions to the left of the table and prepends them as column 0.
+fn try_add_label_column(
+    table: &mut Table,
+    all_candidates: &[(usize, &TextItem)],
+    claimed_indices: &std::collections::HashSet<usize>,
+    y_min: f32,
+    y_max: f32,
+) {
+    // Only apply to tables with 2-3 numeric columns and ≥5 rows
+    if table.columns.len() < 2 || table.columns.len() > 3 || table.rows.len() < 5 {
+        return;
+    }
+
+    // Check if the table is predominantly numeric (no text labels in any column)
+    let numeric_cells = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|cell| {
+            let text = cell.trim();
+            if text.is_empty() {
+                return false;
+            }
+            let data_chars = text
+                .chars()
+                .filter(|c| c.is_ascii_digit() || ",.-+%€$£¥()".contains(*c))
+                .count();
+            let total_chars = text.chars().count();
+            total_chars > 0 && data_chars as f32 / total_chars as f32 >= 0.6
+        })
+        .count();
+    let total_non_empty = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    if total_non_empty == 0 || (numeric_cells as f32 / total_non_empty as f32) < 0.7 {
+        return;
+    }
+
+    let table_x_min = table.columns.first().copied().unwrap_or(f32::MAX);
+    let y_tol = 5.0;
+
+    // For each table row, find unclaimed items to the left at the same Y
+    let mut label_items_per_row: Vec<Vec<(usize, &TextItem)>> = Vec::new();
+    let mut found_count = 0;
+    for &row_y in &table.rows {
+        let mut row_labels: Vec<(usize, &TextItem)> = all_candidates
+            .iter()
+            .filter(|(idx, item)| {
+                !claimed_indices.contains(idx)
+                    && !table.item_indices.contains(idx)
+                    && (item.y - row_y).abs() < y_tol
+                    && item.x < table_x_min - 10.0
+                    && item.y >= y_min
+                    && item.y <= y_max
+            })
+            .map(|(idx, item)| (*idx, *item))
+            .collect();
+        row_labels.sort_by(|a, b| {
+            a.1.x
+                .partial_cmp(&b.1.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !row_labels.is_empty() {
+            found_count += 1;
+        }
+        label_items_per_row.push(row_labels);
+    }
+
+    // Require labels for at least 40% of rows
+    if found_count < table.rows.len() * 2 / 5 {
+        return;
+    }
+
+    debug!(
+        "recovering label column: {}/{} rows have labels to the left",
+        found_count,
+        table.rows.len()
+    );
+
+    // Prepend label column
+    let label_col_x = label_items_per_row
+        .iter()
+        .flat_map(|items| items.iter().map(|(_, i)| i.x))
+        .fold(f32::INFINITY, f32::min);
+
+    table.columns.insert(0, label_col_x);
+    for (row_idx, row_labels) in label_items_per_row.iter().enumerate() {
+        let label_text = row_labels
+            .iter()
+            .map(|(_, item)| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.cells[row_idx].insert(0, label_text);
+        for (idx, _) in row_labels {
+            table.item_indices.push(*idx);
+        }
+    }
 }
