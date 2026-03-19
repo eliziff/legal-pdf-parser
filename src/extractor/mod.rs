@@ -97,7 +97,7 @@ pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds) =
+    let (extraction, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -130,7 +130,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
         Err(e) => return Err(e.into()),
     };
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds) =
+    let (extraction, _thresholds, _gid_pages) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -149,7 +149,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -159,7 +159,7 @@ pub(crate) fn extract_positioned_text_include_invisible(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     extract_positioned_text_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -168,12 +168,13 @@ fn extract_positioned_text_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
+    let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -185,18 +186,26 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let (mut items, rects, lines) =
+        let ((mut items, rects, lines), has_gid_fonts) =
             extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
+        if has_gid_fonts {
+            gid_encoded_pages.insert(*page_num);
+        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
         debug!(
-            "page {}: {} text items, {} rects, {} lines",
+            "page {}: {} text items, {} rects, {} lines{}",
             page_num,
             items.len(),
             rects.len(),
-            lines.len()
+            lines.len(),
+            if has_gid_fonts {
+                " [gid-encoded fonts]"
+            } else {
+                ""
+            }
         );
         if log::log_enabled!(log::Level::Trace) {
             for item in &items {
@@ -229,7 +238,11 @@ fn extract_positioned_text_impl(
     let form_items = extract_form_fields(doc, &page_id_to_num);
     all_items.extend(form_items);
 
-    Ok(((all_items, all_rects, all_lines), page_thresholds))
+    Ok((
+        (all_items, all_rects, all_lines),
+        page_thresholds,
+        gid_encoded_pages,
+    ))
 }
 
 // ---------------------------------------------------------------------------

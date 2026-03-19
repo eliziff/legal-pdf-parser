@@ -473,29 +473,37 @@ pub(crate) fn get_operand_bytes(obj: &Object) -> Option<&[u8]> {
     }
 }
 
-/// Build encoding maps for all fonts on a page
+/// Build encoding maps for all fonts on a page.
+/// Returns `(encodings, has_gid_fonts)` where `has_gid_fonts` is true when
+/// any font uses raw glyph ID names (gidNNNNN) that can't be decoded.
 pub(crate) fn build_font_encodings(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
-) -> PageFontEncodings {
+) -> (PageFontEncodings, bool) {
     let mut encodings = PageFontEncodings::new();
+    let mut has_gid_fonts = false;
 
     for (font_name, font_dict) in fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
 
-        if let Some(encoding_map) = parse_font_encoding(doc, font_dict) {
-            encodings.insert(resource_name, encoding_map);
+        if let Some(result) = parse_font_encoding(doc, font_dict) {
+            if result.gid_glyph_count > 0 {
+                has_gid_fonts = true;
+            }
+            if !result.map.is_empty() {
+                encodings.insert(resource_name, result.map);
+            }
         }
     }
 
-    encodings
+    (encodings, has_gid_fonts)
 }
 
 /// Parse font encoding from a font dictionary
 pub(crate) fn parse_font_encoding(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
-) -> Option<FontEncodingMap> {
+) -> Option<EncodingResult> {
     let encoding_obj = font_dict.get(b"Encoding").ok()?;
 
     // Encoding can be a name or a dictionary
@@ -519,11 +527,21 @@ pub(crate) fn parse_font_encoding(
     }
 }
 
+/// Result of parsing an encoding dictionary's Differences array.
+pub(crate) struct EncodingResult {
+    pub map: FontEncodingMap,
+    /// Number of glyph names matching the `gidNNNNN` pattern (raw glyph IDs).
+    /// These indicate a font with unresolvable encoding — the glyph IDs
+    /// reference the original font's glyph table, but without the original
+    /// font's cmap there is no way to map them to Unicode.
+    pub gid_glyph_count: u32,
+}
+
 /// Parse an encoding dictionary with Differences array
 pub(crate) fn parse_encoding_dictionary(
     doc: &Document,
     enc_dict: &lopdf::Dictionary,
-) -> Option<FontEncodingMap> {
+) -> Option<EncodingResult> {
     let differences = enc_dict.get(b"Differences").ok()?;
 
     let diff_array = match differences {
@@ -541,6 +559,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut encoding_map = FontEncodingMap::new();
     let mut current_code: u8 = 0;
     let mut ligature_count = 0u32;
+    let mut gid_glyph_count = 0u32;
 
     for item in diff_array {
         match item {
@@ -561,6 +580,14 @@ pub(crate) fn parse_encoding_dictionary(
                         current_code, glyph_name
                     );
                     ligature_count += 1;
+                }
+                // Detect raw glyph ID names (e.g. "gid00053") that can't be
+                // mapped to Unicode without the original font's cmap table.
+                if glyph_name.starts_with("gid")
+                    && glyph_name.len() >= 4
+                    && glyph_name[3..].chars().all(|c| c.is_ascii_digit())
+                {
+                    gid_glyph_count += 1;
                 }
                 if let Some(ch) = glyph_to_char(&glyph_name) {
                     encoding_map.insert(current_code, ch);
@@ -584,11 +611,17 @@ pub(crate) fn parse_encoding_dictionary(
         );
     }
 
-    if encoding_map.is_empty() {
-        None
-    } else {
-        Some(encoding_map)
+    if gid_glyph_count > 0 {
+        debug!(
+            "  Differences: {} gid-encoded glyphs (unresolvable without original font)",
+            gid_glyph_count
+        );
     }
+
+    Some(EncodingResult {
+        map: encoding_map,
+        gid_glyph_count,
+    })
 }
 
 /// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.

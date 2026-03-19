@@ -352,7 +352,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
                 let sample: String = items.iter().take(200).map(|i| i.text.as_str()).collect();
                 if is_garbage_text(&sample) || sample.trim().is_empty() {
                     extractor::extract_positioned_text_include_invisible(
@@ -399,8 +399,8 @@ fn process_document(
         }
     });
 
-    let (markdown, layout, has_encoding_issues) = match extracted {
-        Some(((items, rects, lines), page_thresholds)) => {
+    let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
+        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
@@ -417,9 +417,14 @@ fn process_document(
             };
 
             let enc = md.as_ref().is_some_and(|m| detect_encoding_issues(m));
-            (md, layout, enc)
+            (md, layout, enc, gid_encoded_pages)
         }
-        None => (None, LayoutComplexity::default(), false),
+        None => (
+            None,
+            LayoutComplexity::default(),
+            false,
+            std::collections::HashSet::new(),
+        ),
     };
 
     // If the extracted text is predominantly garbage (non-alphanumeric) and
@@ -431,6 +436,18 @@ fn process_document(
         } else {
             (pdf_type, markdown, confidence)
         };
+
+    // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list
+    let mut pages_needing_ocr = pages_needing_ocr;
+    if !gid_pages.is_empty() {
+        log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
+        for page in gid_pages {
+            if !pages_needing_ocr.contains(&page) {
+                pages_needing_ocr.push(page);
+            }
+        }
+        pages_needing_ocr.sort_unstable();
+    }
 
     Ok(PdfProcessResult {
         pdf_type,

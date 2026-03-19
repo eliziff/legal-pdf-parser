@@ -20,13 +20,15 @@ use super::fonts::{
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, multiply_matrices};
 
+/// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
+/// the page uses fonts with unresolvable gid-encoded glyphs.
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-) -> Result<PageExtraction, PdfError> {
+) -> Result<(PageExtraction, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
@@ -46,7 +48,7 @@ pub(crate) fn extract_page_text_items(
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
     // Build font encoding maps from Differences arrays
-    let font_encodings = build_font_encodings(doc, &fonts);
+    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts);
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
@@ -877,7 +879,7 @@ pub(crate) fn extract_page_text_items(
     }
 
     let items = super::merge_text_items(items);
-    Ok((items, rects, lines))
+    Ok(((items, rects, lines), has_gid_fonts))
 }
 
 /// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).
