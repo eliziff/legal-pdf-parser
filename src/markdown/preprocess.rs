@@ -423,9 +423,13 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
     //   (a) its individual text matches a candidate, OR
     //   (b) its Y-band's coalesced text matches a band candidate, OR
     //   (c) any sibling in its Y-band was removed (propagation).
+    //
+    // The first occurrence (lowest page number) of each repeated header/footer
+    // is kept so that document titles, column headers, etc. appear once.
     let mut removal_set: HashSet<usize> = HashSet::new();
 
-    // (a) Lines matching individual candidates at edge positions
+    // Track which page first shows each candidate (to preserve first occurrence)
+    let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
         if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
@@ -433,11 +437,18 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         let text = line.text();
         let normalized = normalize_for_comparison(&text);
         if candidates.contains(&normalized) {
-            removal_set.insert(idx);
+            let first = first_page_individual.entry(normalized).or_insert(line.page);
+            if line.page > *first {
+                removal_set.insert(idx);
+            } else if line.page == *first {
+                // Keep this occurrence (first page)
+            }
         }
     }
 
-    // (b) Lines in Y-bands whose coalesced text matches a band candidate
+    // Track first page for band candidates
+    let mut first_page_band: HashMap<String, u32> = HashMap::new();
+    // First pass: find first page for each band candidate
     for (&(page, _), indices) in &y_bands {
         if indices.len() < 2 {
             continue;
@@ -455,8 +466,35 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
             .join(" ");
         let normalized = normalize_for_comparison(&coalesced);
         if band_candidates.contains(&normalized) {
-            for &idx in &sorted_indices {
-                removal_set.insert(idx);
+            let first = first_page_band.entry(normalized).or_insert(page);
+            if page < *first {
+                *first = page;
+            }
+        }
+    }
+    // Second pass: mark for removal (skip first page)
+    for (&(page, _), indices) in &y_bands {
+        if indices.len() < 2 {
+            continue;
+        }
+        let band_y = lines[indices[0]].y;
+        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
+            continue;
+        }
+        let mut sorted_indices = indices.clone();
+        sorted_indices.sort();
+        let coalesced: String = sorted_indices
+            .iter()
+            .map(|&i| lines[i].text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let normalized = normalize_for_comparison(&coalesced);
+        if band_candidates.contains(&normalized) {
+            let first = first_page_band.get(&normalized).copied().unwrap_or(0);
+            if page > first {
+                for &idx in &sorted_indices {
+                    removal_set.insert(idx);
+                }
             }
         }
     }
@@ -597,5 +635,52 @@ mod tests {
         let heading_tiers = vec![18.0];
         let result = merge_heading_lines(lines, 12.0, &heading_tiers, None);
         assert_eq!(result.len(), 2, "should merge font-based heading lines");
+    }
+
+    #[test]
+    fn test_strip_repeated_keeps_first_occurrence() {
+        // Simulate a repeated page header on 10 pages.
+        // Each page has a running header at y=750 and many unique body lines.
+        let mut lines = Vec::new();
+        for page in 1..=10u32 {
+            // Header at top
+            lines.push(make_line(
+                "VOICE OF SOUTH MARION May fifteen twenty twenty five",
+                10.0,
+                page,
+                750.0,
+                None,
+            ));
+            // Body content — unique text per line per page (no digits to strip)
+            for j in 0..20u32 {
+                lines.push(make_line(
+                    &format!(
+                        "parcel r-{:04}-{:03} owner smith address oak street",
+                        page * 100 + j,
+                        page
+                    ),
+                    10.0,
+                    page,
+                    600.0 - j as f32 * 15.0,
+                    None,
+                ));
+            }
+        }
+
+        let result = strip_repeated_lines(lines, 10);
+
+        // The header should appear exactly once (page 1)
+        let header_count = result
+            .iter()
+            .filter(|l| l.text().contains("VOICE OF SOUTH MARION"))
+            .count();
+        assert_eq!(header_count, 1, "repeated header should be kept once");
+
+        // First occurrence should be on page 1
+        let first_header = result
+            .iter()
+            .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
+            .unwrap();
+        assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
     }
 }
