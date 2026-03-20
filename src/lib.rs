@@ -449,7 +449,9 @@ fn process_document(
         (markdown, has_encoding_issues, false)
     };
 
-    // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list
+    // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list.
+    // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
+    let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
     let mut pages_needing_ocr = pages_needing_ocr;
     if force_ocr_all {
         pages_needing_ocr = (1..=page_count).collect();
@@ -463,6 +465,16 @@ fn process_document(
         }
         pages_needing_ocr.sort_unstable();
     }
+
+    let markdown = if all_gid {
+        log::debug!(
+            "all {} pages have gid-encoded fonts — suppressing markdown output",
+            page_count
+        );
+        None
+    } else {
+        markdown
+    };
 
     Ok(PdfProcessResult {
         pdf_type,
