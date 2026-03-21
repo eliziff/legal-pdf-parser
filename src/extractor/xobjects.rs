@@ -144,9 +144,10 @@ fn extract_form_xobject_text_inner(
         return items;
     };
 
-    // Decompress the content stream
-    let Ok(content_data) = stream.decompressed_content() else {
-        return items;
+    // Decompress the content stream (fall back to raw bytes for uncompressed streams)
+    let content_data = match stream.decompressed_content() {
+        Ok(data) => data,
+        Err(_) => stream.content.clone(),
     };
 
     // Decode the content stream
