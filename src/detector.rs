@@ -197,12 +197,13 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
-                analysis.total_image_area, analysis.has_identity_h_no_tounicode
+                analysis.total_image_area, analysis.has_identity_h_no_tounicode,
+                analysis.has_only_type3_fonts
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
@@ -215,6 +216,7 @@ pub(crate) fn detect_from_document(
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
+                && !analysis.has_only_type3_fonts
             {
                 pages_with_text += 1;
             }
@@ -319,10 +321,13 @@ pub(crate) fn detect_from_document(
         }
     };
 
-    // Phase 3: Flag pages with Identity-H/V fonts lacking ToUnicode for OCR.
-    // These fonts produce garbage text (raw CID values) for non-Latin scripts.
+    // Phase 3: Flag pages with undecodable fonts for OCR.
+    // - Identity-H/V without ToUnicode: raw CID values can't map to Unicode
+    // - Type3-only without ToUnicode: glyph bitmaps can't map to Unicode
     for (&page_num, analysis) in &analysis_cache {
-        if analysis.has_identity_h_no_tounicode && !pages_needing_ocr.contains(&page_num) {
+        if (analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts)
+            && !pages_needing_ocr.contains(&page_num)
+        {
             pages_needing_ocr.push(page_num);
         }
     }
@@ -333,7 +338,9 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                if page_has_identity_h_no_tounicode(doc, page_id) {
+                if page_has_identity_h_no_tounicode(doc, page_id)
+                    || page_has_only_type3_fonts(doc, page_id)
+                {
                     pages_needing_ocr.push(page_num);
                 }
             }
@@ -416,6 +423,10 @@ struct PageAnalysis {
     /// Whether the page has Type0 fonts with Identity-H/V encoding but no ToUnicode CMap.
     /// These fonts produce garbage text because CID values can't be mapped to Unicode.
     has_identity_h_no_tounicode: bool,
+    /// Whether the page uses only Type3 fonts (no normal text fonts).
+    /// Type3 fonts render each glyph as a custom drawing/bitmap — without a
+    /// ToUnicode CMap, the character codes can't be mapped to Unicode.
+    has_only_type3_fonts: bool,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -491,6 +502,9 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let has_identity_h_no_tounicode =
         text_ops > 0 && page_has_identity_h_no_tounicode(doc, page_id);
 
+    // Check for Type3-only fonts — glyph bitmaps without Unicode mapping
+    let has_only_type3_fonts = text_ops > 0 && page_has_only_type3_fonts(doc, page_id);
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -502,6 +516,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         path_op_count: path_ops,
         has_vector_text,
         has_identity_h_no_tounicode,
+        has_only_type3_fonts,
     }
 }
 
@@ -545,6 +560,40 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
         return true;
     }
     false
+}
+
+/// Returns true if every font on the page is Type3 (no normal text fonts).
+/// Type3 fonts render glyphs as custom drawings/bitmaps. Without a ToUnicode
+/// CMap, character codes can't be mapped to Unicode — the page needs OCR.
+fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if fonts.is_empty() {
+        return false;
+    }
+    let mut has_type3 = false;
+    for font_dict in fonts.values() {
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        if subtype == Some(b"Type3") {
+            // Type3 with a ToUnicode CMap can still produce usable text
+            if font_dict.get(b"ToUnicode").is_ok() {
+                return false;
+            }
+            has_type3 = true;
+        } else {
+            // Has a non-Type3 font — page has real text fonts
+            return false;
+        }
+    }
+    if has_type3 {
+        log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
+    }
+    has_type3
 }
 
 fn scan_xobjects_in_resources(
