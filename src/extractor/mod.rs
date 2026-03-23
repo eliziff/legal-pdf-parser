@@ -363,6 +363,92 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merged
 }
 
+/// Merge subscript/superscript items into their adjacent parent items.
+///
+/// Subscripts (e.g. "2" in H₂O) are rendered as separate text items with a
+/// much smaller font size and a slight Y offset. This pass finds such items
+/// and absorbs them into the preceding normal-sized item so that downstream
+/// table detection and line grouping see complete text (e.g. "H2O" not "H"+"2"+"O").
+pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    if items.len() < 2 {
+        return items;
+    }
+
+    // Group items by (page, approximate Y) with generous tolerance to capture
+    // both the parent line and the subscript/superscript offset.
+    let y_tolerance = 5.0;
+    let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
+
+    for item in items {
+        let found = line_groups
+            .iter_mut()
+            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
+        if let Some((_, _, group)) = found {
+            group.push(item);
+        } else {
+            let page = item.page;
+            let y = item.y;
+            line_groups.push((page, y, vec![item]));
+        }
+    }
+
+    let mut result = Vec::new();
+
+    for (_, _, mut group) in line_groups {
+        // Sort by X position
+        group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Find the dominant (most common) font size in this group
+        let max_fs = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);
+
+        if max_fs < 1.0 {
+            result.extend(group);
+            continue;
+        }
+
+        let sub_threshold = max_fs * 0.75;
+
+        // Walk through items and merge subscripts into their preceding parent
+        let mut merged: Vec<TextItem> = Vec::new();
+        for item in group {
+            if item.font_size < sub_threshold
+                && item.font_size > 0.0
+                && item.text.len() <= 4
+                && item.text.chars().all(|c| c.is_ascii_digit())
+            {
+                // This is a candidate numeric subscript/superscript (e.g. "2" in H₂O).
+                // Only merge purely numeric text to avoid false positives with small
+                // bullets, ordinal indicators, or letter-based labels.
+                if let Some(parent) = merged.last_mut() {
+                    // Only merge into a parent that is normal-sized, not another subscript,
+                    // and whose text ends with a letter. This prevents merging into numbers
+                    // (e.g. "33" + "1" in "33 1/3%") or punctuation, while preserving
+                    // chemical formulas (NH + "3") and footnote refs (word + "2").
+                    let ends_with_letter = parent
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphabetic());
+                    if parent.font_size >= sub_threshold && ends_with_letter {
+                        let parent_right = parent.x + parent.width;
+                        let gap = item.x - parent_right;
+                        // Subscripts must be tightly adjacent (within ~1pt)
+                        if gap < parent.font_size * 0.2 && gap > -parent.font_size * 0.3 {
+                            parent.text.push_str(&item.text);
+                            parent.width = (item.x + item.width) - parent.x;
+                            continue;
+                        }
+                    }
+                }
+            }
+            merged.push(item);
+        }
+        result.extend(merged);
+    }
+
+    result
+}
+
 /// Helper to get f32 from Object
 pub(crate) fn get_number(obj: &Object) -> Option<f32> {
     match obj {
@@ -1017,5 +1103,122 @@ mod tests {
             },
         ];
         assert!(!is_newspaper_layout(&[col1, col2], &cols));
+    }
+
+    fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x,
+            y,
+            width,
+            height: font_size,
+            font: "F1".into(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_subscript_items_chemical_formula() {
+        // NH₃: "NH" at fs=8 followed by subscript "3" at fs=4.7
+        let items = vec![
+            make_item_fs("NH", 78.0, 499.0, 12.0, 8.0),
+            make_item_fs("3", 90.0, 496.0, 2.3, 4.7),
+            make_item_fs("Cl", 100.0, 499.0, 7.0, 8.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "NH3");
+        assert_eq!(merged[1].text, "Cl");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_h2o() {
+        // H₂O: "H" then subscript "2" then "O"
+        let items = vec![
+            make_item_fs("H", 250.0, 499.0, 5.0, 8.0),
+            make_item_fs("2", 255.0, 496.0, 2.3, 4.7),
+            make_item_fs("O", 257.5, 499.0, 6.0, 8.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "H2");
+        assert_eq!(merged[1].text, "O");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_far_gap() {
+        // Subscript-sized item that's far from the parent should NOT merge
+        let items = vec![
+            make_item_fs("Text", 78.0, 499.0, 20.0, 8.0),
+            make_item_fs("▶", 120.0, 498.0, 3.0, 3.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "Text");
+        assert_eq!(merged[1].text, "▶");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_long_text() {
+        // Long subscript-sized text should NOT merge (not a true subscript)
+        let items = vec![
+            make_item_fs("Title", 78.0, 499.0, 30.0, 8.0),
+            make_item_fs("footnote", 108.0, 496.0, 20.0, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_same_font_size() {
+        // Same font size items should NOT be treated as subscripts
+        let items = vec![
+            make_item_fs("NH", 78.0, 499.0, 12.0, 8.0),
+            make_item_fs("3", 90.0, 496.0, 2.3, 8.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_non_numeric() {
+        // Non-numeric subscript text (e.g. "sol", "º", "vf") should NOT merge
+        let items = vec![
+            make_item_fs("∆", 200.0, 639.0, 5.5, 8.0),
+            make_item_fs("sol", 205.8, 636.9, 5.7, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "∆");
+        assert_eq!(merged[1].text, "sol");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_parent_ends_with_digit() {
+        // "33" + "1" in "33 1/3%" — parent ends with digit, should NOT merge
+        let items = vec![
+            make_item_fs("33", 78.0, 499.0, 10.0, 8.0),
+            make_item_fs("1", 88.0, 496.0, 2.3, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "33");
+        assert_eq!(merged[1].text, "1");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_no_merge_parent_ends_with_space() {
+        // "Health " + "1" — parent ends with space (table credit), should NOT merge
+        let items = vec![
+            make_item_fs("Health ", 78.0, 499.0, 30.0, 8.0),
+            make_item_fs("1", 108.0, 496.0, 2.3, 4.7),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
     }
 }
