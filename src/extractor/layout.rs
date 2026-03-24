@@ -1,6 +1,6 @@
 //! Column detection, line grouping, and reading-order layout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
@@ -18,7 +18,11 @@ pub(crate) struct ColumnRegion {
 /// Builds an occupancy histogram across the page width and finds empty valleys
 /// (gutters) where no text exists. Validates valleys with vertical consistency
 /// checks to avoid false positives.
-pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion> {
+pub(crate) fn detect_columns(
+    items: &[TextItem],
+    page: u32,
+    page_has_table: bool,
+) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;
@@ -110,10 +114,358 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
         })
         .collect();
 
-    if valleys.is_empty() {
+    // Fallback: if no absolute valleys found, try relative valley detection.
+    // Justified text can leave gutter bins non-empty because item widths extend
+    // to the column edge. Look for local minima that are significantly lower
+    // than the peaks on either side.
+    // Only attempt this for dense pages (>=100 items) — sparse pages with shallow
+    // histogram dips are likely not multi-column.
+    // Skip on pages with detected tables — table column gaps look like gutters
+    // in the histogram but the table pipeline already handles reading order.
+    if valleys.is_empty() && page_items.len() >= 100 && !page_has_table {
+        let rel_valleys = find_relative_valleys(
+            &histogram,
+            num_bins,
+            x_min,
+            BIN_WIDTH,
+            page_width,
+            margin_threshold,
+        );
+        if !rel_valleys.is_empty() {
+            let result = validate_and_build_columns(
+                &rel_valleys,
+                &page_items,
+                x_min,
+                BIN_WIDTH,
+                x_max,
+                MIN_ITEMS_PER_COLUMN,
+                MIN_VERTICAL_SPAN_RATIO,
+                page,
+                true, // center-based assignment for relative valleys
+            );
+            if result.len() > 1 {
+                // Validate that both sides contain paragraph-like content.
+                // Tables, forms, and checklists have short scattered items
+                // that create false gutter signals. Only commit to relative
+                // valley columns when both sides look like flowing prose.
+                if columns_have_prose(&result, &page_items) {
+                    debug!(
+                        "page {}: relative valley detection found {} columns",
+                        page,
+                        result.len()
+                    );
+                    return result;
+                } else {
+                    debug!(
+                        "page {}: relative valley rejected — columns lack prose density",
+                        page,
+                    );
+                }
+            }
+        }
         return vec![ColumnRegion { x_min, x_max }];
     }
 
+    return validate_and_build_columns(
+        &valleys,
+        &page_items,
+        x_min,
+        BIN_WIDTH,
+        x_max,
+        MIN_ITEMS_PER_COLUMN,
+        MIN_VERTICAL_SPAN_RATIO,
+        page,
+        false, // edge-based assignment for absolute valleys
+    );
+}
+
+/// Check whether each proposed column contains paragraph-like content.
+///
+/// Groups items per column into rough lines by Y-proximity, then measures
+/// what fraction of those lines span a significant portion of the column
+/// width. Two-column prose (justified or ragged-right) produces lines that
+/// fill most of the column width. Tables, forms, and checklists produce
+/// short scattered items that don't.
+///
+/// Returns true only when *every* column passes a minimum prose density.
+fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
+    const Y_TOL: f32 = 3.0; // y-proximity to group items into the same line
+    const LINE_FILL_THRESHOLD: f32 = 0.45; // line must span ≥45% of column width
+    const MIN_PROSE_RATIO: f32 = 0.40; // ≥40% of lines must be "full"
+    const MIN_LINES: usize = 8; // need enough lines to judge
+    const MIN_COL_WIDTH: f32 = 120.0; // columns must be ≥120pt (not narrow sidebars/fragments)
+    const MAX_AVG_ITEMS_PER_LINE: f32 = 3.5; // prose has 1-3 items/line; tables/forms have 4+
+
+    for col in columns {
+        let col_width = col.x_max - col.x_min;
+        if col_width < MIN_COL_WIDTH {
+            return false;
+        }
+
+        // Collect items whose center falls within this column
+        let col_items: Vec<&TextItem> = items
+            .iter()
+            .filter(|i| {
+                let center = i.x + effective_width(i) / 2.0;
+                center >= col.x_min && center <= col.x_max
+            })
+            .copied()
+            .collect();
+
+        if col_items.len() < MIN_LINES {
+            return false;
+        }
+
+        // Sort by Y descending (top of page = higher Y in PDF coords)
+        let mut sorted: Vec<&TextItem> = col_items;
+        sorted.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Group into lines by Y-proximity and measure fill + item count
+        let mut full_lines = 0usize;
+        let mut total_lines = 0usize;
+        let mut total_items_in_lines = 0usize;
+        let mut line_items: Vec<&TextItem> = Vec::new();
+        let mut line_y = f32::NAN;
+
+        let flush_line = |line_items: &[&TextItem],
+                          full: &mut usize,
+                          total: &mut usize,
+                          total_items: &mut usize| {
+            if line_items.is_empty() {
+                return;
+            }
+            *total += 1;
+            *total_items += line_items.len();
+            // Compute the span of text on this line within the column
+            let left = line_items
+                .iter()
+                .map(|i| i.x.max(col.x_min))
+                .fold(f32::INFINITY, f32::min);
+            let right = line_items
+                .iter()
+                .map(|i| (i.x + effective_width(i)).min(col.x_max))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let span = (right - left).max(0.0);
+            if span >= col_width * LINE_FILL_THRESHOLD {
+                *full += 1;
+            }
+        };
+
+        for item in &sorted {
+            if line_items.is_empty() || (line_y - item.y).abs() < Y_TOL {
+                if line_items.is_empty() {
+                    line_y = item.y;
+                }
+                line_items.push(item);
+            } else {
+                flush_line(
+                    &line_items,
+                    &mut full_lines,
+                    &mut total_lines,
+                    &mut total_items_in_lines,
+                );
+                line_items.clear();
+                line_y = item.y;
+                line_items.push(item);
+            }
+        }
+        flush_line(
+            &line_items,
+            &mut full_lines,
+            &mut total_lines,
+            &mut total_items_in_lines,
+        );
+
+        if total_lines < MIN_LINES {
+            return false;
+        }
+
+        let ratio = full_lines as f32 / total_lines as f32;
+        let avg_items = total_items_in_lines as f32 / total_lines as f32;
+        debug!(
+            "columns_have_prose: col [{:.0}..{:.0}] lines={} full={} ratio={:.2} avg_items={:.1}",
+            col.x_min, col.x_max, total_lines, full_lines, ratio, avg_items
+        );
+        if ratio < MIN_PROSE_RATIO {
+            return false;
+        }
+        // Tables and forms tend to have many small items per line (one per cell),
+        // while prose has few items per line (one per word-run or phrase).
+        if avg_items > MAX_AVG_ITEMS_PER_LINE {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Find relative valleys (local minima) in the histogram.
+///
+/// When justified text fills gutters, the absolute noise threshold fails.
+/// This finds local minima where the count drops significantly below
+/// the peaks on either side — indicating a gutter even when not empty.
+fn find_relative_valleys(
+    histogram: &[u32],
+    num_bins: usize,
+    _x_min: f32,
+    bin_width: f32,
+    page_width: f32,
+    margin_threshold: f32,
+) -> Vec<(usize, usize)> {
+    const MIN_GUTTER_BINS: usize = 2; // minimum 4pt gutter
+    const CONTRAST_THRESHOLD: f32 = 0.60; // valley must be < 60% of surrounding peaks
+    const PEAK_WINDOW: usize = 25; // look 50pt on each side for peaks
+    const MIN_PEAK_HEIGHT: f32 = 20.0; // peaks must be ≥20 (dense text columns)
+
+    if num_bins < 10 {
+        return vec![];
+    }
+
+    // Smooth histogram with a 5-bin moving average to reduce noise
+    let mut smoothed = vec![0.0f32; num_bins];
+    let half_win = 2usize;
+    for (i, s) in smoothed.iter_mut().enumerate().take(num_bins) {
+        let lo = i.saturating_sub(half_win);
+        let hi = (i + half_win + 1).min(num_bins);
+        let sum: u32 = histogram[lo..hi].iter().sum();
+        *s = sum as f32 / (hi - lo) as f32;
+    }
+
+    // Find local minima: positions where smoothed value is lower than
+    // both sides within a search window
+    let mut candidates: Vec<(usize, f32, f32)> = Vec::new(); // (bin, valley_val, contrast)
+
+    for i in PEAK_WINDOW..num_bins.saturating_sub(PEAK_WINDOW) {
+        let val = smoothed[i];
+        if val < 1.0 {
+            continue; // skip empty margins
+        }
+
+        // Check this is a local minimum within a small window
+        let local_lo = i.saturating_sub(3);
+        let local_hi = (i + 4).min(num_bins);
+        let is_local_min = (local_lo..local_hi).all(|j| smoothed[j] >= val - 0.5);
+        if !is_local_min {
+            continue;
+        }
+
+        // Find peak values on each side
+        let left_peak = smoothed[i.saturating_sub(PEAK_WINDOW)..i]
+            .iter()
+            .cloned()
+            .fold(0.0f32, f32::max);
+        let right_peak = smoothed[(i + 1)..(i + 1 + PEAK_WINDOW).min(num_bins)]
+            .iter()
+            .cloned()
+            .fold(0.0f32, f32::max);
+
+        if left_peak < MIN_PEAK_HEIGHT || right_peak < MIN_PEAK_HEIGHT {
+            continue;
+        }
+
+        // Both peaks must be substantial — prevents detecting margin drop-offs
+        // as gutters in single-column layouts with ragged text.
+        let peak_balance = left_peak.min(right_peak) / left_peak.max(right_peak);
+        if peak_balance < 0.40 {
+            continue;
+        }
+
+        // Contrast: ratio of valley to the smaller of the two peaks
+        let ref_peak = left_peak.min(right_peak);
+        let contrast = val / ref_peak;
+
+        if contrast < CONTRAST_THRESHOLD {
+            // Check margin constraint
+            let center_pts = i as f32 * bin_width;
+            if center_pts > margin_threshold && center_pts < (page_width - margin_threshold) {
+                candidates.push((i, val, contrast));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    // Group adjacent candidates into valley ranges and pick the deepest point
+    let mut valleys: Vec<(usize, usize)> = Vec::new();
+    let mut best_bin = candidates[0].0;
+    let mut best_contrast = candidates[0].2;
+
+    for window in candidates.windows(2) {
+        let (prev_bin, _, _) = window[0];
+        let (next_bin, _, next_contrast) = window[1];
+
+        if next_bin - prev_bin <= 5 {
+            // Same group
+            if next_contrast < best_contrast {
+                best_bin = next_bin;
+                best_contrast = next_contrast;
+            }
+        } else {
+            // End current group
+            let half = MIN_GUTTER_BINS;
+            valleys.push((
+                best_bin.saturating_sub(half),
+                (best_bin + half + 1).min(num_bins),
+            ));
+            best_bin = next_bin;
+            best_contrast = next_contrast;
+        }
+    }
+    // Close last group
+    let half = MIN_GUTTER_BINS;
+    valleys.push((
+        best_bin.saturating_sub(half),
+        (best_bin + half + 1).min(num_bins),
+    ));
+
+    // Limit to the single best valley (deepest contrast).
+    // Multi-column layouts with 3+ columns typically have clear gutters that
+    // the absolute valley detection handles. The relative fallback is designed
+    // for 2-column layouts where justified text fills the gutter.
+    if valleys.len() > 1 {
+        // Keep only the valley with the best (lowest) contrast in the candidates
+        let mut best_idx = 0;
+        let mut best_c = f32::MAX;
+        for (vi, v) in valleys.iter().enumerate() {
+            let mid = (v.0 + v.1) / 2;
+            // Find the candidate closest to this valley's midpoint
+            if let Some(c) = candidates
+                .iter()
+                .filter(|(b, _, _)| (*b as isize - mid as isize).unsigned_abs() <= 5)
+                .map(|(_, _, c)| *c)
+                .reduce(f32::min)
+            {
+                if c < best_c {
+                    best_c = c;
+                    best_idx = vi;
+                }
+            }
+        }
+        return vec![valleys[best_idx]];
+    }
+
+    valleys
+}
+
+/// Validate valley candidates with vertical consistency checks and build column regions.
+///
+/// When `center_assign` is true, items are assigned to columns based on their
+/// center point rather than their right edge. This helps when justified text
+/// items extend past the gutter.
+#[allow(clippy::too_many_arguments)]
+fn validate_and_build_columns(
+    valleys: &[(usize, usize)],
+    page_items: &[&TextItem],
+    x_min: f32,
+    bin_width: f32,
+    x_max: f32,
+    min_items: usize,
+    min_vertical_span: f32,
+    page: u32,
+    center_assign: bool,
+) -> Vec<ColumnRegion> {
     // Compute Y range of the page
     let y_min = page_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
     let y_max = page_items
@@ -123,22 +475,37 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     let y_range = y_max - y_min;
 
     // Validate each valley with vertical consistency
-    // Each entry: (start_bin, end_bin, left_count, right_count)
     let mut valid_valleys: Vec<(usize, usize, usize, usize)> = Vec::new();
-    for &(start, end) in &valleys {
-        let gutter_left = x_min + start as f32 * BIN_WIDTH;
-        let gutter_right = x_min + end as f32 * BIN_WIDTH;
+    for &(start, end) in valleys {
+        let gutter_left = x_min + start as f32 * bin_width;
+        let gutter_right = x_min + end as f32 * bin_width;
         let gutter_center = (gutter_left + gutter_right) / 2.0;
 
-        // Collect items on each side of the gutter
+        // Collect items on each side of the gutter.
+        // Center-based: use item midpoint (better for justified text).
+        // Edge-based: use item right edge (original behavior).
         let left_items: Vec<&&TextItem> = page_items
             .iter()
-            .filter(|i| i.x + effective_width(i) <= gutter_center)
+            .filter(|i| {
+                if center_assign {
+                    i.x + effective_width(i) / 2.0 <= gutter_center
+                } else {
+                    i.x + effective_width(i) <= gutter_center
+                }
+            })
             .collect();
-        let right_items: Vec<&&TextItem> =
-            page_items.iter().filter(|i| i.x >= gutter_center).collect();
+        let right_items: Vec<&&TextItem> = page_items
+            .iter()
+            .filter(|i| {
+                if center_assign {
+                    i.x + effective_width(i) / 2.0 > gutter_center
+                } else {
+                    i.x >= gutter_center
+                }
+            })
+            .collect();
 
-        if left_items.len() < MIN_ITEMS_PER_COLUMN || right_items.len() < MIN_ITEMS_PER_COLUMN {
+        if left_items.len() < min_items || right_items.len() < min_items {
             continue;
         }
 
@@ -162,7 +529,7 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
             let overlap_max = left_y_max.min(right_y_max);
             let overlap = (overlap_max - overlap_min).max(0.0);
 
-            if overlap / y_range < MIN_VERTICAL_SPAN_RATIO {
+            if overlap / y_range < min_vertical_span {
                 continue;
             }
         }
@@ -171,6 +538,11 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     }
 
     if valid_valleys.is_empty() {
+        debug!(
+            "page {}: {} valleys found but none passed validation",
+            page,
+            valleys.len()
+        );
         return vec![ColumnRegion { x_min, x_max }];
     }
 
@@ -180,14 +552,12 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
         valid_valleys.len() + 1,
         valid_valleys
             .iter()
-            .map(|(s, e, _, _)| x_min + ((*s + *e) as f32 / 2.0) * BIN_WIDTH)
+            .map(|(s, e, _, _)| x_min + ((*s + *e) as f32 / 2.0) * bin_width)
             .collect::<Vec<_>>()
     );
 
     // Limit to at most 3 gutters (4 columns).
     // Score = width_in_bins * min(left_count, right_count)
-    // This prefers gutters that separate substantial content on both sides,
-    // rather than just the physically widest gaps (which may be intra-column).
     if valid_valleys.len() > 3 {
         valid_valleys.sort_by(|a, b| {
             let score_a = (a.1 - a.0) as f32 * (a.2.min(a.3) as f32);
@@ -197,7 +567,6 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         valid_valleys.truncate(3);
-        // Re-sort by position (left to right)
         valid_valleys.sort_by_key(|v| v.0);
     }
 
@@ -205,7 +574,7 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
     let mut columns = Vec::new();
     let mut col_start = x_min;
     for &(start, end, _, _) in &valid_valleys {
-        let gutter_center = x_min + ((start + end) as f32 / 2.0) * BIN_WIDTH;
+        let gutter_center = x_min + ((start + end) as f32 / 2.0) * bin_width;
         columns.push(ColumnRegion {
             x_min: col_start,
             x_max: gutter_center,
@@ -525,7 +894,7 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
 }
 
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
-    group_into_lines_with_thresholds(items, &HashMap::new())
+    group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new())
 }
 
 /// Group text items into lines, using pre-computed per-page adaptive thresholds
@@ -534,6 +903,7 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
 pub(crate) fn group_into_lines_with_thresholds(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
 ) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
@@ -561,7 +931,7 @@ pub(crate) fn group_into_lines_with_thresholds(
         let adaptive_threshold = page_thresholds.get(&page).copied().unwrap_or(0.10);
 
         // Detect columns for this page
-        let columns = detect_columns(&page_items, page);
+        let columns = detect_columns(&page_items, page, table_pages.contains(&page));
 
         if columns.len() <= 1 {
             // Single column - use simple sorting
@@ -939,7 +1309,7 @@ mod tests {
         items.extend(fill_zone(1, 345.0, 660.0, 750.0, 50.0));
         items.extend(fill_zone(1, 675.0, 800.0, 750.0, 50.0));
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 3, "Expected 3 columns, got {}", cols.len());
 
         // Gutter 1 should be in the gap between left and middle zones
@@ -964,7 +1334,7 @@ mod tests {
         items.extend(fill_zone(1, 30.0, 280.0, 750.0, 50.0));
         items.extend(fill_zone(1, 320.0, 570.0, 750.0, 50.0));
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         assert_eq!(cols.len(), 2, "Expected 2 columns, got {}", cols.len());
 
         let gutter = cols[0].x_max;
@@ -995,12 +1365,93 @@ mod tests {
             ));
         }
 
-        let cols = detect_columns(&items, 1);
+        let cols = detect_columns(&items, 1, false);
         // Should detect the gutters between the 3 dense zones, not the wide gap
         // before the sparse zone
         assert!(
             cols.len() >= 3,
             "Expected >=3 columns for dense zones, got {}",
+            cols.len()
+        );
+    }
+
+    /// Helper: create items that fill a zone but with widths that extend past
+    /// the zone boundary (simulating justified text). Items start within the zone
+    /// but their reported width extends `overshoot` points past the zone end.
+    fn fill_zone_justified(
+        page: u32,
+        x_start: f32,
+        x_end: f32,
+        overshoot: f32,
+        y_start: f32,
+        y_end: f32,
+    ) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        let mut y = y_start;
+        while y >= y_end {
+            // Each line: 3-4 items that together span x_start to x_end+overshoot
+            let item_width = (x_end - x_start + overshoot) / 3.0;
+            for i in 0..3 {
+                let x = x_start + i as f32 * (x_end - x_start) / 3.0;
+                let text_len = (item_width / 6.0).ceil() as usize;
+                let text: String = "W".repeat(text_len);
+                items.push(TextItem {
+                    text,
+                    x,
+                    y,
+                    width: item_width,
+                    height: 12.0,
+                    font_size: 12.0,
+                    font: String::new(),
+                    page,
+                    is_bold: false,
+                    is_italic: false,
+                    item_type: ItemType::Text,
+                    mcid: None,
+                });
+            }
+            y -= 14.0;
+        }
+        items
+    }
+
+    #[test]
+    fn relative_valley_detects_justified_text_columns() {
+        // Two columns of justified text where item widths overshoot the gutter
+        // by a few points, preventing absolute valley detection from finding
+        // an empty gutter.
+        let mut items = Vec::new();
+        // Left column: x=40..290, items extend to ~297 (7pt overshoot)
+        items.extend(fill_zone_justified(1, 40.0, 290.0, 7.0, 750.0, 50.0));
+        // Right column: x=300..550, items extend to ~557
+        items.extend(fill_zone_justified(1, 300.0, 550.0, 7.0, 750.0, 50.0));
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            2,
+            "Expected 2 columns for justified text, got {}",
+            cols.len()
+        );
+
+        let gutter = cols[0].x_max;
+        assert!(
+            (280.0..=310.0).contains(&gutter),
+            "Gutter at {gutter}, expected ~295"
+        );
+    }
+
+    #[test]
+    fn relative_valley_rejects_single_column_margin() {
+        // Single column of text — the right margin drop-off should NOT be
+        // detected as a column gutter.
+        let items = fill_zone_justified(1, 40.0, 350.0, 0.0, 750.0, 50.0);
+
+        let cols = detect_columns(&items, 1, false);
+        assert_eq!(
+            cols.len(),
+            1,
+            "Expected 1 column for single-column text, got {}",
             cols.len()
         );
     }
