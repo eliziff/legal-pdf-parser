@@ -658,9 +658,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             let mut rect_claimed: HashSet<usize> = HashSet::new();
 
             // 0. Structure-tree detection (highest priority — semantic PDF tagging)
+            //    Only use struct-tree tables when they capture a majority (≥50%) of
+            //    band items.  Incomplete struct trees (partial tagging) should fall
+            //    through to geometry detection which sees all items.
             if !struct_tables.is_empty() {
                 let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
                 for table in &st_tables {
+                    let coverage = table.item_indices.len() as f32 / band_items.len().max(1) as f32;
+                    if coverage < 0.5 {
+                        continue;
+                    }
                     for &idx in &table.item_indices {
                         rect_claimed.insert(idx);
                         if let Some(&page_idx) = band_index_map.get(idx) {
@@ -678,12 +685,10 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
 
-            // 1. Rect-based detection (always runs; struct-tree claims prevent
-            //    double-counting via table_items but rect may find additional tables)
+            // 1. Rect-based detection (skips tables overlapping struct-tree claims)
             let (rect_tables, hint_regions) =
                 detect_tables_from_rects(band_items, band_rects, page);
             for table in &rect_tables {
-                // Skip rect tables that overlap with struct-tree claimed items
                 if !rect_claimed.is_empty()
                     && table
                         .item_indices
