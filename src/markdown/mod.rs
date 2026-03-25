@@ -497,7 +497,15 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
-    to_markdown_from_items_with_rects_and_lines(items, options, rects, &[], &HashMap::new(), None)
+    to_markdown_from_items_with_rects_and_lines(
+        items,
+        options,
+        rects,
+        &[],
+        &HashMap::new(),
+        None,
+        &[],
+    )
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -511,10 +519,11 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pdf_lines: &[crate::types::PdfLine],
     page_thresholds: &HashMap<u32, f32>,
     struct_roles: Option<&HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
+    struct_tables: &[crate::structure_tree::StructTable],
 ) -> String {
     use crate::tables::{
-        detect_tables, detect_tables_from_lines, detect_tables_from_rects, table_to_markdown,
-        try_build_rect_guided_table,
+        detect_tables, detect_tables_from_lines, detect_tables_from_rects,
+        detect_tables_from_struct_tree, table_to_markdown, try_build_rect_guided_table,
     };
     use crate::types::ItemType;
 
@@ -647,6 +656,27 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
             // Track which band-local indices are claimed by structural detection
             let mut rect_claimed: HashSet<usize> = HashSet::new();
+
+            // 0. Structure-tree detection (highest priority — semantic PDF tagging)
+            if !struct_tables.is_empty() {
+                let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
+                for table in &st_tables {
+                    for &idx in &table.item_indices {
+                        rect_claimed.insert(idx);
+                        if let Some(&page_idx) = band_index_map.get(idx) {
+                            if let Some(&(global_idx, _)) = group.get(page_idx) {
+                                table_items.insert(global_idx);
+                            }
+                        }
+                    }
+                    let table_y = table.rows.first().copied().unwrap_or(0.0);
+                    let table_md = table_to_markdown(table);
+                    page_tables
+                        .entry(page)
+                        .or_default()
+                        .push((table_y, table_md));
+                }
+            }
 
             // 1. Rect-based detection first (well-tested, high precision)
             let (rect_tables, hint_regions) =

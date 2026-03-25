@@ -5,6 +5,7 @@
 mod detect_heuristic;
 mod detect_lines;
 mod detect_rects;
+mod detect_struct;
 mod financial;
 mod format;
 mod grid;
@@ -13,6 +14,7 @@ pub use detect_heuristic::detect_tables;
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
+pub use detect_struct::detect_tables_from_struct_tree;
 pub use format::table_to_markdown;
 
 use crate::types::TextItem;

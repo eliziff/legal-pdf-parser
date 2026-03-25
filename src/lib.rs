@@ -386,20 +386,23 @@ fn process_document(
     };
 
     // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let struct_roles = structure_tree::StructTree::from_doc(&doc).and_then(|tree| {
-        let page_ids = doc.get_pages();
-        let roles = tree.mcid_to_roles(&page_ids);
-        if roles.is_empty() {
-            None
-        } else {
-            log::debug!(
-                "structure tree: {} pages with MCID roles, {} total MCIDs",
-                roles.len(),
-                tree.mcid_count()
-            );
-            Some(roles)
-        }
-    });
+    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| {
+            let page_ids = doc.get_pages();
+            let roles = tree.mcid_to_roles(&page_ids);
+            let tables = tree.extract_tables(&page_ids);
+            if !roles.is_empty() {
+                log::debug!(
+                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
+                    roles.len(),
+                    tree.mcid_count(),
+                    tables.len()
+                );
+            }
+            let roles = if roles.is_empty() { None } else { Some(roles) };
+            (roles, tables)
+        })
+        .unwrap_or((None, Vec::new()));
 
     let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
@@ -463,6 +466,7 @@ fn process_document(
                     &lines,
                     &page_thresholds,
                     struct_roles.as_ref(),
+                    &struct_tables,
                 ))
             };
 

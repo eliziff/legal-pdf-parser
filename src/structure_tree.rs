@@ -273,6 +273,111 @@ impl StructTree {
         flatten_recursive(&self.children, &mut out, 0);
         out
     }
+
+    /// Extract table structures from the tagged PDF tree.
+    ///
+    /// Walks the tree to find `/Table` elements with `/TR` > `/TD|TH` children,
+    /// collecting MCIDs at each cell.  Returns structured descriptors that can
+    /// be matched against extracted [`TextItem`]s to build tables without
+    /// relying on geometry-based detection.
+    pub fn extract_tables(
+        &self,
+        page_ids: &std::collections::BTreeMap<u32, ObjectId>,
+    ) -> Vec<StructTable> {
+        let obj_to_page: HashMap<ObjectId, u32> =
+            page_ids.iter().map(|(&num, &id)| (id, num)).collect();
+        let mut tables = Vec::new();
+        collect_tables(&self.children, &obj_to_page, &mut tables);
+        tables
+    }
+}
+
+// ─── Tagged table structures ────────────────────────────────────────
+
+/// A table cell extracted from the structure tree.
+#[derive(Debug, Clone)]
+pub struct StructTableCell {
+    /// Whether this cell is a header cell (`/TH`).
+    pub is_header: bool,
+    /// MCIDs with their resolved page numbers.
+    pub mcids: Vec<(i64, u32)>,
+}
+
+/// A table row extracted from the structure tree.
+#[derive(Debug, Clone)]
+pub struct StructTableRow {
+    pub cells: Vec<StructTableCell>,
+}
+
+/// A complete table extracted from the structure tree.
+#[derive(Debug, Clone)]
+pub struct StructTable {
+    pub rows: Vec<StructTableRow>,
+}
+
+fn collect_tables(
+    elements: &[StructElement],
+    obj_to_page: &HashMap<ObjectId, u32>,
+    tables: &mut Vec<StructTable>,
+) {
+    for elem in elements {
+        if elem.role == StructRole::Table {
+            let mut rows = Vec::new();
+            collect_rows(&elem.children, obj_to_page, &mut rows);
+            if rows.len() >= 2 && rows.iter().any(|r| !r.cells.is_empty()) {
+                tables.push(StructTable { rows });
+            }
+        } else {
+            collect_tables(&elem.children, obj_to_page, tables);
+        }
+    }
+}
+
+/// Collect rows from Table children, transparently descending through
+/// THead/TBody/TFoot grouping elements.
+fn collect_rows(
+    elements: &[StructElement],
+    obj_to_page: &HashMap<ObjectId, u32>,
+    rows: &mut Vec<StructTableRow>,
+) {
+    for elem in elements {
+        match elem.role {
+            StructRole::TR => {
+                let mut cells = Vec::new();
+                for child in &elem.children {
+                    if child.role == StructRole::TD || child.role == StructRole::TH {
+                        let is_header = child.role == StructRole::TH;
+                        let mut mcids = Vec::new();
+                        collect_mcids_recursive(child, obj_to_page, &mut mcids);
+                        cells.push(StructTableCell { is_header, mcids });
+                    }
+                }
+                rows.push(StructTableRow { cells });
+            }
+            StructRole::THead | StructRole::TBody | StructRole::TFoot => {
+                collect_rows(&elem.children, obj_to_page, rows);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively collect all MCIDs from an element and its descendants.
+fn collect_mcids_recursive(
+    elem: &StructElement,
+    obj_to_page: &HashMap<ObjectId, u32>,
+    mcids: &mut Vec<(i64, u32)>,
+) {
+    for mcref in &elem.content_refs {
+        if let Some(page_id) = mcref.page_id {
+            if let Some(&page_num) = obj_to_page.get(&page_id) {
+                mcids.push((mcref.mcid, page_num));
+            }
+        }
+    }
+    for child in &elem.children {
+        collect_mcids_recursive(child, obj_to_page, mcids);
+    }
 }
 
 /// A flattened view of a structure element for linear traversal.
