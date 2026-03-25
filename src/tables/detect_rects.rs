@@ -327,7 +327,42 @@ pub fn detect_tables_from_rects(
 
     // Full grid detection requires ≥ 6 rects
     if page_rects.len() >= 6 {
-        let clusters = cluster_rects(&page_rects, 3.0, 6);
+        // Identify origin-anchored page-background rects (clipping paths or
+        // page fills) that would bridge separate table regions if included in
+        // clustering.  Exclude them from adjacency but add them back to each
+        // cluster they overlap, so grid detection still has their edges.
+        let is_page_bg = {
+            let mut heights: Vec<f32> = page_rects.iter().map(|&(_, _, _, h)| h).collect();
+            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_height = heights[heights.len() / 2];
+            let height_threshold = median_height * 20.0;
+            let flags: Vec<bool> = page_rects
+                .iter()
+                .map(|&(x, y, _, h)| x < 5.0 && y < 5.0 && h > height_threshold)
+                .collect();
+            if flags.iter().any(|&b| b) {
+                debug!(
+                    "page {}: {} origin-anchored page-bg rects excluded from clustering",
+                    page,
+                    flags.iter().filter(|&&b| b).count(),
+                );
+            }
+            flags
+        };
+
+        // Build filtered rect list for clustering (excluding page backgrounds)
+        let non_bg_indices: Vec<usize> =
+            (0..page_rects.len()).filter(|&i| !is_page_bg[i]).collect();
+        let non_bg_rects: Vec<(f32, f32, f32, f32)> =
+            non_bg_indices.iter().map(|&i| page_rects[i]).collect();
+        let raw_clusters = cluster_rects(&non_bg_rects, 3.0, 6);
+
+        // Map cluster indices back to page_rects indices
+        let clusters: Vec<Vec<usize>> = raw_clusters
+            .iter()
+            .map(|cluster| cluster.iter().map(|&i| non_bg_indices[i]).collect())
+            .collect();
+
         debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
         for cluster_indices in &clusters {
             let group_rects: Vec<(f32, f32, f32, f32)> =
@@ -2577,6 +2612,77 @@ mod tests {
         assert!(
             hints.is_empty(),
             "narrow header band (20pt) should not produce hint"
+        );
+    }
+
+    // --- page-bg clustering exclusion ---
+
+    #[test]
+    fn page_bg_rects_do_not_bridge_separate_clusters() {
+        // Simulate page 27 scenario: two groups of row stripes at different Y
+        // ranges, connected by full-page background rects at (0,0).
+        // Without exclusion, all rects cluster into one group.
+        // With exclusion, two separate clusters form.
+        let mut rects = Vec::new();
+        let page = 1;
+
+        // Group 1: 7 row stripes at Y=444..537 (Reference Group table)
+        for i in 0..7 {
+            let y = 444.0 + i as f32 * 15.5;
+            rects.push(PdfRect {
+                x: 44.0,
+                y,
+                width: 505.0,
+                height: 15.5,
+                page,
+            });
+        }
+
+        // Group 2: 4 row stripes at Y=176..238 (smaller table)
+        for i in 0..4 {
+            let y = 176.0 + i as f32 * 15.5;
+            rects.push(PdfRect {
+                x: 44.0,
+                y,
+                width: 505.0,
+                height: 15.5,
+                page,
+            });
+        }
+
+        // 3 full-page background rects at origin
+        for _ in 0..3 {
+            rects.push(PdfRect {
+                x: 0.0,
+                y: 0.0,
+                width: 594.0,
+                height: 774.0,
+                page,
+            });
+        }
+
+        // Items in group 1 region for row-stripe detection
+        let mut items = Vec::new();
+        for i in 0..7 {
+            let y = 449.0 + i as f32 * 15.5;
+            items.push(make_item("Company Name", 50.0, y, 9.0));
+            items.push(make_item("P", 320.0, y, 9.0));
+            items.push(make_item("P", 450.0, y, 9.0));
+        }
+
+        let (tables, _hints) = detect_tables_from_rects(&items, &rects, page);
+        // Should detect the group 1 table (7 row stripes) without being
+        // confused by group 2 stripes bridged via page-bg rects.
+        assert!(
+            !tables.is_empty(),
+            "should detect table from row stripes when page-bg rects are excluded from clustering"
+        );
+        // The table should have rows from group 1 only, not spanning to group 2
+        let table = &tables[0];
+        assert!(
+            table.rows.len() <= 8,
+            "table should have at most ~7 rows from group 1, got {}",
+            table.rows.len()
         );
     }
 }
