@@ -69,14 +69,64 @@ for item in items[:5]:
 |---|---|
 | `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
 | `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
-| `detect_pdf(path)` | Fast detection only |
+| `detect_pdf(path)` | Fast detection only (returns PdfResult) |
 | `detect_pdf_bytes(data)` | Fast detection from bytes |
+| `classify_pdf(path)` | Lightweight classification (returns PdfClassification) |
+| `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
+| `extract_text_bytes(data)` | Plain text extraction from bytes |
 | `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
+| `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
+| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
+| `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 
 **`PdfResult` fields:** `pdf_type`, `markdown`, `page_count`, `processing_time_ms`, `pages_needing_ocr`, `title`, `confidence`, `is_complex_layout`, `pages_with_tables`, `pages_with_columns`, `has_encoding_issues`
 
+**`PdfClassification` fields:** `pdf_type`, `page_count`, `pages_needing_ocr` (0-indexed), `confidence`
+
 **`TextItem` fields:** `text`, `x`, `y`, `width`, `height`, `font`, `font_size`, `page`, `is_bold`, `is_italic`, `item_type`
+
+**`RegionText` fields:** `text`, `needs_ocr`
+
+**`PageRegionTexts` fields:** `page` (0-indexed), `regions` (list of RegionText)
+
+### Node.js (NAPI)
+
+```bash
+npm install @firecrawl/pdf-inspector-js
+```
+
+```javascript
+import { readFileSync } from 'fs';
+import { processPdf, classifyPdf, extractTextInRegions } from '@firecrawl/pdf-inspector-js';
+
+const buffer = readFileSync('document.pdf');
+
+// Full processing
+const result = processPdf(buffer);
+console.log(result.pdfType);   // "TextBased", "Scanned", "ImageBased", "Mixed"
+console.log(result.markdown);  // Markdown string or null
+
+// Lightweight classification
+const cls = classifyPdf(buffer);
+console.log(cls.pdfType, cls.pagesNeedingOcr);
+
+// Region-based extraction (for hybrid OCR pipelines)
+const regions = extractTextInRegions(buffer, [
+  { page: 0, regions: [[0, 0, 600, 100]] }
+]);
+```
+
+#### Node.js API reference
+
+| Function | Description |
+|---|---|
+| `processPdf(buffer, pages?)` | Full processing (detect + extract + markdown) |
+| `detectPdf(buffer)` | Fast detection only (returns PdfResult) |
+| `classifyPdf(buffer)` | Lightweight classification (returns PdfClassification) |
+| `extractText(buffer)` | Plain text extraction |
+| `extractTextWithPositions(buffer, pages?)` | Text with X/Y coords and font info |
+| `extractTextInRegions(buffer, pageRegions)` | Extract text in bounding-box regions |
 
 ### Rust
 

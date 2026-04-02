@@ -71,6 +71,28 @@ def main():
             f"'{item.text}'"
         )
 
+    # 6. Lightweight classification
+    print("\n" + "=" * 60)
+    print("Lightweight classification")
+    print("=" * 60)
+    cls = pdf_inspector.classify_pdf(path)
+    print(f"Type:       {cls.pdf_type}")
+    print(f"Pages:      {cls.page_count}")
+    print(f"Confidence: {cls.confidence:.0%}")
+    print(f"OCR pages:  {cls.pages_needing_ocr or 'none'} (0-indexed)")
+
+    # 7. Region-based text extraction
+    print("\n" + "=" * 60)
+    print("Region-based text extraction (page 0, top region)")
+    print("=" * 60)
+    regions = pdf_inspector.extract_text_in_regions(
+        path, [(0, [[0.0, 0.0, 600.0, 200.0]])]
+    )
+    for page_result in regions:
+        for i, region in enumerate(page_result.regions):
+            print(f"  Region {i}: needs_ocr={region.needs_ocr}")
+            print(f"  Text: {region.text[:200]}")
+
 
 if __name__ == "__main__":
     main()

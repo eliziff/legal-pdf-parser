@@ -11,6 +11,11 @@ def fixture_path(name: str) -> str:
     return os.path.join(FIXTURES_DIR, name)
 
 
+def fixture_bytes(name: str) -> bytes:
+    with open(fixture_path(name), "rb") as f:
+        return f.read()
+
+
 # ---------------------------------------------------------------------------
 # process_pdf
 # ---------------------------------------------------------------------------
@@ -61,15 +66,13 @@ class TestProcessPdf:
 
 class TestProcessPdfBytes:
     def test_basic(self):
-        with open(fixture_path("thermo-freon12.pdf"), "rb") as f:
-            data = f.read()
+        data = fixture_bytes("thermo-freon12.pdf")
         result = pdf_inspector.process_pdf_bytes(data)
         assert result.pdf_type == "text_based"
         assert result.markdown is not None
 
     def test_with_pages(self):
-        with open(fixture_path("thermo-freon12.pdf"), "rb") as f:
-            data = f.read()
+        data = fixture_bytes("thermo-freon12.pdf")
         result = pdf_inspector.process_pdf_bytes(data, pages=[1, 2])
         assert result.markdown is not None
 
@@ -87,15 +90,48 @@ class TestDetectPdf:
         assert result.page_count == 3
 
     def test_detect_bytes(self):
-        with open(fixture_path("thermo-freon12.pdf"), "rb") as f:
-            data = f.read()
+        data = fixture_bytes("thermo-freon12.pdf")
         result = pdf_inspector.detect_pdf_bytes(data)
         assert result.pdf_type == "text_based"
         assert result.markdown is None
 
 
 # ---------------------------------------------------------------------------
-# extract_text
+# classify_pdf / classify_pdf_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyPdf:
+    def test_classify_file(self):
+        result = pdf_inspector.classify_pdf(fixture_path("thermo-freon12.pdf"))
+        assert result.pdf_type == "text_based"
+        assert result.page_count == 3
+        assert result.confidence > 0.0
+        assert isinstance(result.pages_needing_ocr, list)
+
+    def test_classify_bytes(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        result = pdf_inspector.classify_pdf_bytes(data)
+        assert result.pdf_type == "text_based"
+        assert result.page_count == 3
+        assert result.confidence > 0.0
+
+    def test_classify_repr(self):
+        result = pdf_inspector.classify_pdf(fixture_path("thermo-freon12.pdf"))
+        r = repr(result)
+        assert "PdfClassification" in r
+        assert "text_based" in r
+
+    def test_classify_fields(self):
+        result = pdf_inspector.classify_pdf(fixture_path("thermo-freon12.pdf"))
+        assert isinstance(result.pdf_type, str)
+        assert isinstance(result.page_count, int)
+        assert isinstance(result.pages_needing_ocr, list)
+        assert isinstance(result.confidence, float)
+
+
+# ---------------------------------------------------------------------------
+# extract_text / extract_text_bytes
 # ---------------------------------------------------------------------------
 
 
@@ -105,9 +141,20 @@ class TestExtractText:
         assert isinstance(text, str)
         assert len(text) > 0
 
+    def test_bytes(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        text = pdf_inspector.extract_text_bytes(data)
+        assert isinstance(text, str)
+        assert len(text) > 0
+
+    def test_bytes_matches_file(self):
+        text_file = pdf_inspector.extract_text(fixture_path("thermo-freon12.pdf"))
+        text_bytes = pdf_inspector.extract_text_bytes(fixture_bytes("thermo-freon12.pdf"))
+        assert text_file == text_bytes
+
 
 # ---------------------------------------------------------------------------
-# extract_text_with_positions
+# extract_text_with_positions / extract_text_with_positions_bytes
 # ---------------------------------------------------------------------------
 
 
@@ -144,6 +191,77 @@ class TestExtractTextWithPositions:
         r = repr(items[0])
         assert "TextItem" in r
 
+    def test_bytes(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        items = pdf_inspector.extract_text_with_positions_bytes(data)
+        assert len(items) > 0
+        assert isinstance(items[0].text, str)
+
+    def test_bytes_with_pages(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        items = pdf_inspector.extract_text_with_positions_bytes(data, pages=[1])
+        assert len(items) > 0
+        assert all(item.page == 1 for item in items)
+
+
+# ---------------------------------------------------------------------------
+# extract_text_in_regions / extract_text_in_regions_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTextInRegions:
+    def test_file(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("thermo-freon12.pdf"),
+            [(0, [[0.0, 0.0, 600.0, 100.0]])],
+        )
+        assert len(results) == 1
+        assert results[0].page == 0
+        assert len(results[0].regions) == 1
+        assert isinstance(results[0].regions[0].text, str)
+        assert isinstance(results[0].regions[0].needs_ocr, bool)
+
+    def test_bytes(self):
+        data = fixture_bytes("thermo-freon12.pdf")
+        results = pdf_inspector.extract_text_in_regions_bytes(
+            data,
+            [(0, [[0.0, 0.0, 600.0, 100.0]])],
+        )
+        assert len(results) == 1
+        assert results[0].page == 0
+        assert len(results[0].regions) == 1
+        assert isinstance(results[0].regions[0].text, str)
+
+    def test_repr(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("thermo-freon12.pdf"),
+            [(0, [[0.0, 0.0, 600.0, 100.0]])],
+        )
+        r = repr(results[0])
+        assert "PageRegionTexts" in r
+        r2 = repr(results[0].regions[0])
+        assert "RegionText" in r2
+
+    def test_multiple_regions(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("thermo-freon12.pdf"),
+            [(0, [[0.0, 0.0, 300.0, 100.0], [300.0, 0.0, 600.0, 100.0]])],
+        )
+        assert len(results) == 1
+        assert len(results[0].regions) == 2
+
+    def test_multiple_pages(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("thermo-freon12.pdf"),
+            [
+                (0, [[0.0, 0.0, 600.0, 100.0]]),
+                (1, [[0.0, 0.0, 600.0, 100.0]]),
+            ],
+        )
+        assert len(results) == 2
+        assert results[0].page == 0
+        assert results[1].page == 1
+
 
 # ---------------------------------------------------------------------------
 # Error handling
@@ -162,6 +280,24 @@ class TestErrors:
     def test_empty_bytes(self):
         with pytest.raises(ValueError):
             pdf_inspector.process_pdf_bytes(b"")
+
+    def test_classify_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.classify_pdf_bytes(b"not a pdf")
+
+    def test_classify_nonexistent(self):
+        with pytest.raises((ValueError, OSError)):
+            pdf_inspector.classify_pdf("/nonexistent/file.pdf")
+
+    def test_extract_text_bytes_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.extract_text_bytes(b"not a pdf")
+
+    def test_regions_not_a_pdf(self):
+        with pytest.raises(ValueError):
+            pdf_inspector.extract_text_in_regions_bytes(
+                b"not a pdf", [(0, [[0.0, 0.0, 100.0, 100.0]])]
+            )
 
 
 # ---------------------------------------------------------------------------
