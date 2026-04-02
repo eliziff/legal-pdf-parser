@@ -28,9 +28,9 @@ R E V I E W 8 5
 
 -800
 
-| 1982 | 1986      | 1990       | 1998       | 2006   |
-| ---- | --------- | ---------- | ---------- | ------ |
-|      | Apartment | Industrial | Office-CBD | Retail |
+|1982|1986|1990|1998|2006|
+|---|---|---|---|---|
+||Apartment|Industrial|Office-CBD|Retail|
 
 1982 1986 1990 1994 1998 2002 2006
 
@@ -38,11 +38,11 @@ R E V I E W 8 5
 
 **Correlation of Cap Rate Spreads Over Treasury** **Multifamily Industrial CBD Office**
 
-|            | Multifamily | Industrial | CBD Office |
-| ---------- | ----------- | ---------- | ---------- |
-| Industrial | 0.937       |            |            |
-| CBDOffice  | 0.924       |            |            |
-| Retail     | 0.922       | 0.969      | 0.964      |
+||Multifamily|Industrial|CBD Office|
+|---|---|---|---|
+|Industrial|0.937|||
+|CBDOffice|0.924|||
+|Retail|0.922|0.969|0.964|
 
 more about investing in tax losses than burst, cap rates spreads steadily com- real estate cash streams. When tax laws pressed, recently falling to approximately dramatically changed in 1986, cap rate zero. And if NOI cap rate spreads are spreads rose, though they generally roughly zero, cash flow cap rate spreads remained negative due to the availability (after reserves for tenant improvements, of excess leverage through 1990 and pro-leasing commissions, and capital expendi- jections of strong cash flow growth, in tures) are well below zero. spite of weak fundamentals. This compression of cap rates and cap Throughout the first two-thirds of the rate spreads over the past five years has 1990s, spreads substantially widened as generated enormous wealth for real estate capital abandoned real estate. Spreads fur-owners. In fact, the combination of cheap ther widened in the latter part of the debt and cap rate compression covered a 1990s, as investors scorned cash flow dur-multitude of property underwriting ing the tech bubble and treasury rates errors made during the past five years, as drifted downward. As the tech bubble neither cap rate compression nor narrow-
 

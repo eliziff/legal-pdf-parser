@@ -4,8 +4,8 @@ use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
-    detect_pdf_type, extract_text, extract_text_with_positions, to_markdown, MarkdownOptions,
-    PdfError, PdfType, TextItem,
+    detect_pdf_type, extract_text, extract_text_with_positions, process_pdf_with_options,
+    to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 
 // Helper to create test TextItems
@@ -23,6 +23,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_bold: false,
         is_italic: false,
         item_type: ItemType::Text,
+        mcid: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn make_text_item_with_font(
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
         item_type: ItemType::Text,
+        mcid: None,
     }
 }
 
@@ -138,6 +140,7 @@ fn test_text_line_text_method() {
         items,
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "Hello World");
 }
@@ -149,6 +152,7 @@ fn test_text_line_single_item() {
         items,
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "Single");
 }
@@ -159,6 +163,7 @@ fn test_text_line_empty() {
         items: vec![],
         y: 700.0,
         page: 1,
+        adaptive_threshold: 0.10,
     };
     assert_eq!(line.text(), "");
 }
@@ -473,11 +478,13 @@ fn test_markdown_from_lines_basic() {
             items: vec![make_text_item("First", 100.0, 700.0, 12.0, 1)],
             y: 700.0,
             page: 1,
+            adaptive_threshold: 0.10,
         },
         TextLine {
             items: vec![make_text_item("Second", 100.0, 680.0, 12.0, 1)],
             y: 680.0,
             page: 1,
+            adaptive_threshold: 0.10,
         },
     ];
     let md = to_markdown_from_lines(lines, MarkdownOptions::default());
@@ -993,4 +1000,110 @@ startxref
             result.pages_needing_ocr
         );
     }
+}
+
+#[test]
+fn test_firecrawl_tagged_pdf_struct_tree() {
+    use lopdf::Document;
+    use pdf_inspector::structure_tree::{StructRole, StructTree};
+
+    let doc = Document::load("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let tree = StructTree::from_doc(&doc).expect("Should have a structure tree");
+
+    // Verify structure tree contains expected roles
+    let page_ids = doc.get_pages();
+    let roles = tree.mcid_to_roles(&page_ids);
+    assert!(!roles.is_empty(), "Should have MCID roles across pages");
+
+    let flat = tree.flatten();
+    let has_code = flat.iter().any(|e| matches!(e.role, StructRole::Code));
+    let has_h1 = flat.iter().any(|e| matches!(e.role, StructRole::H1));
+    let has_li = flat.iter().any(|e| matches!(e.role, StructRole::LI));
+    let has_caption = flat.iter().any(|e| matches!(e.role, StructRole::Caption));
+    assert!(has_code, "Should have Code elements");
+    assert!(has_h1, "Should have H1 elements");
+    assert!(has_li, "Should have LI elements");
+    assert!(has_caption, "Should have Caption elements");
+
+    // Full conversion: code fences should be generated from Code struct elements
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    let md = result.markdown.unwrap();
+    let fence_count = md.matches("```").count();
+    assert!(
+        fence_count > 0,
+        "Should produce code fences from tagged Code elements"
+    );
+    // Fences come in open/close pairs
+    assert_eq!(fence_count % 2, 0, "Code fences should be balanced");
+}
+
+#[test]
+fn test_identity_h_no_tounicode_suppresses_garbage() {
+    // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
+    // ToUnicode CMap.  The raw CID values look like random Latin characters.
+    // We should suppress the garbage and flag the page for OCR.
+    let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+
+    // Page 1 should be flagged for OCR
+    assert!(
+        result.pages_needing_ocr.contains(&1),
+        "Page with Identity-H font without ToUnicode should be flagged for OCR"
+    );
+
+    // Markdown should be empty (garbage suppressed)
+    let md = result.markdown.unwrap_or_default();
+    assert!(
+        md.trim().is_empty(),
+        "Garbage CID text should be suppressed, got {} chars: {:?}",
+        md.len(),
+        &md[..md.len().min(100)]
+    );
+}
+
+#[test]
+fn test_rotated_table_layout_correction() {
+    // tnagriculture_06_12.pdf has landscape content in a portrait page via
+    // a 90° CCW text matrix [0, b, -b, 0, tx, ty].  Without rotation
+    // correction, the table is read sideways (jumbled numbers).
+    let result =
+        process_pdf_with_options("tests/fixtures/tnagriculture_06_12.pdf", PdfOptions::new())
+            .unwrap();
+    let md = result.markdown.unwrap_or_default();
+
+    // Title should appear near the top
+    assert!(
+        md.contains("DISTRICT WISE PRODUCTION OF SPICES AND CONDIMENTS"),
+        "Should extract the table title"
+    );
+
+    // District names should be readable (not jumbled with numbers)
+    assert!(
+        md.contains("Ariyalur"),
+        "Should extract district name Ariyalur"
+    );
+    assert!(
+        md.contains("Coimbatore"),
+        "Should extract district name Coimbatore"
+    );
+
+    // Spice column headers should appear
+    assert!(
+        md.contains("CARDAMOM"),
+        "Should extract spice header CARDAMOM"
+    );
+    assert!(
+        md.contains("RED CHILLIES"),
+        "Should extract spice header RED CHILLIES"
+    );
+
+    // Table should be formatted as markdown table (has pipe delimiters)
+    let has_table_row = md
+        .lines()
+        .any(|l: &str| l.contains('|') && l.contains("Ariyalur"));
+    assert!(
+        has_table_row,
+        "District data should be in a markdown table row"
+    );
 }

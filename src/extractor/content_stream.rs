@@ -20,12 +20,69 @@ use super::fonts::{
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, multiply_matrices};
 
+/// Strip PDF comments (% to end of line) from content stream bytes.
+///
+/// Some PDF generators (e.g. PD4ML) embed comments in content streams that
+/// confuse lopdf's `Content::decode` parser.  Comments inside string literals
+/// (parentheses) are NOT stripped — only top-level comments.
+fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+    // Quick check: if no '%' present, return as-is (common case)
+    if !data.contains(&b'%') {
+        return data.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    let mut in_string = 0i32; // parenthesis nesting depth
+    let mut in_hex_string = false;
+
+    while i < data.len() {
+        let b = data[i];
+        match b {
+            b'(' if !in_hex_string => {
+                in_string += 1;
+                result.push(b);
+            }
+            b')' if !in_hex_string && in_string > 0 => {
+                in_string -= 1;
+                result.push(b);
+            }
+            b'<' if in_string == 0 && !in_hex_string => {
+                in_hex_string = true;
+                result.push(b);
+            }
+            b'>' if in_hex_string => {
+                in_hex_string = false;
+                result.push(b);
+            }
+            b'%' if in_string == 0 && !in_hex_string => {
+                // Skip until end of line
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+                // Replace comment with a space to preserve token separation
+                result.push(b' ');
+                continue; // Don't increment i again
+            }
+            _ => {
+                result.push(b);
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
+/// the page uses fonts with unresolvable gid-encoded glyphs.
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-) -> Result<PageExtraction, PdfError> {
+    include_invisible: bool,
+) -> Result<(PageExtraction, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
@@ -45,7 +102,7 @@ pub(crate) fn extract_page_text_items(
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
     // Build font encoding maps from Differences arrays
-    let font_encodings = build_font_encodings(doc, &fonts);
+    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts);
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
@@ -72,12 +129,13 @@ pub(crate) fn extract_page_text_items(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    if let Ok(data) = s.decompressed_content() {
-                        if let Some(entry) =
-                            crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                        {
-                            inline_cmaps.insert(resource_name, entry);
-                        }
+                    let data = s
+                        .decompressed_content()
+                        .unwrap_or_else(|_| s.content.clone());
+                    if let Some(entry) =
+                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
+                    {
+                        inline_cmaps.insert(resource_name, entry);
                     }
                 }
             }
@@ -109,38 +167,74 @@ pub(crate) fn extract_page_text_items(
         .get_page_content(page_id)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
 
+    // Strip PDF comments (% to end of line) from the content stream.
+    // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
+    // Content::decode parser, causing it to skip operators like ET and Q.
+    let content_data = strip_pdf_comments(&content_data);
+
     let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
+
+    const MAX_OPERATIONS: usize = 1_000_000;
+    if content.operations.len() > MAX_OPERATIONS {
+        log::warn!(
+            "page {}: skipping extraction — {} operations exceeds limit ({})",
+            page_num,
+            content.operations.len(),
+            MAX_OPERATIONS
+        );
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false));
+    }
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
-    let mut gstate_stack: Vec<([f32; 6], i32)> = Vec::new();
+    let mut gstate_stack: Vec<([f32; 6], i32, f32, f32)> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_leading: f32 = 0.0; // TL parameter (in text-space units)
+    let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
+    let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
 
-    // Marked content (ActualText) tracking
-    let mut marked_content_stack: Vec<Option<String>> = Vec::new();
+    // Track text direction votes: (horizontal_count, rotated_count).
+    // For each text item, if |combined[0]| > |combined[1]| the text runs
+    // horizontally (normal); otherwise it's rotated ~90°.
+    let mut rotation_votes = RotationVotes {
+        horizontal: 0,
+        rotated: 0,
+    };
+
+    // Marked content tracking: (ActualText, MCID) per nesting level
+    struct MarkedContentEntry {
+        actual_text: Option<String>,
+        mcid: Option<i64>,
+    }
+    let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
     let mut actual_text_start_tm: Option<[f32; 6]> = None; // text matrix at BDC entry
+    /// Get the innermost MCID from the marked content stack.
+    fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
+        stack.iter().rev().find_map(|e| e.mcid)
+    }
 
     for op in &content.operations {
         trace!("{} {:?}", op.operator, op.operands);
         match op.operator.as_str() {
             "q" => {
                 // Save graphics state
-                gstate_stack.push((ctm, text_rendering_mode));
+                gstate_stack.push((ctm, text_rendering_mode, char_spacing, word_spacing));
             }
             "Q" => {
                 // Restore graphics state
-                if let Some((saved_ctm, saved_tr)) = gstate_stack.pop() {
+                if let Some((saved_ctm, saved_tr, saved_tc, saved_tw)) = gstate_stack.pop() {
                     ctm = saved_ctm;
                     text_rendering_mode = saved_tr;
+                    char_spacing = saved_tc;
+                    word_spacing = saved_tw;
                 }
             }
             "cm" => {
@@ -193,6 +287,18 @@ pub(crate) fn extract_page_text_items(
                     text_rendering_mode = mode as i32;
                 }
             }
+            "Tc" => {
+                // Set character spacing (extra space added after each character)
+                if let Some(tc) = op.operands.first().and_then(get_number) {
+                    char_spacing = tc;
+                }
+            }
+            "Tw" => {
+                // Set word spacing (extra space added for each space character)
+                if let Some(tw) = op.operands.first().and_then(get_number) {
+                    word_spacing = tw;
+                }
+            }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
@@ -233,8 +339,15 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                        get_operand_bytes(&op.operands[0])
-                            .map(|raw| compute_string_width_ts(raw, fi, current_font_size))
+                        get_operand_bytes(&op.operands[0]).map(|raw| {
+                            compute_string_width_ts(
+                                raw,
+                                fi,
+                                current_font_size,
+                                char_spacing,
+                                word_spacing,
+                            )
+                        })
                     });
                     // ActualText: suppress glyph extraction, just advance text matrix
                     if suppress_glyph_extraction {
@@ -244,8 +357,10 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
-                    // Skip invisible (Tr=3) text but still advance text matrix
-                    if text_rendering_mode == 3 {
+                    // Skip invisible (Tr=3) text but still advance text matrix.
+                    // For Mixed/template PDFs, include_invisible=true extracts
+                    // the OCR text layer that sits behind scanned images.
+                    if text_rendering_mode == 3 && !include_invisible {
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -266,6 +381,11 @@ pub(crate) fn extract_page_text_items(
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
                         let (x, y) = (combined[4], combined[5]);
+                        if combined[0].abs() >= combined[1].abs() {
+                            rotation_votes.horizontal += 1;
+                        } else {
+                            rotation_votes.rotated += 1;
+                        }
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -292,6 +412,7 @@ pub(crate) fn extract_page_text_items(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: current_mcid(&marked_content_stack),
                             });
                         }
                     }
@@ -302,7 +423,8 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
-                        let is_invisible = text_rendering_mode == 3 || suppress_glyph_extraction;
+                        let is_invisible = (text_rendering_mode == 3 && !include_invisible)
+                            || suppress_glyph_extraction;
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -379,8 +501,13 @@ pub(crate) fn extract_page_text_items(
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts +=
-                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                    total_width_ts += compute_string_width_ts(
+                                        raw_bytes,
+                                        fi,
+                                        current_font_size,
+                                        char_spacing,
+                                        word_spacing,
+                                    );
                                 }
                             }
                             if !is_invisible {
@@ -406,6 +533,11 @@ pub(crate) fn extract_page_text_items(
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
                             let rendered_size = effective_font_size(current_font_size, &combined);
                             let base_font = font_base_names
                                 .get(&current_font)
@@ -440,6 +572,7 @@ pub(crate) fn extract_page_text_items(
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
                                     item_type: ItemType::Text,
+                                    mcid: current_mcid(&marked_content_stack),
                                 });
                             }
                         }
@@ -461,7 +594,7 @@ pub(crate) fn extract_page_text_items(
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
-                if !(text_rendering_mode == 3
+                if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {
@@ -478,6 +611,11 @@ pub(crate) fn extract_page_text_items(
                     ) {
                         if !text.trim().is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
                             let rendered_size = effective_font_size(current_font_size, &combined);
                             let (x, y) = (combined[4], combined[5]);
                             let base_font = font_base_names
@@ -496,6 +634,7 @@ pub(crate) fn extract_page_text_items(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: current_mcid(&marked_content_stack),
                             });
                         }
                     }
@@ -531,11 +670,15 @@ pub(crate) fn extract_page_text_items(
             }
             "BMC" => {
                 // Begin Marked Content (no properties)
-                marked_content_stack.push(None);
+                marked_content_stack.push(MarkedContentEntry {
+                    actual_text: None,
+                    mcid: None,
+                });
             }
             "BDC" => {
-                // Begin Marked Content with properties — extract ActualText
+                // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
+                let mut mcid: Option<i64> = None;
                 if op.operands.len() >= 2 {
                     let dict = match &op.operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
@@ -549,47 +692,61 @@ pub(crate) fn extract_page_text_items(
                                 _ => None,
                             };
                         }
+                        if let Ok(Object::Integer(id)) = d.get(b"MCID") {
+                            mcid = Some(*id);
+                        }
                     }
                 }
                 if actual_text.is_some() {
                     suppress_glyph_extraction = true;
                     actual_text_start_tm = Some(text_matrix);
                 }
-                marked_content_stack.push(actual_text);
+                marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
             }
             "EMC" => {
                 // End Marked Content — emit ActualText item with correct width
-                if let Some(Some(at)) = marked_content_stack.pop() {
-                    // Compute width from text matrix advancement during BDC..EMC
-                    if let Some(start_tm) = actual_text_start_tm.take() {
-                        let combined = multiply_matrices(&start_tm, &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined);
-                        let (x, y) = (combined[4], combined[5]);
-                        // Width in device space from text matrix delta
-                        let delta_ts = text_matrix[4] - start_tm[4];
-                        let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
-                        let width = (delta_ts * scale_x).abs();
-                        if !at.trim().is_empty() {
-                            let base_font = font_base_names
-                                .get(&current_font)
-                                .map(|s| s.as_str())
-                                .unwrap_or(&current_font);
-                            items.push(TextItem {
-                                text: expand_ligatures(&at),
-                                x,
-                                y,
-                                width,
-                                height: rendered_size,
-                                font: current_font.clone(),
-                                font_size: rendered_size,
-                                page: page_num,
-                                is_bold: is_bold_font(base_font),
-                                is_italic: is_italic_font(base_font),
-                                item_type: ItemType::Text,
-                            });
+                if let Some(entry) = marked_content_stack.pop() {
+                    if let Some(at) = entry.actual_text {
+                        // Compute width from text matrix advancement during BDC..EMC
+                        if let Some(start_tm) = actual_text_start_tm.take() {
+                            let combined = multiply_matrices(&start_tm, &ctm);
+                            if combined[0].abs() >= combined[1].abs() {
+                                rotation_votes.horizontal += 1;
+                            } else {
+                                rotation_votes.rotated += 1;
+                            }
+                            let rendered_size = effective_font_size(current_font_size, &combined);
+                            let (x, y) = (combined[4], combined[5]);
+                            // Width in device space from text matrix delta
+                            let delta_ts = text_matrix[4] - start_tm[4];
+                            let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
+                            let width = (delta_ts * scale_x).abs();
+                            if !at.trim().is_empty() {
+                                let base_font = font_base_names
+                                    .get(&current_font)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_font);
+                                items.push(TextItem {
+                                    text: expand_ligatures(&at),
+                                    x,
+                                    y,
+                                    width,
+                                    height: rendered_size,
+                                    font: current_font.clone(),
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: is_bold_font(base_font),
+                                    is_italic: is_italic_font(base_font),
+                                    item_type: ItemType::Text,
+                                    mcid: entry
+                                        .mcid
+                                        .or_else(|| current_mcid(&marked_content_stack)),
+                                });
+                            }
                         }
+                        suppress_glyph_extraction =
+                            marked_content_stack.iter().any(|e| e.actual_text.is_some());
                     }
-                    suppress_glyph_extraction = marked_content_stack.iter().any(|a| a.is_some());
                 }
             }
             "re" => {
@@ -848,8 +1005,94 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    // Detect dominant text rotation and transform coordinates if needed.
+    // Some PDFs embed landscape content in portrait pages using a rotated text
+    // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
+    // assumes x=horizontal, y=vertical — so we swap coordinates to match.
+    let (items, rects, lines) = correct_rotated_page(items, rects, lines, &rotation_votes);
+
     let items = super::merge_text_items(items);
-    Ok((items, rects, lines))
+    let items = super::merge_subscript_items(items);
+    Ok(((items, rects, lines), has_gid_fonts))
+}
+
+/// Counts of text operators with horizontal vs rotated combined matrices.
+struct RotationVotes {
+    horizontal: u32,
+    rotated: u32,
+}
+
+/// Detect if most text items on a page are rotated 90° or 270°, and if so,
+/// swap x↔y coordinates (plus widths/heights) so the layout engine sees
+/// them as horizontal text on a landscape page.
+fn correct_rotated_page(
+    mut items: Vec<TextItem>,
+    mut rects: Vec<PdfRect>,
+    mut lines: Vec<PdfLine>,
+    votes: &RotationVotes,
+) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>) {
+    if items.len() < 2 {
+        return (items, rects, lines);
+    }
+
+    // Use the combined-matrix direction votes collected during extraction.
+    // For normal text, combined[0] (the x-component of the text x-axis) is
+    // large; for 90° rotated text, combined[1] dominates instead.
+    let total_votes = votes.horizontal + votes.rotated;
+    if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
+        // Less than ~67% of text operators are rotated → not a rotated page
+        return (items, rects, lines);
+    }
+
+    log::debug!(
+        "detected rotated page text: {}/{} text ops are rotated — swapping coordinates",
+        votes.rotated,
+        total_votes
+    );
+
+    // For 90° CCW rotation (the common case: Tm = [0, b, -b, 0, tx, ty]):
+    //   device x increases = visual "down"   → negate when mapping to y
+    //   device y increases = visual "right"   → use directly as x
+    // The layout engine sorts by y descending (highest = top of page), so
+    // we negate old_x so that visual-top (low device x) gets high new_y.
+    for item in &mut items {
+        let new_x = item.y;
+        let new_y = -item.x;
+        item.x = new_x;
+        item.y = new_y;
+        // For rotated text, the "width" along the reading direction was
+        // lost (computed as 0 due to scale_x ≈ 0).  Estimate from text
+        // length × approximate char width.  font_size is the rendered
+        // height in device space, which for 90° rotation corresponds to
+        // the horizontal extent of one em.
+        if item.width < 0.5 {
+            let char_count = item.text.chars().count() as f32;
+            item.width = char_count * item.font_size * 0.5;
+        }
+    }
+
+    // Transform rectangles
+    for rect in &mut rects {
+        let new_x = rect.y;
+        let new_y = -(rect.x + rect.width.abs());
+        rect.x = new_x;
+        rect.y = new_y;
+        std::mem::swap(&mut rect.width, &mut rect.height);
+    }
+
+    // Transform lines
+    for line in &mut lines {
+        let new_x1 = line.y1;
+        let new_y1 = -line.x1;
+        let new_x2 = line.y2;
+        let new_y2 = -line.x2;
+        line.x1 = new_x1;
+        line.y1 = new_y1;
+        line.x2 = new_x2;
+        line.y2 = new_y2;
+    }
+
+    (items, rects, lines)
 }
 
 /// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).
@@ -948,5 +1191,78 @@ mod tests {
         let mut single = vec![rect(1.0, 2.0, 3.0, 4.0, 1)];
         dedup_rects(&mut single);
         assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn test_skip_excessive_operations() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+
+        // "0 0 m\n" = 6 bytes per op, 1_100_000 ops → ~6.6 MB content stream
+        let ops_bytes = "0 0 m\n".repeat(1_100_000).into_bytes();
+        let stream = Stream::new(dictionary! {}, ops_bytes);
+        let content_id = doc.add_object(Object::Stream(stream));
+
+        let page_dict = dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {},
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        };
+        let page_id = doc.add_object(page_dict);
+
+        // Register the page so get_page_content can find it
+        let pages_dict = dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        };
+        let pages_id = doc.add_object(pages_dict);
+        let catalog = dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        };
+        doc.add_object(catalog);
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let result = extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
+        let ((items, rects, lines), _has_gid) = result;
+        assert!(items.is_empty());
+        assert!(rects.is_empty());
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_strip_pdf_comments() {
+        // Basic comment stripping
+        let input = b"BT\n% comment\nTj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"BT\n \nTj\nET\n");
+
+        // No comments = unchanged
+        let input = b"BT\nTj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, input.to_vec());
+
+        // Don't strip inside string literals
+        let input = b"(text with % not a comment)\n% real comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(text with % not a comment)\n \n");
+
+        // Don't strip inside hex strings
+        let input = b"<0033% not a comment>\n% real comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"<0033% not a comment>\n \n");
+
+        // PD4ML style: comment between Tj and ET
+        let input = b"<0033> Tj\n\t% Mission Statement\n\tET\n";
+        let output = strip_pdf_comments(input);
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("ET"),
+            "ET should be preserved after comment stripping"
+        );
     }
 }

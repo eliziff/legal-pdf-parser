@@ -144,9 +144,10 @@ fn extract_form_xobject_text_inner(
         return items;
     };
 
-    // Decompress the content stream
-    let Ok(content_data) = stream.decompressed_content() else {
-        return items;
+    // Decompress the content stream (fall back to raw bytes for uncompressed streams)
+    let content_data = match stream.decompressed_content() {
+        Ok(data) => data,
+        Err(_) => stream.content.clone(),
     };
 
     // Decode the content stream
@@ -156,7 +157,7 @@ fn extract_form_xobject_text_inner(
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
-    let font_encodings = build_font_encodings(doc, &form_fonts);
+    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts);
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
@@ -179,12 +180,13 @@ fn extract_form_xobject_text_inner(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    if let Ok(data) = s.decompressed_content() {
-                        if let Some(entry) =
-                            crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                        {
-                            inline_cmaps.insert(resource_name, entry);
-                        }
+                    let data = s
+                        .decompressed_content()
+                        .unwrap_or_else(|_| s.content.clone());
+                    if let Some(entry) =
+                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
+                    {
+                        inline_cmaps.insert(resource_name, entry);
                     }
                 }
             }
@@ -352,6 +354,8 @@ fn extract_form_xobject_text_inner(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
+                                    0.0,
+                                    0.0,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -379,6 +383,8 @@ fn extract_form_xobject_text_inner(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
+                                    0.0,
+                                    0.0,
                                 );
                                 text_matrix[4] += w_ts * text_matrix[0];
                                 text_matrix[5] += w_ts * text_matrix[1];
@@ -408,6 +414,7 @@ fn extract_form_xobject_text_inner(
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
                                 item_type: ItemType::Text,
+                                mcid: None,
                             });
                         }
                     }
@@ -490,8 +497,13 @@ fn extract_form_xobject_text_inner(
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts +=
-                                        compute_string_width_ts(raw_bytes, fi, current_font_size);
+                                    total_width_ts += compute_string_width_ts(
+                                        raw_bytes,
+                                        fi,
+                                        current_font_size,
+                                        0.0,
+                                        0.0,
+                                    );
                                 }
                             }
                             if !fill_is_white {
@@ -549,6 +561,7 @@ fn extract_form_xobject_text_inner(
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
                                     item_type: ItemType::Text,
+                                    mcid: None,
                                 });
                             }
                         }

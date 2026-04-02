@@ -17,33 +17,21 @@ pub fn table_to_markdown(table: &Table) -> String {
     let num_cols = cleaned_cells[0].len();
     let mut output = String::new();
 
-    // Calculate column widths for alignment (capped to avoid massive whitespace padding)
-    const MAX_COL_WIDTH: usize = 40;
-    let col_widths: Vec<usize> = (0..num_cols)
-        .map(|col| {
-            cleaned_cells
-                .iter()
-                .map(|row| row.get(col).map(|c| c.len()).unwrap_or(0))
-                .max()
-                .unwrap_or(3)
-                .clamp(3, MAX_COL_WIDTH)
-        })
-        .collect();
-
-    // Output each row
+    // Compact format: no padding, minimal separators. Optimized for token
+    // efficiency — AI agents are the primary consumer, not human eyes.
     for (row_idx, row) in cleaned_cells.iter().enumerate() {
         output.push('|');
-        for (col_idx, cell) in row.iter().enumerate() {
-            let width = col_widths[col_idx];
-            output.push_str(&format!(" {:width$} |", cell, width = width));
+        for cell in row.iter() {
+            output.push_str(cell);
+            output.push('|');
         }
         output.push('\n');
 
         // Add separator after header row
         if row_idx == 0 {
             output.push('|');
-            for width in &col_widths {
-                output.push_str(&format!(" {} |", "-".repeat(*width)));
+            for _ in 0..num_cols {
+                output.push_str("---|");
             }
             output.push('\n');
         }
@@ -119,11 +107,43 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        let is_continuation = first_cell.is_empty()
+        // Classic continuation: first cell empty, content in other cells
+        let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
-            && cleaned.len() > 1; // Don't merge into the first row (header)
+            && cleaned.len() > 1;
+
+        // Wrapped-cell continuation: row has fewer filled cells than the header
+        // row, suggesting it's overflow text from the previous row's cells.
+        // Only trigger when the previous row has significantly more filled cells.
+        let num_cols = row.len();
+        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
+        let prev_filled = cleaned
+            .last()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(0);
+        let header_filled = cleaned
+            .first()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(num_cols);
+        // Merge when the row has significantly fewer filled cells than header.
+        // For wide tables (5+ cols), require ≤50% of header cells.
+        // For narrow tables (2-4 cols), require fewer than header cells.
+        // This prevents merging normal data rows in wide tables (6_KE_Chart)
+        // while allowing continuation merging in narrow tables (178).
+        let max_filled_for_merge = if header_filled >= 5 {
+            header_filled / 2
+        } else {
+            header_filled.saturating_sub(1)
+        };
+        let is_wrapped_continuation = cleaned.len() > 1
+            && filled_cells <= max_filled_for_merge
+            && prev_filled > filled_cells
+            && !looks_like_data_row
+            && !is_short_subheader;
+
+        let is_continuation = is_classic_continuation || is_wrapped_continuation;
 
         if is_continuation {
             // Merge with previous row
@@ -340,10 +360,10 @@ mod tests {
             item_indices: vec![],
         };
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Name"));
-        assert!(md.contains("| ---"));
-        assert!(md.contains("| Alice"));
-        assert!(md.contains("| Bob"));
+        assert!(md.contains("|Name|"));
+        assert!(md.contains("|---|"));
+        assert!(md.contains("|Alice|"));
+        assert!(md.contains("|Bob|"));
     }
 
     #[test]
@@ -355,8 +375,8 @@ mod tests {
             item_indices: vec![],
         };
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Only"));
-        assert!(md.contains("| ---"));
+        assert!(md.contains("|Only|"));
+        assert!(md.contains("|---|"));
     }
 
     #[test]

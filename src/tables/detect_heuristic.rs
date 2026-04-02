@@ -105,6 +105,7 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
                 is_bold: first_item.is_bold,
                 is_italic: first_item.is_italic,
                 item_type: first_item.item_type.clone(),
+                mcid: first_item.mcid,
             });
             index_map.push(indices);
 
@@ -178,6 +179,14 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             {
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
+                // Try to recover a label column from unclaimed items to the left
+                try_add_label_column(
+                    &mut table,
+                    &table_candidates,
+                    &claimed_indices,
+                    y_min,
+                    y_max,
+                );
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -203,17 +212,34 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             })
             .collect();
 
+        log::debug!(
+            "body-font pass: {} candidates (base={:.1}, range={:.1}..{:.1})",
+            body_candidates.len(),
+            base_font_size,
+            body_font_low,
+            body_font_high,
+        );
         if body_candidates.len() >= 9 {
             let regions = find_table_regions_strict(&body_candidates);
+            log::debug!("body-font: {} strict regions found", regions.len());
 
-            for (y_min, y_max, x_min, x_max) in regions {
+            for (y_min, y_max, _x_min, _x_max) in &regions {
+                // Use full X range for region items — the strict X bounds from
+                // qualifying rows can exclude continuation lines in wrapped cells.
+                // Y bounds from the region are sufficient to scope the table area.
                 let region_items: Vec<(usize, &TextItem)> = body_candidates
                     .iter()
-                    .filter(|(_, item)| {
-                        item.y >= y_min && item.y <= y_max && item.x >= x_min && item.x <= x_max
-                    })
+                    .filter(|(_, item)| item.y >= *y_min && item.y <= *y_max)
                     .cloned()
                     .collect();
+
+                log::debug!(
+                    "  region y={:.0}..{:.0}: {} items of {} candidates",
+                    y_min,
+                    y_max,
+                    region_items.len(),
+                    body_candidates.len()
+                );
 
                 if region_items.len() < 9 {
                     continue;
@@ -240,6 +266,12 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .collect();
         table.item_indices = original_indices.into_iter().collect();
         table.item_indices.sort_unstable();
+        log::debug!(
+            "  heuristic table: {}x{}, {} item indices",
+            table.rows.len(),
+            table.columns.len(),
+            table.item_indices.len()
+        );
     }
 
     tables
@@ -330,24 +362,43 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
             }
         }
 
-        if cluster_starts.len() >= 3 {
+        if cluster_starts.len() >= 2 {
             qualifying_rows.push((*y, cluster_starts));
         }
     }
 
+    log::debug!(
+        "find_table_regions_strict: {} row groups, {} qualifying (2+ X-clusters)",
+        row_groups.len(),
+        qualifying_rows.len()
+    );
     if qualifying_rows.len() < 3 {
         return vec![];
     }
 
-    // Step 3: Find contiguous runs of qualifying rows (25pt max Y-gap)
+    // Step 3: Find contiguous runs of qualifying rows.
+    // Use adaptive gap: median spacing × 3 (handles wrapped cells where
+    // qualifying rows are spaced further apart), with a floor of 25pt.
     qualifying_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let max_gap = if qualifying_rows.len() >= 3 {
+        let mut gaps: Vec<f32> = qualifying_rows
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0).abs())
+            .collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_gap = gaps[gaps.len() / 2];
+        (median_gap * 3.0).max(25.0)
+    } else {
+        25.0
+    };
 
     let mut candidate_regions: Vec<Vec<&(f32, Vec<f32>)>> = Vec::new();
     let mut current_region: Vec<&(f32, Vec<f32>)> = vec![&qualifying_rows[0]];
 
     for row in qualifying_rows.iter().skip(1) {
         let prev_y = current_region.last().unwrap().0;
-        if row.0 - prev_y > 25.0 {
+        if row.0 - prev_y > max_gap {
             if current_region.len() >= 3 {
                 candidate_regions.push(current_region);
             }
@@ -397,6 +448,11 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
         } else {
             0.0
         };
+        log::debug!(
+            "  candidate region: {} rows, avg alignment score={:.2}",
+            num_rows,
+            avg_score
+        );
         if avg_score >= 0.5 {
             let y_min = region_rows.first().unwrap().0;
             let y_max = region_rows.last().unwrap().0;
@@ -422,23 +478,34 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
 fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Option<Table> {
     // Find column boundaries
     let columns = find_column_boundaries(items, mode);
-    let min_cols = match mode {
-        TableDetectionMode::SmallFont => 2,
-        TableDetectionMode::BodyFont => 3,
-    };
+    let min_cols = 2;
     if columns.len() < min_cols || columns.len() > 25 {
+        log::debug!(
+            "  detect_table_in_region: rejected {} cols (need {}..25)",
+            columns.len(),
+            min_cols
+        );
         return None;
     }
 
     // Find row boundaries
     let rows = find_row_boundaries(items);
-    let min_rows = match mode {
-        TableDetectionMode::SmallFont => 2,
-        TableDetectionMode::BodyFont => 3,
-    };
+    let min_rows = 2;
     if rows.len() < min_rows {
+        log::debug!(
+            "  detect_table_in_region: rejected {} rows (need {}+)",
+            rows.len(),
+            min_rows
+        );
         return None;
     }
+
+    log::debug!(
+        "  detect_table_in_region: {} cols, {} rows, {} items",
+        columns.len(),
+        rows.len(),
+        items.len()
+    );
 
     // Verify this looks like a table: multiple items should align to columns
     let col_alignment = check_column_alignment(items, &columns, mode);
@@ -447,6 +514,13 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => 0.7,
     };
     if col_alignment < min_alignment {
+        log::debug!(
+            "  detect_table_in_region: rejected alignment {:.2} < {:.2} ({} cols, {} rows)",
+            col_alignment,
+            min_alignment,
+            columns.len(),
+            rows.len()
+        );
         return None;
     }
 
@@ -506,9 +580,16 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         cells.push(row_cells);
     }
 
-    // Validation 1: most rows should have content in first column
+    // Validation 1: some rows should have content in first column.
+    // Use a lower threshold (25%) for tables with wrapped cells where
+    // continuation lines leave the first column empty.
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
-    if rows_with_first_col < rows.len() / 2 {
+    if rows_with_first_col < rows.len() / 4 {
+        log::debug!(
+            "  validation 1 fail: {}/{} rows have first col",
+            rows_with_first_col,
+            rows.len()
+        );
         return None;
     }
 
@@ -522,6 +603,12 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         TableDetectionMode::BodyFont => (rows.len() / 2).max(1),  // 50%
     };
     if rows_with_multi_cols < multi_col_threshold {
+        log::debug!(
+            "  validation 2 fail: {}/{} rows multi-col (need {})",
+            rows_with_multi_cols,
+            rows.len(),
+            multi_col_threshold
+        );
         return None;
     }
 
@@ -540,36 +627,43 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         .map(|row| row.iter().filter(|c| !c.is_empty()).count())
         .sum();
     let avg_cells_per_row = total_filled as f32 / rows.len() as f32;
-    let min_avg_cells = match mode {
-        TableDetectionMode::SmallFont => 1.5,
-        TableDetectionMode::BodyFont => 2.5,
-    };
+    let min_avg_cells = 1.5;
     if avg_cells_per_row < min_avg_cells {
+        log::debug!(
+            "  validation 4 fail: avg_cells={:.1} < {:.1}",
+            avg_cells_per_row,
+            min_avg_cells
+        );
         return None;
     }
 
     // Validation 5: Check for key-value pair layout (NOT a table)
     if is_key_value_layout(&cells) {
+        log::debug!("  validation 5 fail: key-value layout");
         return None;
     }
 
     // Validation 6: Check column count consistency
     if !has_consistent_columns(&cells) {
+        log::debug!("  validation 6 fail: inconsistent columns");
         return None;
     }
 
     // Validation 7: Tables should have some numeric/data content
     if !has_table_like_content(&cells, mode) {
+        log::debug!("  validation 7 fail: no table-like content");
         return None;
     }
 
     // Validation 8: Check for Table of Contents pattern
     if is_table_of_contents(&cells) {
+        log::debug!("  validation 8 fail: table of contents");
         return None;
     }
 
     // Validation 9: Reject paragraph-like content falsely detected as tables
     if is_paragraph_content(&cells) {
+        log::debug!("  validation 9 fail: paragraph content");
         return None;
     }
 
@@ -706,9 +800,10 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
         TableDetectionMode::BodyFont => 0.3,
     };
 
-    // For SmallFont, bypass content check for wide tables (5+ columns may have text headers).
-    // For BodyFont, always require data-like content to prevent paragraph false positives.
-    pct_data > min_pct || (mode == TableDetectionMode::SmallFont && num_cols >= 5)
+    // Bypass content check for wide tables (3+ columns) — text-only tables
+    // (category lists, program descriptions) are legitimate if they passed
+    // all structural validations (alignment, consistency, not key-value).
+    pct_data > min_pct || num_cols >= 3
 }
 
 /// Check if a cell value looks like table data
@@ -794,12 +889,18 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
         return false;
     }
 
+    let num_cols = cells[0].len();
     let mut dot_cells = 0;
     let mut page_number_cells = 0;
     let mut total_cells = 0;
+    // Track which columns contain dots vs numbers to distinguish
+    // TOC (dots span middle, page number at end) from data tables
+    // (dots only in label column, many number columns).
+    let mut dot_cols = vec![0u32; num_cols];
+    let mut numeric_cols = vec![0u32; num_cols];
 
     for row in cells {
-        for cell in row {
+        for (ci, cell) in row.iter().enumerate() {
             let trimmed = cell.trim();
             if trimmed.is_empty() {
                 continue;
@@ -812,6 +913,9 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
             let is_mostly_dots = dot_count > trimmed.len() / 2 && dot_count >= 3;
             if is_mostly_dots {
                 dot_cells += 1;
+                if ci < num_cols {
+                    dot_cols[ci] += 1;
+                }
             }
 
             // Check for standalone page numbers (1-4 digits, possibly with spaces)
@@ -821,11 +925,25 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
                 && digits_only.chars().all(|c| c.is_ascii_digit())
             {
                 page_number_cells += 1;
+                if ci < num_cols {
+                    numeric_cols[ci] += 1;
+                }
             }
         }
     }
 
     if total_cells == 0 {
+        return false;
+    }
+
+    // Data tables with dot leaders (e.g. "1973....") have dots concentrated
+    // in one column (the label column) while many other columns contain numbers.
+    // True TOCs have dots spanning the middle and one page-number column at the end.
+    // If dots are confined to ≤1 column AND there are ≥3 columns with numbers,
+    // this is a data table, not a TOC.
+    let cols_with_dots = dot_cols.iter().filter(|&&c| c >= 2).count();
+    let cols_with_numbers = numeric_cols.iter().filter(|&&c| c >= 2).count();
+    if cols_with_dots <= 1 && cols_with_numbers >= 3 {
         return false;
     }
 
@@ -1071,4 +1189,197 @@ pub(crate) fn find_first_table_row(
     }
 
     (first_table_row, excluded_items)
+}
+
+/// Try to recover a label column for numeric-only tables.
+///
+/// Financial balance sheets often have text labels (row descriptions) to the
+/// left of numeric columns. The label X-positions vary due to indentation,
+/// so they don't form a consistent column cluster and are excluded from the
+/// initial table detection. This function finds unclaimed items at matching
+/// Y-positions to the left of the table and prepends them as column 0.
+fn try_add_label_column(
+    table: &mut Table,
+    all_candidates: &[(usize, &TextItem)],
+    claimed_indices: &std::collections::HashSet<usize>,
+    y_min: f32,
+    y_max: f32,
+) {
+    // Only apply to tables with 2-3 numeric columns and ≥5 rows
+    if table.columns.len() < 2 || table.columns.len() > 3 || table.rows.len() < 5 {
+        return;
+    }
+
+    // Check if the table is predominantly numeric (no text labels in any column)
+    let numeric_cells = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|cell| {
+            let text = cell.trim();
+            if text.is_empty() {
+                return false;
+            }
+            let data_chars = text
+                .chars()
+                .filter(|c| c.is_ascii_digit() || ",.-+%€$£¥()".contains(*c))
+                .count();
+            let total_chars = text.chars().count();
+            total_chars > 0 && data_chars as f32 / total_chars as f32 >= 0.6
+        })
+        .count();
+    let total_non_empty = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    if total_non_empty == 0 || (numeric_cells as f32 / total_non_empty as f32) < 0.7 {
+        return;
+    }
+
+    let table_x_min = table.columns.first().copied().unwrap_or(f32::MAX);
+    let y_tol = 5.0;
+
+    // For each table row, find unclaimed items to the left at the same Y
+    let mut label_items_per_row: Vec<Vec<(usize, &TextItem)>> = Vec::new();
+    let mut found_count = 0;
+    for &row_y in &table.rows {
+        let mut row_labels: Vec<(usize, &TextItem)> = all_candidates
+            .iter()
+            .filter(|(idx, item)| {
+                !claimed_indices.contains(idx)
+                    && !table.item_indices.contains(idx)
+                    && (item.y - row_y).abs() < y_tol
+                    && item.x < table_x_min - 10.0
+                    && item.y >= y_min
+                    && item.y <= y_max
+            })
+            .map(|(idx, item)| (*idx, *item))
+            .collect();
+        row_labels.sort_by(|a, b| {
+            a.1.x
+                .partial_cmp(&b.1.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !row_labels.is_empty() {
+            found_count += 1;
+        }
+        label_items_per_row.push(row_labels);
+    }
+
+    // Require labels for at least 40% of rows
+    if found_count < table.rows.len() * 2 / 5 {
+        return;
+    }
+
+    debug!(
+        "recovering label column: {}/{} rows have labels to the left",
+        found_count,
+        table.rows.len()
+    );
+
+    // Prepend label column
+    let label_col_x = label_items_per_row
+        .iter()
+        .flat_map(|items| items.iter().map(|(_, i)| i.x))
+        .fold(f32::INFINITY, f32::min);
+
+    table.columns.insert(0, label_col_x);
+    for (row_idx, row_labels) in label_items_per_row.iter().enumerate() {
+        let label_text = row_labels
+            .iter()
+            .map(|(_, item)| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.cells[row_idx].insert(0, label_text);
+        for (idx, _) in row_labels {
+            table.item_indices.push(*idx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_table_of_contents_rejects_toc() {
+        // TOC with separate dot-leader cells and page number cells
+        let cells = vec![
+            vec![
+                "Chapter 1".to_string(),
+                "....................".to_string(),
+                "1".to_string(),
+            ],
+            vec![
+                "Chapter 2".to_string(),
+                "....................".to_string(),
+                "15".to_string(),
+            ],
+            vec![
+                "Chapter 3".to_string(),
+                "....................".to_string(),
+                "42".to_string(),
+            ],
+            vec![
+                "Appendix".to_string(),
+                "....................".to_string(),
+                "100".to_string(),
+            ],
+        ];
+        assert!(is_table_of_contents(&cells));
+    }
+
+    #[test]
+    fn is_table_of_contents_allows_data_table_with_dot_leaders() {
+        // Simulates ERP appendix tables where the first column has year + dots
+        // (e.g. "1973..........") and other columns have numeric data.
+        let cells = vec![
+            vec![
+                "1973..........".to_string(),
+                "0.80".to_string(),
+                "1.08".to_string(),
+                "1.05".to_string(),
+                "0.02".to_string(),
+                "-0.28".to_string(),
+                "-0.33".to_string(),
+                "5.16".to_string(),
+            ],
+            vec![
+                "1974..........".to_string(),
+                "73".to_string(),
+                "56".to_string(),
+                "49".to_string(),
+                "08".to_string(),
+                "17".to_string(),
+                "17".to_string(),
+                "-.28".to_string(),
+            ],
+            vec![
+                "1975..........".to_string(),
+                "86".to_string(),
+                "-.05".to_string(),
+                "-.14".to_string(),
+                "09".to_string(),
+                "91".to_string(),
+                "85".to_string(),
+                "1.03".to_string(),
+            ],
+            vec![
+                "1976..........".to_string(),
+                "-1.05".to_string(),
+                "36".to_string(),
+                "34".to_string(),
+                "02".to_string(),
+                "-1.41".to_string(),
+                "-1.31".to_string(),
+                "4.01".to_string(),
+            ],
+        ];
+        assert!(
+            !is_table_of_contents(&cells),
+            "data table with dot-leader labels should not be rejected as TOC"
+        );
+    }
 }

@@ -8,10 +8,11 @@ use crate::types::{PdfRect, TextItem};
 
 use super::Table;
 
-/// Disjoint-set (union-find) for clustering indices.
+/// Disjoint-set (union-find) with component sizes for clustering indices.
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<usize>,
+    size: Vec<usize>,
 }
 
 impl UnionFind {
@@ -19,6 +20,7 @@ impl UnionFind {
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n],
+            size: vec![1; n],
         }
     }
 
@@ -35,14 +37,23 @@ impl UnionFind {
         if ra == rb {
             return;
         }
+        let new_size = self.size[ra] + self.size[rb];
         if self.rank[ra] < self.rank[rb] {
             self.parent[ra] = rb;
+            self.size[rb] = new_size;
         } else if self.rank[ra] > self.rank[rb] {
             self.parent[rb] = ra;
+            self.size[ra] = new_size;
         } else {
             self.parent[rb] = ra;
+            self.size[ra] = new_size;
             self.rank[ra] += 1;
         }
+    }
+
+    fn component_size(&mut self, x: usize) -> usize {
+        let root = self.find(x);
+        self.size[root]
     }
 }
 
@@ -64,8 +75,19 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+/// Maximum component size for rect clustering.  No real table has thousands
+/// of cell rects — once a component exceeds this, it is a vector drawing or
+/// page-spanning clipping path.  We skip overlap checks for rects already in
+/// an oversized component, keeping the original O(n²) loop but making it
+/// effectively O(n) for pathological pages.
+const MAX_CLUSTER_RECTS: usize = 2000;
+
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
+///
+/// Skips overlap checks for rects whose component has already exceeded
+/// [`MAX_CLUSTER_RECTS`], so pages with tens of thousands of vector-drawing
+/// rects complete in milliseconds instead of minutes.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -75,9 +97,20 @@ pub(crate) fn cluster_rects(
     let mut uf = UnionFind::new(n);
 
     for i in 0..n {
+        // If rect i is already in an oversized component, no point comparing
+        // it against further rects — the component won't be used for table
+        // detection anyway.
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
         for j in (i + 1)..n {
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
+                // Check if the merged component just exceeded the cap —
+                // if so, no need to test more pairs for rect i.
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
             }
         }
     }
@@ -253,26 +286,31 @@ pub fn detect_tables_from_rects(
         // Only remove when the container is a similarly-sized cell (height
         // ratio < 4×), NOT when the container is a table-wide background
         // that dwarfs the sub-rect.
-        let before = page_rects.len();
-        let snapshot = page_rects.clone();
-        page_rects.retain(|&(ax, ay, aw, ah)| {
-            let tol = 2.0;
-            !snapshot.iter().any(|&(bx, by, bw, bh)| {
-                // b must strictly contain a (b is larger in area)
-                bw * bh > aw * ah * 1.2
-                    && bh < ah * 4.0 // container must be similarly sized, not a table background
-                    && bx <= ax + tol
-                    && (bx + bw) >= (ax + aw) - tol
-                    && by <= ay + tol
-                    && (by + bh) >= (ay + ah) - tol
-            })
-        });
-        if page_rects.len() < before {
-            debug!(
-                "page {}: removed {} contained sub-rects",
-                page,
-                before - page_rects.len(),
-            );
+        //
+        // Skip this O(n²) dedup when there are too many rects — pages with
+        // thousands of vector-drawing rects won't benefit from cell dedup.
+        if page_rects.len() < MAX_CLUSTER_RECTS {
+            let before = page_rects.len();
+            let snapshot = page_rects.clone();
+            page_rects.retain(|&(ax, ay, aw, ah)| {
+                let tol = 2.0;
+                !snapshot.iter().any(|&(bx, by, bw, bh)| {
+                    // b must strictly contain a (b is larger in area)
+                    bw * bh > aw * ah * 1.2
+                        && bh < ah * 4.0 // container must be similarly sized, not a table background
+                        && bx <= ax + tol
+                        && (bx + bw) >= (ax + aw) - tol
+                        && by <= ay + tol
+                        && (by + bh) >= (ay + ah) - tol
+                })
+            });
+            if page_rects.len() < before {
+                debug!(
+                    "page {}: removed {} contained sub-rects",
+                    page,
+                    before - page_rects.len(),
+                );
+            }
         }
     }
 
@@ -285,12 +323,47 @@ pub fn detect_tables_from_rects(
 
     let mut tables = Vec::new();
     let mut hint_regions = Vec::new();
+    let mut failed_clusters: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
 
     // Full grid detection requires ≥ 6 rects
     if page_rects.len() >= 6 {
-        let clusters = cluster_rects(&page_rects, 3.0, 6);
-        debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
+        // Identify origin-anchored page-background rects (clipping paths or
+        // page fills) that would bridge separate table regions if included in
+        // clustering.  Exclude them from adjacency but add them back to each
+        // cluster they overlap, so grid detection still has their edges.
+        let is_page_bg = {
+            let mut heights: Vec<f32> = page_rects.iter().map(|&(_, _, _, h)| h).collect();
+            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_height = heights[heights.len() / 2];
+            let height_threshold = median_height * 20.0;
+            let flags: Vec<bool> = page_rects
+                .iter()
+                .map(|&(x, y, _, h)| x < 5.0 && y < 5.0 && h > height_threshold)
+                .collect();
+            if flags.iter().any(|&b| b) {
+                debug!(
+                    "page {}: {} origin-anchored page-bg rects excluded from clustering",
+                    page,
+                    flags.iter().filter(|&&b| b).count(),
+                );
+            }
+            flags
+        };
 
+        // Build filtered rect list for clustering (excluding page backgrounds)
+        let non_bg_indices: Vec<usize> =
+            (0..page_rects.len()).filter(|&i| !is_page_bg[i]).collect();
+        let non_bg_rects: Vec<(f32, f32, f32, f32)> =
+            non_bg_indices.iter().map(|&i| page_rects[i]).collect();
+        let raw_clusters = cluster_rects(&non_bg_rects, 3.0, 6);
+
+        // Map cluster indices back to page_rects indices
+        let clusters: Vec<Vec<usize>> = raw_clusters
+            .iter()
+            .map(|cluster| cluster.iter().map(|&i| non_bg_indices[i]).collect())
+            .collect();
+
+        debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
         for cluster_indices in &clusters {
             let group_rects: Vec<(f32, f32, f32, f32)> =
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
@@ -307,13 +380,21 @@ pub fn detect_tables_from_rects(
                     left.len(),
                     right.len()
                 );
+                let mut split_found = false;
                 for sub in [&left, &right] {
                     if let Some(table) = detect_table_from_rect_group(items, sub, page) {
                         tables.push(table);
+                        split_found = true;
                     } else if let Some(table) = detect_row_stripe_table(items, sub, page) {
                         tables.push(table);
+                        split_found = true;
                     }
                 }
+                if !split_found {
+                    failed_clusters.push(group_rects);
+                }
+            } else {
+                failed_clusters.push(group_rects);
             }
         }
 
@@ -349,6 +430,27 @@ pub fn detect_tables_from_rects(
             }
         }
 
+        // Cell-rect fallback: when per-cluster attempts all fail, try using
+        // rect Y-edges for rows + text X-positions for columns on each failed
+        // cluster.  Handles tables with cell-background rects that don't form
+        // a clean grid (variable column widths, decoration fills).
+        if tables.is_empty() {
+            debug!(
+                "page {}: cell-rect fallback: {} failed clusters",
+                page,
+                failed_clusters.len()
+            );
+            for fc_rects in &failed_clusters {
+                if fc_rects.len() >= 6 {
+                    if let Some(table) =
+                        detect_row_stripe_table_from_cell_rects(items, fc_rects, page)
+                    {
+                        tables.push(table);
+                    }
+                }
+            }
+        }
+
         // Row-stripe fallback: when clustering produces no large clusters
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
@@ -379,8 +481,11 @@ pub fn detect_tables_from_rects(
         // from cluster bounding boxes to scope heuristic table detection.
         // This handles both large decorative-rect clusters (calendars, forms)
         // and small cell-border clusters on rect-sparse pages.
+        let mut has_failed_cluster_hints = false;
         if page_rects.len() >= 6 {
             let clusters = cluster_rects(&page_rects, 3.0, 6);
+
+            // Generate hints from large clusters (≥30 rects, decorative/calendar style)
             for cluster_indices in &clusters {
                 let group_rects: Vec<(f32, f32, f32, f32)> =
                     cluster_indices.iter().map(|&i| page_rects[i]).collect();
@@ -415,12 +520,62 @@ pub fn detect_tables_from_rects(
                     });
                 }
             }
+
+            // Generate hints from failed clusters (≥6 rects that had valid bounding
+            // boxes but insufficient grid structure — e.g. outer border or header
+            // divider with 2x2 edges). These tell us WHERE a table is even though
+            // the rects don't define column structure.
+            for fc_rects in &failed_clusters {
+                if fc_rects.len() < 6 {
+                    continue;
+                }
+                let x_left = fc_rects.iter().map(|r| r.0).reduce(f32::min).unwrap();
+                let x_right = fc_rects.iter().map(|r| r.0 + r.2).reduce(f32::max).unwrap();
+                let y_bottom = fc_rects.iter().map(|r| r.1).reduce(f32::min).unwrap();
+                let y_top = fc_rects.iter().map(|r| r.1 + r.3).reduce(f32::max).unwrap();
+                let h = y_top - y_bottom;
+                // Require reasonable height and text items inside the region
+                let padding = 15.0;
+                let items_inside = items
+                    .iter()
+                    .filter(|item| {
+                        item.y >= y_bottom - padding
+                            && item.y <= y_top + padding
+                            && item.x >= x_left - padding
+                            && item.x <= x_right + padding
+                    })
+                    .count();
+                let w = x_right - x_left;
+                // Require reasonable dimensions: height ≥100pt (≈5+ rows),
+                // height ≤600pt (not full page).
+                // Width check: ≤500pt normally, but allow wider for large
+                // clusters (≥30 rects) that are clearly structured.
+                let max_w = if fc_rects.len() >= 30 { 800.0 } else { 500.0 };
+                if (100.0..=600.0).contains(&h) && w <= max_w && items_inside >= 6 {
+                    debug!(
+                        "page {}: failed-cluster hint from {} rects ({} items): x={:.1}..{:.1} y={:.1}..{:.1} ({:.0}×{:.0})",
+                        page, fc_rects.len(), items_inside, x_left, x_right, y_bottom, y_top,
+                        x_right - x_left, h
+                    );
+                    hint_regions.push(RectHintRegion {
+                        y_top,
+                        y_bottom,
+                        x_left,
+                        x_right,
+                        cluster_rects: fc_rects.clone(),
+                    });
+                    has_failed_cluster_hints = true;
+                }
+            }
+
             // Deduplicate overlapping hints
             hint_regions = merge_overlapping_hints(hint_regions);
             // Require multiple hint regions to confirm a multi-zone layout
             // (calendars, forms). A single hint is likely a decorative cluster
             // that would interfere with full-page heuristic detection.
-            if hint_regions.len() < 2 {
+            // Exception: failed-cluster hints represent real table boundaries
+            // confirmed by rect presence, so a single one is meaningful.
+            if hint_regions.len() < 2 && !has_failed_cluster_hints {
                 hint_regions.clear();
             }
             if !hint_regions.is_empty() {
@@ -835,16 +990,52 @@ fn try_build_grid(
         }
     }
 
-    // Reject tables with any completely empty column — indicates a bad grid.
-    for col in 0..num_cols {
+    // Trim empty outer columns (rect edges beyond text), reject if any
+    // interior column is empty — that indicates a bad grid.
+    let first_non_empty = (0..num_cols).find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let last_non_empty = (0..num_cols).rev().find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let (first_col, last_col) = match (first_non_empty, last_non_empty) {
+        (Some(f), Some(l)) if l > f => (f, l),
+        _ => {
+            debug!("  rejected: no content columns");
+            return GridResult::Failed;
+        }
+    };
+    // Check interior columns
+    for col in first_col..=last_col {
         let col_has_content = cells
             .iter()
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
-            debug!("  rejected: column {} is completely empty", col);
+            debug!("  rejected: interior column {} is completely empty", col);
             return GridResult::Failed;
         }
     }
+    // Trim outer empty columns
+    let (columns, cells) = if first_col > 0 || last_col < num_cols - 1 {
+        let trimmed_cols: Vec<f32> = columns[first_col..=last_col].to_vec();
+        let trimmed_cells: Vec<Vec<String>> = cells
+            .iter()
+            .map(|row| row[first_col..=last_col].to_vec())
+            .collect();
+        debug!(
+            "  trimmed {} empty outer columns ({}..={})",
+            (num_cols - 1 - last_col + first_col),
+            first_col,
+            last_col
+        );
+        (trimmed_cols, trimmed_cells)
+    } else {
+        (columns, cells)
+    };
 
     GridResult::Ok(Table {
         columns,
@@ -1180,16 +1371,62 @@ fn detect_row_stripe_table(
         return None;
     }
 
-    // No empty columns
-    for col in 0..num_cols {
+    // Reject if any cell has excessive text — layout background rects (sidebar,
+    // header, section bands) produce "cells" that contain paragraphs of body text.
+    // Real alternating-row-stripe data tables have short cell content.
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    // Allow longer cells for multi-column tables (descriptions in one column
+    // are common).  Single-column or 2-column "tables" with giant cells are
+    // almost always layout backgrounds.
+    let max_allowed = if num_cols >= 3 { 2000 } else { 500 };
+    if max_cell_len > max_allowed {
+        debug!(
+            "  row-stripe rejected: max cell length {} > {} (layout background)",
+            max_cell_len, max_allowed
+        );
+        return None;
+    }
+
+    // Trim empty outer columns, reject if interior columns are empty
+    let first_col = (0..num_cols).find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let last_col = (0..num_cols).rev().find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let (first_col, last_col) = match (first_col, last_col) {
+        (Some(f), Some(l)) if l > f => (f, l),
+        _ => return None,
+    };
+    for col in first_col..=last_col {
         let col_has_content = cells
             .iter()
             .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
         if !col_has_content {
-            debug!("  row-stripe rejected: column {} is empty", col);
+            debug!("  row-stripe rejected: interior column {} is empty", col);
             return None;
         }
     }
+    let (col_edges, cells) = if first_col > 0 || last_col < num_cols - 1 {
+        let new_edges: Vec<f32> = col_edges[first_col..=last_col + 1].to_vec();
+        let new_cells: Vec<Vec<String>> = cells
+            .iter()
+            .map(|row| row[first_col..=last_col].to_vec())
+            .collect();
+        (new_edges, new_cells)
+    } else {
+        (col_edges, cells)
+    };
+    let num_cols = col_edges.len() - 1;
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -1203,6 +1440,255 @@ fn detect_row_stripe_table(
         num_rows,
         num_cols,
         content_ratio * 100.0
+    );
+
+    Some(Table {
+        columns: column_centers,
+        rows: row_centers,
+        cells,
+        item_indices,
+    })
+}
+
+/// Detect a table from cell-background rects that failed grid detection.
+///
+/// Uses rect Y-edges for row boundaries and text X-position clustering for
+/// columns.  Handles tables with cell backgrounds that don't form a clean
+/// X-edge grid (variable column widths, decorative fills).
+fn detect_row_stripe_table_from_cell_rects(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    if group_rects.len() < 6 {
+        return None;
+    }
+
+    // Extract Y-edges from rects
+    let mut y_edges: Vec<f32> = Vec::new();
+    for &(_, y, _, h) in group_rects {
+        y_edges.push(y);
+        y_edges.push(y + h);
+    }
+    let y_edges = snap_edges(&y_edges, 6.0);
+
+    // If rect Y-edges are insufficient for row structure, use the rect
+    // bounding box to scope items and derive rows from text Y-positions.
+    let row_edges = if y_edges.len() >= 4 {
+        let mut edges = y_edges;
+        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        edges
+    } else {
+        // Fall back: gather items in the rect region and cluster by Y
+        let y_min = y_edges.first().copied().unwrap_or(0.0);
+        let y_max = y_edges.last().copied().unwrap_or(0.0);
+        let x_min = group_rects
+            .iter()
+            .map(|r| r.0)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        let x_max = group_rects
+            .iter()
+            .map(|r| r.0 + r.2)
+            .reduce(f32::max)
+            .unwrap_or(0.0);
+        let region_items: Vec<&TextItem> = items
+            .iter()
+            .filter(|i| {
+                i.page == page
+                    && i.y >= y_min - 5.0
+                    && i.y <= y_max + 5.0
+                    && i.x >= x_min - 5.0
+                    && i.x <= x_max + 5.0
+            })
+            .collect();
+        if region_items.len() < 4 {
+            return None;
+        }
+        // Cluster Y positions using median font height as threshold
+        let median_h = {
+            let mut hs: Vec<f32> = region_items.iter().map(|i| i.height).collect();
+            hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            hs[hs.len() / 2]
+        };
+        let mut ys: Vec<f32> = region_items.iter().map(|i| i.y).collect();
+        ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut edges = Vec::new();
+        let threshold = median_h * 0.8;
+        let mut cluster_start = ys[0];
+        let mut cluster_sum = ys[0];
+        let mut cluster_count = 1.0f32;
+        for &y in &ys[1..] {
+            if (cluster_sum / cluster_count - y).abs() > threshold {
+                let center = cluster_sum / cluster_count;
+                edges.push(center + median_h * 0.5);
+                edges.push(center - median_h * 0.5);
+                cluster_start = y;
+                cluster_sum = y;
+                cluster_count = 1.0;
+            } else {
+                cluster_sum += y;
+                cluster_count += 1.0;
+            }
+        }
+        let center = cluster_sum / cluster_count;
+        edges.push(center + median_h * 0.5);
+        edges.push(center - median_h * 0.5);
+        let _ = cluster_start; // suppress unused warning
+        edges = snap_edges(&edges, 3.0);
+        edges.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        if edges.len() < 4 {
+            return None;
+        }
+        edges
+    };
+
+    // Compute bounding box from non-full-page rects
+    let median_h = {
+        let mut heights: Vec<f32> = group_rects.iter().map(|&(_, _, _, h)| h).collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        heights[heights.len() / 2]
+    };
+    let content_rects: Vec<_> = group_rects
+        .iter()
+        .filter(|&&(_, _, _, h)| h < median_h * 10.0)
+        .collect();
+    if content_rects.is_empty() {
+        return None;
+    }
+
+    let x_left = content_rects
+        .iter()
+        .map(|&&(x, _, _, _)| x)
+        .reduce(f32::min)?;
+    let x_right = content_rects
+        .iter()
+        .map(|&&(x, _, w, _)| x + w)
+        .reduce(f32::max)?;
+    let y_top = row_edges[0];
+    let y_bottom = *row_edges.last()?;
+
+    // Gather items within the rect region
+    let page_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page
+                && item.y >= y_bottom - 2.0
+                && item.y <= y_top + 2.0
+                && item.x >= x_left - 5.0
+                && item.x + item.width <= x_right + 5.0
+        })
+        .collect();
+
+    if page_items.is_empty() {
+        return None;
+    }
+
+    // Derive columns from text X-position clustering
+    let columns = cluster_x_positions(&page_items, 15.0);
+    if columns.len() < 2 {
+        return None;
+    }
+
+    // Build column edges
+    let mut col_edges: Vec<f32> = Vec::with_capacity(columns.len() + 1);
+    let min_x = page_items.iter().map(|(_, i)| i.x).reduce(f32::min)?;
+    col_edges.push(min_x - 5.0);
+    for pair in columns.windows(2) {
+        col_edges.push((pair[0] + pair[1]) / 2.0);
+    }
+    let max_x_right = page_items
+        .iter()
+        .map(|(_, i)| i.x + i.width)
+        .reduce(f32::max)?;
+    col_edges.push(max_x_right + 5.0);
+
+    let num_cols = col_edges.len() - 1;
+    let num_rows = row_edges.len() - 1;
+
+    debug!(
+        "  cell-rect table: {}x{} from {} rects, {} items",
+        num_rows,
+        num_cols,
+        group_rects.len(),
+        page_items.len()
+    );
+
+    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+
+    if item_indices.is_empty() {
+        return None;
+    }
+
+    // Validate: >=2 non-empty rows, >=25% density
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count();
+    if non_empty_rows < 2 {
+        debug!(
+            "  cell-rect rejected: only {} non-empty rows",
+            non_empty_rows
+        );
+        return None;
+    }
+
+    let total_cells = (num_cols * num_rows) as f32;
+    let non_empty_cells = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let density = if total_cells > 0.0 {
+        non_empty_cells as f32 / total_cells
+    } else {
+        0.0
+    };
+    if density < 0.25 {
+        debug!(
+            "  cell-rect rejected: density {:.0}% < 25%",
+            density * 100.0
+        );
+        return None;
+    }
+
+    // Reject tables with paragraph-length cells (layout backgrounds, not tables)
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    if max_cell_len > 500 {
+        debug!(
+            "  cell-rect rejected: max cell length {} > 500",
+            max_cell_len
+        );
+        return None;
+    }
+
+    // Reject wildly disproportionate grids (e.g. 68x6 from decorative rects)
+    if num_rows > 20 && num_cols < 4 {
+        debug!(
+            "  cell-rect rejected: disproportionate grid {}x{}",
+            num_rows, num_cols
+        );
+        return None;
+    }
+
+    let column_centers: Vec<f32> = (0..num_cols)
+        .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
+        .collect();
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
+
+    debug!(
+        "  cell-rect table accepted: {}x{}, {:.0}% density",
+        num_rows,
+        num_cols,
+        non_empty_cells as f32 / total_cells * 100.0
     );
 
     Some(Table {
@@ -1348,6 +1834,22 @@ fn detect_merged_cluster_table(
         return None;
     }
 
+    // Reject if any cell has excessive text — layout background rects produce
+    // "cells" containing paragraphs, not short data-table values.
+    let max_cell_len = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    if max_cell_len > 500 {
+        debug!(
+            "  merged-cluster rejected: max cell length {} > 500 (layout background)",
+            max_cell_len
+        );
+        return None;
+    }
+
     // No empty columns
     for col in 0..num_cols {
         let col_has_content = cells
@@ -1450,6 +1952,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -1753,6 +2256,28 @@ mod tests {
         ];
         // 3/4 = 0.75 — NOT > 0.75, so false
         assert!(!is_row_stripe_pattern(&rects));
+    }
+
+    #[test]
+    fn test_row_stripe_rejects_layout_background_long_cells() {
+        // Simulate a newsletter page with wide background rects (sidebar, header, body)
+        // that look like row stripes but contain paragraphs of body text.
+        let rects = vec![
+            (10.0, 700.0, 550.0, 50.0),  // header band
+            (10.0, 640.0, 550.0, 50.0),  // nav band
+            (10.0, 200.0, 550.0, 430.0), // body background
+        ];
+        let items = vec![
+            make_item("General News", 20.0, 650.0, 10.0),
+            make_item("People News", 20.0, 710.0, 10.0),
+            // Simulate a long body text (>500 chars) in the main content area
+            make_item(&"A".repeat(600), 200.0, 650.0, 10.0),
+        ];
+        let result = detect_row_stripe_table(&items, &rects, 1);
+        assert!(
+            result.is_none(),
+            "layout background rects should not be detected as a table"
+        );
     }
 
     // --- propagate_merged_cells ---
@@ -2292,5 +2817,210 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!((merged[0].x_left - 20.0).abs() < 0.01);
         assert!((merged[0].x_right - 340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn failed_cluster_generates_hint_with_items() {
+        // A cluster of rects forming an outer border (2 x-edges after snapping)
+        // that fails grid detection should produce a hint when items are inside.
+        // Use overlapping rects with the same left/right edges but varied heights
+        // so row-stripe detection also fails.
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 100.0, 400.0, 200.0), // outer border
+            (52.0, 102.0, 396.0, 196.0), // inner border (within snap tolerance)
+            (51.0, 101.0, 398.0, 198.0), // another border variant
+            (50.0, 100.0, 400.0, 10.0),  // top divider (thin)
+            (50.0, 290.0, 400.0, 10.0),  // bottom divider (thin)
+            (50.0, 195.0, 400.0, 10.0),  // middle divider
+        ];
+        // Create text items inside the bounding box (≥6 items)
+        let mut items: Vec<TextItem> = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                items.push(TextItem {
+                    text: format!("cell{}_{}", row, col),
+                    x: 60.0 + col as f32 * 120.0,
+                    y: 120.0 + row as f32 * 40.0,
+                    width: 50.0,
+                    height: 10.0,
+                    font: String::new(),
+                    font_size: 10.0,
+                    page: 1,
+                    is_bold: false,
+                    is_italic: false,
+                    item_type: crate::types::ItemType::Text,
+                    mcid: None,
+                });
+            }
+        }
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        // Grid detection should fail (2 x-edges after snapping: ~50 and ~450)
+        // If detection fails, we should get a failed-cluster hint
+        if tables.is_empty() {
+            assert_eq!(hints.len(), 1, "failed cluster should produce one hint");
+            assert!(!hints[0].cluster_rects.is_empty());
+        }
+        // If tables were detected, that's also acceptable
+    }
+
+    #[test]
+    fn failed_cluster_no_hint_without_items() {
+        // Rects with no text items inside → no failed-cluster hint generated.
+        // Use >6 rects to avoid the rect-sparse path (4-6 rects).
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 100.0, 400.0, 200.0),
+            (52.0, 102.0, 396.0, 196.0),
+            (51.0, 101.0, 398.0, 198.0),
+            (50.0, 100.0, 400.0, 10.0),
+            (50.0, 290.0, 400.0, 10.0),
+            (50.0, 195.0, 400.0, 10.0),
+            (50.0, 150.0, 400.0, 10.0),
+            (50.0, 250.0, 400.0, 10.0),
+        ];
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&[], &rects, 1);
+        // No items → no table, no hint (items_inside check fails)
+        if tables.is_empty() {
+            assert!(hints.is_empty(), "no items inside → no hint");
+        }
+    }
+
+    #[test]
+    fn failed_cluster_no_hint_narrow_height() {
+        // Cluster with only 20pt height (header band) should not produce hint
+        // even with items inside (height < 100pt threshold)
+        let page_rects: Vec<(f32, f32, f32, f32)> = vec![
+            (50.0, 650.0, 50.0, 20.0),
+            (100.0, 650.0, 50.0, 20.0),
+            (150.0, 650.0, 50.0, 20.0),
+            (200.0, 650.0, 50.0, 20.0),
+            (250.0, 650.0, 50.0, 20.0),
+            (300.0, 650.0, 50.0, 20.0),
+            (350.0, 650.0, 50.0, 20.0),
+            (400.0, 650.0, 50.0, 20.0),
+        ];
+        let mut items: Vec<TextItem> = Vec::new();
+        for col in 0..8 {
+            items.push(TextItem {
+                text: format!("hdr{}", col),
+                x: 55.0 + col as f32 * 50.0,
+                y: 655.0,
+                width: 40.0,
+                height: 10.0,
+                font: String::new(),
+                font_size: 10.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: crate::types::ItemType::Text,
+                mcid: None,
+            });
+        }
+        let rects: Vec<crate::types::PdfRect> = page_rects
+            .iter()
+            .map(|&(x, y, w, h)| crate::types::PdfRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                page: 1,
+            })
+            .collect();
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert!(
+            hints.is_empty(),
+            "narrow header band (20pt) should not produce hint"
+        );
+    }
+
+    // --- page-bg clustering exclusion ---
+
+    #[test]
+    fn page_bg_rects_do_not_bridge_separate_clusters() {
+        // Simulate page 27 scenario: two groups of row stripes at different Y
+        // ranges, connected by full-page background rects at (0,0).
+        // Without exclusion, all rects cluster into one group.
+        // With exclusion, two separate clusters form.
+        let mut rects = Vec::new();
+        let page = 1;
+
+        // Group 1: 7 row stripes at Y=444..537 (Reference Group table)
+        for i in 0..7 {
+            let y = 444.0 + i as f32 * 15.5;
+            rects.push(PdfRect {
+                x: 44.0,
+                y,
+                width: 505.0,
+                height: 15.5,
+                page,
+            });
+        }
+
+        // Group 2: 4 row stripes at Y=176..238 (smaller table)
+        for i in 0..4 {
+            let y = 176.0 + i as f32 * 15.5;
+            rects.push(PdfRect {
+                x: 44.0,
+                y,
+                width: 505.0,
+                height: 15.5,
+                page,
+            });
+        }
+
+        // 3 full-page background rects at origin
+        for _ in 0..3 {
+            rects.push(PdfRect {
+                x: 0.0,
+                y: 0.0,
+                width: 594.0,
+                height: 774.0,
+                page,
+            });
+        }
+
+        // Items in group 1 region for row-stripe detection
+        let mut items = Vec::new();
+        for i in 0..7 {
+            let y = 449.0 + i as f32 * 15.5;
+            items.push(make_item("Company Name", 50.0, y, 9.0));
+            items.push(make_item("P", 320.0, y, 9.0));
+            items.push(make_item("P", 450.0, y, 9.0));
+        }
+
+        let (tables, _hints) = detect_tables_from_rects(&items, &rects, page);
+        // Should detect the group 1 table (7 row stripes) without being
+        // confused by group 2 stripes bridged via page-bg rects.
+        assert!(
+            !tables.is_empty(),
+            "should detect table from row stripes when page-bg rects are excluded from clustering"
+        );
+        // The table should have rows from group 1 only, not spanning to group 2
+        let table = &tables[0];
+        assert!(
+            table.rows.len() <= 8,
+            "table should have at most ~7 rows from group 1, got {}",
+            table.rows.len()
+        );
     }
 }

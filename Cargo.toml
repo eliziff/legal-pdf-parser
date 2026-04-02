@@ -17,7 +17,7 @@ crate-type = ["lib", "cdylib"]
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 # PDF parsing
-lopdf = { git = "https://github.com/firecrawl/lopdf", branch = "firecrawl/zlib-checksum-encrypted", features = ["rayon"] }
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "052674053814a9f4897af94f0b8e46a545c9b329", features = ["rayon"] }
 
 # Error handling
 thiserror = "2.0"
@@ -32,6 +32,7 @@ env_logger = "0.11"
 # Text processing
 regex = "1.10"
 once_cell = "1.19"
+unicode-normalization = "0.1"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"

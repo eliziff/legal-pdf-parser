@@ -144,7 +144,7 @@ pub fn detect_pdf_type_mem_with_config(
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
         Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_password(buffer, "")?
+            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
         }
         Err(e) => return Err(e.into()),
     };
@@ -197,11 +197,13 @@ pub(crate) fn detect_from_document(
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} path_ops={} vector_text={} image_area={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
-                analysis.unique_text_chars, analysis.path_op_count, analysis.has_vector_text,
-                analysis.total_image_area
+                analysis.unique_text_chars, analysis.unique_alphanum_chars,
+                analysis.path_op_count, analysis.has_vector_text,
+                analysis.total_image_area, analysis.has_identity_h_no_tounicode,
+                analysis.has_only_type3_fonts, analysis.font_change_count
             );
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
@@ -214,6 +216,7 @@ pub(crate) fn detect_from_document(
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
+                && !analysis.has_only_type3_fonts
             {
                 pages_with_text += 1;
             }
@@ -265,9 +268,8 @@ pub(crate) fn detect_from_document(
 
     // Classification logic
     let (pdf_type, confidence) = if has_template_images && pages_with_text > 0 {
-        // Template-based PDF: has text but images provide essential context
-        // Classify as Mixed with lower confidence
         ocr_recommended = true;
+        // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
     } else if text_ratio >= config.text_page_ratio_threshold {
         ocr_recommended = false;
@@ -291,8 +293,51 @@ pub(crate) fn detect_from_document(
         (PdfType::TextBased, text_ratio.max(0.5))
     };
 
+    // Phase 1b: Newspaper-style layout detection.
+    // Dense multi-column newspapers (WSJ, NYT) have extractable text but produce
+    // poor output due to complex interleaved article layouts. Detect via consistently
+    // high text density combined with moderate font switches and a low Tf/Tj ratio.
+    //
+    // The Tf/Tj ratio distinguishes newspapers from styled legal/business documents:
+    // - Newspapers: ratio 0.02-0.06 (dense prose with occasional font switches)
+    // - Rich-styled docs (DPA, contracts): ratio 0.25-0.35 (per-character styling)
+    //
+    // Thresholds calibrated against:
+    // - WSJ 50-page newspaper: text_ops 1500-3800, font_changes 50-194, ratio 0.02-0.06
+    // - DPA/contracts: text_ops 1300-2260, font_changes 327-630, ratio 0.25-0.32
+    // - SEC filings: text_ops 1-1800, font_changes 1-65 (only 1-2 dense pages)
+    // - Normal docs: text_ops < 700, font_changes < 55
+    let ocr_recommended = if pdf_type == PdfType::TextBased && pages_sampled >= 3 {
+        let mut newspaper_pages = 0u32;
+        for analysis in analysis_cache.values() {
+            let ratio = if analysis.text_operator_count > 0 {
+                analysis.font_change_count as f32 / analysis.text_operator_count as f32
+            } else {
+                1.0
+            };
+            if analysis.text_operator_count >= 1500
+                && analysis.font_change_count >= 50
+                && ratio < 0.15
+            {
+                newspaper_pages += 1;
+            }
+        }
+        let newspaper_ratio = newspaper_pages as f32 / pages_sampled as f32;
+        if newspaper_ratio >= 0.5 {
+            log::debug!(
+                "newspaper layout detected: {}/{} pages with high text_ops + font_changes → OCR recommended",
+                newspaper_pages, pages_sampled
+            );
+            true
+        } else {
+            ocr_recommended
+        }
+    } else {
+        ocr_recommended
+    };
+
     // Phase 2: Build per-page OCR list
-    let pages_needing_ocr = match pdf_type {
+    let mut pages_needing_ocr = match pdf_type {
         PdfType::TextBased => Vec::new(),
         PdfType::Scanned | PdfType::ImageBased => (1..=total_pages).collect(),
         PdfType::Mixed => {
@@ -318,6 +363,34 @@ pub(crate) fn detect_from_document(
             ocr_pages
         }
     };
+
+    // Phase 3: Flag pages with undecodable fonts for OCR.
+    // - Identity-H/V without ToUnicode: raw CID values can't map to Unicode
+    // - Type3-only without ToUnicode: glyph bitmaps can't map to Unicode
+    for (&page_num, analysis) in &analysis_cache {
+        if (analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts)
+            && !pages_needing_ocr.contains(&page_num)
+        {
+            pages_needing_ocr.push(page_num);
+        }
+    }
+    // Check uncached pages too (when not all pages were sampled)
+    if pages_needing_ocr.len() < total_pages as usize {
+        for page_num in 1..=total_pages {
+            if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
+                continue;
+            }
+            if let Some(&page_id) = pages.get(&page_num) {
+                if page_has_identity_h_no_tounicode(doc, page_id)
+                    || page_has_only_type3_fonts(doc, page_id)
+                {
+                    pages_needing_ocr.push(page_num);
+                }
+            }
+        }
+    }
+    pages_needing_ocr.sort();
+    pages_needing_ocr.dedup();
 
     // Try to get title from metadata
     let title = get_document_title(doc);
@@ -383,11 +456,22 @@ struct PageAnalysis {
     image_count: u32,
     /// Number of unique non-whitespace text characters found in string operands
     unique_text_chars: u32,
+    /// Number of unique ASCII alphanumeric bytes (letters + digits) in string operands
+    unique_alphanum_chars: u32,
     /// Number of path construction/painting ops (m, l, c, h, f, re, etc.)
     #[allow(dead_code)]
     path_op_count: u32,
     /// Whether the page has vector-outlined text (massive path ops, minimal text ops)
     has_vector_text: bool,
+    /// Whether the page has Type0 fonts with Identity-H/V encoding but no ToUnicode CMap.
+    /// These fonts produce garbage text because CID values can't be mapped to Unicode.
+    has_identity_h_no_tounicode: bool,
+    /// Whether the page uses only Type3 fonts (no normal text fonts).
+    /// Type3 fonts render each glyph as a custom drawing/bitmap — without a
+    /// ToUnicode CMap, the character codes can't be mapped to Unicode.
+    has_only_type3_fonts: bool,
+    /// Number of Tf (set font) operators — high count indicates many font switches
+    font_change_count: u32,
 }
 
 /// Analyze a page's content stream for text operators and images
@@ -396,6 +480,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut has_images = false;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
 
     // Get content streams for this page
@@ -409,12 +494,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 Err(_) => stream.content.clone(),
             };
 
-            // Scan for text operators (Tj, TJ), image operators (Do), and path ops
-            let (ops, imgs, paths) =
+            // Scan for text operators (Tj, TJ), font changes (Tf), image operators (Do), and path ops
+            let (ops, imgs, paths, fonts) =
                 scan_content_for_text_operators(&content, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
+            font_changes += fonts;
             has_images = has_images || imgs > 0;
         }
     }
@@ -423,20 +509,22 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
-            let (ops, imgs, paths) =
+            let (ops, imgs, paths, fonts) =
                 scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
+            font_changes += fonts;
             has_images = has_images || imgs > 0;
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                let (ops, imgs, paths) =
+                let (ops, imgs, paths, fonts) =
                     scan_xobjects_in_resources(doc, resources, &mut visited, &mut all_unique_chars);
                 text_ops += ops;
                 image_count += imgs;
                 path_ops += paths;
+                font_changes += fonts;
                 has_images = has_images || imgs > 0;
             }
         }
@@ -454,6 +542,18 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // outlined text produces thousands of path ops.
     let has_vector_text = path_ops >= 1000 && path_ops > text_ops.saturating_mul(200);
 
+    let unique_alphanum_chars = all_unique_chars
+        .iter()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .count() as u32;
+
+    // Check for Identity-H/V fonts without ToUnicode — these produce garbage text
+    let has_identity_h_no_tounicode =
+        text_ops > 0 && page_has_identity_h_no_tounicode(doc, page_id);
+
+    // Check for Type3-only fonts — glyph bitmaps without Unicode mapping
+    let has_only_type3_fonts = text_ops > 0 && page_has_only_type3_fonts(doc, page_id);
+
     PageAnalysis {
         text_operator_count: text_ops,
         has_images,
@@ -461,9 +561,89 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
+        unique_alphanum_chars,
         path_op_count: path_ops,
         has_vector_text,
+        has_identity_h_no_tounicode,
+        has_only_type3_fonts,
+        font_change_count: font_changes,
     }
+}
+
+/// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
+/// These fonts encode text as raw CID values that can't be mapped to Unicode without
+/// a ToUnicode CMap, producing garbage output for non-Latin scripts (e.g. Cyrillic).
+fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    for font_dict in fonts.values() {
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        if subtype != Some(b"Type0") {
+            continue;
+        }
+        let encoding = font_dict
+            .get(b"Encoding")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        let is_identity = matches!(encoding, Some(b"Identity-H") | Some(b"Identity-V"));
+        if !is_identity {
+            continue;
+        }
+        // Has ToUnicode? Then the font is decodable.
+        if font_dict.get(b"ToUnicode").is_ok() {
+            continue;
+        }
+        // Identity-H/V without ToUnicode — flag it
+        log::debug!(
+            "page has Identity-H/V font without ToUnicode: {:?}",
+            font_dict
+                .get(b"BaseFont")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).to_string())
+        );
+        return true;
+    }
+    false
+}
+
+/// Returns true if every font on the page is Type3 (no normal text fonts).
+/// Type3 fonts render glyphs as custom drawings/bitmaps. Without a ToUnicode
+/// CMap, character codes can't be mapped to Unicode — the page needs OCR.
+fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if fonts.is_empty() {
+        return false;
+    }
+    let mut has_type3 = false;
+    for font_dict in fonts.values() {
+        let subtype = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        if subtype == Some(b"Type3") {
+            // Type3 with a ToUnicode CMap can still produce usable text
+            if font_dict.get(b"ToUnicode").is_ok() {
+                return false;
+            }
+            has_type3 = true;
+        } else {
+            // Has a non-Type3 font — page has real text fonts
+            return false;
+        }
+    }
+    if has_type3 {
+        log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
+    }
+    has_type3
 }
 
 fn scan_xobjects_in_resources(
@@ -471,10 +651,11 @@ fn scan_xobjects_in_resources(
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
     unique_chars: &mut HashSet<u8>,
-) -> (u32, u32, u32) {
+) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -503,22 +684,24 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    let (ops, imgs, paths) =
+                    let (ops, imgs, paths, fonts) =
                         scan_content_for_text_operators(&content, unique_chars);
                     text_ops += ops;
                     image_count += imgs;
                     path_ops += paths;
+                    font_changes += fonts;
                     if let Some(res) = stream
                         .dict
                         .get(b"Resources")
                         .ok()
                         .and_then(|o| o.as_dict().ok())
                     {
-                        let (ops2, imgs2, paths2) =
+                        let (ops2, imgs2, paths2, fonts2) =
                             scan_xobjects_in_resources(doc, res, visited, unique_chars);
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
+                        font_changes += fonts2;
                     }
                 }
                 Some(b"Image") => {
@@ -529,7 +712,7 @@ fn scan_xobjects_in_resources(
         }
     }
 
-    (text_ops, image_count, path_ops)
+    (text_ops, image_count, path_ops, font_changes)
 }
 
 /// Fast scan of content stream bytes for text operators
@@ -540,15 +723,16 @@ fn scan_xobjects_in_resources(
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
 ///
-/// Returns (text_op_count, image_count, path_op_count).
+/// Returns (text_op_count, image_count, path_op_count, font_change_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
 fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
-) -> (u32, u32, u32) {
+) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
+    let mut font_changes = 0u32;
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
@@ -561,7 +745,7 @@ fn scan_content_for_text_operators(
     while i < content.len() {
         let b = content[i];
 
-        // Look for 'T' followed by 'j' or 'J'
+        // Look for 'T' followed by 'j', 'J', or 'f'
         if b == b'T' && i + 1 < content.len() {
             let next = content[i + 1];
             if next == b'j' || next == b'J' {
@@ -574,6 +758,15 @@ fn scan_content_for_text_operators(
                     text_ops += 1;
                     // Scan backward for text string operand to collect unique chars
                     collect_text_chars_before(content, i, unique_chars);
+                }
+            } else if next == b'f' {
+                // Tf = set font operator
+                if i + 2 >= content.len()
+                    || content[i + 2].is_ascii_whitespace()
+                    || content[i + 2] == b'\n'
+                    || content[i + 2] == b'\r'
+                {
+                    font_changes += 1;
                 }
             }
         }
@@ -619,7 +812,7 @@ fn scan_content_for_text_operators(
         i += 1;
     }
 
-    (text_ops, image_count, path_ops)
+    (text_ops, image_count, path_ops, font_changes)
 }
 
 /// Scan backward from a Tj/TJ operator to find the preceding string operand
@@ -798,7 +991,56 @@ fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u64, bool) {
                 TEMPLATE_IMAGE_THRESHOLD,
                 &mut visited,
             );
+
+            // Also check Pattern resources: tiling patterns can contain
+            // XObject images (e.g., screenshots pasted into PDFs via
+            // Chrome "Save as PDF").
+            if let Ok(pattern_obj) = resources.get(b"Pattern") {
+                let pattern_dict = match pattern_obj {
+                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                    Object::Dictionary(dict) => Some(dict),
+                    _ => None,
+                };
+                if let Some(pattern_dict) = pattern_dict {
+                    for (_, value) in pattern_dict.iter() {
+                        let pat_ref = match value.as_reference() {
+                            Ok(r) => r,
+                            _ => continue,
+                        };
+                        if !visited.insert(pat_ref) {
+                            continue;
+                        }
+                        if let Ok(Object::Stream(stream)) = doc.get_object(pat_ref) {
+                            if let Ok(pat_resources) = stream.dict.get(b"Resources") {
+                                let pat_res_dict = match pat_resources {
+                                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                                    Object::Dictionary(dict) => Some(dict),
+                                    _ => None,
+                                };
+                                if let Some(pat_res) = pat_res_dict {
+                                    collect_images_from_resources(
+                                        doc,
+                                        pat_res,
+                                        &mut has_images,
+                                        &mut total_area,
+                                        &mut has_template_image,
+                                        TEMPLATE_IMAGE_THRESHOLD,
+                                        &mut visited,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    // Tiled scans: many small image tiles (e.g., JBIG2 strips) that together
+    // cover the full page. No individual tile triggers the template threshold,
+    // but the aggregate area clearly indicates a scanned/image-backed page.
+    if !has_template_image && total_area >= TEMPLATE_IMAGE_THRESHOLD * 4 {
+        has_template_image = true;
     }
 
     (has_images, total_area, has_template_image)
@@ -929,7 +1171,7 @@ mod tests {
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
-        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
@@ -938,7 +1180,7 @@ mod tests {
         // Content with TJ array
         uchars.clear();
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
-        let (ops2, _, _) = scan_content_for_text_operators(content2, &mut uchars);
+        let (ops2, _, _, _) = scan_content_for_text_operators(content2, &mut uchars);
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
         assert!(uchars.len() >= 4);
@@ -946,7 +1188,7 @@ mod tests {
         // Content with Do (image)
         uchars.clear();
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
-        let (ops3, imgs3, _) = scan_content_for_text_operators(content3, &mut uchars);
+        let (ops3, imgs3, _, _) = scan_content_for_text_operators(content3, &mut uchars);
         assert_eq!(ops3, 0);
         assert_eq!(imgs3, 1);
     }
@@ -965,7 +1207,7 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
         let mut uchars = HashSet::new();
-        let (ops, imgs, _) = scan_content_for_text_operators(&content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(ops, 3);
         assert_eq!(imgs, 50);
         // Only 'x' unique char
@@ -983,7 +1225,7 @@ mod tests {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
         let mut uchars = HashSet::new();
-        let (ops, imgs, _) = scan_content_for_text_operators(content, &mut uchars);
+        let (ops, imgs, _, _) = scan_content_for_text_operators(content, &mut uchars);
         assert_eq!(ops, 1);
         assert_eq!(imgs, 2);
         // Many unique chars from the sentence
@@ -1006,7 +1248,7 @@ mod tests {
         content.extend_from_slice(b"f\n");
 
         let mut uchars = HashSet::new();
-        let (text, imgs, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, imgs, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(text, 1);
         assert_eq!(imgs, 0);
         // 500 * (m + l + c + h) + 1 f = 2001
@@ -1031,7 +1273,7 @@ mod tests {
         }
 
         let mut uchars = HashSet::new();
-        let (text, _, paths) = scan_content_for_text_operators(&content, &mut uchars);
+        let (text, _, paths, _) = scan_content_for_text_operators(&content, &mut uchars);
         assert_eq!(text, 20);
         assert!(paths >= 40, "expected >= 40 path ops, got {paths}");
 
@@ -1073,5 +1315,117 @@ mod tests {
             result.pages_needing_ocr
         );
         assert!(result.ocr_recommended);
+    }
+
+    #[test]
+    fn test_page_has_identity_h_no_tounicode_positive() {
+        // Build a minimal PDF with a Type0 Identity-H font and no ToUnicode.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+ArialMT".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(page_has_identity_h_no_tounicode(&doc, page_id));
+    }
+
+    #[test]
+    fn test_page_has_identity_h_with_tounicode_negative() {
+        // Type0 Identity-H font WITH ToUnicode — should NOT flag.
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let cmap_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {},
+            b"fake cmap".to_vec(),
+        )));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type0".to_vec()),
+            "BaseFont" => Object::Name(b"ABCDEF+ArialMT".to_vec()),
+            "Encoding" => Object::Name(b"Identity-H".to_vec()),
+            "ToUnicode" => Object::Reference(cmap_id),
+        });
+        let resources = dictionary! {
+            "Font" => dictionary! {
+                "F1" => Object::Reference(font_id),
+            },
+        };
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "Resources" => resources,
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        assert!(!page_has_identity_h_no_tounicode(&doc, page_id));
+    }
+
+    #[test]
+    fn test_scan_content_counts_tf_operators() {
+        let mut uchars = HashSet::new();
+        let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
+        let (ops, _, _, fonts) = scan_content_for_text_operators(content, &mut uchars);
+        assert_eq!(ops, 2);
+        assert_eq!(fonts, 2);
+    }
+
+    #[test]
+    fn test_newspaper_heuristic_thresholds() {
+        // Newspaper page: high text ops, moderate font changes, low ratio
+        let text_ops = 3500u32;
+        let font_changes = 150u32;
+        let ratio = font_changes as f32 / text_ops as f32;
+        assert!(text_ops >= 1500);
+        assert!(font_changes >= 50);
+        assert!(ratio < 0.15); // 0.043
+
+        // Dense styled doc (DPA/contract): high text ops, very high font changes, high ratio
+        let text_ops = 1800u32;
+        let font_changes = 540u32;
+        let ratio = font_changes as f32 / text_ops as f32;
+        assert!(text_ops >= 1500);
+        assert!(font_changes >= 50);
+        assert!(ratio >= 0.15); // 0.30 — should NOT trigger newspaper heuristic
+
+        // Normal doc: low text ops — doesn't qualify at all
+        let text_ops = 300u32;
+        let font_changes = 50u32;
+        assert!(text_ops < 1500);
     }
 }
