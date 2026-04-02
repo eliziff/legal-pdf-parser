@@ -1,18 +1,32 @@
 {
   "name": "firecrawl-pdf-inspector",
-  "version": "0.2.2",
+  "version": "0.2.3",
+  "description": "Fast PDF classification and text extraction. Detect text-based vs scanned PDFs, extract text by region with quality checks. Native Rust performance via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
+  "keywords": [
+    "pdf",
+    "pdf-extraction",
+    "pdf-parser",
+    "text-extraction",
+    "ocr",
+    "pdf-classification",
+    "napi",
+    "rust",
+    "firecrawl"
+  ],
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node"
+    "*.node",
+    "README.md"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/firecrawl/pdf-inspector"
   },
+  "homepage": "https://github.com/firecrawl/pdf-inspector",
   "publishConfig": {
     "access": "public"
   },
