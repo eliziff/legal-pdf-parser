@@ -77,12 +77,12 @@ jobs:
           path: napi/artifacts
 
       - name: Move artifacts
-        run: bunx napi artifacts --dir napi/artifacts --napi-dir napi
         working-directory: napi
+        run: bunx napi artifacts --build-output-dir artifacts
 
       - name: List packages
-        run: ls -R npm/
         working-directory: napi
+        run: ls -R npm/
 
       - name: Publish
         working-directory: napi
