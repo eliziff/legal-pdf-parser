@@ -8,7 +8,14 @@ description = "Fast PDF inspection, classification, and text extraction with sma
 license = "MIT"
 repository = "https://github.com/firecrawl/pdf-inspector"
 
+[lib]
+name = "pdf_inspector"
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
+# Python bindings
+pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+
 # PDF parsing
 lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "052674053814a9f4897af94f0b8e46a545c9b329", features = ["rayon"] }
 
@@ -35,6 +42,7 @@ tempfile = "3.3"
 
 [features]
 default = []
+python = ["pyo3"]
 
 [[bin]]
 name = "pdf2md"

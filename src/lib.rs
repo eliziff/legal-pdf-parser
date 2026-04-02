@@ -22,6 +22,9 @@
 //! ).unwrap();
 //! ```
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
