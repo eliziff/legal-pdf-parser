@@ -79,8 +79,8 @@ jobs:
       - name: Prepare and publish
         working-directory: napi
         run: |
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
-          echo "@firecrawl:registry=https://npm.pkg.github.com" >> .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc
+          echo "@firecrawl:registry=https://npm.pkg.github.com" >> ~/.npmrc
 
           VERSION=$(node -p "require('./package.json').version")
 
