@@ -296,11 +296,34 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     })
 }
 
+/// Result for a single region's text extraction.
+#[derive(Debug)]
+pub struct RegionText {
+    /// Extracted text (may be empty if region has no text items).
+    pub text: String,
+    /// `true` when the text should not be trusted and OCR should be used instead.
+    /// Set when: the region is empty, the page uses GID-encoded fonts, or the
+    /// extracted text fails garbage/encoding checks.
+    pub needs_ocr: bool,
+}
+
+/// Result for a page's region extractions.
+#[derive(Debug)]
+pub struct PageRegionResult {
+    /// 0-indexed page number.
+    pub page: u32,
+    /// Per-region results, parallel to the input regions.
+    pub regions: Vec<RegionText>,
+}
+
 /// Extract text within bounding-box regions from a PDF in memory.
 ///
 /// This is designed for hybrid OCR pipelines: a layout model detects regions
 /// in a rendered page image, and this function extracts the PDF text that
 /// falls within each region — avoiding GPU OCR for text-based pages.
+///
+/// Each region result includes a `needs_ocr` flag that is set when extraction
+/// quality is suspect (empty text, GID-encoded fonts, garbage/encoding issues).
 ///
 /// # Arguments
 ///
@@ -311,13 +334,11 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
 ///
 /// # Returns
 ///
-/// A `Vec` parallel to `page_regions`, each containing a `Vec<String>` parallel
-/// to that page's region list. Each string is the extracted text within that
-/// region, in reading order (top→bottom, left→right), with lines joined by `\n`.
+/// A `Vec<PageRegionResult>` parallel to `page_regions`.
 pub fn extract_text_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
-) -> Result<Vec<Vec<String>>, PdfError> {
+) -> Result<Vec<PageRegionResult>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
@@ -329,6 +350,7 @@ pub fn extract_text_in_regions_mem(
     // Extract text items for needed pages only
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
+    let mut gid_pages: HashSet<u32> = HashSet::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -340,7 +362,7 @@ pub fn extract_text_in_regions_mem(
         page_heights.insert(*page_num, height);
 
         // Extract text items for this page
-        let ((mut items, _rects, _lines), _has_gid) =
+        let ((mut items, _rects, _lines), has_gid) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -349,6 +371,9 @@ pub fn extract_text_in_regions_mem(
                 false,
             )?;
         text_utils::fix_letterspaced_items(&mut items);
+        if has_gid {
+            gid_pages.insert(*page_num);
+        }
         items_by_page.insert(*page_num, items);
     }
 
@@ -359,6 +384,7 @@ pub fn extract_text_in_regions_mem(
         let page_1idx = page_0idx + 1;
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
+        let page_has_gid = gid_pages.contains(&page_1idx);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -370,10 +396,18 @@ pub fn extract_text_in_regions_mem(
                 None => String::new(),
             };
 
-            page_results.push(text);
+            let needs_ocr = text.trim().is_empty()
+                || page_has_gid
+                || is_garbage_text(&text)
+                || detect_encoding_issues(&text);
+
+            page_results.push(RegionText { text, needs_ocr });
         }
 
-        results.push(page_results);
+        results.push(PageRegionResult {
+            page: *page_0idx,
+            regions: page_results,
+        });
     }
 
     Ok(results)
