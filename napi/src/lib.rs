@@ -3,6 +3,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashSet;
+use std::panic;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -116,6 +117,30 @@ fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
 }
 
+/// Run a closure, catching any Rust panic and converting it to a NAPI error.
+/// Prevents process abort from unwind panics in the native module.
+fn catch_panic<F, T>(ctx: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + panic::UnwindSafe,
+{
+    match panic::catch_unwind(f) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            Err(Error::new(
+                Status::GenericFailure,
+                format!("{ctx}: Rust panic: {msg}"),
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public NAPI API
 // ---------------------------------------------------------------------------
@@ -123,21 +148,27 @@ fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
 /// Process a PDF from a Buffer: detect type, extract text, and convert to Markdown.
 #[napi]
 pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult> {
-    let mut opts = pdf_inspector::PdfOptions::new();
-    if let Some(p) = pages {
-        opts = opts.pages(p);
-    }
-    let result = pdf_inspector::process_pdf_mem_with_options(&buffer, opts)
-        .map_err(|e| to_napi_err(e, "process_pdf"))?;
-    Ok(to_napi_result(result))
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("process_pdf", move || {
+        let mut opts = pdf_inspector::PdfOptions::new();
+        if let Some(p) = pages {
+            opts = opts.pages(p);
+        }
+        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
+            .map_err(|e| to_napi_err(e, "process_pdf"))?;
+        Ok(to_napi_result(result))
+    })
 }
 
 /// Fast detection only — no text extraction or markdown.
 #[napi]
 pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
-    let result =
-        pdf_inspector::detect_pdf_mem(&buffer).map_err(|e| to_napi_err(e, "detect_pdf"))?;
-    Ok(to_napi_result(result))
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("detect_pdf", move || {
+        let result =
+            pdf_inspector::detect_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "detect_pdf"))?;
+        Ok(to_napi_result(result))
+    })
 }
 
 /// Lightweight PDF classification — returns type, page count, and OCR pages.
@@ -145,21 +176,27 @@ pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
 /// Pages in pagesNeedingOcr are 0-indexed.
 #[napi]
 pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
-    let result =
-        pdf_inspector::classify_pdf_mem(&buffer).map_err(|e| to_napi_err(e, "classify_pdf"))?;
-
-    Ok(PdfClassification {
-        pdf_type: pdf_type_string(result.pdf_type),
-        page_count: result.page_count,
-        pages_needing_ocr: result.pages_needing_ocr,
-        confidence: result.confidence as f64,
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("classify_pdf", move || {
+        let result =
+            pdf_inspector::classify_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
+        Ok(PdfClassification {
+            pdf_type: pdf_type_string(result.pdf_type),
+            page_count: result.page_count,
+            pages_needing_ocr: result.pages_needing_ocr,
+            confidence: result.confidence as f64,
+        })
     })
 }
 
 /// Extract plain text from a PDF Buffer.
 #[napi]
 pub fn extract_text(buffer: Buffer) -> Result<String> {
-    pdf_inspector::extractor::extract_text_mem(&buffer).map_err(|e| to_napi_err(e, "extract_text"))
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_text", move || {
+        pdf_inspector::extractor::extract_text_mem(&bytes)
+            .map_err(|e| to_napi_err(e, "extract_text"))
+    })
 }
 
 /// Extract text with position information from a PDF Buffer.
@@ -168,35 +205,38 @@ pub fn extract_text_with_positions(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
 ) -> Result<Vec<TextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            pdf_inspector::extractor::extract_text_with_positions_mem_pages(
-                &buffer,
-                Some(&page_set),
-            )
-            .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
-        }
-        None => pdf_inspector::extractor::extract_text_with_positions_mem(&buffer)
-            .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
-    };
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_text_with_positions", move || {
+        let items = match pages {
+            Some(p) => {
+                let page_set: HashSet<u32> = p.into_iter().collect();
+                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
+                    &bytes,
+                    Some(&page_set),
+                )
+                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
+            }
+            None => pdf_inspector::extractor::extract_text_with_positions_mem(&bytes)
+                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
+        };
 
-    Ok(items
-        .into_iter()
-        .map(|item| TextItem {
-            text: item.text,
-            x: item.x as f64,
-            y: item.y as f64,
-            width: item.width as f64,
-            height: item.height as f64,
-            font: item.font,
-            font_size: item.font_size as f64,
-            page: item.page,
-            is_bold: item.is_bold,
-            is_italic: item.is_italic,
-            item_type: item_type_string(&item.item_type),
-        })
-        .collect())
+        Ok(items
+            .into_iter()
+            .map(|item| TextItem {
+                text: item.text,
+                x: item.x as f64,
+                y: item.y as f64,
+                width: item.width as f64,
+                height: item.height as f64,
+                font: item.font,
+                font_size: item.font_size as f64,
+                page: item.page,
+                is_bold: item.is_bold,
+                is_italic: item.is_italic,
+                item_type: item_type_string(&item.item_type),
+            })
+            .collect())
+    })
 }
 
 /// Extract text within bounding-box regions from a PDF.
@@ -214,6 +254,7 @@ pub fn extract_text_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
 ) -> Result<Vec<PageRegionTexts>> {
+    let bytes: Vec<u8> = buffer.to_vec();
     let regions: Vec<(u32, Vec<[f32; 4]>)> = page_regions
         .iter()
         .map(|pr| {
@@ -232,21 +273,23 @@ pub fn extract_text_in_regions(
         })
         .collect();
 
-    let results = pdf_inspector::extract_text_in_regions_mem(&buffer, &regions)
-        .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
+    catch_panic("extract_text_in_regions", move || {
+        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
+            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
 
-    Ok(results
-        .into_iter()
-        .map(|page_result| PageRegionTexts {
-            page: page_result.page,
-            regions: page_result
-                .regions
-                .into_iter()
-                .map(|r| RegionText {
-                    text: r.text,
-                    needs_ocr: r.needs_ocr,
-                })
-                .collect(),
-        })
-        .collect())
+        Ok(results
+            .into_iter()
+            .map(|page_result| PageRegionTexts {
+                page: page_result.page,
+                regions: page_result
+                    .regions
+                    .into_iter()
+                    .map(|r| RegionText {
+                        text: r.text,
+                        needs_ocr: r.needs_ocr,
+                    })
+                    .collect(),
+            })
+            .collect())
+    })
 }
