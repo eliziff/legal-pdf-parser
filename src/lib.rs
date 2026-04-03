@@ -406,6 +406,7 @@ pub fn extract_text_in_regions_mem(
             let needs_ocr = text.trim().is_empty()
                 || page_has_gid
                 || is_garbage_text(&text)
+                || is_cid_garbage(&text)
                 || detect_encoding_issues(&text);
 
             page_results.push(RegionText { text, needs_ocr });
@@ -482,29 +483,11 @@ pub fn collect_text_in_region(
     }
 
     // Sort top→bottom (descending Y in bottom-left coords), then left→right.
-    // Uses total_cmp to avoid panics on NaN values from bogus font metrics.
+    // Uses strict total_cmp ordering to guarantee transitivity (required by
+    // Rust's sort). The line-grouping phase below handles fuzzy Y matching.
     matched.sort_by(|a, b| {
-        let fs_a = if a.font_size.is_finite() {
-            a.font_size
-        } else {
-            0.0
-        };
-        let fs_b = if b.font_size.is_finite() {
-            b.font_size
-        } else {
-            0.0
-        };
-        let line_threshold = fs_a.max(fs_b) * 0.5;
-        let ay = if a.y.is_finite() { a.y } else { 0.0 };
-        let by = if b.y.is_finite() { b.y } else { 0.0 };
-        let y_diff = by - ay; // descending Y = top to bottom
-        if y_diff.abs() < line_threshold {
-            let ax = if a.x.is_finite() { a.x } else { 0.0 };
-            let bx = if b.x.is_finite() { b.x } else { 0.0 };
-            ax.total_cmp(&bx)
-        } else {
-            by.total_cmp(&ay)
-        }
+        b.y.total_cmp(&a.y) // descending Y = top to bottom
+            .then(a.x.total_cmp(&b.x)) // ascending X = left to right
     });
 
     // Group into lines and join
