@@ -164,6 +164,10 @@ pub(crate) fn detect_columns(
                 }
             }
         }
+        // Try XY-cut fallback before giving up
+        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+            return columns;
+        }
         return vec![ColumnRegion { x_min, x_max }];
     }
 
@@ -184,7 +188,7 @@ pub(crate) fn detect_columns(
     if result.len() > 1 {
         return result;
     }
-    return validate_and_build_columns(
+    let result = validate_and_build_columns(
         &valleys,
         &page_items,
         x_min,
@@ -195,6 +199,161 @@ pub(crate) fn detect_columns(
         page,
         false, // edge-based fallback
     );
+    if result.len() > 1 {
+        return result;
+    }
+
+    // Fallback: XY-cut style gap detection.  When the histogram finds no
+    // clear valleys (common with asymmetric/sidebar layouts), look for the
+    // largest horizontal gap between item edges.  This is a simplified
+    // single-level XY-cut inspired by opendataloader's XY-Cut++ algorithm.
+    if page_items.len() >= 20 && !page_has_table {
+        if let Some(columns) = try_xy_cut_split(&page_items, x_min, x_max, page) {
+            return columns;
+        }
+    }
+
+    vec![ColumnRegion { x_min, x_max }]
+}
+
+/// Simplified single-level XY-cut: find the largest horizontal gap between
+/// item right-edges and left-edges.  If the gap is wide enough and both sides
+/// have sufficient items with vertical overlap, split into two columns.
+///
+/// Inspired by opendataloader's XY-Cut++ algorithm but without full recursion.
+/// Handles asymmetric layouts (sidebars) that the histogram misses because
+/// the narrow column has too few items to register in the occupancy profile.
+fn try_xy_cut_split(
+    page_items: &[&TextItem],
+    page_x_min: f32,
+    page_x_max: f32,
+    page: u32,
+) -> Option<Vec<ColumnRegion>> {
+    const MIN_GAP: f32 = 15.0; // minimum gap to consider a split
+    const MIN_ITEMS_MAJOR: usize = 10; // major column must have ≥10 items
+    const MIN_ITEMS_MINOR: usize = 3; // minor column (sidebar) must have ≥3
+
+    let page_width = page_x_max - page_x_min;
+    if page_width < 200.0 {
+        return None;
+    }
+
+    // Collect all item edges: (right_edge, left_edge) pairs sorted by right_edge
+    // The gap between one item's right edge and the next item's left edge
+    // reveals column gutters.
+    let mut edges: Vec<(f32, f32)> = page_items
+        .iter()
+        .map(|i| (i.x, i.x + effective_width(i)))
+        .collect();
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    // Find the largest gap between consecutive items (by left edge).
+    // Use a sweep: sort left edges, find max gap between sorted right edges
+    // of items to the left and left edges of items to the right.
+    let mut left_edges: Vec<f32> = page_items.iter().map(|i| i.x).collect();
+    left_edges.sort_by(|a, b| a.total_cmp(b));
+
+    // Build prefix max of right edges (for items sorted by left edge)
+    let mut sorted_by_left: Vec<(f32, f32)> = page_items
+        .iter()
+        .map(|i| (i.x, i.x + effective_width(i)))
+        .collect();
+    sorted_by_left.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut best_gap = 0.0f32;
+    let mut best_split = 0.0f32;
+    let mut max_right_so_far = f32::NEG_INFINITY;
+
+    for i in 0..sorted_by_left.len() - 1 {
+        let (_, right) = sorted_by_left[i];
+        max_right_so_far = max_right_so_far.max(right);
+
+        let (next_left, _) = sorted_by_left[i + 1];
+        let gap = next_left - max_right_so_far;
+        if gap > best_gap {
+            best_gap = gap;
+            best_split = (max_right_so_far + next_left) / 2.0;
+        }
+    }
+
+    if best_gap < MIN_GAP {
+        return None;
+    }
+
+    // Don't split at page margins (within 10% of edges)
+    let margin = page_width * 0.10;
+    if best_split - page_x_min < margin || page_x_max - best_split < margin {
+        return None;
+    }
+
+    // Count items on each side
+    let left_count = page_items
+        .iter()
+        .filter(|i| i.x + effective_width(i) / 2.0 <= best_split)
+        .count();
+    let right_count = page_items
+        .iter()
+        .filter(|i| i.x + effective_width(i) / 2.0 > best_split)
+        .count();
+
+    let (minor, major) = if left_count <= right_count {
+        (left_count, right_count)
+    } else {
+        (right_count, left_count)
+    };
+
+    if major < MIN_ITEMS_MAJOR || minor < MIN_ITEMS_MINOR {
+        return None;
+    }
+
+    // Check vertical overlap — both sides should span a meaningful Y range
+    let left_items: Vec<&&TextItem> = page_items
+        .iter()
+        .filter(|i| i.x + effective_width(i) / 2.0 <= best_split)
+        .collect();
+    let right_items: Vec<&&TextItem> = page_items
+        .iter()
+        .filter(|i| i.x + effective_width(i) / 2.0 > best_split)
+        .collect();
+
+    let l_y_min = left_items.iter().map(|i| i.y).fold(f32::INFINITY, f32::min);
+    let l_y_max = left_items
+        .iter()
+        .map(|i| i.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let r_y_min = right_items
+        .iter()
+        .map(|i| i.y)
+        .fold(f32::INFINITY, f32::min);
+    let r_y_max = right_items
+        .iter()
+        .map(|i| i.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let overlap_min = l_y_min.max(r_y_min);
+    let overlap_max = l_y_max.min(r_y_max);
+    let overlap = (overlap_max - overlap_min).max(0.0);
+    let y_range = (l_y_max.max(r_y_max) - l_y_min.min(r_y_min)).max(1.0);
+
+    if overlap / y_range < 0.20 {
+        return None;
+    }
+
+    debug!(
+        "page {}: XY-cut split at x={:.1} (gap={:.1}pt, left={}, right={})",
+        page, best_split, best_gap, left_count, right_count
+    );
+
+    Some(vec![
+        ColumnRegion {
+            x_min: page_x_min,
+            x_max: best_split,
+        },
+        ColumnRegion {
+            x_min: best_split,
+            x_max: page_x_max,
+        },
+    ])
 }
 
 /// Check whether each proposed column contains paragraph-like content.
