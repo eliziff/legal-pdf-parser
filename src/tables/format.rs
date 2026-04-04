@@ -107,11 +107,16 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        // Classic continuation: first cell empty, content in other cells
+        // Classic continuation: first cell empty, content in other cells.
+        // Exclude rows where the non-first content is a long label (section
+        // header like "Category No. 03 - ...") — these are spanning headers,
+        // not overflow from the previous row.
+        let has_long_spanning_cell = non_first_cells.len() == 1 && non_first_cells[0].len() > 15;
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
+            && !has_long_spanning_cell
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
@@ -137,11 +142,17 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         } else {
             header_filled.saturating_sub(1)
         };
+        // Don't merge rows where only the first cell has content and it's
+        // long text — these are section separators (e.g. "Note: ...") or
+        // section headers (e.g. "Category No. 03 - ..."), not overflow.
+        let is_first_cell_only = filled_cells == 1 && !first_cell.is_empty();
+        let first_cell_long = first_cell.len() > 15;
         let is_wrapped_continuation = cleaned.len() > 1
             && filled_cells <= max_filled_for_merge
             && prev_filled > filled_cells
             && !looks_like_data_row
-            && !is_short_subheader;
+            && !is_short_subheader
+            && !(is_first_cell_only && first_cell_long);
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
 
