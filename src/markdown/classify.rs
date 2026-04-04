@@ -4,13 +4,11 @@
 pub(crate) fn is_caption_line(text: &str) -> bool {
     let trimmed = text.trim();
 
-    // Common caption prefixes in multiple languages
-    let caption_prefixes = [
-        "Figure ",
+    // Caption prefixes that always match (always followed by identifiers)
+    let always_prefixes = [
         "Figura ",
         "Fig. ",
         "Fig ",
-        "Table ",
         "Tabela ",
         "Source:",
         "Fonte:",
@@ -27,17 +25,39 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
         "Photo ",
         "Foto ",
     ];
-
-    // Check if line starts with a caption prefix
-    for prefix in &caption_prefixes {
+    for prefix in &always_prefixes {
         if trimmed.starts_with(prefix) {
             return true;
         }
     }
 
-    // Check case-insensitive patterns
+    // "Figure" and "Table" need a digit/reference after them to distinguish
+    // captions ("Table 1", "Figure 3.2") from headings ("Table of Contents")
+    for prefix in ["Figure ", "Table "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '#')
+            {
+                return true;
+            }
+        }
+    }
+
+    // Check case-insensitive patterns — require digit or punctuation after
+    // prefix to avoid matching "Table of Contents" or "Figure drawing" etc.
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("figure ") || lower.starts_with("table ") || lower.starts_with("source:") {
+    for pfx in ["figure ", "table "] {
+        if let Some(rest) = lower.strip_prefix(pfx) {
+            if rest
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '#')
+            {
+                return true;
+            }
+        }
+    }
+    if lower.starts_with("source:") {
         return true;
     }
 

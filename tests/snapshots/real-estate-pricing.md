@@ -6,7 +6,7 @@
 
 8 4 Z E L L / L U R I E R E A L E S T A T E C E N T E R
 
-**Table I: Cap rate correlations**
+## Table I: Cap rate correlations
 
 ## Cap Rate Correlation With:*
 
@@ -38,7 +38,7 @@ R E V I E W 8 5
 
 1982 1986 1990 1994 1998 2002 2006
 
-**Table II: Correlationsofspreadsbypropertytype**
+## Table II: Correlationsofspreadsbypropertytype
 
 ## Correlation of Cap Rate Spreads Over Treasury
 
