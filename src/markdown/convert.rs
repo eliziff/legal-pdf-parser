@@ -444,16 +444,23 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+                let word_count = plain_trimmed.split_whitespace().count();
                 // Bold-only lines at body font size that are standalone (paragraph break
                 // before them) are likely section headings. Require ≥3 words to avoid
                 // promoting short labels/field names.
                 let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
-                let word_count = plain_trimmed.split_whitespace().count();
                 if all_bold && !in_paragraph && word_count >= 3 {
-                    Some(bold_heading_level(&heading_tiers))
-                } else {
-                    None
+                    return Some(bold_heading_level(&heading_tiers));
                 }
+                // Lines slightly larger than body text (ratio 1.08-1.2) that are
+                // standalone and short are also likely headings. This catches
+                // academic paper headings with only a ~10% font size bump.
+                // Require ≥1 word to avoid single labels.
+                let ratio = line_font_size / base_size;
+                if (1.10..1.2).contains(&ratio) && !in_paragraph && (1..=8).contains(&word_count) {
+                    return Some(bold_heading_level(&heading_tiers));
+                }
+                None
             })
         } else {
             None
@@ -711,17 +718,16 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
                 detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
-                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                     let word_count = plain_trimmed.split_whitespace().count();
-                    let ends_with_colon = plain_trimmed
-                        .trim_end_matches(|c: char| !c.is_alphanumeric())
-                        .ends_with(':')
-                        || plain_trimmed.ends_with(':');
-                    if all_bold && !in_paragraph && word_count >= 3 && !ends_with_colon {
-                        Some(bold_heading_level(&heading_tiers))
-                    } else {
-                        None
+                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                    if all_bold && !in_paragraph && word_count >= 3 {
+                        return Some(bold_heading_level(&heading_tiers));
                     }
+                    let ratio = line_font_size / base_size;
+                    if ratio >= 1.05 && !in_paragraph && word_count <= 10 {
+                        return Some(bold_heading_level(&heading_tiers));
+                    }
+                    None
                 })
             {
                 if in_paragraph {
