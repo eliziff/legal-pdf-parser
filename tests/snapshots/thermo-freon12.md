@@ -29,8 +29,7 @@ S = Entropy (kJ/kg.K)
 |Chemical Formula|CCl2F2|
 |---|---|
 |Molecular mass|120.91|
-|Boiling Point|-29.75°C|
-|At one atmosphere||
+|Boiling Point At one atmosphere|-29.75°C|
 |Critical Temperature|111.97°C|
 |Critical Pressure|4136 kPa|
 |Critical Density|565.0 kg/m|
@@ -46,9 +45,7 @@ l
 
 |Temp|Pressure||Volume|||Density||Enthalpy|||Entropy|Temp|
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-|°C|[kPa]|[m3|/kg]|||[kg/m3]||[kJ/kg]|||[kJ/K-kg]|°C|
-|||Liquid||Vapour|Liquid|Vapour|Liquid|Latent|Vapour|Liquid|Vapour||
-|||v f||v g|d f|d g|H f|H fg|H g|S f|S g||
+|°C|[kPa]|[m3 Liquid v f|/kg]|Vapour v g|Liquid d f|[kg/m3] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
 
 |-100|1.2|0.0006|10.0000|1679.0|0.100|113.3|192.8|306.1|0.6077|1.7210|-100|
 |---|---|---|---|---|---|---|---|---|---|---|---|

@@ -185,11 +185,6 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         .filter(|row| row.iter().any(|cell| !cell.is_empty()))
         .count();
     if non_empty_rows < 2 {
-        log::debug!(
-            "detect_lines p{}: rejected — only {} non-empty rows",
-            page,
-            non_empty_rows
-        );
         return Vec::new();
     }
 
@@ -204,11 +199,6 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
             .count();
         let density = filled_cells as f32 / total_cells as f32;
         if density < 0.15 {
-            log::debug!(
-                "detect_lines p{}: rejected — low density {:.2}",
-                page,
-                density
-            );
             return Vec::new();
         }
     }
@@ -253,17 +243,9 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
                 .map(|s| (s - mean_spacing).powi(2))
                 .sum::<f32>()
                 / spacings.len() as f32;
-            let cv = variance.sqrt() / mean_spacing;
-            // CV < 0.02 means nearly identical spacing — likely chart grid.
-            // Spreadsheet-exported tables often have uniform rows (CV 0.03-0.05),
-            // so we use a tighter threshold to avoid false negatives.
-            if cv < 0.02 {
-                log::debug!(
-                    "detect_lines p{}: rejected — uniform row spacing (cv={:.4}, mean={:.1})",
-                    page,
-                    cv,
-                    mean_spacing
-                );
+            let cv = variance.sqrt() / mean_spacing; // coefficient of variation
+                                                     // CV < 0.05 means nearly identical spacing — chart grid
+            if cv < 0.05 {
                 return Vec::new();
             }
         }
@@ -281,158 +263,12 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    // Post-process: split rows that contain items at multiple distinct Y
-    // positions.  This happens in stacked sub-tables where "Note:" footer
-    // text and the next section's "Category" header land between the same
-    // pair of horizontal rules.  Re-assign items to sub-rows by Y proximity.
-    let cells = split_multi_y_rows(cells, items, &col_edges, &row_edges_desc, page);
-
-    // Split the grid into separate tables at rows that lack vertical border
-    // coverage (e.g. "Note:" footer text that sits between horizontal rules
-    // but outside the actual table grid).  A row is "unbounded" when fewer
-    // than 2 vertical lines span its Y range — it's freestanding text, not
-    // a table cell.
-    let mut tables = Vec::new();
-    let mut current_rows: Vec<Vec<String>> = Vec::new();
-
-    for (r, row) in cells.into_iter().enumerate() {
-        // Determine Y range for this row
-        let row_top = if r < row_edges_desc.len() {
-            row_edges_desc[r]
-        } else {
-            row_edges_desc.last().copied().unwrap_or(0.0)
-        };
-        let row_bot = if r + 1 < row_edges_desc.len() {
-            row_edges_desc[r + 1]
-        } else {
-            row_edges_desc.last().copied().unwrap_or(0.0) - 15.0
-        };
-
-        // Count vertical lines that span this row's Y range
-        let v_covering = verticals
-            .iter()
-            .filter(|(_, y_min, y_max)| *y_min <= row_bot + 2.0 && *y_max >= row_top - 2.0)
-            .count();
-
-        if v_covering >= 2 {
-            current_rows.push(row);
-        } else {
-            // Flush accumulated rows as a table
-            if current_rows.len() >= 2 {
-                tables.push(Table {
-                    columns: col_edges.clone(),
-                    rows: Vec::new(),
-                    cells: std::mem::take(&mut current_rows),
-                    item_indices: item_indices.clone(),
-                });
-            } else {
-                current_rows.clear();
-            }
-            // The unbounded row's text becomes a standalone "table" with 1 row
-            // so it gets emitted as text outside the table.
-            let text = row
-                .iter()
-                .map(|c| c.trim())
-                .filter(|c| !c.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !text.is_empty() {
-                // Emit as a 1-cell table which the markdown converter will
-                // render as a standalone line (single-row tables are just text).
-                tables.push(Table {
-                    columns: vec![col_edges[0], *col_edges.last().unwrap_or(&col_edges[0])],
-                    rows: Vec::new(),
-                    cells: vec![vec![text]],
-                    item_indices: item_indices.clone(),
-                });
-            }
-        }
-    }
-    // Flush remaining rows
-    if current_rows.len() >= 2 {
-        tables.push(Table {
-            columns: col_edges,
-            rows: Vec::new(),
-            cells: current_rows,
-            item_indices,
-        });
-    }
-
-    tables
-}
-
-/// Split table rows where items within cells span multiple Y positions.
-/// Groups items by Y proximity and emits one output row per Y group.
-fn split_multi_y_rows(
-    cells: Vec<Vec<String>>,
-    items: &[TextItem],
-    col_edges: &[f32],
-    row_edges: &[f32],
-    page: u32,
-) -> Vec<Vec<String>> {
-    let num_cols = col_edges.len() - 1;
-    let num_rows = cells.len();
-    if num_rows == 0 {
-        return cells;
-    }
-
-    // Re-collect items per cell to get Y positions
-    let mut cell_items: Vec<Vec<Vec<&TextItem>>> = vec![vec![Vec::new(); num_cols]; num_rows];
-    for item in items {
-        if item.page != page {
-            continue;
-        }
-        let cx = item.x + item.width / 2.0;
-        let cy = item.y;
-        let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
-        let row = (0..num_rows).find(|&r| cy >= row_edges[r + 1] - 2.0 && cy <= row_edges[r] + 2.0);
-        if let (Some(c), Some(r)) = (col, row) {
-            cell_items[r][c].push(item);
-        }
-    }
-
-    let y_tol = 4.0; // items within 4pt are on the same sub-row
-    let mut out: Vec<Vec<String>> = Vec::new();
-
-    for (r, _row_cells) in cells.iter().enumerate() {
-        // Collect all Y positions across all columns in this row
-        let mut all_ys: Vec<f32> = cell_items[r]
-            .iter()
-            .flat_map(|items| items.iter().map(|i| i.y))
-            .collect();
-        if all_ys.is_empty() {
-            out.push(vec![String::new(); num_cols]);
-            continue;
-        }
-        all_ys.sort_by(|a, b| b.total_cmp(a)); // descending (top first)
-        all_ys.dedup_by(|a, b| (*a - *b).abs() < y_tol);
-
-        if all_ys.len() <= 1 {
-            // Single Y level — keep original row
-            out.push(cells[r].clone());
-        } else {
-            // Multiple Y levels — split into sub-rows
-            for &sub_y in &all_ys {
-                let mut sub_row = Vec::with_capacity(num_cols);
-                for col_items in &cell_items[r] {
-                    let text: String = col_items
-                        .iter()
-                        .filter(|i| (i.y - sub_y).abs() < y_tol)
-                        .map(|i| i.text.trim())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    sub_row.push(text);
-                }
-                // Skip fully empty sub-rows
-                if sub_row.iter().any(|s| !s.is_empty()) {
-                    out.push(sub_row);
-                }
-            }
-        }
-    }
-
-    out
+    vec![Table {
+        columns: col_edges,
+        rows: row_edges_desc[..num_rows].to_vec(),
+        cells,
+        item_indices,
+    }]
 }
 
 #[cfg(test)]
