@@ -16,6 +16,23 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
 - **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
 
+## Benchmark
+
+Evaluated on the [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) corpus (200 PDFs). Only direct text extraction engines are shown — no OCR, no ML models. Scores are 0-1, higher is better.
+
+| Engine | Overall | Reading Order (NID) | Tables (TEDS) | Headings (MHS) | Speed (200 docs) |
+|---|---|---|---|---|---|
+| pdf-inspector | 0.77 | 0.87 | 0.52 | 0.56 | 4s |
+| opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
+| pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
+| markitdown | 0.58 | 0.88 | 0.00 | 0.00 | 8s |
+
+For context, engines that use OCR/ML (docling, marker, mineru) score 0.83-0.88 overall but take 2-180 minutes on the same corpus.
+
+**Where we do well:** Speed (fastest of all engines), reading order, table detection vs other direct-text tools.
+
+**Where we lag:** Heading detection trails opendataloader — many PDFs use bold text at body font size for headings, or headings that are only slightly larger than body text. Table detection trails OCR-based engines that can see visual table structure.
+
 ## Quick start
 
 ### Python
