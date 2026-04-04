@@ -7,7 +7,7 @@ use crate::types::TextLine;
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
-    detect_header_level, has_dot_leaders,
+    detect_header_level, font_size_rarity, has_dot_leaders,
 };
 use super::classify::{format_list_item, is_caption_line, is_list_item, is_monospace_font};
 use super::postprocess::clean_markdown;
@@ -444,23 +444,31 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+                // Rarity-based heading detection (inspired by opendataloader).
+                // Score = font_rarity * 0.5 + bold * 0.3 + standalone * 0.2
+                // Lines scoring above threshold are promoted to headings.
+                // Only consider lines at or above body font size.
+                if line_font_size < base_size * 0.95 {
+                    return None;
+                }
                 let word_count = plain_trimmed.split_whitespace().count();
-                // Bold-only lines at body font size that are standalone (paragraph break
-                // before them) are likely section headings. Require ≥3 words to avoid
-                // promoting short labels/field names.
+                if !(1..=15).contains(&word_count) {
+                    return None;
+                }
+                let rarity = font_size_rarity(line_font_size, &font_stats);
                 let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
-                if all_bold && !in_paragraph && word_count >= 3 {
-                    return Some(bold_heading_level(&heading_tiers));
+                let standalone = !in_paragraph;
+
+                let score = rarity * 0.5
+                    + if all_bold { 0.3 } else { 0.0 }
+                    + if standalone { 0.2 } else { 0.0 };
+
+                // Require standalone + at least one other signal
+                if score >= 0.5 && standalone && word_count >= 3 {
+                    Some(bold_heading_level(&heading_tiers))
+                } else {
+                    None
                 }
-                // Lines slightly larger than body text (ratio 1.08-1.2) that are
-                // standalone and short are also likely headings. This catches
-                // academic paper headings with only a ~10% font size bump.
-                // Require ≥1 word to avoid single labels.
-                let ratio = line_font_size / base_size;
-                if (1.10..1.2).contains(&ratio) && !in_paragraph && (1..=8).contains(&word_count) {
-                    return Some(bold_heading_level(&heading_tiers));
-                }
-                None
             })
         } else {
             None
@@ -718,13 +726,20 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
                 detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
-                    let word_count = plain_trimmed.split_whitespace().count();
-                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
-                    if all_bold && !in_paragraph && word_count >= 3 {
-                        return Some(bold_heading_level(&heading_tiers));
+                    if line_font_size < base_size * 0.95 {
+                        return None;
                     }
-                    let ratio = line_font_size / base_size;
-                    if ratio >= 1.05 && !in_paragraph && word_count <= 10 {
+                    let word_count = plain_trimmed.split_whitespace().count();
+                    if !(1..=15).contains(&word_count) {
+                        return None;
+                    }
+                    let rarity = font_size_rarity(line_font_size, &font_stats);
+                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                    let standalone = !in_paragraph;
+                    let score = rarity * 0.5
+                        + if all_bold { 0.3 } else { 0.0 }
+                        + if standalone { 0.2 } else { 0.0 };
+                    if score >= 0.5 && standalone && word_count >= 3 {
                         return Some(bold_heading_level(&heading_tiers));
                     }
                     None

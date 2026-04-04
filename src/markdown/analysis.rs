@@ -8,6 +8,24 @@ use log::debug;
 /// Font statistics for a document
 pub(crate) struct FontStats {
     pub(crate) most_common_size: f32,
+    /// Font size frequency distribution (size_key → line count).
+    /// Used for rarity-based heading detection.
+    pub(crate) size_counts: HashMap<i32, usize>,
+    /// Total number of lines counted.
+    pub(crate) total_lines: usize,
+}
+
+/// Compute how rare a font size is in the document (0.0 = most common, 1.0 = unique).
+/// Mirrors opendataloader's font rarity boosting approach: heading fonts appear on
+/// far fewer lines than body text, so their percentile rank is high.
+pub(crate) fn font_size_rarity(font_size: f32, stats: &FontStats) -> f32 {
+    if stats.total_lines == 0 {
+        return 0.0;
+    }
+    let key = (font_size * 10.0) as i32;
+    let count = stats.size_counts.get(&key).copied().unwrap_or(0);
+    // Rarity = 1 - (frequency ratio). A size used on 1/100 lines has rarity ~0.99.
+    1.0 - (count as f32 / stats.total_lines as f32)
 }
 
 /// Calculate font stats directly from items (before grouping into lines)
@@ -21,6 +39,8 @@ pub(crate) fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
         }
     }
 
+    let total_lines = size_counts.values().sum();
+
     // Break ties by preferring the smaller font size for deterministic output
     let most_common_size = size_counts
         .iter()
@@ -30,7 +50,11 @@ pub(crate) fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(12.0);
 
-    FontStats { most_common_size }
+    FontStats {
+        most_common_size,
+        size_counts,
+        total_lines,
+    }
 }
 
 /// Calculate font stats from grouped lines
@@ -48,6 +72,8 @@ pub(crate) fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         }
     }
 
+    let total_lines = size_counts.values().sum();
+
     // Break ties by preferring the smaller font size for deterministic output
     let most_common_size = size_counts
         .iter()
@@ -57,7 +83,11 @@ pub(crate) fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(12.0);
 
-    FontStats { most_common_size }
+    FontStats {
+        most_common_size,
+        size_counts,
+        total_lines,
+    }
 }
 
 /// Determine the heading level for a bold-only line that didn't meet the font-size
