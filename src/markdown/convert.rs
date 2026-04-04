@@ -1,6 +1,6 @@
 //! Core line-to-markdown conversion loop with table/image interleaving.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
 use crate::types::TextLine;
@@ -13,6 +13,88 @@ use super::classify::{format_list_item, is_caption_line, is_list_item, is_monosp
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::MarkdownOptions;
+
+/// Pre-scan lines to find "isolated" ones: short lines with paragraph breaks both
+/// before and after.  These are heading candidates even at body font size — common
+/// in academic papers ("Acknowledgements", "B.3 Prompt Engineering").
+fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) -> HashSet<usize> {
+    let mut set = HashSet::new();
+    for i in 0..lines.len() {
+        let line = &lines[i];
+        let plain = line.text();
+        let trimmed = plain.trim();
+        let word_count = trimmed.split_whitespace().count();
+        if !(1..=6).contains(&word_count) || trimmed.len() <= 3 {
+            continue;
+        }
+        let font_size = line.items.first().map(|it| it.font_size).unwrap_or(0.0);
+        if font_size < base_size * 0.95 {
+            continue;
+        }
+        if is_list_item(trimmed) || is_caption_line(trimmed) {
+            continue;
+        }
+
+        // Reject lines that look like wrapped paragraph text:
+        // ends with hyphen, comma, preposition, or lowercase continuation
+        let last_char = trimmed.chars().last().unwrap_or(' ');
+        if last_char == '-' || last_char == ',' || last_char == ';' {
+            continue;
+        }
+        // Last word is a common continuation word → wrapped paragraph
+        let last_word = trimmed.split_whitespace().last().unwrap_or("");
+        let continuation_words = [
+            "the", "a", "an", "and", "or", "of", "in", "to", "for", "with", "by", "on", "at",
+            "from", "as", "is", "are", "was", "were", "be", "that", "this", "their", "its", "our",
+            "your", "has", "have", "had", "not",
+        ];
+        if continuation_words.contains(&last_word.to_lowercase().as_str()) {
+            continue;
+        }
+
+        // Paragraph break BEFORE
+        let break_before = if i == 0 {
+            true
+        } else {
+            let prev = &lines[i - 1];
+            prev.page != line.page || (prev.y - line.y).abs() > para_threshold
+        };
+
+        // Paragraph break AFTER
+        let break_after = if i + 1 >= lines.len() {
+            true
+        } else {
+            let next = &lines[i + 1];
+            next.page != line.page || (line.y - next.y).abs() > para_threshold
+        };
+
+        if !break_before || !break_after {
+            continue;
+        }
+
+        set.insert(i);
+    }
+
+    // Density guard: if too many lines on a page are "isolated", they're
+    // all paragraph lines in a multi-column layout, not headings.  Real
+    // headings are rare — at most ~20% of lines on a page.
+    let mut page_line_counts: HashMap<u32, (usize, usize)> = HashMap::new(); // (total, isolated)
+    for (i, line) in lines.iter().enumerate() {
+        let entry = page_line_counts.entry(line.page).or_insert((0, 0));
+        entry.0 += 1;
+        if set.contains(&i) {
+            entry.1 += 1;
+        }
+    }
+    for (&page, &(total, isolated)) in &page_line_counts {
+        if total > 0 && isolated as f32 / total as f32 > 0.25 {
+            // Too many isolated lines on this page — remove them all
+            set.retain(|&i| lines[i].page != page);
+        }
+    }
+
+    set
+}
 
 /// Resolve the dominant structure role for a text line by looking up its items' MCIDs.
 ///
@@ -256,6 +338,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // threshold and cause every line to be treated as a paragraph break.
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
+    // Pre-scan: identify isolated lines (paragraph break before AND after).
+    // These are heading candidates even without bold/large font — common in
+    // academic papers where section titles like "Acknowledgements" sit alone
+    // between paragraphs at body font size. Inspired by opendataloader's
+    // lookahead in HeadingProcessor (prevNode/nextNode context).
+    let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -277,7 +366,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     all_content_pages.sort();
     all_content_pages.dedup();
 
-    for line in lines {
+    for (line_idx, line) in lines.iter().enumerate() {
         // Page break
         if line.page != current_page {
             // Flush current page's remaining tables and images
@@ -405,7 +494,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
-        let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(&line, roles));
+        let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(line, roles));
 
         // Determine if this line is code (struct-tree or font-based) for block accumulation
         let is_code_line = struct_role
@@ -445,8 +534,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
                 // Rarity-based heading detection (inspired by opendataloader).
-                // Score = font_rarity * 0.5 + bold * 0.3 + standalone * 0.2
-                // Lines scoring above threshold are promoted to headings.
+                // Heading probability scoring with lookahead context.
+                // Score = rarity * 0.5 + bold * 0.3 + standalone * 0.2
+                //       + isolated * 0.3 (paragraph break before AND after)
                 // Only consider lines at or above body font size.
                 if line_font_size < base_size * 0.95 {
                     return None;
@@ -458,13 +548,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 let rarity = font_size_rarity(line_font_size, &font_stats);
                 let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                 let standalone = !in_paragraph;
+                let isolated = isolated_lines.contains(&line_idx);
 
                 let score = rarity * 0.5
                     + if all_bold { 0.3 } else { 0.0 }
-                    + if standalone { 0.2 } else { 0.0 };
+                    + if standalone { 0.2 } else { 0.0 }
+                    + if isolated { 0.3 } else { 0.0 };
 
-                // Require standalone + at least one other signal
-                if score >= 0.5 && standalone && word_count >= 3 {
+                // Require standalone + at least one other signal (bold, rare, or isolated)
+                if score >= 0.5 && standalone && word_count >= 2 {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None
@@ -652,6 +744,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     // Compute the typical line spacing for paragraph break detection
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
+    let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
@@ -660,7 +754,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut last_list_x: Option<f32> = None;
     let mut prev_had_dot_leaders = false;
 
-    for line in lines {
+    for (line_idx, line) in lines.iter().enumerate() {
         // Page break
         if line.page != current_page {
             if current_page > 0 {
@@ -736,10 +830,12 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     let rarity = font_size_rarity(line_font_size, &font_stats);
                     let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                     let standalone = !in_paragraph;
+                    let isolated = isolated_lines.contains(&line_idx);
                     let score = rarity * 0.5
                         + if all_bold { 0.3 } else { 0.0 }
-                        + if standalone { 0.2 } else { 0.0 };
-                    if score >= 0.5 && standalone && word_count >= 3 {
+                        + if standalone { 0.2 } else { 0.0 }
+                        + if isolated { 0.3 } else { 0.0 };
+                    if score >= 0.5 && standalone && word_count >= 2 {
                         return Some(bold_heading_level(&heading_tiers));
                     }
                     None
