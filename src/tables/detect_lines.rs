@@ -286,14 +286,79 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
     // text and the next section's "Category" header land between the same
     // pair of horizontal rules.  Re-assign items to sub-rows by Y proximity.
     let cells = split_multi_y_rows(cells, items, &col_edges, &row_edges_desc, page);
-    let num_rows = cells.len();
 
-    vec![Table {
-        columns: col_edges,
-        rows: row_edges_desc[..num_rows.min(row_edges_desc.len())].to_vec(),
-        cells,
-        item_indices,
-    }]
+    // Split the grid into separate tables at rows that lack vertical border
+    // coverage (e.g. "Note:" footer text that sits between horizontal rules
+    // but outside the actual table grid).  A row is "unbounded" when fewer
+    // than 2 vertical lines span its Y range — it's freestanding text, not
+    // a table cell.
+    let mut tables = Vec::new();
+    let mut current_rows: Vec<Vec<String>> = Vec::new();
+
+    for (r, row) in cells.into_iter().enumerate() {
+        // Determine Y range for this row
+        let row_top = if r < row_edges_desc.len() {
+            row_edges_desc[r]
+        } else {
+            row_edges_desc.last().copied().unwrap_or(0.0)
+        };
+        let row_bot = if r + 1 < row_edges_desc.len() {
+            row_edges_desc[r + 1]
+        } else {
+            row_edges_desc.last().copied().unwrap_or(0.0) - 15.0
+        };
+
+        // Count vertical lines that span this row's Y range
+        let v_covering = verticals
+            .iter()
+            .filter(|(_, y_min, y_max)| *y_min <= row_bot + 2.0 && *y_max >= row_top - 2.0)
+            .count();
+
+        if v_covering >= 2 {
+            current_rows.push(row);
+        } else {
+            // Flush accumulated rows as a table
+            if current_rows.len() >= 2 {
+                tables.push(Table {
+                    columns: col_edges.clone(),
+                    rows: Vec::new(),
+                    cells: std::mem::take(&mut current_rows),
+                    item_indices: item_indices.clone(),
+                });
+            } else {
+                current_rows.clear();
+            }
+            // The unbounded row's text becomes a standalone "table" with 1 row
+            // so it gets emitted as text outside the table.
+            let text = row
+                .iter()
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                // Emit as a 1-cell table which the markdown converter will
+                // render as a standalone line (single-row tables are just text).
+                tables.push(Table {
+                    columns: vec![col_edges[0], *col_edges.last().unwrap_or(&col_edges[0])],
+                    rows: Vec::new(),
+                    cells: vec![vec![text]],
+                    item_indices: item_indices.clone(),
+                });
+            }
+        }
+    }
+    // Flush remaining rows
+    if current_rows.len() >= 2 {
+        tables.push(Table {
+            columns: col_edges,
+            rows: Vec::new(),
+            cells: current_rows,
+            item_indices,
+        });
+    }
+
+    tables
 }
 
 /// Split table rows where items within cells span multiple Y positions.

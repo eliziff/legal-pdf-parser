@@ -15,6 +15,17 @@ pub fn table_to_markdown(table: &Table) -> String {
     }
 
     let num_cols = cleaned_cells[0].len();
+
+    // Single-cell "tables" are standalone text, not real tables.
+    // Emit as plain text (e.g. "Note: ..." between sub-tables).
+    if cleaned_cells.len() == 1 && num_cols == 1 {
+        let text = cleaned_cells[0][0].trim();
+        if !text.is_empty() {
+            return format!("{}\n", text);
+        }
+        return String::new();
+    }
+
     let mut output = String::new();
 
     // Compact format: no padding, minimal separators. Optimized for token
