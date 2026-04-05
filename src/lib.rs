@@ -525,9 +525,6 @@ fn collect_text_in_region_with_options(
     adaptive_threshold: f32,
 ) -> String {
     let bounds = region_bounds(rx1, ry1, rx2, ry2, page_height, coord_space);
-    let Some(page) = items.first().map(|item| item.page) else {
-        return String::new();
-    };
     let matched: Vec<TextItem> = items
         .iter()
         .filter(|item| region_overlaps_item(item, bounds))
@@ -536,11 +533,39 @@ fn collect_text_in_region_with_options(
     if matched.is_empty() {
         return String::new();
     }
-    let mut thresholds = HashMap::new();
-    if adaptive_threshold > 0.10 {
-        thresholds.insert(page, adaptive_threshold);
+
+    // Simple extraction: the caller (fire-pdf) already handles reading order
+    // and column splitting via the layout model. We just need to sort items
+    // top-to-bottom, left-to-right and group into lines.
+    let mut sorted = matched;
+    sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+
+    let y_tolerance = 3.0;
+    let mut lines: Vec<extractor::TextLine> = Vec::new();
+
+    for item in sorted {
+        let should_merge = lines.last().is_some_and(|last_line: &extractor::TextLine| {
+            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+        });
+        if should_merge {
+            lines.last_mut().unwrap().items.push(item);
+        } else {
+            let y = item.y;
+            let page = item.page;
+            lines.push(extractor::TextLine {
+                items: vec![item],
+                y,
+                page,
+                adaptive_threshold,
+            });
+        }
     }
-    let lines = extractor::group_into_lines_with_thresholds(matched, &thresholds, &HashSet::new());
+
+    // Sort items within each line by X position
+    for line in &mut lines {
+        text_utils::sort_line_items(&mut line.items);
+    }
+
     lines
         .into_iter()
         .map(|line| line.text())
