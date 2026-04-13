@@ -1298,6 +1298,56 @@ fn looks_like_partial_table(markdown: &str) -> bool {
         }
     }
 
+    // Failure mode 5: cells flow as continuation paragraph (text wrapping
+    // mistaken for column structure). When a paragraph of prose gets mis-
+    // detected as a multi-column table, cells in the same column tend to
+    // start with lowercase letters or punctuation (continuation), not
+    // capital letters / digits (new entries). Real tables almost never
+    // have most data cells starting lowercase.
+    //
+    // Signal: ≥2 cols, ≥4 data rows, and ≥60% of non-empty data cells
+    // start with a lowercase letter or continuation punctuation.
+    let data_rows: Vec<Vec<&str>> = lines
+        .iter()
+        .skip(2) // header + separator
+        .map(|l| {
+            let parts: Vec<&str> = l.split('|').map(|s| s.trim()).collect();
+            if parts.len() >= 3 {
+                parts[1..parts.len() - 1].to_vec()
+            } else {
+                Vec::new()
+            }
+        })
+        .filter(|cells| !cells.is_empty())
+        .collect();
+
+    if n_cols >= 2 && data_rows.len() >= 4 {
+        let mut continuation = 0;
+        let mut total = 0;
+        for row in &data_rows {
+            for cell in row {
+                let trimmed = cell.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                total += 1;
+                let first = trimmed.chars().next().unwrap();
+                // Continuation indicators: lowercase letter, common
+                // mid-sentence punctuation, closing quote
+                if first.is_lowercase()
+                    || matches!(first, ',' | '.' | ';' | ')' | '"' | '\'' | '”' | '’')
+                {
+                    continuation += 1;
+                }
+            }
+        }
+        if total > 0 && continuation * 5 >= total * 3 {
+            // ≥60% of cells look like sentence continuations → paragraph
+            // misread as table.
+            return true;
+        }
+    }
+
     false
 }
 
@@ -1375,6 +1425,34 @@ mod looks_like_partial_table_tests {
         // Real data rows can have one empty cell (e.g. missing value);
         // only flag when ≥1/3 of cells are empty.
         let md = "|A|B|C|D|\n|---|---|---|---|\n|x|y||z|\n|p|q|r|s|";
+        assert!(!looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn paragraph_misread_as_two_column_table_is_partial() {
+        // Real production failure: text-wrapped paragraph mis-detected as
+        // 2-col table. Each cell continues the previous one as prose.
+        let md = "|Approval is needed from the|Acquisitions of|\n\
+                  |---|---|\n\
+                  |Treasurer if the acquisition|residential and|\n\
+                  |constitutes a \"significant|agricultural|\n\
+                  |action,\" including acquiring an|land by foreign|\n\
+                  |interest in different types of|persons must be|\n\
+                  |land where the monetary|reported to the|";
+        assert!(looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn real_multi_word_table_is_kept() {
+        // Real table with multi-word entries — cells start with capital
+        // letters / proper nouns, NOT lowercase continuations.
+        let md = "|Country|Capital|Notes|\n\
+                  |---|---|---|\n\
+                  |United States|Washington DC|Federal capital|\n\
+                  |United Kingdom|London|City of London is a separate|\n\
+                  |France|Paris|Île-de-France region|\n\
+                  |Germany|Berlin|Reunified 1990|\n\
+                  |Spain|Madrid|Largest city in Spain|";
         assert!(!looks_like_partial_table(md));
     }
 }
