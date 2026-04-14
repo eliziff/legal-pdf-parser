@@ -426,8 +426,10 @@ pub fn extract_text_in_regions_mem(
                 None => String::new(),
             };
 
+            // Check per-region text quality instead of blanket page-level
+            // GID rejection. A GID font in a logo elsewhere on the page
+            // shouldn't force GPU OCR for clean text regions.
             let needs_ocr = text.trim().is_empty()
-                || page_has_gid
                 || is_garbage_text(&text)
                 || is_cid_garbage(&text)
                 || detect_encoding_issues(&text);
@@ -516,14 +518,14 @@ pub fn extract_tables_in_regions_mem(
         for rect in regions {
             let [rx1, ry1, rx2, ry2] = *rect;
 
-            // If page has GID font issues, bail early
-            if page_has_gid {
-                page_results.push(RegionText {
-                    text: String::new(),
-                    needs_ocr: true,
-                });
-                continue;
-            }
+            // Note: we intentionally DO NOT bail on page_has_gid here.
+            // The GID flag means some font on the page uses unresolvable
+            // glyph IDs, but that font may only appear in a logo or
+            // header — not in the table region. Instead we let the
+            // per-region text quality checks (is_garbage_text, is_cid_garbage,
+            // detect_encoding_issues) reject based on the actual extracted
+            // content. This avoids rejecting clean tables just because an
+            // unrelated decorative font on the same page is GID-encoded.
 
             let matched: Vec<TextItem> = match items {
                 Some(items) => {
@@ -577,10 +579,12 @@ pub fn extract_tables_in_regions_mem(
                     //     mis-detected (numeric "header", empty header cells,
                     //     duplicate header cells). Caught GLM-OCR-as-baseline
                     //     scoring 0 TEDS on real prod tables in eval.
+                    // Layout model already identified this region as a table,
+                    // so use relaxed partial-table checks (layout_assisted=true).
                     let needs_ocr = is_garbage_text(&md)
                         || is_cid_garbage(&md)
                         || detect_encoding_issues(&md)
-                        || looks_like_partial_table(&md);
+                        || looks_like_partial_table_ex(&md, true);
                     page_results.push(RegionText {
                         text: if needs_ocr { String::new() } else { md },
                         needs_ocr,
@@ -1220,7 +1224,14 @@ fn is_cid_garbage(text: &str) -> bool {
 ///
 /// Conservative by design: a few false positives (perfectly fine tables flagged)
 /// just mean we run GPU OCR which is the existing safe path.
-fn looks_like_partial_table(markdown: &str) -> bool {
+/// When `layout_assisted` is true (the layout model identified this region
+/// as a table), we relax boundary-detection heuristics (numeric header,
+/// empty header cells, sparse first data row) because the layout model
+/// already gave us the table bbox — we're not guessing "is this a table?"
+/// anymore, only "can we extract it correctly?". Paragraph and duplicate-
+/// header checks stay, since those indicate genuine extraction quality
+/// issues regardless of how the region was identified.
+fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let lines: Vec<&str> = markdown.lines().filter(|l| l.starts_with('|')).collect();
     if lines.len() < 2 {
         return false;
@@ -1252,17 +1263,28 @@ fn looks_like_partial_table(markdown: &str) -> bool {
     }
 
     // Failure mode 1: header starts with a bare number (likely we missed
-    // the real header row above)
-    if let Some(first) = header_cells.first() {
-        let trimmed = first.trim();
-        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
-            return true;
+    // the real header row above). Skip when layout-assisted — the layout
+    // model's bbox includes the real header; a numeric first cell (e.g.,
+    // a year "2024") is legitimate.
+    if !layout_assisted {
+        if let Some(first) = header_cells.first() {
+            let trimmed = first.trim();
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
         }
     }
 
-    // Failure mode 2: header has empty cells in a multi-column table
+    // Failure mode 2: header has empty cells in a multi-column table.
+    // When layout-assisted, allow up to 1 empty header cell (common in
+    // tables with merged/spanning header cells that we can't represent).
     let empty_count = header_cells.iter().filter(|c| c.is_empty()).count();
-    if n_cols >= 3 && empty_count >= 1 {
+    if layout_assisted {
+        // Reject only if >1 empty header cell (2+ means serious boundary issue)
+        if n_cols >= 3 && empty_count >= 2 {
+            return true;
+        }
+    } else if n_cols >= 3 && empty_count >= 1 {
         return true;
     }
 
@@ -1290,9 +1312,13 @@ fn looks_like_partial_table(markdown: &str) -> bool {
         if data_cells.len() >= 3 {
             let data_inner = &data_cells[1..data_cells.len() - 1];
             let empty_data = data_inner.iter().filter(|c| c.is_empty()).count();
-            // ≥3 cols, and a third or more of cells in the first data row
-            // are empty → very likely we mis-split a multi-row header.
-            if n_cols >= 3 && empty_data * 3 >= n_cols {
+            // ≥3 cols, and significant portion of cells in the first data
+            // row are empty → likely we mis-split a multi-row header.
+            // When layout-assisted, relax from 33% to 50% — the bbox is
+            // more reliable, and real tables with one sparse first row
+            // (totals, subtotals) are common.
+            let threshold = if layout_assisted { 2 } else { 3 };
+            if n_cols >= 3 && empty_data * threshold >= n_cols {
                 return true;
             }
         }
@@ -1351,9 +1377,15 @@ fn looks_like_partial_table(markdown: &str) -> bool {
     false
 }
 
+/// Original strict validation (no layout assistance). Used by full-page
+/// extraction where the table boundary is heuristic-detected.
+fn looks_like_partial_table(markdown: &str) -> bool {
+    looks_like_partial_table_ex(markdown, false)
+}
+
 #[cfg(test)]
 mod looks_like_partial_table_tests {
-    use super::looks_like_partial_table;
+    use super::{looks_like_partial_table, looks_like_partial_table_ex};
 
     #[test]
     fn good_table_passes() {
@@ -1454,6 +1486,93 @@ mod looks_like_partial_table_tests {
                   |Germany|Berlin|Reunified 1990|\n\
                   |Spain|Madrid|Largest city in Spain|";
         assert!(!looks_like_partial_table(md));
+    }
+
+    // --- layout_assisted relaxation tests ---
+
+    #[test]
+    fn numeric_header_accepted_when_layout_assisted() {
+        // Year as first header cell is valid when layout model gave us the bbox.
+        let md = "|2024|Revenue|Growth|\n|---|---|---|\n|Q1|1.2M|5%|\n|Q2|1.4M|8%|";
+        assert!(
+            looks_like_partial_table(md),
+            "strict mode rejects numeric header"
+        );
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "layout-assisted should accept"
+        );
+    }
+
+    #[test]
+    fn one_empty_header_accepted_when_layout_assisted() {
+        // Common in merged-header tables: one spanning cell leaves a gap.
+        let md = "|Position||Senate|House|\n|---|---|---|---|\n|Chair|1|2|3|\n|Vice|4|5|6|";
+        assert!(
+            looks_like_partial_table(md),
+            "strict rejects 1 empty header"
+        );
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "layout-assisted allows 1 empty"
+        );
+    }
+
+    #[test]
+    fn two_empty_headers_still_rejected_when_layout_assisted() {
+        // 2+ empty headers is still bad even with layout assistance.
+        let md = "|A|||D|\n|---|---|---|---|\n|x|y|z|w|";
+        assert!(
+            looks_like_partial_table_ex(md, true),
+            "2 empty headers rejected even layout-assisted"
+        );
+    }
+
+    #[test]
+    fn sparse_first_row_relaxed_when_layout_assisted() {
+        // 1/4 empty = 25%, below strict 33% threshold but accepted by layout-assisted 50%.
+        let md = "|A|B|C|D|\n|---|---|---|---|\n|x||y|z|\n|p|q|r|s|";
+        assert!(!looks_like_partial_table(md), "strict: 25% empty is OK");
+        // 2/4 = 50%, strict would flag (2*3>=4), relaxed threshold (2*2>=4) would also flag.
+        let md2 = "|A|B|C|D|\n|---|---|---|---|\n|||y|z|\n|p|q|r|s|";
+        assert!(looks_like_partial_table(md2), "strict: 50% empty flagged");
+        assert!(
+            looks_like_partial_table_ex(md2, true),
+            "layout-assisted: 50% also flagged"
+        );
+        // 2/6 = 33%, strict flags (2*3>=6), relaxed does not (2*2<6)
+        let md3 = "|A|B|C|D|E|F|\n|---|---|---|---|---|---|\n|x|||y|z|w|\n|a|b|c|d|e|f|";
+        assert!(looks_like_partial_table(md3), "strict: 33% flagged");
+        assert!(
+            !looks_like_partial_table_ex(md3, true),
+            "layout-assisted: 33% accepted"
+        );
+    }
+
+    #[test]
+    fn paragraph_still_rejected_when_layout_assisted() {
+        // Paragraph detection is not relaxed — it's a genuine extraction issue.
+        let md = "|Approval is needed from the|Acquisitions of|\n\
+                  |---|---|\n\
+                  |Treasurer if the acquisition|residential and|\n\
+                  |constitutes a \"significant|agricultural|\n\
+                  |action,\" including acquiring an|land by foreign|\n\
+                  |interest in different types of|persons must be|\n\
+                  |land where the monetary|reported to the|";
+        assert!(
+            looks_like_partial_table_ex(md, true),
+            "paragraph rejection stays strict"
+        );
+    }
+
+    #[test]
+    fn duplicate_headers_still_rejected_when_layout_assisted() {
+        let md =
+            "|Position|Administration|Administration|Notes|\n|---|---|---|---|\n|Senate|24|16|x|";
+        assert!(
+            looks_like_partial_table_ex(md, true),
+            "duplicate headers rejected even layout-assisted"
+        );
     }
 }
 
