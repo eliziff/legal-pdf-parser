@@ -1556,26 +1556,32 @@ pub fn extract_tables_with_structure_cells_mem(
 
         normalize_cell_bands(&mut cells);
 
-        // Stage 1: exclusive per-item assignment. For each PDF text item,
-        // find the cell(s) whose (band-clamped) bbox satisfies the strict
-        // membership rule (`tsr_region_contains_item`: center inside OR
-        // >=60% overlap on both axes). If multiple cells qualify, assign
-        // the item to the cell whose center is geometrically closest. If
-        // exactly one qualifies, assign to that. If none, the item is an
-        // orphan and stage 2 below tries to recover it.
+        // Stage 1: exclusive per-token assignment. Each PDF text item is
+        // first split into whitespace-separated tokens with estimated x
+        // positions (see `split_item_into_token_subitems`). For each token
+        // we find the cell(s) whose (band-clamped) bbox satisfies the
+        // strict membership rule (`tsr_region_contains_item`: center
+        // inside OR >=60% overlap on both axes). If multiple cells
+        // qualify, the closest-center wins. Tokens that don't land in any
+        // cell are eligible for stage-2 orphan recovery.
         //
-        // The exclusivity (one item → one cell) prevents the cell-overlap
-        // bug where SLANet emits cells whose y-extents overlap between
-        // rows: under the previous "for each cell, gather items" approach,
-        // an item whose center fell in two cells' overlap got duplicated
-        // into both. Closest-center disambiguation routes it to the
-        // correct row.
-        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut item_to_cell: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        // Per-token (rather than per-item) routing is what prevents the
+        // dense-grid collapse bug: a row rendered as one wide Tj
+        // ("Marshall Islands 0.9 0.9 0.9") produces one TextItem whose
+        // CENTER lies in only one cell, so per-item routing parks the
+        // whole row in that single cell and leaves the rest of the row
+        // empty. Per-token routing distributes the words to whichever
+        // cells their (estimated) positions fall into. Single-token items
+        // collapse to a one-element token list and behave exactly as
+        // before.
+        //
+        // The token-level exclusivity (one token → one cell) still
+        // prevents the cell-overlap bug where SLANet emits cells whose
+        // y-extents overlap between rows. Closest-center disambiguation
+        // routes each token to the correct row.
 
         // Pre-compute each cell's bounds + center (in PDF-pt-flipped space)
-        // so we don't redo the work per item.
+        // so we don't redo the work per token.
         let cell_meta: Vec<Option<(RegionBounds, f32, f32)>> = cells
             .iter()
             .map(|cell| {
@@ -1590,44 +1596,53 @@ pub fn extract_tables_with_structure_cells_mem(
             })
             .collect();
 
-        for (item_idx, item) in items.iter().enumerate() {
-            let item_w = text_utils::effective_width(item);
-            let item_cx = item.x + item_w * 0.5;
-            let item_cy = item.y + item.height * 0.5;
-            let mut best: Option<(usize, f32)> = None;
-            for (cell_idx, meta) in cell_meta.iter().enumerate() {
-                let Some((bounds, ccx, ccy)) = meta else {
-                    continue;
-                };
-                if !tsr_region_contains_item(item, *bounds) {
-                    continue;
+        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
+        // Tokens of an item that did NOT land in any cell during stage 1.
+        // These are the orphan candidates handed to `tsr_assign_orphan_items`.
+        // Using token-grain orphan candidates (rather than the original wide
+        // item) lets stage 2 recover individual words that fell just outside
+        // their cell's clamped band, without re-attributing already-claimed
+        // tokens.
+        let mut orphan_token_subitems: Vec<TextItem> = Vec::new();
+
+        for item in items.iter() {
+            let token_subitems = split_item_into_token_subitems(item);
+            for token_item in token_subitems {
+                let token_w = text_utils::effective_width(&token_item);
+                let token_cx = token_item.x + token_w * 0.5;
+                let token_cy = token_item.y + token_item.height * 0.5;
+                let mut best: Option<(usize, f32)> = None;
+                for (cell_idx, meta) in cell_meta.iter().enumerate() {
+                    let Some((bounds, ccx, ccy)) = meta else {
+                        continue;
+                    };
+                    if !tsr_region_contains_item(&token_item, *bounds) {
+                        continue;
+                    }
+                    let dx = token_cx - ccx;
+                    let dy = token_cy - ccy;
+                    let dist_sq = dx * dx + dy * dy;
+                    if best.is_none_or(|(_, d)| dist_sq < d) {
+                        best = Some((cell_idx, dist_sq));
+                    }
                 }
-                let dx = item_cx - ccx;
-                let dy = item_cy - ccy;
-                let dist_sq = dx * dx + dy * dy;
-                if best.is_none_or(|(_, d)| dist_sq < d) {
-                    best = Some((cell_idx, dist_sq));
+                if let Some((ci, _)) = best {
+                    per_cell_items[ci].push(token_item);
+                } else {
+                    orphan_token_subitems.push(token_item);
                 }
-            }
-            if let Some((ci, _)) = best {
-                claimed.insert(item_idx);
-                item_to_cell.insert(item_idx, ci);
             }
         }
 
-        // Build per-cell text from the assigned items. Markdown cells must
+        // Build per-cell text from the assigned tokens. Markdown cells must
         // be one line — collapse line breaks from the line-grouping pass.
-        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
-        for (&item_idx, &cell_idx) in &item_to_cell {
-            per_cell_items[cell_idx].push(items[item_idx].clone());
-        }
         for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
             cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
                 .replace(['\n', '\r'], " ");
         }
 
-        // Stage 2: orphan assignment — text items that didn't land in any
-        // cell during stage 1 get assigned to their nearest *empty* cell,
+        // Stage 2: orphan assignment — tokens that didn't land in any cell
+        // during stage 1 get assigned to their nearest *empty* cell,
         // clamped by a plausibility cap derived from cell geometry.
         //
         // This recovers two failure modes left by `normalize_cell_bands`:
@@ -1639,12 +1654,82 @@ pub fn extract_tables_with_structure_cells_mem(
         // Empty-cell-only is the safety net: a cell already filled by stage 1
         // is never overwritten or augmented, so the cell-bleed case PR #62
         // closed cannot regress.
-        tsr_assign_orphan_items(items, &mut cells, &claimed, page_h, coords);
+        tsr_assign_orphan_items(
+            &orphan_token_subitems,
+            &mut cells,
+            &std::collections::HashSet::new(),
+            page_h,
+            coords,
+        );
 
         results.push(cells);
     }
 
     Ok(results)
+}
+
+/// Split a `TextItem` into one virtual sub-item per whitespace-separated
+/// token, with each token's `x` / `width` estimated from the original item's
+/// effective width and the token's character offset.
+///
+/// PDFs often render an entire row's content as a single Tj — e.g.
+/// "Marshall Islands 0.9 0.9 0.9" — producing one wide TextItem whose
+/// center sits in only one of the model-emitted cells. Per-item routing
+/// then parks the whole row in that one cell. Splitting on whitespace
+/// gives each word its own approximate position so per-cell routing can
+/// distribute the words to whichever cells their estimated centers fall
+/// into.
+///
+/// The character-width estimate is `effective_width / char_count`.
+/// `effective_width` returns the explicit `item.width` when known and
+/// otherwise falls back to `char_count * font_size * 0.5`. Either way the
+/// estimate is uniform across the item — fine for routing, since we only
+/// need to know which cell each token's center lands in, not its exact
+/// position. Single-token items collapse to a one-element vector
+/// equivalent to the input item, making this a no-op for the common case.
+fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
+    let total_chars = item.text.chars().count();
+    if total_chars == 0 {
+        return Vec::new();
+    }
+    let item_w = text_utils::effective_width(item);
+    let char_w = item_w / total_chars as f32;
+
+    let mut tokens: Vec<TextItem> = Vec::new();
+    let mut current_token = String::new();
+    let mut current_start_idx: Option<usize> = None;
+
+    let push_token =
+        |tokens: &mut Vec<TextItem>, text: String, start_idx: usize, end_idx: usize| {
+            if text.is_empty() {
+                return;
+            }
+            let mut sub = item.clone();
+            sub.text = text;
+            sub.x = item.x + start_idx as f32 * char_w;
+            sub.width = (end_idx - start_idx) as f32 * char_w;
+            tokens.push(sub);
+        };
+
+    for (idx, ch) in item.text.chars().enumerate() {
+        if ch.is_whitespace() {
+            if let Some(start_idx) = current_start_idx.take() {
+                let text = std::mem::take(&mut current_token);
+                push_token(&mut tokens, text, start_idx, idx);
+            }
+        } else {
+            if current_start_idx.is_none() {
+                current_start_idx = Some(idx);
+            }
+            current_token.push(ch);
+        }
+    }
+    if let Some(start_idx) = current_start_idx {
+        let text = std::mem::take(&mut current_token);
+        push_token(&mut tokens, text, start_idx, total_chars);
+    }
+
+    tokens
 }
 
 /// Compute plausibility caps for the orphan-assignment pass. Returns

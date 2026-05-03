@@ -373,6 +373,7 @@ fn extract_form_xobject_text_inner(
                         &font_encodings,
                         &encoding_cache,
                         cmap_decisions,
+                        &font_widths,
                     ) {
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
@@ -517,6 +518,7 @@ fn extract_form_xobject_text_inner(
                                     &font_encodings,
                                     &encoding_cache,
                                     cmap_decisions,
+                                    &font_widths,
                                 ) {
                                     current_text.push_str(&text);
                                 }

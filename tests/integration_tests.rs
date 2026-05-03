@@ -1189,9 +1189,38 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
 #[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
-    // ToUnicode CMap.  The raw CID values look like random Latin characters.
-    // We should suppress the garbage and flag the page for OCR.
+    // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
+    // contain non-ASCII high bytes and previously fell through to the
+    // per-byte Latin-1 fallback, producing high-Latin-1 mojibake that
+    // `is_cid_garbage` flagged. The Type0/CID guard in
+    // `extract_text_from_operand` now emits one U+FFFD per CID instead of
+    // mojibake; `detect_encoding_issues` trips on that and suppresses the
+    // markdown / flags the page for OCR — so we still pass this test, but
+    // via the deliberate marker path rather than by accident.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
+
+    // Pre-suppression check: the raw text items must contain the U+FFFD
+    // markers that prove the Type0/CID fallback fired. This pins the
+    // mechanism so a future regression that re-enables Latin-1 mojibake
+    // would fail loudly here, not just silently change the suppression
+    // chain to one that depends on `is_cid_garbage` + high-Latin-1 chars.
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let combined: String = items.iter().map(|i| i.text.as_str()).collect();
+    assert!(
+        combined.contains('\u{FFFD}'),
+        "Type0/CID font with unparseable ToUnicode CMap should emit U+FFFD per CID; \
+         got {} chars: {:?}",
+        combined.len(),
+        &combined[..combined.len().min(100)]
+    );
+    assert!(
+        !combined
+            .chars()
+            .any(|c| ('\u{0080}'..='\u{00FF}').contains(&c)),
+        "Latin-1 mojibake (high bytes) must not leak from Type0/CID fallback; got: {:?}",
+        &combined[..combined.len().min(100)]
+    );
+
     let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
 
     // Page 1 should be flagged for OCR
@@ -2999,4 +3028,339 @@ fn test_extract_pages_markdown_path_none_returns_all_pages() {
 
     let result = extract_pages_markdown(path, None).unwrap();
     assert_eq!(result.pages.len() as u32, page_count);
+}
+
+// ============================================================================
+// PROBE: investigate dense-cell text-assignment failure mode (failure mode 2)
+// ============================================================================
+
+fn synthetic_wide_row_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 10.into()]),
+        Operation::new("Td", vec![20.into(), 700.into()]),
+        // A single Tj that visually spans multiple cells. This mirrors PDFs
+        // where a row's address/role/email columns are emitted as one literal
+        // string with embedded spaces, producing one wide TextItem.
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Name JobTitle Email Phone")],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_extract_tables_with_structure_distributes_wide_item_across_cells() {
+    use pdf_inspector::{extract_tables_with_structure_cells_mem, TsrTableInput};
+
+    // Reproduces failure mode 2: a row of multi-token text rendered as one
+    // Tj produces a single wide TextItem that visually spans multiple cells.
+    // The current first-match-by-center routing parks the entire item in
+    // whichever cell holds the item's center, leaving the other cells empty.
+    // See production samples in scrape_id 019de788-ff41-... where 10-column
+    // grids ended up with row text packed into one cell.
+    let buf = synthetic_wide_row_pdf();
+
+    // Helvetica 10pt with width=0 falls back to char_count*font_size*0.5.
+    // "Name JobTitle Email Phone" is 25 chars → effective_width 125pt,
+    // text starts at PDF (20, 700), top-down y=[90, 100], char_w≈5pt.
+    // Tokens land at:
+    //   "Name"     chars 0-3   center≈x=30
+    //   "JobTitle" chars 5-12  center≈x=65
+    //   "Email"    chars 14-18 center≈x=100
+    //   "Phone"    chars 20-24 center≈x=130
+    let cell_bboxes = vec![
+        poly(15.0, 88.0, 50.0, 102.0),
+        poly(50.0, 88.0, 85.0, 102.0),
+        poly(85.0, 88.0, 120.0, 102.0),
+        poly(120.0, 88.0, 155.0, 102.0),
+    ];
+
+    let tokens: Vec<String> = [
+        "<table>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let cells_lists = extract_tables_with_structure_cells_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+
+    let cells = &cells_lists[0];
+    assert_eq!(cells.len(), 4);
+    assert_eq!(
+        cells[0].text, "Name",
+        "cell 0 should hold 'Name', got {:?}",
+        cells[0].text
+    );
+    assert_eq!(
+        cells[1].text, "JobTitle",
+        "cell 1 should hold 'JobTitle', got {:?}",
+        cells[1].text
+    );
+    assert_eq!(
+        cells[2].text, "Email",
+        "cell 2 should hold 'Email', got {:?}",
+        cells[2].text
+    );
+    assert_eq!(
+        cells[3].text, "Phone",
+        "cell 3 should hold 'Phone', got {:?}",
+        cells[3].text
+    );
+}
+
+// ============================================================================
+// PROPER TEST: synthetic Type0/Identity-H PDF with malformed ToUnicode CMap
+// ============================================================================
+//
+// Complements the existing real-PDF fixture `shinagawa_identity_h.pdf` by
+// building a minimal Type0 / Identity-H font in process. We control:
+//   * the byte stream emitted by Tj (a 2-byte CID containing one high byte),
+//   * the malformed ToUnicode contents (junk bytes that won't parse), and
+//   * the DescendantFonts shape (just enough for `parse_type0_widths` to set
+//     `is_cid=true`, which is what the new guard in `extract_text_from_operand`
+//     keys off of).
+// No fixture file or external license to worry about.
+
+fn synthetic_type0_broken_tounicode_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let cid_font_id = doc.new_object_id();
+    let descriptor_id = doc.new_object_id();
+    let tounicode_id = doc.new_object_id();
+    let cid_system_info_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    // Type0 font with Identity-H encoding and a broken ToUnicode reference.
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "AAAAAA+SyntheticCID",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![cid_font_id.into()],
+            "ToUnicode" => tounicode_id,
+        }
+        .into(),
+    );
+
+    // CIDSystemInfo and a minimal CIDFontType2 descendant. parse_type0_widths
+    // walks DescendantFonts → returns FontWidthInfo with is_cid=true. That's
+    // the only thing the new Latin-1 guard needs to see.
+    doc.objects.insert(
+        cid_system_info_id,
+        dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        cid_font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "AAAAAA+SyntheticCID",
+            "CIDSystemInfo" => cid_system_info_id,
+            "FontDescriptor" => descriptor_id,
+            "DW" => 1000,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        descriptor_id,
+        dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "AAAAAA+SyntheticCID",
+            "Flags" => 4,
+            "FontBBox" => vec![Object::Integer(-100), Object::Integer(-100), 1000.into(), 1000.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => Object::Integer(-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+        }
+        .into(),
+    );
+
+    // Intentionally malformed ToUnicode stream — just junk bytes. ToUnicode
+    // CMap parsing will fail, so `font_cmaps.get_by_obj` returns None and
+    // `has_cmap` stays false. The reference still exists in the font dict,
+    // so `font_tounicode_refs` contains the entry — but the new guard now
+    // routes off `is_cid` from font_widths instead, which is robust to a
+    // failed CMap parse.
+    doc.objects.insert(
+        tounicode_id,
+        Stream::new(dictionary! {}, b"this is not a valid CMap stream".to_vec()).into(),
+    );
+
+    // Tj with a 2-byte CID stream containing a non-ASCII high byte.
+    // Pre-fix this would have decoded as Latin-1 to "\u{00CD}\u{00D9}" ("ÍÙ").
+    // Post-fix it should produce U+FFFD per CID.
+    let cid_bytes = vec![0xCD_u8, 0xD9, 0xCD, 0xD9];
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F0".into(), 12.into()]),
+        Operation::new("Td", vec![50.into(), 100.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::String(cid_bytes, lopdf::StringFormat::Hexadecimal)],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F0" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
+    let buf = synthetic_type0_broken_tounicode_pdf();
+
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let combined: String = items.iter().map(|i| i.text.as_str()).collect();
+
+    // Mojibake leak check: 2-byte CID 0xCDD9 must NOT come out as "ÍÙ"
+    // (U+00CD U+00D9). That was the production scrape symptom.
+    assert!(
+        !combined.contains('\u{00CD}'),
+        "Latin-1 mojibake leaked from Type0 font: {combined:?}"
+    );
+    assert!(
+        !combined.contains('\u{00D9}'),
+        "Latin-1 mojibake leaked from Type0 font: {combined:?}"
+    );
+
+    // Marker presence: Type0/CID + non-ASCII bytes must produce U+FFFD so
+    // `detect_encoding_issues` can flag the page for OCR downstream.
+    assert!(
+        combined.contains('\u{FFFD}'),
+        "Type0 font with malformed ToUnicode CMap should emit U+FFFD per CID; got: {combined:?}"
+    );
+
+    // End-to-end check: the page is correctly routed to OCR.
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    assert!(
+        result.pages_needing_ocr.contains(&1),
+        "Type0 page with broken ToUnicode + non-ASCII bytes must be flagged for OCR; \
+         pages_needing_ocr={:?}",
+        result.pages_needing_ocr
+    );
 }

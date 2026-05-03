@@ -720,7 +720,11 @@ pub(crate) fn extract_text_from_operand(
     font_encodings: &PageFontEncodings,
     encoding_cache: &HashMap<String, Encoding<'_>>,
     cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
 ) -> Option<String> {
+    let is_type0_cid_font = font_widths
+        .get(current_font)
+        .is_some_and(|info| info.is_cid);
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
             let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
@@ -962,7 +966,31 @@ pub(crate) fn extract_text_from_operand(
                 return Some(symbol_text);
             }
 
-            // Latin-1 fallback
+            // Latin-1 fallback. Safe ONLY for fonts that use single-byte
+            // encodings — for these, an unmapped byte is a valid character
+            // code in Latin-1/WinAnsi space. CID fonts (Type0 / Identity-H)
+            // emit multi-byte CIDs that aren't characters; per-byte Latin-1
+            // produces mojibake (e.g. 2-byte CID 0xCDD9 → "ÍÙ" for the
+            // production scrape_id 019de78c-... samples).
+            //
+            // For a CID font (has_cmap is set OR a /ToUnicode reference
+            // exists) with any non-ASCII bytes, emit a single U+FFFD per
+            // CID instead. This both replaces the mojibake with a proper
+            // "decode failed" marker AND keeps `detect_encoding_issues`
+            // tripping so the page is flagged for OCR — the existing
+            // garbage-detection path that the high-Latin-1 mojibake used
+            // to satisfy by accident.
+            if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
+                // 2-byte CIDs (Identity-H) are by far the common case; for
+                // an odd byte count we still emit at least one marker so
+                // detection downstream fires.
+                let cid_count = (bytes.len() / 2).max(1);
+                return Some("\u{FFFD}".repeat(cid_count));
+            }
+            // Pure ASCII bytes round-trip safely (Latin-1 == ASCII for
+            // 0x00..=0x7F), and non-CID (Type1 / TrueType / Type3) fonts
+            // use single-byte encodings where Latin-1 fallback is the
+            // canonical interpretation.
             Some(bytes.iter().map(|&b| b as char).collect())
         } else {
             None
@@ -1212,5 +1240,98 @@ mod tests {
         let good = "the quick brown fox and the lazy dog";
         let bad = "###!!!@@@$$$";
         assert!(score_text(good) > score_text(bad));
+    }
+
+    #[test]
+    fn cid_font_with_unparseable_cmap_does_not_emit_latin1_mojibake() {
+        // Type0/CID font (font_widths reports `is_cid=true`) where the
+        // ToUnicode CMap couldn't be parsed (FontCMaps doesn't have the
+        // obj_num). Bytes are a 2-byte CID stream containing high bytes
+        // that aren't valid UTF-8 — exactly the case in the production
+        // samples (Identity-H text where the ToUnicode CMap was missing
+        // or malformed, scrape_id 019de78c-..., e.g. "Í Ù Z)¿").
+        //
+        // Without the guard, the function falls through to the byte-by-byte
+        // Latin-1 fallback and produces "ÍÙ" (U+00CD U+00D9). The correct
+        // behavior is to emit U+FFFD per CID so downstream
+        // `detect_encoding_issues` flags the page for OCR.
+        let bytes = vec![0xCD_u8, 0xD9, 0xCD, 0xD9];
+        let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
+
+        let font_cmaps = FontCMaps::default();
+        let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        font_tounicode_refs.insert("F0".to_string(), 999);
+        let inline_cmaps = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, true));
+
+        let result = extract_text_from_operand(
+            &obj,
+            "F0",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        );
+
+        let text = result.expect("CID font fallback should still emit a marker");
+        assert!(
+            !text.contains('\u{00CD}') && !text.contains('\u{00D9}'),
+            "CID font with unparseable CMap leaked Latin-1 mojibake: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "CID font with unparseable CMap should emit U+FFFD so detect_encoding_issues fires: {text:?}"
+        );
+    }
+
+    #[test]
+    fn simple_font_latin1_fallback_passes_high_bytes_through() {
+        // A Type1/TrueType simple font (is_cid=false) with a `/ToUnicode`
+        // reference but no usable CMap and no `/Differences` map.
+        // Per-byte Latin-1 IS the canonical interpretation here — these
+        // bytes are character codes, not CIDs. The CID guard must NOT
+        // strip them. Reproduces the false positive that an earlier
+        // version of the guard introduced for fonts in PDFs like
+        // pdf-evals/Navigating-Artificial-Intelligence-..., where bytes
+        // like 0xB6 are legitimate Latin-1 character codes.
+        let bytes = vec![0x24_u8, 0x47, 0xB6, 0x56]; // "$G¶V"
+        let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
+
+        let font_cmaps = FontCMaps::default();
+        let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        font_tounicode_refs.insert("F1".to_string(), 999);
+        let inline_cmaps = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F1".to_string(), make_font_info(&[], 1000, false));
+
+        let text = extract_text_from_operand(
+            &obj,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("simple font should round-trip Latin-1 bytes");
+        assert_eq!(text, "$G\u{00B6}V");
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "simple font fallback must not stamp FFFD over legitimate bytes: {text:?}"
+        );
     }
 }

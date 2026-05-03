@@ -385,6 +385,7 @@ pub(crate) fn extract_page_text_items(
                         &font_encodings,
                         &encoding_cache,
                         &mut cmap_decisions,
+                        &font_widths,
                     ) {
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
@@ -533,6 +534,7 @@ pub(crate) fn extract_page_text_items(
                                     &font_encodings,
                                     &encoding_cache,
                                     &mut cmap_decisions,
+                                    &font_widths,
                                 ) {
                                     current_text.push_str(&text);
                                 }
@@ -620,6 +622,7 @@ pub(crate) fn extract_page_text_items(
                         &font_encodings,
                         &encoding_cache,
                         &mut cmap_decisions,
+                        &font_widths,
                     ) {
                         if !text.trim().is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
