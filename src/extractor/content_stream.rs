@@ -1015,9 +1015,17 @@ pub(crate) fn extract_page_text_items(
     // producing thousands of identical rects that yield a degenerate grid.
     // After dedup, if too few unique clip rects remain we fall through to
     // fill rects (explicitly drawn visible rectangles).
+    //
+    // When fill rects substantially outnumber clip rects, the clips are
+    // typically section-level wrappers and the fills are the actual table
+    // cell backgrounds (e.g. shaded-header tables drawn with `m`/`l`/`h`/`f*`
+    // sequences). In that case, prefer fills.
     if rects.is_empty() {
         dedup_rects(&mut clip_rects);
-        if clip_rects.len() >= 4 {
+        let prefer_fills = !fill_rects.is_empty() && fill_rects.len() >= clip_rects.len() * 3;
+        if prefer_fills {
+            rects = fill_rects;
+        } else if clip_rects.len() >= 4 {
             rects = clip_rects;
         } else if !fill_rects.is_empty() {
             rects = fill_rects;

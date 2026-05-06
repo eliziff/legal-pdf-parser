@@ -1035,6 +1035,137 @@ mod vector_grid_tests {
         );
     }
 
+    /// Helper: load a fixture PDF and run the rect-based table detector.
+    fn detect_rect_tables_in_fixture(path: &str) -> Vec<crate::tables::Table> {
+        use crate::extractor::content_stream::extract_page_text_items;
+        use crate::tables::detect_tables_from_rects;
+        use crate::tounicode::FontCMaps;
+        use lopdf::Document;
+        use std::collections::HashSet;
+        use std::fs;
+
+        let buf = fs::read(path).unwrap();
+        let doc = Document::load_mem(&buf).unwrap();
+        let pages = doc.get_pages();
+        let &page_id = pages.get(&1).unwrap();
+        let needed: HashSet<u32> = HashSet::from([1]);
+        let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
+        let ((items, rects, _lines), _has_gid, _rotated) =
+            extract_page_text_items(&doc, page_id, 1, &cmaps, false).unwrap();
+
+        let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        rect_tables
+    }
+
+    /// Regression for the prose-in-a-frame failure mode introduced by the
+    /// shaded-header detection lift (PR #76). The accessory_building permit
+    /// form has a paragraph of legal text laid out in a 2-column justified
+    /// block; the new fill-priority + dedup changes start producing rects
+    /// for it, and the rect detector then admits a 10×2 fake table where
+    /// every cell holds a sentence fragment ("I agree to comply...", "I",
+    /// "It is the property owner's responsibility..."). This test asserts
+    /// the detector REJECTS that fake table — only the real 5×3 form data
+    /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
+    /// for the original score regression that surfaced this.
+    #[test]
+    fn accessory_building_rejects_prose_in_frame() {
+        let tables = detect_rect_tables_in_fixture(
+            "tests/fixtures/accessory_building_permit_prose_frame.pdf",
+        );
+        // Real form data table (TYPE / SIZE / SETBACKS) must still be detected.
+        let data_table = tables.iter().find(|t| t.columns.len() == 3);
+        assert!(
+            data_table.is_some(),
+            "expected to keep the 5×3 TYPE/SIZE/SETBACKS data table; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+        // Prose paragraph laid out in 2 cols must NOT be detected as a table.
+        // If the rejection regresses, the 10×2 fake table reappears and
+        // produces fragmented markdown like "I agree to comply..." | "I"
+        // that fragments mid-sentence.
+        let prose_table = tables.iter().find(|t| t.columns.len() == 2);
+        assert!(
+            prose_table.is_none(),
+            "expected the 10×2 prose-in-frame block to be rejected; got rows×cols = {:?}",
+            prose_table.map(|t| (t.rows.len(), t.columns.len()))
+        );
+    }
+
+    /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
+    /// glossary with a green-shaded header row and plain (line-drawn) body cells.
+    /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
+    /// (BIO 350 course header): a few colored header rects sit in a horizontal
+    /// strip while body rows are drawn with `m`/`l` operators, so the rect
+    /// cluster has only 2 Y-edges and `try_build_grid` rejects.
+    ///
+    /// IGNORED: lifting this shape required the exact-duplicate early-dedup
+    /// (PR #76 first iteration), which had broad collateral damage on
+    /// SEC 10-K TOCs and similar docs that draw rule-rects above + below
+    /// section dividers (production diff: 0001104659-25-093871 lost its
+    /// TOC structure, perf-graph data table, and qualifications matrix).
+    /// Re-enable once a more surgical lift exists in `try_build_grid` or
+    /// `snap_edges` that handles cell-border + inner-fill + text-bg rect
+    /// triplets without page-wide dedup.
+    #[test]
+    #[ignore]
+    fn greencomp_competence_two_cols() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/greencomp_competence.pdf");
+        assert!(
+            !tables.is_empty(),
+            "expected at least one rect-detected table for shaded-header + plain-body shape"
+        );
+        let t = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .unwrap();
+        assert_eq!(
+            t.columns.len(),
+            2,
+            "GreenComp competence is a 2-column table; got {}: {:?}",
+            t.columns.len(),
+            t.columns
+        );
+        assert!(
+            t.rows.len() >= 6,
+            "expected at least 6 rows of competences; got {}",
+            t.rows.len()
+        );
+    }
+
+    /// Regression for `upstage_key_functions.pdf` — a 4-column "Service Stage /
+    /// Function Name / Explanation / Expected Benefit" table with a blue-shaded
+    /// header band plus alternating row backgrounds. Mirrors production crops
+    /// #2 (Parameter / Value with alternating blue rows) and #7 (Spanish XML
+    /// schema with shaded header). Currently `pdf2md` returns zero markdown
+    /// table rows.
+    #[test]
+    fn upstage_key_functions_four_cols() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/upstage_key_functions.pdf");
+        assert!(
+            !tables.is_empty(),
+            "expected at least one rect-detected table for shaded-header + alt-row shape"
+        );
+        let t = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .unwrap();
+        assert_eq!(
+            t.columns.len(),
+            4,
+            "Service Flow is a 4-column table; got {}: {:?}",
+            t.columns.len(),
+            t.columns
+        );
+        assert!(
+            t.rows.len() >= 8,
+            "expected at least 8 visible body rows; got {}",
+            t.rows.len()
+        );
+    }
+
     #[test]
     fn test_crop_px_bbox_is_plausible_bounds() {
         let crop = [10.0, 20.0, 110.0, 220.0];
