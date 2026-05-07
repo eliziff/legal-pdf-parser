@@ -1632,17 +1632,17 @@ fn detect_row_stripe_table_from_cell_rects(
         }
     };
 
-    let col_edges = match (rect_col_edges, text_col_edges) {
+    let (col_edges, columns_from_text) = match (rect_col_edges, text_col_edges) {
         (Some(rect_edges), Some(text_edges)) if rect_edges.len() <= text_edges.len() => {
             debug!(
                 "  cell-rect using {} rect-derived columns over {} text clusters",
                 rect_edges.len() - 1,
                 text_edges.len() - 1
             );
-            rect_edges
+            (rect_edges, false)
         }
-        (_, Some(text_edges)) => text_edges,
-        (Some(rect_edges), None) => rect_edges,
+        (_, Some(text_edges)) => (text_edges, true),
+        (Some(rect_edges), None) => (rect_edges, false),
         (None, None) => {
             debug!(
                 "  cell-rect rejected: only {} columns from text clustering",
@@ -1742,7 +1742,7 @@ fn detect_row_stripe_table_from_cell_rects(
     // well-distributed-cols check (both cols populated), so we need a
     // content-based signal to tell them apart.
     //
-    // Two layered checks combine after the 20%-of-cells prose-word
+    // Layered checks combine after the 20%-of-cells prose-word
     // trigger fires:
     //   (a) Long-cell content: prose-in-a-frame averages ~70-100 chars
     //       per non-empty cell (sentence fragments); real data tables
@@ -1753,7 +1753,10 @@ fn detect_row_stripe_table_from_cell_rects(
     //       overrides the well-distributed relaxation — long cells
     //       are the strongest prose signal even when both cols are
     //       populated.
-    //   (b) Well-distributed columns: ≥75% of cols hold ≥2 non-empty
+    //   (b) Two-column text-only scaffold: when both columns were inferred
+    //       from text starts rather than rect edges, prose fragments can look
+    //       perfectly balanced. Require rect evidence for this relaxed shape.
+    //   (c) Well-distributed columns: ≥75% of cols hold ≥2 non-empty
     //       cells. Catches the prose-paragraph-as-many-cols shape
     //       while admitting real "label / value / description /
     //       benefit"-style tables.
@@ -1801,7 +1804,18 @@ fn detect_row_stripe_table_from_cell_rects(
                 return None;
             }
 
-            // (b) Well-distributed columns.
+            // (b) Two text-derived columns are not enough vector evidence once
+            // the content looks prose-like. Real 2-col rect tables still pass
+            // when the column scaffold comes from drawn cell geometry.
+            if columns_from_text && num_cols == 2 {
+                debug!(
+                    "  cell-rect rejected: prose-in-frame with text-derived 2-col scaffold (mean {} chars, prose words {}/{})",
+                    mean_chars, prose_cells, counted
+                );
+                return None;
+            }
+
+            // (c) Well-distributed columns.
             let filled_cols = (0..num_cols)
                 .filter(|&c| {
                     cells
@@ -3037,6 +3051,62 @@ mod tests {
             assert!(!hints[0].cluster_rects.is_empty());
         }
         // If tables were detected, that's also acceptable
+    }
+
+    #[test]
+    fn text_derived_two_col_prose_is_not_cell_rect_table() {
+        let page = 1;
+        let mut rects = Vec::new();
+        for row in 0..8 {
+            rects.push(PdfRect {
+                x: 50.0,
+                y: 100.0 + row as f32 * 20.0,
+                width: 180.0,
+                height: 18.0,
+                page,
+            });
+        }
+
+        let mut items = Vec::new();
+        let left = [
+            "the annual plan was revised",
+            "and the team noted changes",
+            "this section explains limits",
+            "with additional notes below",
+            "the policy was reviewed",
+            "and results are summarized",
+            "this appendix describes scope",
+            "with examples for reference",
+        ];
+        let right = [
+            "for each area in the review",
+            "as part of the assessment",
+            "that were applied in context",
+            "to support the conclusion",
+            "for use by the committee",
+            "as shown in the narrative",
+            "that remain under discussion",
+            "to clarify the method",
+        ];
+        for row in 0..8 {
+            let y = 104.0 + row as f32 * 20.0;
+            let mut left_item = make_item(left[row], 60.0, y, 9.0);
+            left_item.width = 50.0;
+            items.push(left_item);
+            let mut right_item = make_item(right[row], 150.0, y, 9.0);
+            right_item.width = 50.0;
+            items.push(right_item);
+        }
+
+        let (tables, _hints) = detect_tables_from_rects(&items, &rects, page);
+        assert!(
+            tables.is_empty(),
+            "text-derived two-column prose must not be accepted as a rect table; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

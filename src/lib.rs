@@ -1094,6 +1094,72 @@ mod vector_grid_tests {
         );
     }
 
+    /// Wireless table regression: decorative/text-region rects may provide row
+    /// bands, but without a real rect-derived column scaffold they must not be
+    /// accepted as a vector grid.
+    #[test]
+    fn wireless_two_col_rejects_rect_grid() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_two_col_no_rects.pdf");
+        assert!(
+            tables.is_empty(),
+            "expected no rect-detected tables for wireless content; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wireless_two_col_region_rejects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/wireless_two_col_no_rects.pdf").unwrap();
+        let crops = [
+            [49.32_f32, 52.92, 558.72, 214.2],
+            [49.32_f32, 288.72, 556.56, 378.0],
+            [51.48_f32, 478.44, 558.36, 567.36],
+        ];
+        for crop in crops {
+            let detected = crate::detect_vector_grid_in_region_mem(&buf, 0, crop, 200.0).unwrap();
+            assert!(
+                detected.is_none(),
+                "expected no vector grid for wireless crop {crop:?}; got {} cells",
+                detected.map(|grid| grid.cell_bboxes.len()).unwrap_or(0)
+            );
+        }
+    }
+
+    /// Wireless dense table regression: text-position columns alone are not
+    /// enough evidence for a rect-derived grid.
+    #[test]
+    fn wireless_dense_rejects_rect_grid() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_dense_no_rects.pdf");
+        assert!(
+            tables.is_empty(),
+            "expected no rect-detected tables for wireless content; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wireless_dense_region_rejects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/wireless_dense_no_rects.pdf").unwrap();
+        let crops = [
+            [72.36_f32, 177.48, 243.72, 333.36],
+            [72.0_f32, 390.24, 286.92, 417.6],
+        ];
+        for crop in crops {
+            let detected = crate::detect_vector_grid_in_region_mem(&buf, 0, crop, 200.0).unwrap();
+            assert!(
+                detected.is_none(),
+                "expected no vector grid for wireless crop {crop:?}; got {} cells",
+                detected.map(|grid| grid.cell_bboxes.len()).unwrap_or(0)
+            );
+        }
+    }
+
     /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
     /// glossary with a green-shaded header row and plain (line-drawn) body cells.
     /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
