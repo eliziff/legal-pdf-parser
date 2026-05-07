@@ -1036,7 +1036,7 @@ mod vector_grid_tests {
     }
 
     /// Helper: load a fixture PDF and run the rect-based table detector.
-    fn detect_rect_tables_in_fixture(path: &str) -> Vec<crate::tables::Table> {
+    fn detect_rect_tables_in_fixture_page(path: &str, page_num: u32) -> Vec<crate::tables::Table> {
         use crate::extractor::content_stream::extract_page_text_items;
         use crate::tables::detect_tables_from_rects;
         use crate::tounicode::FontCMaps;
@@ -1047,14 +1047,18 @@ mod vector_grid_tests {
         let buf = fs::read(path).unwrap();
         let doc = Document::load_mem(&buf).unwrap();
         let pages = doc.get_pages();
-        let &page_id = pages.get(&1).unwrap();
-        let needed: HashSet<u32> = HashSet::from([1]);
+        let &page_id = pages.get(&page_num).unwrap();
+        let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
         let ((items, rects, _lines), _has_gid, _rotated) =
-            extract_page_text_items(&doc, page_id, 1, &cmaps, false).unwrap();
+            extract_page_text_items(&doc, page_id, page_num, &cmaps, false).unwrap();
 
-        let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
+    }
+
+    fn detect_rect_tables_in_fixture(path: &str) -> Vec<crate::tables::Table> {
+        detect_rect_tables_in_fixture_page(path, 1)
     }
 
     /// Regression for the prose-in-a-frame failure mode introduced by the
@@ -1158,6 +1162,50 @@ mod vector_grid_tests {
                 detected.map(|grid| grid.cell_bboxes.len()).unwrap_or(0)
             );
         }
+    }
+
+    #[test]
+    fn multiline_indent_cell_rect_grid_fixture_detects_table() {
+        let tables = detect_rect_tables_in_fixture_page(
+            "tests/fixtures/multiline_indent_cell_rect_grid.pdf",
+            30,
+        );
+        let table = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .expect("expected a rect-detected table");
+        assert_eq!(
+            table.columns.len(),
+            5,
+            "expected the Controls Version / Control / IG table shape; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            table.rows.len() >= 3,
+            "expected at least header plus data rows; got {}",
+            table.rows.len()
+        );
+    }
+
+    #[test]
+    fn multiline_indent_cell_rect_grid_region_detects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/multiline_indent_cell_rect_grid.pdf").unwrap();
+        let detected =
+            crate::detect_vector_grid_in_region_mem(&buf, 29, [0.0, 0.0, 612.0, 792.0], 200.0)
+                .unwrap()
+                .expect("expected vector grid for multiline indented description table");
+        let rows = detected
+            .structure_tokens
+            .iter()
+            .filter(|token| token.as_str() == "<tr>")
+            .count();
+        assert_eq!(detected.cell_bboxes.len() % rows, 0);
+        assert_eq!(detected.cell_bboxes.len() / rows, 5);
+        assert!(rows >= 3);
+        assert!(!detected.cell_bboxes.is_empty());
     }
 
     /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"

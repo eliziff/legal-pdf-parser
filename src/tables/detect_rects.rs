@@ -1667,10 +1667,23 @@ fn detect_row_stripe_table_from_cell_rects(
         page_items.len()
     );
 
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         return None;
+    }
+
+    let mut row_edges = row_edges;
+    let (collapsed_cells, collapsed_row_edges, collapsed_rows) =
+        collapse_multiline_description_rows(cells, row_edges, &col_edges);
+    let has_wrapped_description_rows = collapsed_rows > 0;
+    cells = collapsed_cells;
+    row_edges = collapsed_row_edges;
+    if collapsed_rows > 0 {
+        debug!(
+            "  cell-rect collapsed {} wrapped description rows",
+            collapsed_rows
+        );
     }
 
     // Validate: >=2 non-empty rows, >=25% density
@@ -1686,6 +1699,7 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
+    let num_rows = cells.len();
     let total_cells = (num_cols * num_rows) as f32;
     let non_empty_cells = cells
         .iter()
@@ -1796,12 +1810,17 @@ fn detect_row_stripe_table_from_cell_rects(
             // discriminator.
             const PROSE_MEAN_CHAR_THRESHOLD: usize = 65;
             let mean_chars = total_chars / counted;
-            if mean_chars > PROSE_MEAN_CHAR_THRESHOLD {
+            if mean_chars > PROSE_MEAN_CHAR_THRESHOLD && !has_wrapped_description_rows {
                 debug!(
                     "  cell-rect rejected: prose-in-frame, mean non-empty cell {} chars > {} (prose words {}/{})",
                     mean_chars, PROSE_MEAN_CHAR_THRESHOLD, prose_cells, counted
                 );
                 return None;
+            } else if mean_chars > PROSE_MEAN_CHAR_THRESHOLD {
+                debug!(
+                    "  cell-rect prose check relaxed: wrapped description rows, mean {} chars (prose words {}/{})",
+                    mean_chars, prose_cells, counted
+                );
             }
 
             // (b) Two text-derived columns are not enough vector evidence once
@@ -1861,6 +1880,132 @@ fn detect_row_stripe_table_from_cell_rects(
     );
 
     Some(Table::new(column_centers, row_centers, cells, item_indices))
+}
+
+/// Merge wrapped description-line bands back into their visual data rows.
+///
+/// Some Word/PDF exports draw enough rectangle geometry to prove a table exists
+/// but expose Y bands per wrapped text line instead of per cell row. In the
+/// common mapping-table shape, a narrow row-label column precedes one wide
+/// description column, and wrapped continuation bands have content only in that
+/// wide column. Merge only that high-confidence shape so framed prose still
+/// falls through the existing prose guards.
+fn collapse_multiline_description_rows(
+    cells: Vec<Vec<String>>,
+    row_edges: Vec<f32>,
+    col_edges: &[f32],
+) -> (Vec<Vec<String>>, Vec<f32>, usize) {
+    let num_rows = cells.len();
+    let num_cols = col_edges.len().saturating_sub(1);
+    if num_rows < 3 || num_cols < 3 || row_edges.len() != num_rows + 1 {
+        return (cells, row_edges, 0);
+    }
+
+    let table_width = col_edges[num_cols] - col_edges[0];
+    if table_width <= 0.0 {
+        return (cells, row_edges, 0);
+    }
+
+    let Some((description_col, description_width)) = (0..num_cols)
+        .map(|c| (c, col_edges[c + 1] - col_edges[c]))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return (cells, row_edges, 0);
+    };
+
+    // Require a preceding row-label column. Without it (e.g. a prose frame
+    // split into text-start columns), "one populated wide column" is not enough
+    // evidence to find visual row starts safely.
+    if description_col == 0 || description_width < table_width * 0.35 {
+        return (cells, row_edges, 0);
+    }
+
+    let row_has_left_label = |row: &[String]| {
+        row.iter()
+            .take(description_col)
+            .any(|cell| !cell.trim().is_empty())
+    };
+    let labeled_rows = cells.iter().filter(|row| row_has_left_label(row)).count();
+    if labeled_rows < 2 {
+        return (cells, row_edges, 0);
+    }
+
+    let mut merged_rows = 0usize;
+    let mut wrapped_description_rows = 0usize;
+    let mut new_cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
+    let mut new_edges = Vec::with_capacity(row_edges.len());
+    new_edges.push(row_edges[0]);
+
+    for (row_idx, row) in cells.into_iter().enumerate() {
+        let desc_text = row
+            .get(description_col)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        let left_label = row_has_left_label(&row);
+        let non_desc_non_empty = row
+            .iter()
+            .enumerate()
+            .filter(|(col, cell)| *col != description_col && !cell.trim().is_empty())
+            .count();
+
+        // Wrapped continuation bands contain only description-column text.
+        // The preceding label/marker column is empty because the visual row's
+        // label cell spans the whole wrapped block.
+        let is_description_continuation = row_idx > 0
+            && !desc_text.is_empty()
+            && !left_label
+            && non_desc_non_empty == 0
+            && !new_cells.is_empty();
+
+        // Header cells are often split as "Controls" / "Version" in the first
+        // column while the other header labels sit on the first band.
+        let only_first_col = row
+            .iter()
+            .enumerate()
+            .all(|(col, cell)| col == 0 || cell.trim().is_empty());
+        let is_header_continuation = row_idx > 0
+            && only_first_col
+            && row
+                .first()
+                .is_some_and(|cell| !cell.trim().is_empty() && cell.chars().count() <= 24)
+            && !new_cells.is_empty()
+            && new_cells
+                .last()
+                .is_some_and(|prev| prev.iter().filter(|c| !c.trim().is_empty()).count() >= 2);
+
+        if is_description_continuation || is_header_continuation {
+            if let Some(prev) = new_cells.last_mut() {
+                for (col, cell) in row.iter().enumerate() {
+                    let text = cell.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !prev[col].trim().is_empty() {
+                        prev[col].push(' ');
+                    }
+                    prev[col].push_str(text);
+                }
+            }
+            merged_rows += 1;
+            if is_description_continuation {
+                wrapped_description_rows += 1;
+            }
+        } else {
+            if !new_cells.is_empty() {
+                new_edges.push(row_edges[row_idx]);
+            }
+            new_cells.push(row);
+        }
+    }
+
+    new_edges.push(*row_edges.last().unwrap());
+
+    if merged_rows == 0 || new_cells.len() < 2 || new_edges.len() != new_cells.len() + 1 {
+        return (new_cells, row_edges, 0);
+    }
+
+    (new_cells, new_edges, wrapped_description_rows)
 }
 
 /// Detect a table by merging all cluster rects into one group.
@@ -3107,6 +3252,94 @@ mod tests {
                 .map(|t| (t.rows.len(), t.columns.len()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn multiline_indented_description_rows_collapse_to_visual_rows() {
+        let page = 1;
+        let col_edges = [0.0, 60.0, 420.0, 460.0, 500.0, 540.0];
+        let row_edges = [
+            340.0, 320.0, 300.0, 270.0, 250.0, 230.0, 200.0, 180.0, 160.0,
+        ];
+
+        let mut rects = Vec::new();
+        for row in 0..row_edges.len() - 1 {
+            let y_top = row_edges[row];
+            let y_bot = row_edges[row + 1];
+            for col in 0..col_edges.len() - 1 {
+                rects.push((
+                    col_edges[col],
+                    y_bot,
+                    col_edges[col + 1] - col_edges[col],
+                    y_top - y_bot,
+                ));
+            }
+        }
+
+        let mut items = vec![
+            make_item("Controls", 8.0, 330.0, 9.0),
+            make_item("Control", 70.0, 330.0, 9.0),
+            make_item("IG 1", 428.0, 330.0, 9.0),
+            make_item("IG 2", 468.0, 330.0, 9.0),
+            make_item("IG 3", 508.0, 330.0, 9.0),
+            make_item("Version", 8.0, 310.0, 9.0),
+            make_item("v8", 20.0, 285.0, 9.0),
+            make_item(
+                "4.5 Implement and Manage a Firewall on End-User Devices",
+                70.0,
+                285.0,
+                9.0,
+            ),
+            make_item("*", 438.0, 285.0, 9.0),
+            make_item("*", 478.0, 285.0, 9.0),
+            make_item("*", 518.0, 285.0, 9.0),
+            make_item("v7", 20.0, 215.0, 9.0),
+            make_item(
+                "9.4 Apply Host-based Firewalls or Port-Filtering",
+                70.0,
+                215.0,
+                9.0,
+            ),
+            make_item("*", 478.0, 215.0, 9.0),
+            make_item("*", 518.0, 215.0, 9.0),
+        ];
+        items.push(make_item(
+            "Implement and manage a host-based firewall or port-filtering tool",
+            84.0,
+            260.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "on end-user devices with a default-deny rule",
+            84.0,
+            240.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "Apply host-based firewalls or port filtering tools on end systems",
+            84.0,
+            190.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "and deny unauthorized network communication",
+            84.0,
+            170.0,
+            8.0,
+        ));
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, page)
+            .expect("expected multiline description table");
+        assert_eq!(table.columns.len(), 5);
+        assert_eq!(
+            table.rows.len(),
+            3,
+            "wrapped lines should collapse to header plus two data rows"
+        );
+        assert_eq!(table.cells[0][0], "Controls Version");
+        assert!(table.cells[1][1].contains("host-based firewall"));
+        assert!(table.cells[1][1].contains("default-deny rule"));
+        assert!(table.cells[2][1].contains("deny unauthorized"));
     }
 
     #[test]
