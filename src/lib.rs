@@ -644,6 +644,8 @@ pub fn extract_tables_in_regions_mem(
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
 
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut rects_by_page: HashMap<u32, Vec<PdfRect>> = HashMap::new();
+    let mut lines_by_page: HashMap<u32, Vec<PdfLine>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
@@ -656,7 +658,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        let ((mut items, rects, lines), has_gid, coords_rotated) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -675,6 +677,8 @@ pub fn extract_tables_in_regions_mem(
             rotated_pages.insert(*page_num);
         }
         items_by_page.insert(*page_num, items);
+        rects_by_page.insert(*page_num, rects);
+        lines_by_page.insert(*page_num, lines);
     }
 
     let mut results = Vec::with_capacity(page_regions.len());
@@ -704,15 +708,13 @@ pub fn extract_tables_in_regions_mem(
             // content. This avoids rejecting clean tables just because an
             // unrelated decorative font on the same page is GID-encoded.
 
+            let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
             let matched: Vec<TextItem> = match items {
-                Some(items) => {
-                    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
-                    items
-                        .iter()
-                        .filter(|item| region_overlaps_item(item, bounds))
-                        .cloned()
-                        .collect()
-                }
+                Some(items) => items
+                    .iter()
+                    .filter(|item| region_overlaps_item(item, bounds))
+                    .cloned()
+                    .collect(),
                 None => Vec::new(),
             };
 
@@ -736,42 +738,82 @@ pub fn extract_tables_in_regions_mem(
                     .unwrap_or(12.0)
             };
 
-            // Run heuristic table detection; skip_body_font = false since
-            // the layout model already identified this region as a table.
-            let detected = tables::detect_tables(&matched, base_font_size, false);
+            // Try rect-backed and line-backed vector-grid detectors first,
+            // then fall back to the heuristic text-only detector. Each
+            // candidate's markdown is quality-gated by the same
+            // needs_ocr checks the heuristic-only path used: if a vector
+            // detector produces a partial/garbled table, we ignore it and
+            // try the next path rather than degrade the output.
+            // needs_ocr fires on any of:
+            //   - garbage text (non-alphanumeric heavy)
+            //   - CID/Latin-1 mojibake
+            //   - encoding issues (U+FFFD, dollar-as-space)
+            //   - structural giveaways that the table is partial /
+            //     mis-detected (numeric "header", empty header cells,
+            //     duplicate header cells).
+            // skip_body_font = false / layout_assisted = true because the
+            // layout model already identified this region as a table.
+            let region_rects: Vec<PdfRect> = rects_by_page
+                .get(&page_1idx)
+                .map(|rs| {
+                    rs.iter()
+                        .filter(|r| region_overlaps_rect(r, bounds))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let region_lines: Vec<PdfLine> = lines_by_page
+                .get(&page_1idx)
+                .map(|ls| {
+                    ls.iter()
+                        .filter(|l| region_overlaps_line(l, bounds))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            if let Some(table) = detected.into_iter().next() {
-                let md = tables::table_to_markdown(&table);
-                if md.trim().is_empty() {
-                    page_results.push(RegionText {
-                        text: String::new(),
-                        needs_ocr: true,
-                    });
-                } else {
-                    // needs_ocr fires on any of:
-                    //   - garbage text (non-alphanumeric heavy)
-                    //   - CID/Latin-1 mojibake
-                    //   - encoding issues (U+FFFD, dollar-as-space)
-                    //   - structural giveaways that the table is partial /
-                    //     mis-detected (numeric "header", empty header cells,
-                    //     duplicate header cells). Caught GLM-OCR-as-baseline
-                    //     scoring 0 TEDS on real prod tables in eval.
-                    // Layout model already identified this region as a table,
-                    // so use relaxed partial-table checks (layout_assisted=true).
-                    let needs_ocr = is_garbage_text(&md)
-                        || is_cid_garbage(&md)
-                        || detect_encoding_issues(&md)
-                        || looks_like_partial_table_ex(&md, true);
-                    page_results.push(RegionText {
-                        text: if needs_ocr { String::new() } else { md },
-                        needs_ocr,
-                    });
+            let evaluate = |t: &tables::Table| -> Option<String> {
+                let md = tables::table_to_markdown(t);
+                let trimmed = md.trim();
+                if trimmed.is_empty() {
+                    return None;
                 }
-            } else {
-                page_results.push(RegionText {
+                if is_garbage_text(&md)
+                    || is_cid_garbage(&md)
+                    || detect_encoding_issues(&md)
+                    || looks_like_partial_table_ex(&md, true)
+                {
+                    None
+                } else {
+                    Some(md)
+                }
+            };
+
+            let mut accepted_md: Option<String> = None;
+            if !region_rects.is_empty() {
+                let (rect_tables, _) =
+                    tables::detect_tables_from_rects(&matched, &region_rects, page_1idx);
+                accepted_md = rect_tables.iter().find_map(&evaluate);
+            }
+            if accepted_md.is_none() && !region_lines.is_empty() {
+                let line_tables =
+                    tables::detect_tables_from_lines(&matched, &region_lines, page_1idx);
+                accepted_md = line_tables.iter().find_map(&evaluate);
+            }
+            if accepted_md.is_none() {
+                let detected = tables::detect_tables(&matched, base_font_size, false);
+                accepted_md = detected.iter().find_map(&evaluate);
+            }
+
+            match accepted_md {
+                Some(md) => page_results.push(RegionText {
+                    text: md,
+                    needs_ocr: false,
+                }),
+                None => page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
-                });
+                }),
             }
         }
 

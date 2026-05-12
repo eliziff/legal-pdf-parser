@@ -1648,6 +1648,33 @@ fn test_bits_pilani_page8_table_detection() {
     assert!(!region.needs_ocr, "Page 8 table should still be detected");
 }
 
+#[test]
+fn test_extract_tables_in_regions_uses_line_grid() {
+    // Stroked-grid table (m/l/S path operators forming a 2x2 grid).
+    // The heuristic text-only detector handles the same cells already,
+    // so this guards that the line-backed path doesn't regress: the
+    // markdown still contains all four data cells.
+    let buf = synthetic_vector_grid_pdf(false);
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[40.0, 50.0, 220.0, 760.0]])]).unwrap();
+    let region = &results[0].regions[0];
+    assert!(
+        !region.needs_ocr,
+        "stroked-grid table should be extracted, got needs_ocr=true"
+    );
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(
+            region.text.contains(tok),
+            "expected '{tok}' in output, got: {}",
+            region.text
+        );
+    }
+    assert!(
+        region.text.contains('|'),
+        "expected pipe-delimited markdown"
+    );
+}
+
 // =========================================================================
 // extract_tables_with_structure_mem tests (TSR-aware path)
 // =========================================================================
