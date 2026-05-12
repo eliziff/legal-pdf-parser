@@ -1394,13 +1394,15 @@ fn detect_row_stripe_table(
         .max()
         .unwrap_or(0);
     // Allow longer cells for multi-column tables (descriptions in one column
-    // are common).  Single-column or 2-column "tables" with giant cells are
-    // almost always layout backgrounds.
+    // are common). Narrow grids with giant cells are usually layout
+    // backgrounds — but only when the row count is also small. A 4+-row
+    // key/value table with one descriptive column reads as a real table
+    // on every other gate, so don't reject it on cell length alone.
     let max_allowed = if num_cols >= 3 { 2000 } else { 500 };
-    if max_cell_len > max_allowed {
+    if max_cell_len > max_allowed && non_empty_rows < 4 {
         debug!(
-            "  row-stripe rejected: max cell length {} > {} (layout background)",
-            max_cell_len, max_allowed
+            "  row-stripe rejected: max cell length {} > {} (layout background, {} rows)",
+            max_cell_len, max_allowed, non_empty_rows
         );
         return None;
     }
@@ -1761,17 +1763,21 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Reject tables with paragraph-length cells (layout backgrounds, not tables)
+    // Reject tables with paragraph-length cells — typically layout
+    // backgrounds (sidebars, banners) where a single big rectangle
+    // contains a wall of prose.  Spare multi-row key/value tables where
+    // the value column is a multi-bullet description: those pass every
+    // other gate and shouldn't get killed on cell length alone.
     let max_cell_len = cells
         .iter()
         .flat_map(|row| row.iter())
         .map(|c| c.len())
         .max()
         .unwrap_or(0);
-    if max_cell_len > 500 {
+    if max_cell_len > 500 && non_empty_rows < 4 {
         debug!(
-            "  cell-rect rejected: max cell length {} > 500",
-            max_cell_len
+            "  cell-rect rejected: max cell length {} > 500 ({} rows, layout background)",
+            max_cell_len, non_empty_rows
         );
         return None;
     }
@@ -2185,18 +2191,20 @@ fn detect_merged_cluster_table(
         return None;
     }
 
-    // Reject if any cell has excessive text — layout background rects produce
-    // "cells" containing paragraphs, not short data-table values.
+    // Reject if any cell has excessive text — layout background rects
+    // produce "cells" containing paragraphs, not short data-table values.
+    // Multi-row key/value tables can legitimately have one column of
+    // long descriptive text, so only reject narrow-row layouts here.
     let max_cell_len = cells
         .iter()
         .flat_map(|row| row.iter())
         .map(|c| c.len())
         .max()
         .unwrap_or(0);
-    if max_cell_len > 500 {
+    if max_cell_len > 500 && non_empty_rows < 4 {
         debug!(
-            "  merged-cluster rejected: max cell length {} > 500 (layout background)",
-            max_cell_len
+            "  merged-cluster rejected: max cell length {} > 500 ({} rows, layout background)",
+            max_cell_len, non_empty_rows
         );
         return None;
     }
@@ -2624,6 +2632,46 @@ mod tests {
             result.is_none(),
             "layout background rects should not be detected as a table"
         );
+    }
+
+    #[test]
+    fn test_row_stripe_accepts_multi_row_key_value_long_cells() {
+        // Multi-row 2-column key/value table where one value cell holds
+        // a paragraph (>500 chars).  The old `max_cell_len > 500` check
+        // rejected this shape as a "layout background"; with the
+        // multi-row guard, it should be accepted.
+        let mut rects = Vec::new();
+        let row_h = 25.0_f32;
+        let y_top = 700.0_f32;
+        for i in 0..8 {
+            let y = y_top - (i as f32) * row_h;
+            rects.push((40.0, y, 510.0, row_h));
+        }
+        let mut items = Vec::new();
+        for i in 0..8 {
+            let row_center_y = y_top - (i as f32) * row_h + row_h / 2.0;
+            // Left column: short label
+            items.push(make_item(&format!("Field {}", i), 45.0, row_center_y, 10.0));
+            // Right column: short value, except the last row which is a paragraph
+            let value = if i == 7 {
+                "X".repeat(800)
+            } else {
+                "value".to_string()
+            };
+            items.push(make_item(&value, 300.0, row_center_y, 10.0));
+        }
+        let result = detect_row_stripe_table(&items, &rects, 1);
+        assert!(
+            result.is_some(),
+            "multi-row key/value table with one long cell should be accepted"
+        );
+        let t = result.unwrap();
+        assert!(
+            t.cells.len() >= 4,
+            "expected ≥4 rows, got {}",
+            t.cells.len()
+        );
+        assert_eq!(t.cells[0].len(), 2, "expected 2 columns");
     }
 
     // --- propagate_merged_cells ---
