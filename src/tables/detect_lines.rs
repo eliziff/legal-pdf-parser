@@ -4,10 +4,73 @@
 //! gridlines.  Many IRS forms and government PDFs use these instead of
 //! `re` (rectangle) operators.
 
+use std::collections::HashSet;
+
 use crate::tables::Table;
 use crate::types::{PdfLine, TextItem};
 
 use super::detect_rects::{assign_items_to_grid, snap_edges};
+
+/// Derive column edges from the x-endpoints of horizontal-rule
+/// segments when no vertical lines were drawn.
+///
+/// Catalog and archival-finding-aid tables are commonly drawn with
+/// per-row horizontal rules broken into N segments (one segment per
+/// cell), with no vertical dividers at all. The segment break points
+/// (e.g. `[50, 127], [127, 485], [485, 562]` per row) implicitly
+/// encode the column boundaries.
+///
+/// Returns column edges if ≥3 distinct x-positions each show up as a
+/// segment endpoint on ≥50% of the unique horizontal-line rows.
+/// Returns `None` otherwise — decorative rules with varying widths
+/// shouldn't be mistaken for a table.
+fn derive_columns_from_horizontal_segments(horizontals: &[(f32, f32, f32)]) -> Option<Vec<f32>> {
+    if horizontals.len() < 3 {
+        return None;
+    }
+
+    let mut endpoints: Vec<f32> = Vec::with_capacity(horizontals.len() * 2);
+    for &(_, x_min, x_max) in horizontals {
+        endpoints.push(x_min);
+        endpoints.push(x_max);
+    }
+    let clusters = snap_edges(&endpoints, 5.0);
+    if clusters.len() < 3 {
+        return None;
+    }
+
+    // Bucket y-values to count unique rows. Tolerance ~0.1pt (×10
+    // rounding) tolerates the snap_edges 3pt clustering used later
+    // for row edges.
+    let unique_rows: HashSet<i32> = horizontals
+        .iter()
+        .map(|&(y, _, _)| (y * 10.0).round() as i32)
+        .collect();
+    if unique_rows.len() < 2 {
+        return None;
+    }
+    let min_rows = (unique_rows.len() as f32 * 0.5).ceil() as usize;
+
+    let qualifying: Vec<f32> = clusters
+        .iter()
+        .copied()
+        .filter(|&cluster_x| {
+            let rows_touched: HashSet<i32> = horizontals
+                .iter()
+                .filter(|&&(_, x_min, x_max)| {
+                    (x_min - cluster_x).abs() < 5.0 || (x_max - cluster_x).abs() < 5.0
+                })
+                .map(|&(y, _, _)| (y * 10.0).round() as i32)
+                .collect();
+            rows_touched.len() >= min_rows
+        })
+        .collect();
+
+    if qualifying.len() < 3 {
+        return None;
+    }
+    Some(qualifying)
+}
 
 /// Detect tables from line segments on a given page.
 ///
@@ -52,25 +115,50 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
         // Diagonal lines are ignored
     }
 
-    if horizontals.len() < 3 || verticals.len() < 2 {
+    if horizontals.len() < 3 {
         return Vec::new();
     }
 
+    // If no/very-few vertical lines are drawn, try to derive column edges
+    // from the x-endpoints of the horizontal-rule segments. Catalog and
+    // archival-finding-aid layouts commonly draw each row's horizontal
+    // rule as N segments (one per cell), with no vertical dividers at
+    // all — the segment break points encode the column boundaries.
+    let implicit_col_edges: Option<Vec<f32>> = if verticals.len() < 2 {
+        derive_columns_from_horizontal_segments(&horizontals)
+    } else {
+        None
+    };
+    if verticals.len() < 2 && implicit_col_edges.is_none() {
+        return Vec::new();
+    }
+    let cols_from_segments = implicit_col_edges.is_some();
+
     log::debug!(
-        "detect_lines p{}: {} horiz, {} vert lines (of {} total on page)",
+        "detect_lines p{}: {} horiz, {} vert lines (of {} total on page){}",
         page,
         horizontals.len(),
         verticals.len(),
-        page_lines.len()
+        page_lines.len(),
+        if cols_from_segments {
+            " — columns from horizontal segments"
+        } else {
+            ""
+        }
     );
 
     // Snap Y-values of horizontal lines → row edges
     let h_ys: Vec<f32> = horizontals.iter().map(|(y, _, _)| *y).collect();
     let row_edges = snap_edges(&h_ys, 3.0);
 
-    // Snap X-values of vertical lines → column edges
-    let v_xs: Vec<f32> = verticals.iter().map(|(x, _, _)| *x).collect();
-    let col_edges = snap_edges(&v_xs, 3.0);
+    // Column edges from drawn verticals when present, else from the
+    // horizontal-segment endpoints derived above.
+    let col_edges = if let Some(c) = implicit_col_edges {
+        c
+    } else {
+        let v_xs: Vec<f32> = verticals.iter().map(|(x, _, _)| *x).collect();
+        snap_edges(&v_xs, 3.0)
+    };
 
     log::debug!(
         "detect_lines p{}: {} row edges, {} col edges after snap",
@@ -152,24 +240,33 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
 
     // Validate vertical lines: at least 2 should span a meaningful height.
     // Full spanning (>30%) is ideal, but accept many shorter lines (>10%)
-    // for tables with partial column separators.
-    let spanning_v = verticals
-        .iter()
-        .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.3)
-        .count();
-    let partial_v = verticals
-        .iter()
-        .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.10)
-        .count();
-    if spanning_v < 2 && partial_v < 4 {
-        log::debug!(
-            "detect_lines p{}: rejected — {} spanning + {} partial V lines",
-            page,
-            spanning_v,
-            partial_v
-        );
-        return Vec::new();
-    }
+    // for tables with partial column separators. Skipped entirely when
+    // columns came from horizontal-segment endpoints — there are no
+    // vertical lines to validate against, and the segment-endpoint
+    // consistency check in `derive_columns_from_horizontal_segments`
+    // is the equivalent guard.
+    let spanning_v = if cols_from_segments {
+        0
+    } else {
+        let s = verticals
+            .iter()
+            .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.3)
+            .count();
+        let p = verticals
+            .iter()
+            .filter(|(_, y_min, y_max)| (y_max - y_min) > table_height * 0.10)
+            .count();
+        if s < 2 && p < 4 {
+            log::debug!(
+                "detect_lines p{}: rejected — {} spanning + {} partial V lines",
+                page,
+                s,
+                p
+            );
+            return Vec::new();
+        }
+        s
+    };
 
     // Row edges need to be in descending order (top of page = higher Y first)
     let mut row_edges_desc = row_edges;
@@ -414,6 +511,66 @@ mod tests {
 
         let tables = detect_tables_from_lines(&items, &lines, 1);
         assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_horizontal_segments_only_implicit_columns_accepted() {
+        // Catalog/finding-aid pattern: each row's horizontal rule is
+        // drawn as 3 segments at consistent x-endpoints (50, 127, 485,
+        // 562), with no vertical lines anywhere. The segment break
+        // points must be inferred as column edges.
+        let mut lines = Vec::new();
+        // Slightly uneven row spacing so the chart-gridline rejector
+        // (CV < 0.02) doesn't fire.
+        let row_ys = [80.0_f32, 145.0, 215.0, 280.0, 350.0, 415.0, 485.0];
+        for &y in &row_ys {
+            lines.push(make_hline(y, 50.0, 127.0, 1));
+            lines.push(make_hline(y, 127.0, 485.0, 1));
+            lines.push(make_hline(y, 485.0, 562.0, 1));
+        }
+        // Populate every cell so capture / density checks pass.
+        let mut items = Vec::new();
+        for w in row_ys.windows(2) {
+            let row_y = (w[0] + w[1]) / 2.0;
+            items.push(make_item("id", 80.0, row_y, 1));
+            items.push(make_item("description here", 200.0, row_y, 1));
+            items.push(make_item("date", 510.0, row_y, 1));
+        }
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(
+            tables.len(),
+            1,
+            "horizontal-segment-only grid should be accepted"
+        );
+        let t = &tables[0];
+        assert!(
+            t.cells.len() >= 4,
+            "expected ≥4 rows, got {}",
+            t.cells.len()
+        );
+        assert_eq!(t.cells[0].len(), 3, "expected 3 columns");
+    }
+
+    #[test]
+    fn test_horizontal_segments_with_inconsistent_endpoints_rejected() {
+        // Decorative rules of varying widths shouldn't be detected as a
+        // table — each line has its own x-endpoints, no consistent
+        // column boundary survives the 50%-of-rows threshold.
+        let lines = vec![
+            make_hline(100.0, 50.0, 150.0, 1),
+            make_hline(200.0, 50.0, 220.0, 1),
+            make_hline(300.0, 50.0, 310.0, 1),
+            make_hline(400.0, 50.0, 470.0, 1),
+        ];
+        let items = vec![
+            make_item("decorative", 100.0, 150.0, 1),
+            make_item("text", 100.0, 250.0, 1),
+        ];
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert!(
+            tables.is_empty(),
+            "varying-width decorative rules should not be detected"
+        );
     }
 
     #[test]
