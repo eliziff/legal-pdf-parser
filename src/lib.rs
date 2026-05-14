@@ -772,6 +772,10 @@ pub fn extract_tables_in_regions_mem(
                 })
                 .unwrap_or_default();
 
+            // Total length of text the page extractor saw inside this
+            // region, used by the captured-fragment guard below.
+            let region_text_chars: usize = matched.iter().map(|i| i.text.chars().count()).sum();
+
             let evaluate = |t: &tables::Table| -> Option<String> {
                 let md = tables::table_to_markdown(t);
                 let trimmed = md.trim();
@@ -783,10 +787,24 @@ pub fn extract_tables_in_regions_mem(
                     || detect_encoding_issues(&md)
                     || looks_like_partial_table_ex(&md, true)
                 {
-                    None
-                } else {
-                    Some(md)
+                    return None;
                 }
+                // Reject extractions that only captured a small fraction
+                // of the text actually in the region. Two recurring
+                // failure shapes this catches:
+                //   - "header-only": detector found the column-header band
+                //     cleanly but missed every data row below (financial
+                //     statements with multi-line column headers + many
+                //     data rows are the dominant case).
+                //   - "sparse": detector returned a couple of fragmentary
+                //     cells even though the region has many lines of text.
+                // The region floor (200 chars) keeps short legitimate
+                // tables (timestamps, units, axis labels) from being
+                // rejected as partial.
+                if captured_only_a_fragment(&md, region_text_chars) {
+                    return None;
+                }
+                Some(md)
             };
 
             let mut accepted_md: Option<String> = None;
@@ -3608,6 +3626,28 @@ fn is_cid_garbage(text: &str) -> bool {
 /// anymore, only "can we extract it correctly?". Paragraph and duplicate-
 /// header checks stay, since those indicate genuine extraction quality
 /// issues regardless of how the region was identified.
+/// Return true when the captured table markdown represents only a small
+/// fraction of the text the page extractor actually saw inside the
+/// region — typically a header-only band or a sparse fragment where
+/// the detector found valid grid structure but missed most of the
+/// data rows below.
+///
+/// Tuned at a 25% floor: tables that captured at least a quarter of
+/// the region's text are treated as complete-enough. Below 25%, the
+/// caller falls back to `needs_ocr = true` so GLM-OCR can take over.
+/// The 200-char region floor keeps short legitimate tables (units,
+/// axis labels, single-row stat blocks) from being mis-flagged.
+fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
+    if region_text_chars <= 200 {
+        return false;
+    }
+    let captured_text_chars: usize = markdown
+        .chars()
+        .filter(|c| !matches!(c, '|' | '-' | '\n'))
+        .count();
+    captured_text_chars * 4 < region_text_chars
+}
+
 fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let lines: Vec<&str> = markdown.lines().filter(|l| l.starts_with('|')).collect();
     if lines.len() < 2 {
@@ -3759,6 +3799,57 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
 #[cfg(test)]
 fn looks_like_partial_table(markdown: &str) -> bool {
     looks_like_partial_table_ex(markdown, false)
+}
+
+#[cfg(test)]
+mod captured_only_a_fragment_tests {
+    use super::captured_only_a_fragment;
+
+    #[test]
+    fn small_region_skips_check() {
+        // Short legitimate tables (axis labels, unit blocks) shouldn't be
+        // flagged even when the captured markdown is tiny.
+        let md = "|Year|Value|\n|---|---|\n|2024|10|";
+        assert!(!captured_only_a_fragment(md, 50));
+    }
+
+    #[test]
+    fn full_table_passes() {
+        // Captured markdown matches the region text — full extraction.
+        let md =
+            "|Name|Year|Country|\n|---|---|---|\n|Alice|2020|US|\n|Bob|2021|UK|\n|Carol|2019|FR|";
+        // Region had ~50 chars of text (rough estimate of just the data words).
+        assert!(!captured_only_a_fragment(md, 50));
+        // Even a much larger region matched by the markdown content passes.
+        assert!(!captured_only_a_fragment(md, md.len()));
+    }
+
+    #[test]
+    fn header_only_extraction_rejected() {
+        // Captured the column-header band (~30 chars) while the region
+        // actually has many rows of data (~1500 chars).
+        let md = "|Description|Year|Amount|\n|---|---|---|";
+        assert!(captured_only_a_fragment(md, 1500));
+    }
+
+    #[test]
+    fn sparse_fragment_rejected() {
+        // A couple of fragment cells captured from a content-rich region.
+        let md = "|percent|for|\n|---|---|\n|sites|15|";
+        assert!(captured_only_a_fragment(md, 2000));
+    }
+
+    #[test]
+    fn boundary_at_25_percent_floor() {
+        // Right at the 25% line: 250 captured chars of 1000 region chars.
+        // The check rejects when captured*4 < region, so 250*4=1000 is NOT
+        // less than 1000 — boundary is treated as acceptable.
+        let md = "x".repeat(250);
+        assert!(!captured_only_a_fragment(&md, 1000));
+        // Just under 25%: 249*4=996 < 1000 — flagged.
+        let md_under = "x".repeat(249);
+        assert!(captured_only_a_fragment(&md_under, 1000));
+    }
 }
 
 #[cfg(test)]
