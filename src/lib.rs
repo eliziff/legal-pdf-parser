@@ -775,6 +775,7 @@ pub fn extract_tables_in_regions_mem(
             // Total length of text the page extractor saw inside this
             // region, used by the captured-fragment guard below.
             let region_text_chars: usize = matched.iter().map(|i| i.text.chars().count()).sum();
+            let region_area = (rx2 - rx1).max(0.0) * (ry2 - ry1).max(0.0);
             let line_region_has_vertical_rules = has_vertical_rules(&region_lines);
 
             let evaluate =
@@ -804,6 +805,22 @@ pub fn extract_tables_in_regions_mem(
                     // tables (timestamps, units, axis labels) from being
                     // rejected as partial.
                     if captured_only_a_fragment(&md, region_text_chars) {
+                        return None;
+                    }
+                    // Text-density floor: when a region has lots of pixel
+                    // real estate but very few text items, the page
+                    // extractor likely hit a font-CMap failure (Identity-H
+                    // fonts with missing or broken ToUnicode entries,
+                    // Type-3 fonts without unicode metadata, etc.). The
+                    // page extractor returns punctuation-only fragments or
+                    // single-glyph strings; the rendered image still has
+                    // the visible text, so the region should fall back to
+                    // OCR. `captured_only_a_fragment` compares captured
+                    // chars against text the extractor saw, which is
+                    // symmetrically low under font-decode failure — this
+                    // guard breaks that symmetry by comparing against
+                    // bbox area, which is independent of extraction.
+                    if region_text_density_too_low(region_text_chars, region_area) {
                         return None;
                     }
                     let shape = markdown_table_shape(&md);
@@ -3683,6 +3700,46 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
     captured_text_chars * 4 < region_text_chars
 }
 
+/// Return true when the text the page extractor saw inside this region
+/// is far too little for the bbox area — a strong signal that the page
+/// has a font-CMap failure: Identity-H fonts with missing or broken
+/// ToUnicode entries, Type-3 fonts without unicode metadata, etc. The
+/// rendered image still carries the visible text (so GLM-OCR will
+/// succeed), but the text extractor returns punctuation-only fragments
+/// or single-glyph repeats.
+///
+/// `captured_only_a_fragment` can't catch this case on its own because
+/// `region_text_chars` is itself symmetrically low under font-decode
+/// failure — the captured-vs-region ratio still looks fine when both
+/// numerator and denominator collapse. The area-based floor breaks the
+/// symmetry: bbox area is independent of extraction success.
+///
+/// Threshold of 0.003 chars/sq pt sits between observed clean
+/// extractions (≥0.005 chars/sq pt on full-page A4 tables, key/value
+/// layouts, archival catalogs) and observed font-decode failures
+/// (≤0.0014 chars/sq pt on the prod-traffic samples that motivated
+/// this guard).
+///
+/// Two char-count + area bounds keep the guard from misfiring:
+///   - text_chars < 20: too few chars to distinguish a font-decode
+///     failure from a synthetic / fragmentary fixture. Observed
+///     prod failures decode ≥30 chars before bottoming out.
+///   - area < 30,000 sq pt: tiny stat blocks where density is
+///     naturally low even for legitimate extractions.
+///   - area > 400,000 sq pt: near-whole-A4 bboxes include large
+///     white-space margins, so density is unreliable. Real font-
+///     decode failures present at typical table sizes
+///     (50k–400k sq pt).
+fn region_text_density_too_low(region_text_chars: usize, region_area: f32) -> bool {
+    if region_text_chars < 20 {
+        return false;
+    }
+    if !(30_000.0..=400_000.0).contains(&region_area) {
+        return false;
+    }
+    (region_text_chars as f32) / region_area < 0.003
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TableCandidateSource {
     Rect,
@@ -4269,6 +4326,87 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
 #[cfg(test)]
 fn looks_like_partial_table(markdown: &str) -> bool {
     looks_like_partial_table_ex(markdown, false)
+}
+
+#[cfg(test)]
+mod region_text_density_tests {
+    use super::region_text_density_too_low;
+
+    #[test]
+    fn small_region_skips_check() {
+        // Tiny stat blocks below the area floor are never flagged —
+        // can't distinguish "font failure" from "small legitimate table".
+        // 100×100 = 10,000 sq pt, below the 30,000 floor.
+        assert!(!region_text_density_too_low(5, 10_000.0));
+    }
+
+    #[test]
+    fn dense_full_table_passes() {
+        // Observed clean extractions sit at 0.005–0.015 chars/sq pt.
+        // Full A4 ledger: 438,000 sq pt with 6,500 chars → density 0.015.
+        assert!(!region_text_density_too_low(6_500, 438_000.0));
+    }
+
+    #[test]
+    fn moderate_density_table_passes() {
+        // Key/value tables with multi-line cells sit at ~0.005 chars/sq pt.
+        // 291,000 sq pt with 1,600 chars → density 0.0055.
+        assert!(!region_text_density_too_low(1_600, 291_000.0));
+    }
+
+    #[test]
+    fn font_decode_failure_caught() {
+        // Big region, almost no extractable text — page extractor hit a
+        // CMap failure. 102,000 sq pt with 46 chars → density 0.0005.
+        assert!(region_text_density_too_low(46, 102_000.0));
+    }
+
+    #[test]
+    fn sparse_glyph_repeat_caught() {
+        // Full-page Cyrillic where every glyph decoded to "Т". The text
+        // extractor returned a few hundred chars, but they're all the
+        // same letter. Density 0.00025 — well under the floor.
+        assert!(region_text_density_too_low(89, 353_000.0));
+    }
+
+    #[test]
+    fn sparse_layout_band_caught() {
+        // Specimen-materials horizontal band: real text decoded fine for
+        // the slice that's in-bbox, but the table extends below the
+        // bbox. 73,000 sq pt with 96 chars → density 0.0013.
+        assert!(region_text_density_too_low(96, 73_000.0));
+    }
+
+    #[test]
+    fn boundary_at_density_floor() {
+        // Right at the 0.003 floor: 90 chars / 30,000 sq pt = 0.003
+        // exactly. The check rejects when density is strictly less than
+        // the floor, so the boundary is treated as acceptable.
+        assert!(!region_text_density_too_low(90, 30_000.0));
+        // Just under: 89 chars / 30,000 = 0.00297 — flagged.
+        assert!(region_text_density_too_low(89, 30_000.0));
+    }
+
+    #[test]
+    fn whole_page_bbox_skips_check() {
+        // Near-whole-A4 bboxes (>400,000 sq pt) include large white-
+        // space margins, so text density is unreliable. Layout
+        // typically produces tight per-table bboxes; whole-page
+        // bboxes appear in fixtures and edge cases where this signal
+        // would misfire. 612×792 = 484,704 sq pt with 423 chars in
+        // a real table inside it.
+        assert!(!region_text_density_too_low(423, 484_704.0));
+    }
+
+    #[test]
+    fn tiny_text_chars_skips_check() {
+        // Synthetic / fragmentary fixtures with <20 chars in a
+        // generously-sized bbox aren't font-decode failures — they're
+        // unit-test artifacts. Real prod failures decode ≥30 chars.
+        // 8 chars in a 127,800 sq pt bbox would otherwise flag at
+        // density 0.00006.
+        assert!(!region_text_density_too_low(8, 127_800.0));
+    }
 }
 
 #[cfg(test)]
