@@ -227,6 +227,69 @@ fn extract_positioned_text_impl(
 // Shared helpers (used by submodules via `super::`)
 // ---------------------------------------------------------------------------
 
+/// Return true when this item should participate in text-layout
+/// heuristics (column detection, table grid detection, line grouping).
+///
+/// Image XObjects emit a positional placeholder via
+/// `extract_text_with_positions` (so layout-aware callers can crop +
+/// caption figures), but their bboxes don't carry text glyphs and would
+/// skew column/row clustering if they reached the heuristics. Hyperlinks
+/// and form fields *do* participate — the existing logic treats them as
+/// text-like and we keep that.
+pub(crate) fn is_text_layout_item(item: &crate::types::TextItem) -> bool {
+    !matches!(item.item_type, crate::types::ItemType::Image)
+}
+
+/// Map a (u, v) point in unit-square coordinates through the 6-element CTM
+/// to page-space. CTM format is `[a, b, c, d, e, f]` per
+/// [`multiply_matrices`].
+fn apply_ctm_point(ctm: &[f32; 6], u: f32, v: f32) -> (f32, f32) {
+    (
+        u * ctm[0] + v * ctm[2] + ctm[4],
+        u * ctm[1] + v * ctm[3] + ctm[5],
+    )
+}
+
+/// Compute the page-space axis-aligned bounding box of an Image XObject
+/// invoked under the given CTM.
+///
+/// Per the PDF spec, an image XObject is always rendered into a unit
+/// square `(0,0)–(1,1)` in its local coordinate system, and the `Do`
+/// operator applies the current CTM to position/scale/rotate that square
+/// onto the page. For the common axis-aligned case (no rotation/shear),
+/// the CTM reduces to `[w, 0, 0, h, x, y]` and the bbox is just
+/// `(x, y, w, h)`. For rotated/sheared images we transform all four
+/// corners and return their axis-aligned bbox so the caller always gets
+/// an upright rectangle.
+///
+/// Coordinates are PDF user space (origin at bottom-left, y-up). Width
+/// and height are non-negative.
+pub(crate) fn image_bbox_from_ctm(ctm: &[f32; 6]) -> (f32, f32, f32, f32) {
+    let corners = [
+        apply_ctm_point(ctm, 0.0, 0.0),
+        apply_ctm_point(ctm, 1.0, 0.0),
+        apply_ctm_point(ctm, 1.0, 1.0),
+        apply_ctm_point(ctm, 0.0, 1.0),
+    ];
+    let (mut x_min, mut x_max) = (corners[0].0, corners[0].0);
+    let (mut y_min, mut y_max) = (corners[0].1, corners[0].1);
+    for (cx, cy) in corners.iter().skip(1) {
+        if *cx < x_min {
+            x_min = *cx;
+        }
+        if *cx > x_max {
+            x_max = *cx;
+        }
+        if *cy < y_min {
+            y_min = *cy;
+        }
+        if *cy > y_max {
+            y_max = *cy;
+        }
+    }
+    (x_min, y_min, x_max - x_min, y_max - y_min)
+}
+
 /// Multiply two 2D transformation matrices
 /// Matrix format: [a, b, c, d, e, f] representing:
 /// | a  b  0 |

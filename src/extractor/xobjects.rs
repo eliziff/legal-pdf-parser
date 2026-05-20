@@ -10,7 +10,7 @@ use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
 };
-use super::{get_number, multiply_matrices};
+use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
@@ -262,19 +262,43 @@ fn extract_form_xobject_text_inner(
                 if !op.operands.is_empty() {
                     if let Ok(name) = op.operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
-                        if let Some(XObjectType::Form(nested_id)) = form_xobjects.get(&xobj_name) {
-                            if depth < MAX_FORM_XOBJECT_DEPTH {
-                                let nested_items = extract_form_xobject_text_inner(
-                                    doc,
-                                    *nested_id,
-                                    page_num,
-                                    font_cmaps,
-                                    &ctm,
-                                    cmap_decisions,
-                                    depth + 1,
-                                );
-                                items.extend(nested_items);
+                        match form_xobjects.get(&xobj_name) {
+                            Some(XObjectType::Form(nested_id)) => {
+                                if depth < MAX_FORM_XOBJECT_DEPTH {
+                                    let nested_items = extract_form_xobject_text_inner(
+                                        doc,
+                                        *nested_id,
+                                        page_num,
+                                        font_cmaps,
+                                        &ctm,
+                                        cmap_decisions,
+                                        depth + 1,
+                                    );
+                                    items.extend(nested_items);
+                                }
                             }
+                            Some(XObjectType::Image) => {
+                                // Mirror the top-level Image-XObject emission
+                                // in content_stream.rs so figures embedded
+                                // inside Form XObjects (common in print-to-PDF
+                                // workflows) aren't silently dropped.
+                                let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                items.push(TextItem {
+                                    text: format!("[Image: {}]", xobj_name),
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                    font: String::new(),
+                                    font_size: 0.0,
+                                    page: page_num,
+                                    is_bold: false,
+                                    is_italic: false,
+                                    item_type: ItemType::Image,
+                                    mcid: None,
+                                });
+                            }
+                            None => {}
                         }
                     }
                 }

@@ -231,6 +231,15 @@ pub fn detect_tables_from_rects(
     rects: &[PdfRect],
     page: u32,
 ) -> (Vec<Table>, Vec<RectHintRegion>) {
+    // Strip Image placeholders before column/row clustering — an image's bbox
+    // would otherwise show up as a spurious column edge. See `is_text_layout_item`.
+    let items_owned: Vec<TextItem> = items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .cloned()
+        .collect();
+    let items = items_owned.as_slice();
+
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
     for r in rects {

@@ -422,7 +422,16 @@ impl Default for MarkdownOptions {
             fix_hyphenation: true,
             detect_bold: true,
             detect_italic: true,
-            include_images: true,
+            // `include_images: false` is intentional. The content-stream walker
+            // now emits `ItemType::Image` `TextItem`s for every Image XObject
+            // it encounters (see `extractor/content_stream.rs`). If we rendered
+            // those into markdown by default, every existing caller would
+            // suddenly see `![Image: Im0](image)` placeholders inserted
+            // throughout their output — a silent regression for anyone who
+            // upgrades. Image bboxes are still available via
+            // `extract_text_with_positions` for callers (e.g. layout-aware
+            // pipelines) that want to crop + caption figures themselves.
+            include_images: false,
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,

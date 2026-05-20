@@ -2,13 +2,14 @@
 
 use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
+use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, process_pdf_mem,
-    process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions, PdfType,
-    TextItem,
+    extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
+    process_pdf_mem, process_pdf_with_options, to_markdown, MarkdownOptions, PdfError, PdfOptions,
+    PdfType, TextItem,
 };
 use std::collections::HashSet;
 
@@ -3390,4 +3391,187 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
          pages_needing_ocr={:?}",
         result.pages_needing_ocr
     );
+}
+
+// ============================================================================
+// Image XObject emission
+// ============================================================================
+
+/// Build a minimal PDF containing one Image XObject placed at a known CTM.
+/// `image_ctm` is the 6-element matrix applied to the unit square by the
+/// `Do` operator (per PDF spec section 8.9.5 "Image Coordinate System").
+/// For an axis-aligned image at `(x, y)` with size `w × h`, that's
+/// `[w, 0, 0, h, x, y]`.
+fn make_pdf_with_image(image_ctm: [f32; 6]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    // 1: catalog → 2: pages → 3: page with XObject /Im0 → 4: content stream
+    // 5: font → 6: image XObject (1×1 grayscale)
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    let [a, b, c, d, e, f] = image_ctm;
+    // BT/ET around a small text item just so the page isn't classified as
+    // image-only (which would route to a different code path). Then save
+    // graphics state, apply the image CTM, invoke Im0, restore.
+    let content = format!(
+        "BT /F1 12 Tf 100 700 Td (Hi) Tj ET\nq {} {} {} {} {} {} cm /Im0 Do Q",
+        a, b, c, d, e, f
+    );
+    add_stream_object(&mut pdf, &mut offsets, 4, "", content.as_bytes());
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    // 1×1 grayscale image; the single byte is mid-gray. Contents don't
+    // matter to the extractor — it only cares about the XObject's
+    // /Subtype and the CTM at the `Do` operator.
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_extract_text_with_positions_emits_image_bboxes() {
+    // Place a 200×100 image at (50, 600) in PDF user space (origin
+    // bottom-left). The Do operator applies the CTM to a unit square,
+    // so for an axis-aligned image, CTM = [w, 0, 0, h, x, y].
+    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0]);
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+
+    let images: Vec<&TextItem> = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Image))
+        .collect();
+    assert_eq!(
+        images.len(),
+        1,
+        "expected exactly one Image item, got items: {:?}",
+        items
+            .iter()
+            .map(|i| (&i.text, &i.item_type))
+            .collect::<Vec<_>>()
+    );
+    let img = images[0];
+    assert!((img.x - 50.0).abs() < 0.01, "x={}", img.x);
+    assert!((img.y - 600.0).abs() < 0.01, "y={}", img.y);
+    assert!((img.width - 200.0).abs() < 0.01, "width={}", img.width);
+    assert!((img.height - 100.0).abs() < 0.01, "height={}", img.height);
+    assert_eq!(img.page, 1);
+    // text field carries the legacy `[Image: <resource-name>]` form that
+    // the markdown emitter already knows how to parse.
+    assert_eq!(img.text, "[Image: Im0]");
+}
+
+#[test]
+fn test_image_xobject_bbox_handles_rotated_ctm() {
+    // 90° rotation CTM: a unit square at the origin maps to a square
+    // rotated counter-clockwise about (0,0), then translated to (200, 300).
+    // For a 100×100 image, that's CTM = [0, 100, -100, 0, 200, 300]
+    // (apply the rotation: (1,0) → (0,100); (0,1) → (-100,0)).
+    // The page-space corners are:
+    //   (0,0) → (200, 300)
+    //   (1,0) → (200, 400)
+    //   (1,1) → (100, 400)
+    //   (0,1) → (100, 300)
+    // → AABB: x=100..200 (w=100), y=300..400 (h=100).
+    let pdf = make_pdf_with_image([0.0, 100.0, -100.0, 0.0, 200.0, 300.0]);
+    let items = extract_text_with_positions_mem(&pdf).expect("extract");
+    let img = items
+        .iter()
+        .find(|i| matches!(i.item_type, ItemType::Image))
+        .expect("image item");
+    assert!((img.x - 100.0).abs() < 0.01, "x={}", img.x);
+    assert!((img.y - 300.0).abs() < 0.01, "y={}", img.y);
+    assert!((img.width - 100.0).abs() < 0.01, "width={}", img.width);
+    assert!((img.height - 100.0).abs() < 0.01, "height={}", img.height);
+}
+
+#[test]
+fn test_image_emission_does_not_change_default_markdown() {
+    // Default `MarkdownOptions::include_images = false` — adding image
+    // emission MUST NOT make `extract_pages_markdown` start producing
+    // `![Image: …]` placeholders for everyone. Existing callers that
+    // upgrade should see no diff in their markdown.
+    let pdf = make_pdf_with_image([200.0, 0.0, 0.0, 100.0, 50.0, 600.0]);
+    let result = extract_pages_markdown_mem(&pdf, None).expect("extract");
+    assert_eq!(result.pages.len(), 1);
+    assert!(
+        !result.pages[0].markdown.contains("Image:"),
+        "default markdown leaked an image placeholder: {:?}",
+        result.pages[0].markdown
+    );
+}
+
+#[test]
+fn test_markdown_options_default_has_include_images_false() {
+    // Explicit assertion so anyone flipping this back catches it in CI.
+    // See `MarkdownOptions::default` in src/markdown/mod.rs for the
+    // long-form rationale.
+    let opts = MarkdownOptions::default();
+    assert!(!opts.include_images);
 }

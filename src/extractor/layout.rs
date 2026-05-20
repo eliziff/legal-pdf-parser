@@ -29,8 +29,12 @@ pub(crate) fn detect_columns(
     const MIN_ITEMS_PER_COLUMN: usize = 10;
     const NOISE_FRACTION: f32 = 0.15;
 
-    // Get items for this page
-    let page_items: Vec<&TextItem> = items.iter().filter(|i| i.page == page).collect();
+    // Get items for this page. Strip Image placeholders — an image's left edge
+    // would otherwise count toward the column projection profile.
+    let page_items: Vec<&TextItem> = items
+        .iter()
+        .filter(|i| i.page == page && crate::extractor::is_text_layout_item(i))
+        .collect();
 
     if page_items.is_empty() {
         return vec![];

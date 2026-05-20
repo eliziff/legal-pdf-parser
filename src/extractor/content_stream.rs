@@ -18,7 +18,7 @@ use super::fonts::{
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
 };
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
-use super::{get_number, multiply_matrices};
+use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
 ///
@@ -664,7 +664,29 @@ pub(crate) fn extract_page_text_items(
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
                                 XObjectType::Image => {
-                                    // Skip images — text extraction only
+                                    // Emit a positional placeholder for the image
+                                    // so downstream consumers (layout-aware
+                                    // pipelines, figure-OCR routers) can locate
+                                    // raster figures without parsing the PDF
+                                    // again. The text field carries the
+                                    // XObject resource name in the legacy
+                                    // `[Image: Im0]` format that the markdown
+                                    // emitter already recognizes.
+                                    let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                    items.push(TextItem {
+                                        text: format!("[Image: {}]", xobj_name),
+                                        x,
+                                        y,
+                                        width,
+                                        height,
+                                        font: String::new(),
+                                        font_size: 0.0,
+                                        page: page_num,
+                                        is_bold: false,
+                                        is_italic: false,
+                                        item_type: ItemType::Image,
+                                        mcid: current_mcid(&marked_content_stack),
+                                    });
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
