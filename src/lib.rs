@@ -823,7 +823,9 @@ pub fn extract_tables_in_regions_mem(
                     // symmetrically low under font-decode failure — this
                     // guard breaks that symmetry by comparing against
                     // bbox area, which is independent of extraction.
-                    if region_text_density_too_low(region_text_chars, region_area) {
+                    if region_text_density_too_low(region_text_chars, region_area)
+                        && !markdown_table_body_is_dense(&md)
+                    {
                         return None;
                     }
                     let shape = markdown_table_shape(&md);
@@ -834,7 +836,9 @@ pub fn extract_tables_in_regions_mem(
                         Some(TableCandidateIssue::LineRowUndercount)
                     } else if wide_table_sparse_prefix_undercount(&md) {
                         Some(TableCandidateIssue::SparseWideUndercount)
-                    } else if text_cluster_column_undercount(&matched, shape) {
+                    } else if source != TableCandidateSource::Line
+                        && text_cluster_column_undercount(&matched, shape)
+                    {
                         Some(TableCandidateIssue::TextColumnUndercount)
                     } else if prose_grid_fragment_needs_ocr(&md) {
                         Some(TableCandidateIssue::ProseGridFragment)
@@ -4253,12 +4257,21 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     }
 
     // Failure mode 2: header has empty cells in a multi-column table.
-    // When layout-assisted, allow up to 1 empty header cell (common in
-    // tables with merged/spanning header cells that we can't represent).
-    let empty_count = header_cells.iter().filter(|c| c.is_empty()).count();
+    // When layout-assisted, tolerate merged/spanning header gaps if the
+    // body is dense. Region bboxes from a layout model often start at a
+    // visual table whose header cannot be represented faithfully in a
+    // flat pipe table, while the body rows are still complete enough to use.
+    let header_empty_indices: Vec<usize> = header_cells
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cell)| cell.is_empty().then_some(idx))
+        .collect();
+    let empty_count = header_empty_indices.len();
     if layout_assisted {
-        // Reject only if >1 empty header cell (2+ means serious boundary issue)
-        if n_cols >= 3 && empty_count >= 2 {
+        if n_cols >= 3
+            && empty_count >= 2
+            && !layout_assisted_empty_header_has_dense_body(markdown, n_cols)
+        {
             return true;
         }
     } else if n_cols >= 3 && empty_count >= 1 {
@@ -4296,7 +4309,14 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
             // (totals, subtotals) are common.
             let threshold = if layout_assisted { 2 } else { 3 };
             if n_cols >= 3 && empty_data * threshold >= n_cols {
-                return true;
+                let sparse_row_shares_header_spacer = layout_assisted
+                    && data_inner.iter().enumerate().any(|(idx, cell)| {
+                        cell.trim().is_empty() && header_empty_indices.contains(&idx)
+                    })
+                    && layout_assisted_empty_header_has_dense_body(markdown, n_cols);
+                if !sparse_row_shares_header_spacer {
+                    return true;
+                }
             }
         }
     }
@@ -4352,6 +4372,68 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     }
 
     false
+}
+
+fn layout_assisted_empty_header_has_dense_body(markdown: &str, n_cols: usize) -> bool {
+    let rows = markdown_pipe_rows(markdown);
+    let data_rows: Vec<&Vec<&str>> = rows
+        .iter()
+        .skip(1)
+        .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .collect();
+    if data_rows.len() < 2 || n_cols < 3 {
+        return false;
+    }
+
+    let total_cells = data_rows.len() * n_cols;
+    let mut filled_cells = 0usize;
+    let mut rows_with_multiple_cells = 0usize;
+    let mut max_filled_in_row = 0usize;
+    for row in &data_rows {
+        let filled = row.iter().filter(|cell| !cell.trim().is_empty()).count();
+        filled_cells += filled;
+        max_filled_in_row = max_filled_in_row.max(filled);
+        if filled >= 2 {
+            rows_with_multiple_cells += 1;
+        }
+    }
+
+    // Dense enough to be a useful extraction despite lossy merged headers.
+    // The row-count gate avoids accepting a single tidy row under a broken
+    // header, and the density gate keeps sparse fragments on the OCR path.
+    rows_with_multiple_cells * 2 >= data_rows.len()
+        && max_filled_in_row >= n_cols.min(3)
+        && filled_cells * 100 >= total_cells * 45
+}
+
+fn markdown_table_body_is_dense(markdown: &str) -> bool {
+    let rows = markdown_pipe_rows(markdown);
+    let data_rows: Vec<&Vec<&str>> = rows
+        .iter()
+        .skip(1)
+        .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .collect();
+    if data_rows.len() < 3 {
+        return false;
+    }
+
+    let cols = rows.iter().map(|row| row.len()).max().unwrap_or_default();
+    if cols < 3 {
+        return false;
+    }
+
+    let mut filled_cells = 0usize;
+    let mut rows_with_multiple_cells = 0usize;
+    for row in &data_rows {
+        let filled = row.iter().filter(|cell| !cell.trim().is_empty()).count();
+        filled_cells += filled;
+        if filled >= cols.min(3) {
+            rows_with_multiple_cells += 1;
+        }
+    }
+
+    let total_cells = data_rows.len() * cols;
+    rows_with_multiple_cells * 2 >= data_rows.len() && filled_cells * 100 >= total_cells * 45
 }
 
 /// Original strict validation (no layout assistance). Used by tests and
@@ -4809,7 +4891,9 @@ mod table_candidate_selection_tests {
 
 #[cfg(test)]
 mod looks_like_partial_table_tests {
-    use super::{looks_like_partial_table, looks_like_partial_table_ex};
+    use super::{
+        looks_like_partial_table, looks_like_partial_table_ex, markdown_table_body_is_dense,
+    };
 
     #[test]
     fn good_table_passes() {
@@ -4944,11 +5028,29 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn two_empty_headers_still_rejected_when_layout_assisted() {
-        // 2+ empty headers is still bad even with layout assistance.
+        // A single tidy row is not enough evidence to trust a badly gapped header.
         let md = "|A|||D|\n|---|---|---|---|\n|x|y|z|w|";
         assert!(
             looks_like_partial_table_ex(md, true),
-            "2 empty headers rejected even layout-assisted"
+            "2 empty headers with only one body row are rejected even layout-assisted"
+        );
+    }
+
+    #[test]
+    fn dense_body_with_empty_merged_header_passes_when_layout_assisted() {
+        let md = "|Year||Unadjusted Basis|||\n\
+                  |---|---|---|---|---|\n\
+                  |1|.1667|$100,000|$16,670|$16,670|\n\
+                  |2|.3333|$100,000|$33,330|$50,000|\n\
+                  |3|.3333|$100,000|$33,330|$88,330|\n\
+                  |4|.1667|$100,000|$16,670|$100,000|";
+        assert!(
+            looks_like_partial_table(md),
+            "strict mode still rejects merged-header gaps"
+        );
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "layout-assisted should trust a dense body under a merged header"
         );
     }
 
@@ -4970,6 +5072,22 @@ mod looks_like_partial_table_tests {
         assert!(
             !looks_like_partial_table_ex(md3, true),
             "layout-assisted: 33% accepted"
+        );
+    }
+
+    #[test]
+    fn sparse_first_row_with_header_spacer_passes_when_layout_assisted() {
+        let md = "|Properties|Instruction||Training Datasets Alignment|\n\
+                  |---|---|---|---|\n\
+                  ||Alpaca-GPT4 OpenOrca Synth. Math-Instruct||Orca DPO Pairs Ultrafeedback Cleaned|\n\
+                  |Total # Samples|52K 2.91M 126K||12.9K 60.8K 126K|";
+        assert!(
+            looks_like_partial_table(md),
+            "strict mode rejects the sparse first row"
+        );
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "layout-assisted should allow sparse rows that share a header spacer column"
         );
     }
 
@@ -5025,6 +5143,27 @@ mod looks_like_partial_table_tests {
             looks_like_partial_table_ex(md, true),
             "duplicate headers rejected even layout-assisted"
         );
+    }
+
+    #[test]
+    fn dense_numeric_table_body_is_structurally_trusted() {
+        let md = "|Year|3-Year|5-Year|7-Year|\n\
+                  |---|---|---|---|\n\
+                  |1|33.0%|20.00%|14.29%|\n\
+                  |2|44.45%|32.00%|24.49%|\n\
+                  |3|14.81%|19.20%|17.49%|\n\
+                  |4|7.41%|11.52%|12.49%|";
+        assert!(markdown_table_body_is_dense(md));
+    }
+
+    #[test]
+    fn sparse_markdown_fragment_is_not_structurally_trusted() {
+        let md = "|A|B|C|D|\n\
+                  |---|---|---|---|\n\
+                  |x||||\n\
+                  |||y||\n\
+                  ||||z|";
+        assert!(!markdown_table_body_is_dense(md));
     }
 }
 
