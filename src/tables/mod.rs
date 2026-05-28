@@ -460,6 +460,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
             item_indices.push(item_idx);
         }
     }
+    merge_superscript_marker_rows(&mut row_ys, &mut cells);
 
     // Validate: need reasonable fill rate
     let total_cells = row_ys.len() * columns.len();
@@ -545,6 +546,60 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     );
 
     Some(Table::new(col_xs, row_ys, cells, item_indices))
+}
+
+fn merge_superscript_marker_rows(row_ys: &mut Vec<f32>, cells: &mut Vec<Vec<String>>) {
+    let mut row_idx = 0;
+    while row_idx < cells.len() {
+        let non_empty: Vec<(usize, String)> = cells[row_idx]
+            .iter()
+            .enumerate()
+            .filter_map(|(col_idx, cell)| {
+                let trimmed = cell.trim();
+                (!trimmed.is_empty()).then_some((col_idx, trimmed.to_string()))
+            })
+            .collect();
+
+        if non_empty.len() != 1 || !is_superscript_marker_cell(&non_empty[0].1) {
+            row_idx += 1;
+            continue;
+        }
+
+        let (marker_col, marker) = &non_empty[0];
+        let prev =
+            (row_idx > 0).then(|| (row_idx - 1, (row_ys[row_idx - 1] - row_ys[row_idx]).abs()));
+        let next = (row_idx + 1 < cells.len())
+            .then(|| (row_idx + 1, (row_ys[row_idx] - row_ys[row_idx + 1]).abs()));
+        let target = [prev, next]
+            .into_iter()
+            .flatten()
+            .filter(|(_, gap)| *gap <= 10.0)
+            .min_by(|(_, gap_a), (_, gap_b)| gap_a.total_cmp(gap_b))
+            .map(|(idx, _)| idx);
+
+        let Some(target_idx) = target else {
+            row_idx += 1;
+            continue;
+        };
+
+        let target_cell = &mut cells[target_idx][*marker_col];
+        if target_cell.trim().is_empty() {
+            *target_cell = marker.to_string();
+        } else {
+            target_cell.push_str(marker);
+        }
+        cells.remove(row_idx);
+        row_ys.remove(row_idx);
+    }
+}
+
+fn is_superscript_marker_cell(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= 2
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '*' | '#' | 'o' | 'O' | '°' | 'º' | '†' | '‡'))
 }
 
 /// What kind of structure a detected `Table` represents. Classification is
@@ -687,6 +742,69 @@ mod tests {
         assert!(md.contains("|Header 1|"));
         assert!(md.contains("|---|"));
         assert!(md.contains("|Cell 1|"));
+    }
+
+    #[test]
+    fn test_merge_superscript_marker_rows() {
+        let mut rows = vec![506.0, 500.0, 480.0];
+        let mut cells = vec![
+            vec!["".into(), "".into(), "*".into()],
+            vec!["Name".into(), "Method".into(), "Typical values".into()],
+            vec!["Flow".into(), "ASTM D1238".into(), "3.0".into()],
+        ];
+
+        merge_superscript_marker_rows(&mut rows, &mut cells);
+
+        assert_eq!(rows, vec![500.0, 480.0]);
+        assert_eq!(cells[0][2], "Typical values*");
+    }
+
+    #[test]
+    fn test_column_builder_handles_borderless_specs_table() {
+        let items = vec![
+            make_char("*", 458.1, 544.2, 8.0, 4.4),
+            make_char("Properties", 36.0, 538.6, 12.0, 53.1),
+            make_char("Conditions", 195.8, 538.6, 12.0, 55.0),
+            make_char("Method", 297.2, 538.6, 12.0, 39.4),
+            make_char("Typical values", 384.1, 538.6, 12.0, 74.0),
+            make_char("Units", 510.6, 538.6, 8.0, 17.9),
+            make_char("Rheology", 36.0, 508.3, 10.0, 40.6),
+            make_char("o", 209.8, 492.5, 6.5, 3.5),
+            make_char("Melt Flow Rate", 36.0, 488.0, 10.0, 65.2),
+            make_char("230 ", 190.4, 488.0, 10.0, 19.4),
+            make_char("C/2.16 kg", 213.3, 488.0, 10.0, 42.8),
+            make_char("ASTM D1238", 288.4, 488.0, 10.0, 56.8),
+            make_char("3.0 ", 416.4, 488.0, 10.0, 16.9),
+            make_char("g/10 min", 504.1, 488.0, 10.0, 39.5),
+            make_char("Mechanical", 36.0, 451.5, 10.0, 48.3),
+            make_char("Tensile Stress at Yield", 36.0, 431.3, 10.0, 96.7),
+            make_char("50 mm/min", 197.9, 431.3, 10.0, 50.8),
+            make_char("ASTM D638", 291.2, 431.3, 10.0, 51.3),
+            make_char("31 ", 417.9, 431.3, 10.0, 13.9),
+            make_char("MPa", 514.7, 431.3, 10.0, 18.4),
+            make_char("Elongation at Yield", 36.0, 403.0, 10.0, 82.2),
+            make_char("50 mm/min", 197.9, 403.0, 10.0, 50.8),
+            make_char("ASTM D638", 291.2, 403.0, 10.0, 51.3),
+            make_char("8 ", 420.6, 403.0, 10.0, 8.5),
+            make_char("%", 519.1, 403.0, 10.0, 9.7),
+            make_char("Flexural Modulus", 36.0, 374.6, 10.0, 74.0),
+            make_char("ASTM D790", 291.2, 374.6, 10.0, 51.3),
+            make_char("1400", 412.4, 374.6, 10.0, 21.8),
+            make_char("MPa", 514.7, 374.6, 10.0, 18.4),
+        ];
+
+        let table = try_build_table_from_columns(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(
+            md.contains("|Properties|Conditions|Method|Typical values*|Units|"),
+            "{md}"
+        );
+        assert!(md.contains("|Mechanical|||||"), "{md}");
+        assert!(
+            md.contains("|Flexural Modulus||ASTM D790|1400|MPa|"),
+            "{md}"
+        );
     }
 
     #[test]

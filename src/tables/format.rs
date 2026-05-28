@@ -208,6 +208,24 @@ fn looks_like_compact_entry_label(cell: &str) -> bool {
     (1..=6).contains(&words)
 }
 
+fn looks_like_plain_section_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 4 || trimmed.len() > 40 {
+        return false;
+    }
+    if trimmed.ends_with(['.', ',', ';', ':']) || trimmed.contains(|ch: char| ch.is_ascii_digit()) {
+        return false;
+    }
+    if trimmed.len() <= 4 && trimmed.chars().all(|ch| !ch.is_lowercase()) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_alphabetic() || ch.is_whitespace() || matches!(ch, '&' | '/' | '-'))
+        && starts_with_uppercase_alpha(trimmed)
+        && (1..=4).contains(&alpha_word_count(trimmed))
+}
+
 fn ends_like_incomplete_phrase(cell: &str) -> bool {
     let lower = cell.trim_end().to_ascii_lowercase();
     lower.ends_with(" and")
@@ -305,6 +323,10 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .and_then(|r| r.first())
             .map(|c| c.trim())
             .unwrap_or("");
+        let header_filled = cleaned
+            .first()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(num_cols);
         let looks_like_spanning_first_column_row = first_cell.is_empty()
             && row.len() >= 4
             && non_first_cells.len() == row.len().saturating_sub(1)
@@ -328,6 +350,10 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && non_first_cells
                 .iter()
                 .any(|cell| looks_like_compact_entry_label(cell));
+        let looks_like_section_label_row = !first_cell.is_empty()
+            && filled_cells == 1
+            && header_filled >= 3
+            && looks_like_plain_section_label(first_cell);
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -344,10 +370,6 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .last()
             .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
             .unwrap_or(0);
-        let header_filled = cleaned
-            .first()
-            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
-            .unwrap_or(num_cols);
         // Merge when the row has significantly fewer filled cells than header.
         // For wide tables (5+ cols), require ≤50% of header cells.
         // For narrow tables (2-4 cols), require fewer than header cells.
@@ -369,6 +391,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
             && !looks_like_new_first_column_entry
+            && !looks_like_section_label_row
             && !is_short_subheader;
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
@@ -512,6 +535,44 @@ mod tests {
         assert_eq!(cleaned.len(), 2);
         assert!(cleaned[1][1].contains("Short"));
         assert!(cleaned[1][1].contains("continued text here"));
+    }
+
+    #[test]
+    fn test_clean_table_cells_first_column_section_label_not_merged() {
+        let cells = vec![
+            vec![
+                "Properties".into(),
+                "Conditions".into(),
+                "Method".into(),
+                "Typical values".into(),
+                "Units".into(),
+            ],
+            vec![
+                "Melt Flow Rate".into(),
+                "230 C/2.16 kg".into(),
+                "ASTM D1238".into(),
+                "3.0".into(),
+                "g/10 min".into(),
+            ],
+            vec![
+                "Mechanical".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "Tensile Stress at Yield".into(),
+                "50 mm/min".into(),
+                "ASTM D638".into(),
+                "31".into(),
+                "MPa".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2][0], "Mechanical");
     }
 
     #[test]

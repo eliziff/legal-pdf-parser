@@ -881,6 +881,11 @@ pub fn extract_tables_in_regions_mem(
             {
                 candidates.push(candidate);
             }
+            if let Some(table) = tables::try_build_table_from_columns(&matched, page_1idx) {
+                if let Some(candidate) = evaluate(TableCandidateSource::Column, &table) {
+                    candidates.push(candidate);
+                }
+            }
 
             match select_table_candidate(&candidates) {
                 Some(candidate) => page_results.push(RegionText {
@@ -3752,6 +3757,7 @@ enum TableCandidateSource {
     Rect,
     Line,
     Heuristic,
+    Column,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3786,8 +3792,10 @@ fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandida
     // serving a tidy-looking fragment.
     if first.issue == Some(TableCandidateIssue::LineRowUndercount) {
         return candidates.iter().find(|candidate| {
-            candidate.source == TableCandidateSource::Heuristic
-                && candidate.issue.is_none()
+            matches!(
+                candidate.source,
+                TableCandidateSource::Heuristic | TableCandidateSource::Column
+            ) && candidate.issue.is_none()
                 && candidate.shape.cols * 10 >= first.shape.cols * 13
         });
     }
@@ -3805,11 +3813,24 @@ fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandida
         TableCandidateSource::Rect | TableCandidateSource::Line
     ) {
         if let Some(heuristic) = candidates.iter().find(|candidate| {
-            candidate.source == TableCandidateSource::Heuristic
-                && candidate.issue.is_none()
+            matches!(
+                candidate.source,
+                TableCandidateSource::Heuristic | TableCandidateSource::Column
+            ) && candidate.issue.is_none()
                 && heuristic_substantially_better(candidate.shape, accepted.shape)
         }) {
             accepted = heuristic;
+        }
+    }
+
+    if accepted.source == TableCandidateSource::Heuristic {
+        if let Some(column) = candidates.iter().find(|candidate| {
+            candidate.source == TableCandidateSource::Column
+                && candidate.issue.is_none()
+                && candidate.shape.cols >= accepted.shape.cols
+                && candidate.shape.rows > accepted.shape.rows
+        }) {
+            accepted = column;
         }
     }
 
@@ -4314,7 +4335,9 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
                         cell.trim().is_empty() && header_empty_indices.contains(&idx)
                     })
                     && layout_assisted_empty_header_has_dense_body(markdown, n_cols);
-                if !sparse_row_shares_header_spacer {
+                let sparse_row_is_section_label = layout_assisted
+                    && layout_assisted_sparse_section_row_is_ok(data_inner, markdown, n_cols);
+                if !sparse_row_shares_header_spacer && !sparse_row_is_section_label {
                     return true;
                 }
             }
@@ -4404,6 +4427,26 @@ fn layout_assisted_empty_header_has_dense_body(markdown: &str, n_cols: usize) ->
     rows_with_multiple_cells * 2 >= data_rows.len()
         && max_filled_in_row >= n_cols.min(3)
         && filled_cells * 100 >= total_cells * 45
+}
+
+fn layout_assisted_sparse_section_row_is_ok(row: &[&str], markdown: &str, n_cols: usize) -> bool {
+    let labels: Vec<&str> = row
+        .iter()
+        .map(|cell| cell.trim())
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    if labels.len() != 1 {
+        return false;
+    }
+    let label = labels[0];
+    if label.len() > 40 || !label.chars().any(|ch| ch.is_alphabetic()) {
+        return false;
+    }
+    if label.ends_with('.') || label.ends_with('!') || label.ends_with('?') || label.ends_with(':')
+    {
+        return false;
+    }
+    layout_assisted_empty_header_has_dense_body(markdown, n_cols)
 }
 
 fn markdown_table_body_is_dense(markdown: &str) -> bool {
@@ -4788,6 +4831,16 @@ mod table_candidate_selection_tests {
     }
 
     #[test]
+    fn prefers_clean_column_fallback_when_it_recovers_more_rows() {
+        let candidates = vec![
+            candidate(TableCandidateSource::Heuristic, 6, 5, None),
+            candidate(TableCandidateSource::Column, 7, 5, None),
+        ];
+        let selected = select_table_candidate(&candidates).unwrap();
+        assert_eq!(selected.source, TableCandidateSource::Column);
+    }
+
+    #[test]
     fn line_candidate_collapsing_captured_y_clusters_is_suspicious() {
         let long = "value value value value value value value value value value value value";
         let items = vec![
@@ -5088,6 +5141,24 @@ mod looks_like_partial_table_tests {
         assert!(
             !looks_like_partial_table_ex(md, true),
             "layout-assisted should allow sparse rows that share a header spacer column"
+        );
+    }
+
+    #[test]
+    fn sparse_section_row_passes_when_layout_assisted_body_is_dense() {
+        let md = "|Properties|Conditions|Method|Typical values|Units|\n\
+                  |---|---|---|---|---|\n\
+                  |Rheology|||||\n\
+                  |Melt Flow Rate|230 C/2.16 kg|ASTM D1238|3.0|g/10 min|\n\
+                  |Tensile Stress at Yield|50 mm/min|ASTM D638|31|MPa|\n\
+                  |Elongation at Yield|50 mm/min|ASTM D638|8|%|";
+        assert!(
+            looks_like_partial_table(md),
+            "strict mode rejects the sparse first row"
+        );
+        assert!(
+            !looks_like_partial_table_ex(md, true),
+            "layout-assisted should allow a short section label above dense table rows"
         );
     }
 
