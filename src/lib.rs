@@ -823,7 +823,8 @@ pub fn extract_tables_in_regions_mem(
                     // symmetrically low under font-decode failure — this
                     // guard breaks that symmetry by comparing against
                     // bbox area, which is independent of extraction.
-                    if region_text_density_too_low(region_text_chars, region_area)
+                    if source != TableCandidateSource::KeyValue
+                        && region_text_density_too_low(region_text_chars, region_area)
                         && !markdown_table_body_is_dense(&md)
                     {
                         return None;
@@ -836,8 +837,10 @@ pub fn extract_tables_in_regions_mem(
                         Some(TableCandidateIssue::LineRowUndercount)
                     } else if wide_table_sparse_prefix_undercount(&md) {
                         Some(TableCandidateIssue::SparseWideUndercount)
-                    } else if source != TableCandidateSource::Line
-                        && text_cluster_column_undercount(&matched, shape)
+                    } else if !matches!(
+                        source,
+                        TableCandidateSource::Line | TableCandidateSource::KeyValue
+                    ) && text_cluster_column_undercount(&matched, shape)
                     {
                         Some(TableCandidateIssue::TextColumnUndercount)
                     } else if prose_grid_fragment_needs_ocr(&md) {
@@ -883,6 +886,11 @@ pub fn extract_tables_in_regions_mem(
             }
             if let Some(table) = tables::try_build_table_from_columns(&matched, page_1idx) {
                 if let Some(candidate) = evaluate(TableCandidateSource::Column, &table) {
+                    candidates.push(candidate);
+                }
+            }
+            if let Some(table) = tables::try_build_key_value_table_from_rows(&matched, page_1idx) {
+                if let Some(candidate) = evaluate(TableCandidateSource::KeyValue, &table) {
                     candidates.push(candidate);
                 }
             }
@@ -3758,6 +3766,7 @@ enum TableCandidateSource {
     Line,
     Heuristic,
     Column,
+    KeyValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3794,7 +3803,9 @@ fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandida
         return candidates.iter().find(|candidate| {
             matches!(
                 candidate.source,
-                TableCandidateSource::Heuristic | TableCandidateSource::Column
+                TableCandidateSource::Heuristic
+                    | TableCandidateSource::Column
+                    | TableCandidateSource::KeyValue
             ) && candidate.issue.is_none()
                 && candidate.shape.cols * 10 >= first.shape.cols * 13
         });
@@ -3815,7 +3826,9 @@ fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandida
         if let Some(heuristic) = candidates.iter().find(|candidate| {
             matches!(
                 candidate.source,
-                TableCandidateSource::Heuristic | TableCandidateSource::Column
+                TableCandidateSource::Heuristic
+                    | TableCandidateSource::Column
+                    | TableCandidateSource::KeyValue
             ) && candidate.issue.is_none()
                 && heuristic_substantially_better(candidate.shape, accepted.shape)
         }) {
@@ -3824,13 +3837,15 @@ fn select_table_candidate(candidates: &[TableCandidate]) -> Option<&TableCandida
     }
 
     if accepted.source == TableCandidateSource::Heuristic {
-        if let Some(column) = candidates.iter().find(|candidate| {
-            candidate.source == TableCandidateSource::Column
-                && candidate.issue.is_none()
+        if let Some(layout_candidate) = candidates.iter().find(|candidate| {
+            matches!(
+                candidate.source,
+                TableCandidateSource::Column | TableCandidateSource::KeyValue
+            ) && candidate.issue.is_none()
                 && candidate.shape.cols >= accepted.shape.cols
                 && candidate.shape.rows > accepted.shape.rows
         }) {
-            accepted = column;
+            accepted = layout_candidate;
         }
     }
 
