@@ -566,7 +566,7 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         })
         .collect();
 
-    if page_items.len() < 4 {
+    if page_items.len() < 2 {
         return None;
     }
 
@@ -575,15 +575,12 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         .max(1.0);
     let y_tol = (median_font_size * 0.75).clamp(4.0, 9.0);
     let rows = group_key_value_visual_rows(page_items, y_tol);
-    if rows.len() < 2 || rows.len() > 80 {
+    if rows.is_empty() || rows.len() > 80 {
         return None;
     }
 
     let split_x = infer_key_value_split_x(&rows, median_font_size)?;
     let mut kv_rows: Vec<KeyValueRow> = Vec::new();
-    let mut paired_rows = 0usize;
-    let mut section_rows = 0usize;
-    let mut left_label_like = 0usize;
     let mut left_starts = Vec::new();
     let mut right_starts = Vec::new();
 
@@ -609,18 +606,12 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         item_indices.dedup();
 
         if !left.is_empty() && !right.is_empty() {
-            paired_rows += 1;
-            if looks_like_key_value_label(&left) {
-                left_label_like += 1;
-            }
             if let Some(x) = left_items.first().map(|ri| ri.item.x) {
                 left_starts.push(x);
             }
             if let Some(x) = right_items.first().map(|ri| ri.item.x) {
                 right_starts.push(x);
             }
-        } else if !left.is_empty() {
-            section_rows += 1;
         }
 
         kv_rows.push(KeyValueRow {
@@ -631,11 +622,75 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         });
     }
 
-    if kv_rows.len() < 2 || paired_rows < 2 {
+    if kv_rows.is_empty() {
         return None;
     }
 
-    let header_inferred = key_value_first_pair_is_header(&kv_rows);
+    let raw_left_only_rows = kv_rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && row.right.is_empty())
+        .count();
+    let raw_right_only_rows = kv_rows
+        .iter()
+        .filter(|row| row.left.is_empty() && !row.right.is_empty())
+        .count();
+    let edgar_tag_rows = key_value_rows_look_like_edgar_tags(&kv_rows);
+    if edgar_tag_rows {
+        kv_rows.retain(|row| !row.right.is_empty() || !is_edgar_table_boundary_cell(&row.left));
+    }
+    let header_inferred = !edgar_tag_rows && key_value_first_pair_is_header(&kv_rows);
+    kv_rows = normalize_key_value_rows(kv_rows, header_inferred);
+
+    let paired_rows = kv_rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && !row.right.is_empty())
+        .count();
+    let section_rows = kv_rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && row.right.is_empty())
+        .count();
+    let dangling_right_rows = kv_rows
+        .iter()
+        .filter(|row| row.left.is_empty() && !row.right.is_empty())
+        .count();
+    let left_label_like = kv_rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && !row.right.is_empty())
+        .filter(|row| looks_like_key_value_label(&row.left))
+        .count();
+    if paired_rows < 1 {
+        return None;
+    }
+    if dangling_right_rows > 0 {
+        return None;
+    }
+
+    let left_x = median_f32(left_starts).unwrap_or_else(|| {
+        rows.iter()
+            .flat_map(|row| row.items.iter().map(|ri| ri.item.x))
+            .fold(f32::INFINITY, f32::min)
+    });
+    let right_x = median_f32(right_starts).unwrap_or(split_x);
+    if !left_x.is_finite() || !right_x.is_finite() || right_x - left_x < 40.0 {
+        return None;
+    }
+
+    let single_pair_allowed = key_value_single_pair_allowed(
+        KeyValueSinglePairStats {
+            paired_rows,
+            section_rows,
+            raw_left_only_rows,
+            raw_right_only_rows,
+        },
+        &kv_rows,
+        header_inferred,
+        left_x,
+        right_x,
+    );
+    if (kv_rows.len() < 2 || paired_rows < 2) && !single_pair_allowed {
+        return None;
+    }
+
     let data_pairs = if header_inferred {
         paired_rows.saturating_sub(1)
     } else {
@@ -645,7 +700,7 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         return None;
     }
 
-    if section_rows > paired_rows * 2 + 2 {
+    if section_rows > paired_rows * 2 + 2 && !single_pair_allowed {
         return None;
     }
 
@@ -659,28 +714,25 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
     } else {
         left_label_like
     };
-    if label_rows_for_score >= 2 && label_like_for_score * 2 < label_rows_for_score {
-        return None;
-    }
-
-    let left_x = median_f32(left_starts).unwrap_or_else(|| {
-        rows.iter()
-            .flat_map(|row| row.items.iter().map(|ri| ri.item.x))
-            .fold(f32::INFINITY, f32::min)
-    });
-    let right_x = median_f32(right_starts).unwrap_or(split_x);
-    if !left_x.is_finite() || !right_x.is_finite() || right_x - left_x < 40.0 {
-        return None;
-    }
-    let right_cluster_count = significant_side_x_clusters(&rows, split_x, false);
-    let marker_rows = marker_matrix_value_rows(&kv_rows);
-    if (right_cluster_count >= 5 && paired_rows >= 3)
-        || (right_cluster_count >= 3 && marker_rows >= 3 && marker_rows * 2 >= paired_rows)
+    if !header_inferred
+        && !edgar_tag_rows
+        && label_rows_for_score >= 2
+        && label_like_for_score * 2 < label_rows_for_score
     {
         return None;
     }
 
-    if key_value_rows_look_like_prose(&kv_rows, header_inferred) {
+    let right_cluster_count = significant_side_x_clusters(&rows, split_x, false);
+    let marker_rows = marker_matrix_value_rows(&kv_rows);
+    if !single_pair_allowed
+        && !edgar_tag_rows
+        && ((right_cluster_count >= 5 && paired_rows >= 3)
+            || (right_cluster_count >= 3 && marker_rows >= 3 && marker_rows * 2 >= paired_rows))
+    {
+        return None;
+    }
+
+    if !edgar_tag_rows && key_value_rows_look_like_prose(&kv_rows, header_inferred) {
         return None;
     }
 
@@ -765,6 +817,82 @@ struct KeyValueRow {
     item_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct KeyValueSinglePairStats {
+    paired_rows: usize,
+    section_rows: usize,
+    raw_left_only_rows: usize,
+    raw_right_only_rows: usize,
+}
+
+fn normalize_key_value_rows(rows: Vec<KeyValueRow>, header_inferred: bool) -> Vec<KeyValueRow> {
+    let mut normalized: Vec<KeyValueRow> = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        if row.left.is_empty() && row.right.is_empty() {
+            continue;
+        }
+
+        if row.left.is_empty() && !row.right.is_empty() {
+            if let Some(last) = normalized.last_mut() {
+                if !last.right.is_empty() {
+                    append_key_value_text(&mut last.right, &row.right);
+                    last.item_indices.extend(row.item_indices);
+                    continue;
+                }
+            }
+            normalized.push(row);
+            continue;
+        }
+
+        if !row.left.is_empty() && row.right.is_empty() {
+            let normalized_len = normalized.len();
+            if let Some(last) = normalized.last_mut() {
+                let last_is_header = header_inferred && normalized_len == 1;
+                if !last_is_header
+                    && !last.left.is_empty()
+                    && !last.right.is_empty()
+                    && key_value_left_continuation_allowed(&last.left, &row.left)
+                {
+                    append_key_value_text(&mut last.left, &row.left);
+                    last.item_indices.extend(row.item_indices);
+                    continue;
+                }
+            }
+        }
+
+        normalized.push(row);
+    }
+
+    normalized
+}
+
+fn append_key_value_text(target: &mut String, addition: &str) {
+    let addition = addition.trim();
+    if addition.is_empty() {
+        return;
+    }
+    if !target.trim().is_empty() {
+        target.push(' ');
+    }
+    target.push_str(addition);
+}
+
+fn key_value_left_continuation_allowed(previous_left: &str, continuation: &str) -> bool {
+    let trimmed = continuation.trim();
+    if trimmed.is_empty() || looks_like_key_value_section_label(trimmed) {
+        return false;
+    }
+
+    let previous = previous_left.trim_end();
+    let continuation_chars = trimmed.chars().count();
+    let continuation_words = word_count_simple(trimmed);
+    previous.ends_with(['-', '/', ',', ';', ':'])
+        || first_alpha_is_lowercase(trimmed)
+        || continuation_chars > 28
+        || continuation_words > 4
+}
+
 fn group_key_value_visual_rows(mut items: Vec<RowItem>, y_tol: f32) -> Vec<VisualRow> {
     items.sort_by(|a, b| {
         b.item
@@ -828,6 +956,13 @@ fn infer_key_value_split_x(rows: &[VisualRow], median_font_size: f32) -> Option<
     }
 
     if splits.len() < 2 {
+        let paired_visual_rows = rows.iter().filter(|row| row.items.len() >= 2).count();
+        if splits.len() == 1
+            && paired_visual_rows == 1
+            && (rows.len() == 1 || rows.iter().all(|row| row.items.len() <= 2))
+        {
+            return splits.into_iter().next();
+        }
         return None;
     }
 
@@ -902,16 +1037,169 @@ fn looks_like_key_value_label(cell: &str) -> bool {
     trimmed.chars().any(|c| c.is_alphabetic())
 }
 
+fn key_value_rows_look_like_edgar_tags(rows: &[KeyValueRow]) -> bool {
+    let paired_rows = rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && !row.right.is_empty())
+        .count();
+    if paired_rows < 2 {
+        return false;
+    }
+
+    let tag_pairs = rows
+        .iter()
+        .filter(|row| !row.left.is_empty() && !row.right.is_empty())
+        .filter(|row| is_edgar_tag_cell(&row.left))
+        .count();
+    let first_marker = rows.first().is_some_and(|row| {
+        row.left.eq_ignore_ascii_case("<S>") && row.right.eq_ignore_ascii_case("<C>")
+    });
+
+    tag_pairs >= 3 || (first_marker && tag_pairs >= 2)
+}
+
+fn is_edgar_tag_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner.len() <= 48
+        && inner
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+}
+
+fn is_edgar_table_boundary_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    trimmed.eq_ignore_ascii_case("<TABLE>") || trimmed.eq_ignore_ascii_case("</TABLE>")
+}
+
+fn key_value_single_pair_allowed(
+    stats: KeyValueSinglePairStats,
+    rows: &[KeyValueRow],
+    header_inferred: bool,
+    left_x: f32,
+    right_x: f32,
+) -> bool {
+    if header_inferred || stats.paired_rows != 1 || stats.section_rows != 0 || rows.len() != 1 {
+        return false;
+    }
+    if right_x - left_x < 60.0 {
+        return false;
+    }
+
+    let Some(row) = rows
+        .iter()
+        .find(|row| !row.left.is_empty() && !row.right.is_empty())
+    else {
+        return false;
+    };
+    let left_chars = row.left.chars().count();
+    let right_chars = row.right.chars().count();
+    if !(2..=120).contains(&left_chars) || right_chars == 0 {
+        return false;
+    }
+    if key_value_cell_looks_like_sentence(&row.left) {
+        return false;
+    }
+    if stats.raw_left_only_rows == 0
+        && stats.raw_right_only_rows >= 2
+        && left_chars <= 70
+        && right_chars <= 1_500
+        && looks_like_key_value_label(&row.left)
+    {
+        return true;
+    }
+    if right_chars > 80 {
+        return false;
+    }
+    if key_value_cell_looks_like_sentence(&row.right) && !compact_key_value_scalar(&row.right) {
+        return false;
+    }
+
+    (looks_like_key_value_label(&row.left) || left_chars <= 90)
+        && compact_key_value_scalar(&row.right)
+}
+
+fn compact_key_value_scalar(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let chars = trimmed.chars().count();
+    let words = word_count_simple(trimmed);
+    if trimmed.is_empty() || chars > 60 || words > 6 || trimmed.ends_with(['.', '!', '?']) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.chars().any(|ch| ch.is_ascii_digit())
+        || matches!(
+            lower.as_str(),
+            "yes" | "no" | "true" | "false" | "none" | "n/a" | "na"
+        )
+        || words <= 4
+}
+
+fn looks_like_key_value_section_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let chars = trimmed.chars().count();
+    let words = word_count_simple(trimmed);
+    if !(1..=5).contains(&words) || !(2..=48).contains(&chars) {
+        return false;
+    }
+    if trimmed.ends_with(['.', ',', ';', ':']) || first_alpha_is_lowercase(trimmed) {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| matches!(ch, '.' | ',' | ';' | '(' | ')' | '[' | ']'))
+    {
+        return false;
+    }
+
+    trimmed.chars().any(|ch| ch.is_alphabetic())
+}
+
+fn first_alpha_is_lowercase(cell: &str) -> bool {
+    cell.chars()
+        .find(|ch| ch.is_alphabetic())
+        .is_some_and(|ch| ch.is_lowercase())
+}
+
+fn key_value_cell_looks_like_sentence(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let chars = trimmed.chars().count();
+    chars > 90
+        || word_count_simple(trimmed) > 12
+        || (chars > 42 && trimmed.ends_with(['.', '!', '?']))
+}
+
 fn key_value_rows_look_like_prose(rows: &[KeyValueRow], header_inferred: bool) -> bool {
-    let mut long_sentence_cells = 0usize;
-    let mut total_cells = 0usize;
-    let mut total_chars = 0usize;
+    let mut left_cells = 0usize;
+    let mut left_prose_cells = 0usize;
+    let mut left_label_like = 0usize;
+    let mut total_left_chars = 0usize;
     let mut paired_rows = 0usize;
+    let mut paired_sentence_rows = 0usize;
     let mut solo_prose_rows = 0usize;
 
     for row in rows.iter().skip(usize::from(header_inferred)) {
         if !row.left.is_empty() && !row.right.is_empty() {
             paired_rows += 1;
+            let left = row.left.trim();
+            let right = row.right.trim();
+            let left_prose = key_value_cell_looks_like_sentence(left);
+            let right_prose = key_value_cell_looks_like_sentence(right);
+            left_cells += 1;
+            total_left_chars += left.chars().count();
+            if looks_like_key_value_label(left) {
+                left_label_like += 1;
+            }
+            if left_prose {
+                left_prose_cells += 1;
+            }
+            if left_prose && right_prose {
+                paired_sentence_rows += 1;
+            }
         } else {
             let solo = if row.left.is_empty() {
                 row.right.trim()
@@ -925,30 +1213,23 @@ fn key_value_rows_look_like_prose(rows: &[KeyValueRow], header_inferred: bool) -
                 solo_prose_rows += 1;
             }
         }
-        for cell in [&row.left, &row.right] {
-            let trimmed = cell.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            total_cells += 1;
-            total_chars += trimmed.chars().count();
-            if trimmed.chars().count() > 100
-                || (trimmed.chars().count() > 55 && trimmed.ends_with(['.', '!', '?']))
-            {
-                long_sentence_cells += 1;
-            }
-        }
     }
 
-    if paired_rows < 1 || total_cells == 0 {
+    if paired_rows < 1 || left_cells == 0 {
         return true;
     }
     if solo_prose_rows >= 3 {
         return true;
     }
+    if paired_rows >= 2 && paired_sentence_rows * 2 >= paired_rows {
+        return true;
+    }
+    if !header_inferred && left_prose_cells * 2 >= left_cells {
+        return true;
+    }
 
-    let avg_chars = total_chars as f32 / total_cells as f32;
-    avg_chars > 75.0 || long_sentence_cells * 2 >= total_cells
+    let avg_left_chars = total_left_chars as f32 / left_cells as f32;
+    !header_inferred && avg_left_chars > 70.0 && left_label_like * 2 < left_cells
 }
 
 fn marker_matrix_value_rows(rows: &[KeyValueRow]) -> usize {
@@ -1352,6 +1633,243 @@ mod tests {
         assert!(md.contains("|Engine Code|1NR-FE|"), "{md}");
         assert!(md.contains("|Section|1.6 VALVEMATIC|"), "{md}");
         assert!(md.contains("|Engine Code|1ZR-FAE|"), "{md}");
+    }
+
+    #[test]
+    fn test_key_value_builder_merges_wrapped_value_continuations() {
+        let items = vec![
+            make_char("Storage", 80.0, 700.0, 9.0, 42.0),
+            make_char(
+                "Store under normal conditions in dry rooms.",
+                250.0,
+                700.0,
+                9.0,
+                210.0,
+            ),
+            make_char(
+                "Protect from heat and humidity in the original packaging material.",
+                250.0,
+                686.0,
+                9.0,
+                315.0,
+            ),
+            make_char("Shelf Life", 80.0, 668.0, 9.0, 48.0),
+            make_char(
+                "To obtain best performance use within 24 months.",
+                250.0,
+                668.0,
+                9.0,
+                255.0,
+            ),
+            make_char("Technical Information", 80.0, 650.0, 9.0, 104.0),
+            make_char(
+                "The product is designed for repeated industrial use and long service life.",
+                250.0,
+                650.0,
+                9.0,
+                340.0,
+            ),
+            make_char(
+                "Additional details are provided for compatibility and installation planning.",
+                250.0,
+                636.0,
+                9.0,
+                350.0,
+            ),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.contains("|Field|Value|"), "{md}");
+        assert!(
+            md.contains(
+                "|Storage|Store under normal conditions in dry rooms. Protect from heat and humidity in the original packaging material.|"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "|Technical Information|The product is designed for repeated industrial use and long service life. Additional details are provided for compatibility and installation planning.|"
+            ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_merges_wrapped_left_labels() {
+        let items = vec![
+            make_char("Title/Description", 76.0, 700.0, 9.0, 86.0),
+            make_char("Instances", 350.0, 700.0, 9.0, 48.0),
+            make_char("RE: Homes Gerald Ford lived in.", 76.0, 682.0, 9.0, 150.0),
+            make_char("Box 7", 350.0, 682.0, 9.0, 28.0),
+            make_char(
+                "Grand Rapids Remembers Gerald R. Ford issue. Grand",
+                76.0,
+                664.0,
+                9.0,
+                245.0,
+            ),
+            make_char("Box 7", 350.0, 664.0, 9.0, 28.0),
+            make_char(
+                "Rapids Magazine, September 1987, p. 65.",
+                76.0,
+                650.0,
+                9.0,
+                196.0,
+            ),
+            make_char(
+                "A Workhorse not a show horse: Gerald Ford remembered as humble.",
+                76.0,
+                632.0,
+                9.0,
+                290.0,
+            ),
+            make_char("Box 7", 350.0, 632.0, 9.0, 28.0),
+            make_char(
+                "not flashy during his public life.",
+                76.0,
+                618.0,
+                9.0,
+                150.0,
+            ),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.starts_with("|Title/Description|Instances|"), "{md}");
+        assert!(
+            md.contains(
+                "|Grand Rapids Remembers Gerald R. Ford issue. Grand Rapids Magazine, September 1987, p. 65.|Box 7|"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "|A Workhorse not a show horse: Gerald Ford remembered as humble. not flashy during his public life.|Box 7|"
+            ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_allows_tiny_two_cell_region() {
+        let items = vec![
+            make_char(
+                "3M E-A-R Classic Small Earplug Uncorded",
+                80.0,
+                700.0,
+                9.0,
+                210.0,
+            ),
+            make_char("02/05/24", 360.0, 700.0, 9.0, 42.0),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.contains("|Field|Value|"), "{md}");
+        assert!(
+            md.contains("|3M E-A-R Classic Small Earplug Uncorded|02/05/24|"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_allows_single_wrapped_value_region() {
+        let items = vec![
+            make_char("Intrinsic Safety", 42.0, 174.0, 9.0, 60.0),
+            make_char(
+                "The powered air purifying respirator has been tested and classified",
+                311.0,
+                174.0,
+                9.0,
+                260.0,
+            ),
+            make_char(
+                "for intrinsic safety in hazardous locations by Underwriters Laboratory",
+                311.0,
+                160.0,
+                9.0,
+                270.0,
+            ),
+            make_char(
+                "for the following classes, divisions, groups, and temperature ratings.",
+                311.0,
+                146.0,
+                9.0,
+                275.0,
+            ),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.contains("|Field|Value|"), "{md}");
+        assert!(
+            md.contains(
+                "|Intrinsic Safety|The powered air purifying respirator has been tested and classified for intrinsic safety in hazardous locations by Underwriters Laboratory for the following classes, divisions, groups, and temperature ratings.|"
+            ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_rejects_leading_value_only_prose() {
+        let items = vec![
+            make_char(
+                "3rd Party Authorization documenting the reason for the hardship.",
+                260.0,
+                714.0,
+                9.0,
+                310.0,
+            ),
+            make_char("Borrower", 80.0, 696.0, 9.0, 44.0),
+            make_char(
+                "Homeowner has adequate income to support modified payments.",
+                260.0,
+                696.0,
+                9.0,
+                300.0,
+            ),
+            make_char("Servicer", 80.0, 678.0, 9.0, 42.0),
+            make_char(
+                "Collects documentation and reviews hardship status.",
+                260.0,
+                678.0,
+                9.0,
+                260.0,
+            ),
+        ];
+
+        assert!(try_build_key_value_table_from_rows(&items, 1).is_none());
+    }
+
+    #[test]
+    fn test_key_value_builder_recovers_edgar_tag_value_rows() {
+        let items = vec![
+            make_char("<S>", 70.0, 700.0, 9.0, 18.0),
+            make_char("<C>", 240.0, 700.0, 9.0, 18.0),
+            make_char("<PERIOD-TYPE>", 70.0, 684.0, 9.0, 78.0),
+            make_char("3-MOS", 240.0, 684.0, 9.0, 30.0),
+            make_char("<FISCAL-YEAR-END>", 70.0, 668.0, 9.0, 104.0),
+            make_char("DEC-31-2000", 240.0, 668.0, 9.0, 66.0),
+            make_char("<PERIOD-END>", 70.0, 652.0, 9.0, 76.0),
+            make_char("MAR-31-2000", 240.0, 652.0, 9.0, 66.0),
+            make_char("<CASH>", 70.0, 636.0, 9.0, 38.0),
+            make_char("214", 240.0, 636.0, 9.0, 18.0),
+            make_char("</TABLE>", 70.0, 620.0, 9.0, 46.0),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.starts_with("|Field|Value|"), "{md}");
+        assert!(md.contains("|<S>|<C>|"), "{md}");
+        assert!(md.contains("|<FISCAL-YEAR-END>|DEC-31-2000|"), "{md}");
+        assert!(md.contains("|<CASH>|214|"), "{md}");
+        assert!(!md.contains("</TABLE>"), "{md}");
     }
 
     #[test]
