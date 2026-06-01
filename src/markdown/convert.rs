@@ -149,6 +149,79 @@ fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) 
     set
 }
 
+/// Pre-scan body-size all-bold runs that are too long to be headings.
+///
+/// Some academic PDFs use an all-bold abstract/summary paragraph immediately
+/// after the author block.  A line-local bold heading heuristic sees each
+/// wrapped visual line as "standalone" once the first line is misclassified,
+/// producing a stack of `##` headings.  Multi-line body-size bold runs with a
+/// paragraph-sized word count should stay paragraph text.
+fn find_wrapped_bold_paragraph_lines(
+    lines: &[TextLine],
+    base_size: f32,
+    para_threshold: f32,
+) -> HashSet<usize> {
+    let mut set = HashSet::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if !is_body_size_all_bold_line(&lines[i], base_size) {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut end = i;
+        let mut word_count = lines[i].text().split_whitespace().count();
+
+        while end + 1 < lines.len()
+            && is_body_size_all_bold_line(&lines[end + 1], base_size)
+            && is_wrapped_same_style_line(&lines[end], &lines[end + 1], para_threshold)
+        {
+            end += 1;
+            word_count += lines[end].text().split_whitespace().count();
+        }
+
+        let line_count = end - start + 1;
+        if line_count >= 3 && word_count > 20 {
+            for idx in start..=end {
+                set.insert(idx);
+            }
+        }
+
+        i = end + 1;
+    }
+
+    set
+}
+
+fn is_body_size_all_bold_line(line: &TextLine, base_size: f32) -> bool {
+    let Some(first) = line.items.first() else {
+        return false;
+    };
+    first.font_size >= base_size * 0.95
+        && first.font_size < base_size * 1.2
+        && line
+            .items
+            .iter()
+            .all(|item| item.is_bold && (item.font_size - first.font_size).abs() < 0.5)
+}
+
+fn is_wrapped_same_style_line(prev: &TextLine, next: &TextLine, para_threshold: f32) -> bool {
+    if prev.page != next.page {
+        return false;
+    }
+
+    let y_gap = prev.y - next.y;
+    if !(y_gap > 0.0 && y_gap <= para_threshold) {
+        return false;
+    }
+
+    let prev_x = prev.items.first().map(|item| item.x).unwrap_or(0.0);
+    let next_x = next.items.first().map(|item| item.x).unwrap_or(0.0);
+    (prev_x - next_x).abs() <= 40.0
+}
+
 /// Resolve the dominant structure role for a text line by looking up its items' MCIDs.
 ///
 /// Returns the first non-container role found (skipping Document/Part/Sect/Div/NonStruct/Span).
@@ -397,6 +470,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // between paragraphs at body font size. Inspired by opendataloader's
     // lookahead in HeadingProcessor (prevNode/nextNode context).
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+    let wrapped_bold_paragraph_lines =
+        find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
 
     // Detect struct heading levels that are overused (body text mistagged as headings)
     let overused_heading_levels = detect_overused_struct_heading_levels(&lines, struct_roles);
@@ -410,6 +485,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut last_list_x: Option<f32> = None;
     let mut in_code_block = false;
     let mut prev_had_dot_leaders = false;
+    let mut paragraph_in_wrapped_bold_run = false;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
@@ -475,6 +551,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             current_page = line.page;
             prev_y = f32::MAX;
             prev_x = 0.0;
+            paragraph_in_wrapped_bold_run = false;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
@@ -489,6 +566,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
+                        paragraph_in_wrapped_bold_run = false;
                     }
                     output.push('\n');
                     output.push_str(table_md);
@@ -506,6 +584,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
+                        paragraph_in_wrapped_bold_run = false;
                     }
                     output.push('\n');
                     output.push_str(image_md);
@@ -527,9 +606,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && y_gap.abs() <= para_threshold
             && (prev_x - line_x).abs() > 50.0
             && prev_y < f32::MAX;
-        if (is_para_break || is_band_switch) && in_paragraph {
+        let line_all_bold = !line.items.is_empty() && line.items.iter().all(|item| item.is_bold);
+        let line_in_wrapped_bold_run = wrapped_bold_paragraph_lines.contains(&line_idx);
+        let is_bold_to_regular_break = in_paragraph
+            && paragraph_in_wrapped_bold_run
+            && !line_in_wrapped_bold_run
+            && !line_all_bold
+            && y_gap > base_size * 1.2
+            && y_gap <= para_threshold;
+        if (is_para_break || is_band_switch || is_bold_to_regular_break) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
+            paragraph_in_wrapped_bold_run = false;
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
@@ -572,6 +660,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(trimmed);
             output.push_str("\n\n");
@@ -625,6 +714,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 if !(1..=15).contains(&word_count) {
                     return None;
                 }
+                if wrapped_bold_paragraph_lines.contains(&line_idx) {
+                    return None;
+                }
                 let rarity = font_size_rarity(line_font_size, &font_stats);
                 let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                 let standalone = !in_paragraph;
@@ -656,6 +748,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let prefix = "#".repeat(level);
             // Use plain text for headers to avoid redundant formatting
@@ -678,6 +771,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(&format!("- {}", trimmed));
             output.push('\n');
@@ -691,6 +785,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let formatted = format_list_item(trimmed);
             output.push_str(&formatted);
@@ -737,6 +832,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(&format!("> {}\n", trimmed));
             continue;
@@ -747,6 +843,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             if !in_code_block {
                 output.push_str("```\n");
@@ -767,6 +864,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
         output.push_str(trimmed);
+        paragraph_in_wrapped_bold_run = if in_paragraph {
+            paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
+        } else {
+            line_in_wrapped_bold_run
+        };
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
     }
@@ -836,6 +938,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+    let wrapped_bold_paragraph_lines =
+        find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
 
     let mut output = String::new();
     let mut current_page = 0u32;
@@ -844,6 +948,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
     let mut prev_had_dot_leaders = false;
+    let mut paragraph_in_wrapped_bold_run = false;
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -860,6 +965,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             in_list = false;
             last_list_x = None;
             prev_had_dot_leaders = false;
+            paragraph_in_wrapped_bold_run = false;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
@@ -870,9 +976,18 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // (newspaper columns emitted sequentially on the same page).
         let y_gap = prev_y - line.y;
         let is_para_break = y_gap.abs() > para_threshold;
-        if is_para_break && in_paragraph {
+        let line_all_bold = !line.items.is_empty() && line.items.iter().all(|item| item.is_bold);
+        let line_in_wrapped_bold_run = wrapped_bold_paragraph_lines.contains(&line_idx);
+        let is_bold_to_regular_break = in_paragraph
+            && paragraph_in_wrapped_bold_run
+            && !line_in_wrapped_bold_run
+            && !line_all_bold
+            && y_gap > base_size * 1.2
+            && y_gap <= para_threshold;
+        if (is_para_break || is_bold_to_regular_break) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
+            paragraph_in_wrapped_bold_run = false;
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
@@ -896,6 +1011,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(trimmed);
             output.push_str("\n\n");
@@ -918,6 +1034,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     if !(1..=15).contains(&word_count) {
                         return None;
                     }
+                    if wrapped_bold_paragraph_lines.contains(&line_idx) {
+                        return None;
+                    }
                     let rarity = font_size_rarity(line_font_size, &font_stats);
                     let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                     let standalone = !in_paragraph;
@@ -935,6 +1054,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
+                    paragraph_in_wrapped_bold_run = false;
                 }
                 let prefix = "#".repeat(header_level);
                 // Use plain text for headers to avoid redundant formatting
@@ -949,6 +1069,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let formatted = format_list_item(trimmed);
             output.push_str(&formatted);
@@ -993,6 +1114,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
+                    paragraph_in_wrapped_bold_run = false;
                 }
                 // Use plain text for code blocks
                 output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
@@ -1010,6 +1132,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
         output.push_str(trimmed);
+        paragraph_in_wrapped_bold_run = if in_paragraph {
+            paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
+        } else {
+            line_in_wrapped_bold_run
+        };
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
     }
@@ -1353,6 +1480,109 @@ mod tests {
         assert!(
             heading_count <= 2,
             "Expected at most 2 headings but found {heading_count} in:\n{md}"
+        );
+    }
+
+    #[test]
+    fn test_wrapped_bold_abstract_is_not_split_into_headings() {
+        // Regression for arXiv 1107.1353: the opening abstract paragraph is
+        // entirely bold at body size. The first wrapped lines used to become
+        // separate H2 headings, and the following body paragraph was joined to
+        // the bold abstract because the paragraph gap is modest.
+        let make = |text: &str, y: f32, font_size: f32, bold: bool| {
+            let mut item = make_item(text, 1, None);
+            item.y = y;
+            item.font_size = font_size;
+            item.height = font_size;
+            item.is_bold = bold;
+            item
+        };
+
+        let lines = vec![
+            make_line(vec![make(
+                "Quantum Nature of Light Measured With a Single Detector",
+                747.7,
+                25.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "Gesine A. Steudle1*, Stefan Schietinger1, David Höckel1",
+                651.1,
+                11.0,
+                false,
+            )]),
+            make_line(vec![make(
+                "Zwiller2, and Oliver Benson1",
+                638.5,
+                11.0,
+                false,
+            )]),
+            make_line(vec![make(
+                "The introduction of light quanta by Einstein in 1905 triggered strong efforts to",
+                607.5,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "demonstrate the quantum properties of light directly, without involving matter",
+                594.8,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "quantization. It however took more than seven decades for the quantum granularity",
+                582.2,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "of light to be observed in the fluorescence of single atoms. Single atoms emit",
+                569.5,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "photons one at a time, this is typically demonstrated with a Hanbury-Brown-Twiss",
+                556.9,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "Our work significantly simplifies a widely used photon-correlation technique.",
+                544.2,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "A photon is a single excitation of a mode of the electromagnetic field.",
+                528.7,
+                11.0,
+                false,
+            )]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("# Quantum Nature of Light Measured With a Single Detector"),
+            "title should remain a heading: {md}"
+        );
+        assert!(
+            !md.contains("## The introduction")
+                && !md.contains("## demonstrate")
+                && !md.contains("## quantization"),
+            "bold abstract lines should not become headings: {md}"
+        );
+        assert!(
+            md.contains("technique.**\n\nA photon is a single excitation"),
+            "body paragraph should be separated from bold abstract: {md}"
         );
     }
 
