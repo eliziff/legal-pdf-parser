@@ -1,5 +1,8 @@
 # pdf-inspector
 
+[![Crates.io](https://img.shields.io/crates/v/pdf-inspector.svg)](https://crates.io/crates/pdf-inspector)
+[![npm](https://img.shields.io/npm/v/@firecrawl/pdf-inspector.svg)](https://www.npmjs.com/package/@firecrawl/pdf-inspector)
+
 Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md) and [Node.js](napi/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
@@ -71,9 +74,17 @@ console.log(result.markdown);  // Markdown string or null
 
 ### Rust
 
+Install from [crates.io](https://crates.io/crates/pdf-inspector):
+
+```bash
+cargo add pdf-inspector
+```
+
+Or add it manually:
+
 ```toml
 [dependencies]
-pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
+pdf-inspector = "0.1"
 ```
 
 ```rust
@@ -91,28 +102,33 @@ if let Some(markdown) = &result.markdown {
 ### CLI
 
 ```bash
+# Install the CLI tools
+cargo install pdf-inspector
+
 # Convert PDF to Markdown
-cargo run --bin pdf2md -- document.pdf
+pdf2md document.pdf
 
 # JSON output (for piping)
-cargo run --bin pdf2md -- document.pdf --json
+pdf2md document.pdf --json
 
 # Raw markdown only (no headers)
-cargo run --bin pdf2md -- document.pdf --raw
+pdf2md document.pdf --raw
 
 # Insert page break markers (<!-- Page N -->)
-cargo run --bin pdf2md -- document.pdf --pages
+pdf2md document.pdf --pages
 
 # Process only specific pages
-cargo run --bin pdf2md -- document.pdf --select-pages 1,3,5-10
+pdf2md document.pdf --select-pages 1,3,5-10
 
 # Detection only (no extraction)
-cargo run --bin detect-pdf -- document.pdf
-cargo run --bin detect-pdf -- document.pdf --json
+detect-pdf document.pdf
+detect-pdf document.pdf --json
 
 # Detection + layout analysis (tables, columns)
-cargo run --bin detect-pdf -- document.pdf --analyze --json
+detect-pdf document.pdf --analyze --json
 ```
+
+From a source checkout, use `cargo run --bin pdf2md -- document.pdf` or `cargo run --bin detect-pdf -- document.pdf` instead.
 
 ## Architecture
 
