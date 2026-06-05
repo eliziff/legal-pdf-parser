@@ -858,6 +858,13 @@ pub(crate) fn extract_text_from_operand(
             // unmapped. Don't fall through to text-interpretation fallbacks
             // (Latin-1, UTF-16, etc.) which would misinterpret CID bytes as
             // character codes (e.g. CID 0x01A9 → Latin-1 "©").
+            if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
+                // 2-byte CIDs (Identity-H) are by far the common case; for
+                // an odd byte count we still emit at least one marker so
+                // detection downstream fires.
+                let cid_count = (bytes.len() / 2).max(1);
+                return Some("\u{FFFD}".repeat(cid_count));
+            }
 
             // Try our custom encoding map from Differences arrays.
             // The Differences array overrides specific codes in a base encoding (typically
@@ -966,27 +973,6 @@ pub(crate) fn extract_text_from_operand(
                 return Some(symbol_text);
             }
 
-            // Latin-1 fallback. Safe ONLY for fonts that use single-byte
-            // encodings — for these, an unmapped byte is a valid character
-            // code in Latin-1/WinAnsi space. CID fonts (Type0 / Identity-H)
-            // emit multi-byte CIDs that aren't characters; per-byte Latin-1
-            // produces mojibake (e.g. 2-byte CID 0xCDD9 → "ÍÙ" for the
-            // production scrape_id 019de78c-... samples).
-            //
-            // For a CID font (has_cmap is set OR a /ToUnicode reference
-            // exists) with any non-ASCII bytes, emit a single U+FFFD per
-            // CID instead. This both replaces the mojibake with a proper
-            // "decode failed" marker AND keeps `detect_encoding_issues`
-            // tripping so the page is flagged for OCR — the existing
-            // garbage-detection path that the high-Latin-1 mojibake used
-            // to satisfy by accident.
-            if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
-                // 2-byte CIDs (Identity-H) are by far the common case; for
-                // an odd byte count we still emit at least one marker so
-                // detection downstream fires.
-                let cid_count = (bytes.len() / 2).max(1);
-                return Some("\u{FFFD}".repeat(cid_count));
-            }
             // Pure ASCII bytes round-trip safely (Latin-1 == ASCII for
             // 0x00..=0x7F), and non-CID (Type1 / TrueType / Type3) fonts
             // use single-byte encodings where Latin-1 fallback is the
