@@ -37,7 +37,7 @@ console.log(result.confidence)     // 0.875
 
 Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pipelines where a layout model detects regions in rendered page images, and this function extracts text from the PDF structure for text-based pages — skipping GPU OCR.
 
-Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues).
+Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
 ```typescript
 import { extractTextInRegions } from '@firecrawl/pdf-inspector'
@@ -84,6 +84,7 @@ interface PageRegionTexts {
 interface RegionText {
   text: string
   needsOcr: boolean         // true when text is unreliable
+  ocrReason?: string        // "suspected_garbled_text" when known
 }
 ```
 

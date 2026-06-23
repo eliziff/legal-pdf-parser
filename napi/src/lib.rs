@@ -40,12 +40,21 @@ pub struct PdfResult {
     pub processing_time_ms: u32,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     pub title: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+}
+
+/// OCR reasons for a single 1-indexed page.
+#[napi(object)]
+pub struct PageOcrReasons {
+    pub page: u32,
+    pub reasons: Vec<String>,
 }
 
 /// Lightweight PDF classification result.
@@ -90,6 +99,8 @@ pub struct RegionText {
     pub text: String,
     /// `true` when the text should not be trusted (empty, GID fonts, garbage, encoding issues).
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Extracted text for one page's regions.
@@ -126,6 +137,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms as u32,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
@@ -133,6 +145,18 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
     }
+}
+
+fn to_napi_page_ocr_reasons(
+    reasons: Vec<pdf_inspector::PageOcrReasons>,
+) -> Vec<PageOcrReasons> {
+    reasons
+        .into_iter()
+        .map(|reason| PageOcrReasons {
+            page: reason.page,
+            reasons: reason.reasons,
+        })
+        .collect()
 }
 
 fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<String>) {
@@ -563,6 +587,8 @@ pub struct PageMarkdownResult {
     pub markdown: String,
     /// `true` when text on this page is unreliable.
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -576,6 +602,8 @@ pub struct PagesExtractionResult {
     pub pages_with_columns: Vec<u32>,
     /// 1-indexed pages that need OCR (scanned/image-based).
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -607,11 +635,13 @@ pub fn extract_pages_markdown(
                     page: r.page,
                     markdown: r.markdown,
                     needs_ocr: r.needs_ocr,
+                    ocr_reason: r.ocr_reason,
                 })
                 .collect(),
             pages_with_tables: result.pages_with_tables,
             pages_with_columns: result.pages_with_columns,
             pages_needing_ocr: result.pages_needing_ocr,
+            ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
             is_complex: result.is_complex,
         })
     })
@@ -648,6 +678,7 @@ fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<Pa
                 .map(|r| RegionText {
                     text: r.text,
                     needs_ocr: r.needs_ocr,
+                    ocr_reason: r.ocr_reason,
                 })
                 .collect(),
         })

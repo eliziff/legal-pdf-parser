@@ -30,6 +30,9 @@ pub struct PyPdfResult {
     /// 1-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
     /// Title from PDF metadata.
     #[pyo3(get)]
     pub title: Option<String>,
@@ -56,6 +59,28 @@ impl PyPdfResult {
         format!(
             "PdfResult(pdf_type='{}', pages={}, confidence={:.2})",
             self.pdf_type, self.page_count, self.confidence
+        )
+    }
+}
+
+/// OCR reasons for a single 1-indexed page.
+#[pyclass(name = "PageOcrReasons")]
+#[derive(Clone)]
+pub struct PyPageOcrReasons {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page: u32,
+    /// Machine-readable OCR reason identifiers.
+    #[pyo3(get)]
+    pub reasons: Vec<String>,
+}
+
+#[pymethods]
+impl PyPageOcrReasons {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageOcrReasons(page={}, reasons={:?})",
+            self.page, self.reasons
         )
     }
 }
@@ -106,6 +131,9 @@ pub struct PyRegionText {
     /// True when the text should not be trusted (empty, GID fonts, garbage, encoding issues).
     #[pyo3(get)]
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    #[pyo3(get)]
+    pub ocr_reason: Option<String>,
 }
 
 #[pymethods]
@@ -160,6 +188,9 @@ pub struct PyPageMarkdown {
     /// encoding issues, garbage text, or empty extraction).
     #[pyo3(get)]
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    #[pyo3(get)]
+    pub ocr_reason: Option<String>,
 }
 
 #[pymethods]
@@ -190,6 +221,9 @@ pub struct PyPagesExtractionResult {
     /// 1-indexed pages that need OCR (scanned/image-based or unreliable text).
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
     /// True if any page has tables or columns.
     #[pyo3(get)]
     pub is_complex: bool,
@@ -268,6 +302,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,
@@ -275,6 +310,16 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
     }
+}
+
+fn to_py_page_ocr_reasons(reasons: Vec<crate::PageOcrReasons>) -> Vec<PyPageOcrReasons> {
+    reasons
+        .into_iter()
+        .map(|reason| PyPageOcrReasons {
+            page: reason.page,
+            reasons: reason.reasons,
+        })
+        .collect()
 }
 
 fn to_py_err(e: crate::PdfError) -> PyErr {
@@ -350,11 +395,13 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
                 page: p.page,
                 markdown: p.markdown,
                 needs_ocr: p.needs_ocr,
+                ocr_reason: p.ocr_reason,
             })
             .collect(),
         pages_with_tables: r.pages_with_tables,
         pages_with_columns: r.pages_with_columns,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
         is_complex: r.is_complex,
     }
 }
@@ -370,6 +417,7 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
                 .map(|r| PyRegionText {
                     text: r.text,
                     needs_ocr: r.needs_ocr,
+                    ocr_reason: r.ocr_reason,
                 })
                 .collect(),
         })
@@ -563,6 +611,7 @@ fn extract_pages_markdown_bytes(
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
+    m.add_class::<PyPageOcrReasons>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyRegionText>()?;

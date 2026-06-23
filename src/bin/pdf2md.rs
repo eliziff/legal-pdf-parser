@@ -31,6 +31,22 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> String {
+    reasons
+        .iter()
+        .map(|entry| {
+            let reasons_json = entry
+                .reasons
+                .iter()
+                .map(|reason| format!(r#""{}""#, json_escape(reason)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"page":{},"reasons":[{}]}}"#, entry.page, reasons_json)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Parse a page specification like "1,3,5-10,20" into a HashSet of page numbers.
 fn parse_page_spec(spec: &str) -> Result<HashSet<u32>, String> {
     let mut pages = HashSet::new();
@@ -177,12 +193,14 @@ fn main() {
                         .iter()
                         .map(|p| p.to_string())
                         .collect();
+                    let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
                         ocr_pages.join(","),
+                        ocr_reasons,
                         result.layout.is_complex,
                         table_pages.join(","),
                         col_pages.join(","),
@@ -223,8 +241,9 @@ fn main() {
                     .iter()
                     .map(|p| p.to_string())
                     .collect();
+                let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -236,6 +255,7 @@ fn main() {
                     result.processing_time_ms,
                     result.markdown.as_ref().map(|m| m.len()).unwrap_or(0),
                     ocr_pages.join(","),
+                    ocr_reasons,
                     result.layout.is_complex,
                     table_pages.join(","),
                     col_pages.join(","),

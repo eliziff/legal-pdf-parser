@@ -62,9 +62,22 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tounicode::FontCMaps;
 
+/// OCR reason emitted when the extracted text layer appears garbled due to
+/// broken font decoding or mojibake.
+pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
+
 // =========================================================================
 // Result type
 // =========================================================================
+
+/// OCR reasons for a single 1-indexed page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageOcrReasons {
+    /// 1-indexed page number.
+    pub page: u32,
+    /// Machine-readable OCR reason identifiers.
+    pub reasons: Vec<String>,
+}
 
 /// High-level PDF processing result.
 #[derive(Debug)]
@@ -79,6 +92,8 @@ pub struct PdfProcessResult {
     pub processing_time_ms: u64,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// Title from PDF metadata (if available).
     pub title: Option<String>,
     /// Detection confidence score (0.0–1.0).
@@ -322,6 +337,8 @@ pub struct PageMarkdown {
     /// `true` when text on this page is unreliable (GID-encoded fonts,
     /// encoding issues, garbage text, or empty extraction).
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -335,6 +352,8 @@ pub struct PagesExtractionResult {
     pub pages_with_columns: Vec<u32>,
     /// 1-indexed pages that need OCR (scanned/image-based).
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -388,6 +407,7 @@ pub fn extract_pages_markdown_mem(
 
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
+    let mut ocr_reasons_by_page = BTreeMap::new();
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -397,6 +417,7 @@ pub fn extract_pages_markdown_mem(
                 page: page_0idx,
                 markdown: String::new(),
                 needs_ocr: true,
+                ocr_reason: None,
             });
             continue;
         }
@@ -441,12 +462,19 @@ pub fn extract_pages_markdown_mem(
             )
         };
 
-        let needs_ocr = has_text_quality_issue
-            || md.trim().is_empty()
-            || has_gid
-            || is_garbage_text(&md)
-            || is_cid_garbage(&md)
-            || detect_encoding_issues(&md);
+        let has_decoding_issue = has_text_quality_issue
+            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+        if has_decoding_issue {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_SUSPECTED_GARBLED_TEXT,
+            );
+        }
+        let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
+
+        let needs_ocr =
+            ocr_reason.is_some() || md.trim().is_empty() || has_gid || is_garbage_text(&md);
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
@@ -456,6 +484,7 @@ pub fn extract_pages_markdown_mem(
             page: page_0idx,
             markdown: if needs_ocr { String::new() } else { md },
             needs_ocr,
+            ocr_reason,
         });
     }
 
@@ -464,6 +493,7 @@ pub fn extract_pages_markdown_mem(
         pages_with_tables: complexity.pages_with_tables,
         pages_with_columns: complexity.pages_with_columns,
         pages_needing_ocr,
+        ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
         is_complex: complexity.is_complex,
     })
 }
@@ -495,6 +525,8 @@ pub struct RegionText {
     /// Set when: the region is empty, the page uses GID-encoded fonts, or the
     /// extracted text fails garbage/encoding checks.
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Result for a page's region extractions.
@@ -610,17 +642,25 @@ pub fn extract_text_in_regions_mem(
             };
             let has_text_quality_issue = region_items_have_decoding_issue(&matched);
             let text = collect_text_from_matched_items(matched, adaptive_threshold);
+            let has_cid_issue = is_cid_garbage(&text);
+            let has_encoding_issue = detect_encoding_issues(&text);
+            let ocr_reason = if has_text_quality_issue || has_cid_issue || has_encoding_issue {
+                Some(suspected_garbled_reason())
+            } else {
+                None
+            };
 
             // Check per-region text quality instead of blanket page-level
             // GID rejection. A GID font in a logo elsewhere on the page
             // shouldn't force GPU OCR for clean text regions.
-            let needs_ocr = has_text_quality_issue
-                || text.trim().is_empty()
-                || is_garbage_text(&text)
-                || is_cid_garbage(&text)
-                || detect_encoding_issues(&text);
+            let needs_ocr =
+                ocr_reason.is_some() || text.trim().is_empty() || is_garbage_text(&text);
 
-            page_results.push(RegionText { text, needs_ocr });
+            page_results.push(RegionText {
+                text,
+                needs_ocr,
+                ocr_reason,
+            });
         }
 
         results.push(PageRegionResult {
@@ -731,6 +771,7 @@ pub fn extract_tables_in_regions_mem(
                 page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
+                    ocr_reason: None,
                 });
                 continue;
             }
@@ -739,6 +780,7 @@ pub fn extract_tables_in_regions_mem(
                 page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
+                    ocr_reason: Some(suspected_garbled_reason()),
                 });
                 continue;
             }
@@ -913,10 +955,12 @@ pub fn extract_tables_in_regions_mem(
                 Some(candidate) => page_results.push(RegionText {
                     text: candidate.markdown.clone(),
                     needs_ocr: false,
+                    ocr_reason: None,
                 }),
                 None => page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
+                    ocr_reason: None,
                 }),
             }
         }
@@ -3330,6 +3374,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
+            ocr_reasons_by_page: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3345,6 +3390,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
+            ocr_reasons_by_page: Vec::new(),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3415,8 +3461,17 @@ fn process_document(
         })
         .unwrap_or((None, Vec::new()));
 
-    let (markdown, layout, has_encoding_issues, gid_pages, text_quality_pages) = match extracted {
+    let (
+        markdown,
+        layout,
+        has_encoding_issues,
+        gid_pages,
+        text_quality_pages,
+        text_quality_reasons_by_page,
+    ) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+            let mut ocr_reasons_by_page = BTreeMap::new();
+
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
             // passthrough actually produced readable text.  If a page's text
@@ -3449,6 +3504,13 @@ fn process_document(
                             "suppressing garbage text from OCR-flagged pages: {:?}",
                             garbage_pages
                         );
+                        for page in &garbage_pages {
+                            add_ocr_reason(
+                                &mut ocr_reasons_by_page,
+                                *page,
+                                OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                            );
+                        }
                         let items: Vec<_> = items
                             .into_iter()
                             .filter(|i| !garbage_pages.contains(&i.page))
@@ -3466,6 +3528,7 @@ fn process_document(
                 };
 
             let text_quality = analyze_text_quality(&items);
+            merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
             let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
@@ -3482,7 +3545,8 @@ fn process_document(
                 ))
             };
 
-            let enc = text_quality.has_encoding_issues
+            let enc = !ocr_reasons_by_page.is_empty()
+                || text_quality.has_encoding_issues
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -3490,6 +3554,7 @@ fn process_document(
                 enc,
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
+                ocr_reasons_by_page,
             )
         }
         None => (
@@ -3498,6 +3563,7 @@ fn process_document(
             false,
             std::collections::HashSet::new(),
             Vec::new(),
+            BTreeMap::new(),
         ),
     };
 
@@ -3541,7 +3607,8 @@ fn process_document(
     }
     if !text_quality_pages.is_empty() {
         log::debug!(
-            "pages with suspicious text-layer decoding (need OCR): {:?}",
+            "pages with OCR reason {} (need OCR): {:?}",
+            OCR_REASON_SUSPECTED_GARBLED_TEXT,
             text_quality_pages
         );
         for page in text_quality_pages {
@@ -3589,6 +3656,7 @@ fn process_document(
         page_count,
         processing_time_ms: start.elapsed().as_millis() as u64,
         pages_needing_ocr,
+        ocr_reasons_by_page: page_ocr_reasons_vec(text_quality_reasons_by_page),
         title,
         confidence,
         layout,
@@ -3640,26 +3708,67 @@ fn detect_encoding_issues(markdown: &str) -> bool {
 struct TextQualityReport {
     pages_needing_ocr: Vec<u32>,
     has_encoding_issues: bool,
+    reasons_by_page: BTreeMap<u32, Vec<String>>,
 }
 
 fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
-    let mut pages = HashSet::new();
+    let mut reasons_by_page = BTreeMap::new();
 
     for item in items {
         if !matches!(item.item_type, crate::types::ItemType::Text) {
             continue;
         }
         if text_span_has_decoding_issue(&item.text) {
-            pages.insert(item.page);
+            add_ocr_reason(
+                &mut reasons_by_page,
+                item.page,
+                OCR_REASON_SUSPECTED_GARBLED_TEXT,
+            );
         }
     }
 
-    let mut pages_needing_ocr: Vec<u32> = pages.into_iter().collect();
-    pages_needing_ocr.sort_unstable();
+    let pages_needing_ocr: Vec<u32> = reasons_by_page.keys().copied().collect();
     TextQualityReport {
         has_encoding_issues: !pages_needing_ocr.is_empty(),
         pages_needing_ocr,
+        reasons_by_page,
     }
+}
+
+fn suspected_garbled_reason() -> String {
+    OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
+}
+
+fn add_ocr_reason(reasons_by_page: &mut BTreeMap<u32, Vec<String>>, page: u32, reason: &str) {
+    let reasons = reasons_by_page.entry(page).or_default();
+    if !reasons.iter().any(|existing| existing == reason) {
+        reasons.push(reason.to_string());
+    }
+}
+
+fn merge_ocr_reasons(
+    reasons_by_page: &mut BTreeMap<u32, Vec<String>>,
+    extra_reasons_by_page: BTreeMap<u32, Vec<String>>,
+) {
+    for (page, reasons) in extra_reasons_by_page {
+        for reason in reasons {
+            add_ocr_reason(reasons_by_page, page, &reason);
+        }
+    }
+}
+
+fn page_ocr_reason(reasons_by_page: &BTreeMap<u32, Vec<String>>, page: u32) -> Option<String> {
+    reasons_by_page
+        .get(&page)
+        .and_then(|reasons| reasons.first())
+        .cloned()
+}
+
+fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<PageOcrReasons> {
+    reasons_by_page
+        .into_iter()
+        .map(|(page, reasons)| PageOcrReasons { page, reasons })
+        .collect()
 }
 
 fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
@@ -5737,6 +5846,10 @@ mod tests {
 
         assert!(quality.has_encoding_issues);
         assert_eq!(quality.pages_needing_ocr, vec![1]);
+        assert_eq!(
+            quality.reasons_by_page.get(&1).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
     }
 
     #[test]
@@ -5749,6 +5862,14 @@ mod tests {
         let quality = analyze_text_quality(&items);
 
         assert_eq!(quality.pages_needing_ocr, vec![1, 3]);
+        assert_eq!(
+            quality.reasons_by_page.get(&1).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
+        assert_eq!(
+            quality.reasons_by_page.get(&3).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
     }
 
     #[test]
@@ -5763,6 +5884,7 @@ mod tests {
 
         assert!(!quality.has_encoding_issues);
         assert!(quality.pages_needing_ocr.is_empty());
+        assert!(quality.reasons_by_page.is_empty());
     }
 
     #[test]

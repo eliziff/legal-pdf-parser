@@ -1107,6 +1107,7 @@ fn test_pages_needing_ocr_field_accessible() {
         page_count: 1,
         processing_time_ms: 0,
         pages_needing_ocr: vec![1, 3],
+        ocr_reasons_by_page: Vec::new(),
         title: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
