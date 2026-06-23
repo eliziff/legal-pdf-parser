@@ -368,6 +368,7 @@ pub fn extract_pages_markdown_mem(
     // Extract ALL pages to get accurate, document-wide font stats.
     let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
         extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
+    let text_quality = analyze_text_quality(&all_items);
 
     // Compute layout complexity from full document (near-zero cost).
     let complexity = compute_layout_complexity(&all_items, &all_rects, &all_lines);
@@ -416,6 +417,7 @@ pub fn extract_pages_markdown_mem(
             .collect();
 
         let has_gid = gid_pages.contains(&page_1idx);
+        let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -425,17 +427,22 @@ pub fn extract_pages_markdown_mem(
             ..MarkdownOptions::default()
         };
 
-        let md = markdown::to_markdown_from_items_with_rects_and_lines(
-            page_items,
-            options,
-            &page_rects,
-            &[],
-            &page_thresholds,
-            None,
-            &[],
-        );
+        let md = if has_text_quality_issue {
+            String::new()
+        } else {
+            markdown::to_markdown_from_items_with_rects_and_lines(
+                page_items,
+                options,
+                &page_rects,
+                &[],
+                &page_thresholds,
+                None,
+                &[],
+            )
+        };
 
-        let needs_ocr = md.trim().is_empty()
+        let needs_ocr = has_text_quality_issue
+            || md.trim().is_empty()
             || has_gid
             || is_garbage_text(&md)
             || is_cid_garbage(&md)
@@ -592,24 +599,23 @@ pub fn extract_text_in_regions_mem(
         for rect in regions {
             let [rx1, ry1, rx2, ry2] = *rect;
 
-            let text = match items {
-                Some(items) => collect_text_in_region_with_options(
-                    items,
-                    rx1,
-                    ry1,
-                    rx2,
-                    ry2,
-                    page_h,
-                    coords,
-                    adaptive_threshold,
-                ),
-                None => String::new(),
+            let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
+            let matched: Vec<TextItem> = match items {
+                Some(items) => items
+                    .iter()
+                    .filter(|item| region_overlaps_item(item, bounds))
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
             };
+            let has_text_quality_issue = region_items_have_decoding_issue(&matched);
+            let text = collect_text_from_matched_items(matched, adaptive_threshold);
 
             // Check per-region text quality instead of blanket page-level
             // GID rejection. A GID font in a logo elsewhere on the page
             // shouldn't force GPU OCR for clean text regions.
-            let needs_ocr = text.trim().is_empty()
+            let needs_ocr = has_text_quality_issue
+                || text.trim().is_empty()
                 || is_garbage_text(&text)
                 || is_cid_garbage(&text)
                 || detect_encoding_issues(&text);
@@ -722,6 +728,14 @@ pub fn extract_tables_in_regions_mem(
             };
 
             if matched.is_empty() {
+                page_results.push(RegionText {
+                    text: String::new(),
+                    needs_ocr: true,
+                });
+                continue;
+            }
+
+            if region_items_have_decoding_issue(&matched) {
                 page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
@@ -3401,7 +3415,7 @@ fn process_document(
         })
         .unwrap_or((None, Vec::new()));
 
-    let (markdown, layout, has_encoding_issues, gid_pages) = match extracted {
+    let (markdown, layout, has_encoding_issues, gid_pages, text_quality_pages) = match extracted {
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
@@ -3451,6 +3465,7 @@ fn process_document(
                     }
                 };
 
+            let text_quality = analyze_text_quality(&items);
             let layout = compute_layout_complexity(&items, &rects, &lines);
 
             let md = if options.mode == ProcessMode::Analyze {
@@ -3467,14 +3482,22 @@ fn process_document(
                 ))
             };
 
-            let enc = md.as_ref().is_some_and(|m| detect_encoding_issues(m));
-            (md, layout, enc, gid_encoded_pages)
+            let enc = text_quality.has_encoding_issues
+                || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
+            (
+                md,
+                layout,
+                enc,
+                gid_encoded_pages,
+                text_quality.pages_needing_ocr,
+            )
         }
         None => (
             None,
             LayoutComplexity::default(),
             false,
             std::collections::HashSet::new(),
+            Vec::new(),
         ),
     };
 
@@ -3510,6 +3533,18 @@ fn process_document(
     if !gid_pages.is_empty() {
         log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
         for page in gid_pages {
+            if !pages_needing_ocr.contains(&page) {
+                pages_needing_ocr.push(page);
+            }
+        }
+        pages_needing_ocr.sort_unstable();
+    }
+    if !text_quality_pages.is_empty() {
+        log::debug!(
+            "pages with suspicious text-layer decoding (need OCR): {:?}",
+            text_quality_pages
+        );
+        for page in text_quality_pages {
             if !pages_needing_ocr.contains(&page) {
                 pages_needing_ocr.push(page);
             }
@@ -3599,6 +3634,104 @@ fn detect_encoding_issues(markdown: &str) -> bool {
     }
 
     false
+}
+
+#[derive(Debug, Default)]
+struct TextQualityReport {
+    pages_needing_ocr: Vec<u32>,
+    has_encoding_issues: bool,
+}
+
+fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
+    let mut pages = HashSet::new();
+
+    for item in items {
+        if !matches!(item.item_type, crate::types::ItemType::Text) {
+            continue;
+        }
+        if text_span_has_decoding_issue(&item.text) {
+            pages.insert(item.page);
+        }
+    }
+
+    let mut pages_needing_ocr: Vec<u32> = pages.into_iter().collect();
+    pages_needing_ocr.sort_unstable();
+    TextQualityReport {
+        has_encoding_issues: !pages_needing_ocr.is_empty(),
+        pages_needing_ocr,
+    }
+}
+
+fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(item.item_type, crate::types::ItemType::Text)
+            && text_span_has_decoding_issue(&item.text)
+    })
+}
+
+fn text_span_has_decoding_issue(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    detect_encoding_issues(text)
+        || has_private_use_text_run(text)
+        || is_cid_garbage(text)
+        || has_cid_control_token(text)
+}
+
+fn has_private_use_text_run(text: &str) -> bool {
+    let mut total = 0usize;
+    let mut private_use = 0usize;
+    let mut current_run = 0usize;
+    let mut longest_run = 0usize;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            current_run = 0;
+            continue;
+        }
+        total += 1;
+        if is_private_use_char(ch) {
+            private_use += 1;
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+
+    if private_use == 0 {
+        return false;
+    }
+
+    longest_run >= 3 || (total >= 5 && private_use >= 2 && private_use * 2 >= total)
+}
+
+fn has_cid_control_token(text: &str) -> bool {
+    text.split_whitespace().any(token_has_cid_control)
+}
+
+fn token_has_cid_control(token: &str) -> bool {
+    let mut total = 0usize;
+    let mut c1_control = 0usize;
+
+    for ch in token.chars() {
+        total += 1;
+        if ('\u{0080}'..='\u{009F}').contains(&ch) {
+            c1_control += 1;
+        }
+    }
+
+    total >= 5 && c1_control > 0 && c1_control * 20 >= total
+}
+
+fn is_private_use_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+    )
 }
 
 /// Check if extracted text is predominantly garbage (non-alphanumeric).
@@ -5543,6 +5676,13 @@ mod tests {
         }
     }
 
+    fn test_text_item_on_page(page: u32, text: &str) -> TextItem {
+        TextItem {
+            page,
+            ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
+        }
+    }
+
     #[test]
     fn test_detect_encoding_issues_fffd() {
         assert!(detect_encoding_issues(
@@ -5576,6 +5716,68 @@ mod tests {
         // Under threshold of 10 total dollars — should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
+    }
+
+    #[test]
+    fn test_text_quality_flags_localized_cid_mojibake_span() {
+        let items = vec![
+            test_text_item_on_page(
+                1,
+                "Waiting Period 等待期 Maternity and newborn infant care benefit",
+            ),
+            test_text_item_on_page(
+                1,
+                "Inpatient and Day-care Benefits DÂB\u{009B}A4gÉ9¶0ÅDÂB\u{009B}Ê(D>öBÑ9¯",
+            ),
+            test_text_item_on_page(1, "Covered up to annual maximum. 赔付至年度最高保额。"),
+            test_text_item_on_page(2, "A clean second page should not be routed to OCR."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(quality.has_encoding_issues);
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn test_text_quality_flags_replacement_and_private_use_runs() {
+        let items = vec![
+            test_text_item_on_page(1, "broken \u{FFFD} text"),
+            test_text_item_on_page(3, "\u{E000}\u{E001}\u{E002}"),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_text_quality_allows_clean_multilingual_and_latin1_text() {
+        let items = vec![
+            test_text_item_on_page(1, "你好世界，这是一段正常的中文文本。"),
+            test_text_item_on_page(1, "Résumé déjà vu: façade, São Paulo, año 2026."),
+            test_text_item_on_page(1, "A single icon \u{E000} should not force OCR."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_region_text_quality_is_scoped_to_matched_items() {
+        let clean_region = vec![
+            test_text_item_on_page(1, "Clean native text"),
+            test_text_item_on_page(1, "Résumé déjà vu"),
+        ];
+        let garbled_region = vec![
+            test_text_item_on_page(1, "Clean prefix"),
+            test_text_item_on_page(1, "DÂB\u{009B}A4gÉ9¶0ÅDÂB\u{009B}Ê(D>öBÑ9¯"),
+        ];
+
+        assert!(!region_items_have_decoding_issue(&clean_region));
+        assert!(region_items_have_decoding_issue(&garbled_region));
     }
 
     #[test]
