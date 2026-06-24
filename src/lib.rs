@@ -3684,6 +3684,10 @@ fn detect_encoding_issues(markdown: &str) -> bool {
     }
 
     // Heuristic 2: dollar-as-space pattern
+    has_dollar_as_space_pattern(markdown)
+}
+
+fn has_dollar_as_space_pattern(markdown: &str) -> bool {
     let total_dollars = markdown.matches('$').count();
     if total_dollars > 10 {
         let bytes = markdown.as_bytes();
@@ -3711,17 +3715,58 @@ struct TextQualityReport {
     reasons_by_page: BTreeMap<u32, Vec<String>>,
 }
 
+#[derive(Debug, Default)]
+struct PageTextQualityEvidence {
+    chars: usize,
+    replacement_chars: usize,
+    replacement_spans: usize,
+    longest_replacement_run: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextSpanIssueKind {
+    Replacement,
+    Strong,
+}
+
 fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
     let mut reasons_by_page = BTreeMap::new();
+    let mut evidence_by_page = BTreeMap::<u32, PageTextQualityEvidence>::new();
 
     for item in items {
         if !matches!(item.item_type, crate::types::ItemType::Text) {
             continue;
         }
-        if text_span_has_decoding_issue(&item.text) {
+
+        let evidence = evidence_by_page.entry(item.page).or_default();
+        evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
+
+        match text_span_decoding_issue_kind(&item.text) {
+            Some(TextSpanIssueKind::Strong) => {
+                add_ocr_reason(
+                    &mut reasons_by_page,
+                    item.page,
+                    OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                );
+            }
+            Some(TextSpanIssueKind::Replacement) => {
+                let stats = replacement_text_stats(&item.text);
+                evidence.replacement_chars += stats.0;
+                evidence.replacement_spans += 1;
+                evidence.longest_replacement_run = evidence.longest_replacement_run.max(stats.1);
+            }
+            None => {}
+        }
+    }
+
+    for (page, evidence) in evidence_by_page {
+        if reasons_by_page.contains_key(&page) {
+            continue;
+        }
+        if page_replacement_evidence_needs_ocr(&evidence) {
             add_ocr_reason(
                 &mut reasons_by_page,
-                item.page,
+                page,
                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
             );
         }
@@ -3779,15 +3824,71 @@ fn region_items_have_decoding_issue(items: &[TextItem]) -> bool {
 }
 
 fn text_span_has_decoding_issue(text: &str) -> bool {
+    text_span_decoding_issue_kind(text).is_some()
+}
+
+fn text_span_decoding_issue_kind(text: &str) -> Option<TextSpanIssueKind> {
     let text = text.trim();
     if text.is_empty() {
-        return false;
+        return None;
     }
 
-    detect_encoding_issues(text)
+    if has_dollar_as_space_pattern(text)
         || has_private_use_text_run(text)
         || is_cid_garbage(text)
         || has_cid_control_token(text)
+    {
+        return Some(TextSpanIssueKind::Strong);
+    }
+
+    if has_replacement_text_run(text) {
+        return Some(TextSpanIssueKind::Replacement);
+    }
+
+    None
+}
+
+fn replacement_text_stats(text: &str) -> (usize, usize) {
+    let mut replacement = 0usize;
+    let mut current_run = 0usize;
+    let mut longest_run = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\u{FFFD}' {
+            replacement += 1;
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+
+    (replacement, longest_run)
+}
+
+fn page_replacement_evidence_needs_ocr(evidence: &PageTextQualityEvidence) -> bool {
+    if evidence.replacement_chars == 0 || evidence.chars == 0 {
+        return false;
+    }
+
+    // If the entire page is only a short broken text layer, even a short
+    // replacement run is enough evidence. On otherwise text-heavy pages,
+    // require density so math formulas do not force full-page OCR.
+    if evidence.chars <= 80 && evidence.longest_replacement_run >= 2 {
+        return true;
+    }
+
+    let replacement_density_bps = evidence.replacement_chars * 10_000 / evidence.chars;
+    let enough_bad_text = evidence.replacement_chars >= 12 && replacement_density_bps >= 500;
+    let repeated_bad_spans = evidence.replacement_spans >= 3 && replacement_density_bps >= 250;
+    let long_bad_run = evidence.longest_replacement_run >= 8 && replacement_density_bps >= 250;
+
+    enough_bad_text || repeated_bad_spans || long_bad_run
+}
+
+fn has_replacement_text_run(text: &str) -> bool {
+    let (replacement, longest_run) = replacement_text_stats(text);
+    longest_run >= 2 || replacement >= 3
 }
 
 fn has_private_use_text_run(text: &str) -> bool {
@@ -3833,7 +3934,7 @@ fn token_has_cid_control(token: &str) -> bool {
         }
     }
 
-    total >= 5 && c1_control > 0 && c1_control * 20 >= total
+    total >= 5 && c1_control >= 2 && c1_control * 20 >= total
 }
 
 fn is_private_use_char(ch: char) -> bool {
@@ -3851,20 +3952,36 @@ fn is_private_use_char(ch: char) -> bool {
 fn is_garbage_text(markdown: &str) -> bool {
     let mut alphanum = 0usize;
     let mut non_alphanum = 0usize;
-    for ch in markdown.chars() {
-        if ch.is_whitespace() {
-            continue;
+
+    let chars: Vec<char> = markdown.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let mut run_end = i + 1;
+        while run_end < chars.len() && chars[run_end] == ch {
+            run_end += 1;
         }
-        // Skip markdown syntax chars that we add (not from the PDF)
-        if matches!(ch, '#' | '*' | '|' | '-' | '\n') {
-            continue;
+
+        let is_decorative_leader = matches!(ch, '.' | '_' | '·') && run_end - i >= 3;
+        if !is_decorative_leader {
+            for &run_ch in &chars[i..run_end] {
+                if run_ch.is_whitespace() {
+                    continue;
+                }
+                // Skip markdown syntax chars that we add (not from the PDF)
+                if matches!(run_ch, '#' | '*' | '|' | '-' | '\n') {
+                    continue;
+                }
+                if run_ch.is_alphanumeric() {
+                    alphanum += 1;
+                } else {
+                    non_alphanum += 1;
+                }
+            }
         }
-        if ch.is_alphanumeric() {
-            alphanum += 1;
-        } else {
-            non_alphanum += 1;
-        }
+        i = run_end;
     }
+
     let total = alphanum + non_alphanum;
     total >= 50 && alphanum * 2 < total
 }
@@ -3889,6 +4006,9 @@ fn is_cid_garbage(text: &str) -> bool {
         }
         total += 1;
         // C1 control characters (U+0080–U+009F) — almost never in real text
+        if ch == '·' {
+            continue;
+        }
         if ('\u{0080}'..='\u{009F}').contains(&ch) {
             c1_control += 1;
         }
@@ -3903,14 +4023,16 @@ fn is_cid_garbage(text: &str) -> bool {
         return false;
     }
     // If ≥5% of non-whitespace chars are C1 controls, it's garbage
-    if c1_control * 20 >= total {
+    if c1_control >= 2 && c1_control * 20 >= total {
         return true;
     }
     // If ≥40% of non-whitespace chars are high Latin-1 AND the text has few
     // ASCII letters, it's likely CID-as-Latin-1 mojibake (Japanese/CJK PDFs
-    // where CID values 0x80-0xFF become accented Latin characters).
+    // where CID values 0x80-0xFF become accented Latin characters).  Keep a
+    // minimum length so short math tokens like "2×()×" do not route a clean
+    // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+    total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
 
 /// Detect markdown tables with suspicious structure that suggest the heuristic
@@ -5855,7 +5977,7 @@ mod tests {
     #[test]
     fn test_text_quality_flags_replacement_and_private_use_runs() {
         let items = vec![
-            test_text_item_on_page(1, "broken \u{FFFD} text"),
+            test_text_item_on_page(1, "broken \u{FFFD}\u{FFFD} text"),
             test_text_item_on_page(3, "\u{E000}\u{E001}\u{E002}"),
         ];
 
@@ -5885,6 +6007,85 @@ mod tests {
         assert!(!quality.has_encoding_issues);
         assert!(quality.pages_needing_ocr.is_empty());
         assert!(quality.reasons_by_page.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_toc_leaders_form_rules_and_short_math() {
+        let items = vec![
+            test_text_item_on_page(
+                1,
+                "Feature Overview ........................................................................................................ 1-5",
+            ),
+            test_text_item_on_page(1, "Signature __________________________________________"),
+            test_text_item_on_page(1, "__________________________________________________"),
+            test_text_item_on_page(1, "2×()×"),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_isolated_replacement_character() {
+        let items = vec![
+            test_text_item_on_page(1, "\u{FFFD}2026 FINRA"),
+            test_text_item_on_page(1, "A mostly clean page should not be sent to OCR."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_allows_formula_replacement_on_clean_page() {
+        let items = vec![
+            test_text_item_on_page(
+                1,
+                "The LCOE of a power plant can be decomposed into three parts and described in prose.",
+            ),
+            test_text_item_on_page(
+                1,
+                "This page has enough normal text that a damaged equation should not force OCR.",
+            ),
+            test_text_item_on_page(1, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD} = x + y"),
+            test_text_item_on_page(1, "More normal explanatory text follows after the formula."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
+    }
+
+    #[test]
+    fn test_text_quality_flags_dense_replacement_text_page() {
+        let items = vec![
+            test_text_item_on_page(1, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD} broken layer"),
+            test_text_item_on_page(1, "more \u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD} broken text"),
+            test_text_item_on_page(1, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+        assert!(quality.has_encoding_issues);
+    }
+
+    #[test]
+    fn test_text_quality_allows_tex_ligature_c1_controls_in_words() {
+        let items = vec![test_text_item_on_page(
+            1,
+            "Especialmente de\u{85}ciente es nuestro conocimiento del control. The amniotic \u{87}uid is important.",
+        )];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(!quality.has_encoding_issues);
+        assert!(quality.pages_needing_ocr.is_empty());
     }
 
     #[test]
@@ -5944,6 +6145,18 @@ mod tests {
         assert!(
             !is_cid_garbage(japanese),
             "Valid Japanese text should not be flagged as garbage"
+        );
+
+        let japanese_toc = "第１章 市政経営方針の位置づけ ···································· 1";
+        assert!(
+            !is_cid_garbage(japanese_toc),
+            "Japanese TOC dot leaders should not be flagged as garbage"
+        );
+
+        let tex_ligature = "amniotic \u{87}uid volume regulation";
+        assert!(
+            !is_cid_garbage(tex_ligature),
+            "A single TeX ligature byte inside a word should not be CID garbage"
         );
     }
 

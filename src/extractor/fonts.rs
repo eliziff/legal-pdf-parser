@@ -526,6 +526,11 @@ pub(crate) fn parse_font_encoding(
     font_dict: &lopdf::Dictionary,
 ) -> Option<EncodingResult> {
     let encoding_obj = font_dict.get(b"Encoding").ok()?;
+    let base_font_name = font_dict
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(|n| String::from_utf8_lossy(n).to_string());
 
     // Encoding can be a name or a dictionary
     match encoding_obj {
@@ -538,12 +543,14 @@ pub(crate) fn parse_font_encoding(
         Object::Reference(obj_ref) => {
             // Reference to encoding dictionary
             if let Ok(enc_dict) = doc.get_dictionary(*obj_ref) {
-                parse_encoding_dictionary(doc, enc_dict)
+                parse_encoding_dictionary(doc, enc_dict, base_font_name.as_deref())
             } else {
                 None
             }
         }
-        Object::Dictionary(enc_dict) => parse_encoding_dictionary(doc, enc_dict),
+        Object::Dictionary(enc_dict) => {
+            parse_encoding_dictionary(doc, enc_dict, base_font_name.as_deref())
+        }
         _ => None,
     }
 }
@@ -562,6 +569,7 @@ pub(crate) struct EncodingResult {
 pub(crate) fn parse_encoding_dictionary(
     doc: &Document,
     enc_dict: &lopdf::Dictionary,
+    base_font_name: Option<&str>,
 ) -> Option<EncodingResult> {
     let differences = enc_dict.get(b"Differences").ok()?;
 
@@ -591,11 +599,9 @@ pub(crate) fn parse_encoding_dictionary(
             Object::Name(name) => {
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
-                if glyph_name == "fi"
-                    || glyph_name == "fl"
-                    || glyph_name == "ffi"
-                    || glyph_name == "ffl"
-                {
+                let mapped_char = glyph_to_char(&glyph_name)
+                    .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
+                if mapped_char.is_some_and(is_ligature_char) {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (ligature)",
                         current_code, glyph_name
@@ -610,7 +616,7 @@ pub(crate) fn parse_encoding_dictionary(
                 {
                     gid_glyph_count += 1;
                 }
-                if let Some(ch) = glyph_to_char(&glyph_name) {
+                if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
                 } else {
                     debug!(
@@ -643,6 +649,31 @@ pub(crate) fn parse_encoding_dictionary(
         map: encoding_map,
         gid_glyph_count,
     })
+}
+
+fn private_glyph_to_char(glyph_name: &str, base_font_name: Option<&str>) -> Option<char> {
+    let base_font_name = strip_subset_prefix(base_font_name?);
+
+    // Aptos CFF subsets from Office PDFs can expose the ff ligature as /g431
+    // without a ToUnicode map. Keep this font-scoped because /gNNN names are private.
+    if base_font_name.eq_ignore_ascii_case("Aptos") && glyph_name == "g431" {
+        Some('\u{FB00}')
+    } else {
+        None
+    }
+}
+
+fn strip_subset_prefix(font_name: &str) -> &str {
+    font_name
+        .split_once('+')
+        .map_or(font_name, |(_, stripped)| stripped)
+}
+
+fn is_ligature_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}'
+    )
 }
 
 /// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
@@ -725,6 +756,8 @@ pub(crate) fn extract_text_from_operand(
     let is_type0_cid_font = font_widths
         .get(current_font)
         .is_some_and(|info| info.is_cid);
+    let use_cp1252_fallback =
+        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
             let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
@@ -755,9 +788,12 @@ pub(crate) fn extract_text_from_operand(
                                     return Some(ch.to_string());
                                 }
                             }
-                            // 4. Printable ASCII/Latin-1 fallback
+                            // 4. Printable single-byte fallback
                             if b >= 0x20 {
-                                return Some((b as char).to_string());
+                                return Some(
+                                    decode_single_byte_fallback_char(b, use_cp1252_fallback)
+                                        .to_string(),
+                                );
                             }
                             None
                         })
@@ -880,8 +916,9 @@ pub(crate) fn extract_text_from_operand(
                                 Some(ch)
                             } else if b >= 0x20 {
                                 // Base encoding fallback for printable bytes.
-                                // For codes 0x20-0x7E this matches all standard PDF encodings.
-                                Some(b as char)
+                                // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
+                                // semantics, not ISO-8859-1 C1 controls.
+                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
                             } else {
                                 None // Skip unmapped control characters
                             }
@@ -937,6 +974,7 @@ pub(crate) fn extract_text_from_operand(
             // Try to decode using cached font encoding from lopdf
             if let Some(encoding) = encoding_cache.get(current_font) {
                 if let Ok(text) = Document::decode_text(encoding, bytes) {
+                    let text = normalize_cp1252_controls(text, use_cp1252_fallback);
                     if text.contains('\u{FFFD}') {
                         debug!(
                             "decode_text produced replacement for font={} bytes_len={}",
@@ -973,16 +1011,119 @@ pub(crate) fn extract_text_from_operand(
                 return Some(symbol_text);
             }
 
-            // Pure ASCII bytes round-trip safely (Latin-1 == ASCII for
-            // 0x00..=0x7F), and non-CID (Type1 / TrueType / Type3) fonts
-            // use single-byte encodings where Latin-1 fallback is the
-            // canonical interpretation.
-            Some(bytes.iter().map(|&b| b as char).collect())
+            // Non-CID (Type1 / TrueType / Type3) fonts use single-byte
+            // encodings. In practice the fallback should follow WinAnsi for
+            // 0x80..=0x9F so bytes like 0x92 become smart punctuation instead
+            // of C1 controls that look like CID mojibake.
+            Some(decode_single_byte_fallback(bytes, use_cp1252_fallback))
         } else {
             None
         }
     })();
-    result.map(clean_symbol_pua)
+    result.map(|text| {
+        let text = clean_symbol_pua(text);
+        normalize_cp1252_controls(text, use_cp1252_fallback)
+    })
+}
+
+fn decode_single_byte_fallback(bytes: &[u8], use_cp1252_fallback: bool) -> String {
+    bytes
+        .iter()
+        .map(|&b| decode_single_byte_fallback_char(b, use_cp1252_fallback))
+        .collect()
+}
+
+fn decode_single_byte_fallback_char(byte: u8, use_cp1252_fallback: bool) -> char {
+    if !use_cp1252_fallback {
+        return byte as char;
+    }
+
+    match byte {
+        0x80 => '\u{20AC}',
+        0x82 => '\u{201A}',
+        0x83 => '\u{0192}',
+        0x84 => '\u{201E}',
+        0x85 => '\u{2026}',
+        0x86 => '\u{2020}',
+        0x87 => '\u{2021}',
+        0x88 => '\u{02C6}',
+        0x89 => '\u{2030}',
+        0x8A => '\u{0160}',
+        0x8B => '\u{2039}',
+        0x8C => '\u{0152}',
+        0x8E => '\u{017D}',
+        0x91 => '\u{2018}',
+        0x92 => '\u{2019}',
+        0x93 => '\u{201C}',
+        0x94 => '\u{201D}',
+        0x95 => '\u{2022}',
+        0x96 => '\u{2013}',
+        0x97 => '\u{2014}',
+        0x98 => '\u{02DC}',
+        0x99 => '\u{2122}',
+        0x9A => '\u{0161}',
+        0x9B => '\u{203A}',
+        0x9C => '\u{0153}',
+        0x9E => '\u{017E}',
+        0x9F => '\u{0178}',
+        _ => byte as char,
+    }
+}
+
+fn normalize_cp1252_controls(text: String, use_cp1252_fallback: bool) -> String {
+    if !use_cp1252_fallback {
+        return text;
+    }
+    if !text
+        .chars()
+        .any(|ch| ('\u{0080}'..='\u{009F}').contains(&ch))
+    {
+        return text;
+    }
+
+    text.chars()
+        .map(|ch| {
+            if ('\u{0080}'..='\u{009F}').contains(&ch) {
+                decode_single_byte_fallback_char(ch as u8, true)
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn should_use_cp1252_single_byte_fallback(
+    base_font_name: Option<&str>,
+    is_type0_cid_font: bool,
+) -> bool {
+    if is_type0_cid_font {
+        return false;
+    }
+
+    let Some(base_font_name) = base_font_name else {
+        return true;
+    };
+    let font_name = base_font_name
+        .rsplit_once('+')
+        .map_or(base_font_name, |(_, stripped)| stripped)
+        .to_ascii_lowercase();
+
+    // TeX/Computer Modern and math/symbol fonts often place ligatures or
+    // symbols in the C1 byte range. Treating those bytes as Windows-1252 makes
+    // words like "deficiente" become "de…ciente" and "fluid" become "‡uid".
+    let non_cp1252_prefixes = [
+        "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti", "ecrm", "ecbx", "ecti",
+        "tcrm", "tctt", "msam", "msbm", "ttdc",
+    ];
+    if non_cp1252_prefixes
+        .iter()
+        .any(|prefix| font_name.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let non_cp1252_names = ["math", "symbol", "dingbat", "emoji"];
+    !non_cp1252_names.iter().any(|name| font_name.contains(name))
 }
 
 /// Replace PUA characters in the F000-F0FF range with standard Unicode equivalents.
@@ -1104,6 +1245,7 @@ fn score_text(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     fn make_font_info(widths: &[(u16, u16)], default_width: u16, is_cid: bool) -> FontWidthInfo {
         FontWidthInfo {
@@ -1228,6 +1370,51 @@ mod tests {
         assert!(score_text(good) > score_text(bad));
     }
 
+    fn doc_with_private_differences() -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let encoding_id = doc.add_object(dictionary! {
+            "Differences" => Object::Array(vec![
+                Object::Integer(0x88),
+                Object::Name(b"g431".to_vec()),
+                Object::Name(b"fi".to_vec()),
+                Object::Integer(0xAD),
+                Object::Name(b"fl".to_vec()),
+            ]),
+        });
+
+        (doc, encoding_id)
+    }
+
+    #[test]
+    fn aptos_private_g431_maps_to_ff_ligature() {
+        let (doc, encoding_id) = doc_with_private_differences();
+        let font_dict = dictionary! {
+            "BaseFont" => Object::Name(b"NJEQOD+Aptos".to_vec()),
+            "Encoding" => Object::Reference(encoding_id),
+        };
+
+        let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
+
+        assert_eq!(result.map.get(&0x88u8), Some(&'\u{FB00}'));
+        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
+        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+    }
+
+    #[test]
+    fn private_g431_does_not_map_for_unrelated_fonts() {
+        let (doc, encoding_id) = doc_with_private_differences();
+        let font_dict = dictionary! {
+            "BaseFont" => Object::Name(b"ABCDEF+OtherFont".to_vec()),
+            "Encoding" => Object::Reference(encoding_id),
+        };
+
+        let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
+
+        assert!(!result.map.contains_key(&0x88u8));
+        assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
+        assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+    }
+
     #[test]
     fn cid_font_with_unparseable_cmap_does_not_emit_latin1_mojibake() {
         // Type0/CID font (font_widths reports `is_cid=true`) where the
@@ -1279,15 +1466,15 @@ mod tests {
     }
 
     #[test]
-    fn simple_font_latin1_fallback_passes_high_bytes_through() {
+    fn simple_font_single_byte_fallback_passes_high_bytes_through() {
         // A Type1/TrueType simple font (is_cid=false) with a `/ToUnicode`
         // reference but no usable CMap and no `/Differences` map.
-        // Per-byte Latin-1 IS the canonical interpretation here — these
-        // bytes are character codes, not CIDs. The CID guard must NOT
-        // strip them. Reproduces the false positive that an earlier
-        // version of the guard introduced for fonts in PDFs like
-        // pdf-evals/Navigating-Artificial-Intelligence-..., where bytes
-        // like 0xB6 are legitimate Latin-1 character codes.
+        // Per-byte fallback is the canonical interpretation here — these
+        // bytes are character codes, not CIDs. The CID guard must NOT strip
+        // them. Reproduces the false positive that an earlier version of the
+        // guard introduced for fonts in PDFs like pdf-evals/Navigating-
+        // Artificial-Intelligence-..., where bytes like 0xB6 are legitimate
+        // single-byte character codes.
         let bytes = vec![0x24_u8, 0x47, 0xB6, 0x56]; // "$G¶V"
         let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
 
@@ -1319,5 +1506,63 @@ mod tests {
             !text.contains('\u{FFFD}'),
             "simple font fallback must not stamp FFFD over legitimate bytes: {text:?}"
         );
+    }
+
+    #[test]
+    fn simple_font_single_byte_fallback_maps_cp1252_punctuation() {
+        let bytes = vec![b'l', 0x92_u8, b'a', b'c', b'a', b'd'];
+        let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
+
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let font_widths: PageFontWidths = HashMap::new();
+
+        let text = extract_text_from_operand(
+            &obj,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("simple font should decode CP1252 punctuation");
+
+        assert_eq!(text, "l’acad");
+    }
+
+    #[test]
+    fn cached_encoding_decode_normalizes_cp1252_controls() {
+        let text = normalize_cp1252_controls("d\u{92}un \u{96} test".to_string(), true);
+        assert_eq!(text, "d’un – test");
+    }
+
+    #[test]
+    fn tex_font_decode_keeps_c1_ligature_bytes_unmodified() {
+        let text = normalize_cp1252_controls("de\u{85}ciente \u{87}uid".to_string(), false);
+        assert_eq!(text, "de\u{85}ciente \u{87}uid");
+        assert!(!should_use_cp1252_single_byte_fallback(
+            Some("TTdcr10"),
+            false
+        ));
+        assert!(!should_use_cp1252_single_byte_fallback(
+            Some("cmr10"),
+            false
+        ));
+    }
+
+    #[test]
+    fn winansi_text_font_uses_cp1252_fallback() {
+        assert!(should_use_cp1252_single_byte_fallback(
+            Some("BJPQNQ+Times-Roman"),
+            false
+        ));
     }
 }
