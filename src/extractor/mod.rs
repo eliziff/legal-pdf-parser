@@ -6,11 +6,12 @@ pub(crate) mod content_stream;
 mod fonts;
 mod layout;
 mod links;
+pub(crate) mod underline;
 mod xobjects;
 
 use crate::text_utils::is_rtl_text;
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, TextItem};
+use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -180,6 +181,7 @@ fn extract_positioned_text_impl(
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
+        suppress_table_underlines(&mut items, &rects, &lines, *page_num);
         debug!(
             "page {}: {} text items, {} rects, {} lines{}",
             page_num,
@@ -224,6 +226,38 @@ fn extract_positioned_text_impl(
         page_thresholds,
         gid_encoded_pages,
     ))
+}
+
+fn suppress_table_underlines(
+    items: &mut [TextItem],
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+    page: u32,
+) {
+    if !items.iter().any(|item| item.is_underline) {
+        return;
+    }
+
+    let mut table_item_indices: HashSet<usize> = HashSet::new();
+
+    if !rects.is_empty() {
+        let (rect_tables, _) = crate::tables::detect_tables_from_rects(items, rects, page);
+        for table in rect_tables {
+            table_item_indices.extend(table.item_indices);
+        }
+    }
+
+    if !lines.is_empty() {
+        for table in crate::tables::detect_tables_from_lines(items, lines, page) {
+            table_item_indices.extend(table.item_indices);
+        }
+    }
+
+    for index in table_item_indices {
+        if let Some(item) = items.get_mut(index) {
+            item.is_underline = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +559,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut is_underline = first.is_underline;
 
             let mut j = i + 1;
             while j < group.len() {
@@ -571,6 +606,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                is_underline |= next.is_underline;
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -591,6 +627,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 page: first.page,
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
+                is_underline,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -701,7 +738,7 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
 mod tests {
     use super::*;
     use crate::text_utils::{is_cjk_char, is_rtl_char, is_rtl_text, sort_line_items};
-    use crate::types::{ItemType, TextLine};
+    use crate::types::{ItemType, PdfLine, TextLine};
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
     fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
@@ -716,6 +753,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -724,6 +762,16 @@ mod tests {
     fn with_mcid(mut item: TextItem) -> TextItem {
         item.mcid = Some(1);
         item
+    }
+
+    fn make_line(x1: f32, y1: f32, x2: f32, y2: f32) -> PdfLine {
+        PdfLine {
+            x1,
+            y1,
+            x2,
+            y2,
+            page: 1,
+        }
     }
 
     #[test]
@@ -772,6 +820,21 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "hello world");
+    }
+
+    #[test]
+    fn merge_items_preserves_underline_from_later_fragment() {
+        let mut items = vec![
+            make_merge_item("pre", 100.0, 18.0),
+            make_merge_item("fix", 119.0, 18.0),
+        ];
+        items[1].is_underline = true;
+
+        let merged = merge_text_items(items);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "prefix");
+        assert!(merged[0].is_underline);
     }
 
     #[test]
@@ -852,6 +915,35 @@ mod tests {
     }
 
     #[test]
+    fn suppress_table_underlines_clears_line_detected_table_items() {
+        let mut items = vec![
+            make_merge_item("H1", 125.0, 20.0),
+            make_merge_item("H2", 225.0, 20.0),
+            make_merge_item("A", 125.0, 20.0),
+            make_merge_item("B", 225.0, 20.0),
+        ];
+        items[0].y = 490.0;
+        items[1].y = 490.0;
+        items[2].y = 470.0;
+        items[3].y = 470.0;
+        for item in &mut items {
+            item.is_underline = true;
+        }
+        let lines = vec![
+            make_line(100.0, 500.0, 300.0, 500.0),
+            make_line(100.0, 480.0, 300.0, 480.0),
+            make_line(100.0, 460.0, 300.0, 460.0),
+            make_line(100.0, 460.0, 100.0, 500.0),
+            make_line(200.0, 460.0, 200.0, 500.0),
+            make_line(300.0, 460.0, 300.0, 500.0),
+        ];
+
+        suppress_table_underlines(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| !item.is_underline));
+    }
+
+    #[test]
     fn test_group_into_lines() {
         let items = vec![
             TextItem {
@@ -865,6 +957,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -879,6 +972,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -893,6 +987,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -947,6 +1042,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -961,6 +1057,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -975,6 +1072,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1000,6 +1098,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1014,6 +1113,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1028,6 +1128,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1055,6 +1156,7 @@ mod tests {
                 page: 1,
                 is_bold: true,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1089,6 +1191,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1124,6 +1227,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1138,6 +1242,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1152,6 +1257,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1174,6 +1280,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1286,6 +1393,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1300,6 +1408,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1324,6 +1433,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1338,6 +1448,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1378,6 +1489,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1422,6 +1534,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1466,6 +1579,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                is_underline: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1503,6 +1617,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }

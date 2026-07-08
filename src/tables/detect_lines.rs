@@ -393,6 +393,7 @@ mod tests {
             page,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }

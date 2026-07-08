@@ -266,6 +266,8 @@ pub struct PyTextItem {
     #[pyo3(get)]
     pub is_italic: bool,
     #[pyo3(get)]
+    pub is_underline: bool,
+    #[pyo3(get)]
     pub item_type: String,
 }
 
@@ -349,6 +351,7 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            is_underline: item.is_underline,
             item_type: item_type_str(&item.item_type),
         })
         .collect()

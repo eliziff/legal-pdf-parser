@@ -514,6 +514,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -866,6 +867,7 @@ mod tests {
                         font: String::new(),
                         is_bold: false,
                         is_italic: false,
+                        is_underline: false,
                         item_type: ItemType::Text,
                         mcid: None,
                         page: 1,
@@ -902,6 +904,7 @@ mod tests {
                         font: String::new(),
                         is_bold: false,
                         is_italic: false,
+                        is_underline: false,
                         item_type: ItemType::Text,
                         mcid: None,
                         page: 1,

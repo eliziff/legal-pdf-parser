@@ -17,6 +17,7 @@ use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
 };
+use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -74,6 +75,37 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     result
 }
 
+fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
+    (
+        x * ctm[0] + y * ctm[2] + ctm[4],
+        x * ctm[1] + y * ctm[3] + ctm[5],
+    )
+}
+
+fn transformed_stroke_width(
+    line_width: f32,
+    ctm: &[f32; 6],
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+) -> f32 {
+    let user_width = line_width.abs();
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= f32::EPSILON {
+        return user_width;
+    }
+
+    // PDF stroke width scales perpendicular to the path direction.
+    let nx = -dy / len;
+    let ny = dx / len;
+    let ndx = nx * ctm[0] + ny * ctm[2];
+    let ndy = nx * ctm[1] + ny * ctm[3];
+    user_width * (ndx * ndx + ndy * ndy).sqrt()
+}
+
 /// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
 /// the page uses fonts with unresolvable gid-encoded glyphs.
 pub(crate) fn extract_page_text_items(
@@ -89,6 +121,7 @@ pub(crate) fn extract_page_text_items(
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
+    let mut underline_lines: Vec<UnderlineLine> = Vec::new();
 
     // Path construction state for m/l/h → S/s line extraction
     let mut path_subpath_start: Option<(f32, f32)> = None;
@@ -97,6 +130,12 @@ pub(crate) fn extract_page_text_items(
     // Completed subpaths (each a vec of line segments) for f/f* rect extraction
     let mut pending_subpaths: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
     let mut fill_rects: Vec<PdfRect> = Vec::new();
+    // `re` rects awaiting a paint operator. Underline detection must only
+    // see painted rects: a `re W n` clip path or `re n` no-op draws nothing
+    // on the page, so treating every `re` as ink would underline text that
+    // merely sits near an invisible clip boundary.
+    let mut pending_re_rects: Vec<PdfRect> = Vec::new();
+    let mut painted_rects: Vec<PdfRect> = Vec::new();
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
@@ -188,10 +227,12 @@ pub(crate) fn extract_page_text_items(
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+    let mut line_width: f32 = 1.0;
     #[derive(Clone)]
     struct SavedGraphicsState {
         ctm: [f32; 6],
         text_rendering_mode: i32,
+        line_width: f32,
         char_spacing: f32,
         word_spacing: f32,
         text_leading: f32,
@@ -240,6 +281,7 @@ pub(crate) fn extract_page_text_items(
                 gstate_stack.push(SavedGraphicsState {
                     ctm,
                     text_rendering_mode,
+                    line_width,
                     char_spacing,
                     word_spacing,
                     text_leading,
@@ -252,6 +294,7 @@ pub(crate) fn extract_page_text_items(
                 if let Some(saved) = gstate_stack.pop() {
                     ctm = saved.ctm;
                     text_rendering_mode = saved.text_rendering_mode;
+                    line_width = saved.line_width;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
                     text_leading = saved.text_leading;
@@ -271,6 +314,11 @@ pub(crate) fn extract_page_text_items(
                         get_number(&op.operands[5]).unwrap_or(0.0),
                     ];
                     ctm = multiply_matrices(&new_matrix, &ctm);
+                }
+            }
+            "w" => {
+                if let Some(width) = op.operands.first().and_then(get_number) {
+                    line_width = width;
                 }
             }
             "BT" => {
@@ -441,6 +489,7 @@ pub(crate) fn extract_page_text_items(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                is_underline: false,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -606,6 +655,7 @@ pub(crate) fn extract_page_text_items(
                                     page: page_num,
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
+                                    is_underline: false,
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                 });
@@ -669,6 +719,7 @@ pub(crate) fn extract_page_text_items(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                is_underline: false,
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -705,6 +756,7 @@ pub(crate) fn extract_page_text_items(
                                         page: page_num,
                                         is_bold: false,
                                         is_italic: false,
+                                        is_underline: false,
                                         item_type: ItemType::Image,
                                         mcid: current_mcid(&marked_content_stack),
                                     });
@@ -801,6 +853,7 @@ pub(crate) fn extract_page_text_items(
                                     page: page_num,
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
+                                    is_underline: false,
                                     item_type: ItemType::Text,
                                     mcid: entry
                                         .mcid
@@ -825,13 +878,19 @@ pub(crate) fn extract_page_text_items(
                     let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
                     let w_dev = rw * ctm[0];
                     let h_dev = rh * ctm[3];
-                    rects.push(PdfRect {
+                    let rect = PdfRect {
                         x: x_dev,
                         y: y_dev,
                         width: w_dev,
                         height: h_dev,
                         page: page_num,
-                    });
+                    };
+                    // Underline detection must only see rects that are
+                    // actually painted — a `re` used purely as a clip path
+                    // (`re W n`) or discarded (`re n`) draws nothing. Hold
+                    // the rect as pending until a paint operator confirms it.
+                    pending_re_rects.push(rect.clone());
+                    rects.push(rect);
                 }
             }
             // ── Path construction operators ──────────────────────
@@ -881,10 +940,8 @@ pub(crate) fn extract_page_text_items(
                     }
                 }
                 for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let x1d = x1 * ctm[0] + y1 * ctm[2] + ctm[4];
-                    let y1d = x1 * ctm[1] + y1 * ctm[3] + ctm[5];
-                    let x2d = x2 * ctm[0] + y2 * ctm[2] + ctm[4];
-                    let y2d = x2 * ctm[1] + y2 * ctm[3] + ctm[5];
+                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
                     lines.push(PdfLine {
                         x1: x1d,
                         y1: y1d,
@@ -892,7 +949,16 @@ pub(crate) fn extract_page_text_items(
                         y2: y2d,
                         page: page_num,
                     });
+                    underline_lines.push(UnderlineLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
+                        page: page_num,
+                    });
                 }
+                painted_rects.append(&mut pending_re_rects);
                 pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
@@ -908,10 +974,8 @@ pub(crate) fn extract_page_text_items(
                     }
                 }
                 for (x1, y1, x2, y2) in pending_lines.drain(..) {
-                    let x1d = x1 * ctm[0] + y1 * ctm[2] + ctm[4];
-                    let y1d = x1 * ctm[1] + y1 * ctm[3] + ctm[5];
-                    let x2d = x2 * ctm[0] + y2 * ctm[2] + ctm[4];
-                    let y2d = x2 * ctm[1] + y2 * ctm[3] + ctm[5];
+                    let (x1d, y1d) = transform_path_point(x1, y1, &ctm);
+                    let (x2d, y2d) = transform_path_point(x2, y2, &ctm);
                     lines.push(PdfLine {
                         x1: x1d,
                         y1: y1d,
@@ -919,7 +983,16 @@ pub(crate) fn extract_page_text_items(
                         y2: y2d,
                         page: page_num,
                     });
+                    underline_lines.push(UnderlineLine {
+                        x1: x1d,
+                        y1: y1d,
+                        x2: x2d,
+                        y2: y2d,
+                        stroke_width: transformed_stroke_width(line_width, &ctm, x1, y1, x2, y2),
+                        page: page_num,
+                    });
                 }
+                painted_rects.append(&mut pending_re_rects);
                 pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
@@ -977,6 +1050,7 @@ pub(crate) fn extract_page_text_items(
                         }
                     }
                 }
+                painted_rects.append(&mut pending_re_rects);
                 pending_lines.clear();
                 path_subpath_start = None;
                 path_current = None;
@@ -1042,7 +1116,10 @@ pub(crate) fn extract_page_text_items(
                 // Do NOT clear pending_lines — the following `n` does that
             }
             "n" => {
-                // end path (no-op): discard
+                // end path (no-op): discard — including any `re` rects that
+                // were only ever part of a clip path (`re W n`), which draw
+                // no ink and must not feed underline detection.
+                pending_re_rects.clear();
                 pending_lines.clear();
                 pending_subpaths.clear();
                 path_subpath_start = None;
@@ -1051,6 +1128,12 @@ pub(crate) fn extract_page_text_items(
             _ => {}
         }
     }
+
+    // Underline detection reads only painted ink: `re` rects confirmed by
+    // a paint operator plus filled-subpath rects — never clip-only rects,
+    // which draw nothing.
+    let mut underline_rects = painted_rects;
+    underline_rects.extend(fill_rects.iter().cloned());
 
     // Only use clip/fill rects when no `re` rects exist on this page.
     // Clip rects take priority over fill rects, but first we deduplicate
@@ -1081,8 +1164,17 @@ pub(crate) fn extract_page_text_items(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (items, rects, lines, coords_rotated) =
+    let (mut items, rects, lines, coords_rotated) =
         correct_rotated_page(items, rects, lines, &rotation_votes);
+    if coords_rotated {
+        rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
+    }
+    super::underline::mark_underlined_items(
+        &mut items,
+        &underline_rects,
+        &underline_lines,
+        page_num,
+    );
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
@@ -1168,6 +1260,27 @@ fn correct_rotated_page(
     (items, rects, lines, true)
 }
 
+fn rotate_underline_graphics(rects: &mut [PdfRect], lines: &mut [UnderlineLine]) {
+    for rect in rects {
+        let new_x = rect.y;
+        let new_y = -(rect.x + rect.width.abs());
+        rect.x = new_x;
+        rect.y = new_y;
+        std::mem::swap(&mut rect.width, &mut rect.height);
+    }
+
+    for line in lines {
+        let new_x1 = line.y1;
+        let new_y1 = -line.x1;
+        let new_x2 = line.y2;
+        let new_y2 = -line.x2;
+        line.x1 = new_x1;
+        line.y1 = new_y1;
+        line.x2 = new_x2;
+        line.y2 = new_y2;
+    }
+}
+
 /// Remove near-duplicate rects (same coordinates within 0.5 pt tolerance).
 /// Some PDFs emit a full-page clip path for every text block, producing
 /// thousands of identical rects. After dedup these collapse to one rect,
@@ -1217,6 +1330,57 @@ mod tests {
         }
     }
 
+    fn simple_doc_with_content(content: &[u8]) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            content.to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => Object::Reference(font_id),
+                },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        (doc, page_id)
+    }
+
+    fn extract_simple_items(content: &[u8]) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _) =
+            extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
+        items
+    }
+
     #[test]
     fn test_dedup_rects_identical() {
         let mut rects = vec![rect(0.0, 0.0, 612.0, 792.0, 1); 3759];
@@ -1264,6 +1428,38 @@ mod tests {
         let mut single = vec![rect(1.0, 2.0, 3.0, 4.0, 1)];
         dedup_rects(&mut single);
         assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn thick_stroked_rule_does_not_mark_underline() {
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (THICK) Tj ET
+4 w
+100 498 m 170 498 l S
+BT /F1 12 Tf 1 0 0 1 100 480 Tm (THIN) Tj ET
+1 w
+100 478 m 160 478 l S";
+
+        let items = extract_simple_items(content);
+        let thick = items.iter().find(|item| item.text == "THICK").unwrap();
+        let thin = items.iter().find(|item| item.text == "THIN").unwrap();
+
+        assert!(!thick.is_underline);
+        assert!(thin.is_underline);
+    }
+
+    #[test]
+    fn rotated_page_underline_is_detected_after_coordinate_correction() {
+        let content = b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
+1 w
+202 100 m 202 170 l S";
+
+        let items = extract_simple_items(content);
+        let hello = items.iter().find(|item| item.text == "HELLO").unwrap();
+        let world = items.iter().find(|item| item.text == "WORLD").unwrap();
+
+        assert!(hello.is_underline);
+        assert!(!world.is_underline);
     }
 
     #[test]

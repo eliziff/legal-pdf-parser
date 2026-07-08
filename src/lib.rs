@@ -4882,6 +4882,7 @@ mod text_cluster_column_undercount_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5156,6 +5157,7 @@ mod table_candidate_selection_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5902,6 +5904,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            is_underline: false,
             item_type: ItemType::Text,
             mcid: None,
         }

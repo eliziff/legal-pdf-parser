@@ -1,6 +1,10 @@
 //! CLI tool for PDF to Markdown conversion
 
-use pdf_inspector::{process_pdf_with_options, LayoutComplexity, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::extractor::ItemType;
+use pdf_inspector::{
+    extract_text_with_positions_pages, process_pdf_with_options, LayoutComplexity, PdfOptions,
+    PdfType, ProcessMode, TextItem,
+};
 use std::collections::HashSet;
 use std::env;
 use std::fmt::Write;
@@ -45,6 +49,92 @@ fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> Stri
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn item_type_label(item_type: &ItemType) -> &'static str {
+    match item_type {
+        ItemType::Text => "text",
+        ItemType::Image => "image",
+        ItemType::Link(_) => "link",
+        ItemType::FormField => "form_field",
+    }
+}
+
+fn format_items_json(items: &[TextItem]) -> String {
+    let underlined_count = items.iter().filter(|item| item.is_underline).count();
+    let items_json = items
+        .iter()
+        .map(|item| {
+            let mcid = item
+                .mcid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let link_url = match &item.item_type {
+                ItemType::Link(url) => format!(r#","url":"{}""#, json_escape(url)),
+                _ => String::new(),
+            };
+            format!(
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"item_type":"{}","mcid":{}{}}}"#,
+                json_escape(&item.text),
+                item.page,
+                item.x,
+                item.y,
+                item.width,
+                item.height,
+                json_escape(&item.font),
+                item.font_size,
+                item.is_bold,
+                item.is_italic,
+                item.is_underline,
+                item_type_label(&item.item_type),
+                mcid,
+                link_url,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        r#"{{"total_items":{},"underlined_count":{},"items":[{}]}}"#,
+        items.len(),
+        underlined_count,
+        items_json
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_items_json;
+    use pdf_inspector::extractor::ItemType;
+    use pdf_inspector::TextItem;
+
+    #[test]
+    fn items_json_includes_position_and_underline_metadata() {
+        let items = vec![TextItem {
+            text: "A \"quoted\" item".to_string(),
+            x: 12.345,
+            y: 67.891,
+            width: 23.456,
+            height: 9.876,
+            font: "F1".to_string(),
+            font_size: 10.0,
+            page: 2,
+            is_bold: false,
+            is_italic: true,
+            is_underline: true,
+            item_type: ItemType::Text,
+            mcid: Some(7),
+        }];
+
+        let json = format_items_json(&items);
+
+        assert!(json.contains(r#""text":"A \"quoted\" item""#));
+        assert!(json.contains(r#""page":2"#));
+        assert!(json.contains(r#""x":12.35"#));
+        assert!(json.contains(r#""is_underline":true"#));
+        assert!(json.contains(r#""item_type":"text""#));
+        assert!(json.contains(r#""mcid":7"#));
+    }
 }
 
 /// Parse a page specification like "1,3,5-10,20" into a HashSet of page numbers.
@@ -104,6 +194,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: {} <pdf_file> [output_file]", args[0]);
         eprintln!("       {} <pdf_file> --json", args[0]);
+        eprintln!("       {} <pdf_file> --items-json", args[0]);
         eprintln!("       {} <pdf_file> --raw", args[0]);
         eprintln!();
         eprintln!("Converts PDF to Markdown with smart type detection.");
@@ -111,6 +202,7 @@ fn main() {
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --json              Output result as JSON");
+        eprintln!("  --items-json        Output positioned TextItem JSON");
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
@@ -121,6 +213,7 @@ fn main() {
 
     let pdf_path = &args[1];
     let json_output = args.iter().any(|a| a == "--json");
+    let items_json_output = args.iter().any(|a| a == "--items-json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
@@ -144,6 +237,17 @@ fn main() {
                 process::exit(1);
             })
         });
+
+    if items_json_output {
+        match extract_text_with_positions_pages(pdf_path, page_filter.as_ref()) {
+            Ok(items) => println!("{}", format_items_json(&items)),
+            Err(e) => {
+                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     let output_file = args
         .get(2)

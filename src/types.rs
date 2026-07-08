@@ -116,6 +116,10 @@ pub struct TextItem {
     pub is_bold: bool,
     /// Whether the font is italic
     pub is_italic: bool,
+    /// Whether the text is underlined (drawn rule/thin rect under the
+    /// baseline — PDFs have no underline font flag, so this is detected
+    /// geometrically after extraction; see `extractor::underline`).
+    pub is_underline: bool,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
     /// Marked Content ID from the content stream's BDC/BMC operator.

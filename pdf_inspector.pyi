@@ -38,6 +38,7 @@ class TextItem:
     page: int
     is_bold: bool
     is_italic: bool
+    is_underline: bool
     item_type: str
 
 class RegionText:

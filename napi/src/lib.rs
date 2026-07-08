@@ -80,6 +80,9 @@ pub struct TextItem {
     pub page: u32,
     pub is_bold: bool,
     pub is_italic: bool,
+    /// Underline detected geometrically (drawn rule/thin rect under the
+    /// baseline) — PDFs carry no underline font flag.
+    pub is_underline: bool,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -290,6 +293,7 @@ pub fn extract_text_with_positions(
                     page: item.page,
                     is_bold: item.is_bold,
                     is_italic: item.is_italic,
+                    is_underline: item.is_underline,
                     item_type,
                     link_url,
                 }

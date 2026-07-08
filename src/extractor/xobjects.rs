@@ -294,6 +294,7 @@ fn extract_form_xobject_text_inner(
                                     page: page_num,
                                     is_bold: false,
                                     is_italic: false,
+                                    is_underline: false,
                                     item_type: ItemType::Image,
                                     mcid: None,
                                 });
@@ -438,6 +439,7 @@ fn extract_form_xobject_text_inner(
                                 page: page_num,
                                 is_bold: is_bold_font(base_font),
                                 is_italic: is_italic_font(base_font),
+                                is_underline: false,
                                 item_type: ItemType::Text,
                                 mcid: None,
                             });
@@ -586,6 +588,7 @@ fn extract_form_xobject_text_inner(
                                     page: page_num,
                                     is_bold: is_bold_font(base_font),
                                     is_italic: is_italic_font(base_font),
+                                    is_underline: false,
                                     item_type: ItemType::Text,
                                     mcid: None,
                                 });
