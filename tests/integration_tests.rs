@@ -1356,6 +1356,32 @@ fn test_extract_regions_mem_identity_h_needs_ocr() {
     );
 }
 
+/// ParseBench `text_simple__att10k.pdf` (issue #118): the producer authored a
+/// broken ToUnicode CMap that shifts every character by a per-range constant,
+/// and the embedded subset font has no `cmap` table to recover from. The
+/// resulting ciphertext is 100% printable ASCII, so it must be caught by the
+/// substitution-cipher statistics and routed to OCR instead of served silently.
+#[test]
+fn test_extract_pages_mem_shifted_cipher_tounicode_needs_ocr() {
+    let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert_eq!(result.pages.len(), 1);
+    assert!(
+        result.pages[0].needs_ocr,
+        "shifted-cipher garbled page should be flagged needs_ocr"
+    );
+    assert!(
+        result.pages[0].markdown.is_empty(),
+        "garbled markdown should be suppressed"
+    );
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        result.pages[0].ocr_reason.as_deref(),
+        Some("suspected_garbled_text")
+    );
+}
+
 #[test]
 fn test_extract_regions_mem_multiple_regions_per_page() {
     let buf = std::fs::read("tests/fixtures/nexo-price-en.pdf").unwrap();

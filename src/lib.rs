@@ -3697,7 +3697,14 @@ fn detect_encoding_issues(markdown: &str) -> bool {
     }
 
     // Heuristic 2: dollar-as-space pattern
-    has_dollar_as_space_pattern(markdown)
+    if has_dollar_as_space_pattern(markdown) {
+        return true;
+    }
+
+    // Heuristic 3: substitution-cipher letter statistics (broken ToUnicode)
+    let mut stats = CipherGarbleStats::default();
+    stats.add_text(markdown);
+    stats.looks_garbled()
 }
 
 fn has_dollar_as_space_pattern(markdown: &str) -> bool {
@@ -3721,6 +3728,156 @@ fn has_dollar_as_space_pattern(markdown: &str) -> bool {
     false
 }
 
+/// English letter frequencies (percent, a–z). Used as a natural-language
+/// reference: every Latin-script language in the eval corpus (Swedish,
+/// Finnish, Turkish, German, romaji) scores ≥ 0.80 cosine similarity against
+/// it, while substitution-cipher text scores ~0.53.
+const ENGLISH_LETTER_FREQ: [f64; 26] = [
+    8.2, 1.5, 2.8, 4.3, 12.7, 2.2, 2.0, 6.1, 7.0, 0.15, 0.8, 4.0, 2.4, 6.7, 7.5, 1.9, 0.1, 6.0,
+    6.3, 9.1, 2.8, 1.0, 2.4, 0.15, 2.0, 0.07,
+];
+
+/// Letter statistics for detecting substitution-cipher garbling: broken
+/// ToUnicode CMaps that shift every character by a per-range constant (e.g.
+/// `Certificate` extracted as `8VceZWZTReV`). Such text is 100% printable
+/// ASCII with word-like token lengths, so it defeats `is_garbage_text` and
+/// produces no replacement characters — it needs its own discriminator.
+#[derive(Debug, Default)]
+struct CipherGarbleStats {
+    /// Case-folded ASCII letter histogram.
+    letter_counts: [u32; 26],
+    ascii_letters: usize,
+    ascii_vowels: usize,
+    /// Accented Latin letters (Latin-1 Supplement through Latin Extended-B,
+    /// plus Latin Extended Additional). Count toward Latin dominance only.
+    latin_ext_letters: usize,
+    non_latin_letters: usize,
+    /// Adjacent ASCII-letter pairs, and how many of them switch from
+    /// lowercase straight to uppercase mid-word.
+    letter_bigrams: usize,
+    case_shift_bigrams: usize,
+}
+
+impl CipherGarbleStats {
+    fn add_text(&mut self, text: &str) {
+        let mut prev: Option<char> = None;
+        for ch in text.chars() {
+            if ch.is_ascii_alphabetic() {
+                let idx = (ch.to_ascii_lowercase() as u8 - b'a') as usize;
+                self.letter_counts[idx] += 1;
+                self.ascii_letters += 1;
+                if matches!(ch.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
+                    self.ascii_vowels += 1;
+                }
+                if let Some(p) = prev {
+                    self.letter_bigrams += 1;
+                    if p.is_ascii_lowercase() && ch.is_ascii_uppercase() {
+                        self.case_shift_bigrams += 1;
+                    }
+                }
+                prev = Some(ch);
+            } else {
+                if ch.is_alphabetic() {
+                    if matches!(ch as u32, 0xC0..=0x24F | 0x1E00..=0x1EFF) {
+                        self.latin_ext_letters += 1;
+                    } else {
+                        self.non_latin_letters += 1;
+                    }
+                }
+                prev = None;
+            }
+        }
+    }
+
+    /// Cosine similarity between the observed letter histogram and English
+    /// letter frequencies. A shifted alphabet permutes the histogram, which
+    /// destroys the similarity regardless of the shift amount.
+    fn english_cosine(&self) -> f64 {
+        if self.ascii_letters == 0 {
+            return 1.0;
+        }
+        let n = self.ascii_letters as f64;
+        let mut dot = 0.0;
+        let mut norm_obs = 0.0;
+        for (count, freq) in self.letter_counts.iter().zip(ENGLISH_LETTER_FREQ) {
+            let p = *count as f64 / n;
+            dot += p * freq;
+            norm_obs += p * p;
+        }
+        let norm_en = ENGLISH_LETTER_FREQ
+            .iter()
+            .map(|f| f * f)
+            .sum::<f64>()
+            .sqrt();
+        dot / (norm_obs.sqrt() * norm_en)
+    }
+
+    /// Cosine similarity between the observed histogram and English
+    /// frequencies after sorting BOTH descending — i.e. comparing the *shape*
+    /// of the frequency profile, ignoring which letter sits where. A
+    /// substitution cipher is a bijection, so it preserves this shape exactly
+    /// (att10k 0.97, arbitrary shifts 0.99) regardless of case or offset.
+    /// Non-linguistic ASCII has a different profile: a small alphabet is far
+    /// steeper (random DNA 0.74, hex dumps 0.81), so the shape diverges.
+    fn english_shape_cosine(&self) -> f64 {
+        if self.ascii_letters == 0 {
+            return 1.0;
+        }
+        let n = self.ascii_letters as f64;
+        let mut obs: [f64; 26] = std::array::from_fn(|i| self.letter_counts[i] as f64 / n);
+        obs.sort_unstable_by(|a, b| b.total_cmp(a));
+        let mut en = ENGLISH_LETTER_FREQ;
+        en.sort_unstable_by(|a, b| b.total_cmp(a));
+
+        let dot: f64 = obs.iter().zip(en).map(|(o, e)| o * e).sum();
+        let norm_obs = obs.iter().map(|o| o * o).sum::<f64>().sqrt();
+        let norm_en = en.iter().map(|e| e * e).sum::<f64>().sqrt();
+        dot / (norm_obs * norm_en)
+    }
+
+    /// Thresholds validated against the 380-document pdf-evals snapshot
+    /// corpus (0 false positives) and the garbled ParseBench `att10k` page
+    /// (vowel ratio 0.245, case-shift rate 0.225, cosine 0.532). Closest
+    /// legitimate document on each axis: vowel ratio 0.264 (circuit
+    /// schematic), case-shift rate 0.021, cosine 0.801.
+    fn looks_garbled(&self) -> bool {
+        // Need a statistically meaningful, Latin-dominant sample.
+        if self.ascii_letters < 200
+            || self.non_latin_letters > self.ascii_letters + self.latin_ext_letters
+        {
+            return false;
+        }
+
+        // Real Latin-script text keeps vowels above ~30% of letters even in
+        // acronym- and part-number-heavy documents; shifted text starves them.
+        let vowel_ratio = self.ascii_vowels as f64 / self.ascii_letters as f64;
+        if vowel_ratio > 0.30 {
+            return false;
+        }
+
+        // Signal 1: lowercase→uppercase transitions inside words. A shifted
+        // lowercase alphabet straddles the ASCII uppercase block ('i'→'Z',
+        // 't'→'e'), so garbled words flip case constantly. Real documents
+        // stay ≤ 0.02 even with camelCase identifiers.
+        let case_shifts = self.letter_bigrams >= 100
+            && self.case_shift_bigrams as f64 >= self.letter_bigrams as f64 * 0.10;
+
+        // Signal 2: the histogram is a permutation of natural language — an
+        // English-like frequency SHAPE (sorted cosine high) but with letters
+        // in the wrong POSITIONS (unsorted cosine low). This is the signature
+        // of a substitution cipher and is case-independent, so it catches
+        // all-lowercase and all-uppercase shifts as well as case-straddling
+        // ones. Genuinely non-linguistic ASCII that is merely "unlike English"
+        // fails one of the two halves: DNA/hex dumps have too steep a profile
+        // (shape cosine < 0.90), while protein sequences, ticker symbols and
+        // base64 are not sufficiently unlike English in position (unsorted
+        // cosine ≥ 0.60) — so none of them are routed to OCR.
+        let permuted_language = self.english_cosine() < 0.60 && self.english_shape_cosine() >= 0.90;
+
+        case_shifts || permuted_language
+    }
+}
+
 #[derive(Debug, Default)]
 struct TextQualityReport {
     pages_needing_ocr: Vec<u32>,
@@ -3734,6 +3891,7 @@ struct PageTextQualityEvidence {
     replacement_chars: usize,
     replacement_spans: usize,
     longest_replacement_run: usize,
+    cipher_garble: CipherGarbleStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3753,6 +3911,7 @@ fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
 
         let evidence = evidence_by_page.entry(item.page).or_default();
         evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
+        evidence.cipher_garble.add_text(&item.text);
 
         match text_span_decoding_issue_kind(&item.text) {
             Some(TextSpanIssueKind::Strong) => {
@@ -3776,7 +3935,8 @@ fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         if reasons_by_page.contains_key(&page) {
             continue;
         }
-        if page_replacement_evidence_needs_ocr(&evidence) {
+        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_garble.looks_garbled()
+        {
             add_ocr_reason(
                 &mut reasons_by_page,
                 page,
@@ -5963,6 +6123,171 @@ mod tests {
         // Under threshold of 10 total dollars — should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
+    }
+
+    /// Real garbled output from ParseBench `text_simple__att10k.pdf`: a broken
+    /// ToUnicode CMap shifts every character by a per-range constant, so
+    /// "Certificate of Designations with respect to Series C" extracts as
+    /// pure-ASCII ciphertext (issue #118).
+    const SHIFTED_CIPHER_TEXT: &str =
+        "8VceZWZTReVW9VdZXReZdhZeYcVdaVTeeHVcZVd8EcVWVccVUHeT:iYZSZe-(,e2'WZ]V \
+        ;VScfRcj2&,*,*$ .'R CZdecfVehYZTYUVWZVdeYVcZXYedWY]UVcdW]X'eVcUVSeYVcVXZdecReRUR]]ed \
+        TCBGC@ZUReVUdfSdZUZRcZVdZdWZ]VUYVcVhZeYafcdfReeVXf]ReZV0*S$.$ZZZ$6$&ViTVae \
+        WceYVZdecfVedcVWVccVUe.'S&.'T&.'U&.'V&.'WSV]h(EfcdfReeYZdcVXf]ReZYV \
+        cVXZdecReYVcVSjRXcVVdeWfcZdYRTajWRjdfTYZdecfVeWZ]VUYVcVhZeYeYVH:8 \
+        cVbfVde( .'S fRcRejWTVceRZZXReZTZWZT7V]]IV]VaYV8(RUHfeYhVdeVc7V]]IV]VaYV8 \
+        :iYZSZe.'TeYVaVcZUVUZX9VTVSVc-&,*$";
+
+    #[test]
+    fn test_detect_encoding_issues_shifted_cipher_text() {
+        assert!(detect_encoding_issues(SHIFTED_CIPHER_TEXT));
+    }
+
+    #[test]
+    fn test_shifted_cipher_below_sample_threshold_not_flagged() {
+        // Fewer than 200 ASCII letters: not enough evidence to condemn.
+        assert!(!detect_encoding_issues("8VceZWZTReVW9VdZXReZdhZeY"));
+    }
+
+    #[test]
+    fn test_clean_prose_not_flagged_as_cipher() {
+        let prose = "Certificate of Designations with respect to Series C Preferred Stock, \
+            filed February 18, 2020. No instrument which defines the rights of holders of \
+            long-term debt of the registrant and all of its consolidated subsidiaries is \
+            filed herewith pursuant to Regulation S-K, Item 601. Pursuant to this regulation, \
+            the registrant hereby agrees to furnish a copy of any such instrument to the SEC \
+            upon request.";
+        assert!(!detect_encoding_issues(prose));
+    }
+
+    #[test]
+    fn test_camel_case_code_not_flagged_as_cipher() {
+        let code = "The getElementById and querySelectorAll methods return DOM nodes. Use \
+            addEventListener with removeEventListener, requestAnimationFrame with \
+            cancelAnimationFrame, and setTimeout with clearTimeout. The XMLHttpRequest \
+            object exposes onreadystatechange, responseText and getAllResponseHeaders. \
+            Prefer createElement, appendChild, insertBefore and replaceChild for DOM \
+            manipulation, and getBoundingClientRect for layout measurement.";
+        assert!(!detect_encoding_issues(code));
+    }
+
+    #[test]
+    fn test_accented_european_text_not_flagged_as_cipher() {
+        let swedish = "Regeringen föreslår att riksdagen antar förslaget till lag om ändring \
+            i skatteförfarandelagen. Bestämmelserna föreslås träda i kraft den första januari. \
+            Förslaget innebär att företag med säte i utlandet måste lämna särskilda uppgifter \
+            till Skatteverket varje kvartal, och att avgiften höjs för överträdelser av de nya \
+            bestämmelserna om rapporteringsskyldighet för gränsöverskridande arrangemang.";
+        assert!(!detect_encoding_issues(swedish));
+    }
+
+    #[test]
+    fn test_all_caps_text_not_flagged_as_cipher() {
+        let caps = "EXHIBIT INDEX PURSUANT TO ITEM 601 OF REGULATION SK CERTIFICATE OF \
+            DESIGNATIONS WITH RESPECT TO SERIES C PREFERRED STOCK FILED FEBRUARY EIGHTEEN \
+            TWENTY TWENTY AND INCORPORATED HEREIN BY REFERENCE TO THE ANNUAL REPORT ON FORM \
+            TENK FOR THE PERIOD ENDED DECEMBER THIRTYFIRST TWENTY NINETEEN AS AMENDED";
+        assert!(!detect_encoding_issues(caps));
+    }
+
+    // A Caesar shift of prose that stays within a single case block does not
+    // trigger the case-shift signal, but it permutes the letter histogram: the
+    // frequency SHAPE stays English-like while letter POSITIONS scramble, so
+    // the permutation signal catches it regardless of case.
+    const CAESAR_PROSE: &str =
+        "The registrant hereby agrees to furnish a copy of any such instrument to the \
+        Commission upon request. This certificate of designations was filed February with \
+        respect to Series Preferred Stock and incorporated herein by reference to the annual \
+        report on form for the period ended December as amended and restated thereafter.";
+
+    fn caesar_shift(text: &str, k: u8) -> String {
+        text.chars()
+            .map(|c| match c {
+                'a'..='z' => (((c as u8 - b'a' + k) % 26) + b'a') as char,
+                'A'..='Z' => (((c as u8 - b'A' + k) % 26) + b'A') as char,
+                _ => c,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_mixed_case_caesar_shift_flagged() {
+        assert!(detect_encoding_issues(&caesar_shift(CAESAR_PROSE, 3)));
+    }
+
+    #[test]
+    fn test_all_lowercase_caesar_shift_flagged() {
+        // Uniform all-lowercase garbled prose: the earlier mixed-case guard
+        // would have exempted this, so it must be caught by the case-agnostic
+        // permutation signal instead.
+        assert!(detect_encoding_issues(&caesar_shift(
+            &CAESAR_PROSE.to_lowercase(),
+            5
+        )));
+    }
+
+    #[test]
+    fn test_all_uppercase_caesar_shift_flagged() {
+        assert!(detect_encoding_issues(&caesar_shift(
+            &CAESAR_PROSE.to_uppercase(),
+            7
+        )));
+    }
+
+    #[test]
+    fn test_dna_sequence_not_flagged_as_cipher() {
+        // Non-linguistic ASCII: unlike English (low vowel ratio, low cosine)
+        // but not garbled. Its 4-letter alphabet makes the frequency profile
+        // too steep, so the shape cosine falls below the permutation threshold.
+        let dna = "ACGT".repeat(120);
+        assert!(!detect_encoding_issues(&dna));
+    }
+
+    #[test]
+    fn test_protein_sequence_not_flagged_as_cipher() {
+        let protein =
+            "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR"
+                .repeat(6);
+        assert!(!detect_encoding_issues(&protein));
+    }
+
+    #[test]
+    fn test_ticker_list_not_flagged_as_cipher() {
+        let tickers = "AAPL MSFT GOOG TSLA NVDA AMZN META NFLX AMD INTC CSCO ORCL CRM ADBE QCOM \
+            TXN AVGO MU LRCX KLAC ASML SNPS CDNS FTNT PANW "
+            .repeat(4);
+        assert!(!detect_encoding_issues(&tickers));
+    }
+
+    #[test]
+    fn test_text_quality_flags_shifted_cipher_page() {
+        let items = vec![
+            test_text_item_on_page(1, SHIFTED_CIPHER_TEXT),
+            test_text_item_on_page(2, "A clean second page should not be routed to OCR."),
+        ];
+
+        let quality = analyze_text_quality(&items);
+
+        assert!(quality.has_encoding_issues);
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
+        assert_eq!(
+            quality.reasons_by_page.get(&1).cloned(),
+            Some(vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()])
+        );
+    }
+
+    #[test]
+    fn test_text_quality_cipher_stats_accumulate_across_items() {
+        // The garbled page arrives as many short spans; no single span has
+        // enough letters to flag on its own.
+        let items: Vec<TextItem> = SHIFTED_CIPHER_TEXT
+            .split_whitespace()
+            .map(|chunk| test_text_item_on_page(1, chunk))
+            .collect();
+
+        let quality = analyze_text_quality(&items);
+
+        assert_eq!(quality.pages_needing_ocr, vec![1]);
     }
 
     #[test]

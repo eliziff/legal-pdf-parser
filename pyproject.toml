@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-inspector"
-version = "0.1.0"
+# Version is sourced from Cargo.toml [package] version by maturin so the Python
+# artifact always tracks the crate release instead of drifting on its own.
+dynamic = ["version"]
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
 license = { text = "MIT" }
 requires-python = ">=3.8"
