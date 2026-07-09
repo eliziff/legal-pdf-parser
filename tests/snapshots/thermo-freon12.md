@@ -26,7 +26,7 @@ A.P., NIST Standard Reference in cubic meters per kilogram Database 23, NIST the
 
 ##### Physical Properties
 
-|Chemical Formula|CCl2F2|
+|Chemical Formula|CCl₂F₂|
 |---|---|
 |Molecular mass|120.91|
 |Boiling Point At one atmosphere|-29.75°C|
@@ -45,7 +45,7 @@ l
 
 |Temp|Pressure||Volume|||Density||Enthalpy|||Entropy|Temp|
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-|°C|[kPa]|[m3 Liquid v f|/kg]|Vapour v g|Liquid d f|[kg/m3] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
+|°C|[kPa]|[m³ Liquid v f|/kg]|Vapour v g|Liquid d f|[kg/m³] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
 
 |-100|1.2|0.0006|10.0000|1679.0|0.100|113.3|192.8|306.1|0.6077|1.7210|-100|
 |---|---|---|---|---|---|---|---|---|---|---|---|

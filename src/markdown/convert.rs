@@ -625,7 +625,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         prev_x = line_x;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
+        let text = line.text_with_formatting(
+            options.detect_bold,
+            options.detect_italic,
+            options.detect_underline,
+        );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching (list detection, captions, etc.)
@@ -751,8 +755,14 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 paragraph_in_wrapped_bold_run = false;
             }
             let prefix = "#".repeat(level);
-            // Use plain text for headers to avoid redundant formatting
-            output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
+            // Plain text for headers (no redundant bold/italic inside `#`),
+            // but underline is preserved: `<u>` carries meaning `#` doesn't.
+            let heading_text = if options.detect_underline {
+                line.text_with_formatting(false, false, true)
+            } else {
+                plain_text.clone()
+            };
+            output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
             in_list = false;
             continue;
         }
@@ -994,7 +1004,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         prev_y = line.y;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
+        let text = line.text_with_formatting(
+            options.detect_bold,
+            options.detect_italic,
+            options.detect_underline,
+        );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching
@@ -1057,8 +1071,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     paragraph_in_wrapped_bold_run = false;
                 }
                 let prefix = "#".repeat(header_level);
-                // Use plain text for headers to avoid redundant formatting
-                output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
+                // Plain text for headers, except underline (see above).
+                let heading_text = if options.detect_underline {
+                    line.text_with_formatting(false, false, true)
+                } else {
+                    plain_text.clone()
+                };
+                output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
                 in_list = false;
                 continue;
             }

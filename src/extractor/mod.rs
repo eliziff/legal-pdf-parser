@@ -559,13 +559,24 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
-            let mut is_underline = first.is_underline;
 
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
                 // Must be similar font size (within 20%)
                 if (next.font_size - first.font_size).abs() > first.font_size * 0.20 {
+                    break;
+                }
+                // Never merge across style boundaries: the merged item
+                // carries `first`'s flags, so absorbing a styled run into a
+                // plain neighbor (or vice versa) silently erases the styling
+                // that markdown emission and downstream inline-styling need —
+                // and OR-ing underline instead would stretch `<u>` spans over
+                // neighboring plain text.
+                if next.is_bold != first.is_bold
+                    || next.is_italic != first.is_italic
+                    || next.is_underline != first.is_underline
+                {
                     break;
                 }
                 let gap = next.x - end_x;
@@ -606,7 +617,6 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
-                is_underline |= next.is_underline;
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -627,7 +637,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 page: first.page,
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
-                is_underline,
+                is_underline: first.is_underline,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -710,7 +720,17 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
                         if gap < parent.font_size * 0.2 && gap > -parent.font_size * 0.3 {
-                            parent.text.push_str(&item.text);
+                            // Preserve the script when absorbing it: map the
+                            // digits to Unicode sub/superscript forms so the
+                            // raised/lowered rendering survives in extracted
+                            // text ("H"+"2" → "H₂", "word"+"2" → "word²").
+                            // NFKC/NFKD normalization folds these back to
+                            // plain digits, so text matching downstream is
+                            // unaffected. Direction from the baseline offset
+                            // (y-up here): raised → superscript (footnote
+                            // refs), lowered/level → subscript (chemistry).
+                            let raised = item.y > parent.y + parent.font_size * 0.1;
+                            parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
                             continue;
                         }
@@ -723,6 +743,21 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
 
     result
+}
+
+/// Map ASCII digits to their Unicode superscript (`raised`) or subscript
+/// forms. Callers guarantee digit-only input (see `merge_subscript_items`);
+/// anything else passes through unchanged.
+fn map_script_digits(text: &str, raised: bool) -> String {
+    const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    text.chars()
+        .map(|c| match c.to_digit(10) {
+            Some(d) if raised => SUP[d as usize],
+            Some(d) => SUB[d as usize],
+            None => c,
+        })
+        .collect()
 }
 
 /// Helper to get f32 from Object
@@ -785,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_items_breaks_at_style_boundaries() {
+        // A styled run adjacent to plain text must stay a separate item —
+        // merging would erase the flags (italic) or stretch the span
+        // (underline) before markdown emission sees them.
+        let mut italic = make_merge_item("emphasis", 150.0, 40.0);
+        italic.is_italic = true;
+        let mut underlined = make_merge_item("term", 195.0, 20.0);
+        underlined.is_underline = true;
+        let items = vec![
+            make_merge_item("plain lead", 100.0, 48.0),
+            italic,
+            underlined,
+            make_merge_item("plain tail", 218.0, 45.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 4);
+        assert!(merged[1].is_italic && !merged[1].is_underline);
+        assert!(merged[2].is_underline && !merged[2].is_italic);
+        assert!(!merged[3].is_underline && !merged[3].is_italic);
+    }
+
+    #[test]
     fn merge_items_no_space_before_period() {
         // Simulate Tc/Tw-adjusted width: "date" width is smaller than the gap
         // to "." due to negative Tc, but period should still join without space.
@@ -824,6 +881,10 @@ mod tests {
 
     #[test]
     fn merge_items_preserves_underline_from_later_fragment() {
+        // Fragments with differing underline stay separate items — OR-merging
+        // would stretch the eventual `<u>` span over the plain fragment.
+        // Line-level text assembly still joins them without a space (tight
+        // gap), so the rendered word is unchanged: `pre<u>fix</u>`.
         let mut items = vec![
             make_merge_item("pre", 100.0, 18.0),
             make_merge_item("fix", 119.0, 18.0),
@@ -832,9 +893,11 @@ mod tests {
 
         let merged = merge_text_items(items);
 
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].text, "prefix");
-        assert!(merged[0].is_underline);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "pre");
+        assert!(!merged[0].is_underline);
+        assert_eq!(merged[1].text, "fix");
+        assert!(merged[1].is_underline);
     }
 
     #[test]
@@ -1633,7 +1696,8 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "NH3");
+        // Lowered baseline → Unicode subscript form (NFKC folds back to "NH3")
+        assert_eq!(merged[0].text, "NH₃");
         assert_eq!(merged[1].text, "Cl");
     }
 
@@ -1647,8 +1711,19 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "H2");
+        assert_eq!(merged[0].text, "H₂");
         assert_eq!(merged[1].text, "O");
+    }
+
+    #[test]
+    fn test_merge_subscript_items_raised_marker_becomes_superscript() {
+        // Footnote reference: "word" followed by a RAISED small "2" → word²
+        let mut marker = make_item_fs("2", 90.0, 502.5, 2.3, 4.7);
+        marker.y = 502.5; // raised above the 499.0 parent baseline
+        let items = vec![make_item_fs("word", 78.0, 499.0, 12.0, 8.0), marker];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "word²");
     }
 
     #[test]

@@ -1288,6 +1288,19 @@ mod vector_grid_tests {
         );
     }
 
+    #[test]
+    fn td9264_insurance_prose_not_rect_table() {
+        let tables = detect_rect_tables_in_fixture_page("tests/fixtures/td9264.pdf", 4);
+        assert!(
+            tables.is_empty(),
+            "expected no rect-detected tables for the insurance-company prose; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len(), t.cells.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Wireless table regression: decorative/text-region rects may provide row
     /// bands, but without a real rect-derived column scaffold they must not be
     /// accepted as a vector grid.

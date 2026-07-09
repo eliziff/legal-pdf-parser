@@ -141,12 +141,17 @@ pub struct TextLine {
 
 impl TextLine {
     pub fn text(&self) -> String {
-        self.text_with_formatting(false, false)
+        self.text_with_formatting(false, false, false)
     }
 
-    /// Get text with optional bold/italic markdown formatting
-    pub fn text_with_formatting(&self, format_bold: bool, format_italic: bool) -> String {
-        if !format_bold && !format_italic {
+    /// Get text with optional bold/italic/underline markdown formatting
+    pub fn text_with_formatting(
+        &self,
+        format_bold: bool,
+        format_italic: bool,
+        format_underline: bool,
+    ) -> String {
+        if !format_bold && !format_italic && !format_underline {
             return self.text_plain();
         }
 
@@ -155,6 +160,7 @@ impl TextLine {
         let mut result = String::new();
         let mut current_bold = false;
         let mut current_italic = false;
+        let mut current_underline = false;
 
         for (i, item) in self.items.iter().enumerate() {
             let text = item.text.as_str();
@@ -180,9 +186,13 @@ impl TextLine {
             // we push text_trimmed below (which strips it).
             let has_leading_space = text.starts_with(' ');
 
-            // Check for style changes
-            let item_bold = format_bold && item.is_bold;
-            let item_italic = format_italic && item.is_italic;
+            // Check for style changes. Underline is exclusive: `<u>` content
+            // stays free of `**`/`*` markers — consumers (and the eval
+            // harnesses this feeds) match the tag content literally, and
+            // mixed `<u>**x**</u>` nesting breaks that.
+            let item_underline = format_underline && item.is_underline;
+            let item_bold = format_bold && item.is_bold && !item_underline;
+            let item_italic = format_italic && item.is_italic && !item_underline;
 
             // Close previous styles if they change
             if current_italic && !item_italic {
@@ -193,6 +203,10 @@ impl TextLine {
                 result.push_str("**");
                 current_bold = false;
             }
+            if current_underline && !item_underline {
+                result.push_str("</u>");
+                current_underline = false;
+            }
 
             // Add space: either from spacing logic or preserved from item text
             if needs_space || (has_leading_space && !result.is_empty() && !result.ends_with(' ')) {
@@ -200,6 +214,10 @@ impl TextLine {
             }
 
             // Open new styles
+            if item_underline && !current_underline {
+                result.push_str("<u>");
+                current_underline = true;
+            }
             if item_bold && !current_bold {
                 result.push_str("**");
                 current_bold = true;
@@ -218,6 +236,9 @@ impl TextLine {
         }
         if current_bold {
             result.push_str("**");
+        }
+        if current_underline {
+            result.push_str("</u>");
         }
 
         result

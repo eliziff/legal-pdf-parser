@@ -131,10 +131,11 @@ pub(crate) fn format_list_item(text: &str) -> String {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }
-        // Bullet inside a leading bold/italic run (e.g. "**● Label:** rest").
-        // The run wraps both the marker and the following label because both
-        // use a bold font in the PDF.
-        for wrapper in ["**", "*"] {
+        // Bullet inside a leading style run (e.g. "**● Label:** rest" or
+        // "<u>● Label</u>"). The run wraps both the marker and the following
+        // label because both carry the style in the PDF. The marker must move
+        // outside the wrapper so markdown still sees a list item.
+        for wrapper in ["**", "*", "<u>"] {
             if let Some(after_open) = trimmed.strip_prefix(wrapper) {
                 if let Some(rest) = after_open.strip_prefix(*bullet) {
                     return format!("- {}{}", wrapper, rest.trim_start());
@@ -233,6 +234,13 @@ mod tests {
     fn format_list_item_plain_bullet() {
         assert_eq!(format_list_item("● Item"), "- Item");
         assert_eq!(format_list_item("• Item"), "- Item");
+    }
+
+    #[test]
+    fn format_list_item_bullet_inside_underline() {
+        // Fully-underlined bullet line: the marker must move outside the
+        // <u> wrapper so markdown still renders a list item.
+        assert_eq!(format_list_item("<u>● Item text</u>"), "- <u>Item text</u>");
     }
 
     #[test]

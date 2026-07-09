@@ -400,6 +400,8 @@ pub struct MarkdownOptions {
     pub detect_bold: bool,
     /// Detect and format italic text from font names
     pub detect_italic: bool,
+    /// Emit `<u>` runs for text with a geometrically-detected underline
+    pub detect_underline: bool,
     /// Include image placeholders in output
     pub include_images: bool,
     /// Include extracted hyperlinks
@@ -422,6 +424,7 @@ impl Default for MarkdownOptions {
             fix_hyphenation: true,
             detect_bold: true,
             detect_italic: true,
+            detect_underline: true,
             // `include_images: false` is intentional. The content-stream walker
             // now emits `ItemType::Image` `TextItem`s for every Image XObject
             // it encounters (see `extractor/content_stream.rs`). If we rendered

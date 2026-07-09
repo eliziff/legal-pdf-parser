@@ -30,6 +30,7 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     // double spaces ("Vice  President" instead of "Vice President").
     collapse_consecutive_spaces(&mut text);
     remove_spaces_before_closing_brackets(&mut text);
+    remove_spaces_before_sentence_punctuation(&mut text);
 
     // Remove excessive newlines (more than 2 in a row)
     while text.contains("\n\n\n") {
@@ -80,6 +81,32 @@ fn remove_spaces_before_closing_brackets(text: &mut String) {
     for ch in text.chars() {
         if ch == ']' && result.ends_with(' ') {
             result.pop();
+        }
+        result.push(ch);
+    }
+    *text = result;
+}
+
+/// Remove a stray space before sentence punctuation ("word ." → "word.").
+/// Style-boundary item splits (bold/italic/underline runs) can strand a
+/// trailing period or comma in its own fragment, and several assembly paths
+/// join fragments with spaces. Only fires when the punctuation ends the
+/// token (followed by whitespace or end of text), so decimals ("3 .14" stays
+/// untouched — no such input exists, but the guard is cheap) and dot leaders
+/// (" ... ") are unaffected.
+fn remove_spaces_before_sentence_punctuation(text: &mut String) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    for (i, &ch) in chars.iter().enumerate() {
+        if matches!(ch, '.' | ',' | ';') && result.ends_with(' ') {
+            let next = chars.get(i + 1);
+            // `|` counts as a token end so table cells get the same fix.
+            let token_ends = next.is_none_or(|c| c.is_whitespace() || *c == '|');
+            // Never touch runs of dots (ellipsis / dot leaders).
+            let in_dot_run = ch == '.' && next == Some(&'.');
+            if token_ends && !in_dot_run {
+                result.pop();
+            }
         }
         result.push(ch);
     }
@@ -367,6 +394,36 @@ mod tests {
             input,
             "Density [kg/m3] and [linked text](https://example.com)"
         );
+    }
+
+    // --- remove_spaces_before_sentence_punctuation ---
+
+    #[test]
+    fn strips_space_before_trailing_period() {
+        let mut t = "Foreign insurance companies . The provisions".to_string();
+        remove_spaces_before_sentence_punctuation(&mut t);
+        assert_eq!(t, "Foreign insurance companies. The provisions");
+    }
+
+    #[test]
+    fn strips_space_before_period_at_cell_boundary() {
+        let mut t = "|Applicability date .|This section|".to_string();
+        remove_spaces_before_sentence_punctuation(&mut t);
+        assert_eq!(t, "|Applicability date.|This section|");
+    }
+
+    #[test]
+    fn keeps_dot_leaders_and_ellipses() {
+        let mut t = "Introduction ... 1".to_string();
+        remove_spaces_before_sentence_punctuation(&mut t);
+        assert_eq!(t, "Introduction ... 1");
+    }
+
+    #[test]
+    fn keeps_mid_token_periods() {
+        let mut t = "version 3 .14 released".to_string();
+        remove_spaces_before_sentence_punctuation(&mut t);
+        assert_eq!(t, "version 3 .14 released");
     }
 
     // --- fix_hyphenation ---

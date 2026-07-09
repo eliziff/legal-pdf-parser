@@ -1124,18 +1124,40 @@ pub(crate) fn assign_items_to_grid(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
-            let text: String = col_items
+            let text = col_items
                 .iter()
                 .map(|(_, item)| item.text.trim())
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
+            let text = remove_inner_delimiter_spaces(&text);
             row_cells.push(text);
         }
         cells.push(row_cells);
     }
 
     (cells, indices)
+}
+
+fn remove_inner_delimiter_spaces(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == ' ' {
+            let after_open =
+                result.ends_with('(') || result.ends_with('[') || result.ends_with('{');
+            let before_close = chars
+                .get(i + 1)
+                .is_some_and(|next| matches!(next, ')' | ']' | '}'));
+            if after_open || before_close {
+                continue;
+            }
+        }
+        result.push(ch);
+    }
+
+    result
 }
 
 /// Consolidate text in vertically-merged cells.
@@ -1451,6 +1473,10 @@ fn detect_row_stripe_table(
         (col_edges, cells)
     };
     let num_cols = col_edges.len() - 1;
+    if row_stripe_is_sparse_prose_outline(&cells) {
+        debug!("  row-stripe rejected: sparse outline/prose continuation shape");
+        return None;
+    }
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -1467,6 +1493,57 @@ fn detect_row_stripe_table(
     );
 
     Some(Table::new(column_centers, row_centers, cells, item_indices))
+}
+
+fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
+    let Some(num_cols) = cells.first().map(|row| row.len()) else {
+        return false;
+    };
+    if num_cols != 2 || cells.len() < 4 {
+        return false;
+    }
+
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .count();
+    if non_empty_rows < 4 {
+        return false;
+    }
+
+    let mut col_counts = [0usize; 2];
+    for row in cells {
+        for (idx, cell) in row.iter().enumerate() {
+            if !cell.trim().is_empty() {
+                col_counts[idx] += 1;
+            }
+        }
+    }
+
+    let (sparse_col, dense_col) = if col_counts[0] <= col_counts[1] {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let sparse_count = col_counts[sparse_col];
+    let dense_count = col_counts[dense_col];
+    if sparse_count * 2 >= non_empty_rows || dense_count * 3 < non_empty_rows * 2 {
+        return false;
+    }
+
+    let blank_sparse_dense_rows = cells
+        .iter()
+        .filter(|row| row[sparse_col].trim().is_empty() && !row[dense_col].trim().is_empty())
+        .count();
+    if blank_sparse_dense_rows * 2 < non_empty_rows {
+        return false;
+    }
+
+    let long_dense_cells = cells
+        .iter()
+        .filter(|row| row[dense_col].split_whitespace().count() >= 6)
+        .count();
+    long_dense_cells * 2 >= dense_count
 }
 
 /// Detect a table from cell-background rects that failed grid detection.
@@ -2522,6 +2599,21 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert!(cells[0][0].contains("Hello"));
         assert!(cells[0][0].contains("World"));
+    }
+
+    #[test]
+    fn test_assign_items_parenthetical_no_inner_spaces() {
+        let items = vec![
+            make_item("The first sentence", 15.0, 85.0, 10.0),
+            make_item("(", 90.0, 85.0, 10.0),
+            make_item("twice", 95.0, 85.0, 10.0),
+            make_item(")", 120.0, 85.0, 10.0),
+        ];
+        let col_edges = vec![10.0, 150.0];
+        let row_edges = vec![90.0, 70.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices.len(), 4);
+        assert_eq!(cells[0][0], "The first sentence (twice)");
     }
 
     #[test]

@@ -369,6 +369,10 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
             let prev_ends_with_hyphen = result.ends_with('-');
             let curr_is_hyphen = text == "-";
             let curr_starts_with_hyphen = text.starts_with('-');
+            let prev_ends_with_open_delimiter =
+                result.ends_with('(') || result.ends_with('[') || result.ends_with('{');
+            let curr_starts_with_close_delimiter =
+                text.starts_with(')') || text.starts_with(']') || text.starts_with('}');
 
             // Detect subscript/superscript: smaller font size and/or Y offset
             let font_ratio = item.font_size / prev_item.font_size;
@@ -385,6 +389,8 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
                 || curr_starts_with_hyphen
                 || is_sub_super
                 || was_sub_super
+                || prev_ends_with_open_delimiter
+                || curr_starts_with_close_delimiter
             {
                 result.push_str(text);
             } else {
@@ -726,6 +732,18 @@ mod tests {
         let b = make_item("-", 120.0, 500.0, 10.0);
         let c = make_item("fix", 130.0, 500.0, 10.0);
         assert_eq!(join_cell_items(&[&a, &b, &c]), "pre-fix");
+    }
+
+    #[test]
+    fn test_join_cell_items_parenthetical_no_inner_spaces() {
+        let a = make_item("The first sentence", 100.0, 500.0, 10.0);
+        let b = make_item("(", 190.0, 500.0, 10.0);
+        let c = make_item("twice", 195.0, 500.0, 10.0);
+        let d = make_item(")", 220.0, 500.0, 10.0);
+        assert_eq!(
+            join_cell_items(&[&a, &b, &c, &d]),
+            "The first sentence (twice)"
+        );
     }
 
     #[test]
