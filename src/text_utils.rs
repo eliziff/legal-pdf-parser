@@ -93,6 +93,9 @@ pub fn is_bold_font(font_name: &str) -> bool {
         || lower.contains("extrabold")
         || lower.contains("ultrabold")
         || lower.contains("medium") && !lower.contains("mediumitalic") // Some fonts use Medium for semi-bold
+        // URW Type 1 fonts abbreviate Medium as "Medi" (e.g. NimbusRomNo9L-Medi,
+        // the Times-Bold substitute in LaTeX documents; -MediItal is bold italic).
+        || lower.contains("-medi") && !lower.contains("mediumital")
 }
 
 /// Detect if a font name indicates italic/oblique style
@@ -761,6 +764,17 @@ pub(crate) fn should_join_items(
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn bold_font_urw_medi_abbreviation() {
+        // URW Type 1 fonts (LaTeX default Times) abbreviate Medium as "Medi"
+        assert!(is_bold_font("NROFIU+NimbusRomNo9L-Medi"));
+        assert!(is_bold_font("NimbusRomNo9L-MediItal"));
+        assert!(!is_bold_font("DSSZWN+NimbusRomNo9L-Regu"));
+        assert!(!is_bold_font("NimbusRomNo9L-ReguItal"));
+        // Medium-Italic exclusion still holds
+        assert!(!is_bold_font("Foo-MediumItalic"));
+    }
 
     #[test]
     fn strip_soft_hyphen() {
