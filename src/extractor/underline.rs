@@ -231,8 +231,27 @@ fn rule_matches_item(rule: &Rule, item: &TextItem) -> bool {
     overlap >= min_overlap
 }
 
+/// Strikeout window: a rule crossing the glyphs. Strikethroughs sit at
+/// roughly 20-35% of the em above the baseline (about half the x-height);
+/// accept a band well inside the glyph body so baseline underlines and
+/// overlines never qualify.
+fn rule_strikes_item(rule: &Rule, item: &TextItem) -> bool {
+    let y_min = item.y + item.font_size * 0.12;
+    let y_max = item.y + item.font_size * 0.55;
+    if rule.y < y_min || rule.y > y_max {
+        return false;
+    }
+
+    let ix1 = item.x;
+    let ix2 = item.x + item.width;
+    let min_overlap = item.width * MIN_X_OVERLAP;
+    let overlap = rule.x2.min(ix2) - rule.x1.max(ix1);
+    overlap >= min_overlap
+}
+
 /// Mark `is_underline` on text items that have a horizontal rule just
-/// below their baseline. `items`, `rects`, and `lines` are a single
+/// below their baseline, and `is_strikeout` on items whose glyphs a rule
+/// crosses at mid x-height. `items`, `rects`, and `lines` are a single
 /// page's extraction output (all in PDF coordinates, y-up, where
 /// `TextItem::y` is the text baseline).
 pub(crate) fn mark_underlined_items(
@@ -258,6 +277,11 @@ pub(crate) fn mark_underlined_items(
             }
             if rule_matches_item(rule, item) {
                 item.is_underline = true;
+            }
+            if rule_strikes_item(rule, item) {
+                item.is_strikeout = true;
+            }
+            if item.is_underline && item.is_strikeout {
                 break;
             }
         }
@@ -282,6 +306,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -355,6 +380,44 @@ mod tests {
 
         mark_underlined_items(&mut items, &[], &[line], 1);
 
+        assert!(!items[0].is_underline);
+    }
+
+    #[test]
+    fn mid_glyph_rule_marks_strikeout_not_underline() {
+        // Rule at ~30% of the em above the baseline crosses the glyphs.
+        let mut items = vec![item("struck out", 100.0, 500.0, 60.0, 10.0)];
+        let lines = vec![hline(99.0, 161.0, 503.0)];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(items[0].is_strikeout);
+        assert!(!items[0].is_underline);
+    }
+
+    #[test]
+    fn baseline_rule_marks_underline_not_strikeout() {
+        let mut items = vec![item("underlined", 100.0, 500.0, 60.0, 10.0)];
+        let lines = vec![hline(99.0, 161.0, 498.5)];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(items[0].is_underline);
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn overline_is_neither_underline_nor_strikeout() {
+        // Rule just above the cap height (overline / next line's rule).
+        let mut items = vec![item("text", 100.0, 500.0, 60.0, 10.0)];
+        let lines = vec![hline(99.0, 161.0, 507.0)];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(!items[0].is_underline);
+        assert!(!items[0].is_strikeout);
+    }
+
+    #[test]
+    fn thin_filled_rect_at_mid_glyph_marks_strikeout() {
+        let mut items = vec![item("struck out", 100.0, 500.0, 60.0, 10.0)];
+        let rects = vec![thin_rect(100.0, 502.6, 60.0)];
+        mark_underlined_items(&mut items, &rects, &[], 1);
+        assert!(items[0].is_strikeout);
         assert!(!items[0].is_underline);
     }
 

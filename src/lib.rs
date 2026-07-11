@@ -579,6 +579,7 @@ pub fn extract_text_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -597,6 +598,7 @@ pub fn extract_text_in_regions_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -699,6 +701,7 @@ pub fn extract_tables_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -714,6 +717,7 @@ pub fn extract_tables_in_regions_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1019,6 +1023,7 @@ pub fn detect_vector_grid_in_region_mem(
             page_1idx,
             &font_cmaps,
             false,
+            &mut extractor::FontStyleCache::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1205,8 +1210,15 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) =
-            extract_page_text_items(&doc, page_id, 1, &cmaps, false).unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &cmaps,
+            false,
+            &mut crate::extractor::FontStyleCache::new(),
+        )
+        .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1240,8 +1252,15 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) =
-            extract_page_text_items(&doc, page_id, page_num, &cmaps, false).unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
+            &doc,
+            page_id,
+            page_num,
+            &cmaps,
+            false,
+            &mut crate::extractor::FontStyleCache::new(),
+        )
+        .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -1966,6 +1985,7 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1981,6 +2001,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 *page_num,
                 &font_cmaps,
                 false,
+                &mut style_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -2782,6 +2803,7 @@ fn detect_tsr_quality_issue(
             page_1idx,
             &font_cmaps,
             false,
+            &mut extractor::FontStyleCache::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -5056,6 +5078,7 @@ mod text_cluster_column_undercount_tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -5331,6 +5354,7 @@ mod table_candidate_selection_tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -6078,6 +6102,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

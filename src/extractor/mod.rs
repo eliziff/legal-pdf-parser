@@ -24,6 +24,7 @@ use links::{extract_form_fields, extract_page_links};
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
+pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
 pub(crate) use layout::group_into_lines_with_thresholds;
@@ -161,6 +162,9 @@ fn extract_positioned_text_impl(
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    // Embedded-font style flags are document-scoped: the same font program
+    // is shared across pages, so parse it once, not once per page.
+    let mut style_cache = FontStyleCache::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -172,8 +176,14 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) =
-            extract_page_text_items(doc, page_id, *page_num, font_cmaps, include_invisible)?;
+        let ((mut items, rects, lines), has_gid_fonts, _coords_rotated) = extract_page_text_items(
+            doc,
+            page_id,
+            *page_num,
+            font_cmaps,
+            include_invisible,
+            &mut style_cache,
+        )?;
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
@@ -234,7 +244,10 @@ fn suppress_table_underlines(
     lines: &[PdfLine],
     page: u32,
 ) {
-    if !items.iter().any(|item| item.is_underline) {
+    if !items
+        .iter()
+        .any(|item| item.is_underline || item.is_strikeout)
+    {
         return;
     }
 
@@ -256,6 +269,7 @@ fn suppress_table_underlines(
     for index in table_item_indices {
         if let Some(item) = items.get_mut(index) {
             item.is_underline = false;
+            item.is_strikeout = false;
         }
     }
 }
@@ -576,6 +590,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if next.is_bold != first.is_bold
                     || next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
+                    || next.is_strikeout != first.is_strikeout
                 {
                     break;
                 }
@@ -638,6 +653,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
+                is_strikeout: first.is_strikeout,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -715,7 +731,9 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         .chars()
                         .last()
                         .is_some_and(|c| c.is_alphabetic());
-                    if parent.font_size >= sub_threshold && ends_with_letter {
+                    let same_marks = parent.is_underline == item.is_underline
+                        && parent.is_strikeout == item.is_strikeout;
+                    if parent.font_size >= sub_threshold && ends_with_letter && same_marks {
                         let parent_right = parent.x + parent.width;
                         let gap = item.x - parent_right;
                         // Subscripts must be tightly adjacent (within ~1pt)
@@ -789,6 +807,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -991,6 +1010,7 @@ mod tests {
         items[3].y = 470.0;
         for item in &mut items {
             item.is_underline = true;
+            item.is_strikeout = true;
         }
         let lines = vec![
             make_line(100.0, 500.0, 300.0, 500.0),
@@ -1004,6 +1024,30 @@ mod tests {
         suppress_table_underlines(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
+        assert!(items.iter().all(|item| !item.is_strikeout));
+    }
+
+    #[test]
+    fn subscript_digit_with_different_marks_is_not_absorbed() {
+        // A struck-out word followed by an unmarked footnote digit: merging
+        // would widen the parent's strikeout claim over the digit (and the
+        // reverse would drop the digit's own mark). Style boundaries break
+        // the merge, as in merge_text_items.
+        let mut word = make_merge_item("word", 100.0, 24.0);
+        word.font_size = 10.0;
+        word.is_strikeout = true;
+        let mut digit = make_merge_item("2", 124.5, 4.0);
+        digit.font_size = 6.0;
+        digit.y = word.y + 3.0;
+
+        let merged = merge_subscript_items(vec![word.clone(), digit.clone()]);
+        assert_eq!(merged.len(), 2);
+
+        // Same marks still merge (footnote ref inside the strike).
+        digit.is_strikeout = true;
+        let merged = merge_subscript_items(vec![word, digit]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].text.starts_with("word"));
     }
 
     #[test]
@@ -1021,6 +1065,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1036,6 +1081,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1051,6 +1097,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1106,6 +1153,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1121,6 +1169,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1136,6 +1185,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1162,6 +1212,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1177,6 +1228,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1192,6 +1244,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1220,6 +1273,7 @@ mod tests {
                 is_bold: true,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1255,6 +1309,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -1291,6 +1346,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1306,6 +1362,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1321,6 +1378,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1344,6 +1402,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1457,6 +1516,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1472,6 +1532,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1497,6 +1558,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1512,6 +1574,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1553,6 +1616,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1598,6 +1662,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1643,6 +1708,7 @@ mod tests {
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
+                is_strikeout: false,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -1681,6 +1747,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             is_underline: false,
+            is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

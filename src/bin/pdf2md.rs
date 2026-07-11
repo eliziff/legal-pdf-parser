@@ -74,7 +74,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
@@ -86,6 +86,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 item.is_bold,
                 item.is_italic,
                 item.is_underline,
+                item.is_strikeout,
                 item_type_label(&item.item_type),
                 mcid,
                 link_url,
@@ -122,6 +123,7 @@ mod tests {
             is_bold: false,
             is_italic: true,
             is_underline: true,
+            is_strikeout: true,
             item_type: ItemType::Text,
             mcid: Some(7),
         }];
