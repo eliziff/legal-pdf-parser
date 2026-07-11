@@ -208,6 +208,7 @@ fn main() {
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
+        eprintln!("  --password PW       Password for an encrypted PDF");
         eprintln!("  --detect-only       Only detect PDF type (no extraction)");
         eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
         process::exit(1);
@@ -220,6 +221,16 @@ fn main() {
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
+
+    // Parse --password value
+    let password = args.iter().position(|a| a == "--password").map(|i| {
+        args.get(i + 1)
+            .unwrap_or_else(|| {
+                eprintln!("Error: --password requires a value");
+                process::exit(1);
+            })
+            .clone()
+    });
 
     // Parse --select-pages value
     let page_filter = args
@@ -269,6 +280,7 @@ fn main() {
     if let Some(pages) = page_filter {
         options.page_filter = Some(pages);
     }
+    options.password = password;
 
     match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {

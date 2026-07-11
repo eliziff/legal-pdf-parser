@@ -125,7 +125,7 @@ pub struct PdfProcessResult {
 ///     .mode(ProcessMode::Analyze)
 ///     .pages([1, 3, 5]);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PdfOptions {
     /// How far the pipeline should run (default: [`ProcessMode::Full`]).
     pub mode: ProcessMode,
@@ -135,6 +135,23 @@ pub struct PdfOptions {
     pub markdown: MarkdownOptions,
     /// Optional set of 1-indexed pages to process.  `None` = all pages.
     pub page_filter: Option<HashSet<u32>>,
+    /// Password for decrypting an encrypted PDF. `None` falls back to the
+    /// empty password (owner-only encryption).
+    pub password: Option<String>,
+}
+
+// Manual `Debug` so the password is never leaked through debug logging or a
+// panic that formats the options; it renders as `Some("[REDACTED]")`.
+impl std::fmt::Debug for PdfOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdfOptions")
+            .field("mode", &self.mode)
+            .field("detection", &self.detection)
+            .field("markdown", &self.markdown)
+            .field("page_filter", &self.page_filter)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Default for PdfOptions {
@@ -144,6 +161,7 @@ impl Default for PdfOptions {
             detection: DetectionConfig::default(),
             markdown: MarkdownOptions::default(),
             page_filter: None,
+            password: None,
         }
     }
 }
@@ -185,6 +203,12 @@ impl PdfOptions {
         self.page_filter = Some(pages.into_iter().collect());
         self
     }
+
+    /// Set the password used to decrypt an encrypted PDF.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
 }
 
 // =========================================================================
@@ -217,7 +241,8 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
 
     // Load the document once — shared by detection AND extraction.
-    let (doc, page_count) = load_document_from_path(&path)?;
+    let (doc, page_count) =
+        load_document_from_path_with_password(&path, options.password.as_deref())?;
 
     process_document(doc, page_count, options, start)
 }
@@ -242,7 +267,8 @@ pub fn process_pdf_mem_with_options(
     let start = std::time::Instant::now();
     validate_pdf_bytes(buffer)?;
 
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) =
+        load_document_from_mem_with_password(buffer, options.password.as_deref())?;
 
     process_document(doc, page_count, options, start)
 }
@@ -3268,23 +3294,39 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
 pub(crate) fn load_document_from_path<P: AsRef<Path>>(
     path: P,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_path_with_password(path, None)
+}
+
+/// Load a PDF file, decrypting with `password` if the file is encrypted.
+pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
+    path: P,
+    password: Option<&str>,
+) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
-    load_document_from_mem(&buffer)
+    load_document_from_mem_with_password(&buffer, password)
 }
 
 /// Load a PDF from a memory buffer.
 pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_password(buffer, None)
+}
+
+/// Load a PDF from a memory buffer, decrypting with `password` if encrypted.
+pub(crate) fn load_document_from_mem_with_password(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf) {
+    let doc = match load_document_bytes(buf, password) {
         Ok(doc) => doc,
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
-                match load_document_bytes(&repaired) {
+                match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
                         let page_count = doc.get_pages().len() as u32;
@@ -3304,13 +3346,31 @@ pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), P
     Ok((doc, page_count))
 }
 
-fn load_document_bytes(buf: &[u8]) -> Result<Document, lopdf::Error> {
+fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     match Document::load_mem(buf) {
+        // Some encrypted PDFs load structurally but leave their streams
+        // encrypted (`is_encrypted()` stays true); reading them yields garbage
+        // until we re-load with a password. Others fail load_mem outright with
+        // an encryption error. Handle both by re-loading with the password.
+        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password),
         Ok(doc) => Ok(doc),
-        Err(ref e) if is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-        }
+        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password),
         Err(e) => Err(e),
+    }
+}
+
+/// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
+/// empty password (owner-only encryption, the common "protected" case) when a
+/// non-empty password was supplied but rejected.
+fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
+    let pw = password.unwrap_or("");
+    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+        Ok(doc) => Ok(doc),
+        Err(inner) if !pw.is_empty() => {
+            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+                .map_err(|_| inner)
+        }
+        Err(inner) => Err(inner),
     }
 }
 

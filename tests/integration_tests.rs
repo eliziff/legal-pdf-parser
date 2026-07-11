@@ -3606,3 +3606,45 @@ fn test_markdown_options_default_has_include_images_false() {
     let opts = MarkdownOptions::default();
     assert!(!opts.include_images);
 }
+
+#[test]
+fn encrypted_pdf_decrypts_with_correct_password() {
+    let path = "tests/fixtures/encrypted-secret123.pdf";
+
+    // No password: the file is encrypted and can't be read.
+    let no_pw = process_pdf_with_options(path, PdfOptions::new());
+    assert!(
+        matches!(no_pw, Err(PdfError::Encrypted)),
+        "expected Encrypted without a password, got {no_pw:?}"
+    );
+
+    // Wrong password: still rejected.
+    let wrong = process_pdf_with_options(path, PdfOptions::new().password("wrong"));
+    assert!(
+        matches!(wrong, Err(PdfError::Encrypted)),
+        "expected Encrypted with a wrong password, got {wrong:?}"
+    );
+
+    // Correct password: decrypts and extracts real content.
+    let ok = process_pdf_with_options(path, PdfOptions::new().password("secret123"))
+        .expect("correct password should decrypt");
+    let md = ok.markdown.unwrap_or_default();
+    // Assert a stable fixture token so a garbled-but-long extraction (the
+    // encrypted-stream regression this guards) still fails the test.
+    assert!(
+        md.contains("Procurement"),
+        "decrypted markdown should contain the fixture's real text, got {} chars",
+        md.len()
+    );
+}
+
+#[test]
+fn pdf_options_debug_redacts_password() {
+    let opts = PdfOptions::new().password("secret123");
+    let dbg = format!("{opts:?}");
+    assert!(
+        !dbg.contains("secret123"),
+        "password leaked in Debug: {dbg}"
+    );
+    assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+}
