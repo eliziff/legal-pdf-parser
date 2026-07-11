@@ -1102,6 +1102,7 @@ fn test_pages_needing_ocr_field_accessible() {
         title: None,
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
+        ocr_reasons_by_page: std::collections::BTreeMap::new(),
     };
     assert!(detection_result.pages_needing_ocr.is_empty());
 

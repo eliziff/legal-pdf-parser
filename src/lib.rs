@@ -71,6 +71,18 @@ use tounicode::FontCMaps;
 /// broken font decoding or mojibake.
 pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
 
+/// OCR reason: the page is a scanned image (a full-page raster / image-only
+/// page) with no usable text layer.
+pub const OCR_REASON_SCANNED: &str = "scanned";
+
+/// OCR reason: the page has no extractable text and no image to OCR — blank,
+/// or content the parser cannot reach.
+pub const OCR_REASON_NO_TEXT: &str = "no_text";
+
+/// OCR reason: the page's text is drawn as vector outlines (path operators)
+/// rather than real text operators, so it cannot be extracted as characters.
+pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -3465,6 +3477,7 @@ fn process_document(
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
     let confidence = detection.confidence;
+    let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
@@ -3474,7 +3487,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
-            ocr_reasons_by_page: Vec::new(),
+            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3490,7 +3503,7 @@ fn process_document(
             page_count,
             processing_time_ms: start.elapsed().as_millis() as u64,
             pages_needing_ocr,
-            ocr_reasons_by_page: Vec::new(),
+            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
             confidence,
             layout: LayoutComplexity::default(),
@@ -3756,7 +3769,13 @@ fn process_document(
         page_count,
         processing_time_ms: start.elapsed().as_millis() as u64,
         pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(text_quality_reasons_by_page),
+        ocr_reasons_by_page: {
+            // Detector reasons (scanned / no_text / vector_text / garbled) merged
+            // with the markdown-stage garbled detection, deduped per page.
+            let mut merged = detection_ocr_reasons;
+            merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
+            page_ocr_reasons_vec(merged)
+        },
         title,
         confidence,
         layout,
