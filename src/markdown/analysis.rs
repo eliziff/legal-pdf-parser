@@ -174,6 +174,21 @@ pub(crate) fn is_toc_marker_heading(text: &str) -> bool {
 pub(crate) fn is_heading_fragment(text: &str) -> bool {
     let t = text.trim_end();
 
+    // A lowercase-initial one-or-two-word "heading" is a mid-sentence
+    // fragment beside display math ("or inversely", "and therefore") —
+    // real headings that short start uppercase. Measured as spurious
+    // headings on academic docs (fire-pdf ENG-5029 / opendataloader MHS).
+    {
+        let words: Vec<&str> = t.split_whitespace().collect();
+        if words.len() <= 2 {
+            if let Some(first_alpha) = t.chars().find(|c| c.is_alphabetic()) {
+                if first_alpha.is_lowercase() {
+                    return true;
+                }
+            }
+        }
+    }
+
     fn is_equation_number(s: &str) -> bool {
         s.strip_prefix('(')
             .and_then(|r| r.strip_suffix(')'))
@@ -460,6 +475,10 @@ mod tests {
     #[test]
     fn heading_fragments() {
         // Equation lead-ins: colon ending + inline equation reference
+        assert!(is_heading_fragment("or inversely"));
+        assert!(is_heading_fragment("and therefore"));
+        assert!(!is_heading_fragment("Introduction"));
+        assert!(!is_heading_fragment("iPhone Sales Strategy Overview")); // 4 words, exempt
         assert!(is_heading_fragment("Rearranging Equation (8) gives:"));
         // Display-equation neighbours ending in an equation number
         assert!(is_heading_fragment("S = kB ln W, (2)"));
