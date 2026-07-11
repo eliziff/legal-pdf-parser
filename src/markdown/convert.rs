@@ -141,8 +141,11 @@ fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) 
         }
     }
     for (&page, &(total, isolated)) in &page_line_counts {
-        if total > 0 && isolated as f32 / total as f32 > 0.25 {
-            // Too many isolated lines on this page — remove them all
+        // The ratio only means something on pages dense enough for a
+        // multi-column misfire; on sparse pages (covers, ToC pages with a
+        // lone title) one isolated line is 25%+ of the page and exactly the
+        // line isolation exists to find.
+        if total >= 10 && isolated as f32 / total as f32 > 0.25 {
             set.retain(|&i| lines[i].page != page);
         }
     }
@@ -700,7 +703,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 _ => false,
             };
 
+        // Lines explicitly tagged with a non-heading content role must never
+        // be promoted by the visual heuristic — a tagged list item, quote, or
+        // code line can look exactly like a heading (short, isolated).
+        let non_heading_role = struct_role
+            .as_ref()
+            .is_some_and(StructRole::is_non_heading_content);
         let heuristic_heading = if options.detect_headers
+            && !non_heading_role
+            && !is_code_line
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
@@ -1053,6 +1064,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && !is_toc_entry_line(plain_trimmed)
             && !is_heading_fragment(plain_trimmed)
             && toc_suppress_page != Some(line.page)
+            && !(options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)))
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
@@ -1225,6 +1237,42 @@ mod tests {
             page,
             adaptive_threshold: 0.10,
         }
+    }
+
+    fn line_at(text: &str, page: u32, y: f32) -> TextLine {
+        let mut item = make_item(text, page, None);
+        item.y = y;
+        make_line(vec![item])
+    }
+
+    #[test]
+    fn isolated_lines_kept_on_sparse_pages() {
+        // A ToC page with a lone title and one entry far below: the density
+        // ratio is 50% but the page is too sparse for the multi-column
+        // misfire the guard targets — the title must stay isolated.
+        let lines = vec![
+            line_at("CONTENTS", 1, 700.0),
+            line_at("Chapter One 5", 1, 500.0),
+        ];
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.contains(&0),
+            "sparse-page title must stay isolated"
+        );
+    }
+
+    #[test]
+    fn isolated_lines_wiped_on_dense_pages() {
+        // 12 short lines all with paragraph gaps — the multi-column misfire
+        // shape. The guard must clear them all.
+        let lines: Vec<TextLine> = (0..12)
+            .map(|i| line_at("Short column line", 1, 700.0 - i as f32 * 50.0))
+            .collect();
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.is_empty(),
+            "dense page of isolated lines must be wiped"
+        );
     }
 
     #[test]
