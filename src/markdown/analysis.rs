@@ -130,6 +130,29 @@ pub(crate) fn has_dot_leaders(text: &str) -> bool {
     dot_groups >= 2
 }
 
+/// Detect a table-of-contents entry: a line ending in a page number preceded by
+/// a dot-leader group (e.g. "Measurement Lab worksheet ... 3"). `has_dot_leaders`
+/// misses single-group leaders ("..."), but a trailing "<dots> <number>" is a
+/// strong TOC signal on its own. Such lines must never be promoted to headings.
+pub(crate) fn is_toc_entry_line(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    let digits = trimmed
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > 4 {
+        return false;
+    }
+    let before_number = trimmed[..trimmed.len() - digits].trim_end();
+    let dots = before_number
+        .chars()
+        .rev()
+        .take_while(|c| *c == '.')
+        .count();
+    dots >= 3
+}
+
 /// Compute the Y-gap threshold for paragraph break detection.
 ///
 /// Instead of using a fixed multiple of base_size (which fails for double-spaced
@@ -318,5 +341,30 @@ pub(crate) fn detect_header_level(
         Some(3)
     } else {
         Some(4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toc_entry_with_single_dot_group() {
+        assert!(is_toc_entry_line("Measurement Lab worksheet ... 3"));
+        assert!(is_toc_entry_line("Results ........ 12"));
+        assert!(is_toc_entry_line("Appendix B...42"));
+    }
+
+    #[test]
+    fn non_toc_lines_pass() {
+        assert!(!is_toc_entry_line(
+            "6.2. Expectations for Re-Hiring Employees"
+        ));
+        assert!(!is_toc_entry_line("What happened in 2020"));
+        assert!(!is_toc_entry_line("IMPLEMENTATION"));
+        // Ellipsis without a trailing page number
+        assert!(!is_toc_entry_line("and so it goes ..."));
+        // Long numbers are data, not page refs
+        assert!(!is_toc_entry_line("ISBN ... 97814"));
     }
 }
