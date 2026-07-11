@@ -7,7 +7,8 @@ use crate::types::TextLine;
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
-    detect_header_level, font_size_rarity, has_dot_leaders, is_toc_entry_line,
+    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
+    is_toc_marker_heading,
 };
 use super::classify::{
     format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
@@ -486,6 +487,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_code_block = false;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
@@ -704,6 +706,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
             && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
@@ -768,6 +772,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 plain_text.clone()
             };
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+            if is_toc_marker_heading(plain_trimmed) {
+                toc_suppress_page = Some(line.page);
+            }
             in_list = false;
             continue;
         }
@@ -964,6 +971,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut last_list_x: Option<f32> = None;
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -1043,6 +1051,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
@@ -1086,6 +1096,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                     plain_text.clone()
                 };
                 output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+                if is_toc_marker_heading(plain_trimmed) {
+                    toc_suppress_page = Some(line.page);
+                }
                 in_list = false;
                 continue;
             }
