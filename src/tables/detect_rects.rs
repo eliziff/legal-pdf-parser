@@ -2367,7 +2367,29 @@ fn detect_merged_cluster_table(
 /// suitable for rect-backed tables where we already know tabular structure exists
 /// (no need for anti-paragraph safeguards).
 fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<f32> {
-    let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
+    // Column edges come from where text STARTS. An item whose left edge hugs
+    // the previous item's right edge on the same line is a continuation run
+    // (style boundary, script change, underline split) — feeding its x-start
+    // in here fabricates a phantom column mid-cell.
+    let mut sorted: Vec<&TextItem> = items.iter().map(|&(_, i)| i).collect();
+    sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    let mut x_positions: Vec<f32> = Vec::with_capacity(sorted.len());
+    for (idx, item) in sorted.iter().enumerate() {
+        let is_continuation = idx > 0 && {
+            let prev = sorted[idx - 1];
+            // Style/underline splits leave runs that TOUCH (gap ~0); real
+            // cell boundaries in even the tightest tables keep a visible
+            // gap. 2pt separates the two without eating dense-table columns.
+            // The negative side is bounded too: text overhanging from an
+            // adjacent cell overlaps by far more than italic kerning ever
+            // does, and must still start its own column.
+            let gap = item.x - (prev.x + prev.width);
+            (prev.y - item.y).abs() <= 2.0 && gap < 2.0 && gap > -4.0 && item.x >= prev.x
+        };
+        if !is_continuation {
+            x_positions.push(item.x);
+        }
+    }
     x_positions.sort_by(|a, b| a.total_cmp(b));
 
     if x_positions.is_empty() {
