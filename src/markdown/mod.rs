@@ -16,7 +16,6 @@ pub use convert::to_markdown_from_lines;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::extractor::group_into_lines_with_thresholds;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
@@ -724,6 +723,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             .push((global_idx, item));
     }
 
+    // Chart regions per page: their text must not steer column detection
+    // during line grouping (it fills the gutter and fuses two-column lines).
+    let mut page_chart_map: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
+    for &page in page_groups.keys() {
+        let page_items_ref: Vec<TextItem> = page_groups[&page]
+            .iter()
+            .map(|(_, item)| (*item).clone())
+            .collect();
+        let regions = crate::tables::detect_chart_regions(&page_items_ref, rects, page);
+        if !regions.is_empty() {
+            page_chart_map.insert(page, regions);
+        }
+    }
+
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
     let page_count = pages.last().copied().unwrap_or(0) + 1;
@@ -748,9 +761,8 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // rects or aligned text and get gridded into phantom tables. Their
         // items are excluded from every table detector below and flow through
         // as plain text instead.
-        let page_rect_vec: Vec<PdfRect> =
-            rects.iter().filter(|r| r.page == page).cloned().collect();
-        let chart_regions = crate::tables::detect_chart_regions(&page_items, &page_rect_vec, page);
+        let chart_regions: Vec<(f32, f32, f32, f32)> =
+            page_chart_map.get(&page).cloned().unwrap_or_default();
         // Pad the claim region: axis/category labels sit just outside the
         // bar rects (below the axis, left of the scale) and belong to the
         // chart as much as the bars do.
@@ -1259,7 +1271,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() {
-        group_into_lines_with_thresholds(non_table_items, page_thresholds, &table_page_set)
+        crate::extractor::group_into_lines_with_thresholds_and_charts(
+            non_table_items,
+            page_thresholds,
+            &table_page_set,
+            &page_chart_map,
+        )
     } else {
         // Separate items into band-split pages and non-split pages
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -1272,8 +1289,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines =
-            group_into_lines_with_thresholds(unsplit_items, page_thresholds, &table_page_set);
+        let mut all_lines = crate::extractor::group_into_lines_with_thresholds_and_charts(
+            unsplit_items,
+            page_thresholds,
+            &table_page_set,
+            &page_chart_map,
+        );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
@@ -1290,11 +1311,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .cloned()
                     .collect();
                 if !band_items.is_empty() {
-                    page_lines.extend(group_into_lines_with_thresholds(
-                        band_items,
-                        page_thresholds,
-                        &table_page_set,
-                    ));
+                    page_lines.extend(
+                        crate::extractor::group_into_lines_with_thresholds_and_charts(
+                            band_items,
+                            page_thresholds,
+                            &table_page_set,
+                            &page_chart_map,
+                        ),
+                    );
                 }
             }
             // Sort by Y descending (top to bottom) so left and right
