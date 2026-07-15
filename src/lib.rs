@@ -673,18 +673,51 @@ pub fn extract_text_in_regions_mem(
 
         let mut page_results = Vec::with_capacity(regions.len());
 
-        for rect in regions {
-            let [rx1, ry1, rx2, ry2] = *rect;
+        // Exclusive item->region assignment: overlapping layout regions used
+        // to extract shared items into EVERY region they touched (the
+        // 1.5pt inclusion margin makes borders generous), duplicating whole
+        // lines in the final markdown on 21% of bench docs — and downstream
+        // duplicate-handling sometimes dropped the variant holding a
+        // sentence tail, turning duplication into content LOSS. Each item
+        // now belongs to the single region with the largest overlap area;
+        // items are partitioned, never suppressed, so no content can vanish.
+        let all_bounds: Vec<RegionBounds> = regions
+            .iter()
+            .map(|rect| {
+                let [rx1, ry1, rx2, ry2] = *rect;
+                region_bounds(rx1, ry1, rx2, ry2, page_h, coords)
+            })
+            .collect();
+        // Single pass over items: assign each to the best-overlap region and
+        // bucket the clone directly (review: avoid a second O(items x
+        // regions) traversal). `had_candidates` marks regions that touched
+        // at least one item even if every one was assigned elsewhere.
+        let mut region_items: Vec<Vec<TextItem>> = vec![Vec::new(); regions.len()];
+        let mut had_candidates: Vec<bool> = vec![false; regions.len()];
+        if let Some(items) = items {
+            for item in items {
+                let mut best: Option<usize> = None;
+                let mut best_area = 0.0_f32;
+                for (ri, b) in all_bounds.iter().enumerate() {
+                    if !region_overlaps_item(item, *b) {
+                        continue;
+                    }
+                    had_candidates[ri] = true;
+                    let area = region_item_overlap_area(item, *b);
+                    if area > best_area {
+                        best_area = area;
+                        best = Some(ri);
+                    }
+                }
+                if let Some(ri) = best {
+                    region_items[ri].push(item.clone());
+                }
+            }
+        }
 
-            let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
-            let matched: Vec<TextItem> = match items {
-                Some(items) => items
-                    .iter()
-                    .filter(|item| region_overlaps_item(item, bounds))
-                    .cloned()
-                    .collect(),
-                None => Vec::new(),
-            };
+        for (region_idx, _rect) in regions.iter().enumerate() {
+            let matched: Vec<TextItem> = std::mem::take(&mut region_items[region_idx]);
+            let assigned_count = matched.len();
             let has_text_quality_issue = region_items_have_decoding_issue(&matched);
             let text = collect_text_from_matched_items(matched, adaptive_threshold);
             let has_cid_issue = is_cid_garbage(&text);
@@ -698,8 +731,21 @@ pub fn extract_text_in_regions_mem(
             // Check per-region text quality instead of blanket page-level
             // GID rejection. A GID font in a logo elsewhere on the page
             // shouldn't force GPU OCR for clean text regions.
-            let needs_ocr =
-                ocr_reason.is_some() || text.trim().is_empty() || is_garbage_text(&text);
+            // A region whose ONLY overlapping items were assigned to a
+            // better-overlapping neighbor must not fall back to OCR: the
+            // pixels it would re-read belong to that neighbor, and OCR
+            // would reintroduce the duplication exclusivity removed.
+            // Before exclusive assignment these regions were non-empty
+            // native (no OCR), so this preserves the old OCR load too.
+            // Requires ZERO items assigned HERE: a region whose own
+            // assigned items materialize to empty text (whitespace-only,
+            // collector-filtered) keeps its OCR fallback.
+            let lost_to_neighbor = text.trim().is_empty()
+                && ocr_reason.is_none()
+                && assigned_count == 0
+                && had_candidates[region_idx];
+            let needs_ocr = !lost_to_neighbor
+                && (ocr_reason.is_some() || text.trim().is_empty() || is_garbage_text(&text));
 
             page_results.push(RegionText {
                 text,
@@ -3215,8 +3261,26 @@ fn region_bounds(
     }
 }
 
+/// Inclusion margin shared by the region/item overlap predicates and the
+/// exclusive-assignment area score — these MUST stay in sync: an item that
+/// passes the boolean guard must always have positive overlap area.
+const REGION_MARGIN: f32 = 1.5;
+
+/// Overlap area between an item and region bounds (same margin as the
+/// boolean test) — the exclusive-assignment score.
+fn region_item_overlap_area(item: &TextItem, bounds: RegionBounds) -> f32 {
+    let item_x_max = item.x + text_utils::effective_width(item);
+    let item_y_max = item.y + item.height;
+    let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
+        - item.x.max(bounds.x_min - REGION_MARGIN))
+    .max(0.0);
+    let y_overlap = (item_y_max.min(bounds.y_max + REGION_MARGIN)
+        - item.y.max(bounds.y_min - REGION_MARGIN))
+    .max(0.0);
+    x_overlap * y_overlap
+}
+
 fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
-    const REGION_MARGIN: f32 = 1.5;
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
@@ -3232,7 +3296,6 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
 }
 
 fn region_overlaps_rect(rect: &PdfRect, bounds: RegionBounds) -> bool {
-    const REGION_MARGIN: f32 = 1.5;
     let (x_min, y_min, x_max, y_max) = normalized_rect_edges(rect);
     ranges_overlap(
         x_min,
@@ -3248,7 +3311,6 @@ fn region_overlaps_rect(rect: &PdfRect, bounds: RegionBounds) -> bool {
 }
 
 fn region_overlaps_line(line: &PdfLine, bounds: RegionBounds) -> bool {
-    const REGION_MARGIN: f32 = 1.5;
     let x_min = line.x1.min(line.x2);
     let x_max = line.x1.max(line.x2);
     let y_min = line.y1.min(line.y2);
