@@ -914,7 +914,126 @@ fn looks_like_number(s: &str) -> bool {
 ///
 /// Used by format.rs to render TOCs as flat lists instead of markdown tables.
 pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
-    is_dot_leader_toc(cells) || is_tabular_toc(cells)
+    is_dot_leader_toc(cells) || is_tabular_toc(cells) || is_page_number_toc(cells)
+}
+
+/// Parse a page-number-like token: a short arabic integer (≤4 digits) or a
+/// canonical roman numeral (front-matter pages: i, ii, …, xxxviii). Roman
+/// parsing is shared with the formatter via `super::canonical_roman_value` so
+/// the two stay in sync.
+fn page_number_value(token: &str) -> Option<u32> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 4 {
+        return t.parse().ok();
+    }
+    super::canonical_roman_value(t)
+}
+
+/// Page-number-column TOC: title-based contents with no dot leaders and no
+/// section numbers (e.g. "About the Publisher  vii", "Experiment #1 …  3").
+/// The signature is a text-title first column and a last column that is almost
+/// entirely page numbers whose values are *mostly non-decreasing* — the
+/// monotonic run is what separates a real TOC from an incidental 2-column
+/// numeric data table.
+pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
+    let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
+    // A page-number TOC is a narrow list (title + page, optionally a leader
+    // column). Wider grids are data tables, not contents.
+    if !(2..=3).contains(&num_cols) || cells.len() < 5 {
+        return false;
+    }
+    let last = num_cols - 1;
+
+    // No header row: a TOC's first row is already an entry, so its last cell is
+    // a page number. A data table's first row is a column header (non-numeric,
+    // or an empty units cell like "Category | ") — the tell that separates
+    // "Mineral | CEC" tables from real contents. Check the actual first row,
+    // not the first non-empty one, so a blank header cell still rejects.
+    let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
+    if page_number_value(first_last).is_none() {
+        return false;
+    }
+
+    // Last column: page numbers on ≥70% of filled rows; collect their values.
+    let mut filled = 0u32;
+    let mut page_vals: Vec<u32> = Vec::new();
+    for row in cells {
+        let cell = row.get(last).map(|s| s.trim()).unwrap_or("");
+        if cell.is_empty() {
+            continue;
+        }
+        filled += 1;
+        if let Some(v) = page_number_value(cell) {
+            page_vals.push(v);
+        }
+    }
+    if filled < 4 || (page_vals.len() as f32) < 0.7 * filled as f32 {
+        return false;
+    }
+
+    // First column: mostly text titles (has alphabetic content). This rejects
+    // numeric-vs-numeric grids.
+    let text_first = cells
+        .iter()
+        .filter(|row| {
+            row.first()
+                .is_some_and(|c| c.chars().any(|ch| ch.is_alphabetic()))
+        })
+        .count();
+    if (text_first as f32) < 0.6 * cells.len() as f32 {
+        return false;
+    }
+
+    // Page numbers mostly ascend (allow front-matter→body resets and noise).
+    if page_vals.len() < 2 {
+        return false;
+    }
+    let non_decreasing = page_vals.windows(2).filter(|w| w[1] >= w[0]).count();
+    if (non_decreasing as f32) < 0.7 * (page_vals.len() - 1) as f32 {
+        return false;
+    }
+
+    // Stronger TOC signal. Real page numbers SPAN the document — entries skip
+    // (3, 6, 13, 24, …) so their range exceeds the entry count. A rank / ID /
+    // ordinal column is instead a *perfectly dense* consecutive run (1,2,3,… or
+    // 100,101,102,…). Accept anything with page gaps; for a dense run — which a
+    // one-page-per-entry TOC can also produce — fall back to a title signal:
+    // real contents entries are multi-word headings, rank labels are short.
+    let min = *page_vals.iter().min().unwrap();
+    let max = *page_vals.iter().max().unwrap();
+    let span = max.saturating_sub(min);
+    if span > page_vals.len() as u32 {
+        return true;
+    }
+    let dense_consecutive = (span as usize) + 1 == page_vals.len() && {
+        let mut sorted = page_vals.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() == page_vals.len()
+    };
+    if !dense_consecutive {
+        // Narrow range but with a gap or repeat — still contents-like.
+        return true;
+    }
+    // Dense counter: only a TOC if the titles read like headings, not the
+    // short single-word labels typical of rank/leaderboard/ID tables.
+    let (total_words, titled_rows) = cells
+        .iter()
+        .filter_map(|row| row.first())
+        .filter(|c| c.chars().any(|ch| ch.is_alphabetic()))
+        .fold((0usize, 0usize), |(w, n), c| {
+            (
+                w + c
+                    .split_whitespace()
+                    .filter(|t| t.chars().any(|ch| ch.is_alphabetic()))
+                    .count(),
+                n + 1,
+            )
+        });
+    titled_rows > 0 && (total_words as f32) / titled_rows as f32 >= 1.8
 }
 
 /// Dot-leader TOC: any "Chapter 1 ........ 42" style with explicit leader
@@ -1885,5 +2004,167 @@ mod tests {
         assert!(!starts_with_section_number("10.0%"));
         assert!(!starts_with_section_number(""));
         assert!(!starts_with_section_number("Hello world"));
+    }
+
+    #[test]
+    fn page_number_value_rejects_roman_lookalike_words() {
+        // Ordinary words made only of {i,v,x,l,c} are not page numbers.
+        assert!(page_number_value("civil").is_none());
+        assert!(page_number_value("mix").is_none());
+        assert!(page_number_value("ill").is_none());
+        assert!(page_number_value("lil").is_none());
+        // Canonical roman numerals still parse.
+        assert_eq!(page_number_value("vii"), Some(7));
+        assert_eq!(page_number_value("ix"), Some(9));
+        assert_eq!(page_number_value("xii"), Some(12));
+        assert_eq!(page_number_value("42"), Some(42));
+    }
+
+    #[test]
+    fn page_number_toc_matches_consecutive_pages_with_titles() {
+        // A short chapter-per-page contents: pages are a dense 1..n run, but
+        // the multi-word titles mark it as a real TOC (recovered by the title
+        // signal rather than rejected for lacking page gaps).
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Introduction to the Study".into(), "1".into()],
+            vec!["Materials and Methods".into(), "2".into()],
+            vec!["Results and Discussion".into(), "3".into()],
+            vec!["Summary of Findings".into(), "4".into()],
+            vec!["References and Notes".into(), "5".into()],
+        ];
+        assert!(is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_dense_ordinal_column() {
+        // Headerless title | rank table: values are a consecutive 1..n
+        // sequence (monotonic, no header, text first column) but their range
+        // ~= the row count, so it is data, not a table of contents.
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Alice".into(), "1".into()],
+            vec!["Bob".into(), "2".into()],
+            vec!["Carol".into(), "3".into()],
+            vec!["Dave".into(), "4".into()],
+            vec!["Erin".into(), "5".into()],
+            vec!["Frank".into(), "6".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_blank_header_cell() {
+        // First row is a header whose last cell is blank ("Category | ");
+        // must not be flattened even though later rows look TOC-like.
+        let cells = vec![
+            vec!["Category".into(), "".into()],
+            vec!["Alpha".into(), "3".into()],
+            vec!["Beta".into(), "9".into()],
+            vec!["Gamma".into(), "14".into()],
+            vec!["Delta".into(), "20".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_matches_title_based_contents() {
+        // Title-left, page-number-right, no dot leaders, no section numbers.
+        let cells = vec![
+            vec!["About the Publisher".into(), "vii".into()],
+            vec!["About This Project".into(), "ix".into()],
+            vec!["Acknowledgments".into(), "xi".into()],
+            vec!["Experiment #1: Hydrostatic Pressure".into(), "3".into()],
+            vec!["Experiment #2: Bernoulli's Theorem".into(), "13".into()],
+            vec![
+                "Experiment #3: Energy Loss in Pipe Fittings".into(),
+                "24".into(),
+            ],
+        ];
+        assert!(is_page_number_toc(&cells));
+        assert!(is_table_of_contents(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_numeric_data_table() {
+        // Real 2-col data table: numeric first column, non-monotonic values.
+        let cells = vec![
+            vec!["101".into(), "45".into()],
+            vec!["102".into(), "12".into()],
+            vec!["103".into(), "88".into()],
+            vec!["104".into(), "7".into()],
+            vec!["105".into(), "63".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_non_monotonic_pages() {
+        // Text labels but the "page" column jumps around — a small data table,
+        // not a contents listing. 5 rows so the row-count guard passes and the
+        // monotonicity check is what does the rejecting.
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Apples".into(), "42".into()],
+            vec!["Oranges".into(), "7".into()],
+            vec!["Pears".into(), "91".into()],
+            vec!["Plums".into(), "3".into()],
+            vec!["Grapes".into(), "60".into()],
+        ];
+        // Sanity: this input clears the row-count and header guards, so a
+        // failure here is genuinely the monotonicity check.
+        assert!(cells.len() >= 5 && page_number_value(cells[0][1].trim()).is_some());
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_header_row_data_table() {
+        // Real 2-col data table with a header row ("Mineral | CEC") and
+        // ascending values that mimic page numbers — the header tells us it
+        // is data, not contents.
+        let cells = vec![
+            vec![
+                "Mineral or colloid type".into(),
+                "CEC of pure colloid".into(),
+            ],
+            vec!["kaolinite".into(), "10".into()],
+            vec!["illite".into(), "30".into()],
+            vec!["montmorillonite".into(), "100".into()],
+            vec!["vermiculite".into(), "150".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_wide_data_grid() {
+        // A 4-column regional data table must not be read as a TOC even with a
+        // text first column and integer last column.
+        let cells = vec![
+            vec![
+                "REGIONS".into(),
+                "2007".into(),
+                "2010".into(),
+                "2016".into(),
+            ],
+            vec![
+                "National Capital Region".into(),
+                "9".into(),
+                "8".into(),
+                "5".into(),
+            ],
+            vec!["Cordillera".into(), "1".into(), "2".into(), "1".into()],
+            vec!["Ilocos Region".into(), "1".into(), "5".into(), "4".into()],
+            vec!["Cagayan Valley".into(), "1".into(), "3".into(), "5".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_needs_page_number_last_column() {
+        // Last column is prose, not page numbers.
+        let cells = vec![
+            vec!["Section A".into(), "see appendix".into()],
+            vec!["Section B".into(), "see notes".into()],
+            vec!["Section C".into(), "later".into()],
+            vec!["Section D".into(), "TBD".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
     }
 }

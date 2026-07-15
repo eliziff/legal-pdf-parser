@@ -123,6 +123,7 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 
 /// True when the cell looks like a page number.  Accepts:
 ///   - plain digit tokens: "42", "86 86"
+///   - canonical roman numerals (front-matter pages): "vii", "ix", "xii"
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
@@ -137,6 +138,9 @@ fn is_page_number_cell(cell: &str) -> bool {
         let all_digits = t.chars().all(|c| c.is_ascii_digit());
         if all_digits {
             return t.len() <= 4;
+        }
+        if super::canonical_roman_value(t).is_some() {
+            return true;
         }
         // Section-page form: uppercase letters, digits, dashes; at least
         // one digit present.
