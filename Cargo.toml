@@ -14,7 +14,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"], optional = true }
 
 # PDF parsing
 lopdf = { version = "0.41.0", features = ["rayon"] }
