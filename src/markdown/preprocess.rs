@@ -42,7 +42,12 @@ fn effective_heading_level(
 
     // Fall back to font-size heuristic
     let font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-    detect_header_level(font, base_size, heading_tiers)
+    detect_header_level(
+        font,
+        base_size,
+        heading_tiers,
+        crate::markdown::analysis::line_is_mostly_bold(line),
+    )
 }
 
 /// Merge consecutive heading lines at the same level into a single line.
