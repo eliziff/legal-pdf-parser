@@ -303,7 +303,11 @@ fn extract_positioned_text_impl(
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
             links.retain(|it| {
                 let cx = it.x + it.width / 2.0;
-                cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && it.y >= by0 - 6.0 && it.y <= by1 + 6.0
+                // Center-y, not it.y: link items carry an annotation rect,
+                // so y is a box edge — unlike text items, where y is a
+                // baseline and testing it directly is the natural semantics.
+                let cy = it.y + it.height / 2.0;
+                cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
             });
         }
         all_items.extend(links);
