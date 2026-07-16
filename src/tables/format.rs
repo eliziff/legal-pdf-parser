@@ -188,6 +188,21 @@ fn starts_with_numbered_label(cell: &str) -> bool {
             .is_some_and(|c| matches!(c, '.' | ')' | '-' | ':'))
 }
 
+fn starts_with_hierarchical_numbered_label(cell: &str) -> bool {
+    let token = cell
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ')', ':', '-']);
+    let levels: Vec<&str> = token.split('.').collect();
+    (2..=4).contains(&levels.len())
+        && levels.iter().all(|level| {
+            !level.is_empty()
+                && level.len() <= 3
+                && level.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 fn alpha_word_count(cell: &str) -> usize {
     cell.split_whitespace()
         .filter(|word| word.chars().any(|c| c.is_alphabetic()))
@@ -341,11 +356,12 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // mid-sentence/lowercase ("continued text here", "with 3.5%...") or
         // carry lowercase fragments in the later cells, so keep those mergeable.
         let looks_like_hierarchical_subrow = first_cell.is_empty()
-            && row.len() >= 3
             && first_non_empty_col == Some(1)
             && looks_like_compact_entry_label(first_non_empty_cell)
-            && ((non_first_cells.len() >= 2 && title_like_later_cells > 0)
+            && ((row.len() == 2 && starts_with_hierarchical_numbered_label(first_non_empty_cell))
+                || (row.len() >= 3 && non_first_cells.len() >= 2 && title_like_later_cells > 0)
                 || (non_first_cells.len() == 1
+                    && row.len() >= 3
                     && prev_first_cell_empty
                     && alpha_word_count(first_non_empty_cell) >= 2));
         let looks_like_new_first_column_entry = !first_cell.is_empty()
@@ -686,6 +702,46 @@ mod tests {
         assert_eq!(cleaned[2][1], "Storage setup");
         assert_eq!(cleaned[3][1], "Label workspace");
         assert_eq!(cleaned[4][1], "Model training");
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_subrows_not_merged() {
+        let cells = vec![
+            vec!["Area".into(), "Competence".into()],
+            vec![
+                "1. Embodying sustainability values".into(),
+                "1.1 Valuing sustainability".into(),
+            ],
+            vec!["".into(), "1.2 Supporting fairness".into()],
+            vec!["".into(), "1.3 Promoting nature".into()],
+            vec![
+                "2. Embracing complexity".into(),
+                "2.1 Systems thinking".into(),
+            ],
+            vec!["".into(), "2.2 Critical thinking".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 6);
+        assert_eq!(cleaned[2], vec!["", "1.2 Supporting fairness"]);
+        assert_eq!(cleaned[3], vec!["", "1.3 Promoting nature"]);
+        assert_eq!(cleaned[5], vec!["", "2.2 Critical thinking"]);
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_continuation_merges() {
+        let cells = vec![
+            vec!["Area".into(), "Requirement".into()],
+            vec!["Safety".into(), "The program includes".into()],
+            vec!["".into(), "1. First requirement for every operator".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(
+            cleaned[1][1],
+            "The program includes 1. First requirement for every operator"
+        );
     }
 
     #[test]
