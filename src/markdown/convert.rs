@@ -1,5 +1,6 @@
 //! Core line-to-markdown conversion loop with table/image interleaving.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
@@ -15,7 +16,146 @@ use super::classify::{
 };
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
-use super::MarkdownOptions;
+use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
+
+/// Logical stream geometry for a page where one full-width chart separates
+/// two prose columns. Positioned non-text blocks use this same ordering so a
+/// right-column table or image cannot jump ahead of left-column prose.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChartProseOrder {
+    split_x: f32,
+    chart_region: (f32, f32, f32, f32),
+}
+
+impl ChartProseOrder {
+    pub(super) fn new(split_x: f32, chart_region: (f32, f32, f32, f32)) -> Self {
+        Self {
+            split_x,
+            chart_region,
+        }
+    }
+}
+
+/// Markdown block with its physical position and optional logical chart-page
+/// stream. Tables and images share this representation because both are
+/// removed before text-line grouping and reinserted during conversion.
+#[derive(Debug, Clone)]
+pub(super) struct PositionedMarkdown {
+    y: f32,
+    x: f32,
+    markdown: String,
+    chart_order: Option<ChartProseOrder>,
+}
+
+impl PositionedMarkdown {
+    pub(super) fn new(
+        y: f32,
+        x: f32,
+        markdown: String,
+        chart_order: Option<ChartProseOrder>,
+    ) -> Self {
+        Self {
+            y,
+            x,
+            markdown,
+            chart_order,
+        }
+    }
+}
+
+fn chart_stream_position(
+    y: f32,
+    x: f32,
+    claimed_by_chart: bool,
+    order: ChartProseOrder,
+) -> (u8, u8) {
+    let (_, y0, _, y1) = order.chart_region;
+    let low = y0.min(y1) - CHART_SEPARATOR_PAD;
+    let high = y0.max(y1) + CHART_SEPARATOR_PAD;
+    let in_chart_zone = claimed_by_chart || (y >= low && y <= high);
+    let zone = if in_chart_zone {
+        1
+    } else if y > high {
+        0
+    } else {
+        2
+    };
+    let column = if in_chart_zone || x < order.split_x {
+        0
+    } else {
+        1
+    };
+    (zone, column)
+}
+
+fn positioned_block_precedes_line(block: &PositionedMarkdown, line: &TextLine) -> bool {
+    let Some(order) = block.chart_order else {
+        return block.y > line.y;
+    };
+    let line_x = line.items.first().map(|item| item.x).unwrap_or(0.0);
+    let line_claimed_by_chart = line
+        .items
+        .iter()
+        .any(|item| item_is_in_chart_region(item, &[order.chart_region]));
+    let block_position = chart_stream_position(block.y, block.x, false, order);
+    let line_position = chart_stream_position(line.y, line_x, line_claimed_by_chart, order);
+    block_position < line_position || (block_position == line_position && block.y > line.y)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PositionedBlockKind {
+    Table,
+    Image,
+}
+
+type PositionedBlockRef<'a> = (PositionedBlockKind, usize, &'a PositionedMarkdown);
+
+fn compare_positioned_blocks(
+    (a_kind, a_idx, a): &PositionedBlockRef<'_>,
+    (b_kind, b_idx, b): &PositionedBlockRef<'_>,
+) -> Ordering {
+    if let (Some(a_order), Some(b_order)) = (a.chart_order, b.chart_order) {
+        let a_position = chart_stream_position(a.y, a.x, false, a_order);
+        let b_position = chart_stream_position(b.y, b.x, false, b_order);
+        return a_position
+            .cmp(&b_position)
+            .then_with(|| b.y.total_cmp(&a.y))
+            .then_with(|| a.x.total_cmp(&b.x))
+            .then_with(|| a_kind.cmp(b_kind))
+            .then_with(|| a_idx.cmp(b_idx));
+    }
+
+    // Preserve the legacy ordering for ordinary pages: tables in detection
+    // order, followed by images in input order. Chart pages give every block
+    // a chart order and use the logical stream comparison above.
+    a_kind.cmp(b_kind).then_with(|| a_idx.cmp(b_idx))
+}
+
+fn positioned_blocks_for_page<'a>(
+    page: u32,
+    page_tables: &'a HashMap<u32, Vec<PositionedMarkdown>>,
+    page_images: &'a HashMap<u32, Vec<PositionedMarkdown>>,
+) -> Vec<PositionedBlockRef<'a>> {
+    let mut blocks = Vec::new();
+    if let Some(tables) = page_tables.get(&page) {
+        blocks.extend(
+            tables
+                .iter()
+                .enumerate()
+                .map(|(idx, table)| (PositionedBlockKind::Table, idx, table)),
+        );
+    }
+    if let Some(images) = page_images.get(&page) {
+        blocks.extend(
+            images
+                .iter()
+                .enumerate()
+                .map(|(idx, image)| (PositionedBlockKind::Image, idx, image)),
+        );
+    }
+    blocks.sort_by(compare_positioned_blocks);
+    blocks
+}
 
 /// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on
 /// so many lines that they clearly represent body text, not real headings.
@@ -383,7 +523,7 @@ fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
 /// We strip their header+separator rows and append their data rows to the first page's
 /// table, then remove them from later pages.
 pub(super) fn merge_continuation_tables(
-    page_tables: &mut std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_tables: &mut std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     table_only_pages: &HashSet<u32>,
 ) {
     let mut sorted_pages: Vec<u32> = page_tables.keys().copied().collect();
@@ -411,7 +551,7 @@ pub(super) fn merge_continuation_tables(
             continue;
         }
 
-        let first_col_count = count_table_columns(&first_tables[0].1);
+        let first_col_count = count_table_columns(&first_tables[0].markdown);
         if first_col_count == 0 {
             i += 1;
             continue;
@@ -442,7 +582,7 @@ pub(super) fn merge_continuation_tables(
                 _ => break,
             };
 
-            let next_col_count = count_table_columns(&next_tables[0].1);
+            let next_col_count = count_table_columns(&next_tables[0].markdown);
             if next_col_count != first_col_count {
                 break;
             }
@@ -456,7 +596,7 @@ pub(super) fn merge_continuation_tables(
             let mut extra_rows = String::new();
             for &cont_page in &continuation_pages {
                 if let Some(tables) = page_tables.get(&cont_page) {
-                    let table_md = &tables[0].1;
+                    let table_md = &tables[0].markdown;
                     // Skip header row (line 1) and separator row (line 2), keep the rest
                     for (line_idx, line) in table_md.lines().enumerate() {
                         if line_idx >= 2 {
@@ -469,7 +609,7 @@ pub(super) fn merge_continuation_tables(
 
             // Append continuation rows to the first page's table
             if let Some(tables) = page_tables.get_mut(&first_page) {
-                tables[0].1.push_str(&extra_rows);
+                tables[0].markdown.push_str(&extra_rows);
             }
 
             // Remove continuation pages from the map
@@ -501,37 +641,35 @@ fn count_table_columns(table_md: &str) -> usize {
 /// Flush any remaining tables and images for a given page
 fn flush_page_tables_and_images(
     page: u32,
-    page_tables: &std::collections::HashMap<u32, Vec<(f32, String)>>,
-    page_images: &std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
     inserted_tables: &mut HashSet<(u32, usize)>,
     inserted_images: &mut HashSet<(u32, usize)>,
     output: &mut String,
     in_paragraph: &mut bool,
 ) {
-    if let Some(tables) = page_tables.get(&page) {
-        for (idx, (_, table_md)) in tables.iter().enumerate() {
-            if !inserted_tables.contains(&(page, idx)) {
-                if *in_paragraph {
-                    output.push_str("\n\n");
-                    *in_paragraph = false;
-                }
-                output.push('\n');
-                output.push_str(table_md);
-                output.push('\n');
+    let Some(blocks) = page_blocks.get(&page) else {
+        return;
+    };
+    for &(kind, idx, block) in blocks {
+        let already_inserted = match kind {
+            PositionedBlockKind::Table => inserted_tables.contains(&(page, idx)),
+            PositionedBlockKind::Image => inserted_images.contains(&(page, idx)),
+        };
+        if already_inserted {
+            continue;
+        }
+        if *in_paragraph {
+            output.push_str("\n\n");
+            *in_paragraph = false;
+        }
+        output.push('\n');
+        output.push_str(&block.markdown);
+        output.push('\n');
+        match kind {
+            PositionedBlockKind::Table => {
                 inserted_tables.insert((page, idx));
             }
-        }
-    }
-    if let Some(images) = page_images.get(&page) {
-        for (idx, (_, image_md)) in images.iter().enumerate() {
-            if !inserted_images.contains(&(page, idx)) {
-                if *in_paragraph {
-                    output.push_str("\n\n");
-                    *in_paragraph = false;
-                }
-                output.push('\n');
-                output.push_str(image_md);
-                output.push('\n');
+            PositionedBlockKind::Image => {
                 inserted_images.insert((page, idx));
             }
         }
@@ -542,8 +680,8 @@ fn flush_page_tables_and_images(
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
-    page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
-    page_images: std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_tables: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_images: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     band_split_pages: &HashSet<u32>,
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
@@ -619,6 +757,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         .collect();
     all_content_pages.sort();
     all_content_pages.dedup();
+    // Build the unified table/image order once per page. This is only a
+    // meaningful sort on chart/prose pages; ordinary pages retain their
+    // legacy table-then-image order without repeating work for every line.
+    let page_blocks: HashMap<u32, Vec<PositionedBlockRef<'_>>> = all_content_pages
+        .iter()
+        .map(|&page| {
+            (
+                page,
+                positioned_blocks_for_page(page, &page_tables, &page_images),
+            )
+        })
+        .collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -631,8 +781,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 flush_page_tables_and_images(
                     current_page,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -656,8 +805,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 flush_page_tables_and_images(
                     p,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -680,38 +828,32 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
 
-        // Check if we should insert a table before this line
-        if let Some(tables) = page_tables.get(&current_page) {
-            for (idx, (table_y, table_md)) in tables.iter().enumerate() {
-                // Insert table when we pass its Y position
-                if *table_y > line.y && !inserted_tables.contains(&(current_page, idx)) {
+        // Insert tables and images through one ordered stream. Chart/prose
+        // pages sort by zone, column, and physical Y; ordinary pages retain
+        // the legacy table-then-image input order.
+        if let Some(blocks) = page_blocks.get(&current_page) {
+            for &(kind, idx, block) in blocks {
+                let already_inserted = match kind {
+                    PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
+                    PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
+                };
+                if positioned_block_precedes_line(block, line) && !already_inserted {
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
                         paragraph_in_wrapped_bold_run = false;
                     }
                     output.push('\n');
-                    output.push_str(table_md);
+                    output.push_str(&block.markdown);
                     output.push('\n');
-                    inserted_tables.insert((current_page, idx));
-                }
-            }
-        }
-
-        // Check if we should insert an image before this line
-        if let Some(images) = page_images.get(&current_page) {
-            for (idx, (image_y, image_md)) in images.iter().enumerate() {
-                // Insert image when we pass its Y position
-                if *image_y > line.y && !inserted_images.contains(&(current_page, idx)) {
-                    if in_paragraph {
-                        output.push_str("\n\n");
-                        in_paragraph = false;
-                        paragraph_in_wrapped_bold_run = false;
+                    match kind {
+                        PositionedBlockKind::Table => {
+                            inserted_tables.insert((current_page, idx));
+                        }
+                        PositionedBlockKind::Image => {
+                            inserted_images.insert((current_page, idx));
+                        }
                     }
-                    output.push('\n');
-                    output.push_str(image_md);
-                    output.push('\n');
-                    inserted_images.insert((current_page, idx));
                 }
             }
         }
@@ -1044,8 +1186,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // (handles table-only pages after the last text line, and trailing image-only pages)
     flush_page_tables_and_images(
         current_page,
-        &page_tables,
-        &page_images,
+        &page_blocks,
         &mut inserted_tables,
         &mut inserted_images,
         &mut output,
@@ -1057,8 +1198,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         }
         flush_page_tables_and_images(
             p,
-            &page_tables,
-            &page_images,
+            &page_blocks,
             &mut inserted_tables,
             &mut inserted_images,
             &mut output,
@@ -1390,6 +1530,90 @@ mod tests {
         let mut item = make_item(text, page, None);
         item.y = y;
         make_line(vec![item])
+    }
+
+    #[test]
+    fn chart_page_blocks_follow_zone_and_column_stream() {
+        let line = |text: &str, x: f32, y: f32| {
+            let mut item = make_item(text, 1, None);
+            item.x = x;
+            item.y = y;
+            make_line(vec![item])
+        };
+        // Logical newspaper order for the prose zone: all left-column lines,
+        // then all right-column lines, even though their physical Y values
+        // jump back upward at the column switch.
+        let lines = vec![
+            line("Left column upper prose.", 90.0, 700.0),
+            line("Left column lower prose.", 90.0, 500.0),
+            line("Right column upper prose.", 340.0, 700.0),
+            line("Right column lower prose.", 340.0, 500.0),
+        ];
+        let order = ChartProseOrder::new(280.0, (100.0, 300.0, 500.0, 400.0));
+        let mut tables = HashMap::new();
+        tables.insert(
+            1,
+            vec![
+                // Detection order is deliberately right before left.
+                PositionedMarkdown::new(
+                    600.0,
+                    340.0,
+                    "| Right metric | Value |\n|---|---|\n| A | 1 |\n".into(),
+                    Some(order),
+                ),
+                PositionedMarkdown::new(
+                    550.0,
+                    90.0,
+                    "| Left metric | Value |\n|---|---|\n| B | 2 |\n".into(),
+                    Some(order),
+                ),
+            ],
+        );
+        let mut images = HashMap::new();
+        images.insert(
+            1,
+            vec![
+                PositionedMarkdown::new(
+                    575.0,
+                    90.0,
+                    "![Left column figure](left-image)\n".into(),
+                    Some(order),
+                ),
+                PositionedMarkdown::new(
+                    575.0,
+                    340.0,
+                    "![Right column figure](right-image)\n".into(),
+                    Some(order),
+                ),
+            ],
+        );
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            tables,
+            images,
+            &HashSet::from([1]),
+            None,
+        );
+        let positions = [
+            "Left column upper prose.",
+            "![Left column figure](left-image)",
+            "| Left metric | Value |",
+            "Left column lower prose.",
+            "Right column upper prose.",
+            "| Right metric | Value |",
+            "![Right column figure](right-image)",
+            "Right column lower prose.",
+        ]
+        .map(|needle| {
+            md.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {md}"))
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "blocks must follow the logical chart-page stream: {md}"
+        );
     }
 
     #[test]
