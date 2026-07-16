@@ -25,7 +25,7 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Test benchmark harness
+      - name: Test developer scripts
         run: python3 -m unittest discover -s scripts/tests
 
   fmt:

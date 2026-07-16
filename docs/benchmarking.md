@@ -27,3 +27,25 @@ The OpenDataLoader repository is external and keeps its normal
 `prediction/pdf-inspector` output. Paired evaluation copies each run into a
 temporary directory before evaluating it, so the baseline and candidate cannot
 overwrite one another.
+
+## Optional backend evidence probe
+
+The evidence probe compares positioned `pdf2md` items with MuPDF structured
+text on the same pages. It is intended to find deterministic extraction or
+layout evidence that could justify a future native implementation; it does not
+merge MuPDF output into Markdown, invoke OCR, or add a runtime dependency.
+
+Install MuPDF's `mutool`, build `pdf2md`, then run:
+
+```bash
+python3 scripts/probe_backend_evidence.py document.pdf \
+  --pdf2md target/release/pdf2md \
+  --json-output /tmp/backend-evidence.json
+```
+
+The report flags pages when MuPDF exposes a material net token gain, repeated
+alignment anchors absent from local evidence, or additional image blocks. The
+JSON includes bounded token samples and page-level counts so promising cases
+can be inspected without treating backend disagreement as automatically
+correct. Thresholds are configurable with `--min-token-gain`,
+`--min-alternate-only-ratio`, and `--min-anchor-gain`.
