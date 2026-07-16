@@ -25,6 +25,9 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Test benchmark harness
+        run: python3 -m unittest discover -s scripts/tests
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

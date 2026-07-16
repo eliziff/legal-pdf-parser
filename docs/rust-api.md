@@ -18,8 +18,8 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 
 | Engine | Overall | Reading order | Tables (TEDS) | Headings | Speed |
 |---|---|---|---|---|---|
-| **pdf-inspector** | 0.83 | 0.88 | **0.66** | 0.74 | **4s** |
-| opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
+| **pdf-inspector** | **0.875** | **0.915** | **0.814** | 0.788 | 3.3s |
+| opendataloader | 0.831 | 0.902 | 0.489 | 0.739 | 3.0s |
 | pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
 
 OCR/ML engines (docling, marker, mineru) score 0.83–0.88 overall but take 2–180 minutes on the same corpus. Full numbers in the [repo README](https://github.com/firecrawl/pdf-inspector#benchmark).
