@@ -671,6 +671,453 @@ fn combine_non_overlapping_tables(mut primary: Vec<Table>, secondary: Vec<Table>
     primary
 }
 
+fn logical_row_anchors(row: &[(usize, &TextItem)]) -> Vec<f32> {
+    let mut spans: Vec<(f32, f32)> = row
+        .iter()
+        .map(|(_, item)| (item.x, item.x + item.width.max(0.0)))
+        .collect();
+    spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut anchors = Vec::new();
+    let mut current_right = f32::NEG_INFINITY;
+    for (x, right) in spans {
+        if anchors.is_empty() || x > current_right + RULE_JOIN_GAP {
+            anchors.push(x);
+            current_right = right;
+        } else {
+            current_right = current_right.max(right);
+        }
+    }
+    anchors
+}
+
+fn nearest_anchor_column(item: &TextItem, anchors: &[f32]) -> Option<usize> {
+    anchors
+        .iter()
+        .enumerate()
+        .min_by(|left, right| (left.1 - item.x).abs().total_cmp(&(right.1 - item.x).abs()))
+        .map(|(index, _)| index)
+}
+
+fn matched_anchor_column_count(row: &[(usize, &TextItem)], anchors: &[f32]) -> usize {
+    row.iter()
+        .filter_map(|(_, item)| nearest_anchor_column(item, anchors))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Build a table hypothesis from the densest text row inside a ruled band.
+///
+/// Multi-level booktabs headers often put one or two spanning labels on the
+/// first baselines, while a later data row exposes every real column. Using
+/// only the first row therefore collapses the table before the legacy segment
+/// detector gets a chance to compare structures. This deliberately strict
+/// alternative requires repeated dense rows and numeric body evidence.
+fn build_dense_row_anchor_table(
+    items: &[TextItem],
+    horizontals: &[HorizontalRule],
+    verticals: &[VerticalRule],
+    page: u32,
+) -> Option<Table> {
+    let rules = merge_horizontal_segments(horizontals);
+    if rules.len() < 4 || rules_are_uniform_grid(&rules) {
+        return None;
+    }
+
+    // A page with several stacked charts can contribute one dense numeric
+    // row per chart. Do not combine separated rule bands into a synthetic
+    // page-wide table; a valid competing hypothesis must be one contiguous
+    // ruled region.
+    let mut distinct_rule_ys: Vec<f32> = rules.iter().map(|rule| rule.0).collect();
+    distinct_rule_ys.sort_by(|left, right| right.total_cmp(left));
+    distinct_rule_ys.dedup_by(|left, right| (*left - *right).abs() <= RULE_Y_TOLERANCE);
+    let mut rule_gaps: Vec<f32> = distinct_rule_ys
+        .windows(2)
+        .map(|pair| pair[0] - pair[1])
+        .collect();
+    rule_gaps.sort_by(f32::total_cmp);
+    if let Some(&median_gap) = rule_gaps.get(rule_gaps.len() / 2) {
+        if median_gap > 0.0
+            && rule_gaps
+                .last()
+                .is_some_and(|largest_gap| *largest_gap > median_gap * 2.5)
+        {
+            return None;
+        }
+    }
+    let has_uniform_run = distinct_rule_ys.windows(4).any(|window| {
+        let spacings = [
+            window[0] - window[1],
+            window[1] - window[2],
+            window[2] - window[3],
+        ];
+        let mean = spacings.iter().sum::<f32>() / spacings.len() as f32;
+        if mean <= 0.1 {
+            return false;
+        }
+        let variance = spacings
+            .iter()
+            .map(|spacing| (spacing - mean).powi(2))
+            .sum::<f32>()
+            / spacings.len() as f32;
+        variance.sqrt() / mean < 0.02
+    });
+    if has_uniform_run {
+        return None;
+    }
+
+    let x_min = rules
+        .iter()
+        .map(|rule| rule.1)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = rules
+        .iter()
+        .map(|rule| rule.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let table_width = x_max - x_min;
+    if table_width < 100.0 {
+        return None;
+    }
+    let y_top = *distinct_rule_ys.first()?;
+    let y_bottom = *distinct_rule_ys.last()?;
+    let band_vertical_xs: Vec<f32> = verticals
+        .iter()
+        .filter(|&&(x, y_min, y_max)| {
+            x >= x_min - RULE_JOIN_GAP
+                && x <= x_max + RULE_JOIN_GAP
+                && y_max >= y_bottom - RULE_Y_TOLERANCE
+                && y_min <= y_top + RULE_Y_TOLERANCE
+        })
+        .map(|rule| rule.0)
+        .collect();
+    if snap_edges(&band_vertical_xs, 3.0).len() >= 2 {
+        // Dense-row anchors are a horizontal-rule fallback. Vertical strokes
+        // elsewhere on the page are irrelevant, but a pair inside this ruled
+        // band means the physical-grid hypotheses should own the region.
+        return None;
+    }
+    let spanning_rules = rules
+        .iter()
+        .filter(|rule| rule.2 - rule.1 >= table_width * 0.8)
+        .count();
+    if spanning_rules < 2 {
+        return None;
+    }
+
+    let rows = collect_anchored_rows(items, &rules, page);
+    if !(3..=30).contains(&rows.len()) {
+        return None;
+    }
+    if rows.len() > distinct_rule_ys.len() * 2 + 2 {
+        // Sparse page decorations around prose can expose many aligned text
+        // starts, but their rule levels do not corroborate the row schema.
+        return None;
+    }
+    let anchors = rows
+        .iter()
+        .map(|(_, row)| logical_row_anchors(row))
+        .max_by_key(Vec::len)?;
+    if !(4..=25).contains(&anchors.len()) || anchors.last()? - anchors[0] < table_width * 0.6 {
+        return None;
+    }
+
+    // At least two rows must independently expose nearly the whole schema.
+    // A single busy line inside a chart or form is not enough evidence.
+    let dense_threshold = (anchors.len() * 3).div_ceil(4);
+    let dense_rows = rows
+        .iter()
+        .filter(|(_, row)| matched_anchor_column_count(row, &anchors) >= dense_threshold)
+        .count();
+    if dense_rows < 2 {
+        return None;
+    }
+
+    let mut columns = vec![x_min.min(anchors[0])];
+    columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
+    columns.push(x_max.max(*anchors.last()?));
+
+    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut item_indices = Vec::new();
+    for (row_index, (_, row)) in rows.iter().enumerate() {
+        for (item_index, item) in row {
+            let column = nearest_anchor_column(item, &anchors)?;
+            if !cells[row_index][column].is_empty() {
+                cells[row_index][column].push(' ');
+            }
+            cells[row_index][column].push_str(item.text.trim());
+            item_indices.push(*item_index);
+        }
+    }
+    item_indices.sort_unstable();
+    item_indices.dedup();
+
+    let body_rows = &cells[1..];
+    let numeric_cells = body_rows
+        .iter()
+        .flatten()
+        .filter(|cell| cell.chars().any(|character| character.is_ascii_digit()))
+        .count();
+    let nonempty_body_cells = body_rows
+        .iter()
+        .flatten()
+        .filter(|cell| !cell.is_empty())
+        .count();
+    if numeric_cells < anchors.len().min(3) || numeric_cells * 4 < nonempty_body_cells.max(1) {
+        return None;
+    }
+
+    Some(Table::new(
+        columns,
+        rows.iter().map(|(y, _)| *y).collect(),
+        cells,
+        item_indices,
+    ))
+}
+
+/// Recover grids whose horizontal rules provide the outer x bounds while
+/// vertical strokes draw only the internal column dividers. A header may sit
+/// immediately above the top rule, as is common in presentation tables.
+fn build_open_edge_grid_table_for_rules(
+    items: &[TextItem],
+    logical_rules: &[HorizontalRule],
+    rules: &[HorizontalRule],
+    verticals: &[(f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    let x_min = rules
+        .iter()
+        .map(|rule| rule.1)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = rules
+        .iter()
+        .map(|rule| rule.2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let y_top = rules
+        .iter()
+        .map(|rule| rule.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let y_bottom = rules
+        .iter()
+        .map(|rule| rule.0)
+        .fold(f32::INFINITY, f32::min);
+    let width = x_max - x_min;
+    let height = y_top - y_bottom;
+    if width < 100.0 || height < 20.0 {
+        return None;
+    }
+
+    let scoped_vertical_xs: Vec<f32> = verticals
+        .iter()
+        .filter(|(x, y_min, y_max)| {
+            *x > x_min + RULE_JOIN_GAP
+                && *x < x_max - RULE_JOIN_GAP
+                && *y_min <= y_bottom + RULE_Y_TOLERANCE
+                && *y_max >= y_top - RULE_Y_TOLERANCE
+                && *y_max - *y_min >= height * 0.8
+        })
+        .map(|(x, _, _)| *x)
+        .collect();
+    let interior_edges = snap_edges(&scoped_vertical_xs, 3.0);
+    if !(1..=24).contains(&interior_edges.len()) {
+        return None;
+    }
+
+    let mut col_edges = Vec::with_capacity(interior_edges.len() + 2);
+    col_edges.push(x_min);
+    col_edges.extend(interior_edges);
+    col_edges.push(x_max);
+
+    let row_y_values: Vec<f32> = rules.iter().map(|rule| rule.0).collect();
+    let mut row_edges = snap_edges(&row_y_values, 3.0);
+    row_edges.sort_by(|left, right| right.total_cmp(left));
+    if row_edges.len() < 3 {
+        return None;
+    }
+
+    let (body_cells, mut item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let column_count = col_edges.len() - 1;
+    let occupied_body_rows = body_cells
+        .iter()
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .count();
+    let occupied_body_columns = (0..column_count)
+        .filter(|&column| body_cells.iter().any(|row| !row[column].is_empty()))
+        .count();
+    if occupied_body_rows < 2 || occupied_body_columns != column_count {
+        return None;
+    }
+
+    let header_band = [
+        (y_top + 30.0, x_min, x_max),
+        (y_top + RULE_Y_TOLERANCE, x_min, x_max),
+    ];
+    let header_rows = collect_anchored_rows(items, &header_band, page);
+    let header_y = header_rows.first()?.0;
+    let mut header_cells = vec![String::new(); column_count];
+    let mut header_indices = Vec::new();
+    for (_, header_items) in &header_rows {
+        for (item_index, item) in header_items {
+            let center_x = item.x + item.width / 2.0;
+            let column = (0..column_count)
+                .find(|&index| center_x >= col_edges[index] && center_x <= col_edges[index + 1])?;
+            if !header_cells[column].is_empty() {
+                header_cells[column].push(' ');
+            }
+            header_cells[column].push_str(item.text.trim());
+            header_indices.push(*item_index);
+        }
+    }
+    let mixed_rule_span_in_band = logical_rules.iter().any(|rule| {
+        rule.0 >= y_bottom - RULE_Y_TOLERANCE
+            && rule.0 <= y_top + RULE_Y_TOLERANCE
+            && rule.2 >= x_min - RULE_JOIN_GAP
+            && rule.1 <= x_max + RULE_JOIN_GAP
+            && !rules.contains(rule)
+    });
+    if header_cells[1..].iter().any(String::is_empty)
+        || (!header_cells[0].is_empty() && mixed_rule_span_in_band)
+    {
+        // The first column may be either an unlabeled row-header stub or a
+        // normal labeled column. A fully populated header is less distinctive,
+        // so only accept it when every logical horizontal rule corroborates
+        // the same open-edge band; mixed rule spans are better left to the
+        // physical-grid detector.
+        return None;
+    }
+
+    let mut cells = Vec::with_capacity(body_cells.len() + 1);
+    cells.push(header_cells);
+    cells.extend(body_cells);
+    item_indices.extend(header_indices);
+    item_indices.sort_unstable();
+    item_indices.dedup();
+
+    let mut rows = Vec::with_capacity(row_edges.len());
+    rows.push(header_y);
+    rows.extend_from_slice(&row_edges[..row_edges.len() - 1]);
+    Some(Table::new(col_edges, rows, cells, item_indices))
+}
+
+fn build_open_edge_grid_tables(
+    items: &[TextItem],
+    horizontals: &[HorizontalRule],
+    verticals: &[(f32, f32, f32)],
+    page: u32,
+) -> Vec<Table> {
+    let logical_rules = merge_horizontal_segments(horizontals);
+    group_rules_by_span(&logical_rules)
+        .into_iter()
+        .flat_map(|span_group| split_independent_rule_runs(&span_group, items, page))
+        .filter(|rules| rules.len() >= 3)
+        .filter_map(|rules| {
+            build_open_edge_grid_table_for_rules(items, &logical_rules, &rules, verticals, page)
+        })
+        .collect()
+}
+
+fn table_evidence_score(table: &Table) -> usize {
+    let filled_cells = table
+        .cells
+        .iter()
+        .flatten()
+        .filter(|cell| !cell.is_empty())
+        .count();
+    let occupied_rows = table
+        .cells
+        .iter()
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .count();
+    let column_count = table.cells.first().map_or(0, Vec::len);
+    let occupied_columns = (0..column_count)
+        .filter(|&column| {
+            table
+                .cells
+                .iter()
+                .any(|row| row.get(column).is_some_and(|cell| !cell.is_empty()))
+        })
+        .count();
+    let empty_cells = table.cells.len() * column_count - filled_cells;
+
+    let positive_evidence = table.item_indices.len() * 100
+        + filled_cells * 25
+        + occupied_columns * 60
+        + occupied_rows * 20;
+    positive_evidence.saturating_sub(empty_cells.saturating_mul(4))
+}
+
+fn select_non_overlapping_hypotheses(mut candidates: Vec<Table>) -> Vec<Table> {
+    candidates.sort_by(|left, right| {
+        table_evidence_score(right)
+            .cmp(&table_evidence_score(left))
+            .then_with(|| right.item_indices.len().cmp(&left.item_indices.len()))
+    });
+
+    let mut selected = Vec::new();
+    let mut claimed_items = HashSet::new();
+    for table in candidates {
+        if table
+            .item_indices
+            .iter()
+            .any(|index| claimed_items.contains(index))
+        {
+            continue;
+        }
+        claimed_items.extend(table.item_indices.iter().copied());
+        selected.push(table);
+    }
+    selected.sort_by(|left, right| {
+        right
+            .rows
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .total_cmp(&left.rows.first().copied().unwrap_or_default())
+    });
+    selected
+}
+
+fn tables_share_items(left: &Table, right: &Table) -> bool {
+    left.item_indices
+        .iter()
+        .any(|index| right.item_indices.contains(index))
+}
+
+fn overlaps_multiple_tables(candidate: &Table, tables: &[Table]) -> bool {
+    tables
+        .iter()
+        .filter(|table| tables_share_items(candidate, table))
+        .take(2)
+        .count()
+        > 1
+}
+
+fn select_table_hypothesis(legacy: Vec<Table>, alternatives: Vec<Table>, page: u32) -> Vec<Table> {
+    if alternatives.is_empty() {
+        return legacy;
+    }
+    if legacy.is_empty() {
+        let selected = select_non_overlapping_hypotheses(alternatives);
+        log::debug!(
+            "detect_lines p{}: accepted {} alternative table(s) (no legacy candidate)",
+            page,
+            selected.len()
+        );
+        return selected;
+    }
+
+    let legacy_count = legacy.len();
+    let mut candidates = legacy;
+    candidates.extend(alternatives);
+    let selected = select_non_overlapping_hypotheses(candidates);
+    log::debug!(
+        "detect_lines p{}: selected {} table(s) from {} legacy and alternative hypotheses",
+        page,
+        selected.len(),
+        legacy_count
+    );
+    selected
+}
+
 /// Derive column edges from the x-endpoints of horizontal-rule
 /// segments when no vertical lines were drawn.
 ///
@@ -737,7 +1184,7 @@ fn derive_columns_from_horizontal_segments(horizontals: &[(f32, f32, f32)]) -> O
 /// Lines are classified as horizontal or vertical, snapped into grid edges,
 /// and validated before assigning text items to the resulting grid.
 pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32) -> Vec<Table> {
-    detect_tables_from_lines_inner(items, lines, page, true)
+    detect_tables_from_lines_inner(items, lines, page, true, true)
 }
 
 /// Detect only tables whose cell grid is backed by explicit vector geometry.
@@ -749,7 +1196,7 @@ pub(crate) fn detect_vector_grid_tables_from_lines(
     lines: &[PdfLine],
     page: u32,
 ) -> Vec<Table> {
-    detect_tables_from_lines_inner(items, lines, page, false)
+    detect_tables_from_lines_inner(items, lines, page, false, false)
 }
 
 fn detect_tables_from_lines_inner(
@@ -757,6 +1204,7 @@ fn detect_tables_from_lines_inner(
     lines: &[PdfLine],
     page: u32,
     allow_text_anchors: bool,
+    allow_alternatives: bool,
 ) -> Vec<Table> {
     // Filter lines for this page
     let page_lines: Vec<&PdfLine> = lines.iter().filter(|l| l.page == page).collect();
@@ -799,7 +1247,18 @@ fn detect_tables_from_lines_inner(
     if horizontals.len() < 2 {
         return Vec::new();
     }
-
+    let mut alternatives = Vec::new();
+    if allow_alternatives {
+        if let Some(table) = build_dense_row_anchor_table(items, &horizontals, &verticals, page) {
+            alternatives.push(table);
+        }
+        alternatives.extend(build_open_edge_grid_tables(
+            items,
+            &horizontals,
+            &verticals,
+            page,
+        ));
+    }
     // Booktabs and response-form tables commonly draw horizontal rules only.
     // Their rules describe table bands, not row/cell boundaries, so infer
     // columns from the first text row and rows from text baselines before the
@@ -822,17 +1281,39 @@ fn detect_tables_from_lines_inner(
                 })
                 .cloned()
                 .collect();
-            let vector_tables =
-                detect_tables_from_lines_inner(items, &remaining_lines, page, false);
-            let text_anchor_tables = text_anchor_tables
+            let anchor_tables: Vec<Table> = text_anchor_tables
                 .into_iter()
                 .map(|candidate| candidate.table)
                 .collect();
-            return combine_non_overlapping_tables(text_anchor_tables, vector_tables);
+            // Re-evaluate geometry and dense/open-edge alternatives on the
+            // remaining page, but do not recurse into sparse text anchors.
+            // Keep a geometry-only result as a fallback: an inferred header
+            // can otherwise reach into an adjacent accepted anchor band and
+            // replace a valid physical grid with an overlapping hypothesis.
+            let vector_tables =
+                detect_tables_from_lines_inner(items, &remaining_lines, page, false, false);
+            let mut inferred_tables =
+                detect_tables_from_lines_inner(items, &remaining_lines, page, false, true);
+            inferred_tables.retain(|table| {
+                !anchor_tables
+                    .iter()
+                    .any(|anchor| tables_share_items(table, anchor))
+            });
+            let remaining_tables = combine_non_overlapping_tables(inferred_tables, vector_tables);
+            alternatives
+                .retain(|alternative| !overlaps_multiple_tables(alternative, &anchor_tables));
+            // A page-wide alternative that consumes two already-independent
+            // sparse tables is a synthetic merge, not a stronger hypothesis.
+            // Alternatives may still replace one overlapping anchor or add an
+            // independent table elsewhere on the page.
+            let mut competing_tables = anchor_tables;
+            competing_tables.extend(alternatives);
+            let selected_tables = select_non_overlapping_hypotheses(competing_tables);
+            return combine_non_overlapping_tables(selected_tables, remaining_tables);
         }
     }
     if horizontals.len() < 3 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // If no/very-few vertical lines are drawn, try to derive column edges
@@ -846,7 +1327,7 @@ fn detect_tables_from_lines_inner(
         None
     };
     if verticals.len() < 2 && implicit_col_edges.is_none() {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
     let cols_from_segments = implicit_col_edges.is_some();
 
@@ -886,7 +1367,7 @@ fn detect_tables_from_lines_inner(
     // Require at least 2 columns (3 col edges) and 2 rows (3 row edges).
     // A single column of horizontal lines is just separator rules, not a table.
     if row_edges.len() < 3 || col_edges.len() < 3 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // Cap grid size: >20 columns is almost certainly a diagram, not a table
@@ -897,21 +1378,21 @@ fn detect_tables_from_lines_inner(
             row_edges.len(),
             col_edges.len()
         );
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     let table_x_min = col_edges.first().copied().unwrap_or(0.0);
     let table_x_max = col_edges.last().copied().unwrap_or(0.0);
     let table_width = table_x_max - table_x_min;
     if table_width < 50.0 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     let table_y_min = row_edges.first().copied().unwrap_or(0.0);
     let table_y_max = row_edges.last().copied().unwrap_or(0.0);
     let table_height = (table_y_max - table_y_min).abs();
     if table_height < 20.0 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // Reject page-spanning frames: a decorative outer border has just 4
@@ -930,7 +1411,7 @@ fn detect_tables_from_lines_inner(
             horizontals.len(),
             verticals.len()
         );
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // Validate horizontal lines: at least 3 should span a meaningful width.
@@ -951,7 +1432,7 @@ fn detect_tables_from_lines_inner(
             spanning_h,
             partial_h
         );
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // Validate vertical lines: at least 2 should span a meaningful height.
@@ -979,7 +1460,7 @@ fn detect_tables_from_lines_inner(
                 s,
                 p
             );
-            return Vec::new();
+            return select_table_hypothesis(Vec::new(), alternatives, page);
         }
         s
     };
@@ -1004,7 +1485,7 @@ fn detect_tables_from_lines_inner(
         .filter(|row| row.iter().any(|cell| !cell.is_empty()))
         .count();
     if non_empty_rows < 2 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // Content density: at least 15% of cells should have content
@@ -1018,7 +1499,7 @@ fn detect_tables_from_lines_inner(
             .count();
         let density = filled_cells as f32 / total_cells as f32;
         if density < 0.15 {
-            return Vec::new();
+            return select_table_hypothesis(Vec::new(), alternatives, page);
         }
     }
 
@@ -1033,7 +1514,7 @@ fn detect_tables_from_lines_inner(
         })
         .count();
     if cols_with_content < 2 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     // The grid must capture a meaningful portion of the page's text items.
@@ -1044,7 +1525,7 @@ fn detect_tables_from_lines_inner(
         let capture_ratio = item_indices.len() as f32 / page_item_count as f32;
         // If the grid captures less than 20% of items, it's not a real table
         if capture_ratio < 0.20 {
-            return Vec::new();
+            return select_table_hypothesis(Vec::new(), alternatives, page);
         }
     }
 
@@ -1067,7 +1548,7 @@ fn detect_tables_from_lines_inner(
             // Spreadsheet-exported tables often have uniform rows (CV 0.03-0.05),
             // so we use a tighter threshold to avoid false negatives.
             if cv < 0.02 {
-                return Vec::new();
+                return select_table_hypothesis(Vec::new(), alternatives, page);
             }
         }
     }
@@ -1076,7 +1557,7 @@ fn detect_tables_from_lines_inner(
     let num_rows = row_edges_desc.len() - 1;
 
     if num_rows < 2 || num_cols < 2 {
-        return Vec::new();
+        return select_table_hypothesis(Vec::new(), alternatives, page);
     }
 
     log::debug!(
@@ -1084,12 +1565,16 @@ fn detect_tables_from_lines_inner(
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    vec![Table::new(
-        col_edges,
-        row_edges_desc[..num_rows].to_vec(),
-        cells,
-        item_indices,
-    )]
+    select_table_hypothesis(
+        vec![Table::new(
+            col_edges,
+            row_edges_desc[..num_rows].to_vec(),
+            cells,
+            item_indices,
+        )],
+        alternatives,
+        page,
+    )
 }
 
 #[cfg(test)]
@@ -1828,6 +2313,425 @@ mod tests {
             "expected ≥3 columns, got {}",
             t.cells[0].len()
         );
+    }
+
+    #[test]
+    fn test_dense_row_hypothesis_beats_partial_segment_grid() {
+        let lines = vec![
+            make_hline(520.0, 80.0, 520.0, 1),
+            make_hline(490.0, 160.0, 310.0, 1),
+            make_hline(490.0, 320.0, 520.0, 1),
+            make_hline(475.0, 80.0, 150.0, 1),
+            make_hline(475.0, 160.0, 310.0, 1),
+            make_hline(475.0, 320.0, 520.0, 1),
+            make_hline(420.0, 80.0, 520.0, 1),
+        ];
+        let xs = [90.0, 160.0, 225.0, 290.0, 355.0, 420.0, 485.0];
+        let mut items = vec![
+            make_item("Training Datasets", 290.0, 510.0, 1),
+            make_item("Properties", xs[0], 500.0, 1),
+            make_item("Instruction", xs[2], 500.0, 1),
+            make_item("Alignment", xs[5], 500.0, 1),
+        ];
+        for (column, x) in xs.into_iter().enumerate() {
+            items.push(make_item(&format!("dataset {column}"), x, 485.0, 1));
+            items.push(make_item(&format!("{}K", column + 1), x, 460.0, 1));
+            items.push(make_item(&format!("{}00", column + 1), x, 440.0, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 5);
+        assert_eq!(tables[0].cells[0].len(), 7);
+        assert_eq!(tables[0].cells[3][0], "1K");
+        assert_eq!(tables[0].cells[3][6], "7K");
+    }
+
+    #[test]
+    fn test_dense_row_hypothesis_requires_numeric_body_evidence() {
+        let lines = vec![
+            make_hline(520.0, 80.0, 520.0, 1),
+            make_hline(490.0, 80.0, 520.0, 1),
+            make_hline(460.0, 80.0, 520.0, 1),
+            make_hline(420.0, 80.0, 520.0, 1),
+        ];
+        let mut items = Vec::new();
+        for (row, y) in [505.0, 475.0, 440.0].into_iter().enumerate() {
+            for (column, x) in [90.0, 200.0, 310.0, 420.0].into_iter().enumerate() {
+                let label = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"][row + column];
+                items.push(make_item(label, x, y, 1));
+            }
+        }
+
+        assert!(build_dense_row_anchor_table(
+            &items,
+            &lines
+                .iter()
+                .map(|line| (line.y1, line.x1, line.x2))
+                .collect::<Vec<_>>(),
+            &[],
+            1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_dense_row_hypothesis_does_not_join_stacked_charts() {
+        let mut lines = Vec::new();
+        for y in [700.0, 680.0, 660.0, 640.0, 500.0, 480.0, 460.0, 440.0] {
+            lines.push(make_hline(y, 80.0, 520.0, 1));
+        }
+        let mut items = Vec::new();
+        for (row, y) in [690.0, 670.0, 650.0, 490.0, 470.0, 450.0]
+            .into_iter()
+            .enumerate()
+        {
+            for (column, x) in [90.0, 200.0, 310.0, 420.0].into_iter().enumerate() {
+                items.push(make_item(&format!("{}", row * 10 + column), x, y, 1));
+            }
+        }
+
+        assert!(build_dense_row_anchor_table(
+            &items,
+            &lines
+                .iter()
+                .map(|line| (line.y1, line.x1, line.x2))
+                .collect::<Vec<_>>(),
+            &[],
+            1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_dense_row_hypothesis_rejects_uniform_chart_run() {
+        let lines: Vec<PdfLine> = [520.0, 500.0, 480.0, 460.0, 440.0]
+            .into_iter()
+            .map(|y| make_hline(y, 80.0, 520.0, 1))
+            .collect();
+        let mut items = Vec::new();
+        for (row, y) in [510.0, 490.0, 470.0, 450.0].into_iter().enumerate() {
+            for (column, x) in [90.0, 200.0, 310.0, 420.0].into_iter().enumerate() {
+                items.push(make_item(&format!("{}", row * 10 + column), x, y, 1));
+            }
+        }
+
+        assert!(build_dense_row_anchor_table(
+            &items,
+            &lines
+                .iter()
+                .map(|line| (line.y1, line.x1, line.x2))
+                .collect::<Vec<_>>(),
+            &[],
+            1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_fragmented_row_counts_distinct_anchor_columns() {
+        let items = vec![
+            make_item("left", 100.0, 500.0, 1),
+            make_item("fragment", 133.0, 500.0, 1),
+            make_item("right", 300.0, 500.0, 1),
+            make_item("tail", 333.0, 500.0, 1),
+        ];
+        let row: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+
+        assert_eq!(logical_row_anchors(&row), vec![100.0, 300.0]);
+        assert_eq!(
+            matched_anchor_column_count(&row, &[100.0, 200.0, 300.0, 400.0]),
+            2
+        );
+    }
+
+    #[test]
+    fn test_dense_row_hypothesis_ignores_verticals_outside_its_band() {
+        let lines = vec![
+            make_hline(520.0, 80.0, 520.0, 1),
+            make_hline(490.0, 160.0, 310.0, 1),
+            make_hline(490.0, 320.0, 520.0, 1),
+            make_hline(475.0, 80.0, 150.0, 1),
+            make_hline(475.0, 160.0, 310.0, 1),
+            make_hline(475.0, 320.0, 520.0, 1),
+            make_hline(420.0, 80.0, 520.0, 1),
+            make_vline(30.0, 600.0, 680.0, 1),
+            make_vline(580.0, 250.0, 330.0, 1),
+        ];
+        let xs = [90.0, 160.0, 225.0, 290.0, 355.0, 420.0, 485.0];
+        let mut items = vec![
+            make_item("Training Datasets", 290.0, 510.0, 1),
+            make_item("Properties", xs[0], 500.0, 1),
+            make_item("Instruction", xs[2], 500.0, 1),
+            make_item("Alignment", xs[5], 500.0, 1),
+        ];
+        for (column, x) in xs.into_iter().enumerate() {
+            items.push(make_item(&format!("dataset {column}"), x, 485.0, 1));
+            items.push(make_item(&format!("{}K", column + 1), x, 460.0, 1));
+            items.push(make_item(&format!("{}00", column + 1), x, 440.0, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0].len(), 7);
+    }
+
+    #[test]
+    fn test_sparse_table_does_not_hide_remaining_dense_hypothesis() {
+        let lines = vec![
+            make_hline(700.0, 60.0, 360.0, 1),
+            make_hline(680.0, 60.0, 360.0, 1),
+            make_hline(640.0, 60.0, 360.0, 1),
+            make_hline(520.0, 80.0, 520.0, 1),
+            make_hline(490.0, 160.0, 310.0, 1),
+            make_hline(490.0, 320.0, 520.0, 1),
+            make_hline(475.0, 80.0, 150.0, 1),
+            make_hline(475.0, 160.0, 310.0, 1),
+            make_hline(475.0, 320.0, 520.0, 1),
+            make_hline(420.0, 80.0, 520.0, 1),
+        ];
+        let mut items = vec![
+            make_item("Model", 80.0, 690.0, 1),
+            make_item("Accuracy", 180.0, 690.0, 1),
+            make_item("Latency", 280.0, 690.0, 1),
+            make_item("Alpha", 80.0, 665.0, 1),
+            make_item("91.2", 180.0, 665.0, 1),
+            make_item("12", 280.0, 665.0, 1),
+            make_item("Beta", 80.0, 650.0, 1),
+            make_item("89.7", 180.0, 650.0, 1),
+            make_item("9", 280.0, 650.0, 1),
+            make_item("Training Datasets", 290.0, 510.0, 1),
+            make_item("Properties", 90.0, 500.0, 1),
+            make_item("Instruction", 225.0, 500.0, 1),
+            make_item("Alignment", 420.0, 500.0, 1),
+        ];
+        let xs = [90.0, 160.0, 225.0, 290.0, 355.0, 420.0, 485.0];
+        for (column, x) in xs.into_iter().enumerate() {
+            items.push(make_item(&format!("dataset {column}"), x, 485.0, 1));
+            items.push(make_item(&format!("{}K", column + 1), x, 460.0, 1));
+            items.push(make_item(&format!("{}00", column + 1), x, 440.0, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells[0], vec!["Model", "Accuracy", "Latency"]);
+        assert_eq!(tables[1].cells[0].len(), 7);
+    }
+
+    #[test]
+    fn test_three_column_open_edge_preempts_text_anchor_and_keeps_first_header() {
+        let lines = vec![
+            make_hline(360.0, 30.0, 930.0, 1),
+            make_hline(275.0, 30.0, 930.0, 1),
+            make_hline(170.0, 30.0, 930.0, 1),
+            make_vline(330.0, 168.0, 362.0, 1),
+            make_vline(630.0, 168.0, 362.0, 1),
+        ];
+        let items = vec![
+            make_item("Category", 60.0, 375.0, 1),
+            make_item("Metric", 360.0, 375.0, 1),
+            make_item("Value", 660.0, 375.0, 1),
+            make_item("Pack", 60.0, 320.0, 1),
+            make_item("OCR body", 360.0, 320.0, 1),
+            make_item("42", 660.0, 320.0, 1),
+            make_item("Application", 60.0, 220.0, 1),
+            make_item("Search", 360.0, 220.0, 1),
+            make_item("84", 660.0, 220.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 3);
+        assert_eq!(tables[0].cells[0], vec!["Category", "Metric", "Value"]);
+        assert_eq!(tables[0].cells[1], vec!["Pack", "OCR body", "42"]);
+    }
+
+    #[test]
+    fn test_two_column_open_edge_uses_single_interior_divider() {
+        let lines = vec![
+            make_hline(360.0, 30.0, 630.0, 1),
+            make_hline(275.0, 30.0, 630.0, 1),
+            make_hline(170.0, 30.0, 630.0, 1),
+            make_vline(330.0, 168.0, 362.0, 1),
+        ];
+        let items = vec![
+            make_item("Category", 60.0, 375.0, 1),
+            make_item("Value", 360.0, 375.0, 1),
+            make_item("Pack", 60.0, 320.0, 1),
+            make_item("42", 360.0, 320.0, 1),
+            make_item("Application", 60.0, 220.0, 1),
+            make_item("84", 360.0, 220.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0], vec!["Category", "Value"]);
+        assert_eq!(tables[0].cells[1], vec!["Pack", "42"]);
+    }
+
+    #[test]
+    fn test_multiple_open_edge_bands_on_one_page_are_preserved() {
+        let lines = vec![
+            make_hline(700.0, 30.0, 630.0, 1),
+            make_hline(615.0, 30.0, 630.0, 1),
+            make_hline(510.0, 30.0, 630.0, 1),
+            make_vline(330.0, 508.0, 702.0, 1),
+            make_hline(360.0, 80.0, 780.0, 1),
+            make_hline(275.0, 80.0, 780.0, 1),
+            make_hline(170.0, 80.0, 780.0, 1),
+            make_vline(430.0, 168.0, 362.0, 1),
+        ];
+        let items = vec![
+            make_item("Category", 60.0, 715.0, 1),
+            make_item("Value", 360.0, 715.0, 1),
+            make_item("Pack", 60.0, 660.0, 1),
+            make_item("42", 360.0, 660.0, 1),
+            make_item("Application", 60.0, 560.0, 1),
+            make_item("84", 360.0, 560.0, 1),
+            make_item("Region", 110.0, 375.0, 1),
+            make_item("Count", 460.0, 375.0, 1),
+            make_item("North", 110.0, 320.0, 1),
+            make_item("12", 460.0, 320.0, 1),
+            make_item("South", 110.0, 220.0, 1),
+            make_item("18", 460.0, 220.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].cells[0], vec!["Category", "Value"]);
+        assert_eq!(tables[1].cells[0], vec!["Region", "Count"]);
+    }
+
+    #[test]
+    fn test_open_edge_grid_merges_multi_line_headers_by_column() {
+        let lines = vec![
+            make_hline(360.0, 30.0, 930.0, 1),
+            make_hline(275.0, 30.0, 930.0, 1),
+            make_hline(170.0, 30.0, 930.0, 1),
+            make_vline(330.0, 168.0, 362.0, 1),
+            make_vline(630.0, 168.0, 362.0, 1),
+        ];
+        let items = vec![
+            make_item("Content", 60.0, 390.0, 1),
+            make_item("Quality", 360.0, 390.0, 1),
+            make_item("Result", 660.0, 390.0, 1),
+            make_item("Category", 60.0, 375.0, 1),
+            make_item("Metric", 360.0, 375.0, 1),
+            make_item("Value", 660.0, 375.0, 1),
+            make_item("Pack", 60.0, 320.0, 1),
+            make_item("OCR body", 360.0, 320.0, 1),
+            make_item("42", 660.0, 320.0, 1),
+            make_item("Application", 60.0, 220.0, 1),
+            make_item("Search", 360.0, 220.0, 1),
+            make_item("84", 660.0, 220.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].cells[0],
+            vec!["Content Category", "Quality Metric", "Result Value"]
+        );
+        assert_eq!(tables[0].item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn test_populated_open_edge_header_requires_unambiguous_rule_band() {
+        let horizontals = vec![
+            (360.0, 30.0, 930.0),
+            (275.0, 30.0, 930.0),
+            (170.0, 30.0, 930.0),
+            (250.0, 200.0, 700.0),
+        ];
+        let verticals = vec![(330.0, 168.0, 362.0), (630.0, 168.0, 362.0)];
+        let items = vec![
+            make_item("Category", 60.0, 375.0, 1),
+            make_item("Metric", 360.0, 375.0, 1),
+            make_item("Value", 660.0, 375.0, 1),
+            make_item("Pack", 60.0, 320.0, 1),
+            make_item("OCR body", 360.0, 320.0, 1),
+            make_item("42", 660.0, 320.0, 1),
+            make_item("Application", 60.0, 220.0, 1),
+            make_item("Search", 360.0, 220.0, 1),
+            make_item("84", 660.0, 220.0, 1),
+        ];
+
+        assert!(build_open_edge_grid_tables(&items, &horizontals, &verticals, 1).is_empty());
+    }
+
+    #[test]
+    fn test_table_evidence_score_saturates_for_sparse_candidates() {
+        let table = Table::new(
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            vec![4.0, 3.0, 2.0, 1.0],
+            vec![vec![String::new(); 4]; 4],
+            Vec::new(),
+        );
+
+        assert_eq!(table_evidence_score(&table), 0);
+    }
+
+    #[test]
+    fn test_page_wide_alternative_cannot_merge_independent_anchor_tables() {
+        let make_table = |indices: Vec<usize>| {
+            Table::new(
+                vec![0.0, 100.0, 200.0],
+                vec![200.0, 100.0],
+                vec![vec!["a".into(), "b".into()]],
+                indices,
+            )
+        };
+        let anchors = vec![make_table(vec![0, 1]), make_table(vec![2, 3])];
+
+        assert!(overlaps_multiple_tables(
+            &make_table(vec![0, 1, 2, 3]),
+            &anchors
+        ));
+        assert!(!overlaps_multiple_tables(&make_table(vec![0, 1]), &anchors));
+    }
+
+    #[test]
+    fn test_open_edge_grid_adds_outer_bounds_and_header() {
+        let lines = vec![
+            make_hline(360.0, 30.0, 930.0, 1),
+            make_hline(275.0, 30.0, 930.0, 1),
+            make_hline(170.0, 30.0, 930.0, 1),
+            make_vline(125.0, 168.0, 362.0, 1),
+            make_vline(385.0, 168.0, 362.0, 1),
+            make_vline(655.0, 168.0, 362.0, 1),
+            make_vline(45.0, 425.0, 500.0, 1),
+        ];
+        let mut items = vec![
+            make_item("OCR", 240.0, 375.0, 1),
+            make_item("Recommendation", 465.0, 375.0, 1),
+            make_item("Semantic search", 735.0, 375.0, 1),
+        ];
+        for (text, x) in [
+            ("Pack", 60.0),
+            ("OCR body", 145.0),
+            ("Rec body", 405.0),
+            ("Search body", 675.0),
+        ] {
+            items.push(make_item(text, x, 320.0, 1));
+        }
+        for (text, x) in [
+            ("Application", 50.0),
+            ("OCR use", 145.0),
+            ("Rec use", 405.0),
+            ("Search use", 675.0),
+        ] {
+            items.push(make_item(text, x, 220.0, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells.len(), 3);
+        assert_eq!(
+            tables[0].cells[0],
+            vec!["", "OCR", "Recommendation", "Semantic search"]
+        );
+        assert_eq!(tables[0].cells[1][0], "Pack");
+        assert_eq!(tables[0].cells[2][3], "Search use");
     }
 
     #[test]
