@@ -6,6 +6,7 @@ pub(crate) mod content_stream;
 mod fonts;
 mod layout;
 mod links;
+mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
@@ -29,6 +30,7 @@ pub(crate) use layout::detect_columns;
 pub use layout::group_into_lines;
 pub(crate) use layout::group_into_lines_with_thresholds;
 pub(crate) use layout::group_into_lines_with_thresholds_and_charts;
+pub(crate) use layout::group_into_lines_with_thresholds_and_regions;
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 

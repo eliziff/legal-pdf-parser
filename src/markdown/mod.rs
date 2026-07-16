@@ -1012,12 +1012,19 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Separate images and links from text items
     let mut images: Vec<TextItem> = Vec::new();
+    let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
 
     for item in items {
         match &item.item_type {
             ItemType::Image => {
+                page_image_regions.entry(item.page).or_default().push((
+                    item.x,
+                    item.y,
+                    item.x + item.width,
+                    item.y + item.height,
+                ));
                 if options.include_images {
                     images.push(item);
                 }
@@ -1655,11 +1662,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
     let lines = if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
-        crate::extractor::group_into_lines_with_thresholds_and_charts(
+        crate::extractor::group_into_lines_with_thresholds_and_regions(
             non_table_items,
             page_thresholds,
             &table_page_set,
             &page_chart_map,
+            &page_image_regions,
         )
     } else {
         // Separate items into physical-band pages, chart/prose pages, and
@@ -1682,11 +1690,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             }
         }
         // Process unsplit pages normally
-        let mut all_lines = crate::extractor::group_into_lines_with_thresholds_and_charts(
+        let mut all_lines = crate::extractor::group_into_lines_with_thresholds_and_regions(
             unsplit_items,
             page_thresholds,
             &table_page_set,
             &page_chart_map,
+            &page_image_regions,
         );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.

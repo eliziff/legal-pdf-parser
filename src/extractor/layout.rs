@@ -1180,6 +1180,22 @@ pub(crate) fn group_into_lines_with_thresholds_and_charts(
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
 ) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_regions(
+        items,
+        page_thresholds,
+        table_pages,
+        chart_regions,
+        &HashMap::new(),
+    )
+}
+
+pub(crate) fn group_into_lines_with_thresholds_and_regions(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -1204,6 +1220,38 @@ pub(crate) fn group_into_lines_with_thresholds_and_charts(
         // (computed before embedded-space removal, with full signal).
         // Non-Canva pages use the default 0.10 threshold.
         let adaptive_threshold = page_thresholds.get(&page).copied().unwrap_or(0.10);
+
+        // Image-backed region graphs recover local/asymmetric column flows
+        // that a whole-page projection cannot represent. Charts already have
+        // their own positioned-region ordering and therefore stay on that path.
+        if !chart_regions.contains_key(&page) {
+            let preliminary_columns =
+                detect_columns(&page_items, page, table_pages.contains(&page));
+            let detected_split =
+                (preliminary_columns.len() == 2).then_some(preliminary_columns[0].x_max);
+            if let Some(band) = image_regions.get(&page).and_then(|regions| {
+                super::reading_order::infer_image_anchored_flow(
+                    &page_items,
+                    regions,
+                    detected_split,
+                )
+            }) {
+                debug!(
+                    "page {}: image-anchored region graph split={:.1} y=[{:.1}..{:.1}]",
+                    page, band.split_x, band.y_bottom, band.y_top
+                );
+                for node in super::reading_order::build_region_graph(page_items, band) {
+                    debug!(
+                        "page {}: region node {:?} items={}",
+                        page,
+                        node.kind,
+                        node.items.len()
+                    );
+                    all_lines.extend(group_single_column(node.items, adaptive_threshold));
+                }
+                continue;
+            }
+        }
 
         // Detect columns for this page, blind to chart text.
         debug!(
