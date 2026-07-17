@@ -28,6 +28,14 @@ The OpenDataLoader repository is external and keeps its normal
 temporary directory before evaluating it, so the baseline and candidate cannot
 overwrite one another.
 
+## Published comparison protocol
+
+The public benchmark table was refreshed on July 16, 2026, on an Apple M4 Pro
+using pdf-inspector 0.1.6, LiteParse 2.6.0, OpenDataLoader 2.1.1,
+PyMuPDF4LLM 0.2.0, and MarkItDown 0.1.4. Every engine processed the same 200
+PDFs with OCR disabled. Reported speed is the median of three complete corpus
+runs; quality scores come from the benchmark evaluator over all 200 outputs.
+
 ## Optional backend evidence probe
 
 The evidence probe compares positioned `pdf2md` items with MuPDF structured

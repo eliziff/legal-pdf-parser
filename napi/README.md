@@ -14,15 +14,17 @@ Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract
 
 ## Benchmark
 
-[opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) corpus (200 PDFs), direct-extraction engines only — no OCR, no ML. Scores 0–1, higher is better:
+[opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) corpus (200 PDFs), local engines without model-based PDF parsing; OCR disabled. Scores 0–1, higher is better:
 
 | Engine | Overall | Reading order | Tables (TEDS) | Headings | Speed |
 |---|---|---|---|---|---|
-| **pdf-inspector** | 0.83 | 0.88 | **0.66** | 0.74 | **4s** |
-| opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
-| pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
+| **pdf-inspector** | **0.875** | **0.915** | **0.814** | 0.788 | **2.8s** |
+| liteparse | 0.870 | 0.908 | 0.693 | **0.811** | 13.9s |
+| opendataloader | 0.843 | 0.912 | 0.489 | 0.760 | 9.8s |
+| pymupdf4llm | 0.735 | 0.886 | 0.401 | 0.424 | 15.5s |
+| markitdown | 0.583 | 0.879 | 0.000 | 0.000 | 6.7s |
 
-OCR/ML engines (docling, marker, mineru) score 0.83–0.88 overall but take 2–180 minutes on the same corpus. Full numbers in the [repo README](https://github.com/firecrawl/pdf-inspector#benchmark).
+Refreshed July 16, 2026, on Apple M4 Pro; speed is the median of three complete corpus runs. Full methodology and versions are in the [repo README](https://github.com/firecrawl/pdf-inspector#benchmark).
 
 ## Install
 
