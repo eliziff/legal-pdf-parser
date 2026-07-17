@@ -302,6 +302,171 @@
   .text-link { color: var(--heat-dark); text-decoration: underline; text-decoration-color: var(--heat-16); text-underline-offset: 4px; }
   .text-link:hover, .text-link:focus-visible { text-decoration-color: var(--heat); }
 
+  .demo-shell {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 22px 60px rgba(38,38,38,.07);
+    overflow: hidden;
+  }
+  .demo-toolbar {
+    min-height: 48px;
+    padding: 0 17px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    color: var(--ink-48);
+    font: 11px/1.3 var(--mono);
+  }
+  .demo-engine,
+  .demo-privacy { display: inline-flex; align-items: center; gap: 8px; }
+  .demo-engine strong { color: var(--ink); font-weight: 500; }
+  .demo-status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--heat); box-shadow: 0 0 0 4px var(--heat-8); }
+  .demo-lock { color: var(--heat); font-size: 12px; }
+  .demo-grid { display: grid; grid-template-columns: minmax(0, .86fr) minmax(0, 1.14fr); min-height: 500px; }
+  .demo-input {
+    padding: 28px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    background: var(--lighter);
+  }
+  .drop-zone {
+    min-height: 286px;
+    padding: 30px;
+    border: 1px dashed var(--ink-16);
+    border-radius: 10px;
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    background: var(--surface);
+    cursor: pointer;
+    transition: border-color .15s ease, background .15s ease, transform .15s ease;
+  }
+  .drop-zone:hover,
+  .drop-zone:focus-visible,
+  .drop-zone.is-dragging { border-color: var(--heat); background: var(--heat-4); }
+  .drop-zone.is-dragging { transform: scale(.995); }
+  .drop-mark {
+    width: 52px;
+    height: 58px;
+    margin-bottom: 21px;
+    border: 1px solid var(--ink-16);
+    border-radius: 5px 5px 9px 5px;
+    display: grid;
+    place-items: center;
+    position: relative;
+    color: var(--heat-dark);
+    background: var(--heat-4);
+    font: 600 11px/1 var(--mono);
+    letter-spacing: .03em;
+  }
+  .drop-mark::after {
+    content: "";
+    position: absolute;
+    top: -1px;
+    right: -1px;
+    width: 14px;
+    height: 14px;
+    border-left: 1px solid var(--ink-16);
+    border-bottom: 1px solid var(--ink-16);
+    background: var(--surface);
+  }
+  .drop-zone strong { font-size: 18px; font-weight: 500; letter-spacing: -.02em; }
+  .drop-zone > span:not(.drop-mark):not(.demo-choose) { margin-top: 7px; color: var(--ink-48); font-size: 13px; }
+  .demo-choose { margin-top: 20px; color: var(--ink); }
+  .demo-file {
+    margin-top: 14px;
+    padding: 13px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 16px;
+    background: var(--surface);
+  }
+  .demo-file strong { overflow: hidden; text-overflow: ellipsis; font: 500 12px/1.35 var(--mono); white-space: nowrap; }
+  .demo-file span { grid-column: 1; color: var(--ink-32); font: 10px/1.3 var(--mono); }
+  .demo-file button {
+    grid-column: 2;
+    grid-row: 1 / 3;
+    padding: 0;
+    border: 0;
+    color: var(--ink-48);
+    background: transparent;
+    cursor: pointer;
+    font: 11px/1 var(--mono);
+  }
+  .demo-file button:hover,
+  .demo-file button:focus-visible { color: var(--heat-dark); }
+  .demo-message { margin: 13px 2px 0; min-height: 19px; color: var(--ink-48); font: 11px/1.55 var(--mono); }
+  .demo-message[data-tone="error"] { color: #a63520; }
+  .demo-message[data-tone="success"] { color: #34725a; }
+  .demo-output { min-width: 0; display: flex; flex-direction: column; background: var(--code); color: #f5f5f5; }
+  .demo-output-head {
+    min-height: 52px;
+    padding: 0 18px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: rgba(255,255,255,.42);
+    font: 11px/1 var(--mono);
+  }
+  .demo-copy {
+    height: 29px;
+    padding: 0 10px;
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 6px;
+    color: rgba(255,255,255,.68);
+    background: rgba(255,255,255,.04);
+    cursor: pointer;
+    font: 10px/1 var(--mono);
+  }
+  .demo-copy:hover,
+  .demo-copy:focus-visible { border-color: var(--heat); color: #fff; }
+  .demo-copy[disabled] { opacity: .35; cursor: not-allowed; }
+  .demo-empty {
+    min-height: 448px;
+    padding: 40px;
+    display: grid;
+    place-items: center;
+    text-align: center;
+    color: rgba(255,255,255,.28);
+    font: 12px/1.7 var(--mono);
+  }
+  .demo-empty span { display: block; color: var(--heat); font-size: 22px; line-height: 1; }
+  .demo-result { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+  .demo-result[hidden],
+  .demo-file[hidden],
+  .demo-empty[hidden] { display: none; }
+  .demo-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-bottom: 1px solid rgba(255,255,255,.08);
+  }
+  .demo-metric { min-width: 0; padding: 14px 17px; border-right: 1px solid rgba(255,255,255,.08); }
+  .demo-metric:last-child { border-right: 0; }
+  .demo-metric span { display: block; margin-bottom: 6px; color: rgba(255,255,255,.32); font: 9px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+  .demo-metric strong { display: block; overflow: hidden; text-overflow: ellipsis; color: #fff; font: 500 12px/1.25 var(--mono); white-space: nowrap; }
+  .demo-metric:first-child strong { color: #ff9c70; }
+  .markdown-output {
+    min-height: 0;
+    max-height: 364px;
+    margin: 0;
+    padding: 23px 20px 28px;
+    flex: 1;
+    overflow: auto;
+    color: rgba(255,255,255,.82);
+    font: 12px/1.7 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
   .capability-grid { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--border); }
   .capability {
     min-height: 245px;
@@ -409,6 +574,9 @@
     .hero-main { grid-template-columns: 1fr; gap: 44px; }
     .terminal { max-width: 580px; }
     .section-intro { grid-template-columns: 1fr; gap: 20px; }
+    .demo-grid { grid-template-columns: 1fr; }
+    .demo-input { border-right: 0; border-bottom: 1px solid var(--border); }
+    .demo-empty { min-height: 360px; }
     .capability-grid { grid-template-columns: repeat(2, 1fr); }
     .capability:nth-child(3n) { border-right: 1px solid var(--border); }
     .capability:nth-child(2n) { border-right: 0; }
@@ -429,6 +597,13 @@
     .package-row { grid-template-columns: 1fr; }
     .package { border-right: 0; border-bottom: 1px solid var(--border); }
     .package:last-child { border-bottom: 0; }
+    .demo-toolbar { padding: 12px 14px; align-items: flex-start; flex-direction: column; gap: 8px; }
+    .demo-input { padding: 18px; }
+    .drop-zone { min-height: 250px; padding: 24px 18px; }
+    .demo-metric { padding: 12px; }
+    .demo-metric strong { font-size: 11px; }
+    .demo-empty { min-height: 320px; padding: 28px; }
+    .markdown-output { max-height: 340px; padding: 20px 16px 24px; font-size: 11px; }
     .capability-grid { grid-template-columns: 1fr; }
     .capability, .capability:nth-child(3n), .capability:nth-child(2n) { min-height: 210px; border-right: 0; border-bottom: 1px solid var(--border); }
     .capability:last-child { border-bottom: 0; }
@@ -463,6 +638,7 @@
     </a>
     <div class="nav-links">
       <a href="#packages">Packages</a>
+      <a href="#demo">Demo</a>
       <a href="#capabilities">Capabilities</a>
       <a href="#architecture">Architecture</a>
       <a href="#benchmark">Benchmark</a>
@@ -484,6 +660,7 @@
         <p class="hero-copy">A Rust-powered, open-source parser that classifies PDFs and turns native text into clean, position-aware Markdown. Use it from Node.js or the bundled CLI, with packages also available from PyPI and crates.io.</p>
         <div class="hero-actions">
           <a class="button button-primary" href="https://github.com/firecrawl/pdf-inspector">View on GitHub <span class="arrow" aria-hidden="true">↗</span></a>
+          <a class="button" href="#demo">Try it locally <span class="arrow" aria-hidden="true">↓</span></a>
           <a class="button" href="https://github.com/firecrawl/pdf-inspector#quick-start">Read the docs <span class="arrow" aria-hidden="true">→</span></a>
         </div>
       </div>
@@ -538,9 +715,61 @@
     </div>
   </div>
 
+  <section id="demo" class="full-rule">
+    <div class="shell">
+      <div class="section-label pad"><span>[ <b>01</b> / 05 ]</span><span>Browser demo</span></div>
+      <div class="section-body pad">
+        <div class="section-intro">
+          <h2>Try it in<br>your browser.</h2>
+          <p>Drop in a native-text PDF to classify it and turn it into Markdown. The Rust core runs locally as WebAssembly in a background worker—your document never leaves this tab.</p>
+        </div>
+        <div class="demo-shell">
+          <div class="demo-toolbar">
+            <span class="demo-engine"><i class="demo-status-dot" aria-hidden="true"></i><strong>Rust core · WebAssembly</strong><span id="demo-engine-status">Loads on first run</span></span>
+            <span class="demo-privacy"><span class="demo-lock" aria-hidden="true">◇</span>PDF bytes stay in your browser</span>
+          </div>
+          <div class="demo-grid">
+            <div class="demo-input">
+              <input id="pdf-input" type="file" accept=".pdf,application/pdf" hidden>
+              <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-controls="pdf-input" aria-label="Choose or drop a PDF file">
+                <span class="drop-mark" aria-hidden="true">PDF</span>
+                <strong>Drop a PDF here</strong>
+                <span>Native-text documents · up to 25 MB</span>
+                <span class="button demo-choose" aria-hidden="true">Choose PDF</span>
+              </div>
+              <div class="demo-file" id="demo-file" hidden>
+                <strong id="demo-file-name"></strong>
+                <span id="demo-file-size"></span>
+                <button id="demo-clear" type="button">Remove</button>
+              </div>
+              <p class="demo-message" id="demo-message" role="status" aria-live="polite">Select a PDF to begin.</p>
+            </div>
+            <div class="demo-output" aria-label="PDF parsing result">
+              <div class="demo-output-head">
+                <span>MARKDOWN OUTPUT</span>
+                <button class="demo-copy" id="demo-copy" type="button" disabled>Copy Markdown</button>
+              </div>
+              <div class="demo-empty" id="demo-empty">
+                <p><span aria-hidden="true">_</span><br>Your parsed Markdown will appear here.</p>
+              </div>
+              <div class="demo-result" id="demo-result" hidden>
+                <div class="demo-metrics">
+                  <div class="demo-metric"><span>Document type</span><strong id="demo-type">—</strong></div>
+                  <div class="demo-metric"><span>Pages</span><strong id="demo-pages">—</strong></div>
+                  <div class="demo-metric"><span>Processing</span><strong id="demo-time">—</strong></div>
+                </div>
+                <pre class="markdown-output" id="markdown-output"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="capabilities" class="full-rule">
     <div class="shell">
-      <div class="section-label pad"><span>[ <b>01</b> / 04 ]</span><span>Core capabilities</span></div>
+      <div class="section-label pad"><span>[ <b>02</b> / 05 ]</span><span>Core capabilities</span></div>
       <div class="section-body pad">
         <div class="section-intro">
           <h2>A focused PDF<br>toolchain.</h2>
@@ -584,7 +813,7 @@
 
   <section id="architecture" class="full-rule">
     <div class="shell">
-      <div class="section-label pad"><span>[ <b>02</b> / 04 ]</span><span>Architecture</span></div>
+      <div class="section-label pad"><span>[ <b>03</b> / 05 ]</span><span>Architecture</span></div>
       <div class="section-body pad">
         <div class="section-intro">
           <h2>One parse.<br>Clear stages.</h2>
@@ -622,7 +851,7 @@
 
   <section id="benchmark" class="full-rule">
     <div class="shell">
-      <div class="section-label pad"><span>[ <b>03</b> / 04 ]</span><span>Benchmark</span></div>
+      <div class="section-label pad"><span>[ <b>04</b> / 05 ]</span><span>Benchmark</span></div>
       <div class="section-body pad">
         <div class="section-intro">
           <h2>Measured on<br>real documents.</h2>
@@ -656,7 +885,7 @@
 
   <section id="usage" class="full-rule">
     <div class="shell">
-      <div class="section-label pad"><span>[ <b>04</b> / 04 ]</span><span>Usage</span></div>
+      <div class="section-label pad"><span>[ <b>05</b> / 05 ]</span><span>Usage</span></div>
       <div class="section-body pad">
         <div class="section-intro">
           <h2>Start with Node.<br>Use the CLI.</h2>
@@ -743,5 +972,201 @@ result = pdf_inspector.<span class="fn">process_pdf</span>(<span class="str">"do
   </div>
 </footer>
 
+<script>
+  (() => {
+    const MAX_FILE_SIZE = 25 * 1024 * 1024;
+    const WASM_MODULE_URL = "https://cdn.jsdelivr.net/npm/@firecrawl/pdf-inspector-wasm@0.1.1/pdf_inspector_wasm.js";
+    const input = document.querySelector("#pdf-input");
+    const dropZone = document.querySelector("#drop-zone");
+    const filePanel = document.querySelector("#demo-file");
+    const fileName = document.querySelector("#demo-file-name");
+    const fileSize = document.querySelector("#demo-file-size");
+    const clearButton = document.querySelector("#demo-clear");
+    const copyButton = document.querySelector("#demo-copy");
+    const message = document.querySelector("#demo-message");
+    const engineStatus = document.querySelector("#demo-engine-status");
+    const emptyOutput = document.querySelector("#demo-empty");
+    const resultPanel = document.querySelector("#demo-result");
+    const markdownOutput = document.querySelector("#markdown-output");
+    const typeOutput = document.querySelector("#demo-type");
+    const pagesOutput = document.querySelector("#demo-pages");
+    const timeOutput = document.querySelector("#demo-time");
+    let selectedFile = null;
+    let currentMarkdown = "";
+    let busy = false;
+
+    const formatBytes = (bytes) => {
+      if (bytes < 1024) return `${bytes} B`;
+      const units = ["KB", "MB", "GB"];
+      let value = bytes / 1024;
+      let unit = units[0];
+      for (let index = 1; value >= 1024 && index < units.length; index += 1) {
+        value /= 1024;
+        unit = units[index];
+      }
+      return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${unit}`;
+    };
+
+    const setMessage = (text, tone = "") => {
+      message.textContent = text;
+      message.dataset.tone = tone;
+    };
+
+    const setBusy = (isBusy) => {
+      busy = isBusy;
+      clearButton.disabled = isBusy;
+      input.disabled = isBusy;
+    };
+
+    const clearResult = () => {
+      currentMarkdown = "";
+      copyButton.disabled = true;
+      copyButton.textContent = "Copy Markdown";
+      markdownOutput.textContent = "";
+      resultPanel.hidden = true;
+      emptyOutput.hidden = false;
+    };
+
+    const clearFile = () => {
+      if (busy) return;
+      selectedFile = null;
+      input.value = "";
+      filePanel.hidden = true;
+      clearResult();
+      setMessage("Select a PDF to begin.");
+    };
+
+    const selectFile = (file) => {
+      if (!file) return;
+      const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+      if (!isPdf) {
+        clearFile();
+        setMessage("Choose a PDF file to run this demo.", "error");
+        return;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        clearFile();
+        setMessage("This demo accepts PDFs up to 25 MB.", "error");
+        return;
+      }
+      selectedFile = file;
+      fileName.textContent = file.name;
+      fileSize.textContent = formatBytes(file.size);
+      filePanel.hidden = false;
+      clearResult();
+      parseSelectedFile();
+    };
+
+    const processInWorker = (buffer) => new Promise((resolve, reject) => {
+      const source = `
+        import init, { processPdf, version } from "${WASM_MODULE_URL}";
+        self.onmessage = async ({ data }) => {
+          try {
+            await init();
+            const result = processPdf(new Uint8Array(data.buffer), { profile: "fidelity" });
+            self.postMessage({ ok: true, result, engineVersion: version() });
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            self.postMessage({ ok: false, error: detail });
+          }
+        };
+      `;
+      const workerUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+      let worker;
+
+      try {
+        worker = new Worker(workerUrl, { type: "module" });
+      } catch (error) {
+        URL.revokeObjectURL(workerUrl);
+        reject(error);
+        return;
+      }
+
+      URL.revokeObjectURL(workerUrl);
+      worker.addEventListener("message", ({ data }) => {
+        worker.terminate();
+        if (data.ok) resolve(data);
+        else reject(new Error(data.error));
+      }, { once: true });
+      worker.addEventListener("error", (event) => {
+        worker.terminate();
+        reject(new Error(event.message || "The WebAssembly engine could not be loaded."));
+      }, { once: true });
+      worker.postMessage({ buffer }, [buffer]);
+    });
+
+    const renderResult = ({ result, engineVersion }) => {
+      currentMarkdown = typeof result.markdown === "string" ? result.markdown : "";
+      typeOutput.textContent = result.pdfType || "Unknown";
+      pagesOutput.textContent = String(result.pageCount ?? "—");
+      timeOutput.textContent = Number.isFinite(result.processingTimeMs)
+        ? `${Math.max(1, Math.round(result.processingTimeMs))} ms`
+        : "—";
+      markdownOutput.textContent = currentMarkdown || "No Markdown output was produced for this document.";
+      emptyOutput.hidden = true;
+      resultPanel.hidden = false;
+      copyButton.disabled = !currentMarkdown;
+      engineStatus.textContent = engineVersion ? `Ready · v${engineVersion}` : "Ready";
+    };
+
+    const parseSelectedFile = async () => {
+      if (!selectedFile || busy) return;
+      const file = selectedFile;
+      setBusy(true);
+      setMessage("Loading the Rust engine and parsing in this browser…");
+      engineStatus.textContent = "Loading…";
+
+      try {
+        const buffer = await file.arrayBuffer();
+        const response = await processInWorker(buffer);
+        renderResult(response);
+        setMessage(`Parsed ${file.name} locally.`, "success");
+      } catch (error) {
+        engineStatus.textContent = "Load failed";
+        clearResult();
+        const detail = error instanceof Error ? error.message : String(error);
+        setMessage(detail || "The PDF could not be parsed.", "error");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    dropZone.addEventListener("click", () => {
+      if (!busy) {
+        input.value = "";
+        input.click();
+      }
+    });
+    dropZone.addEventListener("keydown", (event) => {
+      if ((event.key === "Enter" || event.key === " ") && !busy) {
+        event.preventDefault();
+        input.value = "";
+        input.click();
+      }
+    });
+    dropZone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      if (!busy) dropZone.classList.add("is-dragging");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("is-dragging"));
+    dropZone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dropZone.classList.remove("is-dragging");
+      if (!busy) selectFile(event.dataTransfer.files[0]);
+    });
+    input.addEventListener("change", () => selectFile(input.files[0]));
+    clearButton.addEventListener("click", clearFile);
+    copyButton.addEventListener("click", async () => {
+      if (!currentMarkdown) return;
+      try {
+        await navigator.clipboard.writeText(currentMarkdown);
+        copyButton.textContent = "Copied";
+        window.setTimeout(() => { copyButton.textContent = "Copy Markdown"; }, 1600);
+      } catch {
+        setMessage("Copy is unavailable here. Select the Markdown output instead.", "error");
+      }
+    });
+  })();
+</script>
 </body>
 </html>
