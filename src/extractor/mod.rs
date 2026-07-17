@@ -27,12 +27,12 @@ pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
 pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
-pub use layout::group_into_lines;
 pub(crate) use layout::group_into_lines_with_thresholds;
 pub(crate) use layout::group_into_lines_with_thresholds_and_charts;
 pub(crate) use layout::group_into_lines_with_thresholds_and_regions;
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
+pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -1517,6 +1517,18 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text(), "Hello World");
         assert_eq!(lines[1].text(), "Next line");
+    }
+
+    #[test]
+    fn preserving_all_text_keeps_numeric_page_footer() {
+        let mut page_number = make_merge_item("42", 100.0, 12.0);
+        page_number.y = 50.0;
+
+        assert!(group_into_lines(vec![page_number.clone()]).is_empty());
+
+        let lines = group_into_lines_preserving_all_text(vec![page_number]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "42");
     }
 
     #[test]

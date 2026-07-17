@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-inspector.svg)](https://pypi.org/project/pdf-inspector/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md) and [Node.js](napi/README.md).
+Fast Rust library for PDF classification and text extraction. Detects whether a PDF is text-based or scanned, extracts text with position awareness, and converts to clean Markdown — all without OCR. Includes bindings for [Python](docs/python.md), [Node.js](napi/README.md), and [browser WebAssembly](wasm/README.md).
 
 Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in under 200ms, skipping expensive OCR services for the ~54% of PDFs that don't need them.
 
@@ -19,6 +19,7 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 - **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
 - **Encoding issue detection** — Automatically flags broken font encodings so callers can fall back to OCR.
 - **Single document load** — The document is parsed once and shared between detection and extraction, avoiding redundant I/O.
+- **Browser WebAssembly** — Run the same Rust parser locally in browsers and Web Workers, with embedded CMaps and no server round trip.
 - **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
 
 ## Benchmark
@@ -76,6 +77,26 @@ console.log(result.markdown);  // Markdown string or null
 ```
 
 > Full API reference: [napi/README.md](napi/README.md)
+
+### Browser WebAssembly
+
+```bash
+npm install @firecrawl/pdf-inspector-wasm
+```
+
+```javascript
+import init, { processPdf } from '@firecrawl/pdf-inspector-wasm';
+
+await init();
+const response = await fetch('/document.pdf');
+const pdf = new Uint8Array(await response.arrayBuffer());
+const result = processPdf(pdf);
+
+console.log(result.pdfType);
+console.log(result.markdown);
+```
+
+> Full API reference: [wasm/README.md](wasm/README.md)
 
 ### Rust
 
@@ -188,6 +209,7 @@ src/
   markdown/             — Markdown conversion and structure detection
   bin/                  — CLI tools (pdf2md, detect_pdf)
 napi/                   — Node.js/Bun bindings (napi-rs)
+wasm/                   — Browser bindings (wasm-bindgen)
 ```
 
 ## How classification works

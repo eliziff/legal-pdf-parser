@@ -63,6 +63,7 @@ fn json_escape(s: &str) -> String {
 }
 
 fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
     let args: Vec<String> = env::args().collect();
 

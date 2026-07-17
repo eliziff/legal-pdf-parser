@@ -4,10 +4,16 @@
 
 use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 use crate::glyph_names::glyph_to_char;
+
+#[cfg(target_arch = "wasm32")]
+static BUILTIN_CMAPS: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/external/bcmaps");
 
 /// A parsed ToUnicode CMap mapping CIDs to Unicode strings
 #[derive(Debug, Default, Clone)]
@@ -1149,9 +1155,7 @@ fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, char
 /// Build a ToUnicodeCMap from pdf.js built-in binary CMaps (bcmaps).
 fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     let name = format!("Adobe-{}-UCS2.bcmap", ordering);
-    let dir = find_bcmaps_dir()?;
-    let path = dir.join(name);
-    let data = std::fs::read(&path).ok()?;
+    let data = read_builtin_cmap_file(&name)?;
     let mut cmap = parse_binary_cmap(&data).ok()?;
     if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
         return None;
@@ -1159,13 +1163,14 @@ fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     cmap.code_byte_length = 2;
     debug!(
         "Built-in CMap {}: char_map={} ranges={}",
-        path.display(),
+        name,
         cmap.char_map.len(),
         cmap.ranges.len()
     );
     Some(cmap)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn find_bcmaps_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("PDF_INSPECTOR_BCMAPS_DIR") {
         let p = PathBuf::from(dir);
@@ -1180,6 +1185,18 @@ fn find_bcmaps_dir() -> Option<PathBuf> {
         return Some(default);
     }
     None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
+    let path = find_bcmaps_dir()?.join(name);
+    std::fs::read(path).ok().map(Cow::Owned)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
+    let file = BUILTIN_CMAPS.get_file(name)?;
+    Some(Cow::Borrowed(file.contents()))
 }
 
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
@@ -1492,9 +1509,7 @@ fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCM
 }
 
 fn load_builtin_encoding_cmap(name: &str) -> Option<EncodingCMap> {
-    let dir = find_bcmaps_dir()?;
-    let path = dir.join(format!("{}.bcmap", name));
-    let data = std::fs::read(&path).ok()?;
+    let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
     parse_binary_cmap_encoding(&data).ok()
 }
 
@@ -1779,9 +1794,7 @@ fn load_builtin_cmap_by_name(name: &str) -> Option<ToUnicodeCMap> {
     if !name.ends_with("UCS2") {
         return None;
     }
-    let dir = find_bcmaps_dir()?;
-    let path = dir.join(format!("{}.bcmap", name));
-    let data = std::fs::read(&path).ok()?;
+    let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
     let mut cmap = parse_binary_cmap(&data).ok()?;
     if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
         return None;

@@ -68,6 +68,40 @@ use text_quality::{
 };
 use tounicode::FontCMaps;
 
+#[cfg(not(target_arch = "wasm32"))]
+struct ProcessingTimer(std::time::Instant);
+
+#[cfg(target_arch = "wasm32")]
+struct ProcessingTimer;
+
+impl ProcessingTimer {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self(std::time::Instant::now())
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.0.elapsed().as_millis() as u64
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The wasm32-unknown-unknown standard library has no clock.
+            // Browser bindings measure with JavaScript's host clock.
+            0
+        }
+    }
+}
+
 /// OCR reason emitted when the extracted text layer appears garbled due to
 /// broken font decoding or mojibake.
 pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
@@ -250,7 +284,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     path: P,
     options: PdfOptions,
 ) -> Result<PdfProcessResult, PdfError> {
-    let start = std::time::Instant::now();
+    let start = ProcessingTimer::start();
     validate_pdf_file(&path)?;
 
     // Load the document once — shared by detection AND extraction.
@@ -277,7 +311,7 @@ pub fn process_pdf_mem_with_options(
     buffer: &[u8],
     options: PdfOptions,
 ) -> Result<PdfProcessResult, PdfError> {
-    let start = std::time::Instant::now();
+    let start = ProcessingTimer::start();
     validate_pdf_bytes(buffer)?;
 
     let (doc, page_count) =
@@ -3526,7 +3560,7 @@ fn process_document(
     doc: Document,
     page_count: u32,
     options: PdfOptions,
-    start: std::time::Instant,
+    start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
@@ -3542,7 +3576,7 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
-            processing_time_ms: start.elapsed().as_millis() as u64,
+            processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
@@ -3558,7 +3592,7 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
-            processing_time_ms: start.elapsed().as_millis() as u64,
+            processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
@@ -3824,7 +3858,7 @@ fn process_document(
         pdf_type,
         markdown,
         page_count,
-        processing_time_ms: start.elapsed().as_millis() as u64,
+        processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {
             // Detector reasons (scanned / no_text / vector_text / garbled) merged

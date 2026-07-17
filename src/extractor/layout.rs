@@ -1153,6 +1153,22 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new())
 }
 
+/// Group text items into lines without removing numeric page headers or footers.
+///
+/// Plain-text extraction uses this path because every extracted item is part of
+/// the API result. Markdown conversion keeps using [`group_into_lines`], where
+/// page-number suppression is an intentional presentation cleanup.
+pub fn group_into_lines_preserving_all_text(items: Vec<TextItem>) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_regions_impl(
+        items,
+        &HashMap::new(),
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        false,
+    )
+}
+
 /// Group text items into lines, using pre-computed per-page adaptive thresholds
 /// from Canva-style letter-spacing detection. Falls back to computing the
 /// threshold from item gaps when no pre-computed value is available.
@@ -1196,15 +1212,38 @@ pub(crate) fn group_into_lines_with_thresholds_and_regions(
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
 ) -> Vec<TextLine> {
+    group_into_lines_with_thresholds_and_regions_impl(
+        items,
+        page_thresholds,
+        table_pages,
+        chart_regions,
+        image_regions,
+        true,
+    )
+}
+
+fn group_into_lines_with_thresholds_and_regions_impl(
+    items: Vec<TextItem>,
+    page_thresholds: &HashMap<u32, f32>,
+    table_pages: &HashSet<u32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+    filter_page_numbers: bool,
+) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
     }
 
-    // Filter out page numbers (standalone numbers at top/bottom of page)
-    let items: Vec<TextItem> = items
-        .into_iter()
-        .filter(|item| !is_page_number(item))
-        .collect();
+    // Markdown output omits standalone numeric headers/footers. Plain-text
+    // callers opt out because dropping extracted text violates that API.
+    let items = if filter_page_numbers {
+        items
+            .into_iter()
+            .filter(|item| !is_page_number(item))
+            .collect()
+    } else {
+        items
+    };
 
     // Get unique pages
     let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();

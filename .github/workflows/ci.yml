@@ -42,6 +42,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check WASM formatting
+        run: cargo fmt --manifest-path wasm/Cargo.toml -- --check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -80,3 +83,37 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+  wasm:
+    name: WebAssembly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            wasm -> target
+          key: wasm
+
+      - name: Check WebAssembly bindings
+        run: cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+
+      - name: Check root package for WebAssembly
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Lint WebAssembly bindings
+        run: cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Test WebAssembly package
+        run: wasm-pack test --node --release wasm

@@ -1,10 +1,13 @@
 # Rust build artifacts
 /target/
+/wasm/target/
+/wasm/pkg/
 debug/
 *.pdb
 
 # Cargo lock (optional for libraries)
 Cargo.lock
+!/wasm/Cargo.lock
 
 # IDE
 .idea/
@@ -39,4 +42,3 @@ test_output/
 __pycache__/
 *.pyc
 .pytest_cache/
-
