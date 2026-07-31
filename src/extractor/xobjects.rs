@@ -162,7 +162,7 @@ fn extract_form_xobject_text_inner(
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
-    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts);
+    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);

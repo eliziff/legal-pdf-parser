@@ -497,9 +497,13 @@ pub(crate) fn get_operand_bytes(obj: &Object) -> Option<&[u8]> {
 /// Build encoding maps for all fonts on a page.
 /// Returns `(encodings, has_gid_fonts)` where `has_gid_fonts` is true when
 /// any font uses raw glyph ID names (gidNNNNN) that can't be decoded.
+/// Gid names whose codes the font's own ToUnicode CMap maps are decodable
+/// and do not set the flag (LibreOffice subsets write /gidNNNN Differences
+/// names alongside a complete ToUnicode CMap).
 pub(crate) fn build_font_encodings(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    cmaps: &FontCMaps,
 ) -> (PageFontEncodings, bool) {
     let mut encodings = PageFontEncodings::new();
     let mut has_gid_fonts = false;
@@ -508,7 +512,9 @@ pub(crate) fn build_font_encodings(
         let resource_name = String::from_utf8_lossy(font_name).to_string();
 
         if let Some(result) = parse_font_encoding(doc, font_dict) {
-            if result.gid_glyph_count > 0 {
+            if !result.gid_codes.is_empty()
+                && !tounicode_maps_codes(font_dict, cmaps, &result.gid_codes)
+            {
                 has_gid_fonts = true;
             }
             if !result.map.is_empty() {
@@ -518,6 +524,34 @@ pub(crate) fn build_font_encodings(
     }
 
     (encodings, has_gid_fonts)
+}
+
+/// True when the font's ToUnicode CMap maps the gid-named character codes,
+/// so the Differences entries still decode through the CMap.
+fn tounicode_maps_codes(font_dict: &lopdf::Dictionary, cmaps: &FontCMaps, codes: &[u8]) -> bool {
+    let Some(obj_ref) = font_dict
+        .get(b"ToUnicode")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+    else {
+        return false;
+    };
+    let Some(entry) = cmaps.get_by_obj(obj_ref.0) else {
+        return false;
+    };
+    // At least one gid code usably mapped means the CMap addresses these
+    // codes; remaining unmapped codes are subset leftovers (e.g. the
+    // component glyphs of an emoji ZWJ sequence mapped whole on its first
+    // code). A mapping is usable only when extraction would accept it —
+    // empty or U+FFFD results are rejected there as invalid. Fonts whose
+    // CMap ignores the gid codes entirely stay flagged, and the downstream
+    // garbage/encoding checks still catch partial damage.
+    codes.iter().any(|&code| {
+        entry
+            .primary
+            .lookup(code as u16)
+            .is_some_and(|s| !s.is_empty() && !s.contains('\u{FFFD}'))
+    })
 }
 
 /// Parse font encoding from a font dictionary
@@ -558,11 +592,10 @@ pub(crate) fn parse_font_encoding(
 /// Result of parsing an encoding dictionary's Differences array.
 pub(crate) struct EncodingResult {
     pub map: FontEncodingMap,
-    /// Number of glyph names matching the `gidNNNNN` pattern (raw glyph IDs).
-    /// These indicate a font with unresolvable encoding — the glyph IDs
-    /// reference the original font's glyph table, but without the original
-    /// font's cmap there is no way to map them to Unicode.
-    pub gid_glyph_count: u32,
+    /// Character codes whose glyph names match the `gidNNNNN` pattern (raw
+    /// glyph IDs). These reference the original font's glyph table and are
+    /// only decodable when the font's ToUnicode CMap maps the code.
+    pub gid_codes: Vec<u8>,
 }
 
 /// Parse an encoding dictionary with Differences array
@@ -588,7 +621,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut encoding_map = FontEncodingMap::new();
     let mut current_code: u8 = 0;
     let mut ligature_count = 0u32;
-    let mut gid_glyph_count = 0u32;
+    let mut gid_codes: Vec<u8> = Vec::new();
 
     for item in diff_array {
         match item {
@@ -614,7 +647,7 @@ pub(crate) fn parse_encoding_dictionary(
                     && glyph_name.len() >= 4
                     && glyph_name[3..].chars().all(|c| c.is_ascii_digit())
                 {
-                    gid_glyph_count += 1;
+                    gid_codes.push(current_code);
                 }
                 if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
@@ -638,16 +671,16 @@ pub(crate) fn parse_encoding_dictionary(
         );
     }
 
-    if gid_glyph_count > 0 {
+    if !gid_codes.is_empty() {
         debug!(
-            "  Differences: {} gid-encoded glyphs (unresolvable without original font)",
-            gid_glyph_count
+            "  Differences: {} gid-encoded glyphs (decodable only via ToUnicode)",
+            gid_codes.len()
         );
     }
 
     Some(EncodingResult {
         map: encoding_map,
-        gid_glyph_count,
+        gid_codes,
     })
 }
 
@@ -1937,5 +1970,114 @@ mod tests {
             Some("BJPQNQ+Times-Roman"),
             false
         ));
+    }
+
+    fn gid_font_doc(bfchar: Option<&str>) -> (Document, lopdf::ObjectId) {
+        use lopdf::Stream;
+        let mut doc = Document::with_version("1.4");
+        let cmap = format!(
+            "/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+{}
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end",
+            bfchar.unwrap_or_default()
+        );
+        let tounicode_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            cmap.into_bytes(),
+        )));
+        let enc_id = doc.add_object(dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![
+                1.into(),
+                Object::Name(b"gid1283".to_vec()),
+                Object::Name(b"gid1464".to_vec()),
+            ],
+        });
+        let mut font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "ABCDEF+OpenSymbol",
+            "Encoding" => Object::Reference(enc_id),
+        };
+        if bfchar.is_some() {
+            font.set("ToUnicode", Object::Reference(tounicode_id));
+        }
+        let font_id = doc.add_object(font);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    fn gid_flagged(bfchar: Option<&str>) -> bool {
+        let (doc, page_id) = gid_font_doc(bfchar);
+        let cmaps = FontCMaps::from_doc(&doc);
+        let fonts = doc.get_page_fonts(page_id).unwrap();
+        let (_, has_gid_fonts) = build_font_encodings(&doc, &fonts, &cmaps);
+        has_gid_fonts
+    }
+
+    #[test]
+    fn gid_differences_with_covering_tounicode_are_not_flagged() {
+        // LibreOffice subsets write /gidNNNN Differences names alongside a
+        // ToUnicode CMap that decodes those codes; the page must not be
+        // flagged as unresolvable (which would suppress the whole document's
+        // markdown when every page carries such a font).
+        assert!(!gid_flagged(Some("<01> <2022>\n<02> <25E6>")));
+    }
+
+    #[test]
+    fn gid_differences_with_partial_tounicode_are_not_flagged() {
+        // An emoji ZWJ sequence maps whole on its first code; the remaining
+        // component-glyph codes are subset leftovers, not damage.
+        assert!(!gid_flagged(Some(
+            "<01> <D83DDC68200DD83DDC69200DD83DDC67>"
+        )));
+    }
+
+    #[test]
+    fn gid_differences_without_tounicode_are_flagged() {
+        assert!(
+            gid_flagged(None),
+            "gid glyphs without ToUnicode are unresolvable"
+        );
+    }
+
+    #[test]
+    fn gid_differences_with_disjoint_tounicode_are_flagged() {
+        // A ToUnicode that never addresses the gid codes leaves them
+        // unresolvable.
+        assert!(gid_flagged(Some("<10> <0041>")));
+    }
+
+    #[test]
+    fn gid_differences_with_replacement_char_tounicode_are_flagged() {
+        // A mapping to U+FFFD is not usable — extraction rejects it as an
+        // invalid CMap result — so it must not clear the gid flag.
+        assert!(gid_flagged(Some("<01> <FFFD>\n<02> <FFFD>")));
     }
 }

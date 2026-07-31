@@ -162,7 +162,7 @@ pub(crate) fn extract_page_text_items(
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
     // Build font encoding maps from Differences arrays
-    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts);
+    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
