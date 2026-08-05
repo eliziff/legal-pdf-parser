@@ -491,7 +491,14 @@ pub fn extract_pages_markdown_mem(
 
     // Tables need the original numeric cells; columns use folio-cleaned
     // evidence so removed page numbers cannot create false layout metadata.
-    let complexity = compute_layout_complexity(&all_items, &filtered_items, &all_rects, &all_lines);
+    let chart_regions = markdown::chart_regions_by_page(&all_items, &all_rects, &all_lines);
+    let complexity = compute_layout_complexity_with_chart_regions(
+        &all_items,
+        &filtered_items,
+        &all_rects,
+        &all_lines,
+        &chart_regions,
+    );
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
@@ -565,6 +572,7 @@ pub fn extract_pages_markdown_mem(
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                    precomputed_chart_regions: Some(&chart_regions),
                 },
             )
         };
@@ -3816,7 +3824,14 @@ fn process_document(
 
             let text_quality = analyze_text_quality(&items);
             merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
-            let layout = compute_layout_complexity(&items, &layout_items, &rects, &lines);
+            let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
+            let layout = compute_layout_complexity_with_chart_regions(
+                &items,
+                &layout_items,
+                &rects,
+                &lines,
+                &chart_regions,
+            );
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
@@ -3833,6 +3848,7 @@ fn process_document(
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
                     },
                 ))
             };
@@ -5633,11 +5649,29 @@ fn select_items_with_document_folio_context(
 }
 
 /// Analyse extracted items and rects for layout complexity.
+#[cfg(test)]
 fn compute_layout_complexity(
     items: &[types::TextItem],
     column_items: &[types::TextItem],
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
+) -> LayoutComplexity {
+    let page_chart_regions = markdown::chart_regions_by_page(items, rects, lines);
+    compute_layout_complexity_with_chart_regions(
+        items,
+        column_items,
+        rects,
+        lines,
+        &page_chart_regions,
+    )
+}
+
+fn compute_layout_complexity_with_chart_regions(
+    items: &[types::TextItem],
+    column_items: &[types::TextItem],
+    rects: &[types::PdfRect],
+    lines: &[types::PdfLine],
+    page_chart_regions: &markdown::PageChartRegions,
 ) -> LayoutComplexity {
     use markdown::analysis::calculate_font_stats_from_items;
 
@@ -5659,6 +5693,10 @@ fn compute_layout_complexity(
         let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
         let page_content_width = tables::content_width(&owned_items);
         let bands = markdown::split_side_by_side(&owned_items);
+        let chart_regions = page_chart_regions
+            .get(&page)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
         let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
             // Single region — use sentinel range that includes everything
@@ -5673,7 +5711,8 @@ fn compute_layout_complexity(
             let band_items: Vec<types::TextItem> = owned_items
                 .iter()
                 .filter(|item| {
-                    x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin)
+                    (x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin))
+                        && !markdown::item_is_in_chart_region(item, chart_regions)
                 })
                 .cloned()
                 .collect();
@@ -5725,8 +5764,20 @@ fn compute_layout_complexity(
     }
 
     let mut pages_with_columns: Vec<u32> = Vec::new();
-    for page in seen_pages {
-        let cols = extractor::detect_columns(column_items, page, pages_with_tables.contains(&page));
+    for &page in &seen_pages {
+        let chart_regions = page_chart_regions
+            .get(&page)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let page_column_items: Vec<types::TextItem> = column_items
+            .iter()
+            .filter(|item| {
+                item.page == page && !markdown::item_is_in_chart_region(item, chart_regions)
+            })
+            .cloned()
+            .collect();
+        let cols =
+            extractor::detect_columns(&page_column_items, page, pages_with_tables.contains(&page));
         if cols.len() >= 2 {
             pages_with_columns.push(page);
         }
@@ -5953,6 +6004,66 @@ mod tests {
         assert!(!filtered.is_complex);
         assert!(filtered.pages_with_tables.is_empty());
         assert!(filtered.pages_with_columns.is_empty());
+    }
+
+    #[test]
+    fn dense_chart_panel_is_not_reported_as_a_table() {
+        let mut items: Vec<TextItem> = (0..8)
+            .flat_map(|row| {
+                (0..6).map(move |column| {
+                    test_item(
+                        &format!("{}", row * 10 + column),
+                        105.0 + column as f32 * 35.0,
+                        525.0 - row as f32 * 15.0,
+                        24.0,
+                        10.0,
+                    )
+                })
+            })
+            .collect();
+        for row in 0..6 {
+            items.push(test_item(
+                "Left column prose continues here",
+                80.0,
+                320.0 - row as f32 * 15.0,
+                160.0,
+                10.0,
+            ));
+            items.push(test_item(
+                "Right column prose continues here",
+                300.0,
+                320.0 - row as f32 * 15.0,
+                160.0,
+                10.0,
+            ));
+        }
+        let mut lines: Vec<PdfLine> = (0..30)
+            .map(|column| PdfLine {
+                x1: 100.0 + column as f32 * 8.0,
+                y1: 400.0,
+                x2: 100.0 + column as f32 * 8.0,
+                y2: 550.0,
+                page: 1,
+            })
+            .collect();
+        lines.extend((0..6).map(|row| PdfLine {
+            x1: 100.0,
+            y1: 400.0 + row as f32 * 30.0,
+            x2: 332.0,
+            y2: 400.0 + row as f32 * 30.0,
+            page: 1,
+        }));
+        let rects = vec![PdfRect {
+            x: 80.0,
+            y: 350.0,
+            width: 280.0,
+            height: 240.0,
+            page: 1,
+        }];
+
+        let complexity = compute_layout_complexity(&items, &items, &rects, &lines);
+
+        assert!(complexity.pages_with_tables.is_empty());
     }
 
     #[test]
