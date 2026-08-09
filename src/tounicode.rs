@@ -594,7 +594,7 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
 
     let bytes: Option<Vec<u8>> = (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
         .collect();
     let bytes = bytes?;
 
@@ -2604,6 +2604,24 @@ endcmap
         assert_eq!(cmap.lookup(0x0003), Some(" ".to_string()));
         assert_eq!(cmap.lookup(0x0024), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0025), Some("B".to_string()));
+    }
+
+    #[test]
+    fn test_hex_to_unicode_non_ascii_no_panic() {
+        // A destination containing a multi-byte char makes the byte length even
+        // while a byte offset can land inside a char. Slicing must not panic;
+        // it should be rejected gracefully.
+        assert_eq!(hex_to_unicode_string("XéY"), None);
+        assert_eq!(hex_to_unicode_string("\u{fffd}0"), None);
+    }
+
+    #[test]
+    fn test_parse_bfchar_non_ascii_destination_no_panic() {
+        // Crafted /ToUnicode CMap: a non-hex, non-ASCII destination previously
+        // triggered a char-boundary panic in hex_to_unicode_string.
+        let cmap_content = "beginbfchar <0041> <XéY> endbfchar";
+        // Must not panic; the malformed entry is simply skipped.
+        let _ = ToUnicodeCMap::parse(cmap_content.as_bytes());
     }
 
     #[test]
