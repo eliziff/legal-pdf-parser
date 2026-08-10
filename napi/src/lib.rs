@@ -153,9 +153,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
     }
 }
 
-fn to_napi_page_ocr_reasons(
-    reasons: Vec<pdf_inspector::PageOcrReasons>,
-) -> Vec<PageOcrReasons> {
+fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {
     reasons
         .into_iter()
         .map(|reason| PageOcrReasons {
@@ -203,6 +201,31 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Shared implementations (single body behind sync and async entry points)
+// ---------------------------------------------------------------------------
+
+fn process_pdf_impl(bytes: &[u8], pages: Option<Vec<u32>>) -> Result<PdfResult> {
+    let mut opts = pdf_inspector::PdfOptions::new();
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = pdf_inspector::process_pdf_mem_with_options(bytes, opts)
+        .map_err(|e| to_napi_err(e, "process_pdf"))?;
+    Ok(to_napi_result(result))
+}
+
+fn classify_pdf_impl(bytes: &[u8]) -> Result<PdfClassification> {
+    let result =
+        pdf_inspector::classify_pdf_mem(bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
+    Ok(PdfClassification {
+        pdf_type: convert_pdf_type(result.pdf_type),
+        page_count: result.page_count,
+        pages_needing_ocr: result.pages_needing_ocr,
+        confidence: result.confidence as f64,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Public NAPI API
 // ---------------------------------------------------------------------------
 
@@ -210,15 +233,7 @@ where
 #[napi]
 pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult> {
     let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("process_pdf", move || {
-        let mut opts = pdf_inspector::PdfOptions::new();
-        if let Some(p) = pages {
-            opts = opts.pages(p);
-        }
-        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
-            .map_err(|e| to_napi_err(e, "process_pdf"))?;
-        Ok(to_napi_result(result))
-    })
+    catch_panic("process_pdf", move || process_pdf_impl(&bytes, pages))
 }
 
 /// Fast detection only — no text extraction or markdown.
@@ -238,16 +253,7 @@ pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
 #[napi]
 pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
     let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("classify_pdf", move || {
-        let result =
-            pdf_inspector::classify_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
-        Ok(PdfClassification {
-            pdf_type: convert_pdf_type(result.pdf_type),
-            page_count: result.page_count,
-            pages_needing_ocr: result.pages_needing_ocr,
-            confidence: result.confidence as f64,
-        })
-    })
+    catch_panic("classify_pdf", move || classify_pdf_impl(&bytes))
 }
 
 /// Extract plain text from a PDF Buffer.
@@ -633,25 +639,32 @@ pub fn extract_pages_markdown(
 ) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        let result = pdf_inspector::extract_pages_markdown_mem(&bytes, pages.as_deref())
-            .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
-        Ok(PagesExtractionResult {
-            pages: result
-                .pages
-                .into_iter()
-                .map(|r| PageMarkdownResult {
-                    page: r.page,
-                    markdown: r.markdown,
-                    needs_ocr: r.needs_ocr,
-                    ocr_reason: r.ocr_reason,
-                })
-                .collect(),
-            pages_with_tables: result.pages_with_tables,
-            pages_with_columns: result.pages_with_columns,
-            pages_needing_ocr: result.pages_needing_ocr,
-            ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
-            is_complex: result.is_complex,
-        })
+        extract_pages_markdown_impl(&bytes, pages.as_deref())
+    })
+}
+
+fn extract_pages_markdown_impl(
+    bytes: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<PagesExtractionResult> {
+    let result = pdf_inspector::extract_pages_markdown_mem(bytes, pages)
+        .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
+    Ok(PagesExtractionResult {
+        pages: result
+            .pages
+            .into_iter()
+            .map(|r| PageMarkdownResult {
+                page: r.page,
+                markdown: r.markdown,
+                needs_ocr: r.needs_ocr,
+                ocr_reason: r.ocr_reason,
+            })
+            .collect(),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        pages_needing_ocr: result.pages_needing_ocr,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
+        is_complex: result.is_complex,
     })
 }
 
@@ -691,4 +704,132 @@ fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<Pa
                 .collect(),
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Async variants (libuv thread pool via AsyncTask)
+//
+// The synchronous exports above parse on the calling thread, which in Node is
+// the event loop. These `*Async` variants run the same shared implementations
+// on the libuv thread pool and hand JavaScript a promise, so servers under
+// concurrent load keep answering requests while a document parses. The sync
+// exports keep their names, signatures, and behaviour.
+//
+// Each factory copies the input Buffer to an owned `Vec<u8>` on the calling
+// (JS) thread — deliberately. JS execution is single-threaded, so no JS code
+// can mutate the buffer while the synchronous part of the call copies it.
+// Holding the napi `Buffer` and reading it from the worker instead would be
+// zero-copy, but a caller mutating the buffer before the promise settles
+// would then race the worker's reads — undefined behavior, not a recoverable
+// error (a known napi-rs soundness hazard with cross-thread Buffer access).
+// The copy is a one-time memcpy, negligible next to the parse it unblocks.
+// ---------------------------------------------------------------------------
+
+pub struct ProcessPdfTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+}
+
+impl Task for ProcessPdfTask {
+    type Output = PdfResult;
+    type JsValue = PdfResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        // AssertUnwindSafe: `bytes`/`pages` are moved into the closure and
+        // dropped on unwind — no shared state can be observed broken.
+        catch_panic(
+            "process_pdf",
+            panic::AssertUnwindSafe(move || process_pdf_impl(&bytes, pages)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`processPdf`]: same result, but the parse runs on the
+/// libuv thread pool instead of the event loop and the call returns a
+/// promise. The buffer is copied before the call returns, so it may be
+/// reused or mutated immediately.
+// ts_return_type is required: napi-rs emits `Promise<unknown>` for
+// `AsyncTask<T>` returns without it.
+#[napi(ts_return_type = "Promise<PdfResult>")]
+pub fn process_pdf_async(buffer: Buffer, pages: Option<Vec<u32>>) -> AsyncTask<ProcessPdfTask> {
+    AsyncTask::new(ProcessPdfTask {
+        bytes: buffer.to_vec(),
+        pages,
+    })
+}
+
+pub struct ClassifyPdfTask {
+    bytes: Vec<u8>,
+}
+
+impl Task for ClassifyPdfTask {
+    type Output = PdfClassification;
+    type JsValue = PdfClassification;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        catch_panic(
+            "classify_pdf",
+            panic::AssertUnwindSafe(move || classify_pdf_impl(&bytes)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`classifyPdf`]: same result, but the classification runs
+/// on the libuv thread pool instead of the event loop and the call returns a
+/// promise. The buffer is copied before the call returns, so it may be
+/// reused or mutated immediately.
+#[napi(ts_return_type = "Promise<PdfClassification>")]
+pub fn classify_pdf_async(buffer: Buffer) -> AsyncTask<ClassifyPdfTask> {
+    AsyncTask::new(ClassifyPdfTask {
+        bytes: buffer.to_vec(),
+    })
+}
+
+pub struct ExtractPagesMarkdownTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+}
+
+impl Task for ExtractPagesMarkdownTask {
+    type Output = PagesExtractionResult;
+    type JsValue = PagesExtractionResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        catch_panic(
+            "extract_pages_markdown",
+            panic::AssertUnwindSafe(move || extract_pages_markdown_impl(&bytes, pages.as_deref())),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`extractPagesMarkdown`]: same result, but the extraction
+/// runs on the libuv thread pool instead of the event loop and the call
+/// returns a promise. The buffer is copied before the call returns, so it
+/// may be reused or mutated immediately.
+#[napi(ts_return_type = "Promise<PagesExtractionResult>")]
+pub fn extract_pages_markdown_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+) -> AsyncTask<ExtractPagesMarkdownTask> {
+    AsyncTask::new(ExtractPagesMarkdownTask {
+        bytes: buffer.to_vec(),
+        pages,
+    })
 }

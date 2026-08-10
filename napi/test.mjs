@@ -2,13 +2,16 @@ import { readFileSync } from 'fs';
 import { strict as assert } from 'assert';
 import {
   processPdf,
+  processPdfAsync,
   detectPdf,
   classifyPdf,
+  classifyPdfAsync,
   extractText,
   extractTextWithPositions,
   extractTextInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
+  extractPagesMarkdownAsync,
 } from './index.js';
 
 const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
@@ -124,10 +127,75 @@ assert.equal(picked.pages[0].page, 2);
 assert.equal(picked.pages[1].page, 0);
 console.log('  extractPagesMarkdown with pages: OK');
 
+// --- Async variants ---
+console.log('Testing async variants...');
+
+// processPdfAsync returns a promise and matches the sync result
+const asyncResultPromise = processPdfAsync(fixture);
+assert.ok(asyncResultPromise instanceof Promise);
+const asyncResult = await asyncResultPromise;
+assert.equal(asyncResult.pdfType, result.pdfType);
+assert.equal(asyncResult.pageCount, result.pageCount);
+assert.equal(asyncResult.markdown, result.markdown);
+console.log('  processPdfAsync: OK');
+
+// processPdfAsync with pages
+const asyncResult2 = await processPdfAsync(fixture, [1]);
+assert.equal(asyncResult2.markdown, result2.markdown);
+console.log('  processPdfAsync with pages: OK');
+
+// classifyPdfAsync matches the sync result
+const asyncClassified = await classifyPdfAsync(fixture);
+assert.equal(asyncClassified.pdfType, classified.pdfType);
+assert.equal(asyncClassified.pageCount, classified.pageCount);
+assert.equal(asyncClassified.confidence, classified.confidence);
+assert.deepEqual(asyncClassified.pagesNeedingOcr, classified.pagesNeedingOcr);
+console.log('  classifyPdfAsync: OK');
+
+// extractPagesMarkdownAsync matches the sync result
+const asyncAllPages = await extractPagesMarkdownAsync(fixture);
+assert.equal(asyncAllPages.pages.length, allPages.pages.length);
+assert.deepEqual(
+  asyncAllPages.pages.map(p => p.markdown),
+  allPages.pages.map(p => p.markdown),
+);
+assert.equal(asyncAllPages.isComplex, allPages.isComplex);
+console.log('  extractPagesMarkdownAsync: OK');
+
+// selected pages preserve caller order
+const asyncPicked = await extractPagesMarkdownAsync(fixture, [2, 0]);
+assert.equal(asyncPicked.pages.length, 2);
+assert.equal(asyncPicked.pages[0].page, 2);
+assert.equal(asyncPicked.pages[1].page, 0);
+console.log('  extractPagesMarkdownAsync with pages: OK');
+
+// input buffer is copied at call time: mutating it immediately after the
+// call must not affect the in-flight parse
+const scratch = Buffer.from(fixture);
+const inFlight = processPdfAsync(scratch);
+scratch.fill(0);
+const fromMutated = await inFlight;
+assert.equal(fromMutated.markdown, result.markdown);
+console.log('  processPdfAsync input copied at call time: OK');
+
+// concurrent async calls all settle
+const [c1, c2, c3] = await Promise.all([
+  processPdfAsync(fixture),
+  classifyPdfAsync(fixture),
+  extractPagesMarkdownAsync(fixture),
+]);
+assert.equal(c1.pdfType, 'TextBased');
+assert.equal(c2.pdfType, 'TextBased');
+assert.equal(c3.pages.length, 3);
+console.log('  concurrent async calls: OK');
+
 // --- Error handling ---
 console.log('Testing error handling...');
 assert.throws(() => processPdf(Buffer.from('not a pdf')), /process_pdf/);
 assert.throws(() => classifyPdf(Buffer.from('')), /classify_pdf/);
+await assert.rejects(processPdfAsync(Buffer.from('not a pdf')), /process_pdf/);
+await assert.rejects(classifyPdfAsync(Buffer.from('')), /classify_pdf/);
+await assert.rejects(extractPagesMarkdownAsync(Buffer.from('')), /extract_pages_markdown/);
 console.log('  error handling: OK');
 
 console.log('\nAll NAPI tests passed!');
