@@ -757,6 +757,23 @@ pub struct PageRegionResult {
     pub regions: Vec<RegionText>,
 }
 
+/// Minimum alphanumeric mass an invisible (Tr 3) text layer must carry for
+/// the OCR-layer fallback in [`extract_text_in_regions_mem`] to adopt it. A
+/// real OCR layer carries far more; a stray watermark or artifact does not.
+const OCR_LAYER_MIN_ALNUM: usize = 40;
+
+/// Alphanumeric mass of extracted items, ignoring raster placeholders.
+/// `[Image: ...]` items (ItemType::Image) are synthesized for image
+/// XObjects — they mark that pixels exist, not that text was read, so they
+/// must not count as coverage.
+fn non_placeholder_alnum(items: &[TextItem]) -> usize {
+    items
+        .iter()
+        .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+        .map(|it| it.text.chars().filter(|c| c.is_alphanumeric()).count())
+        .sum()
+}
+
 /// Extract text within bounding-box regions from a PDF in memory.
 ///
 /// This is designed for hybrid OCR pipelines: a layout model detects regions
@@ -810,7 +827,7 @@ pub fn extract_text_in_regions_mem(
         page_heights.insert(*page_num, height);
 
         // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -819,6 +836,51 @@ pub fn extract_text_in_regions_mem(
                 false,
                 &mut style_cache,
             )?;
+        // OCR-layer fallback: scanned pages often carry their text as an
+        // invisible (Tr 3) layer behind the page raster. The visible-only
+        // pass sees nothing there but `[Image: ...]` placeholders, so every
+        // region on the page reports needs_ocr even though the exact text is
+        // embedded in the PDF — and this extractor then disagrees with the
+        // markdown path, which already retries Mixed PDFs with the invisible
+        // layer included. Retry page-scoped, and only when (a) the first
+        // pass actually SKIPPED invisible text — blank pages and image-only
+        // scans without an OCR layer must not pay a second content-stream
+        // parse (review catch) — and (b) the page has NO visible text item
+        // at all (punctuation counts, whitespace-only artifacts don't): an
+        // invisible OCR layer transcribes the raster, so any visible glyph
+        // has an invisible twin there and adoption would duplicate it
+        // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
+        // only when it contributes real, non-garbage text.
+        let has_visible_text = items.iter().any(|it| {
+            !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
+        });
+        if skipped_invisible && !has_visible_text {
+            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
+                extractor::content_stream::extract_page_text_items(
+                    &doc,
+                    page_id,
+                    *page_num,
+                    &font_cmaps,
+                    true,
+                    &mut style_cache,
+                )
+            {
+                let inv_alnum = non_placeholder_alnum(&inv_items);
+                // Judge the WHOLE recovered layer, not a prefix — a broken
+                // OCR layer can hide its garbage past any fixed sample size
+                // (review catch).
+                let sample: String = inv_items
+                    .iter()
+                    .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+                    .map(|it| it.text.as_str())
+                    .collect();
+                if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
+                    items = inv_items;
+                    has_gid = inv_gid;
+                    coords_rotated = inv_rotated;
+                }
+            }
+        }
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -975,7 +1037,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1286,7 +1348,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1480,15 +1542,16 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            1,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1522,15 +1585,16 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            page_num,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                page_num,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -2258,7 +2322,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -3060,7 +3124,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,

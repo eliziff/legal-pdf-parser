@@ -283,17 +283,20 @@ fn extract_positioned_text_impl(
             include_invisible,
             &mut style_cache,
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) = match page_result {
-            Ok(extraction) => extraction,
-            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
-                debug!(
-                    "page {}: skipping context-only extraction error: {}",
-                    page_num, error
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
+            match page_result {
+                Ok(extraction) => extraction,
+                Err(error)
+                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
+                {
+                    debug!(
+                        "page {}: skipping context-only extraction error: {}",
+                        page_num, error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into

@@ -137,8 +137,11 @@ fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
     ]
 }
 
-/// Returns `(page_extraction, has_gid_fonts)` where `has_gid_fonts` indicates
-/// the page uses fonts with unresolvable gid-encoded glyphs.
+/// Returns `(page_extraction, has_gid_fonts, coords_rotated, skipped_invisible)`
+/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
+/// gid-encoded glyphs and `skipped_invisible` reports that invisible (Tr 3)
+/// text was present but suppressed — callers can use it to decide whether an
+/// `include_invisible` retry could recover anything at all.
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -146,7 +149,7 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
-) -> Result<(PageExtraction, bool, bool), PdfError> {
+) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
@@ -262,12 +265,15 @@ pub(crate) fn extract_page_text_items(
             content.operations.len(),
             MAX_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false));
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
     }
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+                                          // Invisible (Tr 3) text was present but suppressed — reported to callers
+                                          // so an include_invisible retry is attempted only when it can recover.
+    let mut skipped_invisible = false;
     let mut line_width: f32 = 1.0;
     #[derive(Clone)]
     struct SavedGraphicsState {
@@ -494,6 +500,14 @@ pub(crate) fn extract_page_text_items(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
+                        if op
+                            .operands
+                            .first()
+                            .and_then(get_operand_bytes)
+                            .is_some_and(|raw| !raw.is_empty())
+                        {
+                            skipped_invisible = true;
+                        }
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -565,6 +579,16 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
+                        // Numeric-only TJ arrays (pure kerning) show no
+                        // text — they must not trigger the invisible retry.
+                        if text_rendering_mode == 3
+                            && !include_invisible
+                            && array
+                                .iter()
+                                .any(|el| get_operand_bytes(el).is_some_and(|raw| !raw.is_empty()))
+                        {
+                            skipped_invisible = true;
+                        }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
                         // Capture first-glyph position for ActualText
@@ -770,6 +794,16 @@ pub(crate) fn extract_page_text_items(
                         )
                     })
                 });
+                if text_rendering_mode == 3
+                    && !include_invisible
+                    && op
+                        .operands
+                        .first()
+                        .and_then(get_operand_bytes)
+                        .is_some_and(|raw| !raw.is_empty())
+                {
+                    skipped_invisible = true;
+                }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
@@ -1300,7 +1334,12 @@ pub(crate) fn extract_page_text_items(
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
-    Ok(((items, rects, lines), has_gid_fonts, coords_rotated))
+    Ok((
+        (items, rects, lines),
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+    ))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1498,7 +1537,7 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
@@ -1736,7 +1775,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &mut FontStyleCache::new(),
         )
         .unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated) = result;
+        let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
@@ -1817,7 +1856,7 @@ BT 30 700 Tm <41> Tj ET";
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _) = extract_page_text_items(
+        let ((items, _, _), _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
