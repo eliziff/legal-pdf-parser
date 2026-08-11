@@ -122,6 +122,65 @@ impl StructRole {
         )
     }
 
+    /// The standard structure type name for this role ("H1", "P", "Table", …).
+    ///
+    /// Inverse of [`StructRole::from_name`]: for [`StructRole::Other`] the
+    /// custom tag name is returned verbatim.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Document => "Document",
+            Self::Part => "Part",
+            Self::Art => "Art",
+            Self::Sect => "Sect",
+            Self::Div => "Div",
+            Self::BlockQuote => "BlockQuote",
+            Self::Caption => "Caption",
+            Self::TOC => "TOC",
+            Self::TOCI => "TOCI",
+            Self::Index => "Index",
+            Self::NonStruct => "NonStruct",
+            Self::Private => "Private",
+            Self::H => "H",
+            Self::H1 => "H1",
+            Self::H2 => "H2",
+            Self::H3 => "H3",
+            Self::H4 => "H4",
+            Self::H5 => "H5",
+            Self::H6 => "H6",
+            Self::P => "P",
+            Self::L => "L",
+            Self::LI => "LI",
+            Self::Lbl => "Lbl",
+            Self::LBody => "LBody",
+            Self::Table => "Table",
+            Self::TR => "TR",
+            Self::TH => "TH",
+            Self::TD => "TD",
+            Self::THead => "THead",
+            Self::TBody => "TBody",
+            Self::TFoot => "TFoot",
+            Self::Span => "Span",
+            Self::Quote => "Quote",
+            Self::Note => "Note",
+            Self::Reference => "Reference",
+            Self::BibEntry => "BibEntry",
+            Self::Code => "Code",
+            Self::Link => "Link",
+            Self::Annot => "Annot",
+            Self::Figure => "Figure",
+            Self::Formula => "Formula",
+            Self::Form => "Form",
+            Self::Ruby => "Ruby",
+            Self::RB => "RB",
+            Self::RT => "RT",
+            Self::RP => "RP",
+            Self::Warichu => "Warichu",
+            Self::WT => "WT",
+            Self::WP => "WP",
+            Self::Other(name) => name,
+        }
+    }
+
     fn from_name(name: &str) -> Self {
         match name {
             "Document" => Self::Document,
@@ -1231,6 +1290,66 @@ mod tests {
             StructRole::from_name("CustomTag"),
             StructRole::Other("CustomTag".to_string())
         );
+    }
+
+    #[test]
+    fn test_struct_role_name_roundtrip() {
+        // `name()` is the inverse of `from_name` for every standard type.
+        for name in [
+            "Document",
+            "Part",
+            "Art",
+            "Sect",
+            "Div",
+            "BlockQuote",
+            "Caption",
+            "TOC",
+            "TOCI",
+            "Index",
+            "NonStruct",
+            "Private",
+            "H",
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "H5",
+            "H6",
+            "P",
+            "L",
+            "LI",
+            "Lbl",
+            "LBody",
+            "Table",
+            "TR",
+            "TH",
+            "TD",
+            "THead",
+            "TBody",
+            "TFoot",
+            "Span",
+            "Quote",
+            "Note",
+            "Reference",
+            "BibEntry",
+            "Code",
+            "Link",
+            "Annot",
+            "Figure",
+            "Formula",
+            "Form",
+            "Ruby",
+            "RB",
+            "RT",
+            "RP",
+            "Warichu",
+            "WT",
+            "WP",
+        ] {
+            assert_eq!(StructRole::from_name(name).name(), name);
+        }
+        // Custom tags pass through verbatim.
+        assert_eq!(StructRole::from_name("CustomTag").name(), "CustomTag");
     }
 
     #[test]

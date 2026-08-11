@@ -8,6 +8,7 @@ import {
   classifyPdfAsync,
   extractText,
   extractTextWithPositions,
+  extractStructureElements,
   extractTextInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
@@ -15,6 +16,7 @@ import {
 } from './index.js';
 
 const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
+const taggedFixture = readFileSync('../tests/fixtures/firecrawl_docs_tagged.pdf');
 
 // --- processPdf ---
 console.log('Testing processPdf...');
@@ -81,6 +83,46 @@ const page1Items = extractTextWithPositions(fixture, [1]);
 assert.ok(page1Items.length > 0);
 assert.ok(page1Items.every(i => i.page === 1));
 console.log('  extractTextWithPositions with pages: OK');
+
+// mcid: undefined on untagged PDFs, numeric on tagged marked content
+assert.ok(items.every(i => i.mcid === undefined || typeof i.mcid === 'number'));
+const taggedItems = extractTextWithPositions(taggedFixture);
+assert.ok(
+  taggedItems.some(i => typeof i.mcid === 'number'),
+  'tagged PDF text items should carry Marked Content IDs',
+);
+console.log('  extractTextWithPositions mcid: OK');
+
+// --- extractStructureElements ---
+console.log('Testing extractStructureElements...');
+const structureElements = extractStructureElements(taggedFixture);
+assert.ok(structureElements.length > 0);
+assert.ok(structureElements.every(e => typeof e.page === 'number'));
+assert.ok(structureElements.every(e => typeof e.mcid === 'number'));
+assert.ok(structureElements.every(e => typeof e.role === 'string' && e.role.length > 0));
+assert.ok(
+  structureElements.some(e => e.role === 'H1'),
+  'tagged fixture should surface H1 heading roles',
+);
+
+// (page, mcid) joins against extractTextWithPositions to recover heading text
+const h1Refs = new Set(
+  structureElements.filter(e => e.role === 'H1').map(e => `${e.page}:${e.mcid}`),
+);
+const h1Text = taggedItems
+  .filter(i => typeof i.mcid === 'number' && h1Refs.has(`${i.page}:${i.mcid}`))
+  .map(i => i.text)
+  .join('');
+assert.ok(h1Text.trim().length > 0, 'H1 join should recover heading text');
+
+// pages filter is 1-indexed, matching TextItem.page
+const page1Elements = extractStructureElements(taggedFixture, [1]);
+assert.ok(page1Elements.length > 0);
+assert.ok(page1Elements.every(e => e.page === 1));
+
+// untagged PDFs yield an empty array
+assert.deepEqual(extractStructureElements(fixture), []);
+console.log('  extractStructureElements: OK');
 
 // --- extractTextInRegions ---
 console.log('Testing extractTextInRegions...');

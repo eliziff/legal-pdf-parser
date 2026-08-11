@@ -89,6 +89,11 @@ pub struct TextItem {
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
+    /// Marked Content ID from the content stream's BDC/BMC operator, `None`
+    /// when the text is not part of marked content. Join with the
+    /// `page`/`mcid` pairs from [`extractStructureElements`] to attach
+    /// structure-tree roles (headings, paragraphs, …) in tagged PDFs.
+    pub mcid: Option<i64>,
 }
 
 /// A page's regions for text extraction: (page_index_0based, bboxes).
@@ -306,7 +311,56 @@ pub fn extract_text_with_positions(
                     is_strikeout: item.is_strikeout,
                     item_type,
                     link_url,
+                    mcid: item.mcid,
                 }
+            })
+            .collect())
+    })
+}
+
+/// One structure-tree element reference from a tagged PDF.
+#[napi(object)]
+pub struct StructureElementJs {
+    /// 1-indexed page number (matches `TextItem.page`).
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// `TextItem.mcid`).
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", …).
+    /// Custom tags are resolved through the document's role map; tags with
+    /// no standard mapping are returned verbatim.
+    pub role: String,
+}
+
+/// Extract structure-tree element references from a tagged PDF.
+///
+/// Parses the document's structure tree (when present) and returns one
+/// entry per marked-content reference, resolved to its 1-indexed page,
+/// MCID, and structure type name. Returns an empty array when the PDF is
+/// not tagged.
+///
+/// Join `(page, mcid)` against the `page`/`mcid` fields from
+/// [`extractTextWithPositions`] to attach heading levels (H1..H6) and other
+/// semantic roles to extracted text.
+///
+/// Pass 1-indexed page numbers (matching `TextItem.page`) to restrict
+/// output; omit `pages` for the whole document. Entries are sorted by
+/// `(page, mcid)`.
+#[napi]
+pub fn extract_structure_elements(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+) -> Result<Vec<StructureElementJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_structure_elements", move || {
+        let elements = pdf_inspector::extract_structure_elements_mem(&bytes, pages.as_deref())
+            .map_err(|e| to_napi_err(e, "extract_structure_elements"))?;
+        Ok(elements
+            .into_iter()
+            .map(|e| StructureElementJs {
+                page: e.page,
+                mcid: e.mcid,
+                role: e.role,
             })
             .collect())
     })
