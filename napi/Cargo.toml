@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector-napi"
-version = "0.2.3"
+version = "1.14.0"
 edition = "2021"
 
 [lib]
