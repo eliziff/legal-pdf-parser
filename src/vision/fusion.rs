@@ -102,12 +102,13 @@ pub fn ocr_page_to_markdown(
     options: &MarkdownOptions,
 ) -> String {
     let (items, _) = ocr_text_items(page);
-    to_markdown_from_items_with_rects_and_page_count(
+    let markdown = to_markdown_from_items_with_rects_and_page_count(
         items,
         options.clone(),
         &[],
         document_page_count,
-    )
+    );
+    preserve_ocr_line_breaks(&markdown, page)
 }
 
 /// Fuses a selective OCR run into per-page native Markdown.
@@ -176,6 +177,7 @@ pub fn fuse_ocr_pages(
                     &[],
                     document_page_count,
                 );
+                let ocr_markdown = preserve_ocr_line_breaks(&ocr_markdown, local);
                 let (markdown, source) = if native.markdown.trim().is_empty() || native.needs_ocr {
                     (ocr_markdown, PageContentSource::Ocr)
                 } else {
@@ -327,6 +329,122 @@ fn image_quad_bounds(
         .fold(f32::NEG_INFINITY, f32::max)
         .clamp(0.0, height as f32);
     (right > left && bottom > top).then_some((left, top, right, bottom))
+}
+
+fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
+    let spans: Vec<(&str, f32, f32, f32, f32)> = page
+        .ocr
+        .spans
+        .iter()
+        .filter_map(|span| {
+            let (left, top, right, bottom) = image_quad_bounds(
+                &span.polygon.points,
+                page.rendered.width(),
+                page.rendered.height(),
+            )?;
+            (!span.text.trim().is_empty()).then_some((span.text.trim(), left, top, right, bottom))
+        })
+        .collect();
+    if spans.len() < 2 {
+        return markdown.to_string();
+    }
+
+    let mut line_heights: Vec<f32> = spans
+        .iter()
+        .map(|(_, _, top, _, bottom)| bottom - top)
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .collect();
+    if line_heights.is_empty() {
+        return markdown.to_string();
+    }
+    line_heights.sort_by(f32::total_cmp);
+    let median_height = line_heights[line_heights.len() / 2];
+
+    // The Markdown converter owns reading order and may normalize syntax such
+    // as list markers. Match every span back to its unique output occurrence,
+    // then use Markdown order rather than imposing a second geometry sort.
+    // If the mapping is incomplete or ambiguous, leave the converter output
+    // untouched instead of risking a break at the wrong duplicate text.
+    let mut mapped = Vec::with_capacity(spans.len());
+    for (text, left, top, right, bottom) in spans {
+        let Some((start, end)) = unique_markdown_span(markdown, text) else {
+            return markdown.to_string();
+        };
+        mapped.push((start, end, left, top, right, bottom));
+    }
+    mapped.sort_by_key(|span| span.0);
+    if mapped
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0 || pair[0].0 == pair[1].0)
+    {
+        return markdown.to_string();
+    }
+
+    let mut replacements = Vec::new();
+    for pair in mapped.windows(2) {
+        let (_, current_end, current_left, _, current_right, current_bottom) = pair[0];
+        let (next_start, _, next_left, next_top, next_right, _) = pair[1];
+        let overlap = (current_right.min(next_right) - current_left.max(next_left)).max(0.0);
+        let narrowest_width = (current_right - current_left).min(next_right - next_left);
+        let same_text_flow = narrowest_width > 0.0 && overlap >= narrowest_width * 0.2;
+        let separated = next_top - current_bottom >= median_height * 0.65;
+        let between = &markdown[current_end..next_start];
+        if same_text_flow
+            && separated
+            && between.chars().all(char::is_whitespace)
+            && !markdown_line_at(markdown, current_end).is_some_and(is_markdown_table_line)
+            && !markdown_line_at(markdown, next_start).is_some_and(is_markdown_table_line)
+        {
+            replacements.push((current_end, next_start));
+        }
+    }
+
+    let mut output = markdown.to_string();
+    for (start, end) in replacements.into_iter().rev() {
+        output.replace_range(start..end, "\n\n");
+    }
+    output
+}
+
+fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize)> {
+    let exact: Vec<_> = markdown.match_indices(span_text).collect();
+    match exact.as_slice() {
+        [(start, matched)] => return Some((*start, *start + matched.len())),
+        [] => {}
+        _ => return None,
+    }
+
+    let normalized = strip_list_marker(span_text)?;
+    let matches: Vec<_> = markdown.match_indices(normalized).collect();
+    match matches.as_slice() {
+        [(start, matched)] => Some((*start, *start + matched.len())),
+        _ => None,
+    }
+}
+
+fn strip_list_marker(text: &str) -> Option<&str> {
+    const BULLETS: &[char] = &['•', '●', '○', '◦', '▪', '–', '—'];
+    let trimmed = text.trim_start();
+    let remainder = trimmed
+        .strip_prefix(BULLETS)?
+        .trim_start_matches(char::is_whitespace);
+    (!remainder.is_empty()).then_some(remainder)
+}
+
+fn markdown_line_at(markdown: &str, offset: usize) -> Option<&str> {
+    if offset > markdown.len() || !markdown.is_char_boundary(offset) {
+        return None;
+    }
+    let start = markdown[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let end = markdown[offset..]
+        .find('\n')
+        .map_or(markdown.len(), |index| offset + index);
+    markdown.get(start..end)
+}
+
+fn is_markdown_table_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
 }
 
 fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
@@ -638,6 +756,20 @@ mod tests {
         }
     }
 
+    fn positioned_span(text: &str, left: f32, top: f32, right: f32, bottom: f32) -> OcrSpan {
+        OcrSpan {
+            text: text.to_string(),
+            polygon: ImageQuad::new([
+                ImagePoint::new(left, top),
+                ImagePoint::new(right, top),
+                ImagePoint::new(right, bottom),
+                ImagePoint::new(left, bottom),
+            ]),
+            confidence: 0.9,
+            orientation_degrees: None,
+        }
+    }
+
     fn run(pages: Vec<RoutedOcrPage>) -> OcrRun {
         OcrRun {
             pages,
@@ -672,6 +804,115 @@ mod tests {
             "test-ocr"
         );
         assert!(!result.pages[0].provenance.hosted_recommended);
+    }
+
+    #[test]
+    fn ocr_assembly_preserves_well_separated_detected_rows() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Column A Column B", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("First row value", 10.0, 35.0, 190.0, 45.0),
+                positioned_span("Second row value", 10.0, 60.0, 190.0, 70.0),
+            ],
+            Some(0.9),
+        );
+
+        let markdown = ocr_page_to_markdown(&page, 1, &MarkdownOptions::default());
+
+        assert!(markdown.contains("Column A Column B\n\n"), "{markdown:?}");
+        assert!(markdown.contains("First row value\n\n"), "{markdown:?}");
+    }
+
+    #[test]
+    fn line_break_recovery_uses_markdown_reading_order_for_columns() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Left top", 10.0, 10.0, 90.0, 20.0),
+                positioned_span("Right top", 110.0, 10.0, 190.0, 20.0),
+                positioned_span("Left bottom", 10.0, 40.0, 90.0, 50.0),
+                positioned_span("Right bottom", 110.0, 40.0, 190.0, 50.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "Left top Left bottom\n\nRight top Right bottom";
+
+        let recovered = preserve_ocr_line_breaks(markdown, &page);
+
+        assert_eq!(
+            recovered,
+            "Left top\n\nLeft bottom\n\nRight top\n\nRight bottom"
+        );
+    }
+
+    #[test]
+    fn line_break_recovery_preserves_tables_but_handles_page_prose() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("A", 10.0, 10.0, 90.0, 20.0),
+                positioned_span("B", 110.0, 10.0, 190.0, 20.0),
+                positioned_span("x", 10.0, 30.0, 90.0, 40.0),
+                positioned_span("y", 110.0, 30.0, 190.0, 40.0),
+                positioned_span("First prose", 10.0, 60.0, 190.0, 70.0),
+                positioned_span("Second prose", 10.0, 90.0, 190.0, 100.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "| A | B |\n|---|---|\n| x | y |\n\nFirst prose Second prose";
+
+        let recovered = preserve_ocr_line_breaks(markdown, &page);
+
+        assert!(recovered.starts_with("| A | B |\n|---|---|\n| x | y |"));
+        assert!(recovered.ends_with("First prose\n\nSecond prose"));
+    }
+
+    #[test]
+    fn line_break_recovery_accepts_normalized_list_markers() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("• First item", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("Next paragraph", 10.0, 40.0, 190.0, 50.0),
+            ],
+            Some(0.9),
+        );
+
+        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
+
+        assert_eq!(recovered, "- First item\n\nNext paragraph");
+    }
+
+    #[test]
+    fn line_break_recovery_accepts_white_bullet_list_markers() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("◦ First item", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("Next paragraph", 10.0, 40.0, 190.0, 50.0),
+            ],
+            Some(0.9),
+        );
+
+        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
+
+        assert_eq!(recovered, "- First item\n\nNext paragraph");
+    }
+
+    #[test]
+    fn line_break_recovery_leaves_ambiguous_duplicates_unchanged() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Repeated", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("Repeated", 10.0, 40.0, 190.0, 50.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "Repeated Repeated";
+
+        assert_eq!(preserve_ocr_line_breaks(markdown, &page), markdown);
     }
 
     #[test]
