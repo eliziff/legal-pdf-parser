@@ -1,15 +1,22 @@
 //! One-call native extraction and OCR pipeline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::{MarkdownOptions, PageOcrReasons, PdfError};
+use crate::text_quality::{
+    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
+};
+use crate::{
+    MarkdownOptions, PageOcrReasons, PdfError, OCR_REASON_SUSPECTED_GARBLED_TEXT,
+    OCR_REASON_VECTOR_TEXT,
+};
 
 use super::oar::onnx_runtime_library_path;
+use super::pdfium::PdfiumTextPage;
 use super::{
     fuse_ocr_pages, route_ocr_pages, run_ocr_pages, FusedPageMarkdown, HttpModelDownloadError,
     HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
@@ -210,7 +217,7 @@ pub fn process_pdf_with_ocr_mem(
 
     let mut page_markdown_options = options.markdown.clone();
     page_markdown_options.include_page_numbers = false;
-    let (native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
+    let (mut native, page_count) = crate::extract_pages_markdown_mem_for_ocr(
         buffer,
         selected_pages_zero_indexed.as_deref(),
         options.password.as_deref(),
@@ -223,12 +230,49 @@ pub fn process_pdf_with_ocr_mem(
         return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
     }
 
-    let routed = route_ocr_pages(
+    let mut routed = route_ocr_pages(
         options.ocr.mode,
         page_count,
         &native.pages_needing_ocr,
         selected_pages.as_deref(),
     )?;
+
+    let mut renderer = None;
+    let mut recovered_natively = BTreeSet::new();
+    if options.ocr.mode == OcrMode::Auto {
+        let recovery_candidates = native_recovery_candidates(&routed, &native.ocr_reasons_by_page);
+        if !recovery_candidates.is_empty() {
+            let native_renderer = PdfiumRenderer::load()?;
+            let recovered = native_renderer.extract_text_pages(
+                buffer,
+                &recovery_candidates,
+                options.password.as_deref(),
+            )?;
+            renderer = Some(native_renderer);
+
+            for page in recovered {
+                let Some(markdown) =
+                    credible_native_recovery(&page.items, page_count, &page_markdown_options)
+                else {
+                    continue;
+                };
+                if !is_complete_native_recovery(&markdown) || !native_recovery_covers_page(&page) {
+                    continue;
+                }
+                let Some(native_page) = native
+                    .pages
+                    .iter_mut()
+                    .find(|entry| entry.page + 1 == page.page)
+                else {
+                    continue;
+                };
+                native_page.markdown = markdown;
+                native_page.needs_ocr = false;
+                recovered_natively.insert(page.page);
+            }
+            routed.retain(|page| !recovered_natively.contains(page));
+        }
+    }
 
     let ocr_run = if routed.is_empty() {
         OcrRun {
@@ -239,7 +283,10 @@ pub fn process_pdf_with_ocr_mem(
     } else {
         // Resolve the native renderer before any network request so a missing
         // PDFium installation cannot trigger a model download it cannot use.
-        let renderer = PdfiumRenderer::load()?;
+        let renderer = match renderer {
+            Some(renderer) => renderer,
+            None => PdfiumRenderer::load()?,
+        };
         let engine = cached_ocr_engine(&options.ocr)?;
         run_ocr_pages(
             &renderer,
@@ -256,7 +303,14 @@ pub fn process_pdf_with_ocr_mem(
         .markdown(page_markdown_options)
         .render_dpi(options.render.dpi)
         .hosted_recommendation_confidence(options.hosted_recommendation_confidence);
-    let fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
+    let mut fused = fuse_ocr_pages(&native.pages, &ocr_run, page_count, &fusion_options)?;
+    for page in &mut fused.pages {
+        if recovered_natively.contains(&page.page) {
+            page.provenance
+                .warnings
+                .push("recovered a credible positioned native text layer before OCR".to_string());
+        }
+    }
     let pages_recommending_hosted = fused
         .pages
         .iter()
@@ -264,6 +318,14 @@ pub fn process_pdf_with_ocr_mem(
         .map(|page| page.provenance.page)
         .collect();
     let markdown = assemble_document_markdown(&fused.pages, options.markdown.include_page_numbers);
+
+    let mut pages_with_tables = native.pages_with_tables;
+    for page in &fused.pages {
+        if markdown_has_table(&page.markdown) && !pages_with_tables.contains(&page.page) {
+            pages_with_tables.push(page.page);
+        }
+    }
+    pages_with_tables.sort_unstable();
 
     Ok(OcrPdfResult {
         markdown,
@@ -273,9 +335,9 @@ pub fn process_pdf_with_ocr_mem(
         pages_routed_to_ocr: routed,
         pages_recommending_hosted,
         ocr_reasons_by_page: native.ocr_reasons_by_page,
-        pages_with_tables: native.pages_with_tables,
+        pages_with_tables: pages_with_tables.clone(),
         pages_with_columns: native.pages_with_columns,
-        is_complex: native.is_complex,
+        is_complex: native.is_complex || !pages_with_tables.is_empty(),
         processing_time_ms: elapsed_ms(started),
         render_time_ms: fused.render_time_ms,
         ocr_time_ms: fused.ocr_time_ms,
@@ -360,6 +422,248 @@ fn normalized_cache_path(path: PathBuf) -> PathBuf {
     absolute
 }
 
+fn native_recovery_candidates(routed: &[u32], reasons: &[PageOcrReasons]) -> Vec<u32> {
+    let reasons_by_page: BTreeMap<u32, &PageOcrReasons> =
+        reasons.iter().map(|entry| (entry.page, entry)).collect();
+    routed
+        .iter()
+        .copied()
+        .filter(|page| {
+            reasons_by_page.get(page).is_some_and(|entry| {
+                !entry.reasons.is_empty()
+                    && entry.reasons.iter().all(|reason| {
+                        reason == OCR_REASON_SUSPECTED_GARBLED_TEXT
+                            || reason == OCR_REASON_VECTOR_TEXT
+                    })
+            })
+        })
+        .collect()
+}
+
+fn credible_native_recovery(
+    items: &[crate::TextItem],
+    document_page_count: u32,
+    options: &MarkdownOptions,
+) -> Option<String> {
+    let text = items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_garbage_text(&text) || is_cid_garbage(&text) {
+        return None;
+    }
+
+    let markdown = crate::to_markdown_from_items_with_rects_and_page_count(
+        items.to_vec(),
+        options.clone(),
+        &[],
+        document_page_count,
+    );
+    let markdown = remove_duplicate_table_lines(&markdown);
+    let structured_uniform_ascii = is_uniform_case_structured_ascii(&text, &markdown);
+    let quality = analyze_text_quality(items);
+    if !structured_uniform_ascii && (quality.has_encoding_issues || detect_encoding_issues(&text)) {
+        return None;
+    }
+    (!markdown.trim().is_empty()).then_some(markdown)
+}
+
+fn is_complete_native_recovery(markdown: &str) -> bool {
+    let alphanumeric_chars = markdown
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    if alphanumeric_chars < 40 {
+        return false;
+    }
+    let visible_chars = markdown
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        .max(1);
+    let density = alphanumeric_chars as f32 / visible_chars as f32;
+    let length_score = (alphanumeric_chars as f32 / 160.0).min(1.0);
+    let nonempty_lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1);
+    let line_score = (alphanumeric_chars as f32 / nonempty_lines as f32 / 12.0).min(1.0);
+    let score = (0.45 + length_score * 0.25 + density * 0.20 + line_score * 0.10).min(1.0);
+    score >= 0.68
+}
+
+fn native_recovery_covers_page(page: &PdfiumTextPage) -> bool {
+    const VERTICAL_BANDS: f32 = 6.0;
+
+    let width = page.page_width;
+    let height = page.page_height;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return false;
+    }
+
+    let mut min_left = width;
+    let mut max_right = 0.0_f32;
+    let mut min_bottom = height;
+    let mut max_top = 0.0_f32;
+    let mut positioned_items = 0usize;
+    let mut occupied_bands = BTreeSet::new();
+    for item in &page.items {
+        if !item.text.chars().any(char::is_alphanumeric)
+            || !item.x.is_finite()
+            || !item.y.is_finite()
+            || !item.width.is_finite()
+            || !item.height.is_finite()
+            || item.width <= 0.0
+            || item.height <= 0.0
+        {
+            continue;
+        }
+        let left = item.x.clamp(0.0, width);
+        let right = (item.x + item.width).clamp(0.0, width);
+        let bottom = item.y.clamp(0.0, height);
+        let top = (item.y + item.height).clamp(0.0, height);
+        if right <= left || top <= bottom {
+            continue;
+        }
+
+        positioned_items += 1;
+        min_left = min_left.min(left);
+        max_right = max_right.max(right);
+        min_bottom = min_bottom.min(bottom);
+        max_top = max_top.max(top);
+        let center = (bottom + top) * 0.5;
+        let band = ((center / height) * VERTICAL_BANDS)
+            .floor()
+            .clamp(0.0, VERTICAL_BANDS - 1.0) as u8;
+        occupied_bands.insert(band);
+    }
+
+    positioned_items >= 6
+        && (max_right - min_left) / width >= 0.15
+        && (max_top - min_bottom) / height >= 0.35
+        && occupied_bands.len() >= 3
+}
+
+fn is_uniform_case_structured_ascii(text: &str, markdown: &str) -> bool {
+    if !text.is_ascii() || text.contains('$') || text.chars().any(char::is_control) {
+        return false;
+    }
+
+    let letters: Vec<_> = text
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .collect();
+    if letters.len() < 200 {
+        return false;
+    }
+    let uniform_case = letters
+        .iter()
+        .all(|character| character.is_ascii_uppercase())
+        || letters
+            .iter()
+            .all(|character| character.is_ascii_lowercase());
+    if !uniform_case {
+        return false;
+    }
+    if markdown_has_table(markdown) {
+        return true;
+    }
+
+    let nonempty_lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let visible_chars = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        .max(1);
+    let structural_chars = text
+        .chars()
+        .filter(|character| {
+            character.is_ascii_digit()
+                || matches!(
+                    character,
+                    '{' | '}'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '_'
+                        | '='
+                        | '+'
+                        | '*'
+                        | '/'
+                        | '\\'
+                        | '|'
+                        | '&'
+                        | '^'
+                        | '%'
+                        | '#'
+                        | '@'
+                        | '~'
+                )
+        })
+        .count();
+    nonempty_lines >= 4 && structural_chars * 20 >= visible_chars
+}
+
+fn markdown_has_table(markdown: &str) -> bool {
+    markdown.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('|')
+            && trimmed.ends_with('|')
+            && trimmed
+                .split('|')
+                .filter(|cell| !cell.is_empty())
+                .all(|cell| !cell.is_empty() && cell.chars().all(|ch| ch == '-'))
+    })
+}
+
+fn remove_duplicate_table_lines(markdown: &str) -> String {
+    let mut output = String::new();
+    let mut adjacent_table_row = None;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        let is_table_line = trimmed.starts_with('|') && trimmed.ends_with('|');
+        if is_table_line {
+            if !trimmed.contains("|---") && trimmed.matches('|').count() >= 4 {
+                let canonical = canonical_table_text(trimmed);
+                if !canonical.is_empty() {
+                    adjacent_table_row = Some(canonical);
+                }
+            }
+        } else if trimmed.is_empty() {
+            // Keep adjacency across the blank line emitted after a table.
+        } else {
+            let duplicate = adjacent_table_row
+                .as_ref()
+                .is_some_and(|table_row| *table_row == canonical_table_text(trimmed));
+            adjacent_table_row = None;
+            if duplicate {
+                continue;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    while output.ends_with("\n\n\n") {
+        output.pop();
+    }
+    output
+}
+
+fn canonical_table_text(text: &str) -> String {
+    text.replace('|', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
     let mut document = String::new();
     for (index, page) in pages.iter().enumerate() {
@@ -427,6 +731,25 @@ pub enum OcrPipelineError {
 mod tests {
     use super::*;
 
+    fn recovery_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> crate::TextItem {
+        crate::TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            font: "PDFium native text".to_string(),
+            font_size: height,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
     #[test]
     fn cache_path_is_stable_when_a_relative_directory_is_created() {
         let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
@@ -440,6 +763,99 @@ mod tests {
 
         assert!(before.is_absolute());
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn native_recovery_is_limited_to_recoverable_routing_reasons() {
+        let routed = [1, 2, 3, 4];
+        let reasons = [
+            PageOcrReasons {
+                page: 1,
+                reasons: vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 2,
+                reasons: vec![crate::OCR_REASON_SCANNED.to_string()],
+            },
+            PageOcrReasons {
+                page: 3,
+                reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+            },
+            PageOcrReasons {
+                page: 4,
+                reasons: vec![
+                    OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string(),
+                    crate::OCR_REASON_SCANNED.to_string(),
+                ],
+            },
+        ];
+
+        assert_eq!(native_recovery_candidates(&routed, &reasons), vec![1, 3]);
+    }
+
+    #[test]
+    fn native_recovery_requires_text_coverage_beyond_a_header() {
+        let header = PdfiumTextPage {
+            page: 1,
+            page_width: 600.0,
+            page_height: 800.0,
+            items: (0..8)
+                .map(|index| recovery_item("HEADER", index as f32 * 60.0, 740.0, 50.0, 12.0))
+                .collect(),
+        };
+        assert!(!native_recovery_covers_page(&header));
+
+        let complete = PdfiumTextPage {
+            page: 1,
+            page_width: 600.0,
+            page_height: 800.0,
+            items: vec![
+                recovery_item("Top one", 40.0, 700.0, 180.0, 12.0),
+                recovery_item("Top two", 260.0, 680.0, 180.0, 12.0),
+                recovery_item("Middle one", 40.0, 400.0, 180.0, 12.0),
+                recovery_item("Middle two", 260.0, 380.0, 180.0, 12.0),
+                recovery_item("Bottom one", 40.0, 100.0, 180.0, 12.0),
+                recovery_item("Bottom two", 260.0, 80.0, 180.0, 12.0),
+            ],
+        };
+        assert!(native_recovery_covers_page(&complete));
+    }
+
+    #[test]
+    fn uniform_case_guard_requires_structured_content() {
+        let table_text = "STATUS CODE 100 READY ".repeat(20);
+        let table_markdown = "|STATUS|CODE|\n|---|---|\n|READY|100|\n|READY|200|\n|READY|300|\n";
+        assert!(is_uniform_case_structured_ascii(
+            &table_text,
+            table_markdown
+        ));
+
+        let prose = "THIS IS ORDINARY UPPERCASE PROSE WITH NATURAL WORDS ".repeat(20);
+        let prose_markdown = prose
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .chunks(8)
+            .map(|line| line.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_uniform_case_structured_ascii(&prose, &prose_markdown));
+    }
+
+    #[test]
+    fn recovered_markdown_drops_plain_duplicates_of_table_rows() {
+        let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nApril 1 42 ok\n";
+
+        assert_eq!(
+            remove_duplicate_table_lines(markdown),
+            "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\n"
+        );
+    }
+
+    #[test]
+    fn recovered_markdown_keeps_nonadjacent_repeated_table_text() {
+        let markdown = "|Date|Value|Status|\n|---|---|---|\n|April 1|42|ok|\n\nSummary follows.\n\nApril 1 42 ok\n";
+
+        assert_eq!(remove_duplicate_table_lines(markdown), markdown);
     }
 
     #[test]
