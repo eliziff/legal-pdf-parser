@@ -48,8 +48,7 @@ Use the [paired benchmark harness](docs/benchmarking.md) to compare two local bu
 ### Python
 
 ```bash
-pip install maturin
-maturin develop --release
+pip install pdf-inspector
 ```
 
 ```python
@@ -182,8 +181,9 @@ and confidence, warnings, and pages recommended for the hosted document
 pipeline. Native Python and Node packages expose the same pipeline without a
 source-build feature. All native entry points still require separately
 installed PDFium and ONNX Runtime libraries only when OCR is routed. See the
-[Rust API guide](docs/rust-api.md#complete-ocr-api) for model cache and offline
-configuration.
+[OCR runtime setup guide](docs/ocr-runtime.md) for pinned downloads, platform
+support, model-cache behavior, and hosted-fallback integration. See the
+[Rust API guide](docs/rust-api.md#complete-ocr-api) for lower-level controls.
 
 From a source checkout, use `cargo run --bin pdf2md -- document.pdf` or `cargo run --bin detect-pdf -- document.pdf` instead.
 

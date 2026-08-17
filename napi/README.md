@@ -41,7 +41,9 @@ OCR calls that route work require compatible PDFium and ONNX Runtime shared
 libraries. Set `PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` when they are not on the
 platform library search path. The pinned OCR model set is downloaded and
 checksum-verified on the first routed page; use `offline: true` with a warm
-cache or `modelDirectory` to prohibit network access.
+cache or `modelDirectory` to prohibit network access. See the
+[OCR runtime setup guide](https://github.com/firecrawl/pdf-inspector/blob/main/docs/ocr-runtime.md)
+for pinned downloads, supported platforms, and hosted-fallback behavior.
 
 ## API
 
