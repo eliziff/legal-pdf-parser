@@ -340,6 +340,62 @@ warnings. A page that required OCR recommends the hosted pipeline when local
 OCR is missing, empty, or below the configurable page-confidence threshold.
 This keeps the lightweight path explicit about cases it cannot finish well.
 
+### Complete OCR API
+
+The `ocr` convenience feature enables the renderer, OCR engine, verified
+model acquisition, routing, and fusion layers together. It is the intended
+downstream application integration boundary; lower-level features remain
+available for consumers that bring their own renderer, model package manager,
+or engine.
+
+```toml
+[dependencies]
+pdf-inspector = { version = "1", features = ["ocr"] }
+```
+
+```rust
+use pdf_inspector::vision::{
+    process_pdf_with_ocr, OcrMode, OcrPdfOptions,
+};
+
+let result = process_pdf_with_ocr(
+    "document.pdf",
+    OcrPdfOptions::new()
+        .mode(OcrMode::Auto)
+        .pages([1, 2, 3]),
+)?;
+
+println!("{}", result.markdown);
+println!("OCR pages: {:?}", result.pages_routed_to_ocr);
+println!(
+    "Hosted fallback pages: {:?}",
+    result.pages_recommending_hosted,
+);
+```
+
+Native extraction always runs first. In `Auto`, a clean PDF returns before
+PDFium loading, model-cache access, HTTP, or OAR initialization. Model files
+remain external and the default crate feature set remains unchanged. `Off`
+provides the same native-only behavior through the OCR result/provenance
+shape; `Force` renders every selected page. Learned layout intentionally
+returns an explicit unsupported error in this lightweight pipeline.
+
+Build the CLI with the same opt-in feature:
+
+```bash
+cargo build --release --features ocr --bin pdf2md
+pdf2md document.pdf --ocr auto --raw
+pdf2md document.pdf --ocr auto --json
+pdf2md document.pdf --ocr auto --ocr-offline --ocr-model-dir /opt/models/pp-ocrv6-small
+```
+
+CLI controls include `--ocr-dpi`, `--ocr-min-confidence`,
+`--ocr-hosted-threshold`, `--select-pages`, and the existing encrypted-PDF
+`--password` option. JSON output includes per-page Markdown, source/model
+provenance, confidence, timings, warnings, routed pages, and hosted-fallback
+recommendations. Page numbers in `OcrPdfResult` and its per-page provenance
+are 1-indexed, matching the PDF page numbers accepted by `OcrPdfOptions::pages`.
+
 Extract per-page Markdown (one string per page, plus document-wide layout
 metadata):
 
