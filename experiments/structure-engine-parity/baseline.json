@@ -1,0 +1,227 @@
+{
+  "schema_version": "legalpdf.structure-engine-parity.v1",
+  "binary": "C:\\Users\\elias\\Desktop\\MikeOSS Fork\\.tmp\\release-live\\bin\\legalpdf.exe",
+  "binary_sha256": "85be89d29d6cfde928eaac66a7834d26568bbca25b467fbccf6945b1bd3075b4",
+  "cargo_quick": {
+    "command": "cargo quick",
+    "elapsed_seconds": 0.799,
+    "budget_seconds": 5.0
+  },
+  "documents": [
+    {
+      "candidate_id": "1887a3a58fc1997c683bd75b",
+      "document_type": "brief_or_submission",
+      "jurisdiction": "ca",
+      "lines": 6586,
+      "pages": 159,
+      "relative_path": "pdfs/ca/digitalborn/closing_submission/poec-submissions/ca-government-of-canada-closing-submissions-pdf-2-mb-96d39f5a23be.pdf",
+      "source_sha256": "96d39f5a23be5068dfc9b1f8f7d1bf3c5d3d349d8e0530963d830786015bdd15",
+      "input_bytes": 10855419,
+      "input_sha256": "3eda5492af9417786eb9d7749f9ffc96e7a7171748767b518cd30c8c1850e248",
+      "output_bytes": 59212699,
+      "output_sha256": "a9956b3fb8b009cbacfe6778d13c8e91131e412732c2fe4e81329c66be9f8dae",
+      "replay_seconds": [
+        0.746817,
+        0.816331
+      ]
+    },
+    {
+      "candidate_id": "52c3516b037bd30495357ebd",
+      "document_type": "pleading_or_order",
+      "jurisdiction": "us",
+      "lines": 118,
+      "pages": 4,
+      "relative_path": "pdfs/us/digitalborn/court_form/us-federal-circuit-forms/us-motion-and-declaration-for-leave-to-proceed-in-forma-pauperis-pdf-0317dee5c040.pdf",
+      "source_sha256": "0317dee5c0401528829720d9ba750beed09191bf180cdf6d9bf61104f5c71abc",
+      "input_bytes": 118318,
+      "input_sha256": "db944202a817211ae332457f80e4411e45ba93c7926594a2afdf7b38e83715f0",
+      "output_bytes": 645006,
+      "output_sha256": "7294f9f25c2a3fcc3cb88b79259a6f79567ca2d54ce6bc3e57371fbc5b5fa7b6",
+      "replay_seconds": [
+        0.430119,
+        0.07863
+      ]
+    },
+    {
+      "candidate_id": "9e1a9f412c72f2b0b73f4dff",
+      "document_type": "other",
+      "jurisdiction": "us",
+      "lines": 214,
+      "pages": 6,
+      "relative_path": "pdfs/us/digitalborn/rules_or_regulations/us-court-forms/us-rules-committee-procedures-805ede259583.pdf",
+      "source_sha256": "805ede259583ea446101a486adcfa1aa4992f9724acba628920ac0ebe181baed",
+      "input_bytes": 309962,
+      "input_sha256": "6cf85c4f43e0506836b08ff2f08e15ffb26b684e1b22472642e72d401a665932",
+      "output_bytes": 1596933,
+      "output_sha256": "d08056759d16348df742b7ec4cbc738b4d8bcff154258ee7b81ae4d7830eaa43",
+      "replay_seconds": [
+        0.429583,
+        0.078212
+      ]
+    },
+    {
+      "candidate_id": "0b1f9a2b92bc22c509da5dfe",
+      "document_type": "exhibit",
+      "jurisdiction": "ca",
+      "lines": 526,
+      "pages": 17,
+      "relative_path": "pdfs/ca/digitalborn/presentation/foreign-interference-commission/ca-house-of-commons-administration-pdf-d9fb42a0cfea.pdf",
+      "source_sha256": "d9fb42a0cfea726e029579b96246cc1ec42ebd7a8fe3b60db35ab3e301c4adfd",
+      "input_bytes": 1063423,
+      "input_sha256": "1003773fbca7c1912b0e5d76c29dae66c5c2708215e7be2ef82fa64695076cc3",
+      "output_bytes": 5611650,
+      "output_sha256": "84b6f487a54db810217182ed4659ec03cccaf02a528e83083a6af17faaa37d9a",
+      "replay_seconds": [
+        0.408728,
+        0.257446
+      ]
+    },
+    {
+      "candidate_id": "d451fa836c772d87455eee42",
+      "document_type": "other",
+      "jurisdiction": "ca",
+      "lines": 7455,
+      "pages": 14,
+      "relative_path": "pdfs/ca/digitalborn/zoning_map/mississauga-zoning/ca-part-13-zoning-maps-642987512af2.pdf",
+      "source_sha256": "642987512af29d0f7dda8fa53f73d40b28d5a361aa2b275f41732476d845a573",
+      "input_bytes": 5052289,
+      "input_sha256": "0505c91af9172e09fb5f32e07a9d53c972d15f9c8309b43d6b0727af0e9e449a",
+      "output_bytes": 26805053,
+      "output_sha256": "9246689c4d0200ab38c0b79a50024ed802fda4bf37f7cc4f433f9aa820cf47e8",
+      "replay_seconds": [
+        0.417017,
+        0.606146
+      ]
+    },
+    {
+      "candidate_id": "ea4ca61f2690c75fbaeca5c6",
+      "document_type": "exhibit",
+      "jurisdiction": "ca",
+      "lines": 3524,
+      "pages": 53,
+      "relative_path": "pdfs/ca/digitalborn/research_report/crtc-legislative-review/ca-bce-inc-a-research-report-examining-affordability-in-the-canadian-mobile-wireless-and-fixe-4a186bafa90c.pdf",
+      "source_sha256": "4a186bafa90cb57a316c3b10eb64b9e2b3758c3bb2e00bcbb4f247e03e6ac40b",
+      "input_bytes": 3644120,
+      "input_sha256": "d638978843b6a64f327134695fba7638b9c4d62843ae86f92358e3a9ca575774",
+      "output_bytes": 19060325,
+      "output_sha256": "0d3835f179b9391279b0a90a7a51b1946e58e6be21ad525c654993dea1801187",
+      "replay_seconds": [
+        0.34607,
+        0.344669
+      ]
+    },
+    {
+      "candidate_id": "49bc9ed1bc05ef7fd4c34624",
+      "document_type": "contract",
+      "jurisdiction": "ca",
+      "lines": 2571,
+      "pages": 72,
+      "relative_path": "pdfs/ca/digitalborn/agreement/ottawa-zoning-documents/ca-overview-of-structure-and-content-final-lpp-project-agreements-b12886db2653.pdf",
+      "source_sha256": "b12886db265379359530810dda851cc61be04f82190297e77a71804f204f342c",
+      "input_bytes": 4210006,
+      "input_sha256": "ea53ed2cbf8d358779654029d06580f7ceff782721b3346d2cb0a93601a67377",
+      "output_bytes": 21793064,
+      "output_sha256": "f72b20261e89a2bf1a7820081cae48b9190f6dda764470ff3cdc19d8b70023a2",
+      "replay_seconds": [
+        0.32744,
+        0.408393
+      ]
+    },
+    {
+      "candidate_id": "057c19eb25ff56cec4a5d0ff",
+      "document_type": "transcript",
+      "jurisdiction": "us",
+      "lines": 5301,
+      "pages": 69,
+      "relative_path": "pdfs/us/digitalborn/transcript/us-supreme-transcripts/us-23-1259-38722d5ecf26.pdf",
+      "source_sha256": "38722d5ecf26d2e392d54e7be1a774b1c379dbce9799d34bbfa67b8d5ada4b0a",
+      "input_bytes": 5758846,
+      "input_sha256": "28a1d3d73adbaddcc3a2a0bf40117a02304db6aa5c970d6cff0843c58cb93e0e",
+      "output_bytes": 31684318,
+      "output_sha256": "c8e6d60f24ced3e1dfe8fae91658e3a637fe43aefd9b9288327446b531f77176",
+      "replay_seconds": [
+        0.394669,
+        0.277093
+      ]
+    },
+    {
+      "candidate_id": "0002eee3dc6f35a24a96db15",
+      "document_type": "other",
+      "jurisdiction": "au",
+      "lines": 201,
+      "pages": 5,
+      "relative_path": "pdfs/au/digitalborn/other/au-nsw-ucpr-forms/au-52-v3-b3db543b54fc.pdf",
+      "source_sha256": "b3db543b54fc90f7a39aeecd4fb3b58e12311018dd5dd8e67d538d0a9aa6df9d",
+      "input_bytes": 178615,
+      "input_sha256": "4e672c5a64507730d998ff2bf69e5a8c425deb0dc3f9ccbc3e8a739d17709dc2",
+      "output_bytes": 996263,
+      "output_sha256": "62daa6b8f71afe5f54fa98d08ab487cec345d1246440111036470a50b97d0bd5",
+      "replay_seconds": [
+        0.048915,
+        0.049478
+      ]
+    },
+    {
+      "candidate_id": "0f93b5b509190aaa3527ac7f",
+      "document_type": "pleading_or_order",
+      "jurisdiction": "nz",
+      "lines": 80,
+      "pages": 1,
+      "relative_path": "pdfs/nz/digitalborn/order/nz-justice-publications/nz-personal-orders-pdf-69-kb-d2b461184e5c.pdf",
+      "source_sha256": "d2b461184e5c4ca21c29e81c3b4d0a14eefcdef226a5f68fc71d49db8f0e75b5",
+      "input_bytes": 104534,
+      "input_sha256": "b6da2b6c3d8dd01fbf69c06c70fbe80aa9fd50d156442ec711114e333f362a32",
+      "output_bytes": 566594,
+      "output_sha256": "98c7a5f3e80633b8dc2a6d3bb56f5945cbbd053f109607f17654808465180434",
+      "replay_seconds": [
+        0.041774,
+        0.041758
+      ]
+    },
+    {
+      "candidate_id": "0051f6cd94a3c39519709a10",
+      "document_type": "pleading_or_order",
+      "jurisdiction": "uk",
+      "lines": 28,
+      "pages": 1,
+      "relative_path": "pdfs/uk/digitalborn/order/uk-infected-blood-workflow/uk-individual-restriction-order-mr-ac-w0196-41d0352c6059.pdf",
+      "source_sha256": "41d0352c6059ae1898bc23341941290f9c7caf78c10307686d4205382f45b1b1",
+      "input_bytes": 41642,
+      "input_sha256": "ee843a5f7388a342203208b89b5c953b437b01efcbf3db2964d48ddb32655b37",
+      "output_bytes": 228303,
+      "output_sha256": "bf336c1e858c17bb5881d52e4a2102be62b18eae8d5ed549767e8ff8bd6bb43b",
+      "replay_seconds": [
+        0.045056,
+        0.046376
+      ]
+    }
+  ],
+  "metrics": {
+    "cache_index_seconds": 0.076,
+    "documents": 11,
+    "lines_per_repetition": 26604,
+    "max_temp_mib_per_document": 128.0,
+    "parallel_jobs": 4,
+    "pages_per_repetition": 401,
+    "repetitions": 2,
+    "replay_pages_per_second": 293.1,
+    "replay_process_seconds": 6.641,
+    "replay_seconds": 2.737,
+    "startup": {
+      "median_ms": 7.376,
+      "p95_ms": 7.933,
+      "runs": 7,
+      "timings_ms": [
+        7.376,
+        6.805,
+        7.494,
+        6.413,
+        7.933,
+        6.642,
+        7.598
+      ]
+    }
+  },
+  "output_sha256": "ea4531f82513c99bacea0b5a5bfef9d1aeb85bfca7113b595b6ae0aa47fb109d",
+  "sample_sha256": "06e80b9f95cba6c9587e19eba8d1bf26173d395794a8377ebe4f118701e292e1"
+}

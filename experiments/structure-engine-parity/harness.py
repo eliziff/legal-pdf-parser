@@ -1,0 +1,694 @@
+"""Fast byte-parity and build-latency gate for the Rust structure engine."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import filecmp
+import gzip
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from statistics import median
+
+
+ROOT = Path(__file__).resolve().parents[3]
+HERE = Path(__file__).resolve().parent
+AUDIT = ROOT / ".tmp" / "digital-native-structure-audit"
+DEFAULT_BINARY = ROOT / ".tmp" / "release-live" / "bin" / "legalpdf.exe"
+BASELINE = HERE / "baseline.json"
+ALL_BASELINE = HERE / "all-cache-baseline.json"
+ALL_RECEIPTS = ROOT / ".tmp" / "structure-engine-parity-receipts"
+HEAVY_INPUT_BYTES = 20 * 1024 * 1024
+LIGHT_TEMP_BYTES = 160 * 1024 * 1024
+HEAVY_TEMP_BYTES = 1024 * 1024 * 1024
+SAMPLE_PREFIXES = (
+    "1887",  # audited Canadian closing submission; 159 pages and dense notes
+    "52c",  # audited US court form
+    "9e1",  # audited US rules
+    "0b1",  # audited Canadian presentation/TOC
+    "d451",  # audited zoning maps and repeated headers
+    "ea4",  # audited research report with tables/notes
+    "49bc",  # audited agreement with a long table
+    "057c",  # audited US Supreme Court transcript/index
+    "0002",  # Australian form
+    "0f93",  # New Zealand order
+    "0051",  # United Kingdom order
+)
+SOURCE_SHA = re.compile(br'"source_sha256"\s*:\s*"([0-9a-f]{64})"')
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_sha(value: object) -> str:
+    return sha256_bytes(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
+
+
+def load_sample() -> list[dict]:
+    records = AUDIT / "records"
+    rows = []
+    for prefix in SAMPLE_PREFIXES:
+        matches = sorted(records.glob(f"{prefix}*.json"))
+        if len(matches) != 1:
+            raise AssertionError(f"expected one audit record for {prefix}, found {len(matches)}")
+        record = json.loads(matches[0].read_text(encoding="utf-8"))
+        if record.get("outcome") != "passed":
+            raise AssertionError(f"audit record did not pass: {matches[0]}")
+        candidate = record["candidate"]
+        rows.append(
+            {
+                "candidate_id": matches[0].stem,
+                "document_type": candidate["document_type"],
+                "jurisdiction": candidate["jurisdiction"],
+                "lines": record["document"]["lines"],
+                "pages": candidate["page_count"],
+                "relative_path": candidate["relative_path"],
+                "source_sha256": candidate["sha256"],
+            }
+        )
+    return rows
+
+
+def load_all_sample() -> list[dict]:
+    rows = []
+    record_paths = sorted((AUDIT / "records").glob("*.json"))
+    outcomes: dict[str, int] = {}
+    for path in record_paths:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        outcome = record.get("outcome", "missing")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if record.get("outcome") != "passed":
+            continue
+        candidate = record["candidate"]
+        rows.append(
+            {
+                "candidate_id": path.stem,
+                "document_type": candidate["document_type"],
+                "jurisdiction": candidate["jurisdiction"],
+                "lines": record.get("document", {}).get("lines", 0),
+                "pages": candidate["page_count"],
+                "relative_path": candidate["relative_path"],
+                "source_sha256": candidate["sha256"],
+            }
+        )
+    if len(record_paths) != 750 or outcomes != {"failed": 2, "passed": 748}:
+        raise AssertionError(
+            f"audit denominator drift: records={len(record_paths)}, outcomes={outcomes}"
+        )
+    if len({row["candidate_id"] for row in rows}) != len(rows):
+        raise AssertionError("duplicate candidate ID in audit records")
+    if len({row["source_sha256"] for row in rows}) != len(rows):
+        raise AssertionError("duplicate source SHA-256 in passed audit records")
+    return rows
+
+
+def extraction_index(wanted: set[str]) -> tuple[dict[str, Path], float]:
+    started = time.perf_counter()
+    found: dict[str, Path] = {}
+    extraction_root = AUDIT / "cache" / "parse-v1" / "extractions"
+    for path in extraction_root.glob("*.json.gz"):
+        with gzip.open(path, "rb") as stream:
+            match = SOURCE_SHA.search(stream.read(4096))
+        if match:
+            source_sha = match.group(1).decode("ascii")
+            if source_sha in wanted:
+                if source_sha in found:
+                    raise AssertionError(f"duplicate cached extraction for source: {source_sha}")
+                found[source_sha] = path
+    missing = sorted(wanted - found.keys())
+    if missing:
+        raise AssertionError(f"missing cached extractions: {missing}")
+    return found, time.perf_counter() - started
+
+
+def validate_document_cache(wanted: set[str]) -> float:
+    started = time.perf_counter()
+    found: dict[str, Path] = {}
+    document_root = AUDIT / "cache" / "parse-v1" / "documents"
+    for path in document_root.glob("*.json.gz"):
+        with gzip.open(path, "rb") as stream:
+            match = SOURCE_SHA.search(stream.read(4096))
+        if not match:
+            raise AssertionError(f"document cache has no source SHA-256 header: {path}")
+        source_sha = match.group(1).decode("ascii")
+        if source_sha in found:
+            raise AssertionError(f"duplicate cached document for source: {source_sha}")
+        found[source_sha] = path
+    missing = sorted(wanted - found.keys())
+    unexpected = sorted(found.keys() - wanted)
+    if missing or unexpected:
+        raise AssertionError(
+            f"document cache/source drift: missing={missing[:3]}, unexpected={unexpected[:3]}"
+        )
+    return time.perf_counter() - started
+
+
+def write_common_input(row: dict, extraction_path: Path, output: Path) -> dict:
+    with gzip.open(extraction_path, "rt", encoding="utf-8") as stream:
+        cached = json.load(stream)
+    if cached["schema_version"] != "legalpdf.extraction-cache.v1":
+        raise AssertionError(f"unexpected cache schema: {extraction_path}")
+    if cached["source_sha256"] != row["source_sha256"]:
+        raise AssertionError(f"source mismatch: {extraction_path}")
+    extracted = cached["extraction"]
+    common = {
+        "pages": extracted["pages"],
+        "schema_version": "legalpdf.common-input.v1",
+        "separators": extracted["separators"],
+        "source_name": Path(row["relative_path"]).name,
+        "source_sha256": row["source_sha256"],
+    }
+    if len(common["pages"]) != row["pages"] or len(common["separators"]) != row["pages"]:
+        raise AssertionError(f"page count mismatch: {row['candidate_id']}")
+    output.write_text(
+        json.dumps(common, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "input_bytes": output.stat().st_size,
+        "input_lines": sum(len(page.get("lines", [])) for page in common["pages"]),
+        "input_sha256": sha256_file(output),
+    }
+
+
+def gzip_size(path: Path) -> int:
+    with path.open("rb") as stream:
+        stream.seek(-4, os.SEEK_END)
+        return struct.unpack("<I", stream.read(4))[0]
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def run(command: list[str], *, cwd: Path | None = None, timeout: float = 15) -> tuple[float, str]:
+    started = time.perf_counter()
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=timeout,
+        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+    )
+    elapsed = time.perf_counter() - started
+    if completed.returncode:
+        raise AssertionError(f"command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr}")
+    return elapsed, completed.stdout
+
+
+def startup_metrics(binary: Path, repetitions: int) -> dict:
+    run([str(binary), "--version"])
+    timings = [run([str(binary), "--version"])[0] * 1000 for _ in range(repetitions)]
+    return {
+        "median_ms": round(median(timings), 3),
+        "p95_ms": round(percentile(timings, 0.95), 3),
+        "runs": repetitions,
+        "timings_ms": [round(value, 3) for value in timings],
+    }
+
+
+def cargo_is_idle() -> bool:
+    if os.name != "nt":
+        return True
+    for executable in ("cargo.exe", "rustc.exe"):
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {executable}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if executable.lower() in completed.stdout.lower():
+            return False
+    return True
+
+
+def cargo_quick_metrics(max_seconds: float) -> dict:
+    if not cargo_is_idle():
+        raise AssertionError("cargo or rustc is already running; refusing to start cargo quick")
+    elapsed, _ = run(["cargo", "quick"], cwd=ROOT / "legal-pdf-parser", timeout=max_seconds + 2)
+    return {"command": "cargo quick", "elapsed_seconds": round(elapsed, 3), "budget_seconds": max_seconds}
+
+
+def replay(
+    binary: Path,
+    sample: list[dict],
+    index: dict[str, Path],
+    work: Path,
+    repetitions: int,
+    jobs: int,
+    max_temp_bytes: int,
+) -> tuple[list[dict], float, float]:
+    def replay_one(item: tuple[int, dict]) -> dict:
+        position, row = item
+        print(f"[{position}/{len(sample)}] {row['candidate_id']} ({row['pages']} pages)", flush=True)
+        input_path = work / f"{row['candidate_id']}.input.json"
+        result = {**row, **write_common_input(row, index[row["source_sha256"]], input_path)}
+        outputs = []
+        timings = []
+        for repetition in range(repetitions):
+            output_path = work / f"{row['candidate_id']}.output-{repetition + 1}.json"
+            elapsed, _ = run(
+                [str(binary), "_parity-replay", str(input_path), "--output", str(output_path)],
+                timeout=15,
+            )
+            timings.append(elapsed)
+            outputs.append(output_path)
+        if any(not filecmp.cmp(outputs[0], path, shallow=False) for path in outputs[1:]):
+            raise AssertionError(f"repeat replay bytes differ: {row['candidate_id']}")
+        temporary_bytes = input_path.stat().st_size + sum(path.stat().st_size for path in outputs)
+        if temporary_bytes > max_temp_bytes:
+            raise AssertionError(
+                f"temporary output for {row['candidate_id']} is {temporary_bytes} bytes; "
+                f"budget is {max_temp_bytes}"
+            )
+        result.update(
+            {
+                "output_bytes": outputs[0].stat().st_size,
+                "output_sha256": sha256_file(outputs[0]),
+                "replay_seconds": [round(value, 6) for value in timings],
+            }
+        )
+        input_path.unlink()
+        for path in outputs:
+            path.unlink()
+        return result
+
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(pool.map(replay_one, enumerate(sample, 1)))
+    return results, time.perf_counter() - started, sum(sum(row["replay_seconds"]) for row in results)
+
+
+def comparable(report: dict) -> dict:
+    return {
+        "sample_sha256": report["sample_sha256"],
+        "documents": [
+            {
+                key: row[key]
+                for key in ("candidate_id", "input_bytes", "input_sha256", "output_bytes", "output_sha256", "pages")
+            }
+            for row in report["documents"]
+        ],
+    }
+
+
+def comparable_document(row: dict) -> dict:
+    return {
+        key: row[key]
+        for key in ("candidate_id", "input_bytes", "input_sha256", "output_bytes", "output_sha256", "pages")
+    }
+
+
+def all_cache_one(binary: Path, binary_sha: str, row: dict, extraction: Path, work: Path) -> dict:
+    extraction_sha = sha256_file(extraction)
+    receipt_path = ALL_RECEIPTS / binary_sha / f"{row['candidate_id']}.json"
+    if receipt_path.is_file():
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (
+            receipt.get("schema_version") == "legalpdf.structure-engine-parity-receipt.v1"
+            and receipt.get("binary_sha256") == binary_sha
+            and receipt.get("extraction_sha256") == extraction_sha
+            and receipt.get("source_sha256") == row["source_sha256"]
+            and receipt.get("pages") == row["pages"]
+            and receipt.get("relative_path") == row["relative_path"]
+        ):
+            return {**receipt, "resumed": True}
+    input_path = work / f"{row['candidate_id']}.input.json"
+    output_path = work / f"{row['candidate_id']}.output.json"
+    common = write_common_input(row, extraction, input_path)
+    input_size = gzip_size(extraction)
+    limit = HEAVY_TEMP_BYTES if input_size > HEAVY_INPUT_BYTES else LIGHT_TEMP_BYTES
+    elapsed, _ = run(
+        [str(binary), "_parity-replay", str(input_path), "--output", str(output_path)], timeout=30
+    )
+    temporary_bytes = input_path.stat().st_size + output_path.stat().st_size
+    if temporary_bytes > limit:
+        raise AssertionError(
+            f"temporary output for {row['candidate_id']} is {temporary_bytes} bytes; budget is {limit}"
+        )
+    receipt = {
+        "schema_version": "legalpdf.structure-engine-parity-receipt.v1",
+        "binary_sha256": binary_sha,
+        "candidate_id": row["candidate_id"],
+        "document_type": row["document_type"],
+        "elapsed_seconds": round(elapsed, 6),
+        "extraction_bytes": extraction.stat().st_size,
+        "extraction_sha256": extraction_sha,
+        "input_bytes_uncompressed": input_size,
+        "jurisdiction": row["jurisdiction"],
+        "lines": common["input_lines"],
+        "max_temp_bytes": temporary_bytes,
+        "output_bytes": output_path.stat().st_size,
+        "output_sha256": sha256_file(output_path),
+        "pages": row["pages"],
+        "relative_path": row["relative_path"],
+        "source_sha256": row["source_sha256"],
+        **common,
+    }
+    input_path.unlink()
+    output_path.unlink()
+    atomic_json(receipt_path, receipt)
+    return {**receipt, "resumed": False}
+
+
+def all_cache_batch(
+    binary: Path,
+    binary_sha: str,
+    rows: list[dict],
+    index: dict[str, Path],
+    work: Path,
+    jobs: int,
+    completed: int,
+    total: int,
+) -> tuple[list[dict], list[dict], int]:
+    results = []
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(all_cache_one, binary, binary_sha, row, index[row["source_sha256"]], work): row
+            for row in rows
+        }
+        for future in concurrent.futures.as_completed(futures):
+            row = futures[future]
+            completed += 1
+            try:
+                result = future.result()
+                results.append(result)
+                if completed % 25 == 0 or row["pages"] >= 400 or completed == total:
+                    state = "resume" if result["resumed"] else "replay"
+                    print(f"[{completed}/{total}] {state} {row['candidate_id']} ({row['pages']} pages)", flush=True)
+            except Exception as error:  # continue so the receipt names every failure
+                failures.append({"candidate_id": row["candidate_id"], "error": str(error)})
+                print(f"[{completed}/{total}] FAIL {row['candidate_id']}: {error}", flush=True)
+    return results, failures, completed
+
+
+def all_cache_execute(args: argparse.Namespace) -> dict:
+    started = time.perf_counter()
+    binary = args.binary.resolve()
+    if not binary.is_file():
+        raise AssertionError(f"binary not found: {binary}")
+    binary_sha = sha256_file(binary)
+    sample = load_all_sample()
+    extraction_files = list((AUDIT / "cache" / "parse-v1" / "extractions").glob("*.json.gz"))
+    document_files = list((AUDIT / "cache" / "parse-v1" / "documents").glob("*.json.gz"))
+    if len(extraction_files) != len(sample) or len(document_files) != len(sample):
+        raise AssertionError(
+            f"cache denominator drift: records={len(sample)}, extractions={len(extraction_files)}, "
+            f"documents={len(document_files)}"
+        )
+    wanted_sources = {row["source_sha256"] for row in sample}
+    index, scan_seconds = extraction_index(wanted_sources)
+    document_scan_seconds = validate_document_cache(wanted_sources)
+    heavy = [row for row in sample if gzip_size(index[row["source_sha256"]]) > HEAVY_INPUT_BYTES]
+    light = [row for row in sample if row not in heavy]
+    heavy_sizes = sorted((gzip_size(index[row["source_sha256"]]) for row in heavy), reverse=True)
+    light_sizes = sorted((gzip_size(index[row["source_sha256"]]) for row in light), reverse=True)
+    results = []
+    failures = []
+    completed = 0
+    replay_started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="structure-engine-parity-all-", dir=ROOT / ".tmp") as temporary:
+        work = Path(temporary)
+        batch, errors, completed = all_cache_batch(
+            binary, binary_sha, heavy, index, work, min(2, args.jobs), completed, len(sample)
+        )
+        results.extend(batch)
+        failures.extend(errors)
+        batch, errors, completed = all_cache_batch(
+            binary, binary_sha, light, index, work, args.jobs, completed, len(sample)
+        )
+        results.extend(batch)
+        failures.extend(errors)
+    replay_wall = time.perf_counter() - replay_started
+    results.sort(key=lambda row: row["candidate_id"])
+    expected_by_id = {}
+    if not args.freeze:
+        expected = json.loads(ALL_BASELINE.read_text(encoding="utf-8"))
+        expected_by_id = {row["candidate_id"]: row for row in expected["documents"]}
+        if set(expected_by_id) != {row["candidate_id"] for row in sample}:
+            failures.append({"candidate_id": "all-cache", "error": "baseline/sample ID set mismatch"})
+    exact_matches = sum(
+        comparable_document(row) == comparable_document(expected_by_id[row["candidate_id"]])
+        for row in results
+        if row["candidate_id"] in expected_by_id
+    )
+    if not args.freeze:
+        for row in results:
+            expected_row = expected_by_id.get(row["candidate_id"])
+            if expected_row is None or comparable_document(row) != comparable_document(expected_row):
+                failures.append({"candidate_id": row["candidate_id"], "error": "byte/hash mismatch"})
+    executed = [row for row in results if not row["resumed"]]
+    executed_pages = sum(row["pages"] for row in executed)
+    executed_rate = executed_pages / replay_wall if executed_pages else None
+    if executed_rate is not None and executed_rate < args.min_replay_pages_per_second:
+        failures.append(
+            {
+                "candidate_id": "all-cache",
+                "error": (
+                    f"replay {executed_rate:.1f} pages/s < "
+                    f"{args.min_replay_pages_per_second} pages/s"
+                ),
+            }
+        )
+    report = {
+        "schema_version": "legalpdf.structure-engine-parity-all-cache.v1",
+        "binary_sha256": binary_sha,
+        "documents": [{key: value for key, value in row.items() if key not in {"resumed"}} for row in results],
+        "failures": failures,
+        "metrics": {
+            "cache_index_seconds": round(scan_seconds, 3),
+            "document_cache_index_seconds": round(document_scan_seconds, 3),
+            "documents": len(results),
+            "exact_matches": None if args.freeze else exact_matches,
+            "executed_documents": len(executed),
+            "executed_pages": executed_pages,
+            "executed_pages_per_second": round(executed_rate, 1) if executed_rate else None,
+            "heavy_documents": len(heavy),
+            "jobs_heavy": min(2, args.jobs),
+            "jobs_light": args.jobs,
+            "lines": sum(row["lines"] for row in results),
+            "pages": sum(row["pages"] for row in results),
+            "replay_wall_seconds": round(replay_wall, 3),
+            "resumed_documents": len(results) - len(executed),
+            "total_seconds": round(time.perf_counter() - started, 3),
+        },
+        "bounds": {
+            "heavy_input_threshold_mib": HEAVY_INPUT_BYTES / 1024 / 1024,
+            "heavy_temp_mib_per_document": HEAVY_TEMP_BYTES / 1024 / 1024,
+            "light_temp_mib_per_document": LIGHT_TEMP_BYTES / 1024 / 1024,
+            "max_temp_bytes_observed": max((row["max_temp_bytes"] for row in results), default=0),
+            "raw_outputs_retained": 0,
+            "uncompressed_input_bytes_in_flight_bound": max(
+                sum(heavy_sizes[: min(2, args.jobs)]), sum(light_sizes[: args.jobs])
+            ),
+        },
+        "input_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "input_sha256": row["input_sha256"]} for row in results]
+        ),
+        "output_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "output_sha256": row["output_sha256"]} for row in results]
+        ),
+        "source_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "source_sha256": row["source_sha256"]} for row in results]
+        ),
+        "sample_sha256": canonical_sha(
+            [
+                {
+                    "candidate_id": row["candidate_id"],
+                    "pages": row["pages"],
+                    "relative_path": row["relative_path"],
+                    "source_sha256": row["source_sha256"],
+                }
+                for row in sample
+            ]
+        ),
+    }
+    failed_run_path = ALL_RECEIPTS / binary_sha / "failed-run.json"
+    if failed_run_path.is_file():
+        failed_run = json.loads(failed_run_path.read_text(encoding="utf-8"))
+        if failed_run.get("binary_sha256") == binary_sha and len(failed_run.get("documents", [])) == len(sample):
+            report["fresh_run_receipt"] = {
+                "bounds": failed_run.get("bounds"),
+                "failures": failed_run.get("failures"),
+                "metrics": failed_run.get("metrics"),
+            }
+    if failures or len(results) != len(sample):
+        atomic_json(ALL_RECEIPTS / binary_sha / "failed-run.json", report)
+        raise AssertionError(f"all-cache parity failed: {len(results)}/{len(sample)} complete; {failures[:3]}")
+    if args.freeze:
+        ALL_BASELINE.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    receipt_files = list((ALL_RECEIPTS / binary_sha).glob("*.json"))
+    summary = {
+        "binary_sha256": binary_sha,
+        "bounds": report["bounds"],
+        "failures": failures,
+        "input_sha256": report["input_sha256"],
+        "metrics": report["metrics"],
+        "output_sha256": report["output_sha256"],
+        "receipt_bytes": sum(path.stat().st_size for path in receipt_files),
+        "receipt_files": len(receipt_files),
+        "source_sha256": report["source_sha256"],
+        "sample_sha256": report["sample_sha256"],
+        "status": "PASS",
+    }
+    if ALL_BASELINE.is_file():
+        summary["baseline_bytes"] = ALL_BASELINE.stat().st_size
+    print(json.dumps(summary, indent=2), flush=True)
+    return report
+
+
+def execute(args: argparse.Namespace) -> dict:
+    binary = args.binary.resolve()
+    if not binary.is_file():
+        raise AssertionError(f"binary not found: {binary}")
+    sample = load_sample()
+    sample_sha = canonical_sha(
+        [{"candidate_id": row["candidate_id"], "source_sha256": row["source_sha256"]} for row in sample]
+    )
+    index, scan_seconds = extraction_index({row["source_sha256"] for row in sample})
+    startup = startup_metrics(binary, args.startup_runs)
+    with tempfile.TemporaryDirectory(prefix="structure-engine-parity-", dir=ROOT / ".tmp") as temporary:
+        documents, replay_seconds, process_seconds = replay(
+            binary,
+            sample,
+            index,
+            Path(temporary),
+            args.repetitions,
+            args.jobs,
+            int(args.max_temp_mib_per_document * 1024 * 1024),
+        )
+    pages = sum(row["pages"] for row in sample) * args.repetitions
+    replay_pages_per_second = pages / replay_seconds
+    cargo_quick = None if args.skip_cargo_quick else cargo_quick_metrics(args.max_cargo_quick_seconds)
+    report = {
+        "schema_version": "legalpdf.structure-engine-parity.v1",
+        "binary": str(binary),
+        "binary_sha256": sha256_file(binary),
+        "cargo_quick": cargo_quick,
+        "documents": documents,
+        "metrics": {
+            "cache_index_seconds": round(scan_seconds, 3),
+            "documents": len(sample),
+            "lines_per_repetition": sum(row["lines"] for row in sample),
+            "max_temp_mib_per_document": args.max_temp_mib_per_document,
+            "parallel_jobs": args.jobs,
+            "pages_per_repetition": sum(row["pages"] for row in sample),
+            "repetitions": args.repetitions,
+            "replay_pages_per_second": round(replay_pages_per_second, 1),
+            "replay_process_seconds": round(process_seconds, 3),
+            "replay_seconds": round(replay_seconds, 3),
+            "startup": startup,
+        },
+        "output_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "output_sha256": row["output_sha256"]} for row in documents]
+        ),
+        "sample_sha256": sample_sha,
+    }
+    failures = []
+    if startup["median_ms"] > args.max_startup_ms:
+        failures.append(f"startup median {startup['median_ms']} ms > {args.max_startup_ms} ms")
+    if replay_pages_per_second < args.min_replay_pages_per_second:
+        failures.append(
+            f"replay {replay_pages_per_second:.1f} pages/s < {args.min_replay_pages_per_second} pages/s"
+        )
+    if cargo_quick and cargo_quick["elapsed_seconds"] > args.max_cargo_quick_seconds:
+        failures.append(
+            f"cargo quick {cargo_quick['elapsed_seconds']} s > {args.max_cargo_quick_seconds} s"
+        )
+    if not args.freeze:
+        expected = json.loads(BASELINE.read_text(encoding="utf-8"))
+        if comparable(report) != comparable(expected):
+            failures.append("replay output is not byte-identical to baseline hashes")
+    if failures:
+        raise AssertionError("; ".join(failures))
+    if args.freeze:
+        BASELINE.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "binary_sha256": report["binary_sha256"],
+                "cargo_quick": report["cargo_quick"],
+                "metrics": report["metrics"],
+                "output_sha256": report["output_sha256"],
+                "sample_sha256": report["sample_sha256"],
+                "status": "PASS",
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    return report
+
+
+def self_test() -> None:
+    assert percentile([3.0, 1.0, 2.0], 0.95) == 3.0
+    assert canonical_sha({"b": 2, "a": 1}) == canonical_sha({"a": 1, "b": 2})
+    assert comparable({"sample_sha256": "s", "documents": [{
+        "candidate_id": "x", "input_bytes": 1, "input_sha256": "i", "output_bytes": 2,
+        "output_sha256": "o", "pages": 3, "replay_seconds": [1.0]
+    }]})["documents"][0]["output_sha256"] == "o"
+    print("self-test PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
+    parser.add_argument("--all-cache", action="store_true", help="gate every cached native document")
+    parser.add_argument("--freeze", action="store_true", help="replace the frozen byte-hash baseline")
+    parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--jobs", type=int, default=min(4, max(1, (os.cpu_count() or 2) - 1)))
+    parser.add_argument("--startup-runs", type=int, default=7)
+    parser.add_argument("--max-startup-ms", type=float, default=100.0)
+    parser.add_argument("--max-temp-mib-per-document", type=float, default=128.0)
+    parser.add_argument("--min-replay-pages-per-second", type=float, default=250.0)
+    parser.add_argument("--max-cargo-quick-seconds", type=float, default=5.0)
+    parser.add_argument("--skip-cargo-quick", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+    if args.all_cache:
+        if not args.freeze and not ALL_BASELINE.is_file():
+            parser.error("all-cache-baseline.json is missing; run --all-cache --freeze")
+        all_cache_execute(args)
+        return 0
+    if args.repetitions < 2:
+        parser.error("--repetitions must be at least 2 to prove byte determinism")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+    if not args.freeze and not BASELINE.is_file():
+        parser.error("baseline.json is missing; run once with --freeze")
+    execute(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
