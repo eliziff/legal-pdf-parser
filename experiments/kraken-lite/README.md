@@ -1,42 +1,38 @@
 # Kraken Lite
 
-Lightweight local OCR experiments for the fixed legal-print Kraken recognizer. The browser build is a self-contained HTML application; the native build keeps full stock BLLA segmentation available.
+Kraken Lite is the parser's fast CPU OCR path. It combines a compact
+Tesseract-derived line finder with a legal-specific fine-tune of CATMuS Print
+Small. The same model supports four recognition-width tiers:
 
-## Browser
+- Quality prioritizes the lowest character error rate.
+- Balanced keeps most of Quality's accuracy with higher throughput.
+- Turbo favors faster document turnaround.
+- Extreme uses the narrowest recognition width.
 
-Build and test:
+The current fair CPU benchmark is recorded in
+[`cpu-benchmark/RESULTS.md`](cpu-benchmark/RESULTS.md). It compares every tier
+with native Tesseract 5.4 on the same 153 legal pages, on both a Core i3 laptop
+and a Ryzen desktop. Both engines include cold session/worker setup in the
+timed wall; no browser-worker startup is hidden.
 
-```powershell
-cd kraken-lite-browser
-npm test
-npm run single
-```
+## Runtime
 
-Open `kraken-lite-browser/dist/kraken-lite.html` directly. It accepts PNG and PDF files and contains the model, PDF renderer, Tesseract layout core, recognition runtime, and workers. `kraken-lite-lean.html` omits mature layout and uses projection segmentation.
+The native pack contains the Rust parser, ONNX Runtime, the compact legal OCR
+model and codec, and the line-layout library. CPU scheduling adapts to the
+available logical processors. The low-memory option disables the ONNX CPU arena
+to reduce peak memory at a small throughput cost without changing OCR output.
 
-The shipping full build reserves one browser thread and uses the remaining browser-reported parallelism for persistent single-thread recognition workers (seven on the eight-thread benchmark laptop), plus two layout workers, 32-line batches, 24-pixel width buckets, a 48-pixel-height recognizer, relaxed-SIMD ONNX Runtime, and per-channel INT8 LSTM weights. All four modes use the same model and layout; only recognition width changes.
-
-| Browser mode | Width | CER | pages/s |
-| --- | ---: | ---: | ---: |
-| Quality | 1.00 | 2.582% | 1.548 |
-| Balanced | 0.85 | 2.763% | 1.672 |
-| Turbo | 0.76 | 3.163% | 1.788 |
-| Extreme | 0.70 | 3.837% | 1.824 |
-| Tesseract.js fast | — | 4.108% | 0.364 |
-
-Results use the same 153-page benchmark and already-rendered pixels for CER and timing. Quality is the median of three complete runs; the other tiers are full-corpus single-run confirmations. On the 30 diversified scanned-court pages, Extreme reaches 2.438 pages/s at 3.819% CER versus Tesseract.js at 0.413 pages/s and 7.155% CER.
-
-## Native
-
-```powershell
-cd kraken-lite-native
-python ocr.py --tier quality page.png
-```
-
-The default quality tier reuses the browser's proven dynamic-batch INT8 model, two layout workers, two page-level recognition workers, 32-line batches, and 24-pixel buckets. It reaches 2.820% CER and 1.235 pages/s on the same 153 pages, versus the established in-process Tesseract result of 4.115% CER and 0.763 pages/s. Use `--tier fidelity` for the original full-size recognizer plus stock BLLA geometry.
+The browser experiment packages the same recognizer into a self-contained HTML
+application. It remains useful for portability testing, but public performance
+claims use the native CPU comparison above.
 
 ## Benchmark set
 
-`kraken-lite-native/benchmark-splits/benchmark-153.lst` contains 123 manual-gold pages and 30 manually vetted silver pages. Both accuracy and throughput are measured on this one set; normalization removes both soft hyphen and the model's mathematical-NOT substitute.
+`kraken-lite-native/benchmark-splits/benchmark-153.lst` defines the fixed set:
+123 manual-gold pages and 30 manually vetted silver pages. Accuracy and speed
+use that same set. Normalization collapses whitespace and removes soft hyphen
+and the model's mathematical-NOT line-break substitute before CER scoring.
 
-Rejected defaults include WebGPU LSTM partitioning, static Conv quantization, binary layout thresholding, layout downscaling, whitespace scans, Sauvola/Otsu/morphology preprocessing, a third layout worker, and the 0.62 width tier. Each either regressed CER, throughput, or both on the mixed benchmark.
+Run the benchmark with `benchmark_cpu_ocr.py`; raw transcripts belong under an
+ignored `_temp/` directory. Record durable findings in the benchmark
+`RESULTS.md`, not in generated output files.
