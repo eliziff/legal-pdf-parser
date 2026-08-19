@@ -569,6 +569,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-parser"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "fancy-regex",
+ "flate2",
+ "hayro",
+ "image",
+ "libloading",
+ "lopdf",
+ "mimalloc",
+ "ort",
+ "pdf-inspector",
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "unicode-normalization",
+ "zip",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1277,30 +1301,6 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
-
-[[package]]
-name = "legal-pdf-parser"
-version = "0.1.0"
-dependencies = [
- "cc",
- "fancy-regex",
- "flate2",
- "hayro",
- "image",
- "libloading",
- "lopdf",
- "mimalloc",
- "ort",
- "pdf-inspector",
- "quick-xml",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "unicode-normalization",
- "zip",
-]
 
 [[package]]
 name = "vello_common"

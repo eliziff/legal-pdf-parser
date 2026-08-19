@@ -195,27 +195,65 @@ fn normal_pages(document: &LegalDocument) -> Vec<(u32, String)> {
     pages
 }
 
+struct SourceParagraph<'a> {
+    number: usize,
+    order_on_page: usize,
+    paragraph: &'a crate::model::Paragraph,
+    text: String,
+}
+
+fn source_paragraphs(document: &LegalDocument) -> Vec<SourceParagraph<'_>> {
+    let mut paragraphs_by_page: HashMap<usize, Vec<_>> = HashMap::new();
+    for paragraph in &document.paragraphs {
+        paragraphs_by_page
+            .entry(paragraph.page_index)
+            .or_default()
+            .push(paragraph);
+    }
+    let mut pages: Vec<_> = document.pages.iter().collect();
+    pages.sort_by_key(|page| page.index);
+    let mut output = Vec::new();
+    for page in pages {
+        for (order_on_page, paragraph) in paragraphs_by_page
+            .get(&page.index)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let text = clean_text(&paragraph.text);
+            if !text.is_empty() {
+                output.push(SourceParagraph {
+                    number: output.len() + 1,
+                    order_on_page,
+                    paragraph,
+                    text,
+                });
+            }
+        }
+    }
+    output
+}
+
 fn paragraph_units(document: &LegalDocument) -> Vec<LookupUnit> {
     let pages: HashMap<_, _> = document
         .pages
         .iter()
         .map(|page| (page.index, page))
         .collect();
-    document
-        .paragraphs
-        .iter()
-        .enumerate()
-        .map(|(index, paragraph)| {
+    source_paragraphs(document)
+        .into_iter()
+        .map(|item| {
+            let paragraph = item.paragraph;
             let page = pages.get(&paragraph.page_index);
             LookupUnit {
                 id: if paragraph.id.is_empty() {
-                    format!("paragraph-{}", index + 1)
+                    format!("paragraph-{}", item.number)
                 } else {
                     paragraph.id.clone()
                 },
                 kind: "paragraph".to_owned(),
-                locator: format!("paragraph {}", index + 1),
-                text: clean_text(&paragraph.text),
+                locator: format!("paragraph {}", item.number),
+                text: item.text,
                 page_numbers: page.map_or_else(Vec::new, |item| vec![item.number]),
                 confidence: page.map(|item| item.text_quality.clamp(0.0, 1.0)),
                 confidence_basis: if page.is_some() {
@@ -458,6 +496,12 @@ fn section_alias(raw: &str) -> String {
 fn section_matches(section: &Section, requested_kind: &str, requested: &str) -> bool {
     if requested_kind != "section" && section.locator_kind.as_deref() != Some(requested_kind) {
         return false;
+    }
+    if requested_kind == "section"
+        && !section.id.is_empty()
+        && section_alias(&format!("section:{}", section.id)) == requested
+    {
+        return true;
     }
     std::iter::once(section.locator.as_str())
         .chain(section.aliases.iter().map(String::as_str))
@@ -730,14 +774,7 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
     let mut blocks = Vec::new();
     let mut offsets = HashMap::new();
     let mut position = 0;
-    let mut paragraph_number = 0;
-    let mut paragraphs_by_page: HashMap<usize, Vec<_>> = HashMap::new();
-    for paragraph in &document.paragraphs {
-        paragraphs_by_page
-            .entry(paragraph.page_index)
-            .or_default()
-            .push(paragraph);
-    }
+    let paragraphs = source_paragraphs(document);
     let mut pages: Vec<_> = document.pages.iter().collect();
     pages.sort_by_key(|page| page.index);
     for page in pages {
@@ -752,30 +789,24 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
         let display = printed.map_or_else(|| page.number.to_string(), str::to_owned);
         let page_start = position;
         append(&mut text, &mut position, &format!("[page {display}]\n"));
-        for (order, paragraph) in paragraphs_by_page
-            .get(&page.index)
-            .into_iter()
-            .flatten()
-            .enumerate()
+        for item in paragraphs
+            .iter()
+            .filter(|item| item.paragraph.page_index == page.index)
         {
-            let body = clean_text(&paragraph.text);
-            if body.is_empty() {
-                continue;
-            }
-            if order > 0 {
+            let paragraph = item.paragraph;
+            if item.order_on_page > 0 {
                 append(&mut text, &mut position, "\n\n");
             }
             let start = position;
-            append(&mut text, &mut position, &body);
+            append(&mut text, &mut position, &item.text);
             let end = position;
             let anchor = if paragraph.id.is_empty() {
-                format!("page-{}-paragraph-{}", page.number, order + 1)
+                format!("page-{}-paragraph-{}", page.number, item.order_on_page + 1)
             } else {
                 paragraph.id.clone()
             };
             offsets.insert(anchor.clone(), (start, end));
-            paragraph_number += 1;
-            blocks.push(json!({"kind":"paragraph","label":format!("par{paragraph_number}"),"start":start,"end":end,"origin":"heuristic","anchor":anchor}));
+            blocks.push(json!({"kind":"paragraph","label":format!("par{}",item.number),"start":start,"end":end,"origin":"heuristic","anchor":anchor}));
         }
         let label =
             normalized_locator("page", &display).unwrap_or_else(|| format!("page{}", page.number));
@@ -787,6 +818,10 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
         blocks.push(json!({"kind":"page","label":label,"start":page_start,"end":position,"origin":if printed.is_some(){"heuristic"}else{"native"},"anchor":format!("page={}",page.number),"aliases":aliases}));
     }
     for (order, section) in document.sections.iter().enumerate() {
+        let exact_text = section.text.trim();
+        if exact_text.is_empty() || utf16_len(exact_text) > MAX_RETURN_CHARS {
+            continue;
+        }
         let Some(first) = section.paragraph_ids.first().and_then(|id| offsets.get(id)) else {
             continue;
         };
@@ -866,7 +901,7 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Paragraph, PARSER_VERSION, SCHEMA_VERSION};
+    use crate::model::{Paragraph, Section, PARSER_VERSION, SCHEMA_VERSION};
     use serde_json::Map;
 
     #[test]
@@ -875,17 +910,40 @@ mod tests {
             document_id: "doc".to_owned(),
             source_name: "x.pdf".to_owned(),
             source_sha256: "00".repeat(32),
-            page_count: 0,
+            page_count: 1,
             status: "ready".to_owned(),
-            pages: vec![],
-            paragraphs: vec![Paragraph {
-                id: "p".to_owned(),
-                page_index: 0,
-                region_type: "body".to_owned(),
-                text: "text".to_owned(),
-                line_ids: vec![],
-                anchors: vec![],
+            pages: vec![Page {
+                id: "page-1".to_owned(),
+                index: 0,
+                number: 1,
+                width: 612.0,
+                height: 792.0,
+                lines: vec![],
+                regions: vec![],
+                source: "native".to_owned(),
+                text_quality: 1.0,
+                printed_label: None,
+                printed_label_source: None,
+                printed_label_line_id: None,
             }],
+            paragraphs: vec![
+                Paragraph {
+                    id: "marker".to_owned(),
+                    page_index: 0,
+                    region_type: "body".to_owned(),
+                    text: "⟦FN:one⟧".to_owned(),
+                    line_ids: vec![],
+                    anchors: vec![],
+                },
+                Paragraph {
+                    id: "p".to_owned(),
+                    page_index: 0,
+                    region_type: "body".to_owned(),
+                    text: "text".to_owned(),
+                    line_ids: vec![],
+                    anchors: vec![],
+                },
+            ],
             sections: vec![],
             footnotes: vec![],
             tables: vec![],
@@ -906,5 +964,127 @@ mod tests {
             source_doc(&document, Some("id"), None)["source_doc"]["id"],
             "id"
         );
+        let source = source_doc(&document, Some("id"), None);
+        let paragraph = source["source_doc"]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["kind"] == "paragraph")
+            .unwrap();
+        assert_eq!(paragraph["label"], "par1");
+        assert_eq!(paragraph["anchor"], "p");
+        let lookup = structure_lookup(
+            &document,
+            &json!({"locator_kind":"paragraph","locator":"par1"}),
+        )
+        .unwrap();
+        assert_eq!(lookup["status"], "found");
+        assert_eq!(lookup["units"][0]["id"], "p");
+        assert_eq!(lookup["units"][0]["text"], "text");
+    }
+
+    #[test]
+    fn source_doc_section_ids_are_exact_lookup_locators() {
+        let section = Section {
+            id: "section-000001".to_owned(),
+            heading_paragraph_id: "heading".to_owned(),
+            heading: "A heading too long to use as a trusted locator".to_owned(),
+            locator: "A heading too long to use as a trusted locator".to_owned(),
+            locator_kind: None,
+            aliases: vec![],
+            text: "Exact section text".to_owned(),
+            paragraph_ids: vec!["heading".to_owned()],
+            page_indexes: vec![],
+            line_ids: vec![],
+            provenance: "heading-region".to_owned(),
+        };
+        assert!(section_matches(
+            &section,
+            "section",
+            &section_alias("section:section-000001"),
+        ));
+    }
+
+    #[test]
+    fn source_doc_does_not_publish_an_unresolvable_oversized_section() {
+        let text = "😀".repeat(MAX_RETURN_CHARS / 2 + 1);
+        let document = LegalDocument {
+            document_id: "doc".to_owned(),
+            source_name: "x.pdf".to_owned(),
+            source_sha256: "00".repeat(32),
+            page_count: 1,
+            status: "ready".to_owned(),
+            pages: vec![Page {
+                id: "page-1".to_owned(),
+                index: 0,
+                number: 1,
+                width: 612.0,
+                height: 792.0,
+                lines: vec![],
+                regions: vec![],
+                source: "native".to_owned(),
+                text_quality: 1.0,
+                printed_label: None,
+                printed_label_source: None,
+                printed_label_line_id: None,
+            }],
+            paragraphs: vec![Paragraph {
+                id: "heading".to_owned(),
+                page_index: 0,
+                region_type: "heading".to_owned(),
+                text: text.clone(),
+                line_ids: vec![],
+                anchors: vec![],
+            }],
+            sections: vec![Section {
+                id: "section-000001".to_owned(),
+                heading_paragraph_id: "heading".to_owned(),
+                heading: "Long section".to_owned(),
+                locator: "Long section".to_owned(),
+                locator_kind: None,
+                aliases: vec!["Long section".to_owned()],
+                text: text.clone(),
+                paragraph_ids: vec!["heading".to_owned()],
+                page_indexes: vec![0],
+                line_ids: vec![],
+                provenance: "heading-region".to_owned(),
+            }],
+            footnotes: vec![],
+            tables: vec![],
+            images: vec![],
+            diagnostics: vec![],
+            repairs: vec![],
+            metadata: Map::new(),
+            provenance: Map::new(),
+            schema_version: SCHEMA_VERSION.to_owned(),
+            parser_version: PARSER_VERSION.to_owned(),
+        };
+
+        let source = source_doc(&document, None, None);
+        let blocks = source["source_doc"]["blocks"].as_array().unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block["kind"] == "section")
+                .count(),
+            0
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block["kind"] == "paragraph")
+                .count(),
+            1
+        );
+        assert!(source["source_doc"]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(&text));
+        let lookup = structure_lookup(
+            &document,
+            &json!({"locator_kind":"section","locator":"section:section-000001"}),
+        )
+        .unwrap();
+        assert_eq!(lookup["status"], "invalid");
     }
 }

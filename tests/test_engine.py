@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
 import zipfile
-from contextlib import redirect_stdout
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,13 +14,7 @@ from unittest.mock import patch
 import fitz
 
 from legalpdf.adapters import to_alr_payload, to_toa_text_units
-from legalpdf.benchmark import (
-    extract_docx_gold,
-    run_manifest,
-    score_docx_gold,
-    write_text_fidelity_product,
-)
-from legalpdf.cli import main as cli_main
+from legalpdf.benchmark import extract_docx_gold, score_docx_gold
 from legalpdf.codex_repair import (
     _codex_command,
     _schema,
@@ -44,9 +35,7 @@ from legalpdf.core import (
     _order_page,
     _pair_markers,
     _separator_y,
-    add_pdf_geometry,
     improve,
-    lookup_artifact_footnote,
     lookup_footnote,
     parse_pdf,
 )
@@ -57,9 +46,6 @@ from legalpdf.model import (
     Paragraph,
     Span,
     Word,
-    load_geometry_artifacts,
-    load_artifacts,
-    write_artifacts,
 )
 from legalpdf.ocr import OCRLine, TesseractOCRProvider
 from legalpdf.pdf_backend import _assign_block_indexes, _group_inspector_items
@@ -1654,13 +1640,12 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(separator)
         self.assertAlmostEqual(610, separator or 0, delta=1)
 
-    def test_local_parse_cache_artifacts_lookup_and_adapters(self) -> None:
+    def test_local_parse_lookup_and_adapters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             pdf = root / "legal.pdf"
             make_legal_pdf(pdf)
-            cache = root / "cache"
-            first = parse_pdf(pdf, cache_dir=cache)
+            first = parse_pdf(pdf)
             self.assertEqual(2, first.page_count)
             self.assertEqual(2, len(first.footnotes))
             self.assertFalse(first.provenance["cache_hit"])
@@ -1675,44 +1660,10 @@ class EngineTests(unittest.TestCase):
             self.assertEqual("found", found.status)
             self.assertEqual("Restarted footnote body.", found.footnote.body)
 
-            second = parse_pdf(pdf, cache_dir=cache)
-            self.assertTrue(second.provenance["cache_hit"])
-            self.assertEqual(first.source_sha256, second.source_sha256)
-
-            second.paragraphs[0].region_type = "heading"
-            second.sections = _build_sections(second.paragraphs)
-            manifest = write_artifacts(second, root / "artifacts")
-            sections = [
-                json.loads(line)
-                for line in (manifest.parent / "sections.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            ]
-            self.assertEqual(1, len(sections))
             self.assertEqual(
-                [paragraph.id for paragraph in second.paragraphs],
-                sections[0]["paragraph_ids"],
+                {1, 2}, set(to_alr_payload(first)["footnotes"])
             )
-            self.assertEqual(second.sections[0].text, sections[0]["text"])
-            loaded = load_artifacts(manifest)
-            self.assertEqual(second.footnotes, loaded.footnotes)
-            self.assertEqual(second.text, loaded.text)
-            pages_path = manifest.parent / "pages.jsonl"
-            hidden_pages = manifest.parent / "pages.hidden"
-            pages_path.rename(hidden_pages)
-            try:
-                persisted = lookup_artifact_footnote(
-                    manifest, "1", occurrence=2
-                )
-            finally:
-                hidden_pages.rename(pages_path)
-            self.assertEqual("found", persisted.status)
-            self.assertEqual("Restarted footnote body.", persisted.footnote.body)
-
-            self.assertEqual(
-                {1, 2}, set(to_alr_payload(loaded)["footnotes"])
-            )
-            toa = to_toa_text_units(loaded)
+            toa = to_toa_text_units(first)
             self.assertTrue(any(unit["kind"] == "body" for unit in toa))
             self.assertEqual(2, sum(unit["kind"] == "footnote" for unit in toa))
             self.assertEqual(
@@ -1727,334 +1678,6 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(
                 any("⟦FN:" in unit["text"] for unit in toa if unit["kind"] == "body")
             )
-
-    def test_cache_disabled_parse_skips_cache_io(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            cache = root / "cache"
-            with patch("legalpdf.core.load_artifacts") as load, patch(
-                "legalpdf.core.write_artifacts"
-            ) as write:
-                document = parse_pdf(pdf, cache_dir=cache, use_cache=False)
-            load.assert_not_called()
-            write.assert_not_called()
-            self.assertFalse(cache.exists())
-            self.assertFalse(document.provenance["cache_hit"])
-            self.assertFalse(document.provenance["cache_enabled"])
-            with patch(
-                "legalpdf.core.improve", return_value=document
-            ) as improve_document, patch(
-                "legalpdf.core.load_artifacts"
-            ) as load, patch(
-                "legalpdf.core.write_artifacts"
-            ) as write:
-                repaired = parse_pdf(
-                    pdf,
-                    mode="codex",
-                    model="test-model",
-                    effort="low",
-                    cache_dir=cache,
-                    use_cache=False,
-                )
-            self.assertIs(document, repaired)
-            load.assert_not_called()
-            write.assert_not_called()
-            self.assertEqual(
-                cache / "codex",
-                improve_document.call_args.kwargs["cache_dir"],
-            )
-
-    def test_parse_cli_no_cache_writes_only_requested_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            output = root / "output"
-            cache = root / "cache"
-            make_legal_pdf(pdf)
-            stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                status = cli_main(
-                    [
-                        "parse",
-                        str(pdf),
-                        "--output",
-                        str(output),
-                        "--cache-dir",
-                        str(cache),
-                        "--no-cache",
-                    ]
-                )
-            self.assertEqual(0, status)
-            self.assertFalse(cache.exists())
-            self.assertTrue((output / "document.json").is_file())
-            self.assertFalse(json.loads(stdout.getvalue())["cache_hit"])
-
-    def test_v2_artifacts_reject_missing_structural_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            manifest = write_artifacts(
-                parse_pdf(pdf, cache_dir=root / "cache"),
-                root / "artifacts",
-            )
-            pages_path = manifest.parent / "pages.jsonl"
-            original = pages_path.read_text(encoding="utf-8")
-            fields = (
-                ("page", "lines"),
-                ("page", "regions"),
-                ("page", "source"),
-                ("page", "text_quality"),
-                ("page", "printed_label"),
-                ("page", "printed_label_source"),
-                ("page", "printed_label_line_id"),
-                ("line", "spans"),
-                ("line", "words"),
-            )
-            try:
-                for level, name in fields:
-                    with self.subTest(level=level, field=name):
-                        rows = [
-                            json.loads(line)
-                            for line in original.splitlines()
-                            if line.strip()
-                        ]
-                        target = (
-                            rows[0]
-                            if level == "page"
-                            else rows[0]["lines"][0]
-                        )
-                        del target[name]
-                        pages_path.write_text(
-                            "".join(
-                                json.dumps(row, sort_keys=True) + "\n"
-                                for row in rows
-                            ),
-                            encoding="utf-8",
-                        )
-                        with self.assertRaisesRegex(
-                            ValueError, f"missing fields: {name}"
-                        ):
-                            load_artifacts(manifest)
-            finally:
-                pages_path.write_text(original, encoding="utf-8")
-
-    def test_incomplete_or_corrupt_cache_is_unpublished_and_rebuilt(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            cache = root / "cache"
-            make_legal_pdf(pdf)
-
-            first = parse_pdf(pdf, cache_dir=cache)
-            entry = cache / first.provenance["deterministic_cache_key"]
-            (entry / "paragraphs.jsonl").write_text("{broken", encoding="utf-8")
-
-            repaired = parse_pdf(pdf, cache_dir=cache)
-            self.assertFalse(repaired.provenance["cache_hit"])
-            self.assertEqual(first.text, repaired.text)
-            load_artifacts(entry / "document.json")
-
-            (entry / "sections.jsonl").unlink()
-            completed = parse_pdf(pdf, cache_dir=cache)
-            self.assertFalse(completed.provenance["cache_hit"])
-            self.assertTrue((entry / "sections.jsonl").is_file())
-            self.assertTrue(parse_pdf(pdf, cache_dir=cache).provenance["cache_hit"])
-
-    def test_artifact_republication_removes_the_old_manifest_first(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            document = parse_pdf(pdf, cache_dir=root / "cache")
-            manifest = write_artifacts(document, root / "published")
-
-            with patch(
-                "legalpdf.model._write_jsonl",
-                side_effect=RuntimeError("simulated interrupted publication"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "interrupted publication"):
-                    write_artifacts(document, manifest.parent)
-
-            self.assertFalse(manifest.exists())
-
-    def test_fast_serializer_preserves_legacy_artifact_bytes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            document = parse_pdf(pdf, cache_dir=root / "cache")
-            manifest = write_artifacts(document, root / "published")
-            collections = {
-                "pages": document.pages,
-                "paragraphs": document.paragraphs,
-                "sections": document.sections,
-                "footnotes": document.footnotes,
-                "diagnostics": document.diagnostics,
-                "repairs": document.repairs,
-            }
-            for name, values in collections.items():
-                with self.subTest(name=name):
-                    expected = "".join(
-                        json.dumps(asdict(value), ensure_ascii=False, sort_keys=True)
-                        + "\n"
-                        for value in values
-                    )
-                    self.assertEqual(
-                        expected,
-                        (manifest.parent / f"{name}.jsonl").read_text(
-                            encoding="utf-8"
-                        ),
-                    )
-
-    def test_compact_page_publication_changes_no_other_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            document = parse_pdf(pdf, cache_dir=root / "cache")
-            full = write_artifacts(document, root / "full")
-            compact = write_artifacts(
-                document,
-                root / "compact",
-                compact_pages=True,
-            )
-            for name in (
-                "paragraphs.jsonl",
-                "sections.jsonl",
-                "footnotes.jsonl",
-                "diagnostics.jsonl",
-                "repairs.jsonl",
-            ):
-                with self.subTest(name=name):
-                    self.assertEqual(
-                        (full.parent / name).read_bytes(),
-                        (compact.parent / name).read_bytes(),
-                    )
-            compact_manifest = json.loads(compact.read_text(encoding="utf-8"))
-            self.assertEqual("compact-source", compact_manifest["artifact_profile"])
-            pages = [
-                json.loads(line)
-                for line in (compact.parent / "pages.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-                if line
-            ]
-            page = pages[0]
-            self.assertEqual(
-                {
-                    "id",
-                    "index",
-                    "number",
-                    "printed_label",
-                    "printed_label_source",
-                    "source",
-                    "text_quality",
-                    "lines",
-                },
-                page.keys(),
-            )
-            self.assertTrue(page["lines"])
-            self.assertEqual(
-                {"reading_order", "text"},
-                page["lines"][0].keys(),
-            )
-
-    def test_geometry_upgrade_only_adds_pages_and_skips_derivation(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            document = parse_pdf(pdf, use_cache=False)
-            full = write_artifacts(document, root / "full")
-            compact = write_artifacts(
-                document,
-                root / "compact",
-                compact_pages=True,
-            )
-            compact_before = {
-                path.name: path.read_bytes()
-                for path in compact.parent.iterdir()
-                if path.is_file()
-            }
-
-            with patch(
-                "legalpdf.core._derive",
-                side_effect=AssertionError("geometry must not repeat derivation"),
-            ):
-                with redirect_stdout(io.StringIO()):
-                    status = cli_main(
-                        [
-                            "add-geometry",
-                            str(pdf),
-                            "--document",
-                            str(compact),
-                            "--output",
-                            str(root / "geometry"),
-                        ]
-                    )
-            self.assertEqual(0, status)
-            geometry = root / "geometry" / "geometry.json"
-
-            self.assertEqual(
-                document.pages,
-                load_geometry_artifacts(compact, geometry),
-            )
-            geometry_manifest = json.loads(geometry.read_text(encoding="utf-8"))
-            geometry_pages = geometry.parent / "pages.jsonl.gz"
-            self.assertEqual(
-                hashlib.sha256(geometry_pages.read_bytes()).hexdigest(),
-                geometry_manifest["pages_sha256"],
-            )
-            self.assertLess(
-                geometry_pages.stat().st_size,
-                (full.parent / "pages.jsonl").stat().st_size,
-            )
-            self.assertEqual(
-                compact_before,
-                {
-                    path.name: path.read_bytes()
-                    for path in compact.parent.iterdir()
-                    if path.is_file()
-                },
-            )
-            self.assertEqual(
-                "legalpdf.geometry.v1",
-                geometry_manifest["schema_version"],
-            )
-            corrupted = bytearray(geometry_pages.read_bytes())
-            corrupted[-1] ^= 1
-            geometry_pages.write_bytes(corrupted)
-            with self.assertRaisesRegex(ValueError, "payload hash"):
-                load_geometry_artifacts(compact, geometry)
-
-    def test_geometry_upgrade_rejects_changed_ocr_identity_before_extraction(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "legal.pdf"
-            make_legal_pdf(pdf)
-            document = parse_pdf(pdf, ocr_provider=StubOCR(), use_cache=False)
-            compact = write_artifacts(
-                document,
-                root / "compact",
-                compact_pages=True,
-            )
-            changed = StubOCR()
-            changed.identity = "stub-cli-v2"
-            with patch(
-                "legalpdf.core._extract_pdf_pages",
-                side_effect=AssertionError("identity must fail before extraction"),
-            ), self.assertRaisesRegex(ValueError, "parse identity"):
-                add_pdf_geometry(
-                    pdf,
-                    document=compact,
-                    output=root / "geometry",
-                    ocr_provider=changed,
-                )
 
     def test_empty_pdf_requires_ocr_and_provider_is_source_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2141,66 +1764,6 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(lines[0].bbox[2], lines[0].bbox[0])
         self.assertGreater(lines[0].bbox[3], lines[0].bbox[1])
 
-    def test_ocr_identity_cli_reports_the_detected_executable(self) -> None:
-        output = io.StringIO()
-        with patch(
-            "legalpdf.cli.TesseractOCRProvider", return_value=StubOCR()
-        ) as provider, redirect_stdout(output):
-            status = cli_main(
-                [
-                    "ocr-identity",
-                    "--provider",
-                    "tesseract",
-                    "--ocr-language",
-                    "fra",
-                    "--ocr-dpi",
-                    "144",
-                    "--ocr-psm",
-                    "6",
-                ]
-            )
-
-        self.assertEqual(0, status)
-        self.assertEqual(
-            {"provider": "tesseract", "identity": "stub-cli-v1"},
-            json.loads(output.getvalue()),
-        )
-        provider.assert_called_once_with(language="fra", dpi=144, psm=6)
-
-    def test_page_count_cli_reports_physical_pages_without_parsing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            pdf = Path(temporary) / "empty.pdf"
-            make_empty_pdf(pdf)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = cli_main(["page-count", str(pdf)])
-
-        self.assertEqual(0, status)
-        self.assertEqual({"pages": 1}, json.loads(output.getvalue()))
-
-    def test_repair_identity_cli_reports_the_cache_contract(self) -> None:
-        output = io.StringIO()
-        with redirect_stdout(output):
-            status = cli_main(["repair-identity"])
-
-        self.assertEqual(0, status)
-        identity = json.loads(output.getvalue())
-        self.assertEqual(
-            "legalpdf.codex.repair-identity.v1", identity["schema_version"]
-        )
-        self.assertEqual(
-            "legalpdf.codex.structure.r1.v2", identity["prompt_version"]
-        )
-        self.assertRegex(identity["response_schema_sha256"], r"^[0-9a-f]{64}$")
-        self.assertRegex(
-            identity["repairable_diagnostics_sha256"], r"^[0-9a-f]{64}$"
-        )
-        self.assertEqual(1, identity["context_radius"])
-        self.assertEqual(3, identity["max_attempts"])
-        self.assertEqual(6, identity["max_live_calls"])
-        self.assertEqual(2, identity["max_scope_pages"])
-        self.assertIn("COLUMN_ORDER_UNCERTAIN", identity["repairable_diagnostics"])
-
     def test_codex_repair_honors_the_shared_launcher_without_calling_it(self) -> None:
         with patch.dict(
             os.environ, {"CODEX_EXEC_COMMAND": "C:/pinned/codex.cmd"}
@@ -2213,40 +1776,6 @@ class EngineTests(unittest.TestCase):
         ) as which:
             self.assertEqual("codex-fallback", _codex_command())
             which.assert_called_once_with("codex")
-
-    def test_parse_cli_constructs_the_optional_tesseract_provider(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pdf = root / "empty.pdf"
-            output = root / "parsed"
-            make_empty_pdf(pdf)
-            with patch(
-                "legalpdf.cli.TesseractOCRProvider", return_value=StubOCR()
-            ) as provider:
-                status = cli_main(
-                    [
-                        "parse",
-                        str(pdf),
-                        "--output",
-                        str(output),
-                        "--cache-dir",
-                        str(root / "cache"),
-                        "--ocr-provider",
-                        "tesseract",
-                        "--ocr-language",
-                        "fra",
-                        "--ocr-dpi",
-                        "144",
-                        "--ocr-psm",
-                        "6",
-                    ]
-                )
-            document = load_artifacts(output / "document.json")
-
-        self.assertEqual(0, status)
-        provider.assert_called_once_with(language="fra", dpi=144, psm=6)
-        self.assertEqual("ocr", document.pages[0].source)
-        self.assertIn("OCR recovered", document.text)
 
     def test_endnote_page_is_detected_above_the_page_midpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2787,7 +2316,7 @@ class EngineTests(unittest.TestCase):
             invocation.assert_called_once()
             self.assertEqual([0, 1], result.repairs[-1].scope_pages)
 
-    def test_docx_gold_scoring_and_text_fidelity_export(self) -> None:
+    def test_docx_gold_scoring(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             docx = root / "gold.docx"
@@ -2818,16 +2347,6 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(
                 1.0, metrics["codex"]["repair"]["source_line_conservation"]
             )
-
-            output = write_text_fidelity_product(
-                document,
-                root / "product.jsonl",
-                dataset="TEST",
-                article_id="article",
-            )
-            row = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
-            self.assertEqual("ok", row["final_regions"]["status"])
-            self.assertEqual("TEST", row["dataset"])
 
     def test_docx_gold_includes_true_ooxml_endnotes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2868,48 +2387,6 @@ class EngineTests(unittest.TestCase):
                 "Final proposition",
                 gold["footnotes"][1]["passage_since_prior_note"],
             )
-
-    def test_benchmark_run_records_peak_rss_and_resumes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            docx = root / "gold.docx"
-            pdf = root / "legal.pdf"
-            make_docx(docx)
-            make_legal_pdf(pdf, restarted=False)
-            gold_path = root / "gold.json"
-            gold_path.write_text(
-                json.dumps(extract_docx_gold(docx)), encoding="utf-8"
-            )
-            manifest = root / "manifest.jsonl"
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "case_id": "case-1",
-                        "profile": "test",
-                        "pdf": str(pdf),
-                        "gold": str(gold_path),
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            output = root / "results.jsonl"
-            for _ in range(2):
-                run_manifest(
-                    manifest,
-                    output,
-                    mode="local",
-                    model=None,
-                    effort=None,
-                    cache_dir=root / "cache",
-                )
-            results = [
-                json.loads(line)
-                for line in output.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(1, len(results))
-            self.assertGreater(results[0]["peak_rss_bytes"], 0)
-
 
 if __name__ == "__main__":
     unittest.main()

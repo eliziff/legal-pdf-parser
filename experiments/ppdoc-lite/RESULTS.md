@@ -151,10 +151,10 @@ comparisons put the q75 two-layer candidate about 11% below the full decoder's
 median latency despite substantial machine-state noise. Two counter-ordered
 real-product parses of the 9-page SEC complaint had median latencies of 0.6323
 seconds/page for two layers and 0.7102 for full depth, also an 11% reduction.
-Every output file was byte-identical between tiers except `document.json`, whose
-model identity and derived cache key correctly differed. Repeated outputs
-within each tier were byte-identical. The two-layer export therefore advances
-as the balanced 640 tier; neither q50 nor three layers advances.
+Document structure was identical between tiers; only the model identity and
+derived cache key differed. Repeated results within each tier were identical.
+The two-layer export therefore advances as the balanced 640 tier; neither q50
+nor three layers advances.
 
 `export_ppdocv3_inference_ablation.sh` and
 `build_and_benchmark_openvino_ablation.sh` preserve the exact successful export,

@@ -25,12 +25,6 @@ from .model import (
     Section,
     Span,
     Word,
-    _compact_page,
-    _load_artifact_manifest,
-    _read_jsonl,
-    load_artifacts,
-    write_artifacts,
-    write_geometry_artifacts,
 )
 from .column_order_arbiter import (
     MAX_CHALLENGER_SWITCHES,
@@ -2376,7 +2370,6 @@ def parse_pdf(
     model: str | None = None,
     effort: str | None = None,
     ocr_provider: OCRProvider | None = None,
-    use_cache: bool = True,
 ) -> LegalDocument:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -2392,50 +2385,16 @@ def parse_pdf(
         ocr_provider=ocr_provider,
         engine_identity=engine_identity,
     )
-    cache_root = (
-        (
-            Path(cache_dir).expanduser().resolve()
-            if cache_dir is not None
-            else _default_cache_dir()
-        )
-        if use_cache
-        else None
+    document = _parse_local(
+        source,
+        source_hash=source_hash,
+        ocr_provider=ocr_provider,
     )
-    entry = cache_root / key if cache_root is not None else None
-    manifest = entry / "document.json" if entry is not None else None
-    document: LegalDocument | None = None
-    if manifest is not None and manifest.is_file():
-        try:
-            cached = load_artifacts(manifest)
-            if cached.source_sha256 != source_hash:
-                raise ValueError("Cached document source hash does not match the PDF")
-            _validate_document(cached)
-            cached.provenance = {
-                **cached.provenance,
-                "cache_hit": True,
-                "cache_enabled": True,
-                "deterministic_cache_key": key,
-                "engine_code": engine_identity,
-            }
-            document = cached
-        except (KeyError, OSError, TypeError, ValueError):
-            # document.json is the publication marker. Remove an invalid marker
-            # before rebuilding so readers never accept a partial replacement.
-            manifest.unlink(missing_ok=True)
-    if document is None:
-        document = _parse_local(
-            source,
-            source_hash=source_hash,
-            ocr_provider=ocr_provider,
-        )
-        document.provenance = {
-            **document.provenance,
-            "cache_enabled": use_cache,
-            "deterministic_cache_key": key,
-            "engine_code": engine_identity,
-        }
-        if entry is not None:
-            write_artifacts(document, entry)
+    document.provenance = {
+        **document.provenance,
+        "deterministic_cache_key": key,
+        "engine_code": engine_identity,
+    }
     if mode == "codex":
         chosen_model = model or os.environ.get("LEGALPDF_CODEX_MODEL")
         chosen_effort = effort or os.environ.get("LEGALPDF_CODEX_EFFORT")
@@ -2457,69 +2416,6 @@ def parse_pdf(
             cache_dir=repair_cache_root / "codex",
         )
     return document
-
-
-def add_pdf_geometry(
-    path: str | Path,
-    *,
-    document: str | Path,
-    output: str | Path,
-    ocr_provider: OCRProvider | None = None,
-) -> Path:
-    """Add geometry to a matching compact parse without repeating derivation."""
-
-    source = Path(path).expanduser().resolve()
-    if not source.is_file() or source.suffix.casefold() != ".pdf":
-        raise ValueError(f"Input must be a PDF: {source}")
-    manifest_path = Path(document).expanduser().resolve()
-    if manifest_path.is_dir():
-        manifest_path /= "document.json"
-    with manifest_path.open(encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("artifact_profile") != "compact-source"
-    ):
-        raise ValueError("Geometry can only extend a compact-source artifact")
-    source_hash = _sha256_file(source)
-    if manifest.get("source_sha256") != source_hash:
-        raise ValueError("Compact artifact source hash does not match the PDF")
-    if manifest.get("parser_version") != PARSER_VERSION:
-        raise ValueError("Compact artifact parser version does not match this engine")
-    engine_code = _engine_identity()
-    provenance = manifest.get("provenance")
-    cache_key = _cache_key(
-        source_hash,
-        ocr_provider=ocr_provider,
-        engine_identity=engine_code,
-    )
-    if (
-        not isinstance(provenance, dict)
-        or provenance.get("engine_code") != engine_code
-        or provenance.get("deterministic_cache_key") != cache_key
-    ):
-        raise ValueError("Compact artifact parse identity does not match this engine")
-    artifacts = manifest.get("artifacts")
-    pages_name = artifacts.get("pages") if isinstance(artifacts, dict) else None
-    if not isinstance(pages_name, str) or not pages_name:
-        raise ValueError("Compact artifact has no pages artifact")
-    compact_pages_path = (manifest_path.parent / pages_name).resolve()
-    if not compact_pages_path.is_relative_to(manifest_path.parent):
-        raise ValueError("Compact artifact has an unsafe pages path")
-    compact_pages = _read_jsonl(compact_pages_path)
-    pages, _diagnostics, _metadata = _extract_pdf_pages(
-        source,
-        ocr_provider=ocr_provider,
-    )
-    if compact_pages != [_compact_page(page) for page in pages]:
-        raise ValueError("Extracted geometry does not match the compact page text")
-    return write_geometry_artifacts(
-        pages,
-        output,
-        source_sha256=source_hash,
-        engine_code=engine_code,
-        deterministic_cache_key=cache_key,
-    )
 
 
 def rebuild_derived(document: LegalDocument) -> LegalDocument:
@@ -2616,74 +2512,6 @@ def lookup_footnote(
         for paragraph in document.paragraphs:
             if footnote.reference_line_id in paragraph.line_ids:
                 context = paragraph.text
-                break
-    return FootnoteLookup(
-        status="found",
-        query=query,
-        matches=[footnote.pair_id],
-        footnote=footnote,
-        proposition_mode=proposition_mode,
-        proposition=proposition,
-        context=context[:2000],
-    )
-
-
-def lookup_artifact_footnote(
-    document_path: str | Path,
-    label_or_pair_id: str,
-    *,
-    page: int | None = None,
-    occurrence: int | None = None,
-    proposition_mode: Literal[
-        "sentence", "passage_since_prior_note"
-    ] = "sentence",
-) -> FootnoteLookup:
-    """Look up a persisted note without loading pages, regions, or the PDF."""
-
-    if proposition_mode not in {"sentence", "passage_since_prior_note"}:
-        raise ValueError(f"Unknown proposition mode: {proposition_mode!r}")
-    _manifest, artifacts = _load_artifact_manifest(document_path)
-    footnotes_path = artifacts["footnotes"]
-    query = str(label_or_pair_id).strip()
-    matches: list[Footnote] = []
-    with footnotes_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            footnote = Footnote(**json.loads(line))
-            if footnote.pair_id != query and footnote.label != _normal_label(query):
-                continue
-            if page is not None and (
-                footnote.reference_page != page and page not in footnote.body_pages
-            ):
-                continue
-            if occurrence is not None and footnote.occurrence != occurrence:
-                continue
-            matches.append(footnote)
-    if not matches:
-        return FootnoteLookup(status="not_found", query=query, matches=[])
-    if len(matches) > 1:
-        return FootnoteLookup(
-            status="ambiguous",
-            query=query,
-            matches=[footnote.pair_id for footnote in matches],
-        )
-    footnote = matches[0]
-    proposition = (
-        footnote.sentence_proposition
-        if proposition_mode == "sentence"
-        else footnote.passage_since_prior_note
-    )
-    context = ""
-    paragraphs_path = artifacts["paragraphs"]
-    marker = f"⟦FN:{footnote.pair_id}⟧"
-    with paragraphs_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            paragraph = json.loads(line)
-            if marker in str(paragraph.get("text") or ""):
-                context = str(paragraph["text"])
                 break
     return FootnoteLookup(
         status="found",

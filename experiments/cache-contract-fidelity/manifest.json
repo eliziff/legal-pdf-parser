@@ -1,0 +1,45 @@
+{
+  "schema_version": "legalpdf.cache-contract-corpus.v1",
+  "documents": [
+    {
+      "path": "benchmarks/legal-generalization-corpus/gold/maud-v1/MAUD_v1_README.pdf",
+      "sha256": "104356b913a7e0a955eaca62f991c28c5d801c67a80e3e4f37629420e9aad778",
+      "pages": 7
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2014-scc-bhasin-v-hrynew.pdf",
+      "sha256": "3eed42bcc7dad404dd18201a7281d9555e868cc8ee07bbd6d02ce89467d531ca",
+      "pages": 67
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2021-scc-wastech-services.pdf",
+      "sha256": "fe6909b730a055d6dcbb70ae33b85640d6951680c471a6a670f1dc22610b34ac",
+      "pages": 67
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2020-sec-honig.pdf",
+      "sha256": "714fe3b6f64f030be0a43dd162ccec66611576dc5f086ba69006b9f87b64e469",
+      "pages": 106
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2023-sec-comp25666.pdf",
+      "sha256": "8c4578992501e4d3739e07e81b81e52b88d93e429afe6e1cefedec0585615027",
+      "pages": 9
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-ilnd-05-cv-03198.pdf",
+      "sha256": "fa3081cf2f54431cfe969c9e71be3b262847f9978285edc0c243dcba7a4d9564",
+      "pages": 10
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-10-cv-04728.pdf",
+      "sha256": "da417a2aede8d12adc5e77cfe1cbc49797f2c9672cfa431d7c1436fba2734c29",
+      "pages": 75
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-16-cv-01947-westport.pdf",
+      "sha256": "44d79a58446882328a18dcca31cb1bb29d96487c6624a27e9de65297767da972",
+      "pages": 84
+    }
+  ]
+}
