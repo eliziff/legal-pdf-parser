@@ -368,7 +368,7 @@ fn section_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .collect()
 }
 
-fn parse_ordinal(kind: &str, raw: &str) -> Option<usize> {
+pub(crate) fn parse_ordinal(kind: &str, raw: &str) -> Option<usize> {
     static PAGE: OnceLock<Regex> = OnceLock::new();
     static PARAGRAPH: OnceLock<Regex> = OnceLock::new();
     let value: String = raw.nfkc().collect();
@@ -384,7 +384,7 @@ fn parse_ordinal(kind: &str, raw: &str) -> Option<usize> {
     captures.get(1)?.as_str().parse().ok()
 }
 
-fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
+pub(crate) fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
     static RANGE: OnceLock<Regex> = OnceLock::new();
     static PAGE_PREFIX: OnceLock<Regex> = OnceLock::new();
     static PARAGRAPH_PREFIX: OnceLock<Regex> = OnceLock::new();
@@ -647,7 +647,7 @@ pub fn structure_lookup(document: &LegalDocument, request: &Value) -> Result<Val
             &input,
             "invalid",
             false,
-            Some("Section ranges are not supported by this artifact contract".to_owned()),
+            Some("Section ranges are not supported by this document contract".to_owned()),
         ));
     }
     if input.locator_kind != "section"
@@ -661,7 +661,7 @@ pub fn structure_lookup(document: &LegalDocument, request: &Value) -> Result<Val
             "unavailable",
             false,
             Some(format!(
-                "No exact {} identifiers exist in this PDF artifact",
+                "No exact {} identifiers exist in this source PDF",
                 input.locator_kind
             )),
         ));

@@ -1,6 +1,6 @@
-use crate::artifact::{atomic_write_with, python_json, write_json};
 use crate::deterministic_citations::{extract_fields, split_footnote};
 use crate::grammar_tables::compile_table_entry;
+use crate::storage::{atomic_write_with, python_json, write_json};
 use crate::{Error, Result};
 use fancy_regex::Regex as FancyRegex;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};

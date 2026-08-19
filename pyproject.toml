@@ -14,10 +14,6 @@ dependencies = ["PyMuPDF>=1.24"]
 benchmark = ["rapidfuzz>=3.0", "psutil>=5.9"]
 raster = ["numpy>=1.26"]
 
-[project.scripts]
-legalpdf = "legalpdf.cli:main"
-legalpdf-benchmark = "legalpdf.benchmark:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -97,7 +97,8 @@ impl KrakenTier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct KrakenOptions {
     pub model: Option<PathBuf>,
     pub codec: Option<PathBuf>,

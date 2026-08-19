@@ -1,623 +1,639 @@
+use crate::engine::{parse_pdf, ParseOptions};
+#[cfg(feature = "kraken")]
+use crate::KrakenOptions;
+#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+use crate::PPDocOptions;
 use crate::{
-    apply_docx_links, assess_docx_route, deterministic_docx_intents, extract_citation_fields,
-    extract_docx_gold, load_artifacts, load_projection_artifacts, lookup_artifact_footnote,
-    lookup_footnote, plan_docx_links, repair_context, repair_identity, repair_scopes, source_doc,
-    split_citations, split_citations_recall_first, structure_lookup, to_alr_payload,
-    to_toa_text_units, validate_docx_response, validate_repair_response, write_artifacts,
-    DocxPlanOptions, Error, Result,
+    source_doc, structure_lookup, Error, OcrOptions, Result, TesseractOptions, PARSER_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+const REQUEST_SCHEMA: &str = "legalpdf.document-request.v1";
+const RESULT_SCHEMA: &str = "legalpdf.document-result.v1";
+const MAX_SELECTED_PAGES: usize = 1_000;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::Message(format!("contract input has no {key}")))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Message(format!("document request has no {key}")))
 }
 
-fn optional_u32(value: &Value, key: &str) -> Result<Option<u32>> {
-    value
-        .get(key)
-        .filter(|item| !item.is_null())
-        .map(|item| {
-            item.as_u64()
-                .and_then(|number| u32::try_from(number).ok())
-                .ok_or_else(|| Error::Message(format!("contract input {key} is not an integer")))
-        })
-        .transpose()
-}
-
-fn optional_usize(value: &Value, key: &str) -> Result<Option<usize>> {
-    value
-        .get(key)
-        .filter(|item| !item.is_null())
-        .map(|item| {
-            item.as_u64()
-                .and_then(|number| usize::try_from(number).ok())
-                .ok_or_else(|| Error::Message(format!("contract input {key} is not an integer")))
-        })
-        .transpose()
-}
-
-fn temporary_directory() -> Result<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Message(format!("system clock is invalid: {error}")))?
-        .as_nanos();
-    let root =
-        std::env::temp_dir().join(format!("legalpdf-contract-{}-{stamp}", std::process::id()));
-    fs::create_dir(&root).map_err(|source| Error::io(&root, source))?;
-    Ok(root)
-}
-
-fn artifact_hashes(document: &crate::LegalDocument, compact: bool) -> Result<Value> {
-    let root = temporary_directory()?;
-    let result = (|| {
-        write_artifacts(document, &root, compact)?;
-        let mut hashes = serde_json::Map::new();
-        for name in [
-            "document.json",
-            "pages.jsonl",
-            "paragraphs.jsonl",
-            "sections.jsonl",
-            "footnotes.jsonl",
-            "tables.jsonl",
-            "images.jsonl",
-            "diagnostics.jsonl",
-            "repairs.jsonl",
-        ] {
-            let path = root.join(name);
-            let bytes = fs::read(&path).map_err(|source| Error::io(&path, source))?;
-            hashes.insert(
-                name.to_owned(),
-                json!({
-                    "bytes": bytes.len(),
-                    "sha256": format!("{:x}", Sha256::digest(&bytes)),
-                }),
-            );
-        }
-        Ok(Value::Object(hashes))
-    })();
-    let cleanup = fs::remove_dir_all(&root).map_err(|source| Error::io(&root, source));
-    match (result, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
+fn provider_spec(value: &Value, key: &str) -> Result<Option<(String, Value)>> {
+    let Some(spec) = value.get(key) else {
+        return Ok(None);
+    };
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Message(format!("document request {key} is not an object")))?;
+    if let Some(field) = spec
+        .keys()
+        .find(|field| !matches!(field.as_str(), "provider" | "settings"))
+    {
+        return Err(Error::Message(format!(
+            "unknown document request {key} field: {field}"
+        )));
     }
+    let provider = spec
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 100)
+        .ok_or_else(|| Error::Message(format!("document request {key} has no provider")))?;
+    let settings = spec.get("settings").cloned().unwrap_or_else(|| json!({}));
+    Ok(Some((provider.to_owned(), settings)))
 }
 
-fn docx_notes(gold: &Value) -> Vec<Value> {
-    gold.get("footnotes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|note| {
-            json!({
-                "id": note["ooxml_id"],
-                "label": note["label"],
-                "text": note["body"],
-                "proposition": note["passage_since_prior_note"],
-            })
-        })
-        .collect()
+fn strict_settings(provider: &str, settings: &Value, allowed: &[&str]) -> Result<()> {
+    let settings = settings.as_object().ok_or_else(|| {
+        Error::Message(format!(
+            "document request {provider} settings is not an object"
+        ))
+    })?;
+    if let Some(field) = settings
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(Error::Message(format!(
+            "unknown document request {provider} setting: {field}"
+        )));
+    }
+    Ok(())
 }
 
-fn stable_docx_plan(mut plan: Value) -> Value {
-    if let Some(telemetry) = plan.get_mut("telemetry").and_then(Value::as_object_mut) {
-        telemetry.remove("elapsed_seconds");
-        if let Some(batches) = telemetry.get_mut("batches").and_then(Value::as_array_mut) {
-            for batch in batches {
-                if let Some(batch) = batch.as_object_mut() {
-                    batch.remove("elapsed_seconds");
+fn selected_pages(value: &Value) -> Result<Option<Vec<usize>>> {
+    let Some(pages) = value.get("pages") else {
+        return Ok(None);
+    };
+    let pages = pages
+        .as_array()
+        .filter(|pages| !pages.is_empty() && pages.len() <= MAX_SELECTED_PAGES)
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "document request pages requires 1 to {MAX_SELECTED_PAGES} pages"
+            ))
+        })?;
+    let mut selected = Vec::with_capacity(pages.len());
+    for page in pages {
+        let page = page
+            .as_u64()
+            .and_then(|page| usize::try_from(page).ok())
+            .filter(|page| *page > 0)
+            .ok_or_else(|| {
+                Error::Message("document request pages must be positive integers".to_owned())
+            })?;
+        let index = page - 1;
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    selected.sort_unstable();
+    Ok(Some(selected))
+}
+
+fn parse_options(value: &Value, operation: &str) -> Result<ParseOptions> {
+    if operation == "source_doc" && value.get("pages").is_some() {
+        return Err(Error::Message(
+            "selected pages are not supported by source_doc".to_owned(),
+        ));
+    }
+    if operation == "structure_lookup"
+        && value.get("pages").is_some()
+        && value.pointer("/query/locator_kind").and_then(Value::as_str) != Some("page")
+    {
+        return Err(Error::Message(
+            "selected pages require a page structure lookup".to_owned(),
+        ));
+    }
+    let mut options = ParseOptions {
+        cache_dir: value
+            .get("cache_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
+        ocr_pages: selected_pages(value)?,
+        use_cache: true,
+        ..ParseOptions::default()
+    };
+
+    if let Some((provider, settings)) = provider_spec(value, "ocr")? {
+        options.ocr = match provider.as_str() {
+            "tesseract" => {
+                strict_settings(
+                    &provider,
+                    &settings,
+                    &[
+                        "command",
+                        "language",
+                        "dpi",
+                        "psm",
+                        "timeout_seconds",
+                        "expected_identity",
+                    ],
+                )?;
+                Some(OcrOptions::Tesseract(serde_json::from_value::<
+                    TesseractOptions,
+                >(settings)?))
+            }
+            "kraken-lite" => {
+                strict_settings(
+                    &provider,
+                    &settings,
+                    &[
+                        "model",
+                        "codec",
+                        "runtime",
+                        "runtime_wheel",
+                        "python",
+                        "blla_pack",
+                        "recognizer_pack",
+                        "tesseract_library",
+                        "dpi",
+                        "threads",
+                        "workers",
+                        "layout_workers",
+                        "batch_size",
+                        "runtime_batch_size",
+                        "width_bucket",
+                        "width_scale",
+                        "tier",
+                        "layout",
+                        "backend",
+                        "device",
+                        "cpu_fallback",
+                        "cpu_arena",
+                        "timeout_seconds",
+                        "expected_identity",
+                    ],
+                )?;
+                #[cfg(feature = "kraken")]
+                {
+                    Some(OcrOptions::Kraken(serde_json::from_value::<KrakenOptions>(
+                        settings,
+                    )?))
+                }
+                #[cfg(not(feature = "kraken"))]
+                {
+                    return Err(Error::Message(
+                        "kraken-lite requires a legalpdf binary built with the kraken feature"
+                            .to_owned(),
+                    ));
                 }
             }
+            _ => {
+                return Err(Error::Message(format!(
+                    "unsupported OCR provider: {provider}"
+                )))
+            }
+        };
+    }
+
+    if let Some((provider, settings)) = provider_spec(value, "layout")? {
+        if provider != "ppdoc" {
+            return Err(Error::Message(format!(
+                "unsupported layout provider: {provider}"
+            )));
+        }
+        strict_settings(
+            &provider,
+            &settings,
+            &[
+                "model_pack",
+                "runtime",
+                "cache_dir",
+                "threads",
+                "threshold",
+                "render_dpi",
+                "onednn",
+                "backend",
+                "device",
+                "cpu_fallback",
+                "expected_identity",
+            ],
+        )?;
+        #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+        {
+            options.ppdoc = Some(serde_json::from_value::<PPDocOptions>(settings)?);
+        }
+        #[cfg(not(any(feature = "ppdoc", feature = "ppdoc-openvino")))]
+        {
+            return Err(Error::Message(
+                "layout requires a legalpdf binary built with a layout feature".to_owned(),
+            ));
         }
     }
-    plan
+    Ok(options)
 }
 
-fn stable_docx_gold(mut gold: Value) -> Value {
-    if let Some(gold) = gold.as_object_mut() {
-        gold.remove("source_sha256");
-    }
-    gold
-}
-
-pub fn replay_contract(value: &Value) -> Result<Value> {
-    if value.get("schema_version").and_then(Value::as_str) != Some("legalpdf.contract-input.v1") {
+fn validate_selected_pages(value: &Value, selected: Option<&[usize]>, count: usize) -> Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if selected.iter().any(|page| *page >= count) {
         return Err(Error::Message(
-            "unsupported contract input schema".to_owned(),
+            "document request pages contains a page beyond the source PDF".to_owned(),
+        ));
+    }
+    if value.get("operation").and_then(Value::as_str) != Some("structure_lookup") {
+        return Ok(());
+    }
+    let query = value
+        .get("query")
+        .ok_or_else(|| Error::Message("document request has no query".to_owned()))?;
+    let locator = query
+        .get("locator")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Message("page lookup has no exact page locator".to_owned()))?;
+    let inline = crate::projection::numeric_range("page", locator);
+    let start = inline
+        .map(|range| range.0)
+        .or_else(|| crate::projection::parse_ordinal("page", locator))
+        .ok_or_else(|| Error::Message("page lookup has no exact page locator".to_owned()))?;
+    let end = query
+        .get("end_locator")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|locator| crate::projection::parse_ordinal("page", locator))
+                .ok_or_else(|| Error::Message("page lookup has no exact end locator".to_owned()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| inline.map(|range| range.1).unwrap_or(start));
+    let context = query
+        .get("context_blocks")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value <= 2)
+                .ok_or_else(|| {
+                    Error::Message("page lookup context_blocks must be 0 to 2".to_owned())
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if start == 0 || end < start || end > count {
+        return Err(Error::Message(
+            "page lookup range is outside the source PDF".to_owned(),
+        ));
+    }
+    let required_start = start.saturating_sub(context).max(1);
+    let required_end = end.saturating_add(context).min(count);
+    if (required_start..=required_end).any(|page| !selected.contains(&(page - 1))) {
+        return Err(Error::Message(
+            "selected pages do not cover the requested page range and context".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn source_hash(path: &Path) -> Result<String> {
+    let file = File::open(path).map_err(|source| Error::io(path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| Error::io(path, source))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn inspect_request(value: &Value) -> Result<Value> {
+    let path = Path::new(string(value, "source_pdf")?);
+    if !path.is_file()
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("pdf"))
+    {
+        return Err(Error::Message("input must be a PDF".to_owned()));
+    }
+    let inspection = pdf_inspector::detector::detect_pdf_type(path)
+        .map_err(|error| Error::Message(format!("PDF inspection failed: {error}")))?;
+    let sha256 = source_hash(path)?;
+    Ok(json!({
+        "schema_version": RESULT_SCHEMA,
+        "operation": "inspect",
+        "source": {
+            "sha256": sha256,
+            "parser_version": PARSER_VERSION,
+            "cache_key": Value::Null,
+            "cache_hit": false,
+            "page_count": inspection.page_count,
+        },
+        "result": {
+            "page_count": inspection.page_count,
+            "pdf_type": format!("{:?}", inspection.pdf_type),
+            "confidence": inspection.confidence,
+            "pages_needing_ocr": inspection.pages_needing_ocr,
+        },
+    }))
+}
+
+fn source_summary(document: &crate::LegalDocument) -> Value {
+    json!({
+        "sha256": document.source_sha256,
+        "parser_version": document.parser_version,
+        "cache_key": document.provenance.get("deterministic_cache_key"),
+        "cache_hit": document.provenance.get("cache_hit").and_then(Value::as_bool).unwrap_or(false),
+        "page_count": document.page_count,
+    })
+}
+
+fn physical_pages(value: Option<&Value>) -> Value {
+    Value::Array(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .map(|page| Value::from(page + 1))
+            .collect(),
+    )
+}
+
+fn prepare_summary(document: &crate::LegalDocument, selected: Option<&[usize]>) -> Value {
+    let prepared_pages = selected.map_or_else(
+        || json!({"selection": "full", "count": document.page_count}),
+        |pages| {
+            json!({
+                "selection": "selected",
+                "count": pages.len(),
+                "pages": pages.iter().map(|page| page + 1).collect::<Vec<_>>(),
+            })
+        },
+    );
+    json!({
+        "status": document.status,
+        "page_count": document.page_count,
+        "prepared_pages": prepared_pages,
+        "cache_validated": true,
+        "pdf_type": document.metadata.get("pdf_type"),
+        "confidence": document.metadata.get("confidence"),
+        "pages_needing_ocr": physical_pages(document.metadata.get("pages_needing_ocr")),
+        "ocr_routed_pages": physical_pages(document.metadata.get("ocr_routed_pages")),
+        "counts": {
+            "paragraphs": document.paragraphs.len(),
+            "sections": document.sections.len(),
+            "footnotes": document.footnotes.len(),
+            "tables": document.tables.len(),
+            "images": document.images.len(),
+            "diagnostics": document.diagnostics.len(),
+        },
+    })
+}
+
+pub fn document_request(value: &Value) -> Result<Value> {
+    if serde_json::to_vec(value)?.len() > MAX_REQUEST_BYTES {
+        return Err(Error::Message("document request exceeds 64 KiB".to_owned()));
+    }
+    if value.get("schema_version").and_then(Value::as_str) != Some(REQUEST_SCHEMA) {
+        return Err(Error::Message(
+            "unsupported document request schema".to_owned(),
         ));
     }
     let operation = string(value, "operation")?;
-    let artifact = value.get("artifact").and_then(Value::as_str).map(Path::new);
-    match operation {
-        "separator_contract" => {
-            let images = value
-                .get("images")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no images".to_owned()))?;
-            let mut scans = Vec::new();
-            for image in images {
-                let width = optional_usize(image, "width")?.unwrap_or_default();
-                let height = optional_usize(image, "height")?.unwrap_or_default();
-                let background = image
-                    .get("background")
-                    .and_then(Value::as_u64)
-                    .and_then(|number| u8::try_from(number).ok())
-                    .unwrap_or(255);
-                let mut gray = vec![background; width.saturating_mul(height)];
-                for fill in image
-                    .get("fills")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let fields = fill.as_array().ok_or_else(|| {
-                        Error::Message("separator fill is not an array".to_owned())
-                    })?;
-                    let numbers = fields
-                        .iter()
-                        .map(|field| field.as_u64().unwrap_or_default() as usize)
-                        .collect::<Vec<_>>();
-                    if numbers.len() != 5 {
-                        return Err(Error::Message(
-                            "separator fill must have five values".to_owned(),
-                        ));
-                    }
-                    for y in numbers[1].min(height)..numbers[3].min(height) {
-                        for x in numbers[0].min(width)..numbers[2].min(width) {
-                            gray[y * width + x] = numbers[4] as u8;
-                        }
-                    }
-                }
-                for pattern in image
-                    .get("dotted_rows")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let fields = pattern
-                        .as_array()
-                        .ok_or_else(|| Error::Message("dotted row is not an array".to_owned()))?
-                        .iter()
-                        .map(|field| field.as_u64().unwrap_or_default() as usize)
-                        .collect::<Vec<_>>();
-                    if fields.len() != 9 {
-                        return Err(Error::Message(
-                            "dotted row must have nine values".to_owned(),
-                        ));
-                    }
-                    for base_y in (fields[0]..fields[1].min(height)).step_by(fields[2].max(1)) {
-                        for y in base_y..(base_y + fields[3]).min(height) {
-                            for x in (fields[4]..fields[5].min(width)).step_by(fields[6].max(1)) {
-                                gray[y * width + x] = fields[7] as u8;
-                                for extra in 1..fields[8] {
-                                    if x + extra < fields[5].min(width) {
-                                        gray[y * width + x + extra] = fields[7] as u8;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                scans.push(json!({
-                    "id": image.get("id").cloned().unwrap_or(Value::Null),
-                    "record": crate::separator::scan_gray_page(&gray, width, height),
-                }));
-            }
-            let classifications = value
-                .get("classifications")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|case| {
-                    let rules = serde_json::from_value::<Vec<crate::separator::RuleRecord>>(
-                        case.get("rules").cloned().unwrap_or_else(|| json!([])),
-                    )?;
-                    let verticals =
-                        serde_json::from_value::<Vec<crate::separator::VerticalRuleRecord>>(
-                            case.get("vertical_rules")
-                                .cloned()
-                                .unwrap_or_else(|| json!([])),
-                        )?;
-                    let (separators, status) = crate::separator::classify_separator(
-                        &rules,
-                        &verticals,
-                        case.get("min_y_ratio")
-                            .and_then(Value::as_f64)
-                            .unwrap_or(0.30),
-                    );
-                    Ok(json!({
-                        "id": case.get("id").cloned().unwrap_or(Value::Null),
-                        "separators": separators,
-                        "status": status,
-                    }))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "scans": scans,
-                "classifications": classifications,
-            }))
+    if !matches!(
+        operation,
+        "inspect" | "prepare" | "source_doc" | "structure_lookup"
+    ) {
+        return Err(Error::Message(format!(
+            "unsupported document operation: {operation}"
+        )));
+    }
+    let allowed = match operation {
+        "inspect" => &["schema_version", "operation", "source_pdf"][..],
+        "prepare" => &[
+            "schema_version",
+            "operation",
+            "source_pdf",
+            "cache_dir",
+            "pages",
+            "ocr",
+            "layout",
+        ][..],
+        "source_doc" => &[
+            "schema_version",
+            "operation",
+            "source_pdf",
+            "cache_dir",
+            "ocr",
+            "layout",
+            "id",
+            "url",
+        ][..],
+        "structure_lookup" => &[
+            "schema_version",
+            "operation",
+            "source_pdf",
+            "cache_dir",
+            "ocr",
+            "layout",
+            "query",
+        ][..],
+        _ => unreachable!(),
+    };
+    if let Some(field) = value.as_object().and_then(|request| {
+        request
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+    }) {
+        return Err(Error::Message(format!(
+            "unknown document request field: {field}"
+        )));
+    }
+    for field in ["id", "url"] {
+        if value
+            .get(field)
+            .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 2_048))
+        {
+            return Err(Error::Message(format!(
+                "document request {field} must be a string of at most 2048 bytes"
+            )));
         }
-        "pairing_support" => {
-            let headings = value
-                .get("headings")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no headings".to_owned()))?;
-            let texts = value
-                .get("texts")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no texts".to_owned()))?;
-            let enumerators = value
-                .get("enumerators")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no enumerators".to_owned()))?;
-            let ladders = value
-                .get("ladders")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no ladders".to_owned()))?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
+    }
+    if operation == "inspect" {
+        return inspect_request(value);
+    }
+    let options = parse_options(value, operation)?;
+    let selected = options.ocr_pages.clone();
+    let source = string(value, "source_pdf")?;
+    let document = parse_pdf(source, &options)?;
+    validate_selected_pages(value, selected.as_deref(), document.page_count)?;
+    let result = match operation {
+        "prepare" => prepare_summary(&document, selected.as_deref()),
+        "source_doc" => source_doc(
+            &document,
+            value.get("id").and_then(Value::as_str),
+            value.get("url").and_then(Value::as_str),
+        ),
+        "structure_lookup" => structure_lookup(
+            &document,
+            value
+                .get("query")
+                .ok_or_else(|| Error::Message("document request has no query".to_owned()))?,
+        )?,
+        _ => unreachable!(),
+    };
+    Ok(json!({
+        "schema_version": RESULT_SCHEMA,
+        "operation": operation,
+        "source": source_summary(&document),
+        "result": result,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Document, Object};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn request_requires_a_source_pdf() {
+        let error = document_request(&json!({
+            "schema_version": REQUEST_SCHEMA,
+            "operation": "source_doc",
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("source_pdf"));
+    }
+
+    #[test]
+    fn selected_pages_are_bounded_deduplicated_indexes() {
+        assert_eq!(
+            selected_pages(&json!({"pages": [5, 1, 5]})).unwrap(),
+            Some(vec![0, 4])
+        );
+        assert!(selected_pages(&json!({"pages": [0]})).is_err());
+        assert!(selected_pages(&json!({"pages": []})).is_err());
+    }
+
+    #[test]
+    fn selected_page_lookup_covers_its_range_and_context() {
+        let request = json!({
+            "operation": "structure_lookup",
+            "query": {
+                "locator_kind": "page",
+                "locator": "page 5",
+                "context_blocks": 1,
+            },
+        });
+        assert!(validate_selected_pages(&request, Some(&[3, 4, 5]), 10).is_ok());
+        assert!(validate_selected_pages(&request, Some(&[4]), 10).is_err());
+    }
+
+    #[test]
+    fn selected_pages_reject_non_page_lookups() {
+        let error = parse_options(
+            &json!({
+                "pages": [5],
+                "query": {"locator_kind": "footnote", "locator": "5"},
+            }),
+            "structure_lookup",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("page structure lookup"));
+
+        let error = parse_options(&json!({"pages": [5]}), "source_doc").unwrap_err();
+        assert!(error.to_string().contains("source_doc"));
+    }
+
+    #[test]
+    fn provider_settings_and_top_level_fields_are_strict() {
+        assert!(parse_options(
+            &json!({
+                "ocr": {"provider": "tesseract", "settings": {"mystery": true}},
+            }),
+            "prepare",
+        )
+        .is_err());
+        assert!(parse_options(
+            &json!({
+                "ocr": {
+                    "provider": "tesseract",
+                    "settings": {},
+                    "legacy": true,
+                },
+            }),
+            "prepare",
+        )
+        .is_err());
+        assert!(parse_options(
+            &json!({
+                "layout": {
+                    "provider": "ppdoc",
+                    "settings": {"legacy": true},
+                },
+            }),
+            "prepare",
+        )
+        .is_err());
+        for operation in ["inspect", "prepare", "source_doc", "structure_lookup"] {
+            let error = document_request(&json!({
+                "schema_version": REQUEST_SCHEMA,
                 "operation": operation,
-                "headings": headings.iter().map(|item| {
-                    let text = item.as_str().unwrap_or_default();
-                    json!({"text": text, "plausible": crate::pairing_support::heading_text_plausible(text)})
-                }).collect::<Vec<_>>(),
-                "texts": texts.iter().map(|item| {
-                    let text = item.as_str().unwrap_or_default();
-                    json!({
-                        "text": text,
-                        "cue": crate::pairing_support::has_legal_citation_cue(text),
-                        "continuation": crate::pairing_support::is_legal_citation_continuation(text),
-                        "signal": crate::pairing_support::has_citation_signal(text),
-                        "protected_spans": crate::pairing_support::protected_citation_spans(text),
-                    })
-                }).collect::<Vec<_>>(),
-                "enumerators": enumerators.iter().map(|item| {
-                    let value = item.get("value").and_then(Value::as_str).unwrap_or_default();
-                    let punct = item.get("punct").and_then(Value::as_str).unwrap_or_default();
-                    json!({
-                        "value": value,
-                        "punct": punct,
-                        "interpretations": crate::pairing_support::enumerator_interpretations(value, punct),
-                    })
-                }).collect::<Vec<_>>(),
-                "ladders": ladders.iter().map(|item| {
-                    crate::pairing_support::parse_heading_ladder(item.as_array().map(Vec::as_slice).unwrap_or_default())
-                }).collect::<Vec<_>>(),
+                "source_pdf": "missing.pdf",
+                "artifact": "legacy",
             }))
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown document request field"));
         }
-        "ocr_tsv" => {
-            let number = |key: &str| {
-                value
-                    .get(key)
-                    .and_then(Value::as_f64)
-                    .ok_or_else(|| Error::Message(format!("contract input {key} is not a number")))
-            };
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "lines": crate::ocr::tsv_lines(
-                    string(value, "tsv")?,
-                    number("x_scale")?,
-                    number("y_scale")?,
-                    number("page_width")?,
-                    number("page_height")?,
-                ),
-            }))
-        }
-        "repair_identity" => Ok(json!({
-            "schema_version": "legalpdf.contract-result.v1",
-            "operation": operation,
-            "identity": repair_identity()?,
-        })),
-        "repair_contract" => {
-            let document = load_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            let targets = value
-                .get("target_pages")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no target_pages".to_owned()))?
-                .iter()
-                .map(|page| {
-                    page.as_u64()
-                        .and_then(|page| usize::try_from(page).ok())
-                        .ok_or_else(|| Error::Message("target page is not an integer".to_owned()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let expected = targets
-                .iter()
-                .map(|page| {
-                    Ok((
-                        *page,
-                        document
-                            .pages
-                            .get(*page)
-                            .ok_or_else(|| {
-                                Error::Message("target page is out of range".to_owned())
-                            })?
-                            .lines
-                            .iter()
-                            .map(|line| line.id.clone())
-                            .collect(),
-                    ))
-                })
-                .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-            let validation = value.get("response").map(|response| {
-                let (valid, error) = validate_repair_response(response, &targets, &expected);
-                json!({"valid": valid, "error": error})
-            });
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "identity": repair_identity()?,
-                "scopes": repair_scopes(&document),
-                "context": repair_context(&document, &targets)?,
-                "validation": validation,
-            }))
-        }
-        "docx_intents" => {
-            let id = string(value, "footnote_id")?;
-            let text = string(value, "text")?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "intents": deterministic_docx_intents(id, text)?,
-            }))
-        }
-        "docx_route" => {
-            let footnotes = value
-                .get("footnotes")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no footnotes".to_owned()))?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "assessment": assess_docx_route(footnotes)?,
-            }))
-        }
-        "docx_validate" => {
-            let records = value
-                .get("records")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no records".to_owned()))?;
-            let response = value
-                .get("response")
-                .ok_or_else(|| Error::Message("contract input has no response".to_owned()))?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "validated": validate_docx_response(response, records)?,
-            }))
-        }
-        "docx_extract" => {
-            let path = Path::new(string(value, "docx")?);
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "gold": extract_docx_gold(path)?,
-            }))
-        }
-        "docx_batch" => {
-            let cases = value
-                .get("cases")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no cases".to_owned()))?;
-            let mut results = Vec::with_capacity(cases.len());
-            for case in cases {
-                let path = Path::new(string(case, "docx")?);
-                let gold = extract_docx_gold(path)?;
-                let notes = docx_notes(&gold);
-                let intents = notes
-                    .iter()
-                    .map(|note| {
-                        Ok(json!({
-                            "id": note["id"],
-                            "intents": deterministic_docx_intents(
-                                note["id"].as_str().expect("note id"),
-                                note["text"].as_str().expect("note text"),
-                            )?,
-                        }))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                results.push(json!({
-                    "docx": path,
-                    "gold": gold,
-                    "assessment": assess_docx_route(&notes)?,
-                    "intents": intents,
-                }));
-            }
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "results": results,
-            }))
-        }
-        "docx_plan_hybrid" => {
-            let path = Path::new(string(value, "docx")?);
-            let options = DocxPlanOptions {
-                strategy: "hybrid".to_owned(),
-                ..DocxPlanOptions::default()
-            };
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "plan": stable_docx_plan(plan_docx_links(path, &options)?),
-            }))
-        }
-        "docx_apply" => {
-            let path = Path::new(string(value, "docx")?);
-            let output = Path::new(string(value, "output")?);
-            let links = value
-                .get("links")
-                .ok_or_else(|| Error::Message("contract input has no links".to_owned()))?;
-            let options = DocxPlanOptions {
-                strategy: "hybrid".to_owned(),
-                ..DocxPlanOptions::default()
-            };
-            let plan = plan_docx_links(path, &options)?;
-            let applied = apply_docx_links(path, &plan, links, output)?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "plan": stable_docx_plan(plan),
-                "applied": applied,
-                "gold": stable_docx_gold(extract_docx_gold(output)?),
-                "targets": crate::docx::link_targets(output)?,
-            }))
-        }
-        "citation_batch" => {
-            let cases = value
-                .get("cases")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Message("contract input has no cases".to_owned()))?;
-            let mut results = Vec::with_capacity(cases.len());
-            for case in cases {
-                let text = string(case, "text")?;
-                let mode = case
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("recall_first");
-                let split = match mode {
-                    "conservative" => split_citations(text)?,
-                    "recall_first" => split_citations_recall_first(text)?,
-                    _ => {
-                        return Err(Error::Message(format!(
-                            "unsupported citation split mode: {mode}"
-                        )))
-                    }
-                };
-                let fields = split
-                    .parts
-                    .iter()
-                    .map(extract_citation_fields)
-                    .collect::<Result<Vec<_>>>()?;
-                results.push(json!({"mode": mode, "text": text, "split": split, "fields": fields}));
-            }
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "results": results,
-            }))
-        }
-        "citation_split" | "citation_split_recall_first" => {
-            let text = string(value, "text")?;
-            let split = if operation == "citation_split" {
-                split_citations(text)?
-            } else {
-                split_citations_recall_first(text)?
-            };
-            let fields = split
-                .parts
-                .iter()
-                .map(extract_citation_fields)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "split": split,
-                "fields": fields,
-            }))
-        }
-        "load_document" => {
-            let document = load_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "document": document,
-            }))
-        }
-        "artifact_bytes" => {
-            let document = load_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            let compact = value
-                .get("compact")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "compact": compact,
-                "artifacts": artifact_hashes(&document, compact)?,
-            }))
-        }
-        "adapters" => {
-            let document = load_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "alr": to_alr_payload(&document),
-                "toa": to_toa_text_units(&document)?,
-            }))
-        }
-        "source_doc" => {
-            let document = load_projection_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            let projected = source_doc(
-                &document,
-                value.get("id").and_then(Value::as_str),
-                value.get("url").and_then(Value::as_str),
-            );
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "result": projected,
-            }))
-        }
-        "structure_lookup" => {
-            let document = load_projection_artifacts(
-                artifact
-                    .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?,
-            )?;
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "result": structure_lookup(&document, value)?,
-            }))
-        }
-        "lookup" | "artifact_lookup" => {
-            let artifact = artifact
-                .ok_or_else(|| Error::Message("contract input has no artifact".to_owned()))?;
-            let query = string(value, "query")?;
-            let page = optional_u32(value, "page")?;
-            let occurrence = optional_usize(value, "occurrence")?;
-            let proposition_mode = value
-                .get("proposition_mode")
-                .and_then(Value::as_str)
-                .unwrap_or("sentence");
-            let result = if operation == "lookup" {
-                let document = load_artifacts(artifact)?;
-                lookup_footnote(&document, query, page, occurrence, proposition_mode)?
-            } else {
-                lookup_artifact_footnote(artifact, query, page, occurrence, proposition_mode)?
-            };
-            Ok(json!({
-                "schema_version": "legalpdf.contract-result.v1",
-                "operation": operation,
-                "result": result,
-            }))
-        }
-        other => Err(Error::Message(format!(
-            "unsupported contract operation: {other}"
-        ))),
+    }
+
+    #[test]
+    fn inspect_is_direct_and_has_no_cache_key() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "legalpdf-inspect-{}-{stamp}.pdf",
+            std::process::id()
+        ));
+        let mut pdf = Document::with_version("1.4");
+        let pages_id = pdf.new_object_id();
+        let page_id = pdf.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+        });
+        pdf.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog = pdf.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        pdf.trailer.set("Root", Object::Reference(catalog));
+        pdf.save(&path).unwrap();
+
+        let result = document_request(&json!({
+            "schema_version": REQUEST_SCHEMA,
+            "operation": "inspect",
+            "source_pdf": path,
+        }))
+        .unwrap();
+        assert_eq!(result["result"]["page_count"], 1);
+        assert!(result["source"]["cache_key"].is_null());
+        assert_eq!(result["source"]["cache_hit"], false);
+        std::fs::remove_file(path).unwrap();
     }
 }

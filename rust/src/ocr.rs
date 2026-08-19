@@ -113,7 +113,8 @@ impl OcrProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TesseractOptions {
     pub command: Option<PathBuf>,
     pub language: String,

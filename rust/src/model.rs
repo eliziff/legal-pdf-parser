@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 pub const SCHEMA_VERSION: &str = "legalpdf.document.v2";
-pub const GEOMETRY_SCHEMA_VERSION: &str = "legalpdf.geometry.v1";
 pub const PARSER_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,45 +284,6 @@ impl LegalDocument {
             .map(|paragraph| paragraph.text.as_str())
             .collect::<Vec<_>>()
             .join("\n\n")
-    }
-
-    pub fn manifest(&self, compact_pages: bool) -> Value {
-        let mut value = json!({
-            "schema_version": self.schema_version,
-            "parser_version": self.parser_version,
-            "document_id": self.document_id,
-            "source_name": self.source_name,
-            "source_sha256": self.source_sha256,
-            "page_count": self.page_count,
-            "status": self.status,
-            "metadata": self.metadata,
-            "provenance": self.provenance,
-            "counts": {
-                "pages": self.pages.len(),
-                "lines": self.line_count(),
-                "paragraphs": self.paragraphs.len(),
-                "sections": self.sections.len(),
-                "footnotes": self.footnotes.len(),
-                "tables": self.tables.len(),
-                "images": self.images.len(),
-                "diagnostics": self.diagnostics.len(),
-                "repairs": self.repairs.len(),
-            },
-            "artifacts": {
-                "pages": "pages.jsonl",
-                "paragraphs": "paragraphs.jsonl",
-                "sections": "sections.jsonl",
-                "footnotes": "footnotes.jsonl",
-                "tables": "tables.jsonl",
-                "images": "images.jsonl",
-                "diagnostics": "diagnostics.jsonl",
-                "repairs": "repairs.jsonl",
-            },
-        });
-        if compact_pages {
-            value["artifact_profile"] = Value::String("compact-source".to_owned());
-        }
-        value
     }
 }
 

@@ -1,5 +1,4 @@
 mod adapters;
-mod artifact;
 mod codex;
 mod contract;
 mod deterministic_citations;
@@ -30,19 +29,14 @@ mod ppdoc_openvino;
 mod ppdoc_postprocess;
 mod profile;
 mod projection;
-mod repair;
 mod separator;
+mod storage;
 mod structure;
 #[cfg(feature = "kraken")]
 mod tesseract_layout;
 
 pub use adapters::{to_alr_payload, to_toa_text_units};
-pub use artifact::{
-    load_artifacts, load_geometry_artifacts, load_projection_artifacts, lookup_artifact_footnote,
-    write_artifacts, write_geometry_artifacts,
-};
-#[doc(hidden)]
-pub use contract::replay_contract;
+pub use contract::document_request;
 pub use deterministic_citations::{
     extract_fields as extract_citation_fields, split_footnote as split_citations,
     split_footnote_recall_first as split_citations_recall_first, DeterministicFields,
@@ -52,12 +46,8 @@ pub use docx::{
     apply_docx_links, assess_docx_route, deterministic_docx_intents, extract_docx_gold,
     plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
 };
-#[cfg(feature = "ocr")]
-pub use engine::render_pdf_pages;
-pub use engine::{
-    add_pdf_geometry, apply_external_layout, default_cache_dir, extract_common_input,
-    extract_layout_input, page_count, parse_pdf, replay_common_input, ParseMode, ParseOptions,
-};
+#[doc(hidden)]
+pub use engine::{extract_common_input, replay_common_input};
 pub use error::{Error, Result};
 pub use grammar_tables::{compile_table_entry, load_tables, run_vectors as run_grammar_vectors};
 #[cfg(feature = "kraken")]
@@ -71,7 +61,3 @@ pub use ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord, TesseractOcr, Tesseract
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
 pub use projection::{source_doc, structure_lookup};
-pub use repair::{
-    improve_document, repair_context, repair_identity, repair_scopes, replay_repair,
-    validate_repair_response,
-};
