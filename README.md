@@ -14,10 +14,8 @@ reading order, and pinpoint locators. It runs locally and caches completed work.
 | Turbo | 2.50 pages/s | **6.59 pages/s** | 3.14% |
 | Native Tesseract 5.4 | **2.76 pages/s** | — | 3.83% |
 
-These are end-to-end results on the same 153 scanned legal pages. Quality is
-the most accurate option; Turbo is faster while remaining more accurate than
-native Tesseract. Tesseract has no supported CUDA inference path. The full
-reproducible receipt is in
+These are end-to-end results on the a sample of 153 scanned legal pages.
+The full reproducible receipt is in
 [`experiments/kraken-lite/cpu-benchmark/RESULTS.md`](experiments/kraken-lite/cpu-benchmark/RESULTS.md).
 
 Digital-born PDFs avoid OCR. The native path processed a separate 156-page
