@@ -101,7 +101,6 @@ fn run() -> Result<()> {
                     .ok_or_else(|| Error::Message(format!("invalid {option}: {value}")))?;
             }
             "--kraken-device" => options.device = Some(take(&arguments, &mut index, option)?),
-            "--kraken-cpu-fallback" => options.cpu_fallback = true,
             "--kraken-low-memory" => options.cpu_arena = false,
             "--kraken-workers" => options.workers = number(&arguments, &mut index, option)?,
             "--kraken-threads" => options.threads = number(&arguments, &mut index, option)?,
@@ -114,6 +113,9 @@ fn run() -> Result<()> {
             }
             "--kraken-width-bucket" => {
                 options.width_bucket = number(&arguments, &mut index, option)?
+            }
+            "--kraken-input-height" => {
+                options.input_height = number(&arguments, &mut index, option)?
             }
             "--kraken-width-scale" => {
                 options.width_scale = Some(number(&arguments, &mut index, option)?)
@@ -190,7 +192,12 @@ fn run() -> Result<()> {
                 .into_iter()
                 .map(|image| image.into_rgba8())
                 .collect::<Vec<_>>();
-            (provider.recognize_rgba_images_diagnostics(&decoded)?, None)
+            if profile {
+                let batch = provider.recognize_rgba_images_profile(&decoded)?;
+                (batch.pages, Some(batch.performance))
+            } else {
+                (provider.recognize_rgba_images_diagnostics(&decoded)?, None)
+            }
         } else {
             let decoded = decoded
                 .into_iter()

@@ -127,7 +127,7 @@ fn engine_identity() -> Value {
                 ("tesseract_layout.rs", include_bytes!("tesseract_layout.rs")),
                 (
                     "data/mcgill_reporters.json",
-                    include_bytes!("../../src/legalpdf/data/mcgill_reporters.json"),
+                    include_bytes!("../../data/mcgill_reporters.json"),
                 ),
                 (
                     "data/legal-grammar-tables/grammar-corpus.json",

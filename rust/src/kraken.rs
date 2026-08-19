@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const INPUT_HEIGHT: usize = 48;
 // Store padding in the shared batch tensor, not in every prepared line.
 const INPUT_PADDING: usize = 16;
 const BLANK_LABEL: usize = 0;
@@ -115,12 +114,12 @@ pub struct KrakenOptions {
     pub batch_size: usize,
     pub runtime_batch_size: usize,
     pub width_bucket: usize,
+    pub input_height: usize,
     pub width_scale: Option<f32>,
     pub tier: KrakenTier,
     pub layout: KrakenLayout,
     pub backend: KrakenBackend,
     pub device: Option<String>,
-    pub cpu_fallback: bool,
     pub cpu_arena: bool,
     pub timeout_seconds: u64,
     pub expected_identity: Option<String>,
@@ -140,18 +139,16 @@ impl Default for KrakenOptions {
             dpi: 200,
             threads: 0,
             workers: 0,
-            layout_workers: std::thread::available_parallelism()
-                .map_or(1, |value| value.get().div_ceil(2))
-                .min(8),
-            batch_size: 32,
+            layout_workers: 0,
+            batch_size: 0,
             runtime_batch_size: 0,
-            width_bucket: 24,
+            width_bucket: 0,
+            input_height: 48,
             width_scale: None,
             tier: KrakenTier::Quality,
             layout: KrakenLayout::Tesseract,
             backend: KrakenBackend::Cpu,
             device: None,
-            cpu_fallback: false,
             cpu_arena: true,
             timeout_seconds: 3600,
             expected_identity: None,
@@ -402,6 +399,7 @@ pub struct KrakenOcr {
     dpi: u16,
     batch_size: usize,
     width_bucket: usize,
+    input_height: usize,
     width_scale: f32,
     tesseract_layouts: Vec<TesseractLayout>,
     blla: Option<BllaRuntime>,
@@ -422,6 +420,7 @@ impl KrakenOcr {
                 dpi: options.dpi,
                 batch_size: options.batch_size,
                 width_bucket: options.width_bucket,
+                input_height: options.input_height,
                 width_scale: 1.0,
                 tesseract_layouts: vec![],
                 blla: Some(blla),
@@ -432,6 +431,9 @@ impl KrakenOcr {
         let device = options
             .backend
             .normalized_device(options.device.as_deref())?;
+        let layout_workers = effective_layout_workers(options.layout_workers, options.backend);
+        let (batch_size, width_bucket) =
+            effective_recognition_batch(options.batch_size, options.width_bucket, options.backend);
         let model = required_path(&options.model, "LEGALPDF_KRAKEN_MODEL", "Kraken model")?;
         let codec = options
             .codec
@@ -463,17 +465,17 @@ impl KrakenOcr {
         let session_global_threads = (!independent_pool)
             .then_some(environment_global_threads)
             .flatten();
-        let tesseract_layouts = (0..options.layout_workers)
+        let tesseract_layouts = (0..layout_workers)
             .map(|_| TesseractLayout::new(&tesseract_library, options.dpi))
             .collect::<Result<Vec<_>>>()?;
         let layout_identity = sha256_file(&tesseract_library)?;
         let identity = format!(
-            "kraken-lite-rust-v2:backend={}:device={device}:fallback={}:model={}:codec={}:runtime={}:layout={layout_identity}",
+            "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}",
             options.backend.name(),
-            if options.cpu_fallback { "cpu" } else { "none" },
             sha256_file(&model)?,
             sha256_file(&codec_path)?,
             sha256_file(&runtime)?,
+            options.input_height,
         );
         if options
             .expected_identity
@@ -493,7 +495,6 @@ impl KrakenOcr {
                     threads,
                     options.backend,
                     &device,
-                    options.cpu_fallback,
                     options.cpu_arena,
                     &prepacked_weights,
                     independent_pool,
@@ -508,11 +509,11 @@ impl KrakenOcr {
             "{identity}:tier={}:dpi={}:batch={}:bucket={}:scale={width_scale:.3}:layout={}:workers={workers}:threads={}:layout-workers={}:ort-global-threads={}:cpu-arena={}",
             options.tier.name(),
             options.dpi,
-            options.batch_size,
-            options.width_bucket,
+            batch_size,
+            width_bucket,
             options.layout.name(),
             threads,
-            options.layout_workers,
+            layout_workers,
             session_global_threads.unwrap_or(0),
             options.cpu_arena,
         );
@@ -520,8 +521,9 @@ impl KrakenOcr {
             sessions,
             codec: Some(codec),
             dpi: options.dpi,
-            batch_size: options.batch_size,
-            width_bucket: options.width_bucket,
+            batch_size,
+            width_bucket,
+            input_height: options.input_height,
             width_scale,
             tesseract_layouts,
             blla: None,
@@ -575,6 +577,26 @@ impl KrakenOcr {
         self.diagnose_rgba_many(images)
     }
 
+    pub fn recognize_rgba_images_profile(
+        &mut self,
+        images: &[RgbaImage],
+    ) -> Result<KrakenBatchDiagnostics> {
+        if self.blla.is_some() {
+            return Err(Error::Message(
+                "direct RGBA pages require Tesseract layout".to_owned(),
+            ));
+        }
+        let pages = images
+            .iter()
+            .map(|image| PagePixels::Rgba {
+                pixels: image.as_raw(),
+                width: image.width(),
+                height: image.height(),
+            })
+            .collect::<Vec<_>>();
+        self.diagnose_pages_profile(&pages)
+    }
+
     pub fn recognize_gray_images_profile(
         &mut self,
         images: &[GrayImage],
@@ -593,7 +615,7 @@ impl KrakenOcr {
         }
         let lines = boxes
             .into_iter()
-            .filter_map(|bbox| prepare_line(image, bbox, self.width_scale))
+            .filter_map(|bbox| prepare_line(image, bbox, self.width_scale, self.input_height))
             .collect::<Vec<_>>();
         for session in &mut self.sessions {
             let _ = recognize_prepared(
@@ -602,6 +624,7 @@ impl KrakenOcr {
                 &lines,
                 self.batch_size,
                 self.width_bucket,
+                self.input_height,
             )?;
         }
         Ok(())
@@ -626,13 +649,14 @@ impl KrakenOcr {
             let interpreter = InterpreterSettings::default();
             let settings = pdf_render_settings(self.dpi);
             let rendered = render_pdf_pages(&pdf, &cache, &interpreter, &settings, requests, blla)?;
-            return finish_pdf_pages(rendered, |images| self.diagnose_gray_many(images));
+            return self.finish_rendered_pdf_pages(rendered, blla);
         }
 
         // Preserve the established OCR batches while extending their producer
         // upstream to render only the next bounded page window.
         let window_size = preparation_window_size(requests.len());
         let width_scale = self.width_scale;
+        let input_height = self.input_height;
         let batch_size = self.batch_size;
         let width_bucket = self.width_bucket;
         let dpi = self.dpi;
@@ -671,9 +695,12 @@ impl KrakenOcr {
                             break;
                         }
                     };
-                    let (metadata, gray_images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
-                    let images = gray_images.iter().map(PagePixels::Gray).collect::<Vec<_>>();
-                    let value = Self::prepare_window(layouts, &images, width_scale);
+                    let (metadata, page_images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
+                    let images = page_images
+                        .iter()
+                        .map(RenderedPdfImage::as_page_pixels)
+                        .collect::<Vec<_>>();
+                    let value = Self::prepare_window(layouts, &images, width_scale, input_height);
                     let failed = value.is_err();
                     if !failed && metadata_sender.send(metadata).is_err() {
                         break;
@@ -689,6 +716,7 @@ impl KrakenOcr {
                 codec,
                 batch_size,
                 width_bucket,
+                input_height,
                 requests.len(),
             );
             producer
@@ -699,6 +727,29 @@ impl KrakenOcr {
                 result?.pages,
             )
         })
+    }
+
+    #[cfg(feature = "ocr")]
+    fn finish_rendered_pdf_pages(
+        &mut self,
+        rendered: Vec<RenderedPdfPage>,
+        blla: bool,
+    ) -> Result<Vec<OcrPageResult>> {
+        let (metadata, images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
+        let pages = if blla {
+            let images = images
+                .into_iter()
+                .map(RenderedPdfImage::into_gray)
+                .collect::<Result<Vec<_>>>()?;
+            self.diagnose_gray_many(&images)?
+        } else {
+            let images = images
+                .into_iter()
+                .map(RenderedPdfImage::into_rgba)
+                .collect::<Result<Vec<_>>>()?;
+            self.diagnose_rgba_many(&images)?
+        };
+        finish_recognized_pdf_pages(metadata, pages)
     }
 
     fn recognize_gray(
@@ -796,6 +847,7 @@ impl KrakenOcr {
         // Balance bounded windows so overlap never leaves a one-page tail.
         let window_size = preparation_window_size(images.len());
         let width_scale = self.width_scale;
+        let input_height = self.input_height;
         let batch_size = self.batch_size;
         let width_bucket = self.width_bucket;
         let codec = self.codec.as_ref().expect("fast Kraken codec");
@@ -805,7 +857,7 @@ impl KrakenOcr {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let producer = scope.spawn(move || {
                 for window in images.chunks(window_size) {
-                    let value = Self::prepare_window(layouts, window, width_scale);
+                    let value = Self::prepare_window(layouts, window, width_scale, input_height);
                     let failed = value.is_err();
                     if sender.send(value).is_err() || failed {
                         break;
@@ -818,6 +870,7 @@ impl KrakenOcr {
                 codec,
                 batch_size,
                 width_bucket,
+                input_height,
                 images.len(),
             );
             producer
@@ -894,6 +947,7 @@ impl KrakenOcr {
         codec: &Codec,
         batch_size: usize,
         width_bucket: usize,
+        input_height: usize,
         page_capacity: usize,
     ) -> Result<PreparedDiagnostics> {
         let mut pages = Vec::with_capacity(page_capacity);
@@ -926,6 +980,7 @@ impl KrakenOcr {
                 codec,
                 batch_size,
                 width_bucket,
+                input_height,
                 &window.prepared,
             )?;
             let window_recognition_seconds = window.line_prepare_seconds + part.wall_seconds;
@@ -1048,6 +1103,7 @@ impl KrakenOcr {
         layouts: &mut [TesseractLayout],
         images: &[PagePixels<'_>],
         width_scale: f32,
+        input_height: usize,
     ) -> Result<PreparedWindow> {
         let started = Instant::now();
         let boxes = Self::layout_boxes_many(layouts, images)?;
@@ -1061,7 +1117,7 @@ impl KrakenOcr {
             })
             .collect();
         let started = Instant::now();
-        let prepared = prepare_pages(images, &boxes, width_scale)?;
+        let prepared = prepare_pages(images, &boxes, width_scale, input_height)?;
         Ok(PreparedWindow {
             layout_boxes,
             prepared,
@@ -1075,6 +1131,7 @@ impl KrakenOcr {
         codec: &Codec,
         batch_size: usize,
         width_bucket: usize,
+        input_height: usize,
         pages: &[Vec<PreparedLine>],
     ) -> Result<(Vec<Vec<(String, f64)>>, RecognitionPerformance)> {
         let counts = pages.iter().map(Vec::len).collect::<Vec<_>>();
@@ -1121,6 +1178,7 @@ impl KrakenOcr {
                                 &mut pixels,
                                 &mut lengths,
                                 worker,
+                                input_height,
                             );
                             let failed = value.is_err();
                             if sender.send(value).is_err() || failed {
@@ -1411,6 +1469,7 @@ fn recognize_batch(
     pixels: &mut Vec<f32>,
     lengths: &mut Vec<i64>,
     worker: usize,
+    input_height: usize,
 ) -> Result<RecognizedBatch> {
     let total_started = Instant::now();
     let pack_started = Instant::now();
@@ -1419,16 +1478,16 @@ fn recognize_batch(
         .map(|&index| lines[index].width)
         .max()
         .unwrap_or(1);
-    pixels.resize(batch.len() * INPUT_HEIGHT * maximum, 0.0);
+    pixels.resize(batch.len() * input_height * maximum, 0.0);
     pixels.fill(0.0);
     lengths.clear();
     for (local, &index) in batch.iter().enumerate() {
         let line = lines[index];
         lengths.push(line.width as i64);
         let content_width = line.width - INPUT_PADDING * 2;
-        for row in 0..INPUT_HEIGHT {
+        for row in 0..input_height {
             let source = row * content_width;
-            let target = (local * INPUT_HEIGHT + row) * maximum + INPUT_PADDING;
+            let target = (local * input_height + row) * maximum + INPUT_PADDING;
             for (&value, pixel) in line.pixels[source..source + content_width]
                 .iter()
                 .zip(&mut pixels[target..target + content_width])
@@ -1438,7 +1497,7 @@ fn recognize_batch(
         }
     }
     let image =
-        TensorRef::from_array_view(([batch.len(), 1, INPUT_HEIGHT, maximum], pixels.as_slice()))
+        TensorRef::from_array_view(([batch.len(), 1, input_height, maximum], pixels.as_slice()))
             .map_err(ort_error)?;
     let sequence_lengths =
         TensorRef::from_array_view(([batch.len()], lengths.as_slice())).map_err(ort_error)?;
@@ -1502,10 +1561,10 @@ fn recognize_batch(
             values,
             worker,
             lines: batch.len(),
-            tensor_elements: batch.len() * INPUT_HEIGHT * maximum,
+            tensor_elements: batch.len() * input_height * maximum,
             useful_elements: batch
                 .iter()
-                .map(|&index| lines[index].width * INPUT_HEIGHT)
+                .map(|&index| lines[index].width * input_height)
                 .sum(),
             total_seconds: total_started.elapsed().as_secs_f64(),
             pack_seconds,
@@ -1547,10 +1606,10 @@ fn recognize_batch(
         values,
         worker,
         lines: batch.len(),
-        tensor_elements: batch.len() * INPUT_HEIGHT * maximum,
+        tensor_elements: batch.len() * input_height * maximum,
         useful_elements: batch
             .iter()
-            .map(|&index| lines[index].width * INPUT_HEIGHT)
+            .map(|&index| lines[index].width * input_height)
             .sum(),
         total_seconds: total_started.elapsed().as_secs_f64(),
         pack_seconds,
@@ -1565,14 +1624,24 @@ fn recognize_prepared(
     lines: &[PreparedLine],
     batch_size: usize,
     width_bucket: usize,
+    input_height: usize,
 ) -> Result<Vec<(String, f64)>> {
     let lines = lines.iter().collect::<Vec<_>>();
     let mut output = vec![(String::new(), 0.0); lines.len()];
     let mut pixels = Vec::new();
     let mut lengths = Vec::new();
     for job in recognition_jobs(&lines, batch_size, width_bucket) {
-        for (index, value) in
-            recognize_batch(session, codec, &lines, &job, &mut pixels, &mut lengths, 0)?.values
+        for (index, value) in recognize_batch(
+            session,
+            codec,
+            &lines,
+            &job,
+            &mut pixels,
+            &mut lengths,
+            0,
+            input_height,
+        )?
+        .values
         {
             output[index] = value;
         }
@@ -1583,7 +1652,41 @@ fn recognize_prepared(
 #[cfg(feature = "ocr")]
 type PdfPageMetadata = (usize, Option<f64>, f64, f64);
 #[cfg(feature = "ocr")]
-type RenderedPdfPage = (PdfPageMetadata, GrayImage);
+type RenderedPdfPage = (PdfPageMetadata, RenderedPdfImage);
+
+#[cfg(feature = "ocr")]
+enum RenderedPdfImage {
+    Gray(GrayImage),
+    Rgba(RgbaImage),
+}
+
+#[cfg(feature = "ocr")]
+impl RenderedPdfImage {
+    fn as_page_pixels(&self) -> PagePixels<'_> {
+        match self {
+            Self::Gray(image) => PagePixels::Gray(image),
+            Self::Rgba(image) => PagePixels::Rgba {
+                pixels: image.as_raw(),
+                width: image.width(),
+                height: image.height(),
+            },
+        }
+    }
+
+    fn into_gray(self) -> Result<GrayImage> {
+        match self {
+            Self::Gray(image) => Ok(image),
+            Self::Rgba(_) => Err(Error::Message("expected a grayscale OCR page".to_owned())),
+        }
+    }
+
+    fn into_rgba(self) -> Result<RgbaImage> {
+        match self {
+            Self::Rgba(image) => Ok(image),
+            Self::Gray(_) => Err(Error::Message("expected an RGBA OCR page".to_owned())),
+        }
+    }
+}
 
 #[cfg(feature = "ocr")]
 fn pdf_render_settings(dpi: u16) -> RenderSettings {
@@ -1629,35 +1732,34 @@ fn render_pdf_pages<'a>(
                 request.width / width as f64,
                 request.height / height as f64,
             );
-            let pixels = pixmap
-                .data_as_u8_slice()
-                .chunks_exact(4)
-                .map(|pixel| {
-                    if blla {
+            let image = if blla {
+                let pixels = pixmap
+                    .data_as_u8_slice()
+                    .chunks_exact(4)
+                    .map(|pixel| {
                         ((u32::from(pixel[0]) * 77
                             + u32::from(pixel[1]) * 150
                             + u32::from(pixel[2]) * 29)
                             / 256) as u8
-                    } else {
-                        ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3)
-                            as u8
-                    }
-                })
-                .collect();
-            let image = GrayImage::from_raw(width as u32, height as u32, pixels)
-                .expect("renderer dimensions match its pixel buffer");
+                    })
+                    .collect();
+                RenderedPdfImage::Gray(
+                    GrayImage::from_raw(width as u32, height as u32, pixels)
+                        .expect("renderer dimensions match its pixel buffer"),
+                )
+            } else {
+                RenderedPdfImage::Rgba(
+                    RgbaImage::from_raw(
+                        width as u32,
+                        height as u32,
+                        pixmap.data_as_u8_slice().to_vec(),
+                    )
+                    .expect("renderer dimensions match its pixel buffer"),
+                )
+            };
             Ok((metadata, image))
         })
         .collect()
-}
-
-#[cfg(feature = "ocr")]
-fn finish_pdf_pages(
-    rendered: Vec<RenderedPdfPage>,
-    recognize: impl FnOnce(&[GrayImage]) -> Result<Vec<KrakenImageDiagnostics>>,
-) -> Result<Vec<OcrPageResult>> {
-    let (metadata, images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
-    finish_recognized_pdf_pages(metadata, recognize(&images)?)
 }
 
 #[cfg(feature = "ocr")]
@@ -1710,6 +1812,38 @@ fn scale_lines(lines: &mut [OcrLine], x_scale: f64, y_scale: f64) {
     }
 }
 
+fn effective_layout_workers(requested: usize, backend: KrakenBackend) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    let available = std::thread::available_parallelism().map_or(1, |value| value.get());
+    if backend == KrakenBackend::Cpu {
+        available.div_ceil(2).min(8)
+    } else {
+        available.min(16)
+    }
+}
+
+fn effective_recognition_batch(
+    requested_batch: usize,
+    requested_bucket: usize,
+    backend: KrakenBackend,
+) -> (usize, usize) {
+    let accelerated = backend != KrakenBackend::Cpu;
+    (
+        if requested_batch == 0 {
+            if accelerated { 64 } else { 32 }
+        } else {
+            requested_batch
+        },
+        if requested_bucket == 0 {
+            if accelerated { 128 } else { 24 }
+        } else {
+            requested_bucket
+        },
+    )
+}
+
 fn recognition_schedule(
     requested_workers: usize,
     requested_threads: usize,
@@ -1749,7 +1883,6 @@ fn open_session(
     threads: usize,
     backend: KrakenBackend,
     device: &str,
-    cpu_fallback: bool,
     cpu_arena: bool,
     prepacked_weights: &PrepackedWeights,
     independent_pool: bool,
@@ -1784,21 +1917,11 @@ fn open_session(
         builder = builder
             .with_execution_providers(providers)
             .map_err(ort_error)?;
-        if !cpu_fallback && backend != KrakenBackend::Cpu {
-            builder = builder
-                .with_config_entry("session.disable_cpu_ep_fallback", "1")
-                .map_err(ort_error)?;
-        }
     }
     builder.commit_from_file(model).map_err(ort_error)
 }
 
 fn validate_options(options: &KrakenOptions) -> Result<()> {
-    if options.backend == KrakenBackend::Cpu && options.cpu_fallback {
-        return Err(Error::Message(
-            "Kraken CPU fallback only applies to accelerator backends".to_owned(),
-        ));
-    }
     if options.backend != KrakenBackend::Cpu && !options.cpu_arena {
         return Err(Error::Message(
             "Kraken low-memory mode only applies to the CPU backend".to_owned(),
@@ -1809,16 +1932,16 @@ fn validate_options(options: &KrakenOptions) -> Result<()> {
             "OCR DPI must be between 72 and 600".to_owned(),
         ));
     }
-    if !(1..=256).contains(&options.batch_size)
+    if options.batch_size > 256
         || options.runtime_batch_size > 256
-        || !(1..=1024).contains(&options.width_bucket)
-        || !(1..=16).contains(&options.layout_workers)
+        || options.width_bucket > 1024
+        || !(32..=256).contains(&options.input_height)
+        || options.layout_workers > 16
         || options.workers > 16
         || options.threads > 16
     {
         return Err(Error::Message(
-            "Kraken batch, bucket, and layout-worker counts must be positive and bounded"
-                .to_owned(),
+            "Kraken batch, bucket, and worker counts are outside their supported bounds".to_owned(),
         ));
     }
     if !(1..=86_400).contains(&options.timeout_seconds) {
@@ -1903,7 +2026,12 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn prepare_line(image: &GrayImage, bbox: LineBox, width_scale: f32) -> Option<PreparedLine> {
+fn prepare_line(
+    image: &GrayImage,
+    bbox: LineBox,
+    width_scale: f32,
+    input_height: usize,
+) -> Option<PreparedLine> {
     if bbox.width() == 0 || bbox.height() == 0 {
         return None;
     }
@@ -1914,14 +2042,14 @@ fn prepare_line(image: &GrayImage, bbox: LineBox, width_scale: f32) -> Option<Pr
         bbox.width() as u32,
         bbox.height() as u32,
     );
-    let content_width = ((bbox.width() as f32 * INPUT_HEIGHT as f32 / bbox.height() as f32)
+    let content_width = ((bbox.width() as f32 * input_height as f32 / bbox.height() as f32)
         * width_scale)
         .round()
         .max(1.0) as usize;
     let resized = imageops::resize(
         &*crop,
         content_width as u32,
-        INPUT_HEIGHT as u32,
+        input_height as u32,
         imageops::FilterType::Lanczos3,
     );
     let width = content_width + INPUT_PADDING * 2;
@@ -1937,6 +2065,7 @@ fn prepare_rgba_line(
     page_width: usize,
     bbox: LineBox,
     width_scale: f32,
+    input_height: usize,
 ) -> Option<PreparedLine> {
     if bbox.width() == 0 || bbox.height() == 0 {
         return None;
@@ -1952,14 +2081,14 @@ fn prepare_rgba_line(
                 ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3) as u8;
         }
     }
-    let content_width = ((bbox.width() as f32 * INPUT_HEIGHT as f32 / bbox.height() as f32)
+    let content_width = ((bbox.width() as f32 * input_height as f32 / bbox.height() as f32)
         * width_scale)
         .round()
         .max(1.0) as usize;
     let resized = imageops::resize(
         &gray,
         content_width as u32,
-        INPUT_HEIGHT as u32,
+        input_height as u32,
         imageops::FilterType::Lanczos3,
     );
     Some(PreparedLine {
@@ -1973,11 +2102,12 @@ fn prepare_page_line(
     image: PagePixels<'_>,
     bbox: LineBox,
     width_scale: f32,
+    input_height: usize,
 ) -> Option<PreparedLine> {
     match image {
-        PagePixels::Gray(image) => prepare_line(image, bbox, width_scale),
+        PagePixels::Gray(image) => prepare_line(image, bbox, width_scale, input_height),
         PagePixels::Rgba { pixels, width, .. } => {
-            prepare_rgba_line(pixels, width as usize, bbox, width_scale)
+            prepare_rgba_line(pixels, width as usize, bbox, width_scale, input_height)
         }
     }
 }
@@ -1986,6 +2116,7 @@ fn prepare_pages(
     images: &[PagePixels<'_>],
     boxes: &[Vec<LineBox>],
     width_scale: f32,
+    input_height: usize,
 ) -> Result<Vec<Vec<PreparedLine>>> {
     let workers = images.len().min(
         std::thread::available_parallelism()
@@ -2006,7 +2137,9 @@ fn prepare_pages(
                     }
                     let lines = boxes[index]
                         .iter()
-                        .filter_map(|&bbox| prepare_page_line(images[index], bbox, width_scale))
+                        .filter_map(|&bbox| {
+                            prepare_page_line(images[index], bbox, width_scale, input_height)
+                        })
                         .collect();
                     if sender.send((index, lines)).is_err() {
                         break;
@@ -2096,6 +2229,8 @@ fn greedy_ctc(
 mod tests {
     use super::*;
 
+    const TEST_INPUT_HEIGHT: usize = 48;
+
     #[test]
     fn kraken_options_fail_closed_without_assets() {
         let options = KrakenOptions::default();
@@ -2162,8 +2297,38 @@ mod tests {
     }
 
     #[test]
+    fn layout_workers_use_spare_cpu_capacity_around_the_selected_backend() {
+        let available = std::thread::available_parallelism().map_or(1, |value| value.get());
+        assert_eq!(
+            effective_layout_workers(0, KrakenBackend::Cpu),
+            available.div_ceil(2).min(8)
+        );
+        assert_eq!(
+            effective_layout_workers(0, KrakenBackend::Cuda),
+            available.min(16)
+        );
+        assert_eq!(effective_layout_workers(3, KrakenBackend::Cuda), 3);
+    }
+
+    #[test]
+    fn recognition_batch_defaults_match_the_selected_backend() {
+        assert_eq!(
+            effective_recognition_batch(0, 0, KrakenBackend::Cpu),
+            (32, 24)
+        );
+        assert_eq!(
+            effective_recognition_batch(0, 0, KrakenBackend::Cuda),
+            (64, 128)
+        );
+        assert_eq!(
+            effective_recognition_batch(16, 48, KrakenBackend::Cuda),
+            (16, 48)
+        );
+    }
+
+    #[test]
     fn shared_pool_is_reserved_for_automatic_speed_tiers() {
-        let mut options = KrakenOptions::default();
+        let options = KrakenOptions::default();
         assert!(!uses_global_pool(&options));
         options.tier = KrakenTier::Balanced;
         assert!(uses_global_pool(&options));
@@ -2189,8 +2354,8 @@ mod tests {
                 values: Vec::new(),
                 worker: 0,
                 lines: 2,
-                tensor_elements: 2 * INPUT_HEIGHT * 120,
-                useful_elements: INPUT_HEIGHT * 220,
+                tensor_elements: 2 * TEST_INPUT_HEIGHT * 120,
+                useful_elements: TEST_INPUT_HEIGHT * 220,
                 total_seconds: 0.2,
                 pack_seconds: 0.01,
                 inference_seconds: 0.18,
@@ -2200,8 +2365,8 @@ mod tests {
                 values: Vec::new(),
                 worker: 1,
                 lines: 1,
-                tensor_elements: INPUT_HEIGHT * 200,
-                useful_elements: INPUT_HEIGHT * 200,
+                tensor_elements: TEST_INPUT_HEIGHT * 200,
+                useful_elements: TEST_INPUT_HEIGHT * 200,
                 total_seconds: 0.3,
                 pack_seconds: 0.02,
                 inference_seconds: 0.27,
@@ -2220,7 +2385,8 @@ mod tests {
         assert!((profile.worker_busy_seconds_max - 0.3).abs() < f64::EPSILON);
         assert_eq!(
             profile.peak_tensor_bytes,
-            2 * INPUT_HEIGHT * 120 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<i64>()
+            2 * TEST_INPUT_HEIGHT * 120 * std::mem::size_of::<f32>()
+                + 2 * std::mem::size_of::<i64>()
         );
     }
 
@@ -2243,8 +2409,7 @@ mod tests {
         assert!(KrakenBackend::DirectMl
             .normalized_device(Some("-1"))
             .is_err());
-        let mut options = KrakenOptions::default();
-        options.cpu_fallback = true;
+        let options = KrakenOptions::default();
         assert!(validate_options(&options).is_err());
     }
 }

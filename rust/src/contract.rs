@@ -164,7 +164,6 @@ fn parse_options(value: &Value, operation: &str) -> Result<ParseOptions> {
                         "layout",
                         "backend",
                         "device",
-                        "cpu_fallback",
                         "cpu_arena",
                         "timeout_seconds",
                         "expected_identity",

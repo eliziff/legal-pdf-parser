@@ -203,8 +203,6 @@ def run_tier(args, tier: str, xmls: list[Path], result: dict) -> None:
                "--kraken-tier", tier, "--kraken-backend", args.backend]
     if args.device:
         command += ["--kraken-device", args.device]
-    if args.cpu_fallback:
-        command += ["--kraken-cpu-fallback"]
     if args.low_memory:
         command += ["--kraken-low-memory"]
     if args.workers is not None:
@@ -269,8 +267,6 @@ def main() -> None:
     parser.add_argument("--backend", choices=BACKENDS, default="cpu")
     parser.add_argument("--device",
                         help="numeric CUDA/TensorRT/DirectML id or OpenVINO device string")
-    parser.add_argument("--cpu-fallback", action="store_true",
-                        help="explicitly permit unsupported accelerator nodes to run on CPU")
     parser.add_argument("--low-memory", action="store_true",
                         help="disable the CPU arena to trade throughput for lower peak RAM")
     parser.add_argument("--tiers", default="quality",
@@ -291,8 +287,6 @@ def main() -> None:
         if not configured:
             parser.error("--tesseract-library is required for a reproducible receipt")
         args.tesseract_library = Path(configured)
-    if args.backend == "cpu" and args.cpu_fallback:
-        parser.error("--cpu-fallback requires an accelerator backend")
     if args.device and args.backend in {"cpu", "onednn"}:
         parser.error(f"--device does not apply to the {args.backend} backend")
     tiers = TIERS if args.tiers == "all" else tuple(args.tiers.split(","))
@@ -310,7 +304,6 @@ def main() -> None:
                 "threads": args.threads, "layout_workers": args.layout_workers,
                 "rgba_input": args.rgba_input,
                 "backend": args.backend, "device": args.device,
-                "cpu_fallback": args.cpu_fallback,
                 "low_memory": args.low_memory,
                 "priority": args.priority,
                 "hardware": {"label": args.hardware_label,
