@@ -1,64 +1,61 @@
-# CPU OCR benchmark
+# Legal OCR benchmark results
 
-Measured 2026-08-19 on two ordinary Windows machines. The purpose is one fair,
-reproducible comparison of the shipped Kraken Lite tiers with native Tesseract.
+Measured 2026-08-19 on the same 153 rendered legal-print pages and 438,577
+ground-truth characters. The corpus fingerprint is
+`1ad486e8692fdd67693c92ee4f8d58f7e6e33c81bf79619e0d8a1135daf028d2`.
 
-## Result
+## End-to-end result
 
-| OCR engine | i3-1315U CER | i3 time | i3 pages/s | Ryzen 2600X CER | Ryzen time | Ryzen pages/s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Kraken Lite Quality | 2.5642% | 56.089 s | 2.7278 | 2.7051% | 49.008 s | 3.1219 |
-| Kraken Lite Balanced | 2.7482% | 46.887 s | 3.2631 | 2.9272% | 42.864 s | 3.5695 |
-| Kraken Lite Turbo | 3.1294% | 44.150 s | 3.4654 | 3.4391% | 40.442 s | 3.7832 |
-| Kraken Lite Extreme | 3.7733% | 40.810 s | 3.7491 | 4.2465% | 38.905 s | 3.9326 |
-| Native Tesseract 5.4 | 3.8285% | 55.450 s | 2.7592 | 3.8285% | 35.883 s | 4.2638 |
+| OCR profile | Ryzen 5 2600X CPU | RTX 3080 Ti CUDA | CER |
+| --- | ---: | ---: | ---: |
+| Legal OCR — Quality | 2.951 pages/s | 6.263 pages/s | 2.571% |
+| Legal OCR — Balanced | 3.390 pages/s | 6.396 pages/s | 2.745% |
+| Legal OCR — Turbo | 3.939 pages/s | 6.591 pages/s | 3.135% |
+| Legal OCR — Extreme | 4.095 pages/s | 6.874 pages/s | 3.759% |
+| Native Tesseract 5.4 | 3.899 pages/s | not supported | 3.829% |
 
-Kraken's output is scored independently on each CPU because its automatic
-session schedule and CPU execution differ: four recognition sessions with two
-threads each on the laptop and six by two on the desktop. Tesseract produced
-the same CER on both machines.
+Timing is cold process wall from launch through flushed OCR output. It includes
+runtime/session initialization, page decoding, line finding, recognition, and
+output. Every figure is the median of three complete runs. Tesseract produced
+identical text in all three trials. CPU and CUDA legal-OCR output differed by at
+most nine characters in 438,577 for the two narrowest profiles; the table shows
+the CUDA CER.
+
+Tesseract uses twelve persistent C-API sessions on the desktop and eight on the
+desktop, with `OMP_THREAD_LIMIT=1`. This follows Tesseract's production guidance
+to process multiple pages with independent single-threaded instances. Its
+OpenCL path is experimental and not a supported GPU comparison.
+
+## Runtime efficiency
+
+Warmed CUDA recognition isolates the model from page layout and I/O:
+
+| Recognition model | Pure recognition | Runtime recognition | CER |
+| --- | ---: | ---: | ---: |
+| Legal fine-tune, CATMuS Print Small | 932 lines/s | 879 lines/s | 2.575% |
+| Stock CATMuS Print Small | 1,066 lines/s | 994 lines/s | 3.901% |
+| Stock CATMuS Print Large | 521 lines/s | 418 lines/s | not scored |
+
+The legal fine-tune trades some raw recognition throughput for substantially
+lower legal-print error. The full production benchmark is slower than pure
+recognition because it also decodes pages, finds lines, prepares variable-width
+line tensors, and writes results. On the RTX 3080 Ti, overlapping those CPU
+stages raised Balanced end-to-end throughput to 6.40 pages/s while warmed
+recognition sustained about 900–1,300 lines/s depending on batch packing.
 
 ## Protocol
 
-- Corpus: 153 fixed legal-print pages: 123 manual-gold pages and 30 manually
-  vetted silver pages.
-- Corpus fingerprint:
-  `1ad486e8692fdd67693c92ee4f8d58f7e6e33c81bf79619e0d8a1135daf028d2`.
-- Input: identical already-rendered PNG pixels on both machines.
-- Metric: character-weighted CER after
+- Inputs: identical 200-dpi PNG pages for every engine and machine.
+- Accuracy: character-weighted CER after
   `nfkc-collapse-not-soft-hyphen-v1` normalization.
-- Timing: cold process wall from launch through written OCR output. No warm-up
-  page is removed.
-- Kraken: production Rust provider and automatic CPU schedule; model/session
-  initialization, image decoding, OCR, and output are timed.
-- Tesseract: native Tesseract 5.4.0 C API, one persistent session per logical
-  CPU, one OpenMP thread per session. Session initialization, image decoding,
-  OCR, and output are timed.
-- Priority: both engines ran BelowNormal. The same binary, model, runtime,
-  Tesseract distribution, and corpus archive ran on both machines.
-
-Hardware:
-
-- Laptop: HP Laptop 14-ee0xxx, Intel Core i3-1315U, 8 logical CPUs.
-- Desktop: AMD Ryzen 5 2600X, 12 logical CPUs.
+- Scheduling: benchmark processes run at BelowNormal priority.
+- Legal OCR CUDA: 64-line batches, 128-pixel width buckets, twelve concurrent
+  CPU layout workers, one CUDA recognition stream.
+- Native Tesseract: 5.4.0 with integer `tessdata_fast` English data, one OpenMP
+  thread per persistent worker.
+- Hardware: Ryzen 5 2600X/RTX 3080 Ti 12 GB desktop. A separate Core i3-1315U
+  laptop run reached 2.180 pages/s Quality and 2.503 pages/s Turbo.
 
 The benchmark runner is
-[`../benchmark_cpu_ocr.py`](../benchmark_cpu_ocr.py). Raw OCR transcripts are
-ignored and disposable; the table above is the durable result.
-
-## Frozen inputs
-
-| Input | SHA-256 |
-| --- | --- |
-| Kraken benchmark runner | `c47650f353f1e7161a9318063dd0f4605873841bc922d953778fb2db1e49a951` |
-| Kraken legal model | `c57efb79d08bc3f56568c0b3fbb076eccfc7f0f823c57d688cd7047827e45573` |
-| Kraken codec | `5eb42e63e250d812b454f1c655af1dade5c2f1fdc267f4ccfc13ea62f360dd90` |
-| ONNX Runtime | `b7dfcb4dea88f8488812c99e2c9016b9a30a374c83b888d39664df3238bcb48b` |
-| Line-layout library | `21ef7215c66668473ed8264d76f30944c215108f08d7b6c2aa5a00a8d94db34e` |
-| Native Tesseract executable | `babb405f4366b480d02cd8ff2bac8d497170f6c1711ce6f3d5d8bf0fb7fa6ed9` |
-| Tesseract English model | `7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2` |
-
-Final scored result receipts:
-
-- Laptop: `f074eec86492b6eef49d30e0dbd48815813871011ac75a04dd2c3049a60118cb`
-- Desktop: `b499db144f66a1c4da757b50a462879d53aac326d3e915b5b80e471c52e6eab3`
+[`../benchmark_cpu_ocr.py`](../benchmark_cpu_ocr.py). Raw transcripts, models,
+runtimes, and generated receipts are ignored.

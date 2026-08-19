@@ -250,7 +250,7 @@ fn mcgill_reporter_citation_re(first: u8) -> Option<&'static Regex> {
         .get(index)?;
     let abbreviations = ABBREVIATIONS.get_or_init(|| {
         serde_json::from_str(include_str!(
-            "../../src/legalpdf/data/mcgill_reporters.json"
+            "../../data/mcgill_reporters.json"
         ))
         .expect("frozen McGill reporter inventory")
     });
@@ -714,7 +714,7 @@ mod tests {
     #[test]
     fn mcgill_tenth_inventory_preserves_journal_punctuation() {
         let abbreviations: Vec<String> = serde_json::from_str(include_str!(
-            "../../src/legalpdf/data/mcgill_reporters.json"
+            "../../data/mcgill_reporters.json"
         ))
         .unwrap();
         assert_eq!(abbreviations.len(), 2_110);

@@ -121,9 +121,8 @@ impl BllaRuntime {
         let environment = python_environment(&python, &python_path)?;
         let device = runtime_device(options.backend, options.device.as_deref())?;
         let identity = format!(
-            "kraken-lite-process-v1:backend={}:device={device}:fallback={}:python={}:environment={}:runtime={}:blla={}:recognizer={}",
+            "kraken-lite-process-v1:backend={}:device={device}:python={}:environment={}:runtime={}:blla={}:recognizer={}",
             options.backend.name(),
-            if options.cpu_fallback { "cpu" } else { "none" },
             sha256_file(&python)?,
             sha256_bytes(environment.as_bytes()),
             sha256_file(&wheel)?,
@@ -162,7 +161,7 @@ impl BllaRuntime {
         if options.backend == KrakenBackend::OneDnn {
             command.args(["--providers", "DnnlExecutionProvider"]);
         }
-        if !options.cpu_fallback && options.backend != KrakenBackend::Cpu {
+        if options.backend != KrakenBackend::Cpu {
             command.arg("--strict-device");
         }
         hide_window(&mut command);

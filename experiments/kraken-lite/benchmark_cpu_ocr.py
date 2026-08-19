@@ -1,4 +1,4 @@
-"""Fair cold-run CPU benchmark for Kraken Lite and native Tesseract.
+"""Fair cold-run benchmark for the Kraken fine-tune and native Tesseract.
 
 Both engines receive the same already-rendered page images. Timing begins
 before engine/worker startup and ends after every OCR result has been written.
@@ -74,9 +74,19 @@ def run_kraken(args, tier: str, output: Path) -> dict:
         "--kraken-tesseract-library", str(args.layout_library),
         "--kraken-tier", tier,
         "--kraken-layout", "tesseract",
-        "--kraken-backend", "cpu",
+        "--kraken-backend", args.kraken_backend,
         "--skip-warmup",
     ]
+    if args.kraken_device is not None:
+        command.extend(("--kraken-device", args.kraken_device))
+    for option, value in (
+        ("--kraken-batch-size", args.kraken_batch_size),
+        ("--kraken-width-bucket", args.kraken_width_bucket),
+        ("--kraken-input-height", args.kraken_input_height),
+        ("--kraken-workers", args.kraken_workers),
+    ):
+        if value is not None:
+            command.extend((option, str(value)))
     started = time.perf_counter()
     with output.open("w", encoding="utf-8", newline="\n") as stream:
         process = subprocess.Popen(
@@ -211,7 +221,7 @@ def score(output: Path, xmls: list[Path], summary: dict) -> None:
     helpers = benchmark_helpers()
     truths = [helpers.gold(path) for path in xmls]
     characters = sum(map(len, truths))
-    for name in (*TIERS, "tesseract"):
+    for name in summary["engines"]:
         rows = read_jsonl(output / f"{name}.jsonl")
         if len(rows) != len(truths):
             raise RuntimeError(f"{name} returned {len(rows)} pages; expected {len(truths)}")
@@ -230,6 +240,13 @@ def main() -> None:
     parser.add_argument("--codec", type=Path)
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--layout-library", type=Path)
+    parser.add_argument("--tiers", nargs="+", choices=TIERS, default=list(TIERS))
+    parser.add_argument("--kraken-backend", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--kraken-device")
+    parser.add_argument("--kraken-batch-size", type=int)
+    parser.add_argument("--kraken-width-bucket", type=int)
+    parser.add_argument("--kraken-input-height", type=int)
+    parser.add_argument("--kraken-workers", type=int)
     parser.add_argument("--tesseract", type=Path)
     parser.add_argument("--tesseract-workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--hardware")
@@ -237,30 +254,35 @@ def main() -> None:
     parser.add_argument("--recognize-only", action="store_true")
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--tesseract-only", action="store_true")
+    parser.add_argument("--skip-tesseract", action="store_true")
     args = parser.parse_args()
     xmls, images = page_paths(args.list)
     args.pages = len(images)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.score_only:
-        summary = json.loads((args.output / "result.json").read_text(encoding="utf-8"))
+        summary = json.loads((args.output / "result.json").read_text(encoding="utf-8-sig"))
         score(args.output, xmls, summary)
         atomic_json(args.output / "result.json", summary)
         print(json.dumps(summary, indent=2), flush=True)
         return
     required = (("tesseract", "hardware") if args.tesseract_only else
                 ("kraken_runner", "model", "codec", "runtime", "layout_library",
-                 "tesseract", "hardware"))
+                 "hardware"))
+    if not args.skip_tesseract and not args.tesseract_only:
+        required += ("tesseract",)
     for name in required:
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required unless --score-only is used")
 
-    version = subprocess.run(
-        [str(args.tesseract), "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", check=True,
-        creationflags=below_normal_flags(),
-    ).stdout.splitlines()[0]
+    version = None
+    if not args.skip_tesseract:
+        version = subprocess.run(
+            [str(args.tesseract), "--version"], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            check=True, creationflags=below_normal_flags(),
+        ).stdout.splitlines()[0]
     existing = args.output / "result.json"
-    summary = json.loads(existing.read_text(encoding="utf-8")) if args.tesseract_only else {
+    summary = json.loads(existing.read_text(encoding="utf-8-sig")) if args.tesseract_only else {
         "status": "recognized",
         "protocol": {
             "pages": len(images),
@@ -274,12 +296,15 @@ def main() -> None:
         "engines": {},
     }
     if not args.tesseract_only:
-        for tier in TIERS:
+        for tier in args.tiers:
             print(f"Kraken {tier}: {len(images)} pages", flush=True)
             summary["engines"][tier] = run_kraken(args, tier, args.output / f"{tier}.jsonl")
             atomic_json(args.output / "result.json", summary)
-    print(f"Tesseract: {len(images)} pages with {args.tesseract_workers} workers", flush=True)
-    summary["engines"]["tesseract"] = run_tesseract(args, images, args.output / "tesseract.jsonl")
+    if not args.skip_tesseract:
+        print(f"Tesseract: {len(images)} pages with {args.tesseract_workers} workers", flush=True)
+        summary["engines"]["tesseract"] = run_tesseract(
+            args, images, args.output / "tesseract.jsonl"
+        )
     if not args.recognize_only:
         score(args.output, xmls, summary)
     atomic_json(args.output / "result.json", summary)
