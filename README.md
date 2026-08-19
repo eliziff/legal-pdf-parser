@@ -7,10 +7,8 @@ access. Codex is optional and is called only for pages carrying a concrete
 structural diagnostic.
 
 The extraction backbone is the vendored MIT-licensed `pdf-inspector`, extended
-locally where the complete legal-document contract requires more source
-detail. The production executable has no Python runtime, PyMuPDF fallback,
-server, accounts, cloud storage, database, vector index, or application
-dependency.
+to return usable legal structure for use in other legal applications, 
+including use by LLMs.
 
 ## Install
 
