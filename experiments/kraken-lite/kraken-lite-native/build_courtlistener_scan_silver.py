@@ -12,7 +12,7 @@ from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE.parents[3]
-sys.path.insert(0, str(WORKSPACE / "TableOfAuthoritiesMaker"))
+sys.path.insert(0, str(WORKSPACE / "AuthoritiesHelper"))
 from toa_maker import Authority, _download_pdf
 from build_scan_silver import TESSERACT, align_pages, atomic, pagexml
 

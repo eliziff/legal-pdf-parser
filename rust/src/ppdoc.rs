@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 const PACK_FORMAT: &str = "legalpdf.ppdoc-lite-model/1";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PPDocOptions {
     pub model_pack: Option<PathBuf>,
     pub runtime: Option<PathBuf>,

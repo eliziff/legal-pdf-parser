@@ -13,4 +13,6 @@
 - Keep benchmark output bounded and disposable. Reuse one output directory,
   compare it to frozen hashes, and remove it immediately after recording the
   result.
-
+- Keep any future repair or external-layout adapter provider-neutral: the
+  engine validates bounded structural assignments and source identity, while
+  the embedding application owns provider and runtime selection.

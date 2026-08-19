@@ -7,7 +7,7 @@ from .model import LegalDocument
 
 
 def to_alr_payload(document: LegalDocument) -> dict[str, Any]:
-    """Return the fields needed to construct ALR's ``ParsedDocument``."""
+    """Return the fields needed by AuthoritiesHelper's parsed-document boundary."""
 
     usable_footnotes = [
         note
@@ -70,7 +70,7 @@ def to_alr_payload(document: LegalDocument) -> dict[str, Any]:
 
 
 def to_toa_text_units(document: LegalDocument) -> list[dict[str, Any]]:
-    """Return records matching TableOfAuthoritiesMaker's ``TextUnit`` fields."""
+    """Return records matching AuthoritiesHelper's ``TextUnit`` fields."""
 
     internal_by_pair = {
         note.pair_id: index for index, note in enumerate(document.footnotes, start=1)

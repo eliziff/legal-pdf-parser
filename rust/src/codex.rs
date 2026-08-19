@@ -1,4 +1,4 @@
-use crate::artifact::python_json;
+use crate::storage::python_json;
 use crate::{Error, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

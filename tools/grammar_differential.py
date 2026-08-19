@@ -226,7 +226,7 @@ def main() -> int:
     parser.add_argument(
         "--toa",
         type=Path,
-        default=WORKSPACE / "TableOfAuthoritiesMaker" / "toa_maker.py",
+        default=WORKSPACE / "AuthoritiesHelper" / "toa_maker.py",
         help="toa_maker.py to ast-extract the toa dialect sources from",
     )
     args = parser.parse_args()

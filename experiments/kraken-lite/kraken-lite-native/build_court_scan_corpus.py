@@ -11,7 +11,7 @@ from xml.etree.ElementTree import Element, SubElement, ElementTree
 import pypdfium2 as pdfium
 
 WORKSPACE = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(WORKSPACE / 'TableOfAuthoritiesMaker'))
+sys.path.insert(0, str(WORKSPACE / 'AuthoritiesHelper'))
 from toa_maker import Authority, _download_pdf
 
 DB = Path.home() / 'AppData/Local/OpenLegalProducts/LegalData/providers/a2aj/a2aj-cases-fulltext.sqlite'

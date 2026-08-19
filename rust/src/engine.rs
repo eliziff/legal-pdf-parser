@@ -1,19 +1,15 @@
-use crate::artifact::{add_geometry_to_compact, read_gzip_json, write_gzip_json, write_json};
 use crate::error::{Error, Result};
-use crate::model::{
-    Diagnostic, ImageBlock, LegalDocument, TableBlock, PARSER_VERSION, SCHEMA_VERSION,
-};
+use crate::model::{LegalDocument, PARSER_VERSION, SCHEMA_VERSION};
 use crate::ocr::{OcrOptions, OcrProvider};
 use crate::pdf::{extract_pdf, ExtractedPdf};
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 use crate::ppdoc::{PPDocLayout, PPDocOptions};
-use crate::structure::{
-    derive, prepare_pages, replay_derive, status, validate_document, validate_pages,
-};
+use crate::storage::{read_gzip_json, write_gzip_json, write_json};
+use crate::structure::{derive, replay_derive, status, validate_document};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -31,15 +27,8 @@ struct CachedExtraction {
     extraction: ExtractedPdf,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ParseMode {
-    #[default]
-    Local,
-    Codex,
-}
-
 #[derive(Debug, Clone)]
-pub struct ParseOptions {
+pub(crate) struct ParseOptions {
     pub cache_dir: Option<PathBuf>,
     pub use_cache: bool,
     pub ocr: Option<OcrOptions>,
@@ -48,10 +37,6 @@ pub struct ParseOptions {
     pub ocr_pages: Option<Vec<usize>>,
     #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
     pub ppdoc: Option<PPDocOptions>,
-    pub mode: ParseMode,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub repair_timeout_seconds: u64,
 }
 
 impl Default for ParseOptions {
@@ -63,15 +48,11 @@ impl Default for ParseOptions {
             ocr_pages: None,
             #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
             ppdoc: None,
-            mode: ParseMode::Local,
-            model: None,
-            effort: None,
-            repair_timeout_seconds: 600,
         }
     }
 }
 
-pub fn default_cache_dir() -> PathBuf {
+fn default_cache_dir() -> PathBuf {
     if let Some(root) = std::env::var_os("OPEN_LEGAL_DATA_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(root)
             .join("apps")
@@ -118,7 +99,6 @@ fn engine_identity() -> Value {
     IDENTITY
         .get_or_init(|| {
             let sources: &[(&str, &[u8])] = &[
-                ("artifact.rs", include_bytes!("artifact.rs")),
                 ("engine.rs", include_bytes!("engine.rs")),
                 ("grammar_tables.rs", include_bytes!("grammar_tables.rs")),
                 ("grammar_word.rs", include_bytes!("grammar_word.rs")),
@@ -141,6 +121,7 @@ fn engine_identity() -> Value {
                 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
                 ("ppdoc_openvino.rs", include_bytes!("ppdoc_openvino.rs")),
                 ("separator.rs", include_bytes!("separator.rs")),
+                ("storage.rs", include_bytes!("storage.rs")),
                 ("structure.rs", include_bytes!("structure.rs")),
                 #[cfg(feature = "kraken")]
                 ("tesseract_layout.rs", include_bytes!("tesseract_layout.rs")),
@@ -414,7 +395,7 @@ fn prune_parse_cache(root: &Path) {
     }
 }
 
-pub fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<LegalDocument> {
+pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<LegalDocument> {
     let path = path.as_ref();
     if !path.is_file() {
         return Err(Error::Message(format!(
@@ -524,11 +505,8 @@ pub fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<Legal
             }
         });
         if extracted.is_none() {
-            let mut fresh = extract_pdf(
-                &path,
-                ocr_provider.as_mut(),
-                options.ocr_pages.as_deref(),
-            )?;
+            let mut fresh =
+                extract_pdf(&path, ocr_provider.as_mut(), options.ocr_pages.as_deref())?;
             #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
             if let Some(provider) = ppdoc.as_mut() {
                 fresh
@@ -574,38 +552,7 @@ pub fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<Legal
         }
         document = Some(parsed);
     }
-    let document = document.expect("cache or parse produced a document");
-    if options.mode == ParseMode::Local {
-        return Ok(document);
-    }
-    let model = options
-        .model
-        .clone()
-        .or_else(|| std::env::var("LEGALPDF_CODEX_MODEL").ok())
-        .filter(|value| !value.is_empty());
-    let effort = options
-        .effort
-        .clone()
-        .or_else(|| std::env::var("LEGALPDF_CODEX_EFFORT").ok())
-        .filter(|value| !value.is_empty());
-    let (model, effort) = model.zip(effort).ok_or_else(|| {
-        Error::Message(
-            "Codex mode requires model and effort arguments or LEGALPDF_CODEX_MODEL and LEGALPDF_CODEX_EFFORT."
-                .to_owned(),
-        )
-    })?;
-    crate::repair::improve_document(
-        &document,
-        &path,
-        &model,
-        &effort,
-        &selected_cache_root.join("codex"),
-        options.repair_timeout_seconds,
-    )
-}
-
-pub fn page_count(path: impl AsRef<Path>) -> Result<usize> {
-    Ok(lopdf::Document::load(path)?.get_pages().len())
+    Ok(document.expect("cache or parse produced a document"))
 }
 
 #[doc(hidden)]
@@ -613,7 +560,7 @@ pub fn extract_common_input(path: impl AsRef<Path>, output: impl AsRef<Path>) ->
     extract_layout_input(path, output, None)
 }
 
-pub fn extract_layout_input(
+fn extract_layout_input(
     path: impl AsRef<Path>,
     output: impl AsRef<Path>,
     ocr: Option<&OcrOptions>,
@@ -638,61 +585,6 @@ pub fn extract_layout_input(
     Ok(output.to_path_buf())
 }
 
-pub fn add_pdf_geometry(
-    path: impl AsRef<Path>,
-    document: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-    options: &ParseOptions,
-) -> Result<PathBuf> {
-    let path = path.as_ref();
-    if !path.is_file()
-        || path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_lowercase)
-            .as_deref()
-            != Some("pdf")
-    {
-        return Err(Error::Message(format!(
-            "input must be a PDF: {}",
-            path.display()
-        )));
-    }
-    let source_hash = sha256_file(path)?;
-    let identity = engine_identity();
-    let mut ocr_provider = options.ocr.as_ref().map(OcrProvider::new).transpose()?;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-    let mut ppdoc = options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-    let ppdoc_identity = ppdoc.as_ref().map(PPDocLayout::identity);
-    #[cfg(not(any(feature = "ppdoc", feature = "ppdoc-openvino")))]
-    let ppdoc_identity: Option<&str> = None;
-    let key = cache_key(
-        &source_hash,
-        &identity,
-        ocr_provider.as_ref(),
-        ppdoc_identity,
-        options.ocr_pages.as_deref(),
-    )?;
-    let mut extracted = extract_pdf(path, ocr_provider.as_mut(), options.ocr_pages.as_deref())?;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-    if let Some(provider) = ppdoc.as_mut() {
-        extracted
-            .diagnostics
-            .extend(provider.annotate_pdf(path, &mut extracted.pages)?);
-    }
-    prepare_pages(&mut extracted.pages, &extracted.separators);
-    validate_pages(&extracted.pages)?;
-    add_geometry_to_compact(
-        &extracted.pages,
-        document,
-        output,
-        &source_hash,
-        &identity,
-        &key,
-    )
-}
-
 #[derive(Deserialize)]
 struct CommonInput {
     schema_version: String,
@@ -700,277 +592,6 @@ struct CommonInput {
     source_sha256: String,
     pages: Vec<crate::model::Page>,
     separators: Vec<Option<f64>>,
-    #[serde(default)]
-    metadata: Map<String, Value>,
-    #[serde(default)]
-    tables: Vec<TableBlock>,
-    #[serde(default)]
-    images: Vec<ImageBlock>,
-    #[serde(default)]
-    diagnostics: Vec<Diagnostic>,
-}
-
-#[derive(Deserialize)]
-struct LayoutAssignments {
-    schema_version: String,
-    source_sha256: String,
-    provider: String,
-    model: String,
-    identity: String,
-    pages: Vec<LayoutAssignmentPage>,
-}
-
-#[derive(Deserialize)]
-struct LayoutAssignmentPage {
-    page_index: usize,
-    regions: Vec<LayoutAssignmentRegion>,
-}
-
-#[derive(Deserialize)]
-struct LayoutAssignmentRegion {
-    #[serde(rename = "type")]
-    kind: String,
-    reading_order: usize,
-    line_ids: Vec<String>,
-}
-
-const EXTERNAL_LAYOUT_TYPES: &[&str] = &[
-    "abstract",
-    "content",
-    "display_formula",
-    "doc_title",
-    "figure_title",
-    "footer",
-    "footnote",
-    "header",
-    "image",
-    "paragraph_title",
-    "reference",
-    "table",
-    "text",
-];
-
-pub fn apply_external_layout(
-    input: impl AsRef<Path>,
-    assignments: impl AsRef<Path>,
-) -> Result<LegalDocument> {
-    let input = input.as_ref();
-    let mut common: CommonInput = serde_json::from_reader(BufReader::new(
-        File::open(input).map_err(|source| Error::io(input, source))?,
-    ))?;
-    if common.schema_version != "legalpdf.common-input.v1"
-        || common.separators.len() != common.pages.len()
-    {
-        return Err(Error::Message(
-            "external layout requires a valid legalpdf common input".to_owned(),
-        ));
-    }
-    let assignments_path = assignments.as_ref();
-    let assignment_bytes =
-        fs::read(assignments_path).map_err(|source| Error::io(assignments_path, source))?;
-    let layout: LayoutAssignments = serde_json::from_slice(&assignment_bytes)?;
-    if layout.schema_version != "legalpdf.layout-assignments.v1"
-        || layout.source_sha256 != common.source_sha256
-        || layout.provider.trim().is_empty()
-        || layout.model.trim().is_empty()
-        || layout.identity.trim().is_empty()
-        || [
-            layout.provider.as_str(),
-            layout.model.as_str(),
-            layout.identity.as_str(),
-        ]
-        .iter()
-        .any(|value| value.len() > 1_024 || value.contains(['\r', '\n', '\0']))
-    {
-        return Err(Error::Message(
-            "external layout assignments have invalid provenance".to_owned(),
-        ));
-    }
-
-    let mut locations = HashMap::new();
-    let mut required = HashSet::new();
-    for (page_slot, page) in common.pages.iter().enumerate() {
-        for (line_slot, line) in page.lines.iter().enumerate() {
-            if locations
-                .insert(line.id.clone(), (page_slot, line_slot))
-                .is_some()
-            {
-                return Err(Error::Message(format!(
-                    "common input contains duplicate line ID: {}",
-                    line.id
-                )));
-            }
-            if !line.exclude_from_body && !line.text.trim().is_empty() {
-                required.insert(line.id.clone());
-            }
-        }
-    }
-    let mut assigned = HashSet::new();
-    let mut pages_seen = HashSet::new();
-    for page in &layout.pages {
-        if !pages_seen.insert(page.page_index) {
-            return Err(Error::Message(format!(
-                "external layout repeats page index {}",
-                page.page_index
-            )));
-        }
-        let page_slot = common
-            .pages
-            .iter()
-            .position(|candidate| candidate.index == page.page_index)
-            .ok_or_else(|| {
-                Error::Message(format!(
-                    "external layout page index is out of range: {}",
-                    page.page_index
-                ))
-            })?;
-        let mut regions = page.regions.iter().collect::<Vec<_>>();
-        regions.sort_unstable_by_key(|region| region.reading_order);
-        for (region_slot, region) in regions.into_iter().enumerate() {
-            if region.reading_order == 0
-                || region.reading_order > 100_000
-                || region.line_ids.is_empty()
-                || !EXTERNAL_LAYOUT_TYPES.contains(&region.kind.as_str())
-            {
-                return Err(Error::Message(format!(
-                    "external layout page {} has an invalid region",
-                    page.page_index
-                )));
-            }
-            for (line_order, line_id) in region.line_ids.iter().enumerate() {
-                let &(candidate_page, line_slot) = locations.get(line_id).ok_or_else(|| {
-                    Error::Message(format!("external layout names unknown line ID: {line_id}"))
-                })?;
-                if candidate_page != page_slot || !required.contains(line_id) {
-                    return Err(Error::Message(format!(
-                        "external layout line is not assignable on page {}: {line_id}",
-                        page.page_index
-                    )));
-                }
-                if !assigned.insert(line_id.clone()) {
-                    return Err(Error::Message(format!(
-                        "external layout repeats line ID: {line_id}"
-                    )));
-                }
-                let page_id = common.pages[page_slot].id.clone();
-                let line = &mut common.pages[page_slot].lines[line_slot];
-                line.region_type = region.kind.clone();
-                line.region_id = format!("{}-external-r{:04}", page_id, region_slot + 1);
-                line.reading_order = region.reading_order * 10_000 + line_order;
-            }
-        }
-    }
-    if assigned != required {
-        let mut missing = required.difference(&assigned).cloned().collect::<Vec<_>>();
-        missing.sort();
-        missing.truncate(20);
-        return Err(Error::Message(format!(
-            "external layout did not assign every visible line; missing: {}",
-            missing.join(", ")
-        )));
-    }
-
-    let derived = derive(&mut common.pages, &common.separators);
-    common.diagnostics.extend(derived.diagnostics);
-    let mut metadata = common.metadata;
-    metadata.insert("pairing".to_owned(), derived.pairing_summary);
-    let assignment_sha256 = format!("{:x}", Sha256::digest(&assignment_bytes));
-    let provenance = Map::from_iter([
-        ("engine".to_owned(), Value::String("legalpdf".to_owned())),
-        (
-            "layout_provider".to_owned(),
-            Value::String(layout.provider.clone()),
-        ),
-        (
-            "layout_variant".to_owned(),
-            Value::String(layout.model.clone()),
-        ),
-        (
-            "layout_provider_identity".to_owned(),
-            Value::String(layout.identity.clone()),
-        ),
-        (
-            "layout_assignments_sha256".to_owned(),
-            Value::String(assignment_sha256),
-        ),
-    ]);
-    let document_token = common.source_sha256.get(..20).ok_or_else(|| {
-        Error::Message("common input source_sha256 is not a SHA-256 digest".to_owned())
-    })?;
-    let document = LegalDocument {
-        document_id: format!("doc-{document_token}"),
-        source_name: common.source_name,
-        source_sha256: common.source_sha256,
-        page_count: common.pages.len(),
-        status: status(&common.diagnostics, &common.pages),
-        pages: common.pages,
-        paragraphs: derived.paragraphs,
-        sections: derived.sections,
-        footnotes: derived.footnotes,
-        tables: common.tables,
-        images: common.images,
-        diagnostics: common.diagnostics,
-        repairs: vec![],
-        metadata,
-        provenance,
-        schema_version: SCHEMA_VERSION.to_owned(),
-        parser_version: PARSER_VERSION.to_owned(),
-    };
-    validate_document(&document)?;
-    Ok(document)
-}
-
-#[cfg(feature = "ocr")]
-pub fn render_pdf_pages(
-    path: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-    dpi: u16,
-) -> Result<Vec<PathBuf>> {
-    use hayro::hayro_interpret::InterpreterSettings;
-    use hayro::hayro_syntax::Pdf;
-    use hayro::vello_cpu::color::palette::css::WHITE;
-    use hayro::{render, RenderCache, RenderSettings};
-
-    if !(72..=300).contains(&dpi) {
-        return Err(Error::Message(
-            "layout page rendering DPI must be between 72 and 300".to_owned(),
-        ));
-    }
-    let path = path.as_ref();
-    let bytes = fs::read(path).map_err(|source| Error::io(path, source))?;
-    let pdf = Pdf::new(bytes).map_err(|error| {
-        Error::Message(format!("layout renderer could not open PDF: {error:?}"))
-    })?;
-    let output = output.as_ref();
-    fs::create_dir_all(output).map_err(|source| Error::io(output, source))?;
-    let cache = RenderCache::new();
-    let interpreter = InterpreterSettings::default();
-    let scale = f32::from(dpi) / 72.0;
-    let settings = RenderSettings {
-        x_scale: scale,
-        y_scale: scale,
-        bg_color: WHITE,
-        ..Default::default()
-    };
-    let mut paths = Vec::new();
-    for (index, page) in pdf.pages().iter().enumerate() {
-        let pixmap = render(page, &cache, &interpreter, &settings);
-        let width = u32::from(pixmap.width());
-        let height = u32::from(pixmap.height());
-        let pixels = pixmap
-            .data_as_u8_slice()
-            .chunks_exact(4)
-            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
-            .collect();
-        let image = image::RgbImage::from_raw(width, height, pixels)
-            .ok_or_else(|| Error::Message("layout renderer returned invalid pixels".to_owned()))?;
-        let destination = output.join(format!("page-{index:06}.png"));
-        image.save(&destination).map_err(|error| {
-            Error::Message(format!("could not save {}: {error}", destination.display()))
-        })?;
-        paths.push(destination);
-    }
-    Ok(paths)
 }
 
 #[doc(hidden)]
@@ -1044,89 +665,5 @@ mod tests {
             cache_key(&"00".repeat(32), &identity, None, None, None).unwrap(),
             cache_key(&"00".repeat(32), &identity, None, None, None).unwrap()
         );
-    }
-
-    #[test]
-    fn external_layout_is_source_bound_and_covers_lines_before_derivation() {
-        let root = std::env::temp_dir().join(format!(
-            "legalpdf-layout-contract-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let input = root.join("input.json");
-        let assignments = root.join("assignments.json");
-        let source_sha256 = "12".repeat(32);
-        let line = |id: &str, text: &str, order: usize, y: f64| {
-            json!({
-                "id": id,
-                "page_index": 0,
-                "page_number": 1,
-                "source_index": order,
-                "reading_order": order,
-                "block_index": order,
-                "text": text,
-                "bbox": [10.0, y, 500.0, y + 20.0],
-                "region_id": "",
-                "region_type": "unknown",
-                "source": "native"
-            })
-        };
-        write_json(
-            &input,
-            &json!({
-                "schema_version": "legalpdf.common-input.v1",
-                "source_name": "fixture.pdf",
-                "source_sha256": source_sha256,
-                "pages": [{
-                    "id": "page-1",
-                    "index": 0,
-                    "number": 1,
-                    "width": 612.0,
-                    "height": 792.0,
-                    "lines": [
-                        line("line-heading", "Reasons for Judgment", 1, 50.0),
-                        line("line-body", "The appeal is dismissed.", 2, 90.0)
-                    ],
-                    "regions": [],
-                    "source": "native",
-                    "text_quality": 1.0
-                }],
-                "separators": [null],
-                "metadata": {},
-                "tables": [],
-                "images": [],
-                "diagnostics": []
-            }),
-        )
-        .unwrap();
-        write_json(
-            &assignments,
-            &json!({
-                "schema_version": "legalpdf.layout-assignments.v1",
-                "source_sha256": source_sha256,
-                "provider": "mllm",
-                "model": "fixture-vision",
-                "identity": "fixture-identity",
-                "pages": [{
-                    "page_index": 0,
-                    "regions": [
-                        {"type": "paragraph_title", "reading_order": 1, "line_ids": ["line-heading"]},
-                        {"type": "text", "reading_order": 2, "line_ids": ["line-body"]}
-                    ]
-                }]
-            }),
-        )
-        .unwrap();
-        let document = apply_external_layout(&input, &assignments).unwrap();
-        assert_eq!(document.provenance["layout_provider"], "mllm");
-        assert!(document.pages[0]
-            .lines
-            .iter()
-            .all(|line| line.region_type != "unknown"));
-        let _ = fs::remove_dir_all(root);
     }
 }
