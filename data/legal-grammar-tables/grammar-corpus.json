@@ -1,0 +1,1787 @@
+{
+  "format": "legal-grammar-corpus:v1",
+  "tables": {
+    "citations": {
+      "description": "Citation grammars extracted VERBATIM from the deterministic-citations lineage (ALR verifier_core/deterministic_splitter.py == engine legalpdf/deterministic_citations.py, md5-verified 2026-07-29) and from toa_maker.py where it diverges — dialects preserved side by side, never merged. Authoring rules: JS-style named groups (added groups are provenance-marked; they wrap existing alternations without changing match semantics); leading (?i) hoisted to table flags; invisible characters stay \\uXXXX escapes, visible non-ASCII stays literal. Python compiles with re.ASCII, JS without the u flag.",
+      "defs": {
+        "reporter_words": "[A-Z][A-Za-z&.'-]{1,16}(?:\\s+[A-Z][A-Za-z&.'-]{1,16}){0,4}",
+        "ca_statute_series": "R\\.?S\\.?N\\.?W\\.?T\\.?|S\\.?N\\.?W\\.?T\\.?|R\\.?S\\.?P\\.?E\\.?I\\.?|S\\.?P\\.?E\\.?I\\.?|C\\.?C\\.?S\\.?M\\.?|R\\.?S\\.?N\\.?B\\.?|S\\.?N\\.?B\\.?|R\\.?S\\.?N\\.?S\\.?|S\\.?N\\.?S\\.?|R\\.?S\\.?N\\.?L\\.?|S\\.?N\\.?L\\.?|R\\.?S\\.?B\\.?C\\.?|S\\.?B\\.?C\\.?|R\\.?S\\.?C\\.?|R\\.?S\\.?O\\.?|R\\.?S\\.?A\\.?|R\\.?S\\.?S\\.?|R\\.?S\\.?M\\.?|R\\.?S\\.?Y\\.?|S\\.?C\\.?|S\\.?O\\.?|S\\.?A\\.?|S\\.?S\\.?|S\\.?M\\.?|S\\.?Y\\.?",
+        "fr_statute_series": "C\\.?P\\.?L\\.?M\\.?|R\\.?L\\.?R\\.?Q\\.?|C\\.?Q\\.?L\\.?R\\.?|L\\.?R\\.?C\\.?|L\\.?R\\.?O\\.?|L\\.?R\\.?M\\.?|L\\.?C\\.?|L\\.?O\\.?|L\\.?M\\.?"
+      },
+      "entries": [
+        {
+          "id": "cite.neutral",
+          "pattern": "\\b(?<year>(?:17|18|19|20)\\d{2})\\s+(?<court>[A-Z][A-Z0-9-]{1,15})\\s+(?<num>\\d+)\\b",
+          "flags": "",
+          "canonical": {
+            "lowercase": [
+              "court"
+            ],
+            "map": {
+              "court": {
+                "csc": "scc",
+                "caf": "fca",
+                "cf": "fc",
+                "cfpi": "fc",
+                "cci": "tcc"
+              }
+            }
+          },
+          "provenance": "splitter.py:12 == deterministic_citations.py:12 == toa_maker.py:83 (_NEUTRAL_RE, all byte-identical). Named groups and the FR->EN court canonicalization map are beaver-authored additions; the groups wrap existing subexpressions without changing what matches.",
+          "vectors": [
+            {
+              "input": "As held in 2019 SCC 65, the standard is reasonableness.",
+              "groups": {
+                "year": "2019",
+                "court": "SCC",
+                "num": "65"
+              },
+              "canonical": {
+                "court": "scc"
+              }
+            },
+            {
+              "input": "Voir 2019 CSC 65 au para 23.",
+              "groups": {
+                "year": "2019",
+                "court": "CSC",
+                "num": "65"
+              },
+              "canonical": {
+                "court": "scc"
+              }
+            },
+            {
+              "input": "in 1875 SCC 4 (lineage accepts 17xx-20xx)",
+              "groups": {
+                "year": "1875",
+                "court": "SCC",
+                "num": "4"
+              }
+            },
+            {
+              "input": "2019SCC65 run together",
+              "groups": null
+            },
+            {
+              "input": "Guttman v Law Society of Manitoba, 2010 MBCA 66 at para 75",
+              "groups": {
+                "year": "2010",
+                "court": "MBCA",
+                "num": "66"
+              }
+            },
+            {
+              "input": "See R v LVR, 2014 BCCA 349 at paras 24-26 (NBSP-separated, as CanLII renders).",
+              "groups": {
+                "year": "2014",
+                "court": "BCCA",
+                "num": "349"
+              }
+            }
+          ]
+        },
+        {
+          "id": "cite.neutral.tribunal",
+          "pattern": "\\b(?<year>(?:17|18|19|20)\\d{2})\\s+(?<court>Comp\\.\\s+Trib\\.|Trib\\.\\s+conc\\.|Comp\\s+Trib\\.|CAPPRT\\s+LD|Comp\\s+Trib|Comp\\s+trib|TCRPAP\\s+LD|TRIB\\s+COMP|Trib\\s+Comp|Trib\\s+Conc|Trib\\s+conc|CCRI\\s+LD|CIRB\\s+LD)\\s+(?<num>\\d+)\\b",
+          "flags": "",
+          "canonical": {
+            "lowercase": [
+              "court"
+            ],
+            "strip": {
+              "court": "."
+            },
+            "map": {
+              "court": {
+                "trib conc": "comp trib",
+                "trib comp": "comp trib",
+                "ccri ld": "cirb ld",
+                "tcrpap ld": "capprt ld"
+              }
+            }
+          },
+          "provenance": "Sibling of cite.neutral for the multi-token tribunal dialect. Year/separators/num are VERBATIM from _NEUTRAL_RE (splitter.py:12); the closed-alternation shape is cite.statute.splitter's own series-code mechanism; the 13 members are exactly the surfaces A2AJ providers attest — 8 from citation columns (Comp Trib 1268, Trib conc 1004, CAPPRT LD 6, TCRPAP LD 6, CIRB LD 1, CCRI LD 1, Comp Trib. 1, TRIB COMP 1), 5 from judgment prose (Trib Conc 10, Comp. Trib. 5, Comp trib 2, Trib Comp 2, Trib. conc. 1); longest-first ordering; FR->EN map mirrors cite.neutral's court map (same tribunals renamed). Excluded: the one-off 'ON CA' authoring typo. Measured (probes/cite_class1_*): CT/fr recall 95.3->100.0 with 0 residual; 195 matches over 26.1 MB judgment text, 0 false positives; 0 new matches on 1,860 footnotes + 500 paragraphs. The generic two-token alternative produced 6 FP on the same corpora.",
+          "vectors": [
+            {
+              "input": "Neutral citation 2020 Comp Trib 6 File Number CT-2020-003",
+              "groups": {
+                "year": "2020",
+                "court": "Comp Trib",
+                "num": "6"
+              },
+              "canonical": {
+                "court": "comp trib"
+              }
+            },
+            {
+              "input": "la concurrence c Superior Propane Inc, 2000 Trib conc 8 o N de dossier",
+              "groups": {
+                "year": "2000",
+                "court": "Trib conc",
+                "num": "8"
+              },
+              "canonical": {
+                "court": "comp trib"
+              }
+            },
+            {
+              "input": "Référence neutre 2020 Trib Conc 5 Numéro de dossier CT-2020",
+              "groups": {
+                "year": "2020",
+                "court": "Trib Conc",
+                "num": "5"
+              }
+            },
+            {
+              "input": "and Office Depot, Inc., 2016 Comp. Trib. 6 File No.: CT-2015-012",
+              "groups": {
+                "year": "2016",
+                "court": "Comp. Trib.",
+                "num": "6"
+              }
+            },
+            {
+              "input": "et Garda World Security Corporation, 2019 Trib. conc. 5 N° de dossier",
+              "groups": {
+                "year": "2019",
+                "court": "Trib. conc.",
+                "num": "5"
+              }
+            },
+            {
+              "input": "see Nav Canada, 2000 CIRB LD 213, affirmed in NAV Canada",
+              "groups": {
+                "year": "2000",
+                "court": "CIRB LD",
+                "num": "213"
+              }
+            },
+            {
+              "input": "voir Nav Canada, 2000 CCRI LD 213, confirmée dans NAV Canada",
+              "groups": {
+                "year": "2000",
+                "court": "CCRI LD",
+                "num": "213"
+              },
+              "canonical": {
+                "court": "cirb ld"
+              }
+            },
+            {
+              "input": "2010 CAPPRT LD 108",
+              "groups": {
+                "year": "2010",
+                "court": "CAPPRT LD",
+                "num": "108"
+              }
+            },
+            {
+              "input": "the period from 1996 to December 31, 1997",
+              "groups": null
+            },
+            {
+              "input": "entre 1996 et le 31 décembre 1997",
+              "groups": null
+            },
+            {
+              "input": "R v Smith, 2019 SCC 65 at para 3",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.statute.judgment",
+          "pattern": "\\b(?<series>{{ca_statute_series}}),?\\s+(?:\\(?(?<year>\\d{4})\\)?,?\\s+)?c\\.\\s?(?<chapter>[A-Za-z0-9.\\-]+)(?:,\\s*Sched(?:ule)?\\.?\\s*(?<schedule>[A-Za-z0-9]+))?(?:,\\s*ss?\\.\\s*(?<section>\\d[\\w().]*))?",
+          "flags": "",
+          "canonical": {
+            "lowercase": [
+              "series"
+            ],
+            "strip": {
+              "series": "."
+            }
+          },
+          "provenance": "EXTRACTED VERBATIM from backend/src/lib/legalTextAnchors.ts STATUTE_CANADIAN_RE (~line 249) — the shipped judgment-side statute grammar; member list is CA_STATUTE_SERIES unchanged; the R\\.?S\\.?C\\.? dotting is that file's CA_SERIES_PATTERN mechanism; Sched(ule) and ss. tails byte-identical. Beaver-authored: named groups over existing captures; canonical lowercase+strip so R.S.C. and RSC share a key. Measured (probes/cite_class2_*): 146 matches in 48/120 SCC/en judgments where both footnote-lineage statute entries score 0; 41.5% of 629 census occurrences (89% of dotted/'c.'); span-identical to the TS source over 4,350 documents; 0 false positives on footnotes and paragraphs. Sibling — the footnote dialect entries stay untouched.",
+          "vectors": [
+            {
+              "input": "Criminal Code, R.S.C. 1985, c. C-46, s. 732.1(3)(c).",
+              "groups": {
+                "series": "R.S.C.",
+                "year": "1985",
+                "chapter": "C-46",
+                "section": "732.1(3)(c)."
+              },
+              "canonical": {
+                "series": "rsc"
+              }
+            },
+            {
+              "input": "Excise Tax Act, R.S.C. 1985, c. E-15",
+              "groups": {
+                "series": "R.S.C.",
+                "year": "1985",
+                "chapter": "E-15"
+              }
+            },
+            {
+              "input": "Income Tax Act, R.S.C. 1985, c. 1 (5th Supp.)",
+              "groups": {
+                "series": "R.S.C.",
+                "year": "1985",
+                "chapter": "1"
+              }
+            },
+            {
+              "input": "R.S.C., 1985, c. P-21",
+              "groups": {
+                "series": "R.S.C.",
+                "year": "1985",
+                "chapter": "P-21"
+              }
+            },
+            {
+              "input": "Courts of Justice Act, R.S.O. 1990, c. C.43",
+              "groups": {
+                "series": "R.S.O.",
+                "year": "1990",
+                "chapter": "C.43"
+              }
+            },
+            {
+              "input": "S.O. 1997, c. 16, Sched. A",
+              "groups": {
+                "series": "S.O.",
+                "year": "1997",
+                "chapter": "16",
+                "schedule": "A"
+              }
+            },
+            {
+              "input": "the Act, S.N.S. 2001 c. 6, ss. 74",
+              "groups": {
+                "series": "S.N.S.",
+                "year": "2001",
+                "chapter": "6",
+                "section": "74"
+              }
+            },
+            {
+              "input": "RSC 1985, c C-46",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.statute.judgment.fr",
+          "pattern": "\\b(?<series>{{fr_statute_series}}),?\\s+(?:\\(?(?<year>\\d{4})\\)?,?\\s+)?ch?\\.\\s?(?<chapter>[A-Za-z0-9.\\-]+)(?:,\\s*ann(?:exe)?\\.?\\s*(?<schedule>[A-Za-z0-9]+))?(?:,\\s*(?:art|par)\\.\\s*(?<section>\\d[\\w().]*))?",
+          "flags": "",
+          "canonical": {
+            "lowercase": [
+              "series"
+            ],
+            "strip": {
+              "series": "."
+            },
+            "map": {
+              "series": {
+                "lrc": "rsc",
+                "lro": "rso",
+                "lrm": "rsm",
+                "lc": "sc",
+                "lo": "so",
+                "lm": "sm",
+                "cplm": "ccsm",
+                "rlrq": "cqlr"
+              }
+            }
+          },
+          "provenance": "EXTRACTED VERBATIM from backend/src/lib/legalTextAnchors.ts STATUTE_CANADIAN_FR_RE (~line 273); member list = Object.keys(FR_STATUTE_SERIES) unchanged; ch?\\. accepting 'c.' and 'ch.', ann(exe) and (art|par). tails byte-identical. Beaver-authored: named groups; canonical map = FR_STATUTE_SERIES' own value side (LRC->rsc, LC->sc, CPLM->ccsm, RLRQ->cqlr) for bilingual concordance. Measured: 373 matches in 66/120 SCC/fr judgments where both footnote-lineage entries score 0; 34.7% of census occurrences (76% of dotted/'ch.'); span-identical to the TS source over 4,350 documents; 0 false positives.",
+          "vectors": [
+            {
+              "input": "Loi canadienne sur les droits de la personne, L.R.C. (1985), ch. H-6",
+              "groups": {
+                "series": "L.R.C.",
+                "year": "1985",
+                "chapter": "H-6"
+              },
+              "canonical": {
+                "series": "rsc"
+              }
+            },
+            {
+              "input": "L.R.C. 1985, ch. C-46",
+              "groups": {
+                "series": "L.R.C.",
+                "year": "1985",
+                "chapter": "C-46"
+              }
+            },
+            {
+              "input": "LIPR, L.C. 2001, ch. 27",
+              "groups": {
+                "series": "L.C.",
+                "year": "2001",
+                "chapter": "27"
+              },
+              "canonical": {
+                "series": "sc"
+              }
+            },
+            {
+              "input": "L.R.O. 1980, ch. 321, art. 37(1)",
+              "groups": {
+                "series": "L.R.O.",
+                "year": "1980",
+                "chapter": "321",
+                "section": "37(1)"
+              }
+            },
+            {
+              "input": "L.R.O. 1990, chap. F.32",
+              "groups": null
+            },
+            {
+              "input": "RSC 1985, c C-46",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.canlii",
+          "pattern": "\\b(?:17|18|19|20)\\d{2}\\s+CanLII\\s+\\d+\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:84 (_CANLII_RE). No splitter counterpart (splitter's _NEUTRAL_RE cannot match mixed-case CanLII).",
+          "vectors": [
+            {
+              "input": "R v Smith, 2015 CanLII 12345 (ON CA).",
+              "groups": {}
+            },
+            {
+              "input": "cited to CanLII without a year",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.reporter.splitter",
+          "pattern": "(?<![\\w.])(?:\\[(?:17|18|19|20)\\d{2}\\]\\s+(?:\\d{1,4}\\s+)?{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5}|\\((?:17|18|19|20)\\d{2}\\)\\s+(?:\\d{1,4}\\s+)?{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5}|\\d{1,4}\\s+{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5})(?=\\s*(?:[,;.]|\\bat\\b|\\band\\b|\\bwith\\b|\\(|\\[|$))",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:14-23 (_REPORTER_RE, three-branch: [year] / (year) / bare-volume, built on _REPORTER_WORDS which is the reporter_words def). Trailing lookahead bounds the match at clause edges. Recall-first routing evidence by design.",
+          "vectors": [
+            {
+              "input": "R v Oakes, [1986] 1 SCR 103;",
+              "groups": {}
+            },
+            {
+              "input": "(1990) 71 OR (2d) 725.",
+              "groups": {}
+            },
+            {
+              "input": "R v Bernard, [1988] 2 S.C.R. 833 at 880.",
+              "groups": {}
+            },
+            {
+              "input": "no volume no reporter here",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.reporter.toa",
+          "pattern": "(?<![\\w.])(?:\\[(?:17|18|19|20)\\d{2}\\]\\s+)?\\d{1,4}\\s+[A-Z][A-Za-z0-9&.'-]{1,20}(?:\\s+\\([0-9A-Za-z]{1,4}\\))?(?:\\s+[A-Z][A-Za-z0-9&.'-]{0,14}){0,3}\\s+\\d{1,6}\\b",
+          "flags": "",
+          "canonical": {},
+          "provenance": "toa_maker.py:85-89 (_REPORTER_RE). Dialect vs splitter: single branch, volume mandatory, digits allowed inside reporter words, page \\d{1,6}, NO re.I, no trailing clause-edge lookahead.",
+          "vectors": [
+            {
+              "input": "R v Oakes, [1986] 1 SCR 103;",
+              "groups": {}
+            },
+            {
+              "input": "cited at 71 OR (2d) 725 in passing",
+              "groups": {}
+            },
+            {
+              "input": "lowercase 1 scr 103 stays unmatched (no re.I in this dialect)",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.statute.splitter",
+          "pattern": "\\b(?:RSC|RSO|RSA|RSS|RSM|RSQ|RSY|RSBC|RSNL|RSNB|RSNS|RSPEI|RSNWT|SC|SO|SA|SS|SM|SQ|SY|SBC|SNL|SNB|SNS|SNWT|CQLR|CCSM)\\b\\s*[, ]\\s*\\d{4}(?:\\s*,?\\s*c\\s+[A-Za-z0-9.-]+)?",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:24-29 (_STATUTE_RE). Chapter class [A-Za-z0-9.-] — no parentheses.",
+          "vectors": [
+            {
+              "input": "Criminal Code, RSC 1985, c C-46, s 672.54(a)",
+              "groups": {}
+            },
+            {
+              "input": "CQLR c C-12, art 10",
+              "groups": null
+            },
+            {
+              "input": "SO 1990, c H.8",
+              "groups": {}
+            }
+          ]
+        },
+        {
+          "id": "cite.statute.toa",
+          "pattern": "\\b(?:RSC|RSO|RSA|RSS|RSM|RSQ|RSY|RSBC|RSNL|RSNB|RSNS|RSPEI|RSNWT|CQLR|CCSM|SC|SO|SA|SS|SM|SQ|SY|SBC|SNL|SNB|SNS|SNWT)\\b\\s*[, ]\\s*\\d{4}(?:\\s*,?\\s*c\\s+[A-Za-z0-9().-]+)?|\\b(?:Alta Reg|BC Reg|B C Reg|O Reg|OIC|SOR|SI|SOR/|CFR)\\s*[A-Za-z-]*\\s*\\d{2,4}[-/]\\d{1,4}\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:90-96 (_STATUTE_RE). Dialect vs splitter: CQLR/CCSM hoisted ahead of the two-letter codes, chapter class gains parentheses, and a second branch covers regulations (Alta Reg / BC Reg / O Reg / OIC / SOR / SI / CFR).",
+          "vectors": [
+            {
+              "input": "Criminal Code, RSC 1985, c C-46",
+              "groups": {}
+            },
+            {
+              "input": "O Reg 213/91, s 1",
+              "groups": {}
+            },
+            {
+              "input": "SOR/98-106 applies",
+              "groups": {}
+            },
+            {
+              "input": "no statute series here",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.journal.splitter",
+          "pattern": "\\(?(?:17|18|19|20)\\d{2}\\)?\\s+\\d{1,4}(?::\\s*[A-Za-z0-9.-]+)?\\s+[A-Z][A-Za-z&.'’(), -]{1,100}?\\s+\\d{1,5}\\b",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:30-34 (_JOURNAL_RE). Title class includes U+2019 right single quote.",
+          "vectors": [
+            {
+              "input": "(2019) 97 Can Bar Rev 1 at 12",
+              "groups": {}
+            },
+            {
+              "input": "(2020) 45 Queen’s 221",
+              "groups": {}
+            },
+            {
+              "input": "a paper from 2019 with no volume",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.journal.toa",
+          "pattern": "\\(?(?:17|18|19|20)\\d{2}\\)?\\s+\\d{1,4}(?::\\s*[A-Za-z0-9.-]+)?\\s+[A-Z][A-Za-z&.'(), -]{1,100}?\\s+\\d{1,5}\\b",
+          "flags": "",
+          "canonical": {},
+          "provenance": "toa_maker.py:97-100 (_JOURNAL_RE). Dialect vs splitter: one character — the title class drops U+2019. The Queen’s vector is the discriminating pair.",
+          "vectors": [
+            {
+              "input": "(2019) 97 Can Bar Rev 1 at 12",
+              "groups": {}
+            },
+            {
+              "input": "(2020) 45 Queen’s 221",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "title.legal.splitter",
+          "pattern": "(?<!\\w)(?:(?:and\\s+)?the\\s+)?[A-Z][A-Za-z'’() -]{1,100}?\\s+(?:Act|Code|Rules?|Regulations?|Convention|Treaty)(?=\\b|,)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:132-135 (_LEGAL_TITLE_RE). Title class has U+2019, no ampersand.",
+          "vectors": [
+            {
+              "input": "under the Divorce Act, s 15",
+              "groups": {}
+            },
+            {
+              "input": "the Employees’ Retirement Act",
+              "groups": {}
+            },
+            {
+              "input": "no instrument named",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "title.legal.toa",
+          "pattern": "(?<!\\w)(?:(?:and\\s+)?the\\s+)?[A-Z][A-Za-z'()& -]{1,100}?\\s+(?:Act|Code|Rules?|Regulations?|Convention|Treaty)(?=\\b|,)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "toa_maker.py:101-104 (_LEGAL_TITLE_RE). Dialect vs splitter: gains ampersand, drops U+2019. Match spans differ across dialects on &-bearing and ’-bearing titles; the differential harness, not these vectors, asserts spans.",
+          "vectors": [
+            {
+              "input": "under the Divorce Act, s 15",
+              "groups": {}
+            },
+            {
+              "input": "the Trade & Commerce Act",
+              "groups": {}
+            }
+          ]
+        },
+        {
+          "id": "title.named-code",
+          "pattern": "\\b(?:Model\\s+)?(?:Code|Rules?)\\s+of\\s+[A-Z][A-Za-z'’ -]{2,100}",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:136-138 (_NAMED_CODE_RE). No toa counterpart.",
+          "vectors": [
+            {
+              "input": "the Code of Professional Conduct requires",
+              "groups": {}
+            },
+            {
+              "input": "Model Rules of Professional Conduct r 1.6",
+              "groups": {}
+            },
+            {
+              "input": "a code of silence also matches under re.I — the lineage is recall-first here",
+              "groups": {}
+            },
+            {
+              "input": "no such instrument",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.url",
+          "pattern": "\\b(?:https?://|www\\.)[^\\s<>]+|\\bperma\\.cc/[A-Z0-9-]+|\\bdoi:\\s*10\\.\\d{4,9}/\\S+",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:8-11 == toa_maker.py:82 (_URL_RE; compiled patterns identical). Source spells the flag as a leading (?i); hoisted to table flags.",
+          "vectors": [
+            {
+              "input": "online: https://canlii.ca/t/1fqm7 accessed",
+              "groups": {}
+            },
+            {
+              "input": "archived at perma.cc/ABC1-23DE",
+              "groups": {}
+            },
+            {
+              "input": "doi: 10.1234/example.5678",
+              "groups": {}
+            },
+            {
+              "input": "no link in this sentence",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.url.prefix",
+          "pattern": "(?:https?://|www\\.)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "engine docx_linking.py:54 (URL_RE). Deliberately truncated prefix detector — routing only, no body match, no perma.cc/doi. Kept as its own entry because its purpose differs from cite.url.",
+          "vectors": [
+            {
+              "input": "see www.canlii.org for the source",
+              "groups": {}
+            },
+            {
+              "input": "wwwnot a link",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "frame.book",
+          "pattern": "\\([A-Z][A-Za-z .,'-]{1,50}:\\s*[^()]{0,80},?\\s*(?:17|18|19|20)\\d{2}\\)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:35-37 (_BOOK_FRAME_RE): the (City: Publisher, Year) frame of a monograph citation.",
+          "vectors": [
+            {
+              "input": "Peter Hogg, Constitutional Law of Canada (Toronto: Carswell, 2007) at 121",
+              "groups": {}
+            },
+            {
+              "input": "(see the discussion below)",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.quoted",
+          "pattern": "[\"“][^\"”]{3,240}[\"”][^.;]{0,220}(?:\\b(?:17|18|19|20)\\d{2}\\b|\\b(?:online|perma\\.cc|doi)\\b)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:123-127 (_QUOTED_CITATION_RE). Source spells the curly quotes as \\u201c/\\u201d escapes; written literal here.",
+          "vectors": [
+            {
+              "input": "“The Duty to Consult” (2020) 43 Dal LJ 1",
+              "groups": {}
+            },
+            {
+              "input": "\"short\" then nothing citation-like",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.secondary",
+          "pattern": "(?<!\\w)[A-Z][^.;]{2,220}\\((?:[^()]|\\([^()]*\\)){0,160}(?:17|18|19|20)\\d{2}\\)(?:\\s*\\[[^\\]]+\\])?(?:\\s+at\\b|\\s*[,.;]|\\s*$)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:128-131 (_SECONDARY_CITATION_RE): author-title-(parenthetical ending in year) shape for secondary sources.",
+          "vectors": [
+            {
+              "input": "Ruth Sullivan, Sullivan on the Construction of Statutes (6th ed, 2014) at 45",
+              "groups": {}
+            },
+            {
+              "input": "lowercase start (2014) never matches",
+              "groups": null
+            }
+          ]
+        }
+      ]
+    },
+    "footnote-labels": {
+      "description": "Footnote label / marker grammars extracted VERBATIM from engine legalpdf/core.py (the PDF footnote-linking pass). Spelling follows the sources exactly: superscript digits, † ‡ § ¶ and ⟦ ⟧ are literal where the source writes them literally (_LABEL_RE/_PURE_LABEL_RE/_SUPER_RE/_INLINE_FN_RE), while _STANDALONE_REF_RE's \\u2020\\u2021\\u00a7\\u00b6 escapes and _DOUBLE_ZERO_WIDTH_RE's invisible \\u200b are kept as escapes exactly as the source spells them — a spelling dialect, not a semantic one. (?P<label> translated to JS syntax. Python compiles re.ASCII, JS without u. None of these carry re.I.",
+      "entries": [
+        {
+          "id": "label.line-start",
+          "pattern": "^\\s*(?<label>\\d{1,4}|[*†‡§¶#])(?:\\s|[.)\\],:;-])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:33-35 (_LABEL_RE; (?P<label> translated to JS syntax, symbols literal in source). A footnote label at line start: 1-4 digits or a mark, then whitespace or closing punctuation. CanLII-style [N] bracket numbering does not match.",
+          "vectors": [
+            {
+              "input": "38 Representation before a tribunal concerns legal rights.",
+              "groups": {
+                "label": "38"
+              }
+            },
+            {
+              "input": "19. (1) An embedded statutory provision.",
+              "groups": {
+                "label": "19"
+              }
+            },
+            {
+              "input": "* The author thanks the anonymous reviewers",
+              "groups": {
+                "label": "*"
+              }
+            },
+            {
+              "input": "[2] Second paragraph contains enough ordinary decision prose to establish substantive structure.",
+              "groups": null
+            },
+            {
+              "input": "12345 too many digits",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "label.pure",
+          "pattern": "^(?:\\d{1,4}|[*†‡§¶#])$",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:36 (_PURE_LABEL_RE, symbols literal in source). The whole string IS the label — no trailing punctuation, unlike label.line-start.",
+          "vectors": [
+            {
+              "input": "12",
+              "groups": {}
+            },
+            {
+              "input": "†",
+              "groups": {}
+            },
+            {
+              "input": "12.",
+              "groups": null
+            },
+            {
+              "input": "12345",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "label.superscript",
+          "pattern": "[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,4}",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:38 (_SUPER_RE). Superscript digits stay literal, as in the source; core.py:37 pairs this with _SUPER_TRANSLATION to map them to ASCII digits.",
+          "vectors": [
+            {
+              "input": "Reasons¹²",
+              "groups": {}
+            },
+            {
+              "input": "the court held.⁴",
+              "groups": {}
+            },
+            {
+              "input": "⁰",
+              "groups": {}
+            },
+            {
+              "input": "footnote 12 in plain digits",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "boundary.sentence.engine",
+          "pattern": "[.!?](?:[\"'”’)\\]]*)(?=\\s|⟦FN:|$)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:39-41 (_SENTENCE_EDGE_RE). The ENGINE DIALECT of boundary.sentence.splitter (references.json): instead of looking forward to the next sentence's opener+capital, it consumes trailing closers (\" ' ” ’ ) ]) after the terminal punctuation and requires whitespace, a ⟦FN: marker, or end-of-text next. Source spells the straight quote \\\"; written literal (compiled-identical); ” ’ ⟦ literal in source.",
+          "vectors": [
+            {
+              "input": "It was so held.” Next point.",
+              "groups": {}
+            },
+            {
+              "input": "criminal liability. Depriving a person of liberty",
+              "groups": {}
+            },
+            {
+              "input": "The proceeding ended.⟦FN:12⟧",
+              "groups": {}
+            },
+            {
+              "input": "The end.",
+              "groups": {}
+            },
+            {
+              "input": "R v X, 2020 SCC 1 at para.20",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "marker.inline-fn",
+          "pattern": "⟦FN:[^⟧]+⟧",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:42 (_INLINE_FN_RE) == adapters.py:99 (inline re.sub copy, byte-identical pattern). The engine's internal footnote-reference marker; ⟦ U+27E6 / ⟧ U+27E7 literal in both sources. Requires a non-empty id.",
+          "vectors": [
+            {
+              "input": "The proceeding ended.⟦FN:12⟧ It resumed later.",
+              "groups": {}
+            },
+            {
+              "input": "⟦FN:fn-003⟧",
+              "groups": {}
+            },
+            {
+              "input": "⟦FN:⟧",
+              "groups": null
+            },
+            {
+              "input": "a paragraph with no markers",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "label.standalone",
+          "pattern": "(?:\\d{1,4}|[*\\u2020\\u2021\\u00a7\\u00b6#])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:50 (_STANDALONE_REF_RE). Same token shape as label.pure but unanchored (used against isolated reference-mark spans). The SOURCE spells † ‡ § ¶ as \\u2020\\u2021\\u00a7\\u00b6 escapes here (unlike _LABEL_RE's literals); kept exactly — the compiled characters are identical.",
+          "vectors": [
+            {
+              "input": "7",
+              "groups": {}
+            },
+            {
+              "input": "†",
+              "groups": {}
+            },
+            {
+              "input": "¶",
+              "groups": {}
+            },
+            {
+              "input": "no reference marks in this sentence",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "trap.double-zero-width",
+          "pattern": "\\u200b{2,}",
+          "flags": "",
+          "canonical": {},
+          "provenance": "engine core.py:51 (_DOUBLE_ZERO_WIDTH_RE). Two or more consecutive zero-width spaces — an extraction-defect tripwire. Invisible character stays a \\u200b escape, per the authoring rule and the source's own spelling. Vector inputs carry real U+200B characters (JSON-escaped for visibility).",
+          "vectors": [
+            {
+              "input": "fn​​12",
+              "groups": {}
+            },
+            {
+              "input": "​​​",
+              "groups": {}
+            },
+            {
+              "input": "fn​12",
+              "groups": null
+            },
+            {
+              "input": "clean text",
+              "groups": null
+            }
+          ]
+        }
+      ]
+    },
+    "pinpoints": {
+      "description": "Pinpoint grammars (para/section/page with value sequences) extracted verbatim from the two lineages: the splitter dialect (ALR deterministic_splitter.py == engine deterministic_citations.py) and the toa_maker dialect. The defs mirror the source rf-string composition (_PIN_ITEM/_PIN_SEPARATOR/_PIN_SEQUENCE vs _PINPOINT_VALUE/_PINPOINT_LIST) so each fragment keeps one edit point. Dialects differ on: ranges inside an item (splitter) vs dash-as-list-separator (toa), 'to' as a separator (toa only), '&' as a separator (splitter only), pre-parenthesis space (splitter only), paragraph ¶ (splitter only), 'subsection' keyword (splitter only), and page-abbreviation period placement.",
+      "defs": {
+        "pin_item_splitter": "\\d+(?:\\.\\d+)*(?:\\s*\\([A-Za-z0-9]+\\))*(?:\\s*[-–]\\s*\\d+(?:\\.\\d+)*(?:\\s*\\([A-Za-z0-9]+\\))*)?",
+        "pin_sep_splitter": "(?:,\\s*(?:and|&)?\\s*|\\s+(?:and|&)\\s+)",
+        "pin_seq_splitter": "{{pin_item_splitter}}(?:\\s*{{pin_sep_splitter}}\\s*{{pin_item_splitter}})*",
+        "pin_item_toa": "\\d+(?:\\.\\d+)*(?:\\([A-Za-z0-9]+\\))*",
+        "pin_seq_toa": "{{pin_item_toa}}(?:\\s*(?:,|and|to|[-–—])\\s*{{pin_item_toa}})*"
+      },
+      "entries": [
+        {
+          "id": "pinpoint.para.splitter",
+          "pattern": "(?:\\bparas?(?:graphs?)?\\.?|¶)\\s*(?<values>{{pin_seq_splitter}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:87-89 (_PAR_PIN_RE). ¶ accepted; named group 'values' is in the source ((?P<values>) translated to JS syntax).",
+          "vectors": [
+            {
+              "input": "Vavilov at paras 23, 27 and 31",
+              "groups": {
+                "values": "23, 27 and 31"
+              }
+            },
+            {
+              "input": "see ¶ 12 above",
+              "groups": {
+                "values": "12"
+              }
+            },
+            {
+              "input": "at Paras. 105",
+              "groups": {
+                "values": "105"
+              }
+            },
+            {
+              "input": "at para 75",
+              "groups": {
+                "values": "75"
+              }
+            },
+            {
+              "input": "at paras 23 to 27 — 'to' is not a separator in this dialect",
+              "groups": {
+                "values": "23"
+              }
+            },
+            {
+              "input": "comparable paradigms",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "pinpoint.para.toa",
+          "pattern": "\\bparas?(?:graphs?)?\\.?\\s*({{pin_seq_toa}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:150 (_PAR_RE), moved verbatim with its positional capture.",
+          "vectors": [
+            {
+              "input": "at paras 23 to 27",
+              "groups": {}
+            },
+            {
+              "input": "at para 38",
+              "groups": {}
+            },
+            {
+              "input": "see ¶ 12 above",
+              "groups": null
+            },
+            {
+              "input": "comparable paradigms",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "pinpoint.section.splitter",
+          "pattern": "\\b(?:ss?\\.?|(?:sub)?sections?|rules?|rr?\\.?|articles?|arts?\\.?)\\s*(?<values>{{pin_seq_splitter}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:90-94 (_SEC_PIN_RE). Keyword set includes 'subsection'; named group in source.",
+          "vectors": [
+            {
+              "input": "Ibid, s 49.2.",
+              "groups": {
+                "values": "49.2"
+              }
+            },
+            {
+              "input": "DOLA, supra note 13, subsection 4(4).",
+              "groups": {
+                "values": "4(4)"
+              }
+            },
+            {
+              "input": "ss 4-6 of the Act",
+              "groups": {
+                "values": "4-6"
+              }
+            },
+            {
+              "input": "Ibid at art 1457.",
+              "groups": {
+                "values": "1457"
+              }
+            },
+            {
+              "input": "the session resumed",
+              "groups": null
+            },
+            {
+              "input": "les traités 12 pays (accented boundary keeps this clean)",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "pinpoint.section.toa",
+          "pattern": "\\b(?:s(?:ection)?s?|ss?\\.?|rules?|rr?\\.?|arts?\\.?|articles?)\\s*({{pin_seq_toa}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:151-154 (_SECTION_RE), moved verbatim with its positional capture.",
+          "vectors": [
+            {
+              "input": "Ibid, s 49.2.",
+              "groups": {}
+            },
+            {
+              "input": "s 672.54(a) applies",
+              "groups": {}
+            },
+            {
+              "input": "DOLA, supra note 13, subsection 4(4).",
+              "groups": null
+            },
+            {
+              "input": "no provision named",
+              "groups": null
+            },
+            {
+              "input": "les traités 12 pays (accented boundary keeps this clean)",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "pinpoint.page.splitter",
+          "pattern": "\\bat\\s+(?:(?:pp?\\.?|pages?)\\s+)?(?<values>{{pin_seq_splitter}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:95-98 (_PAGE_PIN_RE). Abbreviation period sits inside the alternation and a following space is mandatory; named group in source.",
+          "vectors": [
+            {
+              "input": "Wills, supra note 2 at 826 [emphasis added].",
+              "groups": {
+                "values": "826"
+              }
+            },
+            {
+              "input": "at pp. 5-7",
+              "groups": {
+                "values": "5-7"
+              }
+            },
+            {
+              "input": "at p.5 — no space after the period fails this dialect",
+              "groups": null
+            },
+            {
+              "input": "we met at noon",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "pinpoint.page.toa",
+          "pattern": "\\bat\\s+(?:(?:pp?|pages?)\\.?\\s*)?({{pin_seq_toa}})",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:155 (_PAGE_RE), moved verbatim with its positional capture.",
+          "vectors": [
+            {
+              "input": "Wills, supra note 2 at 826 [emphasis added].",
+              "groups": {}
+            },
+            {
+              "input": "at p.5 works in this dialect",
+              "groups": {}
+            },
+            {
+              "input": "we met at noon",
+              "groups": null
+            }
+          ]
+        }
+      ]
+    },
+    "provisions": {
+      "description": "Provision-reference grammar moved verbatim from Beaver's legalReferenceGrammar.ts. These patterns identify provision pointers and their external-instrument context; they do not derive document structure.",
+      "defs": {
+        "provision_word_en": "(?:sub-?section|section|paragraph|subparagraph|clause|subclause|item|article|part|division|schedule|definition)",
+        "provision_word_fr": "(?:sous-alinéas?|alinéas?|paragraphes?|articles?|sous-divisions?|divisions?|parties?|annexes?)",
+        "numeric_label": "\\d{1,4}[A-Za-z]?(?:\\.\\d{1,4}[A-Za-z]?)*(?:\\s?\\([^\\s()]{1,12}\\))*",
+        "sub_only_label": "(?:\\([^\\s()]{1,12}\\))+",
+        "roman_label": "[IVXLCDM]{1,7}"
+      },
+      "entries": [
+        {
+          "id": "provision.ref.en.anchored",
+          "pattern": "{{provision_word_en}}s?\\s+((?:\\d+[A-Za-z]?(?:\\.\\d+)*)?(?:\\s?\\([^\\s()]{1,12}\\))*)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts PROVISION_REF, moved verbatim.",
+          "vectors": [
+            { "input": "Subsection 5(1)", "groups": {} },
+            { "input": "clause 5(1)(b)(ii)", "groups": {} },
+            { "input": "ordinary prose", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.ref.fr.anchored",
+          "pattern": "{{provision_word_fr}}\\s+((?:\\d+(?:\\.\\d+)*[A-Za-z]?)?(?:\\s?(?:\\([^\\s()]{1,12}\\)|[a-zà-ÿ]{1,4}\\)))*)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts FR_PROVISION_REF, moved verbatim.",
+          "vectors": [
+            { "input": "le paragraphe 193(2)", "groups": {} },
+            { "input": "alinéa b)", "groups": {} },
+            { "input": "ordinary prose", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.reference.numeric",
+          "pattern": "\\b({{provision_word_en}})(s)?\\s+(?:({{numeric_label}})|({{sub_only_label}}))",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts REFERENCE_RE, moved verbatim.",
+          "vectors": [
+            { "input": "under Section 5.3", "groups": {} },
+            { "input": "paragraph (b) above", "groups": {} },
+            { "input": "this section hereof", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.reference.roman",
+          "pattern": "\\b(article|articles|part|parts|division|divisions)\\s+({{roman_label}})\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts ROMAN_REFERENCE_RE, moved verbatim.",
+          "vectors": [
+            { "input": "set forth in Article VI", "groups": {} },
+            { "input": "Section IV", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.leading-subdivision",
+          "pattern": "^\\s*\\([a-z0-9]{1,4}\\)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts isExternalReference leading-subdivision trim, moved verbatim.",
+          "vectors": [
+            { "input": "(d) of the Exchange Act", "groups": {} },
+            { "input": "of this Agreement", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.following",
+          "pattern": "^(?:of|to|under)\\s+(\\w+)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts isExternalReference owner match, moved verbatim.",
+          "vectors": [
+            { "input": "of the Income Tax Act", "groups": {} },
+            { "input": "hereof", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.instrument-lead",
+          "pattern": "\\b(?:code|act|regulations?|rules?|statutes?|laws?|chapter|title|ordinance|directive|treaty|convention|constitution)\\s*$",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts INSTRUMENT_LEAD, moved verbatim.",
+          "vectors": [
+            { "input": "Exchange Act", "groups": {} },
+            { "input": "this Agreement", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.list-continuation",
+          "pattern": "^(?:\\s*(?:,|and|or|through)\\s*\\d[\\w.()-]*)+",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts LIST_CONTINUATION, moved verbatim.",
+          "vectors": [
+            { "input": " and 906 of the Sarbanes-Oxley Act", "groups": {} },
+            { "input": " of this Agreement", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.hyphenated-number",
+          "pattern": "^-\\s?\\d",
+          "flags": "",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts hyphenated subdivision test, moved verbatim.",
+          "vectors": [
+            { "input": "-4(b)(2)", "groups": {} },
+            { "input": " of this Agreement", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.thereof",
+          "pattern": "^\\s*thereof\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts thereof test, moved verbatim.",
+          "vectors": [
+            { "input": " thereof", "groups": {} },
+            { "input": " hereof", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.external.list-owner",
+          "pattern": "^\\s*(?:of|under)\\s+(\\w+)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts list-owner match, moved verbatim.",
+          "vectors": [
+            { "input": " of the Sarbanes-Oxley Act", "groups": {} },
+            { "input": " to be satisfied", "groups": null }
+          ]
+        },
+        {
+          "id": "provision.label.fr-unclosed",
+          "pattern": "(?<!\\()([a-zà-ÿ]{1,4})\\)",
+          "flags": "",
+          "canonical": {},
+          "provenance": "backend legalReferenceGrammar.ts compactLabelFr repair, moved verbatim.",
+          "vectors": [
+            { "input": "42a)(i)", "groups": {} },
+            { "input": "42(a)(i)", "groups": null }
+          ]
+        }
+      ]
+    },
+    "references": {
+      "description": "Reference, short-form, signal, and boundary grammars extracted VERBATIM from the deterministic-citations lineage (ALR verifier_core/deterministic_splitter.py == engine legalpdf/deterministic_citations.py, byte-identical block, cited as splitter.py:N == deterministic_citations.py:N) with the toa_maker.py and engine docx_linking.py dialects preserved side by side, never merged. The defs mirror the source rf-composition splitter.py:39-47 (_REF_NUM/_REF_NUMS/_REF_PIN) so each fragment keeps one edit point, exactly as pinpoints.json does for pin_*. Authoring rules: JS-style named groups ((?P<x> translated; groups ADDED by beaver are provenance-marked and wrap existing subexpressions without changing what matches); invisible characters stay \\uXXXX escapes, visible non-ASCII stays literal (\\u2018/\\u2019/\\u201c source escapes written as the characters, compiled-identical, noted per entry); Python compiles re.ASCII, JS without u. Vectors: real strings from benchmarks/grammar_vectors/harvested.jsonl (ALR/TOA test corpora) where available; expectations are regex-level (ALR's pure-ref PREFILTER carries extra gates beyond _PURE_REF_RE, e.g. paren-subdivision and bracket-note rejection, so harvested prefilter verdicts are not regex verdicts).",
+      "defs": {
+        "ref_num": "\\d+(?:\\.\\d+)?[a-z]?(?:\\s*\\([A-Za-z0-9]+\\))*(?:\\s*[-–]\\s*\\d+(?:\\.\\d+)?[a-z]?(?:\\s*\\([A-Za-z0-9]+\\))*)?",
+        "ref_nums": "{{ref_num}}(?:\\s*(?:,|and|&)\\s*{{ref_num}})*",
+        "ref_pin": "(?:at\\s+(?:paras?\\.?|pp?\\.?|pages?)?\\s*{{ref_nums}}(?:ff)?|(?:paras?\\.?|ss?\\.?|(?:sub)?sections?|arts?\\.?|articles?)\\s+{{ref_nums}}(?:ff)?)"
+      },
+      "entries": [
+        {
+          "id": "ref.token",
+          "pattern": "\\b(?:supra|ibid)\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:38 == deterministic_citations.py:38 (_REF_TOKEN_RE) == toa_maker.py:137 (_REFERENCE_WORD_RE) == docx_linking.py:52 (REFERENCE_RE) — all byte-identical.",
+          "vectors": [
+            {
+              "input": "Baker, supra note 12 at para 30.",
+              "groups": {}
+            },
+            {
+              "input": "Ibid at para 38. See R v Imperial Tobacco, 2011 SCC 42; Nelson (City) v Marchi, 2021 SCC 41.",
+              "groups": {}
+            },
+            {
+              "input": "the supranational tribunal",
+              "groups": null
+            },
+            {
+              "input": "ibidem in the original",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.pure.splitter",
+          "pattern": "^\\s*(?:(?:see(?:,?\\s+e\\.?g\\.?,?)?(?:\\s+also)?|but\\s+see|contra|compare|cf\\.?|see\\s+generally|citing|quoting|discussing|discussed\\s+in|applying)\\s+)?(?:ibid\\.?|(?:[^,;.]{1,60}\\s*,\\s*)?supra(?:\\s+(?:note|nn?\\.?)\\s+\\d+)?)(?:\\s*,)?(?:\\s+{{ref_pin}})?\\s*[.;]?\\s*$",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:48-54 == deterministic_citations.py:48-54 (_PURE_REF_RE, tail spliced from _REF_PIN = {{ref_pin}}). The case-name prefix [^,;.]{1,60} attaches ONLY to supra, never ibid, and the pin tail accepts non-'at' keywords (subsection/art/etc) — both discriminate against ref.pure.toa. 'r'/'rules' are NOT ref-pin keywords in either dialect (the Alberta Rules vector). Regex-level note: this pattern matches paren subdivisions like 4(4); ALR's prefilter rejects them downstream, beyond the regex.",
+          "vectors": [
+            {
+              "input": "Ibid.",
+              "groups": {}
+            },
+            {
+              "input": "Baker, supra note 12 at para 30.",
+              "groups": {}
+            },
+            {
+              "input": "Gullo & Exner-Pirot, supra note 34.",
+              "groups": {}
+            },
+            {
+              "input": "DOLA, supra note 13, subsection 4(4).",
+              "groups": {}
+            },
+            {
+              "input": "Alberta Rules, supra note 2, r 11.10.",
+              "groups": null
+            },
+            {
+              "input": "Oakes, ibid at 105.",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.pure.toa",
+          "pattern": "^\\s*(?:(?:see(?:,?\\s+e\\.?g\\.?[,]?)?(?:\\s+also)?|but\\s+see|contra|compare|cf\\.?|see\\s+generally|citing|quoting|discussing|applying)\\s+)?(?:[^,;.]{1,80}\\s*,\\s*)?(?:supra(?:\\s+(?:note|nn?\\.?)\\s+\\d+)?|ibid\\.?)(?:\\s*,)?(?:\\s+at\\s+(?:paras?\\.?|pp?\\.?|pages?)?\\s*\\d[\\d\\s,–-]*)?\\s*[.;]?\\s*$",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:105-111 (_REFERENCE_RE). Dialect vs ref.pure.splitter: the name prefix (now {1,80}) attaches to supra AND ibid, the signal list drops 'discussed in', e.g. spelled with [,]? (kept verbatim), and the pin tail is 'at'-only with a flat \\d[\\d\\s,–-]* value list (en dash literal in source) — so 'subsection 4(4)' matches only the splitter dialect and 'Oakes, ibid ...' matches only this one.",
+          "vectors": [
+            {
+              "input": "See also ibid at 44.",
+              "groups": {}
+            },
+            {
+              "input": "Oakes, ibid at 105.",
+              "groups": {}
+            },
+            {
+              "input": "Baker, supra note 12 at para 30.",
+              "groups": {}
+            },
+            {
+              "input": "DOLA, supra note 13, subsection 4(4).",
+              "groups": null
+            },
+            {
+              "input": "Alberta Rules, supra note 2, r 11.10.",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.inline.toa",
+          "pattern": "\\b(?:ibid|supra(?:\\s+(?:note|n\\.?|nn\\.?)\\s+\\d+)?)\\b\\.?",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:138-141 (_INLINE_REFERENCE_RE). Mid-text reference finder; note spelling (?:note|n\\.?|nn\\.?) differs from the splitter lineage's (?:note|nn?\\.?). Trailing \\b rejects 'supranational' (contrast ref.supra-note.linking).",
+          "vectors": [
+            {
+              "input": "Ibid at para 38. See R v Imperial Tobacco, 2011 SCC 42; Nelson (City) v Marchi, 2021 SCC 41.",
+              "groups": {}
+            },
+            {
+              "input": "Johnson, supra note 243 at para 19 citing Lyons, supra note 243 at page 339.",
+              "groups": {}
+            },
+            {
+              "input": "supra n. 4",
+              "groups": {}
+            },
+            {
+              "input": "the supranational tribunal",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.supra-note.linking",
+          "pattern": "\\bsupra(?:\\s+(?:note|nn?\\.?)\\s+(?<note>\\d+))?",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "engine docx_linking.py:53 (SUPRA_NOTE_RE). The (\\d+) capturing group is in the source; the NAME 'note' is a beaver-authored addition that does not change match semantics. No trailing \\b in the source, so 'supranational' matches here and nowhere else in this family — kept verbatim. On a draft blank ('supra note ___') the optional group fails and the match is bare 'supra' with note unset.",
+          "vectors": [
+            {
+              "input": "Johnson, supra note 243 at para 19 citing Lyons, supra note 243 at page 339.",
+              "groups": {
+                "note": "243"
+              }
+            },
+            {
+              "input": "Chehil, supra note ___ at para 28.",
+              "groups": {}
+            },
+            {
+              "input": "the supranational tribunal",
+              "groups": {}
+            },
+            {
+              "input": "no reference here",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.note-reference",
+          "pattern": "(?<!\\w)[A-Z][A-Za-zÀ-ÖØ-öø-ÿ\\u0300-\\u036f.'’\\-]*(?:\\s+(?:et\\s+al|&|and|[A-Z][A-Za-zÀ-ÖØ-öø-ÿ\\u0300-\\u036f.'’\\-]*)){0,6}\\s+note\\s+\\d+\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:142-147 == deterministic_citations.py:142-147 (_NOTE_REFERENCE_START_RE). Author-name(s) + 'note N' with supra dropped. Non-ASCII letter ranges À-ÖØ-öø-ÿ literal in the source and kept literal; combining range kept as \\u0300-\\u036f escapes exactly as the source spells it. Under re.I the [A-Z] starts match lowercase — recall-first by design.",
+          "vectors": [
+            {
+              "input": "Sullivan note 12",
+              "groups": {}
+            },
+            {
+              "input": "Gullo & Exner-Pirot note 34",
+              "groups": {}
+            },
+            {
+              "input": "Côté note 8",
+              "groups": {}
+            },
+            {
+              "input": "even see note 12 matches under re.I — the lineage is recall-first here",
+              "groups": {}
+            },
+            {
+              "input": "as discussed above",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.cross-reference",
+          "pattern": "\\b(?:supra|ibid)\\b|\\b(?:above|below)\\s+note(?:\\s+\\d+)?\\b|\\bnote\\s+\\d+\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:119-122 == deterministic_citations.py:119-122 (_CROSS_REFERENCE_RE). Superset of ref.token: adds 'above/below note [N]' and bare 'note N'.",
+          "vectors": [
+            {
+              "input": "See Oakes, supra note 4 at para 12; ibid at para 14.",
+              "groups": {}
+            },
+            {
+              "input": "see note 12 for details",
+              "groups": {}
+            },
+            {
+              "input": "described above note 12",
+              "groups": {}
+            },
+            {
+              "input": "notable case law",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.quoted-work-author",
+          "pattern": "(?<author>(?<!\\w)[A-Z][A-Za-zÀ-ÖØ-öø-ÿ\\u0300-\\u036f.'’\\-]*(?:\\s+(?:&|and|et\\s+al|[A-Z][A-Za-zÀ-ÖØ-öø-ÿ\\u0300-\\u036f.'’\\-]*)){1,8})\\s*,?\\s*(?=[\"“])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:75-79 == deterministic_citations.py:75-79 (_QUOTED_WORK_AUTHOR_RE). (?P<author> translated to JS syntax. Source spells the curly quote as \\u201c and the straight quote with a redundant \\\" escape; written as the literal characters here (compiled-identical). Letter ranges literal, combining range \\u0300-\\u036f as escapes, per the source. Requires TWO+ name words ({1,8} continuation floor) — the Sullivan vector is the single-name negative. No re.I: iteration alternative order (&|and|et al|Name) differs from ref.note-reference's (et al|&|and|Name); each kept verbatim.",
+          "vectors": [
+            {
+              "input": "Jane Doe, “A Title; With a Subtitle” (2020) 1 Queen's LJ 10; R v Oakes, [1986] 1 SCR 103.",
+              "groups": {
+                "author": "Jane Doe"
+              }
+            },
+            {
+              "input": "On related policy, see Dan Priel, “The Political Origins of English Private Law” (2013) 40:4 J Law and Society 481.",
+              "groups": {
+                "author": "Dan Priel"
+              }
+            },
+            {
+              "input": "Craik & Forcese, \"The Security of Freedom\"",
+              "groups": {
+                "author": "Craik & Forcese"
+              }
+            },
+            {
+              "input": "Sullivan, \"Title\"",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "ref.history.toa",
+          "pattern": ",?\\s+(?:rev[’']?[dg]|aff[’']?[dg]|reversed|affirmed|varying|varied|leave\\s+to\\s+appeal\\s+(?:granted|refused|denied))\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:151-155 (_HISTORY_RE). Source spells the curly apostrophes as \\u2019 escapes; written literal ’ here (compiled-identical). Requires at least one whitespace (optionally comma-led) BEFORE the keyword, so a string-initial 'aff'd' only matches at a later keyword. Discriminating pair vs signal.aggressive: 'varying/varied/leave to appeal ...' live only here; 'citing' lives only there.",
+          "vectors": [
+            {
+              "input": "2023 SCC 14, rev’g 2021 BCCA 222 [Hansman].",
+              "groups": {}
+            },
+            {
+              "input": "R v First, 2020 SCC 1 aff'd R v Second, 2021 SCC 2.",
+              "groups": {}
+            },
+            {
+              "input": ", leave to appeal refused",
+              "groups": {}
+            },
+            {
+              "input": ", varying the order below",
+              "groups": {}
+            },
+            {
+              "input": "citing Vavilov",
+              "groups": null
+            },
+            {
+              "input": "the affidavit was filed",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "signal.prefix.splitter",
+          "pattern": "^\\s*(?:(?:but\\s+)?see(?:,?\\s+e\\.?g\\.?,?|\\s+also|\\s+generally)?|contra|compare|cf\\.?|citing|quoting|discussing|discussed\\s+in|applying|and|or)\\s*[:,.]?\\s+",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:59-64 == deterministic_citations.py:59-64 (_SIGNAL_PREFIX_RE). Dialect vs signal.prefix.toa: leading ^\\s* tolerates indentation, e.g. tail keeps the trailing ,?, and the verb list is short — no cited in/by, quoted in, applied in, relying/relied, following/followed, rev'd/aff'd.",
+          "vectors": [
+            {
+              "input": "See Oakes, supra note 4 at para 12; ibid at para 14.",
+              "groups": {}
+            },
+            {
+              "input": "But see, e.g., Smith v Jones",
+              "groups": {}
+            },
+            {
+              "input": "and the Regulations",
+              "groups": {}
+            },
+            {
+              "input": "  See also Fortin, supra note 293 at 191-92.",
+              "groups": {}
+            },
+            {
+              "input": "Followed in Vavilov",
+              "groups": null
+            },
+            {
+              "input": "On related policy, see Dan Priel, “The Political Origins of English Private Law” (2013) 40:4 J Law and Society 481.",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "signal.prefix.toa",
+          "pattern": "^(?:(?:but\\s+)?see(?:\\s+also|\\s+generally|,?\\s+e\\.?g\\.?)?|contra|compare|cf\\.?|citing|cited\\s+(?:in|by)|quoting|quoted\\s+in|discussing|discussed\\s+in|applying|applied\\s+in|relying\\s+on|relied\\s+on|following|followed\\s+in|rev[’']?[dg]|aff[’']?[dg]|and|or)\\s*[:,.]?\\s+",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:129-136 (_SIGNAL_PREFIX_RE). \\u2019 escapes written literal ’ (compiled-identical). Dialect vs signal.prefix.splitter: bare ^ (no leading whitespace tolerated — the indented vector), e.g. alternative ordered last without trailing comma, and the verb list grows the full cited/quoted/applied/relying/followed/rev'd/aff'd set.",
+          "vectors": [
+            {
+              "input": "See R v Oakes, [1986] 1 SCR 103 at 136.",
+              "groups": {}
+            },
+            {
+              "input": "Followed in Vavilov, 2019 SCC 65",
+              "groups": {}
+            },
+            {
+              "input": "But see, e.g., Smith v Jones",
+              "groups": {}
+            },
+            {
+              "input": "  See also Fortin, supra note 293 at 191-92.",
+              "groups": null
+            },
+            {
+              "input": "On related policy, see Dan Priel, “The Political Origins of English Private Law” (2013) 40:4 J Law and Society 481.",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "signal.source",
+          "pattern": "(?:(?<=[.!?])\\s+(?<sentence>(?:but\\s+)?see(?:\\s+also|\\s+generally)?|cf\\.?|compare|contra)\\b|\\b(?<inline>citing|cited\\s+(?:in|by)|quoting|quoted\\s+in|discussing|discussed\\s+in|applying|applied\\s+in|relying\\s+on|relied\\s+on|following|followed\\s+in|rev[’']?[dg]|aff[’']?[dg])\\b)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:65-74 == deterministic_citations.py:65-74 == toa_maker.py:112-121 (_SOURCE_SIGNAL_RE; compiled patterns identical — the toa copy spells the apostrophes as \\u2019 escapes, the splitter copy is literal; written literal here). Named groups 'sentence'/'inline' are in the sources ((?P<...> translated to JS syntax). Sentence-position signals require preceding [.!?] via fixed-width lookbehind; inline verbs match anywhere.",
+          "vectors": [
+            {
+              "input": "Swinamer v Nova Scotia (Attorney General), [1994] 1 SCR 445 at 461. See also Fortin, supra note 293 at 191-92.",
+              "groups": {
+                "sentence": "See also"
+              }
+            },
+            {
+              "input": "Johnson, supra note 243 at para 19 citing Lyons, supra note 243 at page 339.",
+              "groups": {
+                "inline": "citing"
+              }
+            },
+            {
+              "input": "R v First, 2020 SCC 1 rev’d R v Second, 2021 SCC 2.",
+              "groups": {
+                "inline": "rev’d"
+              }
+            },
+            {
+              "input": "The court did see the problem",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "signal.aggressive",
+          "pattern": "\\b(?:citing|(?:as\\s+)?cited\\s+(?:in|by)|quoting|quoted\\s+in|discussing|(?:as\\s+)?discussed(?:\\s+e\\.?g\\.?)?\\s+in|applying|applied\\s+in|relying\\s+on|relied\\s+on|following|followed\\s+in|adopting|adopted\\s+in|(?:as\\s+)?amended\\s+by|amending|adding|rev[’']?[dg]|reversed\\s+by|aff[’']?[dg]|affirmed\\s+by|penalty\\s+at|republished\\b[^.;]{0,100}\\bin|accord|but\\s+see|contra|compare|cf\\.?|see(?:\\s+also|\\s+generally|\\s*,?\\s*e\\.?g\\.?)?)\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:105-114 == deterministic_citations.py:105-114 (_AGGRESSIVE_SIGNAL_RE). The recall-first superset: adds as-cited/adopting/amended/amending/adding/reversed by/affirmed by/penalty at/republished...in/accord over signal.citation.toa, and matches 'see' anywhere (no sentence-edge requirement). Has no varying/varied/leave-to-appeal — the ref.history.toa pair.",
+          "vectors": [
+            {
+              "input": "Johnson, supra note 243 at para 19 citing Lyons, supra note 243 at page 339.",
+              "groups": {}
+            },
+            {
+              "input": "R v First, 2020 SCC 1 cited by R v Second, 2021 SCC 2.",
+              "groups": {}
+            },
+            {
+              "input": "For critiques in this general vein, see e.g.: Ruth Macklin",
+              "groups": {}
+            },
+            {
+              "input": "as amended by SOR/98-106",
+              "groups": {}
+            },
+            {
+              "input": ", varying the order below",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "signal.citation.toa",
+          "pattern": "(?<!\\w)(?:(?:but\\s+)?see(?:\\s+also|\\s+generally)?|cf\\.?|compare|contra|citing|cited\\s+(?:in|by)|quoting|quoted\\s+in|discussing|discussed\\s+in|applying|applied\\s+in|relying\\s+on|relied\\s+on|following|followed\\s+in|rev[’']?[dg]|aff[’']?[dg])\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "toa_maker.py:122-128 (_CITATION_SIGNAL_RE). \\u2019 escapes written literal ’ (compiled-identical). Dialect vs signal.source: same verb set but flat — 'see/cf/compare/contra' need no preceding sentence punctuation, only (?<!\\w). Dialect vs signal.aggressive: no amended/adopting/penalty/republished/accord branches, no e.g. tail on see.",
+          "vectors": [
+            {
+              "input": "R v First, 2020 SCC 1 cited by R v Second, 2021 SCC 2.",
+              "groups": {}
+            },
+            {
+              "input": "mid-clause see also Vavilov",
+              "groups": {}
+            },
+            {
+              "input": "R v First, 2020 SCC 1 rev'g R v Second, 2021 SCC 2.",
+              "groups": {}
+            },
+            {
+              "input": "as amended by SOR/98-106",
+              "groups": null
+            },
+            {
+              "input": "the trustee agreed",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "bracket.editorial",
+          "pattern": "^(?:sic|emphasis|citation|citations|footnote|footnotes|translated|translation|ellipsis|omitted)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:99-103 == deterministic_citations.py:99-103 (_EDITORIAL_BRACKET_RE). Applied to bracket CONTENT after stripping [ ]: editorial notes route here, short forms (the Hansman vector) do not.",
+          "vectors": [
+            {
+              "input": "emphasis added",
+              "groups": {}
+            },
+            {
+              "input": "citations omitted",
+              "groups": {}
+            },
+            {
+              "input": "sic",
+              "groups": {}
+            },
+            {
+              "input": "translation by the author",
+              "groups": {}
+            },
+            {
+              "input": "Hansman",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "attach.link",
+          "pattern": "^\\s*(?:\\([^()]{0,160}\\)\\s*)?,?\\s*(?:online:?|available\\s+at|at)\\s*<?\\s*$",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "splitter.py:55-58 == deterministic_citations.py:55-58 (_LINK_ATTACHMENT_RE). Matches a whole fragment that ENDS at the connective (optionally after a parenthetical, before an opening <) — glue between a work and its URL, not the URL itself.",
+          "vectors": [
+            {
+              "input": "(10 October 2023), online:",
+              "groups": {}
+            },
+            {
+              "input": "online:",
+              "groups": {}
+            },
+            {
+              "input": "available at",
+              "groups": {}
+            },
+            {
+              "input": "at 826",
+              "groups": null
+            },
+            {
+              "input": "cited online: https://example.com",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "shortform.splitter",
+          "pattern": "\\s*\\[(?<short>[^\\[\\]]{2,60})\\]\\s*\\.?\\s*$",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:80 == deterministic_citations.py:80 (_TRAILING_SHORT_FORM_RE). The capturing group is in the source; the NAME 'short' is a beaver-authored addition. Dialect vs shortform.toa: allows a trailing period, {2,60} length, and accepts a pure-year bracket like [1986].",
+          "vectors": [
+            {
+              "input": "2023 SCC 14, rev’g 2021 BCCA 222 [Hansman].",
+              "groups": {
+                "short": "Hansman"
+              }
+            },
+            {
+              "input": "R v Oakes, [1986] 1 SCR 103 [Oakes]",
+              "groups": {
+                "short": "Oakes"
+              }
+            },
+            {
+              "input": "cited to [1986]",
+              "groups": {
+                "short": "1986"
+              }
+            },
+            {
+              "input": "no bracketed short form",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "shortform.toa",
+          "pattern": "\\s*\\[(?<short>(?!\\d{4}\\])[^\\]]{2,70})\\]\\s*$",
+          "flags": "",
+          "canonical": {},
+          "provenance": "toa_maker.py:156 (_SHORT_FORM_SUFFIX_RE). The source spells the class [^]] (Python-legal); respelled [^\\]] because JS parses [^]] as empty-negated-class + literal ] — compiled patterns identical in Python. Capturing group in source; NAME 'short' beaver-added. Dialect vs shortform.splitter: (?!\\d{4}\\]) rejects pure-year brackets, no trailing period allowed, {2,70}.",
+          "vectors": [
+            {
+              "input": "2021 BCCA 222 [Hansman]",
+              "groups": {
+                "short": "Hansman"
+              }
+            },
+            {
+              "input": "R v Oakes, [1986] 1 SCR 103 [Oakes]",
+              "groups": {
+                "short": "Oakes"
+              }
+            },
+            {
+              "input": "2023 SCC 14, rev’g 2021 BCCA 222 [Hansman].",
+              "groups": null
+            },
+            {
+              "input": "cited to [1986]",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "boundary.sentence.splitter",
+          "pattern": "[.!?]\\s+(?=[(\\[\"'‘“]*[A-Z])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:104 == deterministic_citations.py:104 (_SENTENCE_BOUNDARY_RE). Source spells the openers as \\u2018/\\u201c escapes and the straight quote as \\\"; written literal here (compiled-identical). Forward-looking: terminal punctuation + whitespace + optional openers + capital. The engine dialect is boundary.sentence.engine in footnote-labels.json (closer-consuming, no capital requirement). No re.I.",
+          "vectors": [
+            {
+              "input": "Swinamer v Nova Scotia (Attorney General), [1994] 1 SCR 445 at 461. See also Fortin, supra note 293 at 191-92.",
+              "groups": {}
+            },
+            {
+              "input": "Mills & Atkinson, supra note 64. Ibid.",
+              "groups": {}
+            },
+            {
+              "input": "held? “Yes” said the judge",
+              "groups": {}
+            },
+            {
+              "input": "R v X, 2020 SCC 1 at para.20",
+              "groups": null
+            },
+            {
+              "input": "e.g. the court noted",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "boundary.conjunction",
+          "pattern": "(?:\\b(?:and|or)\\s+(?=(?:the\\s+)?[A-Z])|&\\s+(?=[A-Z]))",
+          "flags": "",
+          "canonical": {},
+          "provenance": "splitter.py:139-141 == deterministic_citations.py:139-141 (_CONJUNCTION_RE). No re.I: the conjunction must precede a capitalized (optionally 'the '-led) continuation — 'bread or butter' stays whole.",
+          "vectors": [
+            {
+              "input": "R v Oakes, [1986] 1 SCR 103 and R v Sparrow, [1990] 1 SCR 1075; R v Grant, 2009 SCC 32.",
+              "groups": {}
+            },
+            {
+              "input": "Gullo & Exner-Pirot, supra note 34.",
+              "groups": {}
+            },
+            {
+              "input": "bread or butter",
+              "groups": null
+            },
+            {
+              "input": "and then some",
+              "groups": null
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+diff --git a/ppdet/modeling/transformers/mask_rtdetr_transformer.py b/ppdet/modeling/transformers/mask_rtdetr_transformer.py
+--- a/ppdet/modeling/transformers/mask_rtdetr_transformer.py
++++ b/ppdet/modeling/transformers/mask_rtdetr_transformer.py
+@@ -956,7 +956,7 @@ class DocLayoutV3Transformer(MaskRTDETR):
+                            is_teacher=False):
+         """Get decoder input, extending parent with enc_topk_order placeholder."""
+         target, reference_points_unact, enc_out, init_out = \
+-            super()._get_decoder_input(
++            MaskRTDETR._get_decoder_input(self,
+                 memory, mask_feat, spatial_shapes,
+                 denoising_class, denoising_bbox_unact, is_teacher)
+         # Order prediction happens at decoder level only; no encoder-level order.

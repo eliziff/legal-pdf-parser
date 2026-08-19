@@ -1,0 +1,20 @@
+diff --git a/ppdet/modeling/post_process.py b/ppdet/modeling/post_process.py
+--- a/ppdet/modeling/post_process.py
++++ b/ppdet/modeling/post_process.py
+@@ -499,12 +499,12 @@ def get_order(order_logits):
+     order_votes = paddle.sum(order_scores, axis=1)  # [B, N]
+ 
+     # Sort elements by vote count (ascending): fewer votes = earlier position
+-    order_pointers = paddle.argsort(order_votes, axis=1, descending=False)
++    _, order_pointers = paddle.topk(
++        order_votes, k=N, axis=1, largest=False, sorted=True)
+ 
+     # Convert sorted indices to position assignments
+     # order_seq[i] = position of element i in the final reading order
+-    order_seq = paddle.full(order_pointers.shape, -1, dtype=order_pointers.dtype)
+-    batch_indices = paddle.arange(B).reshape([-1, 1]).expand([B, N])
+-    order_seq[batch_indices, order_pointers] = paddle.arange(N).expand([B, N])
++    _, order_seq = paddle.topk(
++        order_pointers, k=N, axis=1, largest=False, sorted=True)
+ 
+     return order_seq, order_votes

@@ -1,0 +1,25 @@
+{
+  "schema_version": "legalpdf.ppdoc_paddle_runtime.v1",
+  "archive": {
+    "sha256": "23a2ea41abaedb7dfb928dc10baa72975d50b7a8ffe28f8e081a16a8977a95b2",
+    "url": "https://paddle-inference-lib.bj.bcebos.com/3.2.0/cxx_c/Windows/CPU/x86-64_avx-mkl-vs2019/paddle_inference.zip"
+  },
+  "paddle": {
+    "commit": "e22e2f9af7eeced7e3c9582ddb69a617887d3eb9",
+    "compiler": "MSVC 19.29.30158.0",
+    "version": "3.2.0",
+    "with_gpu": false,
+    "with_mkl": true,
+    "with_onednn": true
+  },
+  "runtime_files": [
+    {"name": "paddle_inference.dll", "bytes": 92097536, "sha256": "aa1edb491b170420b0ca3fe7b8881569c06576d320ef7d89813b69b2a4a245be"},
+    {"name": "phi.dll", "bytes": 43961344, "sha256": "30e840f4fefca21be742892b3f039698fdaf741cac32346ead8d1888c9a6faff"},
+    {"name": "common.dll", "bytes": 707072, "sha256": "14aeb242647aadd69b4bb2940770563497b9213ca64957451bb59ab1734c2d6d"},
+    {"name": "mkldnn.dll", "bytes": 47322112, "sha256": "3fcd796e77fa6e8e0d78b44bb339e33b5fa91c13140ee1725ce95b90ee02d45d"},
+    {"name": "libiomp5md.dll", "bytes": 1726848, "sha256": "bc9e17190505a3beda7feedd90ba3ab7b6dc3f7ca5d980b2140c53ae459fc5ae"},
+    {"name": "mklml.dll", "bytes": 92649344, "sha256": "e2a7fd93e1534568626cffe22676b15164a5a2b3a62f1919a55993478b45811e"}
+  ],
+  "runtime_files_bytes": 278464256,
+  "system_or_redist_dependency": "VCOMP140.DLL"
+}

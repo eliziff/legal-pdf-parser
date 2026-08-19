@@ -1,0 +1,55 @@
+[package]
+name = "legal-pdf-parser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fast local-first structural parsing for legal PDFs"
+build = "rust/kraken_build.rs"
+
+[features]
+default = []
+ocr = ["dep:hayro", "dep:image"]
+kraken = ["ocr", "dep:cc", "dep:image", "dep:libloading", "dep:ort"]
+fast-allocator = ["dep:mimalloc"]
+profiling = []
+ppdoc-openvino = ["dep:image", "dep:libloading"]
+ppdoc = ["ppdoc-openvino", "dep:ort"]
+
+[lib]
+name = "legalpdf"
+path = "rust/src/lib.rs"
+
+[[bin]]
+name = "legalpdf"
+path = "rust/src/main.rs"
+
+[dependencies]
+lopdf = { version = "0.42.0", default-features = false, features = ["rayon"] }
+pdf-inspector = { path = "vendor/pdf-inspector" }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+fancy-regex = "0.19"
+hayro = { version = "0.7.0", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+libloading = { version = "0.8", optional = true }
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
+regex = "1.11"
+quick-xml = "0.41"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+unicode-normalization = "0.1"
+zip = { version = "=8.2.0", default-features = false, features = ["deflate-flate2"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.release]
+codegen-units = 16
+incremental = true
+strip = true

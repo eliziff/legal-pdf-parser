@@ -1,0 +1,61 @@
+{
+  "source_id": "legal25-ppdocv3-l640-document-safe-e15-20260814",
+  "model_name": "PP-DocLayoutV3-L-640",
+  "source_files": {
+    "output/14.pdparams": "f5c8274cacf20d4923a9ef142cce6c4fda431aad70d51ff285bc3686e8222138",
+    "config/PP-DocLayoutV3-640.yml": "e548cfdc9ccfeb4ba8cdfaa6a3cc89ad330080621d0b51d5dbbda51bd56cf536",
+    "status.json": "10e2d80eb1f7c82055feb55811eb91456bb9d564a44df9a042bdba20dfd8e8ee"
+  },
+  "labels": [
+    "abstract",
+    "algorithm",
+    "chart",
+    "content",
+    "display_formula",
+    "doc_title",
+    "figure_title",
+    "footer",
+    "footer_image",
+    "footnote",
+    "formula_number",
+    "header",
+    "header_image",
+    "image",
+    "number",
+    "paragraph_title",
+    "reference",
+    "reference_content",
+    "seal",
+    "table",
+    "text",
+    "vertical_text",
+    "vision_footnote",
+    "block_quote",
+    "byline"
+  ],
+  "selection": {
+    "split": "article-disjoint-validation",
+    "epoch": 15,
+    "bbox_ap": 0.666,
+    "checkpoint": "output/14.pdparams",
+    "checkpoint_is_ema": true,
+    "test_opened": false
+  },
+  "dataset": {
+    "train": {
+      "pages": 499,
+      "annotations": 5280,
+      "sha256": "54fa8d83dcb441bb04154405825b7d267be780c6b37f6b894a57fa71c55d9581"
+    },
+    "validation": {
+      "pages": 75,
+      "annotations": 769,
+      "sha256": "3ecc7d3e3ace47e029e08c0f3b3344505488a8ee4d83b16f1427385ba1702175"
+    },
+    "test": {
+      "pages": 87,
+      "annotations": 975,
+      "sha256": "e7242d2418c8a6e3078385aeda2707cbe3b8a9c0745184ff203decdff5a520a5"
+    }
+  }
+}

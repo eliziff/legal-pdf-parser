@@ -1,0 +1,37 @@
+# PaddleDetection's shipped RT-DETR-HGNetV2-L QAT + soft-label distillation
+# recipe, pointed at the frozen legal-layout teacher by run_teacher_qat.sh.
+Global:
+  include_nms: true
+  Evaluation: false
+  model_dir: __MODEL_DIR__
+  model_filename: model.pdmodel
+  params_filename: model.pdiparams
+
+Distillation:
+  alpha: 1.0
+  loss: soft_label
+
+QuantAware:
+  onnx_format: true
+  activation_quantize_type: moving_average_abs_max
+  quantize_op_types:
+    - conv2d
+    - depthwise_conv2d
+    - matmul_v2
+
+TrainConfig:
+  train_iter: 200
+  eval_iter: 50
+  learning_rate:
+    type: CosineAnnealingDecay
+    learning_rate: 0.00003
+    T_max: 10000
+  optimizer_builder:
+    optimizer:
+      type: SGD
+    # The teacher's first unclipped update diverges on the legal corpus. This
+    # is PaddleSlim's native optimizer hook, not a custom training loop.
+    grad_clip:
+      type: ClipGradByGlobalNorm
+      clip_norm: 1.0
+    weight_decay: 0.00004

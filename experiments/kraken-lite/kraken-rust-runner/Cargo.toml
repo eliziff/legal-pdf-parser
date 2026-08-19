@@ -1,0 +1,38 @@
+[package]
+name = "kraken-rust-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+build = "../../../rust/kraken_build.rs"
+
+[workspace]
+resolver = "2"
+
+[features]
+default = ["kraken"]
+kraken = []
+ppdoc = []
+ocr = ["dep:hayro"]
+
+[dependencies]
+hayro = { version = "0.7.0", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+libloading = "0.8"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+incremental = true
+codegen-units = 16
+strip = false
+
+[profile.release.package."*"]
+incremental = false
+codegen-units = 16

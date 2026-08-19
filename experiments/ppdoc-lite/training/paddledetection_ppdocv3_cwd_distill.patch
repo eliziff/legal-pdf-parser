@@ -1,0 +1,123 @@
+diff --git a/ppdet/slim/__init__.py b/ppdet/slim/__init__.py
+--- a/ppdet/slim/__init__.py
++++ b/ppdet/slim/__init__.py
+@@ -34,6 +34,9 @@ def build_slim_model(cfg, slim_cfg, mode='train'):
+         if "slim_method" in slim_load_cfg and slim_load_cfg[
+                 'slim_method'] == "FGD":
+             model = FGDDistillModel(cfg, slim_cfg)
++        elif "slim_method" in slim_load_cfg and slim_load_cfg[
++                'slim_method'] == "PPDocV3CWD":
++            model = PPDocV3CWDDistillModel(cfg, slim_cfg)
+         elif "slim_method" in slim_load_cfg and slim_load_cfg[
+                 'slim_method'] == "LD":
+             model = LDDistillModel(cfg, slim_cfg)
+diff --git a/ppdet/slim/distill_model.py b/ppdet/slim/distill_model.py
+--- a/ppdet/slim/distill_model.py
++++ b/ppdet/slim/distill_model.py
+@@ -19,6 +19,7 @@ import paddle
+ import paddle.nn as nn
+ 
+ from ppdet.core.workspace import register, create, load_config
++from ppdet.slim.distill_loss import CWDFeatureLoss
+ from ppdet.utils.checkpoint import load_pretrain_weight
+ from ppdet.utils.logger import setup_logger
+ logger = setup_logger(__name__)
+@@ -29,3 +30,4 @@ __all__ = [
+     'LDDistillModel',
+     'PPYOLOEDistillModel',
++    'PPDocV3CWDDistillModel',
+ ]
+@@ -97,5 +99,93 @@ class DistillModel(nn.Layer):
+             return self.student_model(inputs)
+ 
+ 
++@register
++class PPDocV3CWDDistillModel(DistillModel):
++    """Feature-distill PP-DocLayoutV3 without assuming DETR query alignment."""
++
++    def __init__(self, cfg, slim_cfg):
++        super(PPDocV3CWDDistillModel, self).__init__(cfg=cfg, slim_cfg=slim_cfg)
++        if self.arch != 'DETR':
++            raise ValueError('PPDocV3CWD requires the DETR architecture')
++        for role, model in (('student', self.student_model),
++                            ('teacher', self.teacher_model)):
++            if model.transformer.__class__.__name__ != 'DocLayoutV3Transformer':
++                raise ValueError(
++                    '{} transformer is {}, expected DocLayoutV3Transformer'.format(
++                        role, model.transformer.__class__.__name__))
++
++        settings = self.distill_cfg.get('PPDocV3CWD', {})
++        self.encoder_loss_weight = float(settings.get('encoder_weight', 1.0))
++        self.mask_loss_weight = float(settings.get('mask_weight', 1.0))
++        tau = float(settings.get('tau', 1.0))
++        normalize = bool(settings.get('normalize', True))
++        if self.encoder_loss_weight < 0 or self.mask_loss_weight < 0:
++            raise ValueError('PPDocV3CWD weights cannot be negative')
++        self.encoder_distill = nn.LayerList([
++            CWDFeatureLoss(256, 256, normalize=normalize, tau=tau)
++            for _ in range(3)
++        ])
++        self.mask_distill = CWDFeatureLoss(
++            32, 32, normalize=normalize, tau=tau)
++
++    def build_loss(self, distill_cfg):
++        # This wrapper owns fixed, shape-checked feature losses instead of using
++        # the generic query-head loss, which is not valid for DETR matching.
++        return None
++
++    def forward(self, inputs):
++        if not self.training:
++            return self.student_model(inputs)
++
++        student = self.student_model
++        student.inputs = inputs
++        student_backbone = student.backbone(inputs)
++        student_neck = student.neck(student_backbone)
++        pad_mask = inputs.get('pad_mask', None)
++        student_transformer = student.transformer(
++            student_neck, pad_mask, inputs)
++        losses = student.detr_head(
++            student_transformer, student_neck, inputs)
++        losses['loss'] = paddle.add_n(
++            [value for name, value in losses.items() if 'log' not in name])
++
++        # Layer.train() is recursive, so restore the frozen teacher's inference
++        # behavior on every step before observing its neck representation.
++        self.teacher_model.eval()
++        with paddle.no_grad():
++            teacher_backbone = self.teacher_model.backbone(inputs)
++            teacher_neck = self.teacher_model.neck(
++                teacher_backbone, is_teacher=True)
++
++        student_encoder, student_mask = student_neck
++        teacher_encoder, teacher_mask = teacher_neck
++        if len(student_encoder) != 3 or len(teacher_encoder) != 3:
++            raise ValueError('PPDocV3CWD expects three encoder feature levels')
++        for student_feature, teacher_feature in zip(
++                student_encoder, teacher_encoder):
++            if student_feature.shape != teacher_feature.shape:
++                raise ValueError(
++                    'Teacher/student encoder feature shapes differ: {} vs {}'.format(
++                        student_feature.shape, teacher_feature.shape))
++        if student_mask.shape != teacher_mask.shape:
++            raise ValueError(
++                'Teacher/student mask feature shapes differ: {} vs {}'.format(
++                    student_mask.shape, teacher_mask.shape))
++
++        encoder_losses = [
++            loss(student_feature, teacher_feature)
++            for loss, student_feature, teacher_feature in zip(
++                self.encoder_distill, student_encoder, teacher_encoder)
++        ]
++        loss_encoder = paddle.add_n(encoder_losses) / len(encoder_losses)
++        loss_mask = self.mask_distill(student_mask, teacher_mask)
++        loss_encoder *= self.encoder_loss_weight
++        loss_mask *= self.mask_loss_weight
++        losses['loss_distill_encoder'] = loss_encoder
++        losses['loss_distill_mask'] = loss_mask
++        losses['loss'] += loss_encoder + loss_mask
++        return losses
++
++
+ @register
+ class FGDDistillModel(DistillModel):

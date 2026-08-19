@@ -1,0 +1,11 @@
+diff --git a/ppdet/modeling/transformers/mask_rtdetr_transformer.py b/ppdet/modeling/transformers/mask_rtdetr_transformer.py
+--- a/ppdet/modeling/transformers/mask_rtdetr_transformer.py
++++ b/ppdet/modeling/transformers/mask_rtdetr_transformer.py
+@@ -466,6 +466,6 @@ class MaskRTDETR(nn.Layer):
+         Returns:
+             tuple: (target, reference_points_unact, enc_out, init_out)
+         """
+-        bs, _, _ = memory.shape
++        bs = paddle.shape(memory)[0]
+         # prepare input for decoder
+         if self.training or self.eval_size is None or is_teacher:

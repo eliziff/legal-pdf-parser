@@ -1,0 +1,46 @@
+{
+  "format": "legalpdf.ppdoc-lite-model/1",
+  "variant_id": "docling-layout-heron-int8-stock",
+  "labels": [
+    "figure_title",
+    "footnote",
+    "display_formula",
+    "text",
+    "footer",
+    "header",
+    "image",
+    "paragraph_title",
+    "table",
+    "text",
+    "doc_title",
+    "content",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text"
+  ],
+  "model": {
+    "backend": "onnx",
+    "file": "model.onnx",
+    "sha256": "5c7a4685c838b485069b81847f2c9330f7ffc488aefff7a8ceb7f7968c95e410",
+    "inputs": ["pixel_values"],
+    "outputs": {
+      "contract": "rtdetr_raw",
+      "boxes": "pred_boxes",
+      "logits": "logits"
+    },
+    "detections_per_image": 300,
+    "output_width": 7
+  },
+  "input": {
+    "target_size": [640, 640],
+    "interpolation": "bilinear",
+    "scale": 0.00392156862745098,
+    "mean": [0.0, 0.0, 0.0],
+    "std": [1.0, 1.0, 1.0]
+  },
+  "postprocess": {
+    "score_threshold": 0.3
+  }
+}

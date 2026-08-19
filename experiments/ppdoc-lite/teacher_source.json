@@ -1,0 +1,57 @@
+{
+  "schema_version": "legalpdf.ppdoc_lite_source.v1",
+  "source_id": "ppdocv3_train1-12_project_full_valrc_20260619_01",
+  "model_name": "PP-DocLayoutV3",
+  "dataset": {
+    "total_pages": 661,
+    "training_pages": 581,
+    "validation_pages": 40,
+    "benchmark_pages": 40
+  },
+  "historical_evaluation": {
+    "run_id": "ppdocv3_train1-12_project_full_valrc_20260619_01",
+    "run_manifest_sha256": "e63dd071220374b63b52ec94941d9d86465c318e7760386775e7dd1945a4a48b",
+    "best_epoch": 14,
+    "validation_pages": 40,
+    "metrics": {
+      "coco_ap_50_95": 0.746,
+      "ap50": 0.842,
+      "ap75": 0.814,
+      "ar100": 0.909
+    },
+    "qualification": "Legacy regression only: 39 of 40 validation pages share an article with training and the split exercises nine classes. These values are not comparable to the legal25 article-disjoint validation surface."
+  },
+  "source_files": {
+    "inference.json": "eca4077e59d07c34cf44b08e8691ef78b48a42a9d00b5ded94eccad65f62454b",
+    "inference.pdiparams": "f205e2f61bad7d3fdb122d6773024bb1d65bf28ebe8b7712b37b74cc21ce5786",
+    "inference.yml": "cfcb6487cf7353ec9fa340beb0817215d2aacabbcacfc0ed744ec9589149a38a"
+  },
+  "labels": [
+    "abstract",
+    "algorithm",
+    "chart",
+    "content",
+    "display_formula",
+    "doc_title",
+    "figure_title",
+    "footer",
+    "footer_image",
+    "footnote",
+    "formula_number",
+    "header",
+    "header_image",
+    "image",
+    "inline_formula",
+    "number",
+    "paragraph_title",
+    "reference",
+    "reference_content",
+    "seal",
+    "table",
+    "text",
+    "vertical_text",
+    "vision_footnote",
+    "block_quote",
+    "byline"
+  ]
+}
