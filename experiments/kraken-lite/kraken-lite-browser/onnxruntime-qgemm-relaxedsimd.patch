@@ -1,0 +1,49 @@
+diff --git a/cmake/adjust_global_compile_flags.cmake b/cmake/adjust_global_compile_flags.cmake
+index 8f5ef15..26bb9b4 100644
+--- a/cmake/adjust_global_compile_flags.cmake
++++ b/cmake/adjust_global_compile_flags.cmake
+@@ -35,10 +35,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+     set(CMAKE_CXX_FLAGS_DEBUG "-g2")
+   endif()
+ 
+-  if (onnxruntime_ENABLE_WEBASSEMBLY_RELAXED_SIMD)
+-    string(APPEND CMAKE_C_FLAGS " -msimd128 -mrelaxed-simd")
+-    string(APPEND CMAKE_CXX_FLAGS " -msimd128 -mrelaxed-simd")
+-  elseif (onnxruntime_ENABLE_WEBASSEMBLY_SIMD)
++  if (onnxruntime_ENABLE_WEBASSEMBLY_RELAXED_SIMD OR onnxruntime_ENABLE_WEBASSEMBLY_SIMD)
+     string(APPEND CMAKE_C_FLAGS " -msimd128")
+     string(APPEND CMAKE_CXX_FLAGS " -msimd128")
+   endif()
+diff --git a/cmake/onnxruntime_mlas.cmake b/cmake/onnxruntime_mlas.cmake
+index 8decca1..f532207 100644
+--- a/cmake/onnxruntime_mlas.cmake
++++ b/cmake/onnxruntime_mlas.cmake
+@@ -292,6 +292,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+         ${mlas_platform_srcs}
+         ${MLAS_SRC_DIR}/qgemm_kernel_wasmrelaxedsimd.cpp
+       )
++      # Relaxed SIMD only accelerates the unsigned QGEMM dispatch used by the
++      # quantized LSTM. Keep it off the rest of ORT so toggling this option
++      # rebuilds two MLAS files instead of the entire runtime.
++      set_source_files_properties(
++        ${MLAS_SRC_DIR}/qgemm.cpp
++        ${MLAS_SRC_DIR}/qgemm_kernel_wasmrelaxedsimd.cpp
++        PROPERTIES COMPILE_OPTIONS "-mrelaxed-simd"
++      )
+     endif()
+   else()
+     file(GLOB_RECURSE mlas_platform_srcs
+diff --git a/cmake/onnxruntime_webassembly.cmake b/cmake/onnxruntime_webassembly.cmake
+index bfb73e1..a2a1aad 100644
+--- a/cmake/onnxruntime_webassembly.cmake
++++ b/cmake/onnxruntime_webassembly.cmake
+@@ -343,6 +343,9 @@ else()
+     --no-entry
+     "SHELL:--pre-js \"${ONNXRUNTIME_ROOT}/wasm/pre.js\""
+   )
++  if (onnxruntime_ENABLE_WEBASSEMBLY_RELAXED_SIMD)
++    target_link_options(onnxruntime_webassembly PRIVATE "-mrelaxed-simd")
++  endif()
+   if (onnxruntime_ENABLE_WEBASSEMBLY_MEMORY64)
+     set(SIGNATURE_CONVERSIONS "OrtRun:_pppppppp,\
+ OrtRunWithBinding:_ppppp,\

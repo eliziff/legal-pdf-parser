@@ -1,0 +1,114 @@
+{
+  "schema_version": "legalpdf.docx_linking_fixture.v1",
+  "description": "Invented legal citations and propositions. This fixture contains no user document text.",
+  "cases": [
+    {
+      "id": "s1",
+      "text": "R v Alder, 2025 SCC 99 at para 12; Model Evidence Act, SC 2025, c 7, s 3.",
+      "proposition": "The invented court applied the equally invented statutory test.",
+      "expected_verbatim_parts": [
+        "R v Alder, 2025 SCC 99 at para 12",
+        "Model Evidence Act, SC 2025, c 7, s 3."
+      ]
+    },
+    {
+      "id": "s2",
+      "text": "Avery North, \"The Fictional Rule\" (2024) 1 Example LJ 10 at 15; Blair West, Imaginary Remedies, 2nd ed (Test City: Sample Press, 2023) at 44.",
+      "proposition": "The fictional authorities describe an invented remedial rule.",
+      "expected_verbatim_parts": [
+        "Avery North, \"The Fictional Rule\" (2024) 1 Example LJ 10 at 15",
+        "Blair West, Imaginary Remedies, 2nd ed (Test City: Sample Press, 2023) at 44."
+      ]
+    },
+    {
+      "id": "s3",
+      "text": "Avery North, \"A Synthetic Principle\" (2023) 2 Sample Rev 1 at 8 Blair West, Fictional Procedure (Example Press, 2022) at 31.",
+      "proposition": "Two invented sources are juxtaposed without a semicolon.",
+      "expected_verbatim_parts": [
+        "Avery North, \"A Synthetic Principle\" (2023) 2 Sample Rev 1 at 8",
+        "Blair West, Fictional Procedure (Example Press, 2022) at 31."
+      ]
+    },
+    {
+      "id": "s4",
+      "text": "Casey East, \"One Rule; Two Tests\" (2022) 3 Demonstration LJ 20 at 25; R v Cedar, 2024 ONCA 88 at para 7.",
+      "proposition": "The semicolon in the invented article title does not separate authorities.",
+      "expected_verbatim_parts": [
+        "Casey East, \"One Rule; Two Tests\" (2022) 3 Demonstration LJ 20 at 25",
+        "R v Cedar, 2024 ONCA 88 at para 7."
+      ]
+    },
+    {
+      "id": "s5",
+      "text": "Ibid at 22; R v Birch, 2021 ABCA 77 at paras 9-10.",
+      "proposition": "The invented decision repeats one source and adds another.",
+      "expected_verbatim_parts": [
+        "Ibid at 22",
+        "R v Birch, 2021 ABCA 77 at paras 9-10."
+      ]
+    },
+    {
+      "id": "s6",
+      "text": "North, supra note 2 at 18; ibid at 19.",
+      "proposition": "Both fictional references must remain separately resolvable.",
+      "expected_verbatim_parts": [
+        "North, supra note 2 at 18",
+        "ibid at 19."
+      ]
+    },
+    {
+      "id": "s7",
+      "text": "R v Elm, 2020 MBCA 12 at para 6 R v Fir, 2019 SKCA 45 at para 11.",
+      "proposition": "Two invented neutral citations appear without a separator.",
+      "expected_verbatim_parts": [
+        "R v Elm, 2020 MBCA 12 at para 6",
+        "R v Fir, 2019 SKCA 45 at para 11."
+      ]
+    },
+    {
+      "id": "s8",
+      "text": "Synthetic Administration Act, RSC 1985, c S-99, ss 2(1)(a), 3(4) and 8.",
+      "proposition": "One invented statute has several pinpoints but remains one authority.",
+      "expected_verbatim_parts": [
+        "Synthetic Administration Act, RSC 1985, c S-99, ss 2(1)(a), 3(4) and 8."
+      ]
+    },
+    {
+      "id": "s9",
+      "text": "Doe v Roe, unreported, 14 February 2020, Calgary 1901-00001 (ABQB); R v Grove, 2018 BCCA 5 at para 4.",
+      "proposition": "An invented unreported matter and neutral citation are distinct.",
+      "expected_verbatim_parts": [
+        "Doe v Roe, unreported, 14 February 2020, Calgary 1901-00001 (ABQB)",
+        "R v Grove, 2018 BCCA 5 at para 4."
+      ]
+    },
+    {
+      "id": "s10",
+      "text": "House of Commons Debates, 44-1, No 100 (1 April 2024) at 1234 (Sample Member); Fictional Reform Commission, Model Justice (Ottawa: Example Printer, 2021) at 9.",
+      "proposition": "The invented debate and report are different sources.",
+      "expected_verbatim_parts": [
+        "House of Commons Debates, 44-1, No 100 (1 April 2024) at 1234 (Sample Member)",
+        "Fictional Reform Commission, Model Justice (Ottawa: Example Printer, 2021) at 9."
+      ]
+    },
+    {
+      "id": "s11",
+      "text": "Sample Law Commission, Invented Rights: Final Report (Report No 12, 2020), ch 3; Jordan South, \"A Made-Up Account\" in Taylor Lake, ed, Essays on Examples (Mock Press, 2022) 55 at 61.",
+      "proposition": "The fictional report and essay collection are independently cited.",
+      "expected_verbatim_parts": [
+        "Sample Law Commission, Invented Rights: Final Report (Report No 12, 2020), ch 3",
+        "Jordan South, \"A Made-Up Account\" in Taylor Lake, ed, Essays on Examples (Mock Press, 2022) 55 at 61."
+      ]
+    },
+    {
+      "id": "s12",
+      "text": "R v Hazel, 2017 NSCA 4 at paras 14, 18 and 21; Morgan Vale, \"Invented Boundaries\" (2021) 9 Fictional LR 100 at 105-07; Vale, supra note 11 at 108.",
+      "proposition": "Three invented citation units include multiple pinpoints and a supra reference.",
+      "expected_verbatim_parts": [
+        "R v Hazel, 2017 NSCA 4 at paras 14, 18 and 21",
+        "Morgan Vale, \"Invented Boundaries\" (2021) 9 Fictional LR 100 at 105-07",
+        "Vale, supra note 11 at 108."
+      ]
+    }
+  ]
+}

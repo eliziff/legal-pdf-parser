@@ -1,0 +1,30 @@
+metric: COCO
+num_classes: 26
+
+TrainDataset:
+  !COCODataSet
+    image_dir: images
+    anno_path: annotations_generalization_v1/instance_train.json
+    dataset_dir: __DATASET_DIR__
+    data_fields: [image, gt_bbox, gt_class, is_crowd]
+
+EvalDataset:
+  !COCODataSet
+    image_dir: images
+    anno_path: annotations_generalization_v1/instance_val.json
+    dataset_dir: __DATASET_DIR__
+    allow_empty: true
+
+worker_num: 0
+
+# PaddleDetection's auto-compression runner intentionally uses EvalReader for
+# its training dataset; retain the shipped RT-DETR reader semantics.
+EvalReader:
+  sample_transforms:
+    - Decode: {}
+    - Resize: {target_size: [800, 800], keep_ratio: false, interp: 2}
+    - NormalizeImage: {is_scale: true, mean: [0., 0., 0.], std: [1., 1., 1.]}
+    - Permute: {}
+  batch_size: 1
+  shuffle: false
+  drop_last: false

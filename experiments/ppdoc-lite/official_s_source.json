@@ -1,0 +1,36 @@
+{
+  "schema_version": "legalpdf.ppdoc_source.v1",
+  "source_id": "paddlex-official-PP-DocLayout-S-inference",
+  "model_name": "PP-DocLayout-S",
+  "source_files": {
+    "inference.json": "ac09e931895d4c442e5379ab3b7e9b583baf288e816ab7675ca519da9eb2a9d7",
+    "inference.pdiparams": "491c3382d84ca04d2033afbee0c105942ed82fea392bb4a19170646adebe088a",
+    "inference.yml": "6f690098c438214c67822239a568f0bc2bbe97a8f02fba93e492d4f2c47523c3"
+  },
+  "labels": [
+    "paragraph_title",
+    "image",
+    "text",
+    "number",
+    "abstract",
+    "content",
+    "figure_title",
+    "formula",
+    "table",
+    "table_title",
+    "reference",
+    "doc_title",
+    "footnote",
+    "header",
+    "algorithm",
+    "footer",
+    "seal",
+    "chart_title",
+    "chart",
+    "formula_number",
+    "header_image",
+    "footer_image",
+    "aside_text"
+  ],
+  "purpose": "Unmodified vendor baseline used to prove the portable ONNX/Rust contract before legal fine-tuning."
+}

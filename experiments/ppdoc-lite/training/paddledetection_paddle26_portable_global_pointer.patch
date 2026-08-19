@@ -1,0 +1,12 @@
+diff --git a/ppdet/modeling/transformers/utils.py b/ppdet/modeling/transformers/utils.py
+--- a/ppdet/modeling/transformers/utils.py
++++ b/ppdet/modeling/transformers/utils.py
+@@ -629,6 +629,7 @@ class GlobalPointer(nn.Layer):
+         # Compute raw pairwise scores: query[i] · key[j] for all pairs
+         # Using Einstein summation for efficient batch matrix multiplication
+         # 'bmd,bnd->bmn' means: for each batch b, compute qw[m] · kw[n]
+-        raw_logits = paddle.einsum('bmd,bnd->bmn', qw, kw) / (self.head_size ** 0.5)
++        raw_logits = paddle.matmul(
++            qw, kw, transpose_y=True) / (self.head_size ** 0.5)
+ 
+         # Enforce antisymmetric constraint: logits[i,j] = raw[i,j] - raw[j,i]

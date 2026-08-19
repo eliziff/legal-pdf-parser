@@ -1,0 +1,12 @@
+[build]
+# One cache for every invocation; leave one logical core free for the laptop.
+target-dir = "target"
+jobs = -1
+
+[alias]
+quick = "check --lib --offline --quiet"
+kraken-check = "check --offline --manifest-path experiments/kraken-lite/kraken-rust-runner/Cargo.toml"
+kraken-build = "build --offline --release --manifest-path experiments/kraken-lite/kraken-rust-runner/Cargo.toml"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

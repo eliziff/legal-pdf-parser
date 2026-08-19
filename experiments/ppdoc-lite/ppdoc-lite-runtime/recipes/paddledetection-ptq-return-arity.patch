@@ -1,0 +1,12 @@
+diff --git a/ppdet/engine/trainer.py b/ppdet/engine/trainer.py
+--- a/ppdet/engine/trainer.py
++++ b/ppdet/engine/trainer.py
+@@ -1480,7 +1480,7 @@ class Trainer(object):
+ 
+         # TODO: support prune input_spec
+         kl_quant = True if hasattr(self.cfg.slim, 'ptq') else False
+-        _, pruned_input_spec = self._get_infer_cfg_and_input_spec(
++        _, pruned_input_spec, _ = self._get_infer_cfg_and_input_spec(
+             save_dir, prune_input=False, kl_quant=kl_quant)
+ 
+         self.cfg.slim.save_quantized_model(

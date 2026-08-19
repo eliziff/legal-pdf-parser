@@ -1,0 +1,30 @@
+diff --git a/ppdet/data/reader.py b/ppdet/data/reader.py
+--- a/ppdet/data/reader.py
++++ b/ppdet/data/reader.py
+@@ -160,6 +160,8 @@ class BaseDataLoader(object):
+                 disabled if the shared memory of OS is less than
+                 1G, which is not enough for detection models.
+                 Default False.
++        prefetch_factor (int): number of batches each DataLoader worker may
++                prefetch. Default 2, matching paddle.io.DataLoader.
+     """
+ 
+     def __init__(self,
+@@ -171,4 +173,5 @@ class BaseDataLoader(object):
+                  num_classes=80,
+                  collate_batch=True,
+                  use_shared_memory=False,
++                 prefetch_factor=2,
+                  **kwargs):
+@@ -184,3 +187,4 @@ class BaseDataLoader(object):
+         self.drop_last = drop_last
+         self.use_shared_memory = use_shared_memory
++        self.prefetch_factor = prefetch_factor
+         self.kwargs = kwargs
+@@ -226,5 +230,6 @@ class BaseDataLoader(object):
+             num_workers=worker_num,
+             return_list=return_list,
++            prefetch_factor=self.prefetch_factor,
+             use_shared_memory=use_shared_memory)
+ 
+         return self
