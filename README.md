@@ -70,8 +70,7 @@ Segmentation and layout solve different problems:
 - **Layout explains what the lines mean.** The default native mode infers
   headings, body text, footnotes, headers, references, and reading order from
   the lines themselves. An optional local layout pack can add learned semantic
-  regions. A caller may also provide regions through the strict layout-input
-  contract for difficult pages.
+  regions for difficult pages.
 
 Provider-supplied layout is advisory. It must assign the engine's immutable
 line IDs completely and validly; otherwise it is rejected. It can change
@@ -98,7 +97,7 @@ Inspect a PDF without parsing or populating the cache:
 ```
 
 Prepare a document. The engine validates and reuses its content-addressed,
-compressed cache; it does not publish a second document bundle.
+compressed cache.
 
 ```json
 {

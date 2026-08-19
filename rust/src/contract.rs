@@ -336,7 +336,10 @@ fn inspect_request(value: &Value) -> Result<Value> {
             "page_count": inspection.page_count,
             "pdf_type": format!("{:?}", inspection.pdf_type),
             "confidence": inspection.confidence,
-            "pages_needing_ocr": inspection.pages_needing_ocr,
+            "pages_needing_ocr": inspection.pages_needing_ocr
+                .iter()
+                .map(|page| page + 1)
+                .collect::<Vec<_>>(),
         },
     }))
 }
@@ -364,6 +367,7 @@ fn physical_pages(value: Option<&Value>) -> Value {
 }
 
 fn prepare_summary(document: &crate::LegalDocument, selected: Option<&[usize]>) -> Value {
+    let pdf = document.metadata.get("pdf").unwrap_or(&Value::Null);
     let prepared_pages = selected.map_or_else(
         || json!({"selection": "full", "count": document.page_count}),
         |pages| {
@@ -379,10 +383,10 @@ fn prepare_summary(document: &crate::LegalDocument, selected: Option<&[usize]>) 
         "page_count": document.page_count,
         "prepared_pages": prepared_pages,
         "cache_validated": true,
-        "pdf_type": document.metadata.get("pdf_type"),
-        "confidence": document.metadata.get("confidence"),
-        "pages_needing_ocr": physical_pages(document.metadata.get("pages_needing_ocr")),
-        "ocr_routed_pages": physical_pages(document.metadata.get("ocr_routed_pages")),
+        "pdf_type": pdf.get("pdf_type"),
+        "confidence": pdf.get("confidence"),
+        "pages_needing_ocr": physical_pages(pdf.get("pages_needing_ocr")),
+        "ocr_routed_pages": physical_pages(pdf.get("ocr_routed_pages")),
         "counts": {
             "paragraphs": document.paragraphs.len(),
             "sections": document.sections.len(),
@@ -438,6 +442,7 @@ pub fn document_request(value: &Value) -> Result<Value> {
             "operation",
             "source_pdf",
             "cache_dir",
+            "pages",
             "ocr",
             "layout",
             "query",
@@ -532,6 +537,19 @@ mod tests {
         });
         assert!(validate_selected_pages(&request, Some(&[3, 4, 5]), 10).is_ok());
         assert!(validate_selected_pages(&request, Some(&[4]), 10).is_err());
+    }
+
+    #[test]
+    fn structure_lookup_accepts_selected_pages_at_the_strict_boundary() {
+        let error = document_request(&json!({
+            "schema_version": REQUEST_SCHEMA,
+            "operation": "structure_lookup",
+            "source_pdf": "missing.pdf",
+            "pages": [5],
+            "query": {"locator_kind": "page", "locator": "5"},
+        }))
+        .unwrap_err();
+        assert!(!error.to_string().contains("unknown document request field"));
     }
 
     #[test]
@@ -635,5 +653,36 @@ mod tests {
         assert!(result["source"]["cache_key"].is_null());
         assert_eq!(result["source"]["cache_hit"], false);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prepare_summary_reports_physical_ocr_pages_from_pdf_metadata() {
+        let document: crate::LegalDocument = serde_json::from_value(json!({
+            "document_id": "document",
+            "source_name": "source.pdf",
+            "source_sha256": "a".repeat(64),
+            "page_count": 3,
+            "status": "ready",
+            "pages": [],
+            "paragraphs": [],
+            "sections": [],
+            "footnotes": [],
+            "tables": [],
+            "images": [],
+            "diagnostics": [],
+            "metadata": {"pdf": {
+                "pdf_type": "Scanned",
+                "confidence": 0.95,
+                "pages_needing_ocr": [2],
+                "ocr_routed_pages": [0, 1]
+            }},
+            "provenance": {}
+        }))
+        .unwrap();
+
+        let result = prepare_summary(&document, None);
+        assert_eq!(result["pdf_type"], "Scanned");
+        assert_eq!(result["pages_needing_ocr"], json!([3]));
+        assert_eq!(result["ocr_routed_pages"], json!([1, 2]));
     }
 }
