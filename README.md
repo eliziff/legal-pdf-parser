@@ -44,7 +44,7 @@ The versioned contract supports `inspect`, `prepare`, `source_doc`, and
 
 ## Credits
 
-The recognition model is our legal-domain fine-tune of
+The recognition model is my legal-domain fine-tune of
 [CATMuS Print Small](https://zenodo.org/records/10602357), built with the
 [Kraken](https://kraken.re/) OCR ecosystem and the work of the
 [CATMuS project](https://huggingface.co/CATMuS). This project adds the legal
