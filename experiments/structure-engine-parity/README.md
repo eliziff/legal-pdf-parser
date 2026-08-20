@@ -84,10 +84,18 @@ the 1.478 GB synthetic common-input JSON. The bounded candidate
 with aggregate output `ea4531f8...b109d`. The heavy case took 7.984 seconds,
 versus 9.874 seconds for the former Python materialization plus Rust replay.
 That 1.24x gain projects the heavy lane at roughly 48 seconds even with the
-light lane overlapped, so no fresh 748-document run was spent or claimed. The
-remaining route to 30 seconds is streaming the exact recursively sorted pretty
-output without a whole-document JSON value, reducing peak memory enough to run
-more than two heavy documents safely.
+light lane overlapped, so no fresh 748-document run was spent or claimed.
+
+Profiling split the exact heavy path into 2.821 seconds of gzip decode/typed
+parse, 2.382 seconds of replay and sorted-value construction, and 1.427 seconds
+of pretty serialization plus SHA-256. The sink already sustained about 388
+MB/second; it was not the bottleneck. A page-at-a-time sorted serializer kept
+the exact 553,317,754-byte hash, but two runs took 14.80 and 13.16 seconds under
+the observed load and moved conversion work into serialization. Its 29.85-second
+check and 2m39s link also failed the build gates. The prototype was discarded.
+Any next attempt must remove recursive value conversion with a compact direct
+model serializer and prove lower peak memory; wrapping the same conversion in a
+stream is not sufficient.
 
 The direct scheduler caps each heavy uncompressed batch at 128 MiB and each
 light batch at 160 MiB. Two heavy and four light workers may overlap, giving a
