@@ -84,13 +84,21 @@ heavy lane was about 60 seconds, the measured ratio projects it near 48 seconds
 even while the light lane overlaps; the required evidence for another fresh
 748-document run was therefore absent, and no such run was made.
 
-The next credible optimization is an exact streaming serializer for the
-recursively sorted pretty output. It must reproduce the frozen hashes while
-avoiding a whole-document `serde_json::Value`; only after measured peak memory
-falls enough to admit four heavy workers can concurrency plausibly bring the
-projected heavy lane below 30 seconds. The present overlapping scheduler bounds
-uncompressed evidence to 896 MiB (two 128 MiB heavy batches plus four 160 MiB
-light batches) and retains no raw output.
+The heavy profile measured 2.821 seconds for gzip decode/typed parse, 2.382
+seconds for replay and recursively sorted value construction, and 1.427 seconds
+for exact pretty serialization plus SHA-256. The sink already sustained about
+388 MB/second. A page-at-a-time sorted wrapper retained the exact
+553,317,754-byte hash but took 14.80 and 13.16 seconds in two observed runs,
+because it moved recursive conversion into serialization rather than removing
+it. Its 29.85-second check and 2m39s link also failed the build gates, so the
+prototype was discarded. A future attempt must serialize model fields directly
+in the frozen sorted order with compact source and demonstrate reduced peak
+memory; another wrapper around `serde_json::to_value` is ruled out.
+
+The present overlapping scheduler bounds uncompressed evidence to 896 MiB
+(two 128 MiB heavy batches plus four 160 MiB light batches) and retains no raw
+output. Four-heavy concurrency remains prohibited until measured total peak
+memory, not merely input bytes, fits below 2 GiB.
 
 A true no-edit warm `cargo quick` took 3.224 seconds; the one post-edit check
 took 2.221 seconds, and the production-feature link took 44.24 seconds. The
