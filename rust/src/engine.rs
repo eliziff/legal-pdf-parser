@@ -555,25 +555,11 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     Ok(document.expect("cache or parse produced a document"))
 }
 
-#[derive(Deserialize)]
 struct CommonInput {
-    schema_version: String,
     source_name: String,
     source_sha256: String,
     pages: Vec<crate::model::Page>,
     separators: Vec<Option<f64>>,
-}
-
-fn read_common_input(input: &Path) -> Result<CommonInput> {
-    let file = File::open(input).map_err(|source| Error::io(input, source))?;
-    let common: CommonInput = serde_json::from_reader(BufReader::with_capacity(1024 * 1024, file))?;
-    if common.schema_version != "legalpdf.common-input.v1" {
-        return Err(Error::Message(format!(
-            "unsupported common-input schema: {:?}",
-            common.schema_version
-        )));
-    }
-    Ok(common)
 }
 
 fn replay_common(mut common: CommonInput) -> Result<Value> {
@@ -637,15 +623,29 @@ impl Write for DigestWriter {
 }
 
 #[doc(hidden)]
-pub fn digest_common_input(input: impl AsRef<Path>) -> Result<Value> {
+pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) -> Result<Value> {
+    let input = input.as_ref();
+    let cached: CachedExtraction = read_gzip_json(input)?;
+    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
+        || cached.extraction.pages.len() != cached.extraction.separators.len()
+    {
+        return Err(Error::Message("invalid extraction cache".to_owned()));
+    }
+    let common = CommonInput {
+        source_name,
+        source_sha256: cached.source_sha256,
+        pages: cached.extraction.pages,
+        separators: cached.extraction.separators,
+    };
+    let input_lines: usize = common.pages.iter().map(|page| page.lines.len()).sum();
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
-    let value = replay_common(read_common_input(input.as_ref())?)?;
+    let value = replay_common(common)?;
     let source_sha256 = value["source_sha256"].clone();
     serde_json::to_writer_pretty(&mut writer, &value)?;
     writer.write_all(b"\n").expect("digest writer cannot fail");
     let writer = writer.into_inner().expect("digest writer cannot fail");
     Ok(
-        json!({"output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256}),
+        json!({"input_lines": input_lines, "output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256}),
     )
 }
 

@@ -74,6 +74,33 @@ preparation fell from 5.282 to 0.325 seconds after exact x-window count
 memoization. A more aggressive anchor skip produced 747/748 parity and was
 discarded rather than incorporated or normalized into the baseline.
 
+The following direct-cache candidate (`ae4c6a7c...145e5`) removed the Python
+compact-common serialization, temporary file, and Rust reparse from the batch
+path. Receipts now bind the gzip extraction bytes that are actually consumed.
+The 1,401-page worst case remained exact at `ad7ebccc...ec7d` but took 7.984
+seconds, only 1.24x faster than the former combined 9.874-second path. The
+eleven-document smoke remained exact at 409.0 pages/second. Because the prior
+heavy lane was about 60 seconds, the measured ratio projects it near 48 seconds
+even while the light lane overlaps; the required evidence for another fresh
+748-document run was therefore absent, and no such run was made.
+
+The next credible optimization is an exact streaming serializer for the
+recursively sorted pretty output. It must reproduce the frozen hashes while
+avoiding a whole-document `serde_json::Value`; only after measured peak memory
+falls enough to admit four heavy workers can concurrency plausibly bring the
+projected heavy lane below 30 seconds. The present overlapping scheduler bounds
+uncompressed evidence to 896 MiB (two 128 MiB heavy batches plus four 160 MiB
+light batches) and retains no raw output.
+
+A true no-edit warm `cargo quick` took 3.224 seconds; the one post-edit check
+took 2.221 seconds, and the production-feature link took 44.24 seconds. The
+single quick samples are below the 4-second p95 ceiling but do not establish the
+2-second median; the link remains over its 30-second ceiling. The source-budget
+counter reported whole-project production at 125,883 lines, below the 125,896
+hard ceiling, and LPP production at 30,803 lines. Its separate test/authored and
+subrepo-pin checks remain red and are not relabelled as production-budget
+successes.
+
 The eleven-document smoke gate remains the edit-loop check: 401 pages across
 all five jurisdictions and manually audited document shapes, with startup,
 replay, and warm `cargo quick` budgets. It does not replace the 748-document

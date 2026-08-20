@@ -2,7 +2,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use legalpdf::{digest_common_input, document_request, Error, Result};
+use legalpdf::{digest_cached_extraction, document_request, Error, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -23,10 +23,11 @@ fn parity_replay_batch_command(arguments: &[String]) -> Result<i32> {
     if bytes.len() > 1024 * 1024 {
         return Err(Error::Message("replay manifest exceeds 1 MiB".to_owned()));
     }
-    let jobs: Vec<PathBuf> = serde_json::from_slice(&bytes)?;
+    let jobs: Vec<(PathBuf, String)> = serde_json::from_slice(&bytes)?;
     for (index, batch) in jobs.chunks(25).enumerate() {
-        for input in batch {
-            println!("{}", serde_json::to_string(&digest_common_input(input)?)?);
+        for (input, source_name) in batch {
+            let value = digest_cached_extraction(input, source_name.clone())?;
+            println!("{}", serde_json::to_string(&value)?);
         }
         let completed = ((index + 1) * 25).min(jobs.len());
         eprintln!("replayed {completed}/{}", jobs.len());

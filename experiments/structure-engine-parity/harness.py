@@ -26,8 +26,8 @@ BASELINE = HERE / "baseline.json"
 ALL_BASELINE = HERE / "all-cache-baseline.json"
 ALL_RECEIPTS = ROOT / ".tmp" / "structure-engine-parity-receipts"
 HEAVY_INPUT_BYTES = 20 * 1024 * 1024
-LIGHT_TEMP_BYTES = 160 * 1024 * 1024
-HEAVY_TEMP_BYTES = 1024 * 1024 * 1024
+LIGHT_BATCH_BYTES = 160 * 1024 * 1024
+HEAVY_BATCH_BYTES = 128 * 1024 * 1024
 SAMPLE_PREFIXES = (
     "1887",  # audited Canadian closing submission; 159 pages and dense notes
     "52c",  # audited US court form
@@ -163,32 +163,6 @@ def validate_document_cache(wanted: set[str]) -> float:
     return time.perf_counter() - started
 
 
-def write_common_input(row: dict, extraction_path: Path, output: Path) -> dict:
-    with gzip.open(extraction_path, "rt", encoding="utf-8") as stream:
-        cached = json.load(stream)
-    if cached["schema_version"] != "legalpdf.extraction-cache.v1":
-        raise AssertionError(f"unexpected cache schema: {extraction_path}")
-    if cached["source_sha256"] != row["source_sha256"]:
-        raise AssertionError(f"source mismatch: {extraction_path}")
-    extracted = cached["extraction"]
-    common = {
-        "pages": extracted["pages"],
-        "schema_version": "legalpdf.common-input.v1",
-        "separators": extracted["separators"],
-        "source_name": Path(row["relative_path"]).name,
-        "source_sha256": row["source_sha256"],
-    }
-    if len(common["pages"]) != row["pages"] or len(common["separators"]) != row["pages"]:
-        raise AssertionError(f"page count mismatch: {row['candidate_id']}")
-    payload = json.dumps(common, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\r\n"
-    output.write_bytes(payload)
-    return {
-        "input_bytes": len(payload),
-        "input_lines": sum(len(page.get("lines", [])) for page in common["pages"]),
-        "input_sha256": sha256_bytes(payload),
-    }
-
-
 def gzip_size(path: Path) -> int:
     with path.open("rb") as stream:
         stream.seek(-4, os.SEEK_END)
@@ -264,28 +238,27 @@ def replay(
     def replay_one(item: tuple[int, dict]) -> dict:
         position, row = item
         print(f"[{position}/{len(sample)}] {row['candidate_id']} ({row['pages']} pages)", flush=True)
-        input_path = work / f"{row['candidate_id']}.input.json"
-        result = {**row, **write_common_input(row, index[row["source_sha256"]], input_path)}
+        extraction = index[row["source_sha256"]]
         manifest = work / f"{row['candidate_id']}.manifest.json"
-        manifest.write_text(json.dumps([str(input_path)] * repetitions), encoding="utf-8")
+        job = [str(extraction), Path(row["relative_path"]).name]
+        manifest.write_text(json.dumps([job] * repetitions), encoding="utf-8")
         elapsed, stdout = run([str(binary), "_parity-replay-batch", str(manifest)], timeout=30)
         outputs = list(map(json.loads, stdout.splitlines()))
         if len(outputs) != repetitions or any(value != outputs[0] for value in outputs[1:]):
             raise AssertionError(f"repeat replay bytes differ: {row['candidate_id']}")
-        temporary_bytes = input_path.stat().st_size + manifest.stat().st_size
+        temporary_bytes = manifest.stat().st_size
         if temporary_bytes > max_temp_bytes:
             raise AssertionError(
                 f"temporary input for {row['candidate_id']} is {temporary_bytes} bytes; "
                 f"budget is {max_temp_bytes}"
             )
-        result.update(
-            {
-                "output_bytes": outputs[0]["output_bytes"],
-                "output_sha256": outputs[0]["output_sha256"],
-                "replay_seconds": [round(elapsed / repetitions, 6)] * repetitions,
-            }
-        )
-        input_path.unlink()
+        result = {
+            **row,
+            **outputs[0],
+            "extraction_bytes": extraction.stat().st_size,
+            "extraction_sha256": sha256_file(extraction),
+            "replay_seconds": [round(elapsed / repetitions, 6)] * repetitions,
+        }
         manifest.unlink()
         return result
 
@@ -301,7 +274,7 @@ def comparable(report: dict) -> dict:
         "documents": [
             {
                 key: row[key]
-                for key in ("candidate_id", "input_bytes", "input_sha256", "output_bytes", "output_sha256", "pages")
+                for key in ("candidate_id", "output_bytes", "output_sha256", "pages")
             }
             for row in report["documents"]
         ],
@@ -311,7 +284,7 @@ def comparable(report: dict) -> dict:
 def comparable_document(row: dict) -> dict:
     return {
         key: row[key]
-        for key in ("candidate_id", "input_bytes", "input_sha256", "output_bytes", "output_sha256", "pages")
+        for key in ("candidate_id", "extraction_bytes", "extraction_sha256", "output_bytes", "output_sha256", "pages")
     }
 
 
@@ -339,7 +312,7 @@ def digest_batch(binary: Path, binary_sha: str, rows: list[dict], index: dict[st
         if not fresh and receipt_path.is_file():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             if all((
-                receipt.get("schema_version") == "legalpdf.structure-engine-parity-receipt.v2",
+                receipt.get("schema_version") == "legalpdf.structure-engine-parity-receipt.v3",
                 receipt.get("binary_sha256") == binary_sha,
                 receipt.get("extraction_sha256") == extraction_sha,
                 receipt.get("source_sha256") == row["source_sha256"],
@@ -351,25 +324,22 @@ def digest_batch(binary: Path, binary_sha: str, rows: list[dict], index: dict[st
         pending.append(row)
     if not pending:
         return results, 0
-    inputs, common = [], {}
-    for row in pending:
-        path = work / f"{row['candidate_id']}.input.json"
-        common[row["source_sha256"]] = write_common_input(row, index[row["source_sha256"]], path)
-        inputs.append(path)
     manifest = work / f"{pending[0]['candidate_id']}.manifest.json"
-    manifest.write_text(json.dumps([str(path) for path in inputs], separators=(",", ":")), encoding="utf-8")
-    temporary_bytes = manifest.stat().st_size + sum(path.stat().st_size for path in inputs)
-    if temporary_bytes > maximum:
-        raise AssertionError(f"batch temporary inputs are {temporary_bytes} bytes")
+    jobs = [[str(index[row["source_sha256"]]), Path(row["relative_path"]).name] for row in pending]
+    manifest.write_text(json.dumps(jobs, separators=(",", ":")), encoding="utf-8")
+    uncompressed_bytes = sum(gzip_size(index[row["source_sha256"]]) for row in pending)
+    if uncompressed_bytes > maximum:
+        raise AssertionError(f"batch uncompressed inputs are {uncompressed_bytes} bytes")
     _, stdout = run([str(binary), "_parity-replay-batch", str(manifest)], timeout=180)
     values = list(map(json.loads, stdout.splitlines()))
     digests = {value["source_sha256"]: value for value in values}
     if len(values) != len(pending) or set(digests) != {row["source_sha256"] for row in pending}:
         raise AssertionError("digest batch output did not cover every source exactly once")
-    for row, input_path in zip(pending, inputs):
+    for row in pending:
         extraction = index[row["source_sha256"]]
+        digest = digests[row["source_sha256"]]
         receipt = {
-            "schema_version": "legalpdf.structure-engine-parity-receipt.v2",
+            "schema_version": "legalpdf.structure-engine-parity-receipt.v3",
             "binary_sha256": binary_sha,
             "candidate_id": row["candidate_id"],
             "document_type": row["document_type"],
@@ -377,19 +347,17 @@ def digest_batch(binary: Path, binary_sha: str, rows: list[dict], index: dict[st
             "extraction_sha256": extraction_shas[row["candidate_id"]],
             "input_bytes_uncompressed": gzip_size(extraction),
             "jurisdiction": row["jurisdiction"],
-            "lines": common[row["source_sha256"]]["input_lines"],
-            "max_temp_bytes": input_path.stat().st_size,
+            "lines": digest["input_lines"],
+            "max_temp_bytes": manifest.stat().st_size,
             "pages": row["pages"],
             "relative_path": row["relative_path"],
             "source_sha256": row["source_sha256"],
-            **common[row["source_sha256"]],
-            **digests[row["source_sha256"]],
+            **{key: value for key, value in digest.items() if key != "input_lines"},
         }
         atomic_json(ALL_RECEIPTS / binary_sha / f"{row['candidate_id']}.json", receipt)
         results.append({**receipt, "resumed": False})
-        input_path.unlink()
     manifest.unlink()
-    return results, temporary_bytes
+    return results, uncompressed_bytes
 
 
 def run_batches(binary: Path, binary_sha: str, batches: list[list[dict]], index: dict[str, Path], work: Path, jobs: int, fresh: bool, maximum: int, completed: int, total: int) -> tuple[list[dict], list[dict], list[int], int]:
@@ -411,12 +379,16 @@ def run_batches(binary: Path, binary_sha: str, batches: list[list[dict]], index:
     return results, failures, temporary, completed
 
 
-def misalignment_rejection(binary: Path, work: Path) -> None:
-    source, manifest = work / "misaligned.json", work / "misaligned-manifest.json"
-    source.write_text(json.dumps({"schema_version": "legalpdf.common-input.v1", "source_name": "bad", "source_sha256": "0" * 64, "pages": [], "separators": [None]}), encoding="utf-8")
-    manifest.write_text(json.dumps([str(source)]), encoding="utf-8")
+def misalignment_rejection(binary: Path, work: Path, extraction: Path) -> None:
+    source, manifest = work / "misaligned.json.gz", work / "misaligned-manifest.json"
+    with gzip.open(extraction, "rt", encoding="utf-8") as stream:
+        cached = json.load(stream)
+    cached["extraction"]["separators"].pop()
+    with gzip.open(source, "wt", encoding="utf-8", compresslevel=1) as stream:
+        json.dump(cached, stream, ensure_ascii=False, separators=(",", ":"))
+    manifest.write_text(json.dumps([[str(source), "bad.pdf"]]), encoding="utf-8")
     result = subprocess.run([str(binary), "_parity-replay-batch", str(manifest)], capture_output=True, text=True, encoding="utf-8")
-    if result.returncode != 1 or "one separator value per page" not in result.stderr or result.stdout:
+    if result.returncode != 1 or "invalid extraction cache" not in result.stderr or result.stdout:
         raise AssertionError("aligned-input rejection contract failed")
     source.unlink()
     manifest.unlink()
@@ -444,25 +416,27 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
     results = []
     failures = []
     batch_temporary = []
-    completed = 0
     replay_started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="structure-engine-parity-all-", dir=ROOT / ".tmp") as temporary:
         work = Path(temporary)
-        misalignment_rejection(binary, work)
-        batch, errors, used, completed = run_batches(
-            binary, binary_sha, [[row] for row in heavy], index, work,
-            min(2, args.jobs), args.fresh, HEAVY_TEMP_BYTES, completed, len(sample)
+        misalignment_rejection(binary, work, min(index.values(), key=lambda path: path.stat().st_size))
+        lanes = (
+            ([[row] for row in heavy], min(2, args.jobs), HEAVY_BATCH_BYTES),
+            (packed(light, index, LIGHT_BATCH_BYTES), args.jobs, LIGHT_BATCH_BYTES),
         )
-        results.extend(batch)
-        failures.extend(errors)
-        batch_temporary.extend(used)
-        batch, errors, used, completed = run_batches(
-            binary, binary_sha, packed(light, index, LIGHT_TEMP_BYTES), index, work,
-            args.jobs, args.fresh, LIGHT_TEMP_BYTES, completed, len(sample)
-        )
-        results.extend(batch)
-        failures.extend(errors)
-        batch_temporary.extend(used)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    run_batches, binary, binary_sha, batches, index, work,
+                    jobs, args.fresh, maximum, 0, sum(map(len, batches))
+                )
+                for batches, jobs, maximum in lanes
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                batch, errors, used, _ = future.result()
+                results.extend(batch)
+                failures.extend(errors)
+                batch_temporary.extend(used)
     replay_wall = time.perf_counter() - replay_started
     results.sort(key=lambda row: row["candidate_id"])
     expected_by_id = {}
@@ -522,16 +496,16 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
         },
         "bounds": {
             "heavy_input_threshold_mib": HEAVY_INPUT_BYTES / 1024 / 1024,
-            "heavy_temp_mib_per_document": HEAVY_TEMP_BYTES / 1024 / 1024,
-            "light_temp_mib_per_document": LIGHT_TEMP_BYTES / 1024 / 1024,
-            "max_temp_bytes_observed": max(batch_temporary, default=0),
+            "heavy_uncompressed_mib_per_batch": HEAVY_BATCH_BYTES / 1024 / 1024,
+            "light_uncompressed_mib_per_batch": LIGHT_BATCH_BYTES / 1024 / 1024,
+            "max_uncompressed_batch_bytes_observed": max(batch_temporary, default=0),
             "raw_outputs_retained": 0,
-            "uncompressed_input_bytes_in_flight_bound": max(
-                min(2, args.jobs) * HEAVY_TEMP_BYTES, args.jobs * LIGHT_TEMP_BYTES
+            "uncompressed_input_bytes_in_flight_bound": (
+                min(2, args.jobs) * HEAVY_BATCH_BYTES + args.jobs * LIGHT_BATCH_BYTES
             ),
         },
-        "input_sha256": canonical_sha(
-            [{"candidate_id": row["candidate_id"], "input_sha256": row["input_sha256"]} for row in results]
+        "extraction_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "extraction_sha256": row["extraction_sha256"]} for row in results]
         ),
         "output_sha256": canonical_sha(
             [{"candidate_id": row["candidate_id"], "output_sha256": row["output_sha256"]} for row in results]
@@ -570,7 +544,7 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
         "binary_sha256": binary_sha,
         "bounds": report["bounds"],
         "failures": failures,
-        "input_sha256": report["input_sha256"],
+        "extraction_sha256": report["extraction_sha256"],
         "metrics": report["metrics"],
         "output_sha256": report["output_sha256"],
         "receipt_bytes": sum(path.stat().st_size for path in receipt_files),
@@ -614,6 +588,9 @@ def execute(args: argparse.Namespace) -> dict:
         "binary_sha256": sha256_file(binary),
         "cargo_quick": cargo_quick,
         "documents": documents,
+        "extraction_sha256": canonical_sha(
+            [{"candidate_id": row["candidate_id"], "extraction_sha256": row["extraction_sha256"]} for row in documents]
+        ),
         "metrics": {
             "cache_index_seconds": round(scan_seconds, 3),
             "documents": len(sample),
@@ -672,7 +649,7 @@ def self_test() -> None:
     assert percentile([3.0, 1.0, 2.0], 0.95) == 3.0
     assert canonical_sha({"b": 2, "a": 1}) == canonical_sha({"a": 1, "b": 2})
     assert comparable({"sample_sha256": "s", "documents": [{
-        "candidate_id": "x", "input_bytes": 1, "input_sha256": "i", "output_bytes": 2,
+        "candidate_id": "x", "output_bytes": 2,
         "output_sha256": "o", "pages": 3, "replay_seconds": [1.0]
     }]})["documents"][0]["output_sha256"] == "o"
     print("self-test PASS")
