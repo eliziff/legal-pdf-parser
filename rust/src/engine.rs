@@ -1,12 +1,15 @@
 use crate::error::{Error, Result};
-use crate::model::{LegalDocument, PARSER_VERSION, SCHEMA_VERSION};
+use crate::model::{
+    Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Section, Span, Word,
+    PARSER_VERSION, SCHEMA_VERSION,
+};
 use crate::ocr::{OcrOptions, OcrProvider};
 use crate::pdf::{extract_pdf, ExtractedPdf};
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 use crate::ppdoc::{PPDocLayout, PPDocOptions};
 use crate::storage::{read_gzip_json, write_gzip_json};
 use crate::structure::{derive, replay, status, validate_document};
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -54,27 +57,19 @@ impl Default for ParseOptions {
 
 fn default_cache_dir() -> PathBuf {
     if let Some(root) = std::env::var_os("OPEN_LEGAL_DATA_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(root)
-            .join("apps")
-            .join("legalpdf")
-            .join("cache");
+        return PathBuf::from(root).join("apps/legalpdf/cache");
     }
     if cfg!(windows) {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        return base
-            .join("OpenLegalProducts")
-            .join("LegalData")
-            .join("apps")
-            .join("legalpdf")
-            .join("cache");
+        return base.join("OpenLegalProducts/LegalData/apps/legalpdf/cache");
     }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("OpenLegalData").join("legalpdf")
+    base.join("OpenLegalData/legalpdf")
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -562,7 +557,85 @@ struct CommonInput {
     separators: Vec<Option<f64>>,
 }
 
-fn replay_common(mut common: CommonInput) -> Result<Value> {
+struct ReplayOutput {
+    derived_pages: Vec<Page>,
+    diagnostics: Vec<Diagnostic>,
+    footnotes: Vec<Footnote>,
+    marker_summary: Value,
+    markers: Vec<Value>,
+    pairing_summary: Value,
+    paragraphs: Vec<Paragraph>,
+    prepared_pages: Vec<Page>,
+    schema_version: &'static str,
+    sections: Vec<Section>,
+    source_sha256: String,
+    status: String,
+    validation: &'static str,
+}
+
+trait FrozenOrder {
+    fn serialize_frozen<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>;
+}
+
+struct Frozen<'a, T>(&'a T);
+
+impl<T: FrozenOrder> Serialize for Frozen<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize_frozen(serializer)
+    }
+}
+
+struct FrozenSlice<'a, T>(&'a [T]);
+
+impl<T: FrozenOrder> Serialize for FrozenSlice<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(Frozen))
+    }
+}
+
+macro_rules! frozen_fields {
+    ($map:ident $value:ident;) => {};
+    ($map:ident $value:ident; [$field:ident] $($rest:tt)*) => {
+        $map.serialize_entry(stringify!($field), &FrozenSlice(&$value.$field))?;
+        frozen_fields!($map $value; $($rest)*);
+    };
+    ($map:ident $value:ident; $field:ident => $key:literal $($rest:tt)*) => {
+        $map.serialize_entry($key, &$value.$field)?;
+        frozen_fields!($map $value; $($rest)*);
+    };
+    ($map:ident $value:ident; $field:ident $($rest:tt)*) => {
+        $map.serialize_entry(stringify!($field), &$value.$field)?;
+        frozen_fields!($map $value; $($rest)*);
+    };
+}
+
+macro_rules! frozen_type {
+    ($kind:ident: $($fields:tt)*) => {
+        impl FrozenOrder for $kind {
+            fn serialize_frozen<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(None)?;
+                frozen_fields!(map self; $($fields)*);
+                map.end()
+            }
+        }
+    };
+}
+
+frozen_type!(Word: bbox end id start text);
+frozen_type!(Span: bbox end flags font id size start superscript text);
+frozen_type!(Line: bbox block_index detached_references exclude_from_body id note_region_mode page_index page_number reading_order region_id region_type source source_index [spans] suppress_footnote_label text [words]);
+frozen_type!(Region: bbox id line_ids page_index reading_order kind => "type");
+frozen_type!(Page: height id index [lines] number printed_label printed_label_line_id printed_label_source [regions] source text_quality width);
+frozen_type!(Paragraph: anchors id line_ids page_index region_type text);
+frozen_type!(Section: aliases heading heading_paragraph_id id line_ids locator locator_kind page_indexes paragraph_ids provenance text);
+frozen_type!(Footnote: body body_line_ids body_pages confidence crossrefs label occurrence pair_id passage_since_prior_note provenance reference_line_id reference_page restart_sequence sentence_proposition warnings);
+frozen_type!(Diagnostic: code details line_ids message page_index severity);
+frozen_type!(ReplayOutput: [derived_pages] [diagnostics] [footnotes] marker_summary markers pairing_summary [paragraphs] [prepared_pages] schema_version [sections] source_sha256 status validation);
+
+fn replay_common(mut common: CommonInput) -> Result<ReplayOutput> {
     let document_token = common.source_sha256.get(..20).ok_or_else(|| {
         Error::Message("common input source_sha256 is not a SHA-256 digest".to_owned())
     })?;
@@ -587,21 +660,21 @@ fn replay_common(mut common: CommonInput) -> Result<Value> {
         parser_version: PARSER_VERSION.to_owned(),
     };
     validate_document(&document)?;
-    Ok(json!({
-        "schema_version": "legalpdf.common-input-result.v1",
-        "source_sha256": document.source_sha256,
-        "prepared_pages": replay.prepared_pages,
-        "derived_pages": document.pages,
-        "markers": replay.derived.markers,
-        "marker_summary": replay.derived.marker_summary,
-        "pairing_summary": replay.derived.pairing_summary,
-        "paragraphs": document.paragraphs,
-        "sections": document.sections,
-        "footnotes": document.footnotes,
-        "diagnostics": document.diagnostics,
-        "status": document.status,
-        "validation": "ok",
-    }))
+    Ok(ReplayOutput {
+        derived_pages: document.pages,
+        diagnostics: document.diagnostics,
+        footnotes: document.footnotes,
+        marker_summary: replay.derived.marker_summary,
+        markers: replay.derived.markers,
+        pairing_summary: replay.derived.pairing_summary,
+        paragraphs: document.paragraphs,
+        prepared_pages: replay.prepared_pages,
+        schema_version: "legalpdf.common-input-result.v1",
+        sections: document.sections,
+        source_sha256: document.source_sha256,
+        status: document.status,
+        validation: "ok",
+    })
 }
 
 #[derive(Debug, Default)]
@@ -624,8 +697,7 @@ impl Write for DigestWriter {
 
 #[doc(hidden)]
 pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) -> Result<Value> {
-    let input = input.as_ref();
-    let cached: CachedExtraction = read_gzip_json(input)?;
+    let cached: CachedExtraction = read_gzip_json(input.as_ref())?;
     if cached.schema_version != EXTRACTION_CACHE_SCHEMA
         || cached.extraction.pages.len() != cached.extraction.separators.len()
     {
@@ -640,8 +712,8 @@ pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) ->
     let input_lines: usize = common.pages.iter().map(|page| page.lines.len()).sum();
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
     let value = replay_common(common)?;
-    let source_sha256 = value["source_sha256"].clone();
-    serde_json::to_writer_pretty(&mut writer, &value)?;
+    let source_sha256 = value.source_sha256.clone();
+    serde_json::to_writer_pretty(&mut writer, &Frozen(&value))?;
     writer.write_all(b"\n").expect("digest writer cannot fail");
     let writer = writer.into_inner().expect("digest writer cannot fail");
     Ok(

@@ -1909,22 +1909,6 @@ fn replace_file(files: &mut Vec<(String, Vec<u8>)>, name: &str, bytes: Vec<u8>) 
     }
 }
 
-pub(crate) fn link_targets(path: &Path) -> Result<Vec<String>> {
-    let files = zip_read_all(path)?;
-    let Some(raw) = file_bytes(&files, "word/_rels/footnotes.xml.rels") else {
-        return Ok(Vec::new());
-    };
-    let document = parse_xml(raw)?;
-    Ok(document
-        .root()?
-        .direct_elements()
-        .filter(|element| element.attribute(None, "Type") == Some(HYPERLINK_REL))
-        .filter_map(|element| element.attribute(None, "Target").map(str::to_owned))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
-}
-
 pub fn apply_docx_links(
     docx_path: impl AsRef<Path>,
     plan: &Value,
