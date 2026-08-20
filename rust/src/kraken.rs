@@ -1832,12 +1832,20 @@ fn effective_recognition_batch(
     let accelerated = backend != KrakenBackend::Cpu;
     (
         if requested_batch == 0 {
-            if accelerated { 64 } else { 32 }
+            if accelerated {
+                64
+            } else {
+                32
+            }
         } else {
             requested_batch
         },
         if requested_bucket == 0 {
-            if accelerated { 128 } else { 24 }
+            if accelerated {
+                128
+            } else {
+                24
+            }
         } else {
             requested_bucket
         },
