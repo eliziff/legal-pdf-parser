@@ -11,7 +11,7 @@ use crate::pairing_support::{
 use crate::pdf::union_bbox;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 const HARD_DIAGNOSTICS: &[&str] = &[
@@ -444,6 +444,7 @@ fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSet<(usize, u
     let mut parity_hits = Vec::with_capacity(hits.len());
     let mut trial = Vec::with_capacity(hits.len());
     let mut seen_pages = vec![0_u32; hits.iter().map(|hit| hit.page_slot).max().unwrap_or(0) + 1];
+    let mut x_counts = BTreeMap::new();
     let mut generation = 0;
     for y_start in hits {
         y_cluster.clear();
@@ -453,6 +454,7 @@ fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSet<(usize, u
         }));
         trial.clear();
         for parity in [0, 1] {
+            x_counts.clear();
             parity_hits.clear();
             parity_hits.extend(
                 y_cluster
@@ -463,14 +465,17 @@ fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSet<(usize, u
             let mut selected_x = None;
             let mut selected_count = 0;
             for x_start in &parity_hits {
-                let count = unique_page_count(
-                    parity_hits.iter().filter(|hit| {
-                        hit.x_ratio >= x_start.x_ratio
-                            && hit.x_ratio - x_start.x_ratio <= FURNITURE_X_TOLERANCE_FRAC
-                    }),
-                    &mut seen_pages,
-                    &mut generation,
-                );
+                let x = x_start.x_ratio.to_bits();
+                let count = *x_counts.entry(x).or_insert_with(|| {
+                    unique_page_count(
+                        parity_hits.iter().filter(|hit| {
+                            hit.x_ratio >= x_start.x_ratio
+                                && hit.x_ratio - x_start.x_ratio <= FURNITURE_X_TOLERANCE_FRAC
+                        }),
+                        &mut seen_pages,
+                        &mut generation,
+                    )
+                });
                 // Iterator::max_by_key chooses the last equal maximum.
                 if selected_x.is_none() || count >= selected_count {
                     selected_x = Some(x_start.x_ratio);

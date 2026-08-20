@@ -61,8 +61,20 @@ isolated for progress and load balancing. No second fresh corpus run was used
 to erase the failed measurement.
 
 The same candidate's one post-edit `cargo quick` passed in about 10 seconds and
-its cached all-feature release link passed in 62 seconds. Both exceed the 5- and
-30-second budgets and remain recorded as build-performance failures.
+its cached production-feature release link passed in 62 seconds. Both remain
+build-performance failures. The authoritative warm-build contract is a median
+at most 2 seconds and p95 at most 4 seconds; this local harness's single-run
+ceiling is the 4-second p95 bound. The release-link ceiling is 30 seconds.
+
+The optimized candidate (`61ba9ee8...6f46b`) matched all 748 documents and
+24,707 pages exactly, including aggregate output hash `eca681b3...0d9d3`, with
+misalignment rejection and zero retained raw outputs. It completed the fresh
+lane in 89.588 seconds (275.8 pages/second), so the unchanged 30-second and
+1,000-pages/second gates still rejected it. On the 1,401-page worst case,
+memoizing repeated x-window page counts reduced preparation from 5.282 to
+0.325 seconds and candidate replay from 11.592 to 4.074 seconds without a byte
+change. A broader repeated-anchor skip changed one of 748 outputs and was
+rejected before this final run; it is not in production.
 
 The frozen `0.3.0` binary (`85be89d2...075b4`) produced aggregate output SHA-256
 `ea4531f8...109d`. The baseline run replayed 802 page-passes in 2.737 seconds

@@ -691,7 +691,7 @@ def main() -> int:
     parser.add_argument("--min-replay-pages-per-second", type=float, default=250.0)
     parser.add_argument("--min-all-cache-pages-per-second", type=float, default=1000.0)
     parser.add_argument("--max-all-cache-seconds", type=float, default=30.0)
-    parser.add_argument("--max-cargo-quick-seconds", type=float, default=5.0)
+    parser.add_argument("--max-cargo-quick-seconds", type=float, default=4.0)
     parser.add_argument("--skip-cargo-quick", action="store_true")
     parser.add_argument("--fresh", action="store_true", help="ignore resumable receipts and enforce full-corpus speed")
     parser.add_argument("--self-test", action="store_true")

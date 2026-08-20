@@ -61,8 +61,18 @@ Eleven heavy inputs had been placed in one sequential batch, so the harness now
 isolates heavy inputs and reports each completion; this correction is not a
 license to claim the 30-second target without another explicitly fresh run.
 The candidate's post-edit `cargo quick` took about 10 seconds and its cached
-all-feature release link took 62 seconds, failing the 5- and 30-second build
-budgets without a retry or relaxed threshold.
+production-feature release link took 62 seconds. The authoritative warm-build
+budgets are median at most 2 seconds and p95 at most 4 seconds; the release-link
+budget is 30 seconds. These results fail without a retry or relaxed threshold.
+
+The next optimized candidate (`61ba9ee8...6f46b`) preserved all 748 exact byte
+streams and aggregate hash `eca681b3...0d9d3`, rejected misaligned evidence,
+and retained no raw outputs. Its fresh replay took 89.588 seconds (275.8
+pages/second), still failing the unchanged 30-second and 1,000-pages/second
+gates. The heaviest 1,401-page replay improved from 11.592 to 4.074 seconds;
+preparation fell from 5.282 to 0.325 seconds after exact x-window count
+memoization. A more aggressive anchor skip produced 747/748 parity and was
+discarded rather than incorporated or normalized into the baseline.
 
 The eleven-document smoke gate remains the edit-loop check: 401 pages across
 all five jurisdictions and manually audited document shapes, with startup,
