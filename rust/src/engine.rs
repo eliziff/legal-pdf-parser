@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -566,7 +566,7 @@ struct CommonInput {
 
 fn read_common_input(input: &Path) -> Result<CommonInput> {
     let file = File::open(input).map_err(|source| Error::io(input, source))?;
-    let common: CommonInput = serde_json::from_reader(BufReader::new(file))?;
+    let common: CommonInput = serde_json::from_reader(BufReader::with_capacity(1024 * 1024, file))?;
     if common.schema_version != "legalpdf.common-input.v1" {
         return Err(Error::Message(format!(
             "unsupported common-input schema: {:?}",
@@ -618,7 +618,7 @@ fn replay_common(mut common: CommonInput) -> Result<Value> {
     }))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DigestWriter {
     bytes: u64,
     digest: Sha256,
@@ -638,11 +638,12 @@ impl Write for DigestWriter {
 
 #[doc(hidden)]
 pub fn digest_common_input(input: impl AsRef<Path>) -> Result<Value> {
-    let mut writer = DigestWriter::default();
+    let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
     let value = replay_common(read_common_input(input.as_ref())?)?;
     let source_sha256 = value["source_sha256"].clone();
     serde_json::to_writer_pretty(&mut writer, &value)?;
     writer.write_all(b"\n").expect("digest writer cannot fail");
+    let writer = writer.into_inner().expect("digest writer cannot fail");
     Ok(
         json!({"output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256}),
     )
