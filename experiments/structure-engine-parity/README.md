@@ -88,22 +88,23 @@ light lane overlapped, so no fresh 748-document run was spent or claimed.
 
 Profiling split the exact heavy path into 2.821 seconds of gzip decode/typed
 parse, 2.382 seconds of replay and sorted-value construction, and 1.427 seconds
-of pretty serialization plus SHA-256. The sink already sustained about 388
-MB/second; it was not the bottleneck. A page-at-a-time sorted serializer kept
-the exact 553,317,754-byte hash, but two runs took 14.80 and 13.16 seconds under
-the observed load and moved conversion work into serialization. Its 29.85-second
-check and 2m39s link also failed the build gates. The prototype was discarded.
-Any next attempt must remove recursive value conversion with a compact direct
-model serializer and prove lower peak memory; wrapping the same conversion in a
-stream is not sufficient.
+of pretty serialization plus SHA-256. A rejected page-at-a-time wrapper moved
+conversion into serialization and took 13.16--14.80 seconds. The promoted
+dependency-free serializer instead walks typed fields in the frozen key order,
+while `serde_json` still owns escaping and float formatting. It kept the exact
+553,317,754-byte heavy hash and reduced that case from 7.984 to 5.528 seconds
+with a 466,767,872-byte peak working set.
 
 The direct scheduler caps each heavy uncompressed batch at 128 MiB and each
 light batch at 160 MiB. Two heavy and four light workers may overlap, giving a
-896 MiB explicit uncompressed-evidence bound; raw outputs remain forbidden. A
-true no-edit `cargo quick` took 3.224 seconds and the post-edit check took 2.221
-seconds. Both fit the 4-second p95 ceiling as individual samples but neither
-proves the 2-second median. The production-feature link took 44.24 seconds and
-still fails its 30-second ceiling.
+896 MiB explicit uncompressed-evidence bound; raw outputs remain forbidden.
+The typed candidate passed the eleven-document smoke at 474.6 pages/second with
+the frozen `ea4531f8...b109d` aggregate output and rejected misaligned evidence.
+Its 1.44x heavy-case gain projects the prior roughly 48-second heavy lane to
+about 33 seconds, so no fresh 748-document run was spent or claimed. Its one
+post-edit `cargo quick` took 2.759 seconds and its incremental production-feature
+link took 50.121 seconds: the individual check fits the 4-second p95 bound, but
+the 2-second median is unproven and the 30-second link gate remains red.
 
 The frozen `0.3.0` binary (`85be89d2...075b4`) produced aggregate output SHA-256
 `ea4531f8...109d`. The baseline run replayed 802 page-passes in 2.737 seconds

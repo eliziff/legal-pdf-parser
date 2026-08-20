@@ -86,28 +86,28 @@ even while the light lane overlaps; the required evidence for another fresh
 
 The heavy profile measured 2.821 seconds for gzip decode/typed parse, 2.382
 seconds for replay and recursively sorted value construction, and 1.427 seconds
-for exact pretty serialization plus SHA-256. The sink already sustained about
-388 MB/second. A page-at-a-time sorted wrapper retained the exact
-553,317,754-byte hash but took 14.80 and 13.16 seconds in two observed runs,
-because it moved recursive conversion into serialization rather than removing
-it. Its 29.85-second check and 2m39s link also failed the build gates, so the
-prototype was discarded. A future attempt must serialize model fields directly
-in the frozen sorted order with compact source and demonstrate reduced peak
-memory; another wrapper around `serde_json::to_value` is ruled out.
+for exact pretty serialization plus SHA-256. A rejected streaming wrapper moved
+conversion into serialization and took 13.16--14.80 seconds. The promoted
+dependency-free path now serializes typed fields directly in frozen key order
+and leaves escaping and floats to `serde_json`; it contains no `to_value`
+wrapper. The same exact heavy output took 5.528 seconds with a 466,767,872-byte
+peak working set, down from 7.984 seconds. That 1.44x gain still projects the
+prior roughly 48-second heavy lane to about 33 seconds, so the required
+30-second projection was not met and no fresh 748-document run was claimed.
 
 The present overlapping scheduler bounds uncompressed evidence to 896 MiB
 (two 128 MiB heavy batches plus four 160 MiB light batches) and retains no raw
 output. Four-heavy concurrency remains prohibited until measured total peak
 memory, not merely input bytes, fits below 2 GiB.
 
-A true no-edit warm `cargo quick` took 3.224 seconds; the one post-edit check
-took 2.221 seconds, and the production-feature link took 44.24 seconds. The
-single quick samples are below the 4-second p95 ceiling but do not establish the
-2-second median; the link remains over its 30-second ceiling. The source-budget
-counter reported whole-project production at 125,883 lines, below the 125,896
-hard ceiling, and LPP production at 30,803 lines. Its separate test/authored and
-subrepo-pin checks remain red and are not relabelled as production-budget
-successes.
+The typed candidate's one post-edit warm `cargo quick` took 2.759 seconds and
+its incremental production-feature link took 50.121 seconds. The check is below
+the 4-second p95 ceiling but does not establish the 2-second median; the link
+remains over 30 seconds. The eleven-document smoke preserved aggregate output
+`ea4531f8...b109d` at 474.6 pages/second, and misalignment rejection passed.
+Whole-project production is 125,890 lines and LPP production is 30,810, both
+below their frozen baselines; separate test/authored and subrepo-pin failures
+remain red and are not relabelled as source-budget successes.
 
 The eleven-document smoke gate remains the edit-loop check: 401 pages across
 all five jurisdictions and manually audited document shapes, with startup,

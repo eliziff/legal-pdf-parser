@@ -4232,52 +4232,13 @@ pub fn derive(pages: &mut [Page], separators: &[Option<f64>]) -> Result<Structur
     Ok(derive_prepared(pages, diagnostics))
 }
 
-pub(crate) fn rebuild_document(document: &mut crate::LegalDocument) -> Result<()> {
-    let derived = derive_prepared(&mut document.pages, Vec::new());
-    let mut structural = document
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            !matches!(
-                diagnostic.code.as_str(),
-                "FOOTNOTE_UNMATCHED_LABEL"
-                    | "FOOTNOTE_UNMATCHED_REFERENCE"
-                    | "PRINTED_PAGE_LABEL_AMBIGUOUS"
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    structural.extend(assign_printed_page_labels(&mut document.pages));
-    structural.extend(derived.diagnostics);
-    document.paragraphs = derived.paragraphs;
-    document.sections = derived.sections;
-    document.footnotes = derived.footnotes;
-    document.diagnostics = structural;
-    document
-        .metadata
-        .insert("pairing".to_owned(), derived.pairing_summary);
-    document.status = status(&document.diagnostics, &document.pages);
-    validate_document(document)
-}
-
 pub fn replay(pages: &mut [Page], separators: &[Option<f64>]) -> Result<StructureReplay> {
     validate_input(pages, separators)?;
     crate::profile::begin();
-    let started = std::time::Instant::now();
     let diagnostics = prepare_pages(pages, separators);
-    let prepared = started.elapsed();
     let prepared_pages = pages.to_vec();
-    let cloned = started.elapsed();
     let derived = derive_prepared(pages, diagnostics);
     crate::profile::end();
-    if std::env::var_os("LEGALPDF_PROFILE_REPLAY").is_some() {
-        eprintln!(
-            "REPLAY_PROFILE prepare={:.6} clone={:.6} derive={:.6}",
-            prepared.as_secs_f64(),
-            (cloned - prepared).as_secs_f64(),
-            (started.elapsed() - cloned).as_secs_f64(),
-        );
-    }
     Ok(StructureReplay {
         prepared_pages,
         derived,
@@ -4540,10 +4501,6 @@ pub(crate) fn validate_document(document: &LegalDocument) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn validate_pages(pages: &[Page]) -> Result<()> {
-    validate_page_records(pages).map(|_| ())
 }
 
 #[cfg(test)]
