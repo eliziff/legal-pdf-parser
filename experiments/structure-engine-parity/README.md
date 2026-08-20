@@ -116,6 +116,18 @@ unchanged 1,000-pages/second gate failed. The brief qualification understated
 sustained heavy/light CPU contention, so no retry was used; future projections
 must keep the light lane busy for the entire measured heavy-lane wall.
 
+An attempted 3-heavy/8-light qualification was rejected without changing the
+harness. Its arithmetic input bound was 1,744,830,464 bytes, and adding two
+160 MiB slots to the prior conservative evidence bound yielded 1,908,065,280
+bytes, nominally below 2 GiB. In practice, all eleven heavy documents plus the
+160 largest light documents remained oversubscribed after four minutes, so the
+run was stopped. The qualifier buffered progress until completion; therefore
+zero of 171 documents have an admissible durable exact receipt from that run,
+and its actual completed count and aggregate peak are not recoverable. No raw
+output or temporary manifest survived, and no retry was made. Future targeted
+qualifiers must persist a bounded digest/peak receipt after each completed task
+and enforce a wall timeout before testing additional concurrency.
+
 Its one post-edit `cargo quick` took 2.759 seconds, fitting the 4-second p95
 ceiling but not proving the 2-second median. The reported 50.121-second release
 command was not a valid same-feature incremental link: it changed from the
