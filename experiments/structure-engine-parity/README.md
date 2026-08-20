@@ -31,8 +31,8 @@ python legal-pdf-parser\experiments\structure-engine-parity\harness.py --all-cac
 The all-cache acceptance lane covers all 748 successful native extraction
 caches. It reads their aligned page/line evidence directly into warmed Rust
 processes, digests exact pretty bytes, and keeps compact per-document receipts
-under `.tmp`. Heavy and light lanes overlap with two 128 MiB heavy batches and
-up to four 160 MiB light batches. `--fresh` ignores receipts and
+under `.tmp`. Heavy and light lanes overlap with three 128 MiB heavy batches
+and up to six 160 MiB light batches. `--fresh` ignores receipts and
 fails closed below 1,000 pages/second or above 30 seconds. Without `--fresh`,
 valid receipts resume interrupted work but never count as fresh speed proof.
 
@@ -96,15 +96,34 @@ while `serde_json` still owns escaping and float formatting. It kept the exact
 with a 466,767,872-byte peak working set.
 
 The direct scheduler caps each heavy uncompressed batch at 128 MiB and each
-light batch at 160 MiB. Two heavy and four light workers may overlap, giving a
-896 MiB explicit uncompressed-evidence bound; raw outputs remain forbidden.
+light batch at 160 MiB. Three heavy and six light workers may overlap, giving a
+1,409,286,144-byte explicit uncompressed-evidence bound; raw outputs remain
+forbidden. A fixed qualification of all eleven heavy documents plus the six
+largest light documents matched 17/17 outputs across 11,495 pages in 18.379
+seconds. Its measured aggregate controller-and-child peak was 1,258,016,768
+bytes; the frozen 25% evidence bound is 1,572,520,960 bytes, below the 2 GiB
+hard limit.
+
 The typed candidate passed the eleven-document smoke at 474.6 pages/second with
 the frozen `ea4531f8...b109d` aggregate output and rejected misaligned evidence.
-Its 1.44x heavy-case gain projects the prior roughly 48-second heavy lane to
-about 33 seconds, so no fresh 748-document run was spent or claimed. Its one
-post-edit `cargo quick` took 2.759 seconds and its incremental production-feature
-link took 50.121 seconds: the individual check fits the 4-second p95 bound, but
-the 2-second median is unproven and the 30-second link gate remains red.
+The qualifier's short light burst projected a 22.459-second full replay at
+1,100.1 pages/second, authorizing exactly one fresh full run. Candidate
+`76808ab0...6f2245` then matched 748/748 exact outputs (24,707 pages and
+7,803,025,160 output bytes), the frozen `eca681b3...0d9d3` aggregate hash, and
+misalignment rejection with no raw outputs. Replay took 27.044 seconds at
+913.6 pages/second (27.794 seconds total): the 30-second gate passed, but the
+unchanged 1,000-pages/second gate failed. The brief qualification understated
+sustained heavy/light CPU contention, so no retry was used; future projections
+must keep the light lane busy for the entire measured heavy-lane wall.
+
+Its one post-edit `cargo quick` took 2.759 seconds, fitting the 4-second p95
+ceiling but not proving the 2-second median. The reported 50.121-second release
+command was not a valid same-feature incremental link: it changed from the
+existing `fast-allocator,kraken,ocr,ppdoc,ppdoc-openvino` fingerprint to
+`kraken,ppdoc`, forcing about 42 seconds of library codegen in a cold feature
+namespace; executable object/link work was about 4 seconds. No build was
+rerun to manufacture a warmer result. Future build receipts must freeze the
+exact feature set before measuring the 30-second incremental-link contract.
 
 The frozen `0.3.0` binary (`85be89d2...075b4`) produced aggregate output SHA-256
 `ea4531f8...109d`. The baseline run replayed 802 page-passes in 2.737 seconds

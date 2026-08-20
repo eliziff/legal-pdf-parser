@@ -95,16 +95,39 @@ peak working set, down from 7.984 seconds. That 1.44x gain still projects the
 prior roughly 48-second heavy lane to about 33 seconds, so the required
 30-second projection was not met and no fresh 748-document run was claimed.
 
-The present overlapping scheduler bounds uncompressed evidence to 896 MiB
-(two 128 MiB heavy batches plus four 160 MiB light batches) and retains no raw
-output. Four-heavy concurrency remains prohibited until measured total peak
-memory, not merely input bytes, fits below 2 GiB.
+The present overlapping scheduler bounds uncompressed evidence to
+1,409,286,144 bytes (three 128 MiB heavy batches plus six 160 MiB light
+batches) and retains no raw output. A fixed 17-document qualification covering
+all eleven heavy documents and the six largest light documents matched every
+output across 11,495 pages in 18.379 seconds. The measured controller-and-child
+peak was 1,258,016,768 bytes; its frozen 25% evidence bound is 1,572,520,960
+bytes, below the 2 GiB hard limit. More concurrency remains prohibited until
+measured total peak memory, not merely input bytes, fits that limit.
 
-The typed candidate's one post-edit warm `cargo quick` took 2.759 seconds and
-its incremental production-feature link took 50.121 seconds. The check is below
-the 4-second p95 ceiling but does not establish the 2-second median; the link
-remains over 30 seconds. The eleven-document smoke preserved aggregate output
-`ea4531f8...b109d` at 474.6 pages/second, and misalignment rejection passed.
+The qualification's short light burst projected 22.459 seconds and 1,100.1
+pages/second, so it authorized exactly one fresh full run. Candidate
+`76808ab0...6f2245` matched 748/748 exact outputs over all 24,707 pages and
+7,803,025,160 pretty-output bytes, including aggregate hash
+`eca681b3...0d9d3`; misalignment rejection passed and no raw output was
+retained. Replay took 27.044 seconds at 913.6 pages/second (27.794 seconds
+total). Thus the 30-second gate passed but the unchanged 1,000-pages/second
+gate failed. The brief light qualification did not model sustained CPU
+contention with the heavy lane. No retry was made; future qualification must
+sustain representative light work for the complete measured heavy-lane wall.
+The 748 per-document receipts occupy 563,894 bytes; the compact failed-run
+receipt is 564,531 bytes and records the unweakened throughput failure.
+
+The typed candidate's one post-edit warm `cargo quick` took 2.759 seconds. It
+is below the 4-second p95 ceiling but does not establish the 2-second median.
+The 50.121-second release command switched feature fingerprints from the
+existing `fast-allocator,kraken,ocr,ppdoc,ppdoc-openvino` namespace to
+`kraken,ppdoc`; roughly 42 seconds was cold library codegen, while executable
+object/link work was about 4 seconds. It is therefore not a valid same-feature
+incremental-link metric, and no blind rebuild was used to replace it. Future
+build receipts must freeze the exact feature set before applying the 30-second
+incremental-link contract. The eleven-document smoke preserved aggregate
+output `ea4531f8...b109d` at 474.6 pages/second, and misalignment rejection
+passed.
 Whole-project production is 125,890 lines and LPP production is 30,810, both
 below their frozen baselines; separate test/authored and subrepo-pin failures
 remain red and are not relabelled as source-budget successes.
