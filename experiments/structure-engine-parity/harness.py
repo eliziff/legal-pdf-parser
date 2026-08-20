@@ -28,6 +28,9 @@ ALL_RECEIPTS = ROOT / ".tmp" / "structure-engine-parity-receipts"
 HEAVY_INPUT_BYTES = 20 * 1024 * 1024
 LIGHT_BATCH_BYTES = 160 * 1024 * 1024
 HEAVY_BATCH_BYTES = 128 * 1024 * 1024
+HEAVY_JOBS, LIGHT_JOBS = 3, 6
+QUALIFIED_PEAK_BYTES, PEAK_EVIDENCE_BOUND = 1_258_016_768, 1_572_520_960
+PEAK_HARD_LIMIT = 2 * 1024 * 1024 * 1024
 SAMPLE_PREFIXES = (
     "1887",  # audited Canadian closing submission; 159 pages and dense notes
     "52c",  # audited US court form
@@ -413,6 +416,7 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
     document_scan_seconds = validate_document_cache(wanted_sources)
     heavy = [row for row in sample if gzip_size(index[row["source_sha256"]]) > HEAVY_INPUT_BYTES]
     light = [row for row in sample if row not in heavy]
+    heavy_jobs, light_jobs = min(HEAVY_JOBS, args.jobs), min(LIGHT_JOBS, args.jobs)
     results = []
     failures = []
     batch_temporary = []
@@ -421,8 +425,8 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
         work = Path(temporary)
         misalignment_rejection(binary, work, min(index.values(), key=lambda path: path.stat().st_size))
         lanes = (
-            ([[row] for row in heavy], min(2, args.jobs), HEAVY_BATCH_BYTES),
-            (packed(light, index, LIGHT_BATCH_BYTES), args.jobs, LIGHT_BATCH_BYTES),
+            ([[row] for row in heavy], heavy_jobs, HEAVY_BATCH_BYTES),
+            (packed(light, index, LIGHT_BATCH_BYTES), light_jobs, LIGHT_BATCH_BYTES),
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [
@@ -484,8 +488,8 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
             "executed_pages": executed_pages,
             "executed_pages_per_second": round(executed_rate, 1) if executed_rate else None,
             "heavy_documents": len(heavy),
-            "jobs_heavy": min(2, args.jobs),
-            "jobs_light": args.jobs,
+            "jobs_heavy": heavy_jobs,
+            "jobs_light": light_jobs,
             "lines": sum(row["lines"] for row in results),
             "pages": sum(row["pages"] for row in results),
             "replay_wall_seconds": round(replay_wall, 3),
@@ -501,8 +505,11 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
             "max_uncompressed_batch_bytes_observed": max(batch_temporary, default=0),
             "raw_outputs_retained": 0,
             "uncompressed_input_bytes_in_flight_bound": (
-                min(2, args.jobs) * HEAVY_BATCH_BYTES + args.jobs * LIGHT_BATCH_BYTES
+                heavy_jobs * HEAVY_BATCH_BYTES + light_jobs * LIGHT_BATCH_BYTES
             ),
+            "qualified_peak_working_set_bytes": QUALIFIED_PEAK_BYTES,
+            "peak_working_set_evidence_bound_bytes": PEAK_EVIDENCE_BOUND,
+            "peak_working_set_hard_limit_bytes": PEAK_HARD_LIMIT,
         },
         "extraction_sha256": canonical_sha(
             [{"candidate_id": row["candidate_id"], "extraction_sha256": row["extraction_sha256"]} for row in results]
@@ -534,11 +541,9 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
                 "failures": failed_run.get("failures"),
                 "metrics": failed_run.get("metrics"),
             }
-    if failures or len(results) != len(sample):
+    failed = bool(failures or len(results) != len(sample))
+    if failed:
         atomic_json(ALL_RECEIPTS / binary_sha / "failed-run.json", report)
-        raise AssertionError(f"all-cache parity failed: {len(results)}/{len(sample)} complete; {failures[:3]}")
-    if args.freeze:
-        ALL_BASELINE.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     receipt_files = list((ALL_RECEIPTS / binary_sha).glob("*.json"))
     summary = {
         "binary_sha256": binary_sha,
@@ -551,11 +556,15 @@ def all_cache_execute(args: argparse.Namespace) -> dict:
         "receipt_files": len(receipt_files),
         "source_sha256": report["source_sha256"],
         "sample_sha256": report["sample_sha256"],
-        "status": "PASS",
+        "status": "FAIL" if failed else "PASS",
     }
     if ALL_BASELINE.is_file():
         summary["baseline_bytes"] = ALL_BASELINE.stat().st_size
     print(json.dumps(summary, indent=2), flush=True)
+    if failed:
+        raise AssertionError(f"all-cache parity failed: {len(results)}/{len(sample)} complete; {failures[:3]}")
+    if args.freeze:
+        ALL_BASELINE.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 
@@ -646,6 +655,7 @@ def execute(args: argparse.Namespace) -> dict:
 
 
 def self_test() -> None:
+    assert QUALIFIED_PEAK_BYTES < PEAK_EVIDENCE_BOUND < PEAK_HARD_LIMIT
     assert percentile([3.0, 1.0, 2.0], 0.95) == 3.0
     assert canonical_sha({"b": 2, "a": 1}) == canonical_sha({"a": 1, "b": 2})
     assert comparable({"sample_sha256": "s", "documents": [{
@@ -661,7 +671,7 @@ def main() -> int:
     parser.add_argument("--all-cache", action="store_true", help="gate every cached native document")
     parser.add_argument("--freeze", action="store_true", help="replace the frozen byte-hash baseline")
     parser.add_argument("--repetitions", type=int, default=2)
-    parser.add_argument("--jobs", type=int, default=min(4, max(1, (os.cpu_count() or 2) - 1)))
+    parser.add_argument("--jobs", type=int, default=min(LIGHT_JOBS, max(1, (os.cpu_count() or 2) - 1)))
     parser.add_argument("--startup-runs", type=int, default=7)
     parser.add_argument("--max-startup-ms", type=float, default=100.0)
     parser.add_argument("--max-temp-mib-per-document", type=float, default=128.0)
