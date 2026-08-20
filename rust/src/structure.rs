@@ -1,3 +1,5 @@
+//! Shared structure derivation for aligned page and line evidence.
+
 use crate::error::{Error, Result};
 use crate::model::{
     Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Section, Span,
@@ -28,7 +30,7 @@ struct LabelPrefix {
     end: usize,
 }
 
-pub(crate) struct Derived {
+pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
     pub sections: Vec<Section>,
     pub footnotes: Vec<Footnote>,
@@ -38,9 +40,9 @@ pub(crate) struct Derived {
     pub pairing_summary: Value,
 }
 
-pub(crate) struct ReplayDerived {
+pub struct StructureReplay {
     pub prepared_pages: Vec<Page>,
-    pub derived: Derived,
+    pub derived: StructureOutput,
 }
 
 fn normalize_label(value: &str) -> String {
@@ -4185,7 +4187,7 @@ pub(crate) fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> V
     diagnostics
 }
 
-fn derive_prepared(pages: &mut [Page], mut diagnostics: Vec<Diagnostic>) -> Derived {
+fn derive_prepared(pages: &mut [Page], mut diagnostics: Vec<Diagnostic>) -> StructureOutput {
     crate::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
     diagnostics.extend(crate::profile::measure("derive.text_flow", || {
         text_flow_faults(pages)
@@ -4208,7 +4210,7 @@ fn derive_prepared(pages: &mut [Page], mut diagnostics: Vec<Diagnostic>) -> Deri
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
     let sections = crate::profile::measure("derive.sections", || build_sections(&paragraphs));
-    Derived {
+    StructureOutput {
         paragraphs,
         sections,
         footnotes,
@@ -4219,9 +4221,10 @@ fn derive_prepared(pages: &mut [Page], mut diagnostics: Vec<Diagnostic>) -> Deri
     }
 }
 
-pub(crate) fn derive(pages: &mut [Page], separators: &[Option<f64>]) -> Derived {
+pub fn derive(pages: &mut [Page], separators: &[Option<f64>]) -> Result<StructureOutput> {
+    validate_input(pages, separators)?;
     let diagnostics = prepare_pages(pages, separators);
-    derive_prepared(pages, diagnostics)
+    Ok(derive_prepared(pages, diagnostics))
 }
 
 pub(crate) fn rebuild_document(document: &mut crate::LegalDocument) -> Result<()> {
@@ -4252,7 +4255,8 @@ pub(crate) fn rebuild_document(document: &mut crate::LegalDocument) -> Result<()
     validate_document(document)
 }
 
-pub(crate) fn replay_derive(pages: &mut [Page], separators: &[Option<f64>]) -> ReplayDerived {
+pub fn replay(pages: &mut [Page], separators: &[Option<f64>]) -> Result<StructureReplay> {
+    validate_input(pages, separators)?;
     crate::profile::begin();
     let started = std::time::Instant::now();
     let diagnostics = prepare_pages(pages, separators);
@@ -4269,10 +4273,18 @@ pub(crate) fn replay_derive(pages: &mut [Page], separators: &[Option<f64>]) -> R
             (started.elapsed() - cloned).as_secs_f64(),
         );
     }
-    ReplayDerived {
+    Ok(StructureReplay {
         prepared_pages,
         derived,
-    }
+    })
+}
+
+fn validate_input(pages: &[Page], separators: &[Option<f64>]) -> Result<()> {
+    (separators.len() == pages.len())
+        .then_some(())
+        .ok_or_else(|| {
+            Error::Message("common input must contain one separator value per page".to_owned())
+        })
 }
 
 pub(crate) fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {

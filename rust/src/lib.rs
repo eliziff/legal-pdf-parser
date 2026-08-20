@@ -31,7 +31,7 @@ mod profile;
 mod projection;
 mod separator;
 mod storage;
-mod structure;
+pub mod structure;
 #[cfg(feature = "kraken")]
 mod tesseract_layout;
 
