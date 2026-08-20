@@ -29,10 +29,10 @@ python legal-pdf-parser\experiments\structure-engine-parity\harness.py --all-cac
 ```
 
 The all-cache acceptance lane covers all 748 successful native extraction
-caches. It groups common inputs into warmed processes, digests exact pretty
-bytes in Rust, and keeps compact per-document receipts under `.tmp`. Heavy
-batches run at no more than two at once with a 1 GiB ceiling; light batches use
-the requested job count with a 160 MiB ceiling. `--fresh` ignores receipts and
+caches. It reads their aligned page/line evidence directly into warmed Rust
+processes, digests exact pretty bytes, and keeps compact per-document receipts
+under `.tmp`. Heavy and light lanes overlap with two 128 MiB heavy batches and
+up to four 160 MiB light batches. `--fresh` ignores receipts and
 fails closed below 1,000 pages/second or above 30 seconds. Without `--fresh`,
 valid receipts resume interrupted work but never count as fresh speed proof.
 
@@ -75,6 +75,27 @@ memoizing repeated x-window page counts reduced preparation from 5.282 to
 0.325 seconds and candidate replay from 11.592 to 4.074 seconds without a byte
 change. A broader repeated-anchor skip changed one of 748 outputs and was
 rejected before this final run; it is not in production.
+
+The next batch path consumes the frozen gzip extraction cache directly and
+binds receipts to those exact compressed bytes; it no longer writes or reparses
+the 1.478 GB synthetic common-input JSON. The bounded candidate
+(`ae4c6a7c...145e5`) kept the worst 1,401-page output byte-identical at
+`ad7ebccc...ec7d` and passed the eleven-document smoke at 409.0 pages/second
+with aggregate output `ea4531f8...b109d`. The heavy case took 7.984 seconds,
+versus 9.874 seconds for the former Python materialization plus Rust replay.
+That 1.24x gain projects the heavy lane at roughly 48 seconds even with the
+light lane overlapped, so no fresh 748-document run was spent or claimed. The
+remaining route to 30 seconds is streaming the exact recursively sorted pretty
+output without a whole-document JSON value, reducing peak memory enough to run
+more than two heavy documents safely.
+
+The direct scheduler caps each heavy uncompressed batch at 128 MiB and each
+light batch at 160 MiB. Two heavy and four light workers may overlap, giving a
+896 MiB explicit uncompressed-evidence bound; raw outputs remain forbidden. A
+true no-edit `cargo quick` took 3.224 seconds and the post-edit check took 2.221
+seconds. Both fit the 4-second p95 ceiling as individual samples but neither
+proves the 2-second median. The production-feature link took 44.24 seconds and
+still fails its 30-second ceiling.
 
 The frozen `0.3.0` binary (`85be89d2...075b4`) produced aggregate output SHA-256
 `ea4531f8...109d`. The baseline run replayed 802 page-passes in 2.737 seconds
