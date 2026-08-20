@@ -117,6 +117,19 @@ sustain representative light work for the complete measured heavy-lane wall.
 The 748 per-document receipts occupy 563,894 bytes; the compact failed-run
 receipt is 564,531 bytes and records the unweakened throughput failure.
 
+A subsequent 3-heavy/8-light qualification was disqualified and did not alter
+the harness. Three 128 MiB plus eight 160 MiB input slots total 1,744,830,464
+bytes; extending the qualified conservative bound by two light slots gives
+1,908,065,280 bytes, below 2 GiB only under the unproven assumption that each
+extra worker costs no more than its input cap. The fixed workload—eleven heavy
+documents and the 160 largest light documents—was still running after four
+minutes and was stopped for oversubscription. Its controller wrote results
+only at successful completion, so the exact durable completed denominator is
+0/171; actual completion and aggregate peak are unavailable and must not be
+inferred. Cleanup left no raw output or temporary manifests. No retry or full
+run followed. Before another concurrency experiment, the bounded qualifier
+must append per-task digest/progress/peak receipts and enforce a wall timeout.
+
 The typed candidate's one post-edit warm `cargo quick` took 2.759 seconds. It
 is below the 4-second p95 ceiling but does not establish the 2-second median.
 The 50.121-second release command switched feature fingerprints from the
