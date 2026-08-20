@@ -1,11 +1,12 @@
 use crate::engine::{parse_pdf, ParseOptions};
 #[cfg(feature = "kraken")]
 use crate::KrakenOptions;
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use crate::PPDocOptions;
-use crate::{
-    source_doc, structure_lookup, Error, OcrOptions, Result, TesseractOptions, PARSER_VERSION,
-};
+use crate::{source_doc, structure_lookup, Error, Result, PARSER_VERSION};
+#[cfg(feature = "ocr")]
+use crate::{OcrOptions, TesseractOptions};
+use legal_pdf_extraction::inspect_pdf;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -120,6 +121,7 @@ fn parse_options(value: &Value, operation: &str) -> Result<ParseOptions> {
         ..ParseOptions::default()
     };
 
+    #[cfg(feature = "ocr")]
     if let Some((provider, settings)) = provider_spec(value, "ocr")? {
         options.ocr = match provider.as_str() {
             "tesseract" => {
@@ -190,6 +192,12 @@ fn parse_options(value: &Value, operation: &str) -> Result<ParseOptions> {
             }
         };
     }
+    #[cfg(not(feature = "ocr"))]
+    if value.get("ocr").is_some() {
+        return Err(Error::Message(
+            "this legalpdf binary was built without the `ocr` feature".to_owned(),
+        ));
+    }
 
     if let Some((provider, settings)) = provider_spec(value, "layout")? {
         if provider != "ppdoc" {
@@ -214,11 +222,11 @@ fn parse_options(value: &Value, operation: &str) -> Result<ParseOptions> {
                 "expected_identity",
             ],
         )?;
-        #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
         {
             options.ppdoc = Some(serde_json::from_value::<PPDocOptions>(settings)?);
         }
-        #[cfg(not(any(feature = "ppdoc", feature = "ppdoc-openvino")))]
+        #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
         {
             return Err(Error::Message(
                 "layout requires a legalpdf binary built with a layout feature".to_owned(),
@@ -247,10 +255,10 @@ fn validate_selected_pages(value: &Value, selected: Option<&[usize]>, count: usi
         .get("locator")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Message("page lookup has no exact page locator".to_owned()))?;
-    let inline = crate::projection::numeric_range("page", locator);
+    let inline = legal_pdf_support::numeric_range("page", locator);
     let start = inline
         .map(|range| range.0)
-        .or_else(|| crate::projection::parse_ordinal("page", locator))
+        .or_else(|| legal_pdf_support::parse_ordinal("page", locator))
         .ok_or_else(|| Error::Message("page lookup has no exact page locator".to_owned()))?;
     let end = query
         .get("end_locator")
@@ -258,7 +266,7 @@ fn validate_selected_pages(value: &Value, selected: Option<&[usize]>, count: usi
         .map(|value| {
             value
                 .as_str()
-                .and_then(|locator| crate::projection::parse_ordinal("page", locator))
+                .and_then(|locator| legal_pdf_support::parse_ordinal("page", locator))
                 .ok_or_else(|| Error::Message("page lookup has no exact end locator".to_owned()))
         })
         .transpose()?
@@ -318,8 +326,7 @@ fn inspect_request(value: &Value) -> Result<Value> {
     {
         return Err(Error::Message("input must be a PDF".to_owned()));
     }
-    let inspection = pdf_inspector::detector::detect_pdf_type(path)
-        .map_err(|error| Error::Message(format!("PDF inspection failed: {error}")))?;
+    let inspection = inspect_pdf(path)?;
     let sha256 = source_hash(path)?;
     Ok(json!({
         "schema_version": RESULT_SCHEMA,
@@ -333,7 +340,7 @@ fn inspect_request(value: &Value) -> Result<Value> {
         },
         "result": {
             "page_count": inspection.page_count,
-            "pdf_type": format!("{:?}", inspection.pdf_type),
+            "pdf_type": inspection.pdf_type,
             "confidence": inspection.confidence,
             "pages_needing_ocr": inspection.pages_needing_ocr
                 .iter()

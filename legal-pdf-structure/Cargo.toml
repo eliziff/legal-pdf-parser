@@ -1,0 +1,11 @@
+[package]
+name = "legal-pdf-structure"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-support = { path = "../legal-pdf-support" }
+regex = "1.11"
+serde_json = "1.0"

@@ -569,27 +569,133 @@ dependencies = [
 ]
 
 [[package]]
-name = "legal-pdf-parser"
+name = "legal-pdf-core"
 version = "0.1.0"
 dependencies = [
- "cc",
- "fancy-regex",
  "flate2",
- "hayro",
- "image",
- "libloading",
- "lopdf",
- "mimalloc",
  "ort",
- "pdf-inspector",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "legal-pdf-extraction"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-extraction-processor",
+ "pdf-inspector-fidelity",
+]
+
+[[package]]
+name = "legal-pdf-extraction-processor"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "lopdf",
+ "pdf-inspector-core",
+ "pdf-inspector-detector",
+ "pdf-inspector-loader",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "legal-pdf-language"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "legal-pdf-core",
  "quick-xml",
  "regex",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
- "unicode-normalization",
  "zip",
+]
+
+[[package]]
+name = "legal-pdf-ocr"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "hayro",
+ "image",
+ "legal-pdf-core",
+ "libloading",
+ "ort",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "legal-pdf-pairing"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-support",
+ "legal-structure",
+ "regex",
+ "serde_json",
+]
+
+[[package]]
+name = "legal-pdf-parser"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-extraction",
+ "legal-pdf-language",
+ "legal-pdf-ocr",
+ "legal-pdf-pairing",
+ "legal-pdf-structure",
+ "legal-pdf-support",
+ "legal-structure",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "legal-pdf-structure"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-support",
+ "regex",
+ "serde_json",
+]
+
+[[package]]
+name = "legal-pdf-support"
+version = "0.1.0"
+dependencies = [
+ "hayro",
+ "image",
+ "legal-pdf-core",
+ "libloading",
+ "ort",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "legal-structure"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -792,18 +898,117 @@ dependencies = [
 ]
 
 [[package]]
-name = "pdf-inspector"
+name = "pdf-inspector-cid-signal"
+version = "1.14.0"
+dependencies = [
+ "lopdf",
+]
+
+[[package]]
+name = "pdf-inspector-core"
+version = "1.14.0"
+dependencies = [
+ "unicode-normalization",
+]
+
+[[package]]
+name = "pdf-inspector-detector"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "lopdf",
+ "pdf-inspector-cid-signal",
+ "pdf-inspector-loader",
+ "ttf-parser",
+]
+
+[[package]]
+name = "pdf-inspector-fidelity"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "lopdf",
+ "pdf-inspector-core",
+ "pdf-inspector-detector",
+ "pdf-inspector-fonts",
+ "pdf-inspector-layout",
+ "pdf-inspector-loader",
+ "pdf-inspector-tables",
+ "ttf-parser",
+]
+
+[[package]]
+name = "pdf-inspector-fonts"
 version = "1.14.0"
 dependencies = [
  "include_dir",
  "log",
  "lopdf",
- "once_cell",
- "rayon",
- "regex",
- "thiserror",
+ "pdf-inspector-cid-signal",
+ "pdf-inspector-core",
  "ttf-parser",
- "unicode-normalization",
+]
+
+[[package]]
+name = "pdf-inspector-layout"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "pdf-inspector-core",
+]
+
+[[package]]
+name = "pdf-inspector-loader"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "lopdf",
+ "thiserror",
+]
+
+[[package]]
+name = "pdf-inspector-table-heuristic"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "pdf-inspector-core",
+ "pdf-inspector-table-kernel",
+]
+
+[[package]]
+name = "pdf-inspector-table-kernel"
+version = "1.14.0"
+dependencies = [
+ "pdf-inspector-core",
+]
+
+[[package]]
+name = "pdf-inspector-table-lines"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "pdf-inspector-core",
+ "pdf-inspector-table-kernel",
+]
+
+[[package]]
+name = "pdf-inspector-table-rects"
+version = "1.14.0"
+dependencies = [
+ "log",
+ "pdf-inspector-core",
+ "pdf-inspector-table-kernel",
+]
+
+[[package]]
+name = "pdf-inspector-tables"
+version = "1.14.0"
+dependencies = [
+ "pdf-inspector-core",
+ "pdf-inspector-table-heuristic",
+ "pdf-inspector-table-kernel",
+ "pdf-inspector-table-lines",
+ "pdf-inspector-table-rects",
 ]
 
 [[package]]

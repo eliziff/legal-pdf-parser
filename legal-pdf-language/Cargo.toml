@@ -1,0 +1,16 @@
+[package]
+name = "legal-pdf-language"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+fancy-regex = "0.19"
+quick-xml = "0.41"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+zip = { version = "=8.2.0", default-features = false, features = ["deflate-flate2"] }
