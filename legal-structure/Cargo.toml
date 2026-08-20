@@ -7,6 +7,9 @@ license = "MIT"
 [features]
 default = []
 recovery = ["dep:regex"]
+source-doc = []
+a2aj = ["recovery", "source-doc"]
+journal = ["source-doc"]
 
 [dependencies]
 regex = { version = "1.11", optional = true }

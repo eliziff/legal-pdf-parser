@@ -44,4 +44,4 @@ pub use legal_pdf_support::{
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
-pub use structure_engine::{EvidenceError, StructureEvidenceV1, StructureGraphV1};
+pub use structure_engine::{DocumentInput, EvidenceError, StructureGraphV1};

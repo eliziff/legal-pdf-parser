@@ -7,7 +7,7 @@ use legal_pdf_core::model::{
 #[cfg(feature = "pdf")]
 use serde_json::{Map, Value};
 
-pub use legal_structure::{EngineError as EvidenceError, StructureEvidenceV1, StructureGraphV1};
+pub use legal_structure::{DocumentInput, EngineError as EvidenceError, StructureGraphV1};
 
 #[cfg(feature = "pdf")]
 #[derive(Debug)]
