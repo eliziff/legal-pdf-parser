@@ -5,7 +5,7 @@ use crate::pdf::{extract_pdf, ExtractedPdf};
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 use crate::ppdoc::{PPDocLayout, PPDocOptions};
 use crate::storage::{read_gzip_json, write_gzip_json, write_json};
-use crate::structure::{derive, replay_derive, status, validate_document};
+use crate::structure::{derive, replay, status, validate_document};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -276,7 +276,7 @@ fn build_document(
     let (ocr_provider, layout_variant, layout_identity) = providers;
     let provider_name = ocr_provider.map(OcrProvider::name).map(str::to_owned);
     let provider_identity = ocr_provider.map(OcrProvider::identity).map(str::to_owned);
-    let derived = derive(&mut extracted.pages, &extracted.separators);
+    let derived = derive(&mut extracted.pages, &extracted.separators)?;
     extracted.diagnostics.extend(derived.diagnostics);
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), Value::Object(extracted.metadata));
@@ -557,18 +557,9 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
 
 #[doc(hidden)]
 pub fn extract_common_input(path: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<PathBuf> {
-    extract_layout_input(path, output, None)
-}
-
-fn extract_layout_input(
-    path: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-    ocr: Option<&OcrOptions>,
-) -> Result<PathBuf> {
     let path = path.as_ref();
     let source_hash = sha256_file(path)?;
-    let mut ocr_provider = ocr.map(OcrProvider::new).transpose()?;
-    let extracted = extract_pdf(path, ocr_provider.as_mut(), None)?;
+    let extracted = extract_pdf(path, None, None)?;
     let value = json!({
         "schema_version": "legalpdf.common-input.v1",
         "source_name": path.file_name().map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
@@ -605,15 +596,10 @@ pub fn replay_common_input(input: impl AsRef<Path>, output: impl AsRef<Path>) ->
             common.schema_version
         )));
     }
-    if common.separators.len() != common.pages.len() {
-        return Err(Error::Message(
-            "common input must contain one separator value per page".to_owned(),
-        ));
-    }
     let document_token = common.source_sha256.get(..20).ok_or_else(|| {
         Error::Message("common input source_sha256 is not a SHA-256 digest".to_owned())
     })?;
-    let replay = replay_derive(&mut common.pages, &common.separators);
+    let replay = replay(&mut common.pages, &common.separators)?;
     let document = LegalDocument {
         document_id: format!("doc-{document_token}"),
         source_name: common.source_name,

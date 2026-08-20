@@ -12,40 +12,15 @@ fn usage() -> &'static str {
     "usage:\n  legalpdf contract <request.json>\n  legalpdf --version"
 }
 
-fn take_value(arguments: &[String], index: &mut usize, option: &str) -> Result<String> {
-    *index += 1;
-    arguments
-        .get(*index)
-        .cloned()
-        .ok_or_else(|| Error::Message(format!("{option} requires a value")))
-}
-
 fn hidden_output(arguments: &[String], command: &str) -> Result<(PathBuf, PathBuf)> {
-    let input = arguments
-        .first()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::Message(format!("{command} requires an input")))?;
-    let mut output = None;
-    let mut index = 1;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--output" => {
-                output = Some(PathBuf::from(take_value(
-                    arguments, &mut index, "--output",
-                )?))
-            }
-            option => {
-                return Err(Error::Message(format!(
-                    "unknown {command} option: {option}"
-                )))
-            }
+    match arguments {
+        [input, option, output] if option == "--output" => {
+            Ok((PathBuf::from(input), PathBuf::from(output)))
         }
-        index += 1;
+        _ => Err(Error::Message(format!(
+            "{command} requires <input> --output <path>"
+        ))),
     }
-    Ok((
-        input,
-        output.ok_or_else(|| Error::Message(format!("{command} requires --output <path>")))?,
-    ))
 }
 
 fn parity_extract_command(arguments: &[String]) -> Result<i32> {
@@ -59,6 +34,28 @@ fn parity_replay_command(arguments: &[String]) -> Result<i32> {
     let (input, output) = hidden_output(arguments, "_parity-replay")?;
     let path = replay_common_input(input, output)?;
     println!("{}", serde_json::to_string(&json!({"result": path}))?);
+    Ok(0)
+}
+
+fn parity_replay_batch_command(arguments: &[String]) -> Result<i32> {
+    let [manifest] = arguments else {
+        return Err(Error::Message(
+            "_parity-replay-batch requires <manifest.json>".to_owned(),
+        ));
+    };
+    let path = PathBuf::from(manifest);
+    let bytes = std::fs::read(&path).map_err(|source| Error::io(&path, source))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Error::Message("replay manifest exceeds 1 MiB".to_owned()));
+    }
+    let jobs: Vec<[PathBuf; 2]> = serde_json::from_slice(&bytes)?;
+    for (index, batch) in jobs.chunks(25).enumerate() {
+        for [input, output] in batch {
+            replay_common_input(input, output)?;
+        }
+        let completed = ((index + 1) * 25).min(jobs.len());
+        eprintln!("replayed {completed}/{}", jobs.len());
+    }
     Ok(0)
 }
 
@@ -172,6 +169,7 @@ fn run() -> Result<i32> {
         "contract" => contract_command(rest),
         "_parity-extract" => parity_extract_command(rest),
         "_parity-replay" => parity_replay_command(rest),
+        "_parity-replay-batch" => parity_replay_batch_command(rest),
         "--version" | "-V" => {
             println!("legalpdf {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
