@@ -1,0 +1,8 @@
+[package]
+name = "pdf-inspector-core"
+version = "1.14.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+unicode-normalization = "0.1"

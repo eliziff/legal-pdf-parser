@@ -1,0 +1,16 @@
+[package]
+name = "legal-pdf-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = []
+ort-runtime = ["dep:ort"]
+
+[dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

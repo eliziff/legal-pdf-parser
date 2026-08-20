@@ -1,63 +1,47 @@
-mod adapters;
-mod codex;
+#[cfg(feature = "pdf")]
 mod contract;
-mod deterministic_citations;
-mod docx;
+#[cfg(feature = "pdf")]
 mod engine;
-mod error;
-mod grammar_tables;
-mod grammar_word;
-#[cfg(feature = "kraken")]
-mod kraken;
-#[cfg(feature = "kraken")]
-mod kraken_process;
-mod lookup;
-mod model;
-mod ocr;
-#[cfg(any(feature = "kraken", feature = "ppdoc", feature = "ppdoc-openvino"))]
-mod ort_backend;
-#[cfg(any(feature = "kraken", feature = "ppdoc"))]
-mod ort_runtime;
-mod pairing;
-mod pairing_support;
-mod pdf;
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-mod ppdoc;
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-mod ppdoc_openvino;
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-mod ppdoc_postprocess;
-mod profile;
-mod projection;
-mod separator;
-mod storage;
+#[cfg(feature = "pdf")]
 pub mod structure;
-#[cfg(feature = "kraken")]
-mod tesseract_layout;
+mod structure_engine;
 
-pub use adapters::{to_alr_payload, to_toa_text_units};
+#[cfg(all(feature = "profiling", feature = "fast-allocator"))]
+compile_error!("profiling and fast-allocator cannot select two global allocators");
+
+#[cfg(feature = "pdf")]
 pub use contract::document_request;
-pub use deterministic_citations::{
-    extract_fields as extract_citation_fields, split_footnote as split_citations,
-    split_footnote_recall_first as split_citations_recall_first, DeterministicFields,
-    DeterministicPart, DeterministicSplit,
-};
-pub use docx::{
-    apply_docx_links, assess_docx_route, deterministic_docx_intents, extract_docx_gold,
-    plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
-};
+#[cfg(feature = "pdf")]
 #[doc(hidden)]
 pub use engine::digest_cached_extraction;
-pub use error::{Error, Result};
-pub use grammar_tables::{compile_table_entry, load_tables, run_vectors as run_grammar_vectors};
+#[cfg(feature = "pdf")]
+pub use legal_pdf_core::model::*;
+#[cfg(feature = "pdf")]
+pub use legal_pdf_core::{Error, Result};
+#[cfg(feature = "language")]
+pub use legal_pdf_language::{
+    apply_docx_links, assess_docx_route, compile_table_entry, deterministic_docx_intents,
+    extract_docx_gold, load_tables, plan_docx_links, plan_footnotes, run_grammar_vectors,
+    validate_docx_response, DocxPlanOptions,
+};
+#[cfg(feature = "language")]
+pub use legal_pdf_language::{
+    extract_citation_fields, split_citations, split_citations_recall_first, DeterministicFields,
+    DeterministicPart, DeterministicSplit,
+};
 #[cfg(feature = "kraken")]
-pub use kraken::{
+pub use legal_pdf_ocr::{
     KrakenBackend, KrakenBatchDiagnostics, KrakenBatchPerformance, KrakenImageDiagnostics,
     KrakenLayout, KrakenOcr, KrakenOptions, KrakenTier,
 };
-pub use lookup::lookup_footnote;
-pub use model::*;
-pub use ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord, TesseractOcr, TesseractOptions};
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
-pub use projection::{source_doc, structure_lookup};
+#[cfg(feature = "ocr")]
+pub use legal_pdf_ocr::{
+    OcrLine, OcrOptions, OcrProvider, OcrWord, TesseractOcr, TesseractOptions,
+};
+#[cfg(feature = "pdf")]
+pub use legal_pdf_support::{
+    lookup_footnote, source_doc, structure_lookup, to_alr_payload, to_toa_text_units,
+};
+#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
+pub use structure_engine::{EvidenceError, StructureEvidenceV1, StructureGraphV1};

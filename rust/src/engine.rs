@@ -1,14 +1,15 @@
-use crate::error::{Error, Result};
-use crate::model::{
+use crate::structure::{derive, status, validate_document};
+use crate::structure_engine::{derive_pdf_pages, PdfReplayProjection};
+use legal_pdf_core::model::{
     Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Section, Span, Word,
     PARSER_VERSION, SCHEMA_VERSION,
 };
-use crate::ocr::{OcrOptions, OcrProvider};
-use crate::pdf::{extract_pdf, ExtractedPdf};
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-use crate::ppdoc::{PPDocLayout, PPDocOptions};
-use crate::storage::{read_gzip_json, write_gzip_json};
-use crate::structure::{derive, replay, status, validate_document};
+use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
+use legal_pdf_extraction::{extract_pdf, ExtractedPdf};
+#[cfg(feature = "ocr")]
+use legal_pdf_ocr::{OcrOptions, OcrProvider};
+#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -34,11 +35,12 @@ struct CachedExtraction {
 pub(crate) struct ParseOptions {
     pub cache_dir: Option<PathBuf>,
     pub use_cache: bool,
+    #[cfg(feature = "ocr")]
     pub ocr: Option<OcrOptions>,
     /// Zero-based pages eligible for OCR. Native extraction still inspects the
     /// complete PDF so physical page numbering stays authoritative.
     pub ocr_pages: Option<Vec<usize>>,
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     pub ppdoc: Option<PPDocOptions>,
 }
 
@@ -47,9 +49,10 @@ impl Default for ParseOptions {
         Self {
             cache_dir: None,
             use_cache: true,
+            #[cfg(feature = "ocr")]
             ocr: None,
             ocr_pages: None,
-            #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
             ppdoc: None,
         }
     }
@@ -89,51 +92,16 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn insert_digests(identity: &mut BTreeMap<String, Value>, digests: &[(&str, &str)]) {
+    for (name, digest) in digests {
+        identity.insert((*name).to_owned(), Value::String((*digest).to_owned()));
+    }
+}
+
 fn engine_identity() -> Value {
     static IDENTITY: OnceLock<Value> = OnceLock::new();
     IDENTITY
         .get_or_init(|| {
-            let sources: &[(&str, &[u8])] = &[
-                ("engine.rs", include_bytes!("engine.rs")),
-                ("grammar_tables.rs", include_bytes!("grammar_tables.rs")),
-                ("grammar_word.rs", include_bytes!("grammar_word.rs")),
-                #[cfg(feature = "kraken")]
-                ("kraken.rs", include_bytes!("kraken.rs")),
-                ("model.rs", include_bytes!("model.rs")),
-                ("ocr.rs", include_bytes!("ocr.rs")),
-                #[cfg(any(feature = "kraken", feature = "ppdoc"))]
-                ("ort_runtime.rs", include_bytes!("ort_runtime.rs")),
-                ("pairing.rs", include_bytes!("pairing.rs")),
-                ("pairing_support.rs", include_bytes!("pairing_support.rs")),
-                ("pdf.rs", include_bytes!("pdf.rs")),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                ("ppdoc.rs", include_bytes!("ppdoc.rs")),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                (
-                    "ppdoc_postprocess.rs",
-                    include_bytes!("ppdoc_postprocess.rs"),
-                ),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                ("ppdoc_openvino.rs", include_bytes!("ppdoc_openvino.rs")),
-                ("separator.rs", include_bytes!("separator.rs")),
-                ("storage.rs", include_bytes!("storage.rs")),
-                ("structure.rs", include_bytes!("structure.rs")),
-                #[cfg(feature = "kraken")]
-                ("tesseract_layout.rs", include_bytes!("tesseract_layout.rs")),
-                (
-                    "data/mcgill_reporters.json",
-                    include_bytes!("../../data/mcgill_reporters.json"),
-                ),
-                (
-                    "data/legal-grammar-tables/grammar-corpus.json",
-                    include_bytes!("../../data/legal-grammar-tables/grammar-corpus.json"),
-                ),
-                ("Cargo.lock", include_bytes!("../../Cargo.lock")),
-                (
-                    "pdf-inspector/.cargo_vcs_info.json",
-                    include_bytes!("../../vendor/pdf-inspector/.cargo_vcs_info.json"),
-                ),
-            ];
             let mut identity = BTreeMap::from([
                 (
                     "engine".to_owned(),
@@ -160,12 +128,167 @@ fn engine_identity() -> Value {
                     }),
                 ),
             ]);
-            for (name, bytes) in sources {
-                identity.insert(
-                    (*name).to_owned(),
-                    Value::String(format!("{:x}", Sha256::digest(bytes))),
-                );
-            }
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "engine.rs",
+                        "a464a8b25a5a9eaa1e58ee4682a7ce993ecbce589fbafcb7c7fff3a205e24362",
+                    ),
+                    (
+                        "model.rs",
+                        "b3c02c1c938601f2a277a5a54022fdd79b939c7f8d9cbb43361600da9f5f2b09",
+                    ),
+                    (
+                        "pairing.rs",
+                        "bb0bf8def5fbb3f9a12a1ebe4a8a44c3aff9fa397f14f3efa382b5a28f69ab71",
+                    ),
+                    (
+                        "pairing_support.rs",
+                        "45cb53bd9daae49ab58c0614cb61077695751318acc22bb9ae1d20c8ed3c5d80",
+                    ),
+                    (
+                        "legal-pdf-pairing/lib.rs",
+                        "cec953dcd716b02b956637a6eb0c512719387af48ac42f465608ade3ac08965e",
+                    ),
+                    (
+                        "legal-pdf-core/lib.rs",
+                        "73beb349a58ff8ee1727e42978cbd3d2f260f8275506058285ae5eefe67911b8",
+                    ),
+                    (
+                        "legal-pdf-extraction/lib.rs",
+                        "fb0c3551d6041667b17d5aadd04f65ca21df98b2258330fdc612087f90501712",
+                    ),
+                    (
+                        "legal-pdf-support/lib.rs",
+                        "741860d3c2ad26f4fea0daf2876949d8b4e6aeea2f94e67a131405d3b45439db",
+                    ),
+                    (
+                        "legal-pdf-structure/lib.rs",
+                        "48b7f3234b5de89eba0f22160cb7829417accc2f8cdc539df433562926f6fe04",
+                    ),
+                    (
+                        "legal-structure/lib.rs",
+                        "4cab0f76821275e5457bcf0aa9cb2c24aafc3e320b6d05f1a8b70e85599b7b22",
+                    ),
+                    (
+                        "pdf.rs",
+                        "5df9f637cfe2426c752389a6d13163c360b92b08d00e1d608cadd08956a8298e",
+                    ),
+                    (
+                        "storage.rs",
+                        "3da41897710cdaf1992703a20a08ca5466fbe385c183d15a3b372b8bff0a76e6",
+                    ),
+                    (
+                        "structure.rs",
+                        "0d190979fee784669e5061c404ae0ed4bc9d7aaa4470cc0fbd04445c163ef914",
+                    ),
+                    (
+                        "structure-adapter.rs",
+                        "cbe430bd0e0f577a32b99e715164f447348760def362ecfb51426adb5c8cea4a",
+                    ),
+                    (
+                        "data/mcgill_reporters.json",
+                        "946e7554e8e9134d9b148d244d825e999080dd900c666cc4cf43235fa5ec9e2f",
+                    ),
+                    (
+                        "pdf-inspector/.cargo_vcs_info.json",
+                        "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
+                    ),
+                ],
+            );
+            #[cfg(feature = "language")]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "grammar_tables.rs",
+                        "089893ecc62a1965d9729ff67e85c632efb44944e2dd4dc1826c57d4f83506b7",
+                    ),
+                    (
+                        "grammar_word.rs",
+                        "e26a45bc99bcb6c7829338fd16d63ebebee29e09b11e8d0d0a1b38054c486e39",
+                    ),
+                    (
+                        "legal-pdf-language/lib.rs",
+                        "34d868a69379e6be5dd65331b4f8398c0821df48ca06a4c2bcb45118dcbc56e2",
+                    ),
+                    (
+                        "data/legal-grammar-tables/grammar-corpus.json",
+                        "8e6da9011c1cf78c609d54d53abb67b7a3e50f9a67cbf48cd72ab8136b16606f",
+                    ),
+                ],
+            );
+            #[cfg(feature = "ocr")]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "ocr.rs",
+                        "077f42d364cd18fe3e401b4deb933493e69fcbaaf060e58036c6863564a97dcc",
+                    ),
+                    (
+                        "legal-pdf-ocr/lib.rs",
+                        "92e732ac7c66484793b62c0a2c808072a26c7892afd91043daff7a455fcf52a6",
+                    ),
+                    (
+                        "separator.rs",
+                        "600736a243d5ba7c22c1f5b7ef9f2dd40e871047d3f417acac293f414a1440e8",
+                    ),
+                ],
+            );
+            #[cfg(feature = "kraken")]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "kraken.rs",
+                        "86b253e9680652c7e8abfd8bb28520a6abae80fa22c4b80cde1a12516752f718",
+                    ),
+                    (
+                        "ort_runtime.rs",
+                        "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
+                    ),
+                    (
+                        "tesseract_layout.rs",
+                        "6706a12f83cb56740028ee02f99fb37d370c992fb93b3e051b7d923c480618e6",
+                    ),
+                ],
+            );
+            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "ppdoc.rs",
+                        "412e8dec23c786fed282d536013180a9c757e5b6d46501e2bd9635e0ee38e480",
+                    ),
+                    (
+                        "ppdoc_postprocess.rs",
+                        "89c4a0f0a5d2a53532668fded947553dbac3bc79d5a7ffaf20a5718fbaf25a27",
+                    ),
+                    (
+                        "ppdoc_openvino.rs",
+                        "dc8de55bc05c4b859de273a71db061f1baf972d6325bd2dc5ce8dd89091d317c",
+                    ),
+                ],
+            );
+            #[cfg(feature = "ppdoc-full")]
+            insert_digests(
+                &mut identity,
+                &[(
+                    "ort_runtime.rs",
+                    "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
+                )],
+            );
+            #[cfg(feature = "full")]
+            insert_digests(
+                &mut identity,
+                &[(
+                    "Cargo.lock",
+                    "90b3561eeeaad70e651c0a91ec5f5e5932c406660ca52319516c24899bedfba5",
+                )],
+            );
             json!(identity)
         })
         .clone()
@@ -175,30 +298,6 @@ fn extraction_identity() -> Value {
     static IDENTITY: OnceLock<Value> = OnceLock::new();
     IDENTITY
         .get_or_init(|| {
-            let sources: &[(&str, &[u8])] = &[
-                ("model.rs", include_bytes!("model.rs")),
-                ("ocr.rs", include_bytes!("ocr.rs")),
-                ("pdf.rs", include_bytes!("pdf.rs")),
-                #[cfg(feature = "kraken")]
-                ("kraken.rs", include_bytes!("kraken.rs")),
-                #[cfg(feature = "kraken")]
-                ("kraken_process.rs", include_bytes!("kraken_process.rs")),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                ("ppdoc.rs", include_bytes!("ppdoc.rs")),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                (
-                    "ppdoc_postprocess.rs",
-                    include_bytes!("ppdoc_postprocess.rs"),
-                ),
-                #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-                ("ppdoc_openvino.rs", include_bytes!("ppdoc_openvino.rs")),
-                #[cfg(feature = "kraken")]
-                ("tesseract_layout.rs", include_bytes!("tesseract_layout.rs")),
-                (
-                    "pdf-inspector/.cargo_vcs_info.json",
-                    include_bytes!("../../vendor/pdf-inspector/.cargo_vcs_info.json"),
-                ),
-            ];
             let mut identity = BTreeMap::from([
                 (
                     "schema".to_owned(),
@@ -209,12 +308,67 @@ fn extraction_identity() -> Value {
                     Value::String("pdf-inspector 1.14.0; lopdf 0.42.0".to_owned()),
                 ),
             ]);
-            for (name, bytes) in sources {
-                identity.insert(
-                    (*name).to_owned(),
-                    Value::String(format!("{:x}", Sha256::digest(bytes))),
-                );
-            }
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "model.rs",
+                        "b3c02c1c938601f2a277a5a54022fdd79b939c7f8d9cbb43361600da9f5f2b09",
+                    ),
+                    (
+                        "pdf.rs",
+                        "5df9f637cfe2426c752389a6d13163c360b92b08d00e1d608cadd08956a8298e",
+                    ),
+                    (
+                        "pdf-inspector/.cargo_vcs_info.json",
+                        "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
+                    ),
+                ],
+            );
+            #[cfg(feature = "ocr")]
+            insert_digests(
+                &mut identity,
+                &[(
+                    "ocr.rs",
+                    "077f42d364cd18fe3e401b4deb933493e69fcbaaf060e58036c6863564a97dcc",
+                )],
+            );
+            #[cfg(feature = "kraken")]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "kraken.rs",
+                        "86b253e9680652c7e8abfd8bb28520a6abae80fa22c4b80cde1a12516752f718",
+                    ),
+                    (
+                        "kraken_process.rs",
+                        "c8e666d197a136a6b694ace1651d734a1ef43146c2645a10f97b01fdf372294c",
+                    ),
+                    (
+                        "tesseract_layout.rs",
+                        "6706a12f83cb56740028ee02f99fb37d370c992fb93b3e051b7d923c480618e6",
+                    ),
+                ],
+            );
+            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+            insert_digests(
+                &mut identity,
+                &[
+                    (
+                        "ppdoc.rs",
+                        "412e8dec23c786fed282d536013180a9c757e5b6d46501e2bd9635e0ee38e480",
+                    ),
+                    (
+                        "ppdoc_postprocess.rs",
+                        "89c4a0f0a5d2a53532668fded947553dbac3bc79d5a7ffaf20a5718fbaf25a27",
+                    ),
+                    (
+                        "ppdoc_openvino.rs",
+                        "dc8de55bc05c4b859de273a71db061f1baf972d6325bd2dc5ce8dd89091d317c",
+                    ),
+                ],
+            );
             json!(identity)
         })
         .clone()
@@ -223,7 +377,7 @@ fn extraction_identity() -> Value {
 fn cache_key(
     source_hash: &str,
     identity: &Value,
-    ocr_provider: Option<&OcrProvider>,
+    ocr_provider: Option<(&str, &str)>,
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
 ) -> Result<String> {
@@ -232,8 +386,8 @@ fn cache_key(
         "schema_version": SCHEMA_VERSION,
         "parser_version": PARSER_VERSION,
         "engine_code": identity,
-        "ocr_provider": ocr_provider.map(OcrProvider::name),
-        "ocr_provider_identity": ocr_provider.map(OcrProvider::identity),
+        "ocr_provider": ocr_provider.map(|provider| provider.0),
+        "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
         "layout_provider": ppdoc_identity.map(|_| "ppdoc-lite"),
         "layout_provider_identity": ppdoc_identity,
         "ocr_pages": ocr_pages,
@@ -244,15 +398,15 @@ fn cache_key(
 
 fn extraction_cache_key(
     source_hash: &str,
-    ocr_provider: Option<&OcrProvider>,
+    ocr_provider: Option<(&str, &str)>,
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
 ) -> Result<String> {
     let value = json!({
         "source_sha256": source_hash,
         "extractor": extraction_identity(),
-        "ocr_provider": ocr_provider.map(OcrProvider::name),
-        "ocr_provider_identity": ocr_provider.map(OcrProvider::identity),
+        "ocr_provider": ocr_provider.map(|provider| provider.0),
+        "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
         "layout_provider": ppdoc_identity.map(|_| "ppdoc-lite"),
         "layout_provider_identity": ppdoc_identity,
         "ocr_pages": ocr_pages,
@@ -265,12 +419,12 @@ fn build_document(
     source_hash: &str,
     key: &str,
     identity: &Value,
-    providers: (Option<&OcrProvider>, Option<&str>, Option<&str>),
+    providers: (Option<(&str, &str)>, Option<&str>, Option<&str>),
     mut extracted: ExtractedPdf,
 ) -> Result<LegalDocument> {
     let (ocr_provider, layout_variant, layout_identity) = providers;
-    let provider_name = ocr_provider.map(OcrProvider::name).map(str::to_owned);
-    let provider_identity = ocr_provider.map(OcrProvider::identity).map(str::to_owned);
+    let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
+    let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let derived = derive(&mut extracted.pages, &extracted.separators)?;
     extracted.diagnostics.extend(derived.diagnostics);
     let mut metadata = Map::new();
@@ -413,31 +567,42 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     let path = fs::canonicalize(path).map_err(|source| Error::io(path, source))?;
     let source_hash = sha256_file(&path)?;
     let identity = engine_identity();
+    #[cfg(feature = "ocr")]
     let mut ocr_provider = options.ocr.as_ref().map(OcrProvider::new).transpose()?;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ocr")]
+    let ocr_identity = ocr_provider
+        .as_ref()
+        .map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
+    #[cfg(not(feature = "ocr"))]
+    let ocr_identity: Option<(String, String)> = None;
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let ppdoc_identity = ppdoc
         .as_ref()
         .map(|provider| provider.identity().to_owned());
-    #[cfg(not(any(feature = "ppdoc", feature = "ppdoc-openvino")))]
+    #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
     let ppdoc_identity: Option<String> = None;
-    #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let ppdoc_variant = ppdoc
         .as_ref()
         .map(|provider| provider.variant_id().to_owned());
-    #[cfg(not(any(feature = "ppdoc", feature = "ppdoc-openvino")))]
+    #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
     let ppdoc_variant: Option<String> = None;
     let key = cache_key(
         &source_hash,
         &identity,
-        ocr_provider.as_ref(),
+        ocr_identity
+            .as_ref()
+            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
         ppdoc_identity.as_deref(),
         options.ocr_pages.as_deref(),
     )?;
     let extraction_key = extraction_cache_key(
         &source_hash,
-        ocr_provider.as_ref(),
+        ocr_identity
+            .as_ref()
+            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
         ppdoc_identity.as_deref(),
         options.ocr_pages.as_deref(),
     )?;
@@ -500,9 +665,14 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
             }
         });
         if extracted.is_none() {
-            let mut fresh =
-                extract_pdf(&path, ocr_provider.as_mut(), options.ocr_pages.as_deref())?;
-            #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
+            #[cfg(feature = "ocr")]
+            let selected_ocr = ocr_provider
+                .as_mut()
+                .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
+            #[cfg(not(feature = "ocr"))]
+            let selected_ocr = None;
+            let mut fresh = extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())?;
+            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
             if let Some(provider) = ppdoc.as_mut() {
                 fresh
                     .diagnostics
@@ -529,7 +699,9 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
             &key,
             &identity,
             (
-                ocr_provider.as_ref(),
+                ocr_identity
+                    .as_ref()
+                    .map(|provider| (provider.0.as_str(), provider.1.as_str())),
                 ppdoc_variant.as_deref(),
                 ppdoc_identity.as_deref(),
             ),
@@ -548,29 +720,6 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         document = Some(parsed);
     }
     Ok(document.expect("cache or parse produced a document"))
-}
-
-struct CommonInput {
-    source_name: String,
-    source_sha256: String,
-    pages: Vec<crate::model::Page>,
-    separators: Vec<Option<f64>>,
-}
-
-struct ReplayOutput {
-    derived_pages: Vec<Page>,
-    diagnostics: Vec<Diagnostic>,
-    footnotes: Vec<Footnote>,
-    marker_summary: Value,
-    markers: Vec<Value>,
-    pairing_summary: Value,
-    paragraphs: Vec<Paragraph>,
-    prepared_pages: Vec<Page>,
-    schema_version: &'static str,
-    sections: Vec<Section>,
-    source_sha256: String,
-    status: String,
-    validation: &'static str,
 }
 
 trait FrozenOrder {
@@ -633,48 +782,27 @@ frozen_type!(Paragraph: anchors id line_ids page_index region_type text);
 frozen_type!(Section: aliases heading heading_paragraph_id id line_ids locator locator_kind page_indexes paragraph_ids provenance text);
 frozen_type!(Footnote: body body_line_ids body_pages confidence crossrefs label occurrence pair_id passage_since_prior_note provenance reference_line_id reference_page restart_sequence sentence_proposition warnings);
 frozen_type!(Diagnostic: code details line_ids message page_index severity);
-frozen_type!(ReplayOutput: [derived_pages] [diagnostics] [footnotes] marker_summary markers pairing_summary [paragraphs] [prepared_pages] schema_version [sections] source_sha256 status validation);
+struct FrozenReplay<'a>(&'a PdfReplayProjection);
 
-fn replay_common(mut common: CommonInput) -> Result<ReplayOutput> {
-    let document_token = common.source_sha256.get(..20).ok_or_else(|| {
-        Error::Message("common input source_sha256 is not a SHA-256 digest".to_owned())
-    })?;
-    let replay = replay(&mut common.pages, &common.separators)?;
-    let document = LegalDocument {
-        document_id: format!("doc-{document_token}"),
-        source_name: common.source_name,
-        source_sha256: common.source_sha256.clone(),
-        page_count: common.pages.len(),
-        status: status(&replay.derived.diagnostics, &common.pages),
-        pages: common.pages,
-        paragraphs: replay.derived.paragraphs,
-        sections: replay.derived.sections,
-        footnotes: replay.derived.footnotes,
-        tables: vec![],
-        images: vec![],
-        diagnostics: replay.derived.diagnostics,
-        repairs: vec![],
-        metadata: Map::new(),
-        provenance: Map::new(),
-        schema_version: SCHEMA_VERSION.to_owned(),
-        parser_version: PARSER_VERSION.to_owned(),
-    };
-    validate_document(&document)?;
-    Ok(ReplayOutput {
-        derived_pages: document.pages,
-        diagnostics: document.diagnostics,
-        footnotes: document.footnotes,
-        marker_summary: replay.derived.marker_summary,
-        markers: replay.derived.markers,
-        pairing_summary: replay.derived.pairing_summary,
-        paragraphs: document.paragraphs,
-        prepared_pages: replay.prepared_pages,
-        schema_version: "legalpdf.common-input-result.v1",
-        sections: document.sections,
-        source_sha256: document.source_sha256,
-        status: document.status,
-        validation: "ok",
-    })
+impl Serialize for FrozenReplay<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let value = self.0;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("derived_pages", &FrozenSlice(&value.derived_pages))?;
+        map.serialize_entry("diagnostics", &FrozenSlice(&value.diagnostics))?;
+        map.serialize_entry("footnotes", &FrozenSlice(&value.footnotes))?;
+        map.serialize_entry("marker_summary", &value.marker_summary)?;
+        map.serialize_entry("markers", &value.markers)?;
+        map.serialize_entry("pairing_summary", &value.pairing_summary)?;
+        map.serialize_entry("paragraphs", &FrozenSlice(&value.paragraphs))?;
+        map.serialize_entry("prepared_pages", &FrozenSlice(&value.prepared_pages))?;
+        map.serialize_entry("schema_version", "legalpdf.common-input-result.v1")?;
+        map.serialize_entry("sections", &FrozenSlice(&value.sections))?;
+        map.serialize_entry("source_sha256", &value.source_sha256)?;
+        map.serialize_entry("status", &value.status)?;
+        map.serialize_entry("validation", value.validation)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -703,17 +831,30 @@ pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) ->
     {
         return Err(Error::Message("invalid extraction cache".to_owned()));
     }
-    let common = CommonInput {
-        source_name,
-        source_sha256: cached.source_sha256,
-        pages: cached.extraction.pages,
-        separators: cached.extraction.separators,
-    };
-    let input_lines: usize = common.pages.iter().map(|page| page.lines.len()).sum();
+    let input_lines: usize = cached
+        .extraction
+        .pages
+        .iter()
+        .map(|page| page.lines.len())
+        .sum();
+    let document_id = format!(
+        "doc-{}",
+        cached
+            .source_sha256
+            .get(..20)
+            .ok_or_else(|| Error::Message("cached source SHA-256 is invalid".to_owned()))?
+    );
+    let value = derive_pdf_pages(
+        document_id,
+        cached.source_sha256,
+        cached.extraction.pages,
+        cached.extraction.separators,
+    )
+    .map_err(|error| Error::Message(error.message))?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
-    let value = replay_common(common)?;
     let source_sha256 = value.source_sha256.clone();
-    serde_json::to_writer_pretty(&mut writer, &Frozen(&value))?;
+    let _ = source_name;
+    serde_json::to_writer_pretty(&mut writer, &FrozenReplay(&value))?;
     writer.write_all(b"\n").expect("digest writer cannot fail");
     let writer = writer.into_inner().expect("digest writer cannot fail");
     Ok(

@@ -1,0 +1,22 @@
+[package]
+name = "pdf-inspector-fonts"
+version = "1.14.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = ["component-fonts"]
+component-fonts = []
+
+[dependencies]
+log = "0.4"
+pdf-inspector-cid-signal = { path = "../cid-signal" }
+pdf-inspector-core = { path = "../core" }
+ttf-parser = "0.25"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lopdf = { version = "0.42.0", default-features = false, features = ["rayon"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+include_dir = "0.7"
+lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }

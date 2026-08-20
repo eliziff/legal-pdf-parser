@@ -1,0 +1,10 @@
+[package]
+name = "legal-pdf-extraction"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-extraction-processor = { path = "../legal-pdf-extraction-processor" }
+pdf-inspector = { package = "pdf-inspector-fidelity", path = "../vendor/pdf-inspector/crates/fidelity" }

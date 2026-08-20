@@ -21,6 +21,13 @@ python legal-pdf-parser\experiments\structure-engine-parity\harness.py
 python legal-pdf-parser\experiments\structure-engine-parity\harness.py --all-cache --fresh
 ```
 
+Windows build and focused-test commands in this program run through
+`run_bounded.py`. It sets the runner and child BelowNormal, places the process
+tree in a kill-on-close job, enforces the hard timeout, and writes a compact
+receipt containing priority observations plus hashes of the runner, command,
+and captured output. It never records environment values or raw command
+arguments.
+
 Only an intentional product-output change may replace the baseline:
 
 ```powershell
