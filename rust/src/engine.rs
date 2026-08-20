@@ -4,14 +4,14 @@ use crate::ocr::{OcrOptions, OcrProvider};
 use crate::pdf::{extract_pdf, ExtractedPdf};
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 use crate::ppdoc::{PPDocLayout, PPDocOptions};
-use crate::storage::{read_gzip_json, write_gzip_json, write_json};
+use crate::storage::{read_gzip_json, write_gzip_json};
 use crate::structure::{derive, replay, status, validate_document};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -555,27 +555,6 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     Ok(document.expect("cache or parse produced a document"))
 }
 
-#[doc(hidden)]
-pub fn extract_common_input(path: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<PathBuf> {
-    let path = path.as_ref();
-    let source_hash = sha256_file(path)?;
-    let extracted = extract_pdf(path, None, None)?;
-    let value = json!({
-        "schema_version": "legalpdf.common-input.v1",
-        "source_name": path.file_name().map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
-        "source_sha256": source_hash,
-        "pages": extracted.pages,
-        "separators": extracted.separators,
-        "metadata": extracted.metadata,
-        "tables": extracted.tables,
-        "images": extracted.images,
-        "diagnostics": extracted.diagnostics,
-    });
-    let output = output.as_ref();
-    write_json(output, &value)?;
-    Ok(output.to_path_buf())
-}
-
 #[derive(Deserialize)]
 struct CommonInput {
     schema_version: String,
@@ -585,17 +564,19 @@ struct CommonInput {
     separators: Vec<Option<f64>>,
 }
 
-#[doc(hidden)]
-pub fn replay_common_input(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<PathBuf> {
-    let input = input.as_ref();
+fn read_common_input(input: &Path) -> Result<CommonInput> {
     let file = File::open(input).map_err(|source| Error::io(input, source))?;
-    let mut common: CommonInput = serde_json::from_reader(BufReader::new(file))?;
+    let common: CommonInput = serde_json::from_reader(BufReader::new(file))?;
     if common.schema_version != "legalpdf.common-input.v1" {
         return Err(Error::Message(format!(
             "unsupported common-input schema: {:?}",
             common.schema_version
         )));
     }
+    Ok(common)
+}
+
+fn replay_common(mut common: CommonInput) -> Result<Value> {
     let document_token = common.source_sha256.get(..20).ok_or_else(|| {
         Error::Message("common input source_sha256 is not a SHA-256 digest".to_owned())
     })?;
@@ -620,7 +601,7 @@ pub fn replay_common_input(input: impl AsRef<Path>, output: impl AsRef<Path>) ->
         parser_version: PARSER_VERSION.to_owned(),
     };
     validate_document(&document)?;
-    let value = json!({
+    Ok(json!({
         "schema_version": "legalpdf.common-input-result.v1",
         "source_sha256": document.source_sha256,
         "prepared_pages": replay.prepared_pages,
@@ -634,10 +615,37 @@ pub fn replay_common_input(input: impl AsRef<Path>, output: impl AsRef<Path>) ->
         "diagnostics": document.diagnostics,
         "status": document.status,
         "validation": "ok",
-    });
-    let output = output.as_ref();
-    write_json(output, &value)?;
-    Ok(output.to_path_buf())
+    }))
+}
+
+#[derive(Default)]
+struct DigestWriter {
+    bytes: u64,
+    digest: Sha256,
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes += bytes.len() as u64;
+        self.digest.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+pub fn digest_common_input(input: impl AsRef<Path>) -> Result<Value> {
+    let mut writer = DigestWriter::default();
+    let value = replay_common(read_common_input(input.as_ref())?)?;
+    let source_sha256 = value["source_sha256"].clone();
+    serde_json::to_writer_pretty(&mut writer, &value)?;
+    writer.write_all(b"\n").expect("digest writer cannot fail");
+    Ok(
+        json!({"output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256}),
+    )
 }
 
 #[cfg(test)]

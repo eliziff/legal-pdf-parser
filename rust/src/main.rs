@@ -2,7 +2,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use legalpdf::{document_request, extract_common_input, replay_common_input, Error, Result};
+use legalpdf::{digest_common_input, document_request, Error, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -10,31 +10,6 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 fn usage() -> &'static str {
     "usage:\n  legalpdf contract <request.json>\n  legalpdf --version"
-}
-
-fn hidden_output(arguments: &[String], command: &str) -> Result<(PathBuf, PathBuf)> {
-    match arguments {
-        [input, option, output] if option == "--output" => {
-            Ok((PathBuf::from(input), PathBuf::from(output)))
-        }
-        _ => Err(Error::Message(format!(
-            "{command} requires <input> --output <path>"
-        ))),
-    }
-}
-
-fn parity_extract_command(arguments: &[String]) -> Result<i32> {
-    let (input, output) = hidden_output(arguments, "_parity-extract")?;
-    let path = extract_common_input(input, output)?;
-    println!("{}", serde_json::to_string(&json!({"result": path}))?);
-    Ok(0)
-}
-
-fn parity_replay_command(arguments: &[String]) -> Result<i32> {
-    let (input, output) = hidden_output(arguments, "_parity-replay")?;
-    let path = replay_common_input(input, output)?;
-    println!("{}", serde_json::to_string(&json!({"result": path}))?);
-    Ok(0)
 }
 
 fn parity_replay_batch_command(arguments: &[String]) -> Result<i32> {
@@ -48,10 +23,10 @@ fn parity_replay_batch_command(arguments: &[String]) -> Result<i32> {
     if bytes.len() > 1024 * 1024 {
         return Err(Error::Message("replay manifest exceeds 1 MiB".to_owned()));
     }
-    let jobs: Vec<[PathBuf; 2]> = serde_json::from_slice(&bytes)?;
+    let jobs: Vec<PathBuf> = serde_json::from_slice(&bytes)?;
     for (index, batch) in jobs.chunks(25).enumerate() {
-        for [input, output] in batch {
-            replay_common_input(input, output)?;
+        for input in batch {
+            println!("{}", serde_json::to_string(&digest_common_input(input)?)?);
         }
         let completed = ((index + 1) * 25).min(jobs.len());
         eprintln!("replayed {completed}/{}", jobs.len());
@@ -167,8 +142,6 @@ fn run() -> Result<i32> {
         .ok_or_else(|| Error::Message(usage().to_owned()))?;
     match command.as_str() {
         "contract" => contract_command(rest),
-        "_parity-extract" => parity_extract_command(rest),
-        "_parity-replay" => parity_replay_command(rest),
         "_parity-replay-batch" => parity_replay_batch_command(rest),
         "--version" | "-V" => {
             println!("legalpdf {}", env!("CARGO_PKG_VERSION"));

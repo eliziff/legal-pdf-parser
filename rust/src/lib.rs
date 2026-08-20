@@ -47,7 +47,7 @@ pub use docx::{
     plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
 };
 #[doc(hidden)]
-pub use engine::{extract_common_input, replay_common_input};
+pub use engine::digest_common_input;
 pub use error::{Error, Result};
 pub use grammar_tables::{compile_table_entry, load_tables, run_vectors as run_grammar_vectors};
 #[cfg(feature = "kraken")]

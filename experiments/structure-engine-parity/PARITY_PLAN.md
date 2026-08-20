@@ -12,9 +12,9 @@ not an end-to-end PDF proof, and a silver or candidate set is not gold.
 2. Factor the structure engine while the 748-document native replay remains
    byte-identical and all existing SourceDocs provider tests remain green.
    Provider-native structure stays an input/oracle; it is not displaced.
-3. Remove the process/pretty-JSON bottleneck. The fresh full replay must exceed
-   250 pages/second on the same machine. Resumed receipts do not count as fresh
-   throughput.
+3. Remove the process/raw-output bottleneck. A fresh full replay must cover all
+   24,707 pages in at most 30 seconds and at least 1,000 pages/second on the
+   same machine. Resumed receipts do not count as fresh throughput.
 4. Exercise the public PDF/cache contract from source PDFs. This proves the
    extraction-to-common-input boundary that the replay intentionally bypasses.
 5. Improve numbered sequences, footnotes/endnotes, pages, headings, citations,
@@ -50,9 +50,19 @@ An independent check matched 748/748 exact output byte streams. The fresh run
 used no retained raw outputs, observed at most 659,092,968 temporary bytes for
 one document, bounded uncompressed inputs in flight to 201,415,295 bytes, and
 left about 1.35 MB of resumable receipts. It processed 24,707 pages in 168.628
-seconds (147.3 pages/second), correctly failing the fixed 250-pages/second
+seconds (147.3 pages/second), correctly failing the former 250-pages/second
 speed gate. The refactor must make this lane persistent, batched, hash-only, or
 in-process; lowering the gate is not an acceptable fix.
+
+The first digest-only candidate (`f626562b...2232b5`) proved 748/748 exact
+outputs and aggregate hash `eca681b3...0d9d3` without retaining raw output,
+but still took 143.0 seconds (172.7 pages/second). The gate failed unchanged.
+Eleven heavy inputs had been placed in one sequential batch, so the harness now
+isolates heavy inputs and reports each completion; this correction is not a
+license to claim the 30-second target without another explicitly fresh run.
+The candidate's post-edit `cargo quick` took about 10 seconds and its cached
+all-feature release link took 62 seconds, failing the 5- and 30-second build
+budgets without a retry or relaxed threshold.
 
 The eleven-document smoke gate remains the edit-loop check: 401 pages across
 all five jurisdictions and manually audited document shapes, with startup,
