@@ -9,6 +9,22 @@ use std::io::{BufRead, Write};
 #[cfg(feature = "recovery")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "a2aj")]
+mod a2aj;
+#[cfg(feature = "journal")]
+mod journal;
+#[cfg(feature = "source-doc")]
+mod source_doc;
+#[cfg(feature = "a2aj")]
+pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
+#[cfg(feature = "journal")]
+pub use journal::{journal_source_doc, JournalPageLabel};
+#[cfg(feature = "source-doc")]
+pub use source_doc::{
+    create_source_doc, ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind,
+    SourceDocOrigin, SourceDocProvider, SourceDocType,
+};
+
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const RESULT_SCHEMA: &str = "legalpdf.structure-graph.v1";
 pub const SIDECAR_PROTOCOL: &str = "legalpdf.structure-sidecar.v1";
@@ -184,6 +200,14 @@ impl EngineError {
         Self {
             code: "invalid_evidence",
             message: message.into(),
+        }
+    }
+
+    #[cfg(feature = "source-doc")]
+    fn source(message: impl Display) -> Self {
+        Self {
+            code: "invalid_source",
+            message: message.to_string(),
         }
     }
 }
@@ -397,10 +421,14 @@ struct ParagraphBreak {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireEvidence {
+pub struct DocumentInput {
     schema_version: String,
     document_id: String,
     provider: String,
+    #[cfg(feature = "source-doc")]
+    url: Option<String>,
+    #[cfg(feature = "source-doc")]
+    doc_type: Option<SourceDocType>,
     provider_revision: String,
     profile: DetectionProfile,
     report_start_page: Option<u32>,
@@ -417,6 +445,9 @@ struct WireEvidence {
     coverage: Vec<Coverage>,
     exclusions: Vec<Exclusion>,
     paragraph_breaks: Vec<ParagraphBreak>,
+    #[cfg(feature = "source-doc")]
+    #[serde(skip)]
+    original_claims: HashMap<String, SourceDocBlock>,
 }
 
 fn hash(value: &str) -> bool {
@@ -444,7 +475,7 @@ impl EvidenceKind {
     }
 }
 
-impl WireEvidence {
+impl DocumentInput {
     fn validate(&self) -> Result<(), EngineError> {
         let length = self.text.chars().count();
         if self.schema_version != EVIDENCE_SCHEMA
@@ -688,15 +719,13 @@ impl WireEvidence {
     }
 }
 
-pub struct StructureEvidenceV1(WireEvidence);
-
-impl TryFrom<Value> for StructureEvidenceV1 {
+impl TryFrom<Value> for DocumentInput {
     type Error = EngineError;
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        let evidence: WireEvidence = serde_json::from_value(value)
+        let evidence: DocumentInput = serde_json::from_value(value)
             .map_err(|error| EngineError::invalid(error.to_string()))?;
         evidence.validate()?;
-        Ok(Self(evidence))
+        Ok(evidence)
     }
 }
 
@@ -1008,7 +1037,7 @@ mod recovery {
         for line in lines(text) {
             let lead = leading_ascii_space(line.text);
             let value = &line.text[lead..];
-            let start = line.scalar_start + value[..0].chars().count() + lead;
+            let start = line.scalar_start;
             let basic = if let Some(rest) = value.strip_prefix('[') {
                 decimal_prefix(rest, 4).and_then(|(number, length)| {
                     (rest.as_bytes().get(length) == Some(&b']'))
@@ -1819,6 +1848,9 @@ mod recovery {
     }
 
     fn page_markers(text: &ScalarText<'_>, report_start: Option<u32>) -> Vec<PageMarker> {
+        if !cached_regex!(HAS_PAGE, r"(?iu)\bpage\b").is_match(text.value) {
+            return Vec::new();
+        }
         let regex = cached_regex!(
             VALUE,
             r"(?imu)\[[ \t]*pages?[ \t]*[.:,;]?[ \t]*(\d{1,4})[ \t]*[.:,;]?[ \t]*[\]\[)}]?[ \t]*[.,;:]?|^[ \t]*\[?[ \t]*page[ \t]*[.:,;]?[ \t]*(\d{1,4})[ \t]*[\])}]?[ \t]*[.,;:]?[ \t]*$"
@@ -1929,18 +1961,18 @@ mod recovery {
 
     fn detect_case(
         text: &ScalarText<'_>,
-        evidence: &WireEvidence,
+        evidence: &DocumentInput,
         excluded: &[ScalarRange],
     ) -> Vec<Block> {
         let mut paragraphs = match evidence.profile {
             DetectionProfile::CaseContiguousComplete => {
-                let legacy = clipped_case_paragraphs(
+                let complete = clipped_case_paragraphs(
                     detect_paragraphs(text, DetectionProfile::CaseLossy, excluded),
                     excluded,
                     text,
                 );
-                if !legacy.is_empty() && !gapped_paragraphs(&legacy) {
-                    legacy
+                if !complete.is_empty() && !gapped_paragraphs(&complete) {
+                    complete
                 } else {
                     detect_paragraphs(text, DetectionProfile::CaseContiguousComplete, excluded)
                 }
@@ -2078,7 +2110,7 @@ mod recovery {
         Equal
     }
 
-    fn compare_labels(left: &str, right: &str, fraction: bool) -> std::cmp::Ordering {
+    pub(super) fn compare_labels(left: &str, right: &str, fraction: bool) -> std::cmp::Ordering {
         compare_parts(&label_parts(left), &label_parts(right), fraction)
     }
 
@@ -2783,18 +2815,6 @@ mod recovery {
         selected
     }
 
-    fn legacy_marker(value: &str) -> Option<(&str, usize)> {
-        let capture = cached_regex!(
-            VALUE,
-            r"^[ \t]*\((\d+(?:\.\d+)?|[A-Za-z](?:\.\d+)?|[ivxlcdmIVXLCDM]+)\)(?:\s|$)"
-        )
-        .captures(value)?;
-        Some((
-            capture.get(1).unwrap().as_str(),
-            capture.get(0).unwrap().start() + leading_ascii_space(capture.get(0).unwrap().as_str()),
-        ))
-    }
-
     fn roman_value(value: &str) -> Option<u32> {
         let mut total = 0i32;
         let mut prior = 0;
@@ -2815,123 +2835,14 @@ mod recovery {
         (total > 0).then_some(total as u32)
     }
 
-    fn legacy_level(
-        token: &str,
-        counters: &BTreeMap<u8, (String, String)>,
-        next: Option<&str>,
-    ) -> Option<(u8, String)> {
-        let mut pieces = token.split('.');
-        let head = pieces.next()?;
-        if token.starts_with(|value: char| value.is_ascii_digit()) {
-            return Some((1, token.to_owned()));
-        }
-        let upper = head == head.to_ascii_uppercase();
-        let alpha_level = if upper { 4 } else { 2 };
-        let alpha = u32::from(head.as_bytes()[0].to_ascii_lowercase() - b'a' + 1);
-        let roman = roman_value(head);
-        let follows = |level, value| {
-            counters.get(&level).and_then(|prior| prior.0.parse().ok()) == Some(value - 1)
-        };
-        let preferred = head.len() > 1
-            || roman.is_some_and(|value| {
-                if follows(3, value) {
-                    true
-                } else if follows(alpha_level, alpha) {
-                    head.eq_ignore_ascii_case("i")
-                        && next.is_some_and(|value| value.eq_ignore_ascii_case("ii"))
-                } else {
-                    !upper && head == "i" && counters.contains_key(&2)
-                }
-            });
-        if preferred {
-            Some((3, roman?.to_string()))
-        } else {
-            Some((
-                alpha_level,
-                std::iter::once(alpha.to_string())
-                    .chain(pieces.map(str::to_owned))
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ))
-        }
-    }
-
-    fn legacy_children(
-        text: &ScalarText<'_>,
-        section: &SectionMark,
-        section_end: usize,
-    ) -> Vec<Block> {
-        let value = text.slice(ScalarRange {
-            start: section.start,
-            end: section_end,
-        });
-        let local = ScalarText::new(value);
-        let length = local.len();
-        let mut children = lines(&local)
-            .into_iter()
-            .filter_map(|line| {
-                let (token, at) = legacy_marker(line.text)?;
-                Some((
-                    token.to_owned(),
-                    line.scalar_start + line.text[..at].chars().count(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let content = section.content_start - section.start;
-        let inline = utf16_prefix(&value[local.scalar_bytes[content]..], 24);
-        if let Some((token, at)) = legacy_marker(inline) {
-            let nested = !matches!(
-                section.family,
-                SectionFamily::Bare | SectionFamily::DotTerm | SectionFamily::Markdown
-            );
-            let start = nested
-                .then(|| content + inline[..at].chars().count())
-                .unwrap_or(0);
-            if !children.iter().any(|child| child.1 == start) {
-                children.insert(0, (token.to_owned(), start));
-            }
-        }
-        let mut result = Vec::new();
-        let root = format!("sec{}", section.label);
-        let mut counters = BTreeMap::<u8, (String, String)>::new();
-        for (index, child) in children.iter().enumerate() {
-            let Some((level, value)) = legacy_level(
-                &child.0,
-                &counters,
-                children.get(index + 1).map(|value| value.0.as_str()),
-            ) else {
-                continue;
-            };
-            if counters
-                .get(&level)
-                .is_some_and(|prior| compare_labels(&value, &prior.0, true).is_le())
-            {
-                continue;
-            }
-            counters.insert(level, (value, format!("({})", child.0)));
-            counters.retain(|key, _| *key <= level);
-            let suffix = counters
-                .values()
-                .map(|value| value.1.as_str())
-                .collect::<String>();
-            let start = section.start + child.1;
-            let end = section.start + children.get(index + 1).map_or(length, |value| value.1);
-            let mut block =
-                Block::labelled(NodeKind::Section, format!("{root}{suffix}"), start, end);
-            block.parent_label = Some(root.clone());
-            result.push(block);
-        }
-        result
-    }
-
     struct EnumFrame {
         family: u8,
-        value: u32,
+        value: String,
         label: String,
     }
 
     #[derive(Default)]
-    struct InstrumentState {
+    struct StructureState {
         nodes: Vec<(Block, usize)>,
         container: Option<String>,
         section: Option<(String, usize)>,
@@ -2939,9 +2850,12 @@ mod recovery {
         used: HashMap<String, usize>,
     }
 
-    fn enum_readings(token: &str) -> [Option<(u8, u32)>; 2] {
-        if let Ok(value) = token.parse() {
-            return [Some((0, value)), None];
+    fn enum_readings(token: &str) -> [Option<(u8, String)>; 2] {
+        if token
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return [Some((0, token.to_owned())), None];
         }
         let lower = token.to_ascii_lowercase();
         let alpha = match lower.as_bytes() {
@@ -2950,11 +2864,15 @@ mod recovery {
             _ => None,
         };
         let upper = token != lower;
-        let alpha = alpha.map(|value| (if upper { 3 } else { 1 }, value));
-        let roman = roman_value(&lower).map(|value| (if upper { 4 } else { 2 }, value));
+        let alpha = alpha.map(|value| (if upper { 3 } else { 1 }, value.to_string()));
+        let roman = roman_value(&lower).map(|value| (if upper { 4 } else { 2 }, value.to_string()));
         if lower.len() > 1 {
             [
-                roman.filter(|(_, value)| *value <= 50).or(alpha).or(roman),
+                roman
+                    .clone()
+                    .filter(|(_, value)| value.parse::<u32>().unwrap() <= 50)
+                    .or(alpha)
+                    .or(roman),
                 None,
             ]
         } else {
@@ -2964,7 +2882,7 @@ mod recovery {
 
     fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)> {
         let found = cached_regex!(MARKER,
-            r"^(?:\((\d{1,3}|[a-z]{1,2}|[ivxlcdm]{1,6}|[A-Z]{1,2}|[IVXLCDM]{1,6})\)[ \t]*(.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\)[ \t]+(\S.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\.[ \t]+(\S.*))$"
+            r"^(?:\((\d{1,3}(?:\.\d{1,3})?|[a-z]{1,2}|[ivxlcdm]{1,6}|[A-Z]{1,2}|[IVXLCDM]{1,6})\)[ \t]*(.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\)[ \t]+(\S.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\.[ \t]+(\S.*))$"
         ).captures(value)?;
         [(1, 2, true), (3, 4, tail), (5, 6, dot)]
             .into_iter()
@@ -2978,7 +2896,7 @@ mod recovery {
     }
 
     fn admitted_dialects(text: &ScalarText<'_>) -> (bool, bool) {
-        let mut live = [HashMap::<u8, (u32, usize)>::new(), HashMap::new()];
+        let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
         let mut best = [0, 0];
         for line in lines(text) {
             let value = line.text.trim_matches(instrument_space);
@@ -2989,9 +2907,9 @@ mod recovery {
                 if let Some((token, _)) = instrument_marker(value, dialect.0, dialect.1) {
                     for (family, value) in enum_readings(token).into_iter().flatten() {
                         let state = live[index].entry(family).or_default();
-                        if value == 1 {
-                            *state = (1, 1);
-                        } else if state.1 > 0 && value > state.0 && value - state.0 <= 2 {
+                        if value == "1" {
+                            *state = (value, 1);
+                        } else if state.1 > 0 && compare_labels(&value, &state.0, true).is_gt() {
                             *state = (value, state.1 + 1);
                         }
                         best[index] = best[index].max(state.1);
@@ -3002,29 +2920,38 @@ mod recovery {
         (best[0] >= 3, best[1] >= 3)
     }
 
-    impl InstrumentState {
+    impl StructureState {
         fn child(&mut self, token: &str, start: usize, content_start: usize) {
             let (root, root_depth) = self.section.clone().unwrap();
             let readings = enum_readings(token);
             let selected = (0..4).find_map(|pass| {
-                readings.iter().flatten().find_map(|&(family, value)| {
-                    let at = self.stack.iter().rposition(|frame| frame.family == family);
+                readings.iter().flatten().find_map(|(family, value)| {
+                    let at = self.stack.iter().rposition(|frame| frame.family == *family);
                     match (pass, at) {
-                        (0, Some(index)) => self.stack[index].value + 1 == value,
-                        (1, None) => value == 1 && self.stack.len() < 6,
-                        (2, Some(index)) => value == 1 || value > self.stack[index].value + 1,
+                        (0, Some(index)) => {
+                            let prior = &self.stack[index].value;
+                            match (prior.parse::<u32>(), value.parse::<u32>()) {
+                                (Ok(prior), Ok(value)) => prior + 1 == value,
+                                _ => compare_labels(value, prior, true).is_gt(),
+                            }
+                        }
+                        (1, None) => value == "1" && self.stack.len() < 6,
+                        (2, Some(index)) => {
+                            value == "1"
+                                || compare_labels(value, &self.stack[index].value, true).is_gt()
+                        }
                         (3, None) => self.stack.len() < 6,
                         _ => false,
                     }
-                    .then_some((pass, family, value, at))
+                    .then(|| (pass, *family, value.clone(), at))
                 })
             });
-            let (pass, family, value, at) = selected.unwrap_or((4, 0, 0, None));
+            let (pass, family, value, at) = selected.unwrap_or_else(|| (4, 0, String::new(), None));
             let (parent, depth) = if pass == 4 {
                 (root.clone(), root_depth + 1)
             } else if let Some(index) = at {
                 self.stack.truncate(index + 1);
-                self.stack[index].value = value;
+                self.stack[index].value = value.clone();
                 (
                     index
                         .checked_sub(1)
@@ -3039,15 +2966,15 @@ mod recovery {
                 let depth = root_depth + self.stack.len() + 1;
                 self.stack.push(EnumFrame {
                     family,
-                    value,
+                    value: value.clone(),
                     label: String::new(),
                 });
                 (parent, depth)
             };
-            let code = match (pass, value) {
+            let code = match (pass, value.as_str()) {
                 (0, _) => "instrument_ladder_increment",
                 (1, _) => "instrument_ladder_level_open",
-                (2, 1) => "instrument_ladder_restart",
+                (2, "1") => "instrument_ladder_restart",
                 (2, _) => "instrument_ladder_forward_jump",
                 (3, _) => "instrument_ladder_midcounter_open",
                 _ => "instrument_ladder_violation",
@@ -3067,6 +2994,82 @@ mod recovery {
             block.diagnostic = Some(code);
             self.nodes.push((block, depth));
         }
+    }
+
+    fn enumerated_children(
+        value: &str,
+        offset: usize,
+        root: String,
+        root_depth: usize,
+        content_start: usize,
+    ) -> Vec<Block> {
+        let text = ScalarText::new(value);
+        let mut state = StructureState {
+            section: Some((root, root_depth)),
+            ..Default::default()
+        };
+        let inline = &text.value[text.scalar_bytes[content_start]..];
+        if let Some((token, at)) =
+            instrument_marker(inline.lines().next().unwrap_or_default(), false, false)
+        {
+            state.child(
+                token,
+                content_start,
+                content_start + inline[..at].chars().count(),
+            );
+        }
+        for line in lines(&text) {
+            let value = line.text.trim_matches(instrument_space);
+            if let Some((token, at)) = instrument_marker(value, false, false) {
+                let content = line.scalar_start + value[..at].chars().count();
+                if !state
+                    .nodes
+                    .iter()
+                    .any(|(block, _)| block.range.start == line.scalar_start)
+                {
+                    state.child(token, line.scalar_start, content);
+                }
+            }
+        }
+        for index in 0..state.nodes.len() {
+            let depth = state.nodes[index].1;
+            let end = state
+                .nodes
+                .iter()
+                .skip(index + 1)
+                .find(|(_, candidate)| *candidate <= depth)
+                .map_or(text.len(), |(block, _)| block.range.start);
+            state.nodes[index].0.range.end = end;
+            state.nodes[index].0.range.start += offset;
+            state.nodes[index].0.range.end += offset;
+            if let Some(at) = &mut state.nodes[index].0.content_start {
+                *at += offset;
+            }
+        }
+        state.nodes.into_iter().map(|(block, _)| block).collect()
+    }
+
+    #[cfg(all(feature = "a2aj", feature = "source-doc"))]
+    pub(super) fn source_doc_children(
+        label: &str,
+        value: &str,
+        offset: usize,
+    ) -> Vec<SourceDocBlock> {
+        let text = ScalarText::new(value);
+        enumerated_children(value, 0, format!("sec{label}"), 0, 0)
+            .into_iter()
+            .map(|block| {
+                let mut projected = SourceDocBlock::new(
+                    SourceDocKind::Section,
+                    block.label.unwrap(),
+                    offset + text.utf16(block.range.start),
+                    offset + text.utf16(block.range.end),
+                    SourceDocOrigin::Heuristic,
+                );
+                projected.parent_label = block.parent_label;
+                projected
+            })
+            .collect()
     }
 
     fn direct_section(value: &str) -> Option<(String, usize)> {
@@ -3121,7 +3124,7 @@ mod recovery {
         let mut spine = statute_spine(text, false).into_iter().peekable();
         let direct = spine.peek().is_none();
         let dialects = admitted_dialects(text);
-        let mut state = InstrumentState::default();
+        let mut state = StructureState::default();
         for line in lines(text) {
             let trimmed_start = line.text.trim_start_matches(instrument_space);
             let value = trimmed_start.trim_end_matches(instrument_space);
@@ -3184,7 +3187,7 @@ mod recovery {
         state.nodes.into_iter().map(|(block, _)| block).collect()
     }
 
-    fn detect_legislation(text: &ScalarText<'_>, evidence: &WireEvidence) -> Vec<Block> {
+    fn detect_legislation(text: &ScalarText<'_>, evidence: &DocumentInput) -> Vec<Block> {
         let sections = selected_sections(text, evidence.allow_hyphenated_sections);
         let mut result = Vec::new();
         for (index, section) in sections.iter().enumerate() {
@@ -3200,7 +3203,17 @@ mod recovery {
                 .collect();
             top.content_start = Some(section.content_start);
             result.push(top);
-            result.extend(legacy_children(text, section, end));
+            let value = text.slice(ScalarRange {
+                start: section.start,
+                end,
+            });
+            result.extend(enumerated_children(
+                value,
+                section.start,
+                format!("sec{}", section.label),
+                0,
+                section.content_start - section.start,
+            ));
         }
         for claim in evidence
             .native_claims
@@ -3234,7 +3247,14 @@ mod recovery {
                 family: SectionFamily::Emphasis,
                 aliases: Vec::new(),
             };
-            let children = legacy_children(text, &section, claim.range.end);
+            let value = text.slice(claim.range);
+            let children = enumerated_children(
+                value,
+                claim.range.start,
+                format!("sec{label}"),
+                0,
+                section.content_start - claim.range.start,
+            );
             result.retain(|block| {
                 !block
                     .parent_label
@@ -3350,7 +3370,7 @@ mod recovery {
         result
     }
 
-    pub(super) fn inferred_blocks(evidence: &WireEvidence, text: &ScalarText<'_>) -> Vec<Block> {
+    pub(super) fn inferred_blocks(evidence: &DocumentInput, text: &ScalarText<'_>) -> Vec<Block> {
         let paragraph_exclusions = evidence
             .exclusions
             .iter()
@@ -3379,7 +3399,7 @@ fn native_kind(kind: EvidenceKind) -> NodeKind {
 }
 
 fn infer_graph(
-    evidence: WireEvidence,
+    evidence: DocumentInput,
     inferred: Vec<Block>,
     recovery_available: bool,
 ) -> StructureGraphV1 {
@@ -3553,10 +3573,7 @@ fn infer_graph(
 }
 
 #[cfg(feature = "recovery")]
-pub fn derive_structure_evidence(
-    evidence: StructureEvidenceV1,
-) -> Result<StructureGraphV1, EngineError> {
-    let evidence = evidence.0;
+pub fn derive_structure_evidence(evidence: DocumentInput) -> Result<StructureGraphV1, EngineError> {
     let inferred = if evidence.needs_recovery() {
         let text = ScalarText::new(&evidence.text);
         recovery::inferred_blocks(&evidence, &text)
@@ -3567,9 +3584,61 @@ pub fn derive_structure_evidence(
 }
 
 pub fn derive_native_structure_evidence(
-    evidence: StructureEvidenceV1,
+    evidence: DocumentInput,
 ) -> Result<StructureGraphV1, EngineError> {
-    Ok(infer_graph(evidence.0, Vec::new(), false))
+    Ok(infer_graph(evidence, Vec::new(), false))
+}
+
+#[cfg(feature = "source-doc")]
+fn projection(profile: DetectionProfile) -> (ProjectionOrder, Option<SourceDocType>) {
+    match profile {
+        DetectionProfile::CaseRootedComplete => (ProjectionOrder::Case, Some(SourceDocType::Cases)),
+        DetectionProfile::CaseContiguousComplete | DetectionProfile::CaseLossy => {
+            (ProjectionOrder::Position, Some(SourceDocType::Cases))
+        }
+        DetectionProfile::Legislation => (ProjectionOrder::Legislation, Some(SourceDocType::Laws)),
+        DetectionProfile::Instrument => (ProjectionOrder::Legislation, None),
+        DetectionProfile::Journal => (ProjectionOrder::StablePosition, None),
+    }
+}
+
+#[cfg(feature = "source-doc")]
+fn compose_with(mut input: DocumentInput, recovery: bool) -> Result<SourceDoc, EngineError> {
+    input.validate()?;
+    let (order, inferred_type) = projection(input.profile);
+    let provider = SourceDocProvider::from_name(&input.provider);
+    let id = input.document_id.clone();
+    let url = input.url.take();
+    let doc_type = input.doc_type.or(inferred_type);
+    let originals = source_doc::native_blocks(
+        &input.text,
+        &input.native_claims,
+        std::mem::take(&mut input.original_claims),
+    );
+    #[cfg(feature = "recovery")]
+    let inferred = if recovery && input.needs_recovery() {
+        let text = ScalarText::new(&input.text);
+        recovery::inferred_blocks(&input, &text)
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "recovery"))]
+    let inferred = Vec::new();
+    let text = std::mem::take(&mut input.text);
+    let graph = infer_graph(input, inferred, recovery);
+    Ok(source_doc::project_graph(
+        provider, id, url, doc_type, text, &originals, graph, order,
+    ))
+}
+
+#[cfg(feature = "source-doc")]
+pub fn compose_native(input: DocumentInput) -> Result<SourceDoc, EngineError> {
+    compose_with(input, false)
+}
+
+#[cfg(all(feature = "recovery", feature = "source-doc"))]
+pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
+    compose_with(input, true)
 }
 
 #[derive(Deserialize)]
@@ -3639,7 +3708,7 @@ fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<usize, Eng
 fn sidecar_with(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-    derive: fn(StructureEvidenceV1) -> Result<StructureGraphV1, EngineError>,
+    derive: fn(DocumentInput) -> Result<StructureGraphV1, EngineError>,
     capabilities: &[&str],
 ) -> Result<(), EngineError> {
     let executable = std::env::current_exe().map_err(|error| EngineError {
@@ -3702,7 +3771,7 @@ fn sidecar_with(
             if index > 0 {
                 io(writer.write_all(b","))?;
             }
-            match StructureEvidenceV1::try_from(value).and_then(derive) {
+            match DocumentInput::try_from(value).and_then(derive) {
                 Ok(result) => serde_json::to_writer(
                     &mut *writer,
                     &ItemResult {
@@ -3768,15 +3837,19 @@ mod tests {
     use super::recovery::{formal_heading, statute_spine};
     use super::*;
 
-    fn evidence(text: &str, profile: DetectionProfile) -> WireEvidence {
+    fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
         let range = ScalarRange {
             start: 0,
             end: text.chars().count(),
         };
-        WireEvidence {
+        DocumentInput {
             schema_version: EVIDENCE_SCHEMA.into(),
             document_id: "test".into(),
             provider: "test".into(),
+            #[cfg(feature = "source-doc")]
+            url: None,
+            #[cfg(feature = "source-doc")]
+            doc_type: None,
             provider_revision: "1".into(),
             profile,
             report_start_page: None,
@@ -3819,6 +3892,8 @@ mod tests {
             .collect(),
             exclusions: Vec::new(),
             paragraph_breaks: Vec::new(),
+            #[cfg(feature = "source-doc")]
+            original_claims: HashMap::new(),
         }
     }
 
@@ -3893,6 +3968,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
+    fn joined_page_tokens_are_not_reporter_pages() {
+        let graph = derive_structure_evidence(evidence(
+            "Quoted text [page624] continues.\nMore [page625] text.\nLast [page626] text.",
+            DetectionProfile::CaseRootedComplete,
+        ))
+        .unwrap();
+        assert!(graph.nodes.iter().all(|node| node.kind != NodeKind::Page));
+    }
+
+    #[test]
     fn clips_at_complete_native_coverage() {
         let mut value = evidence("0123456789", DetectionProfile::CaseLossy);
         value
@@ -3953,27 +4039,22 @@ mod tests {
             parent_label: None,
             anchor: Some("section-1".into()),
         });
-        let graph = derive_native_structure_evidence(StructureEvidenceV1(value))
-            .expect("valid native evidence");
+        let graph = derive_native_structure_evidence(value).expect("valid native evidence");
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].label.as_deref(), Some("sec1"));
         assert!(matches!(graph.nodes[0].source, Derivation::Native));
         assert!(matches!(graph.status, GraphStatus::Complete));
 
-        let incomplete = derive_native_structure_evidence(StructureEvidenceV1(evidence(
-            text,
-            DetectionProfile::Legislation,
-        )))
-        .expect("valid incomplete native evidence");
+        let incomplete =
+            derive_native_structure_evidence(evidence(text, DetectionProfile::Legislation))
+                .expect("valid incomplete native evidence");
         assert!(matches!(incomplete.status, GraphStatus::Partial));
     }
 
     #[test]
     #[cfg(feature = "recovery")]
     fn native_parent_wins_and_children_survive() {
-        let derive = |value| {
-            derive_structure_evidence(StructureEvidenceV1(value)).expect("valid fixture evidence")
-        };
+        let derive = |value| derive_structure_evidence(value).expect("valid fixture evidence");
         let flat = derive(evidence(
             "1 First provision\n2 Second provision",
             DetectionProfile::Legislation,
@@ -4044,11 +4125,8 @@ mod tests {
             "SCHEDULE 14D-9 37\n",
             "EXHIBIT III Valid Heading\n",
         );
-        let graph = derive_structure_evidence(StructureEvidenceV1(evidence(
-            text,
-            DetectionProfile::Instrument,
-        )))
-        .expect("valid instrument evidence");
+        let graph = derive_structure_evidence(evidence(text, DetectionProfile::Instrument))
+            .expect("valid instrument evidence");
         let labels = graph
             .nodes
             .iter()
@@ -4082,10 +4160,10 @@ mod tests {
         assert!(!formal_heading("() Heading"));
         assert_eq!(utf16_prefix("😀ab", 1), "");
         assert_eq!(utf16_prefix("😀ab", 3), "😀a");
-        let journal = derive_structure_evidence(StructureEvidenceV1(evidence(
+        let journal = derive_structure_evidence(evidence(
             "\u{85}alpha\n\n\u{feff}beta",
             DetectionProfile::Journal,
-        )))
+        ))
         .expect("valid journal evidence");
         assert_eq!(
             journal
@@ -4116,11 +4194,8 @@ mod tests {
     fn dotterm_inline_child_preserves_bare_spine_precedence() {
         let body = "This section provides for the administration of the enactment in force across the territory.";
         let text = format!("1. There is established a board. {body}\n2.(1) A term has the prescribed meaning. {body}\n2.1. This inserted provision governs administration. {body}\n3. The Minister may make regulations. {body}\n4. This Act comes into force. {body}");
-        let graph = derive_structure_evidence(StructureEvidenceV1(evidence(
-            &text,
-            DetectionProfile::Legislation,
-        )))
-        .expect("valid fixture evidence");
+        let graph = derive_structure_evidence(evidence(&text, DetectionProfile::Legislation))
+            .expect("valid fixture evidence");
         let top = graph
             .nodes
             .iter()
