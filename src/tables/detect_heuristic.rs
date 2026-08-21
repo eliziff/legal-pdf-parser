@@ -1,6 +1,5 @@
 //! Heuristic table detection and validation.
 
-use crate::text_utils::is_rtl_text;
 use crate::types::TextItem;
 use log::debug;
 
@@ -1032,10 +1031,19 @@ fn detect_table_in_region(
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(columns.len());
         for col_items in row_items.iter_mut() {
-            // Sort by X position (direction-aware)
-            let rtl = is_rtl_text(col_items.iter().map(|i| &i.text));
+            // Sort by X position (direction-aware). RTL direction comes from
+            // strong RTL letters only — a digit-only cell split across items
+            // must not have its number reversed. RTL cells sort in baseline
+            // bands so wrapped lines stay contiguous for the embedded-LTR
+            // restoration (matching the rect and structure-tree detectors).
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                col_items.sort_by(|a, b| b.x.total_cmp(&a.x));
+                crate::text_utils::sort_rtl_cell_items(
+                    col_items,
+                    |i| i.x,
+                    |i| i.y,
+                    |i| i.text.as_str(),
+                );
             } else {
                 col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }
