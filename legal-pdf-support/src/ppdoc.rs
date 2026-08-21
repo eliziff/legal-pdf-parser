@@ -655,11 +655,7 @@ impl PPDocLayout {
         ))
     }
 
-    pub fn annotate_pdf(
-        &mut self,
-        pdf_path: &Path,
-        pages: &mut [Page],
-    ) -> Result<Vec<Diagnostic>> {
+    pub fn annotate_pdf(&mut self, pdf_path: &Path, pages: &mut [Page]) -> Result<Vec<Diagnostic>> {
         use hayro::hayro_interpret::InterpreterSettings;
         use hayro::hayro_syntax::Pdf;
         use hayro::vello_cpu::color::palette::css::WHITE;

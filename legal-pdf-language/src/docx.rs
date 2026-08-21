@@ -2047,18 +2047,14 @@ pub fn apply_docx_links(
         for (name, bytes) in &files {
             archive
                 .start_file(name, zip_options)
-                .map_err(|source| {
-                    legal_pdf_core::Error::Message(format!("ZIP error: {source}"))
-                })?;
+                .map_err(|source| legal_pdf_core::Error::Message(format!("ZIP error: {source}")))?;
             archive
                 .write_all(bytes)
                 .map_err(|source| legal_pdf_core::Error::io(&target, source))?;
         }
         archive
             .finish()
-            .map_err(|source| {
-                legal_pdf_core::Error::Message(format!("ZIP error: {source}"))
-            })?;
+            .map_err(|source| legal_pdf_core::Error::Message(format!("ZIP error: {source}")))?;
         Ok(())
     })?;
     Ok(json!({

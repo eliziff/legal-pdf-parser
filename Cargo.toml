@@ -6,7 +6,7 @@ license = "MIT"
 description = "Fast local-first structural parsing for legal PDFs"
 
 [workspace]
-members = ["legal-structure"]
+members = ["legal-structure", "legal-structure-node", "legal-structure-store"]
 exclude = [
     "legal-pdf-core",
     "legal-pdf-extraction",

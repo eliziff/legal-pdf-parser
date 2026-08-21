@@ -1,20 +1,17 @@
-use crate::source_doc::utf16_offsets;
 use crate::{
-    compose, Coverage, CoverageState, DetectionProfile, DocumentInput, EngineError, EvidenceKind,
-    NativeClaim, Origin, ScalarRange, Scope, ScopeKind, SourceDoc, SourceDocBlock, SourceDocKind,
-    SourceDocOrigin, SourceDocType, EVIDENCE_SCHEMA,
+    compose_trusted, Coverage, CoverageState, DetectionProfile, DocumentInput, EngineError,
+    EvidenceKind, NativeClaim, Origin, ParagraphBreak, Scope, ScopeKind, SourceDoc, SourceDocBlock,
+    SourceDocKind, SourceDocOrigin, SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
-use serde::ser::SerializeMap;
-use serde::{Serialize, Serializer};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-const ORIGIN: &str = "provider-adapter";
-
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum A2ajSourceKind {
     Cases,
     Laws,
@@ -23,6 +20,7 @@ pub enum A2ajSourceKind {
 /// A section map is ordered provider data, not a generic JSON object.
 pub type A2ajSectionMap = Vec<(String, String)>;
 
+#[derive(Deserialize)]
 pub struct A2ajInput {
     pub citation: String,
     pub source_kind: A2ajSourceKind,
@@ -89,11 +87,16 @@ fn dotted_order(source: &[(usize, &str, &str)]) -> Option<bool> {
     .then_some(false)
 }
 
-fn object_entries(map: &A2ajSectionMap) -> Result<Vec<(usize, &str, &str)>, EngineError> {
+fn validate_section_map(map: &A2ajSectionMap) -> Result<(), EngineError> {
     let mut seen = std::collections::HashSet::new();
     if map.iter().any(|(key, _)| !seen.insert(key)) {
         return Err(EngineError::source("duplicate A2AJ section-map key"));
     }
+    Ok(())
+}
+
+fn object_entries(map: &A2ajSectionMap) -> Result<Vec<(usize, &str, &str)>, EngineError> {
+    validate_section_map(map)?;
     let mut entries = map
         .iter()
         .enumerate()
@@ -110,9 +113,8 @@ fn object_entries(map: &A2ajSectionMap) -> Result<Vec<(usize, &str, &str)>, Engi
 }
 
 fn ordered_sections(map: &A2ajSectionMap) -> Result<Vec<(&str, &str)>, EngineError> {
-    let source = object_entries(map)?;
-    let order = dotted_order(&source);
-    let mut entries = source.clone();
+    let mut entries = object_entries(map)?;
+    let order = dotted_order(&entries);
     entries.sort_by(|left, right| {
         let (a, b) = (left.1.trim(), right.1.trim());
         let preamble =
@@ -142,93 +144,201 @@ fn ordered_sections(map: &A2ajSectionMap) -> Result<Vec<(&str, &str)>, EngineErr
         .collect())
 }
 
-struct SectionObject<'a>(&'a [(usize, &'a str, &'a str)]);
-impl Serialize for SectionObject<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (_, key, value) in self.0 {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
-    }
-}
-
-fn hash(value: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(value))
-}
-
+#[cfg(test)]
 fn utf16_at(text: &str, byte: usize) -> usize {
     text[..byte].encode_utf16().count()
 }
 
-fn provider_source(input: &A2ajInput, entries: &[(&str, &str)]) -> (String, Vec<SourceDocBlock>) {
-    if input.text.trim().is_empty() && !entries.is_empty() {
-        let mut text = String::new();
-        let mut blocks = Vec::new();
-        for (label, value) in entries.iter().filter(|(_, value)| {
-            !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("[blank]")
-        }) {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            let start = text.encode_utf16().count();
-            text.push_str(value);
-            blocks.push(SourceDocBlock::new(
-                SourceDocKind::Section,
-                format!("sec{}", label.trim()),
-                start,
-                text.encode_utf16().count(),
-                SourceDocOrigin::Native,
-            ));
-            if provision_label(label.trim()) {
-                blocks.extend(crate::recovery::source_doc_children(
-                    label.trim(),
-                    value,
-                    start,
-                ));
-            }
-        }
-        return (text, blocks);
+fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<SourceDocBlock>) {
+    if !text.trim().is_empty() || entries.is_empty() {
+        return (text, Vec::new());
     }
+    text.clear();
     let mut blocks = Vec::new();
-    for (label, value) in entries {
-        let label = label.trim();
-        if label.is_empty()
-            || value.trim().is_empty()
-            || value.trim().eq_ignore_ascii_case("[blank]")
-        {
-            continue;
+    let mut utf16 = 0;
+    for (label, value) in entries.iter().filter(|(_, value)| {
+        !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("[blank]")
+    }) {
+        if !text.is_empty() {
+            text.push('\n');
+            utf16 += 1;
         }
-        let Some(start) = input.text.find(value) else {
-            continue;
-        };
-        let after_first = start + input.text[start..].chars().next().unwrap().len_utf8();
-        if input.text[after_first..].contains(value) {
-            continue;
-        }
-        let line_start = input.text[..start].rfind('\n').map_or(0, |at| at + 1);
-        let prefix = &input.text[line_start..start];
-        static PRINTED: OnceLock<Regex> = OnceLock::new();
-        let printed = PRINTED
-            .get_or_init(|| Regex::new(r"^([^\s.)]+)[.)]?$").unwrap())
-            .captures(prefix.trim())
-            .map(|capture| capture[1].to_owned());
-        if printed
-            .as_deref()
-            .is_some_and(|mark| provision_label(mark) && !mark.eq_ignore_ascii_case(label))
-            || printed.is_some()
-        {
-            continue;
-        }
+        let start = utf16;
+        text.push_str(value);
+        utf16 += value.encode_utf16().count();
         blocks.push(SourceDocBlock::new(
             SourceDocKind::Section,
-            format!("sec{label}"),
-            utf16_at(&input.text, start),
-            utf16_at(&input.text, start + value.len()),
+            format!("sec{}", label.trim()),
+            start,
+            utf16,
             SourceDocOrigin::Native,
         ));
     }
-    (input.text.clone(), blocks)
+    (text, blocks)
+}
+
+fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
+    static PRINTED: OnceLock<Regex> = OnceLock::new();
+    let utf16 = |byte| text[..byte].encode_utf16().count();
+    map.iter()
+        .filter_map(|(raw_label, value)| {
+            let label = raw_label.trim();
+            if label.is_empty()
+                || value.trim().is_empty()
+                || value.trim().eq_ignore_ascii_case("[blank]")
+            {
+                return None;
+            }
+            let mut matches = text.match_indices(value).map(|(start, _)| start);
+            let start = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+            let prefix = text[line_start..start].trim();
+            let printed = PRINTED
+                .get_or_init(|| Regex::new(r"^([^\s.)]+)[.)]?$").unwrap())
+                .captures(prefix)
+                .map(|capture| capture[1].to_owned());
+            if printed.is_some() {
+                return None;
+            }
+            let end = start + value.len();
+            Some(SourceDocBlock::new(
+                SourceDocKind::Section,
+                format!("sec{label}"),
+                utf16(start),
+                utf16(end),
+                SourceDocOrigin::Native,
+            ))
+        })
+        .collect()
+}
+
+fn evidence(
+    input: &A2ajInput,
+    text: String,
+    blocks: Vec<SourceDocBlock>,
+) -> Result<DocumentInput, EngineError> {
+    const ORIGIN: &str = "provider-adapter";
+    let offsets = crate::source_doc::utf16_offsets(&text);
+    let scalar = |offset: usize| {
+        offsets
+            .binary_search(&offset)
+            .map_err(|_| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
+    };
+    let mut originals = HashMap::new();
+    let claims = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let id = format!("native-{:06}", index + 1);
+            let claim = NativeClaim {
+                id: id.clone(),
+                kind: EvidenceKind::Section,
+                label: Some(block.label.clone()),
+                aliases: block.aliases.clone(),
+                range: crate::ScalarRange {
+                    start: scalar(block.start)?,
+                    end: scalar(block.end)?,
+                },
+                provider_order: index,
+                origin_id: ORIGIN.to_owned(),
+                parent_label: block.parent_label.clone(),
+                anchor: block.anchor.clone(),
+            };
+            originals.insert(id, block);
+            Ok(claim)
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let scalar_end = offsets.len() - 1;
+    let coverage = [
+        EvidenceKind::Paragraph,
+        EvidenceKind::Prose,
+        EvidenceKind::Page,
+        EvidenceKind::Section,
+        EvidenceKind::Heading,
+        EvidenceKind::Footnote,
+        EvidenceKind::Endnote,
+    ]
+    .into_iter()
+    .map(|kind| Coverage {
+        kind,
+        range: crate::ScalarRange {
+            start: 0,
+            end: scalar_end,
+        },
+        state: if kind == EvidenceKind::Section && !claims.is_empty() {
+            CoverageState::Augment
+        } else {
+            CoverageState::Absent
+        },
+        reason: "shared-engine recovery lane".to_owned(),
+        origin_id: (kind == EvidenceKind::Section && !claims.is_empty()).then(|| ORIGIN.to_owned()),
+    })
+    .collect();
+    let source_kind = input.source_kind;
+    let profile = if source_kind == A2ajSourceKind::Cases {
+        DetectionProfile::CaseRootedComplete
+    } else {
+        DetectionProfile::Legislation
+    };
+    let report_start_page = report_start(input);
+    let require_report_start = source_kind == A2ajSourceKind::Cases
+        && input
+            .dataset
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("SCC"));
+    let allow_hyphenated_sections = source_kind == A2ajSourceKind::Laws
+        && input.name.as_deref().is_some_and(|value| {
+            static RE: OnceLock<Regex> = OnceLock::new();
+            RE.get_or_init(|| {
+                Regex::new(r"(?iu)\b(?:rules?|regulations?|r[eè]glements?)\b").unwrap()
+            })
+            .is_match(value)
+        });
+    let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    Ok(DocumentInput {
+        schema_version: EVIDENCE_SCHEMA.to_owned(),
+        document_id: input.id.clone().unwrap_or_else(|| input.citation.clone()),
+        provider: "a2aj".to_owned(),
+        url: input.url.clone(),
+        doc_type: Some(if source_kind == A2ajSourceKind::Cases {
+            SourceDocType::Cases
+        } else {
+            SourceDocType::Laws
+        }),
+        provider_revision: "a2aj-adapter-v1".to_owned(),
+        profile,
+        report_start_page,
+        require_report_start,
+        allow_hyphenated_sections,
+        text,
+        text_sha256,
+        source_sha256: None,
+        offset_unit: "unicode-scalar".to_owned(),
+        scope: Scope {
+            kind: if input.excerpt_of.is_some() {
+                ScopeKind::Excerpt
+            } else {
+                ScopeKind::Complete
+            },
+            excerpt_of: input.excerpt_of.clone(),
+        },
+        origins: vec![Origin {
+            id: ORIGIN.to_owned(),
+            producer: "a2aj".to_owned(),
+            representation: "provider-rendered-text".to_owned(),
+            revision: "a2aj-adapter-v1".to_owned(),
+            authority: "provider-native-claims".to_owned(),
+        }],
+        units: Vec::new(),
+        native_claims: claims,
+        coverage,
+        exclusions: Vec::new(),
+        paragraph_breaks: Vec::<ParagraphBreak>::new(),
+        original_claims: originals,
+    })
 }
 
 fn report_start(input: &A2ajInput) -> Option<u32> {
@@ -243,149 +353,50 @@ fn report_start(input: &A2ajInput) -> Option<u32> {
         })
 }
 
-fn document_input(
-    input: &A2ajInput,
-    text: String,
-    blocks: Vec<SourceDocBlock>,
-    map_json: &str,
-    source_sha: String,
-) -> DocumentInput {
-    let scalar_end = text.chars().count();
-    let utf16 = utf16_offsets(&text);
-    let native_claims = blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| NativeClaim {
-            id: format!("native-{:06}", index + 1),
-            kind: EvidenceKind::Section,
-            label: Some(block.label.clone()),
-            aliases: vec![],
-            range: ScalarRange {
-                start: utf16.binary_search(&block.start).unwrap(),
-                end: utf16.binary_search(&block.end).unwrap(),
-            },
-            provider_order: index,
-            origin_id: ORIGIN.into(),
-            parent_label: None,
-            anchor: None,
-        })
-        .collect::<Vec<_>>();
-    let original_claims = blocks
-        .into_iter()
-        .enumerate()
-        .map(|(index, block)| (format!("native-{:06}", index + 1), block))
-        .collect();
-    let section_native = !native_claims.is_empty();
-    let kinds = [
-        EvidenceKind::Paragraph,
-        EvidenceKind::Prose,
-        EvidenceKind::Page,
-        EvidenceKind::Section,
-        EvidenceKind::Heading,
-        EvidenceKind::Footnote,
-        EvidenceKind::Endnote,
-    ];
-    let representation = hash(if input.text.is_empty() {
-        map_json.as_bytes()
-    } else {
-        input.text.as_bytes()
-    });
-    DocumentInput {
-        schema_version: EVIDENCE_SCHEMA.into(),
-        document_id: input.id.clone().unwrap_or_else(|| input.citation.clone()),
-        provider: "a2aj".into(),
-        url: input.url.clone(),
-        doc_type: Some(if input.source_kind == A2ajSourceKind::Cases {
-            SourceDocType::Cases
-        } else {
-            SourceDocType::Laws
-        }),
-        provider_revision: "a2aj-adapter-v1".into(),
-        profile: if input.source_kind == A2ajSourceKind::Cases {
-            DetectionProfile::CaseRootedComplete
-        } else {
-            DetectionProfile::Legislation
-        },
-        report_start_page: report_start(input),
-        require_report_start: input.source_kind == A2ajSourceKind::Cases
-            && input
-                .dataset
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("SCC")),
-        allow_hyphenated_sections: input.source_kind == A2ajSourceKind::Laws
-            && input.name.as_deref().is_some_and(|value| {
-                static RE: OnceLock<Regex> = OnceLock::new();
-                RE.get_or_init(|| {
-                    Regex::new(r"(?iu)\b(?:rules?|regulations?|r[eè]glements?)\b").unwrap()
-                })
-                .is_match(value)
-            }),
-        text_sha256: hash(text.as_bytes()),
-        text,
-        source_sha256: Some(source_sha),
-        offset_unit: "unicode-scalar".into(),
-        scope: Scope {
-            kind: if input.excerpt_of.is_some() {
-                ScopeKind::Excerpt
-            } else {
-                ScopeKind::Complete
-            },
-            excerpt_of: input.excerpt_of.clone(),
-        },
-        origins: vec![Origin {
-            id: ORIGIN.into(),
-            producer: "a2aj".into(),
-            representation: "provider-rendered-text".into(),
-            revision: representation,
-            authority: "provider-native-claims".into(),
-        }],
-        units: vec![],
-        native_claims,
-        coverage: kinds
-            .into_iter()
-            .map(|kind| {
-                let augment = kind == EvidenceKind::Section && section_native;
-                Coverage {
-                    kind,
-                    range: ScalarRange {
-                        start: 0,
-                        end: scalar_end,
-                    },
-                    state: if augment {
-                        CoverageState::Augment
-                    } else {
-                        CoverageState::Absent
-                    },
-                    reason: "shared-engine recovery lane".into(),
-                    origin_id: augment.then(|| ORIGIN.into()),
-                }
-            })
-            .collect(),
-        exclusions: vec![],
-        paragraph_breaks: vec![],
-        original_claims,
-    }
-}
-
-fn words(text: &str) -> Vec<(String, usize, usize)> {
+fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
     static RE: OnceLock<Regex> = OnceLock::new();
+    let mut previous = 0;
+    let mut utf16 = 0;
     RE.get_or_init(|| Regex::new(r"[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*").unwrap())
         .find_iter(text)
         .map(|item| {
+            utf16 += text[previous..item.start()].encode_utf16().count();
+            let start = utf16;
+            utf16 += item.as_str().encode_utf16().count();
+            previous = item.end();
             (
                 item.as_str().to_lowercase(),
-                utf16_at(text, item.start()),
-                utf16_at(text, item.end()),
+                start,
+                utf16,
+                item.start(),
+                item.end(),
             )
         })
         .collect()
 }
 
-fn promote(text: &str, blocks: &mut Vec<SourceDocBlock>, map: &A2ajSectionMap) {
+fn apply_provider_section_evidence(
+    text: &str,
+    blocks: &mut Vec<SourceDocBlock>,
+    map: &A2ajSectionMap,
+) {
     let tokens = words(text);
     let mut postings = HashMap::<&str, Vec<usize>>::new();
-    for (index, (word, _, _)) in tokens.iter().enumerate() {
+    for (index, (word, ..)) in tokens.iter().enumerate() {
         postings.entry(word).or_default().push(index);
+    }
+    let mut top_sections = HashMap::<String, Vec<usize>>::new();
+    for (index, block) in blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.kind == SourceDocKind::Section && block.parent_label.is_none())
+    {
+        for label in std::iter::once(&block.label).chain(&block.aliases) {
+            let candidates = top_sections.entry(label.to_lowercase()).or_default();
+            if candidates.last() != Some(&index) {
+                candidates.push(index);
+            }
+        }
     }
     let mut counts = HashMap::new();
     for (label, _) in map {
@@ -400,32 +411,29 @@ fn promote(text: &str, blocks: &mut Vec<SourceDocBlock>, map: &A2ajSectionMap) {
         {
             continue;
         }
-        let phrase = words(provider_text)
-            .into_iter()
-            .map(|(word, _, _)| word)
-            .collect::<Vec<_>>();
+        let phrase = words(provider_text);
         if phrase.is_empty() {
             continue;
         }
-        let Some(anchor) = phrase
+        let Some((anchor_offset, anchor_word)) = phrase
             .iter()
             .enumerate()
-            .min_by_key(|(_, word)| postings.get(word.as_str()).map_or(0, Vec::len))
+            .min_by_key(|(_, word)| postings.get(word.0.as_str()).map_or(0, Vec::len))
         else {
             continue;
         };
         let mut spans = Vec::new();
-        for &position in postings.get(anchor.1.as_str()).into_iter().flatten() {
-            let Some(start) = position.checked_sub(anchor.0) else {
+        for &position in postings.get(anchor_word.0.as_str()).into_iter().flatten() {
+            let Some(start) = position.checked_sub(anchor_offset) else {
                 continue;
             };
             if start + phrase.len() <= tokens.len()
                 && tokens[start..start + phrase.len()]
                     .iter()
                     .map(|token| &token.0)
-                    .eq(phrase.iter())
+                    .eq(phrase.iter().map(|token| &token.0))
             {
-                spans.push((tokens[start].1, tokens[start + phrase.len() - 1].2));
+                spans.push((start, tokens[start].1, tokens[start + phrase.len() - 1].2));
                 if spans.len() == 2 {
                     break;
                 }
@@ -434,112 +442,96 @@ fn promote(text: &str, blocks: &mut Vec<SourceDocBlock>, map: &A2ajSectionMap) {
         if spans.len() != 1 {
             continue;
         }
+        let first_token = spans[0].0;
+        let last_token = first_token + phrase.len() - 1;
+        let body = tokens[first_token]
+            .3
+            .checked_sub(phrase[0].3)
+            .and_then(|body_start| {
+                body_start
+                    .checked_add(provider_text.len())
+                    .filter(|&body_end| text.get(body_start..body_end) == Some(provider_text))
+                    .map(|body_end| {
+                        let body_utf16_start = tokens[first_token].1 - phrase[0].1;
+                        let body_utf16_end = tokens[last_token].2
+                            + provider_text[phrase[phrase.len() - 1].4..]
+                                .encode_utf16()
+                                .count();
+                        (body_start, body_end, body_utf16_start, body_utf16_end)
+                    })
+            });
         let provider_label = format!("sec{label}");
         let key = provider_label.to_lowercase();
-        let candidates = blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| {
-                block.kind == SourceDocKind::Section
-                    && block.parent_label.is_none()
-                    && std::iter::once(&block.label)
-                        .chain(&block.aliases)
-                        .any(|value| value.to_lowercase() == key)
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let exact = text.match_indices(provider_text).collect::<Vec<_>>();
-        let exact = (exact.len() == 1).then(|| utf16_at(text, exact[0].0));
+        let candidates = top_sections.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         if candidates.len() == 1 {
             let index = candidates[0];
-            if spans[0].0 < blocks[index].start || spans[0].1 > blocks[index].end {
+            if spans[0].1 < blocks[index].start || spans[0].2 > blocks[index].end {
                 continue;
             }
             blocks[index].origin = SourceDocOrigin::Native;
-            if let Some(start) = exact.filter(|_| blocks[index].label.eq_ignore_ascii_case(&key)) {
-                let outer = (blocks[index].start, blocks[index].end);
-                let descendant = format!("{key}(");
-                blocks.retain(|block| {
-                    !block.label.to_lowercase().starts_with(&descendant)
-                        || block.start < outer.0
-                        || block.end > outer.1
-                });
-                blocks.extend(crate::recovery::source_doc_children(
-                    label,
-                    provider_text,
-                    start,
-                ));
-            }
         } else if candidates.is_empty() {
-            let Some(start) = exact else { continue };
-            let end = start + provider_text.encode_utf16().count();
+            let Some((body_start, _, body_utf16_start, body_utf16_end)) = body else {
+                continue;
+            };
+            let line_start = text[..body_start].rfind('\n').map_or(0, |at| at + 1);
+            let prefix = &text[line_start..body_start];
+            let lead = prefix.len() - prefix.trim_start_matches([' ', '\t']).len();
+            let printed = prefix[lead..].trim_end_matches([' ', '\t']);
+            let printed = std::iter::once(printed)
+                .chain(
+                    printed
+                        .strip_suffix(['.', ')', ':', '-', '–', '—'])
+                        .map(str::trim_end),
+                )
+                .find(|printed| printed.eq_ignore_ascii_case(label));
+            let start = printed.map_or(body_utf16_start, |_| {
+                body_utf16_start - text[line_start + lead..body_start].encode_utf16().count()
+            });
             blocks.push(SourceDocBlock::new(
                 SourceDocKind::Section,
                 provider_label,
                 start,
-                end,
+                body_utf16_end,
                 SourceDocOrigin::Native,
             ));
-            if provision_label(label) {
-                blocks.extend(crate::recovery::source_doc_children(
-                    label,
-                    provider_text,
-                    start,
-                ));
-            }
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    blocks.retain(|block| seen.insert((block.label.clone(), block.start, block.end)));
     blocks.sort_by_key(|block| (block.start, block.parent_label.is_some()));
 }
 
-pub fn a2aj_source_doc(input: A2ajInput) -> Result<SourceDoc, EngineError> {
-    let entries = input
-        .section_map
-        .as_ref()
-        .map(object_entries)
-        .transpose()?
-        .unwrap_or_default();
-    let map_json = input
-        .section_map
-        .as_ref()
-        .map(|_| serde_json::to_string(&SectionObject(&entries)).unwrap())
-        .unwrap_or_else(|| "null".into());
-    let source_sha = hash(format!(
-        "[{},{}]",
-        serde_json::to_string(&input.text).unwrap(),
-        map_json
-    ));
-    let ordered = input
-        .section_map
-        .as_ref()
-        .map(ordered_sections)
-        .transpose()?
-        .unwrap_or_default();
-    let source_order = entries
-        .iter()
-        .map(|(_, label, value)| (*label, *value))
-        .collect::<Vec<_>>();
-    let provider_entries = if input.text.trim().is_empty() {
-        &ordered
-    } else {
-        &source_order
+pub fn a2aj_source_doc(mut input: A2ajInput) -> Result<SourceDoc, EngineError> {
+    let has_text = !input.text.trim().is_empty();
+    let ordered = match (&input.section_map, has_text) {
+        (Some(map), true) => {
+            validate_section_map(map)?;
+            Vec::new()
+        }
+        (Some(map), false) => ordered_sections(map)?,
+        (None, _) => Vec::new(),
     };
-    let (text, blocks) = provider_source(&input, provider_entries);
-    let mut doc = compose(document_input(&input, text, blocks, &map_json, source_sha))?;
-    if input.source_kind == A2ajSourceKind::Laws && !input.text.trim().is_empty() {
+    let (text, mut blocks) = provider_source(std::mem::take(&mut input.text), &ordered);
+    if has_text {
         if let Some(map) = &input.section_map {
-            promote(&doc.text, &mut doc.blocks, map);
-            doc = crate::create_source_doc(
-                doc.provider,
-                doc.id,
-                doc.url,
-                doc.doc_type,
-                doc.text,
-                doc.blocks,
+            blocks = provider_claims(&text, map);
+        }
+    }
+    let mut document = compose_trusted(evidence(&input, text, blocks)?)?;
+    if input.source_kind == A2ajSourceKind::Laws && has_text {
+        if let Some(map) = &input.section_map {
+            apply_provider_section_evidence(&document.text, &mut document.blocks, map);
+            document = crate::create_source_doc(
+                document.provider,
+                document.id,
+                document.url,
+                document.doc_type,
+                document.text,
+                document.blocks,
             );
         }
     }
-    Ok(doc)
+    Ok(document)
 }
 
 #[cfg(test)]
@@ -547,7 +539,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn map_rendering_and_native_promotion_match_a2aj() {
+    fn map_rendering_and_provider_evidence_match_a2aj() {
         let mut mapped = A2ajInput::new("fixture", A2ajSourceKind::Laws, "");
         mapped.section_map = Some(
             ["1", "2", "4", "4.1", "4.2", "5", "Schedule 2", "Schedule 1"]
@@ -592,6 +584,65 @@ mod tests {
                 ("sec3", SourceDocOrigin::Heuristic)
             ]
         );
+        assert_eq!(
+            promoted
+                .blocks
+                .iter()
+                .find(|block| block.label == "sec2")
+                .unwrap()
+                .start,
+            utf16_at(text, text.find("2 Second").unwrap())
+        );
+
+        let text = "Preamble.\n99 Provider-only provision.";
+        let mut missing = A2ajInput::new("fixture", A2ajSourceKind::Laws, text);
+        missing.section_map = Some(vec![("99".into(), "Provider-only provision.".into())]);
+        let missing = a2aj_source_doc(missing).unwrap();
+        let added = missing
+            .blocks
+            .iter()
+            .find(|block| block.label == "sec99")
+            .unwrap();
+        assert_eq!(added.origin, SourceDocOrigin::Native);
+        assert_eq!(
+            added.start,
+            utf16_at(text, text.find("Provider-only").unwrap())
+        );
+
+        let mut sole = A2ajInput::new("fixture", A2ajSourceKind::Laws, "1 Sole provision.");
+        sole.section_map = Some(vec![("1".into(), "Sole provision.".into())]);
+        let sole = a2aj_source_doc(sole).unwrap();
+        assert_eq!(
+            sole.blocks
+                .iter()
+                .filter(|block| block.kind == SourceDocKind::Section && block.parent_label.is_none())
+                .map(|block| (&*block.label, block.start, block.origin))
+                .collect::<Vec<_>>(),
+            [("sec1", 0, SourceDocOrigin::Native)]
+        );
+
+        let mut printed = A2ajInput::new("fixture", A2ajSourceKind::Laws, "");
+        printed.section_map = Some(vec![(
+            "34".into(),
+            "34(1) Parent provision.\n(a) Child paragraph.".into(),
+        )]);
+        let printed = a2aj_source_doc(printed).unwrap();
+        let subsection = printed
+            .blocks
+            .iter()
+            .find(|block| block.label == "sec34(1)")
+            .unwrap();
+        assert_eq!(subsection.start, 4);
+        assert_eq!(
+            printed
+                .blocks
+                .iter()
+                .find(|block| block.label == "sec34(1)(a)")
+                .unwrap()
+                .parent_label
+                .as_deref(),
+            Some("sec34(1)")
+        );
 
         let text = "1 (1) Parent provision.\n(a) Child.\n\n### Next\n2 Next provision.";
         let mut bounded = A2ajInput::new("fixture", A2ajSourceKind::Laws, text);
@@ -605,7 +656,16 @@ mod tests {
             .iter()
             .find(|block| block.label == "sec1(1)(a)")
             .unwrap();
-        assert_eq!(&bounded.text[child.start..child.end], "(a) Child.");
+        assert_eq!(&bounded.text[child.start..child.start + 3], "(a)");
+        assert_eq!(
+            child.end,
+            bounded
+                .blocks
+                .iter()
+                .find(|block| block.label == "sec2")
+                .unwrap()
+                .start
+        );
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let fixtures = [
@@ -618,8 +678,8 @@ mod tests {
             // The canonical ladder keeps dotted/restarted nodes, immediate parents, and
             // parent-covering spans instead of reproducing the old flat child projection.
             ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-laws-fed-criminalcode-s231.json", "04c603e4e05ea33208c88bc0567f65a05c8f130f509f3d0ee4042e3a0f11b411"),
-            ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-laws-fed-criminalcode-sectionmap.json", "34a6c532cfea1273acdf2a181e6df9be44dad02e222ec1e41efc9da72c9d5750"),
-            ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-regs-on-oreg267-03.json", "82166813931e2c30638623ef7f87bfb8d73d098cc4e216b40a8646801606634b"),
+            ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-laws-fed-criminalcode-sectionmap.json", "244d5cf40421b504a28b8f29b58ce13f07e4ec2b790be6d820762eeeba6a3f80"),
+            ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-regs-on-oreg267-03.json", "c390772151b27d62946f7f592e296340540bcbfdcc5f143ba780d8035b101775"),
             ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-regs-fed-crc870-a01.json", "4f1f04471ef0e84c633241f29b9328cb26d13fbf240350373d4e17e08087cf33"),
             ("backend/src/lib/__tests__/fixtures/sourcedoc/a2aj-laws-ab-abc-benefits-s8.json", "bf8f3d6e7efddc6d15f9d0c2a3717e1746952a20ddfb660c768b3086957551fb"),
         ];
