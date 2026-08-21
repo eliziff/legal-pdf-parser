@@ -1,11 +1,19 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 use legal_pdf_core::model::{
-    Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Section, Span,
+    Diagnostic, Footnote, LegalDocument, Line, NotePairClaim, NotePairKind, Page, Paragraph,
+    Region, Span,
 };
 use legal_pdf_core::{line_font_size, union_bbox, Anchor, Error, PairingOutput, Result};
 use legal_pdf_support::{
     enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
+    protected_citation_spans,
+};
+use legal_structure::{
+    detect_structure_candidate_runs, resolve_structure_graph, BoundaryKind, CandidateEvidenceV2,
+    CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity, NodeKind, NoteBodyV2,
+    NoteKindV2, NotePairClaimV2, ResolutionRuleV2, ScalarRange, StructureBoundaryV2,
+    StructureCandidateRun, StructureDiagnosticV2, StructureGraphV2, StructureNodeV2, TextAnchorV2,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -28,14 +36,211 @@ struct LabelPrefix {
     end: usize,
 }
 
+#[derive(Debug, Default)]
+struct PdfPrimitiveEvidence {
+    source_regions: Option<HashMap<String, String>>,
+    table_cell_line_ids: HashSet<String>,
+    table_note_line_ids: HashSet<String>,
+    heading_levels: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+pub struct PdfPreparation {
+    diagnostics: Vec<Diagnostic>,
+    primitives: PdfPrimitiveEvidence,
+    resolution: Option<PdfResolutionInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureIdentity {
+    pub document_id: String,
+    pub source_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedPdfLine {
+    pub page_id: String,
+    pub page_index: usize,
+    pub line_id: String,
+    pub range: ScalarRange,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdfTextIndex {
+    text: String,
+    lines: Vec<IndexedPdfLine>,
+    line_slots: HashMap<String, usize>,
+    page_ranges: HashMap<usize, ScalarRange>,
+}
+
+#[derive(Debug)]
+struct PdfResolutionInput {
+    index: PdfTextIndex,
+    runs: Vec<StructureCandidateRun>,
+    evidence: Vec<CandidateEvidenceV2>,
+}
+
+impl PdfTextIndex {
+    pub fn from_pages(pages: &[Page]) -> Self {
+        let mut ordered_pages = pages.iter().collect::<Vec<_>>();
+        ordered_pages.sort_by_key(|page| page.index);
+        let mut text = String::new();
+        let mut lines = Vec::new();
+        let mut line_slots = HashMap::new();
+        let mut page_ranges = HashMap::new();
+        let mut scalar_cursor = 0;
+        for page in ordered_pages {
+            let mut ordered_lines = page.lines.iter().collect::<Vec<_>>();
+            ordered_lines.sort_by(|left, right| {
+                left.reading_order
+                    .cmp(&right.reading_order)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            let mut page_start = None;
+            let mut page_end = scalar_cursor;
+            for line in ordered_lines {
+                if !lines.is_empty() {
+                    text.push('\n');
+                    scalar_cursor += 1;
+                }
+                let start = scalar_cursor;
+                text.push_str(&line.text);
+                scalar_cursor += line.text.chars().count();
+                let range = ScalarRange {
+                    start,
+                    end: scalar_cursor,
+                };
+                page_start.get_or_insert(start);
+                page_end = range.end;
+                let slot = lines.len();
+                line_slots.insert(line.id.clone(), slot);
+                lines.push(IndexedPdfLine {
+                    page_id: page.id.clone(),
+                    page_index: page.index,
+                    line_id: line.id.clone(),
+                    range,
+                });
+            }
+            page_ranges.insert(
+                page.index,
+                ScalarRange {
+                    start: page_start.unwrap_or(scalar_cursor),
+                    end: page_end,
+                },
+            );
+        }
+        Self {
+            text,
+            lines,
+            line_slots,
+            page_ranges,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn lines(&self) -> &[IndexedPdfLine] {
+        &self.lines
+    }
+
+    pub fn line(&self, line_id: &str) -> Option<&IndexedPdfLine> {
+        self.line_slots
+            .get(line_id)
+            .and_then(|slot| self.lines.get(*slot))
+    }
+
+    fn line_at(&self, at: usize) -> Option<&IndexedPdfLine> {
+        let slot = self
+            .lines
+            .partition_point(|line| line.range.start <= at)
+            .checked_sub(1)?;
+        self.lines.get(slot).filter(|line| {
+            (line.range.start <= at && at < line.range.end)
+                || (line.range.start == line.range.end && line.range.start == at)
+        })
+    }
+
+    fn overlapping_lines(&self, range: ScalarRange) -> &[IndexedPdfLine] {
+        let start = self
+            .lines
+            .partition_point(|line| line.range.end <= range.start);
+        let end = self
+            .lines
+            .partition_point(|line| line.range.start < range.end);
+        &self.lines[start.min(end)..end]
+    }
+
+    pub fn page_range(&self, page_index: usize) -> Option<ScalarRange> {
+        self.page_ranges.get(&page_index).copied()
+    }
+
+    pub fn global_range(&self, line_id: &str, start: usize, end: usize) -> Option<ScalarRange> {
+        let line = self.line(line_id)?;
+        let length = line.range.end - line.range.start;
+        (start <= end && end <= length).then_some(ScalarRange {
+            start: line.range.start + start,
+            end: line.range.start + end,
+        })
+    }
+
+    pub fn line_ids(&self, range: ScalarRange) -> Vec<String> {
+        self.overlapping_lines(range)
+            .iter()
+            .map(|line| line.line_id.clone())
+            .collect()
+    }
+
+    pub fn page_indexes(&self, range: ScalarRange) -> Vec<usize> {
+        self.overlapping_lines(range)
+            .iter()
+            .fold(Vec::new(), |mut pages, line| {
+                if !pages.contains(&line.page_index) {
+                    pages.push(line.page_index);
+                }
+                pages
+            })
+    }
+
+    fn range_for_line_ids<'a>(
+        &self,
+        line_ids: impl IntoIterator<Item = &'a String>,
+    ) -> Option<ScalarRange> {
+        line_ids
+            .into_iter()
+            .filter_map(|line_id| self.line(line_id))
+            .fold(None, |range, line| {
+                Some(range.map_or(line.range, |range: ScalarRange| ScalarRange {
+                    start: range.start.min(line.range.start),
+                    end: range.end.max(line.range.end),
+                }))
+            })
+    }
+
+    fn page_indexes_for_line_ids<'a>(
+        &self,
+        line_ids: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<usize> {
+        line_ids.into_iter().fold(Vec::new(), |mut pages, line_id| {
+            if let Some(page_index) = self.line(line_id).map(|line| line.page_index) {
+                if !pages.contains(&page_index) {
+                    pages.push(page_index);
+                }
+            }
+            pages
+        })
+    }
+}
+
 pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
-    pub sections: Vec<Section>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
     pub markers: Vec<Value>,
     pub marker_summary: Value,
     pub pairing_summary: Value,
+    pub structure_graph: StructureGraphV2,
 }
 
 pub struct StructureReplay {
@@ -1409,9 +1614,9 @@ fn apply_text_fidelity_headings(
     pages: &mut [Page],
     body_size: f64,
     source_regions: Option<&HashMap<String, String>>,
-) {
+) -> HashMap<String, usize> {
     let Some(source_regions) = source_regions else {
-        return;
+        return HashMap::new();
     };
     static TOC_LEADER: OnceLock<Regex> = OnceLock::new();
     let toc_leader =
@@ -1460,6 +1665,37 @@ fn apply_text_fidelity_headings(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut heading_levels = assignments
+        .iter()
+        .flat_map(|assignment| {
+            let page = assignment
+                .get("page_slot")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let marker = assignment
+                .get("line_slot")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let joined = assignment
+                .get("joined_line_slot")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let level = assignment
+                .get("level")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            [marker, joined]
+                .into_iter()
+                .flatten()
+                .filter_map(move |line| page.zip(level).map(|(page, level)| (page, line, level)))
+        })
+        .filter_map(|(page, line, level)| {
+            pages
+                .get(page)
+                .and_then(|page| page.lines.get(line))
+                .map(|line| (line.id.clone(), level))
+        })
+        .collect::<HashMap<_, _>>();
     let structural: HashSet<(usize, usize)> = assignments
         .iter()
         .flat_map(|assignment| {
@@ -1558,8 +1794,22 @@ fn apply_text_fidelity_headings(
             let block = pages[page_slot].lines[target_slot].block_index;
             pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
             pages[page_slot].lines[continuation_slot].block_index = block;
+            if let Some(level) = assignment.get("level").and_then(Value::as_u64) {
+                heading_levels.insert(
+                    pages[page_slot].lines[continuation_slot].id.clone(),
+                    level as usize,
+                );
+            }
         }
     }
+    let accepted = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .filter(|line| line.region_type == "heading")
+        .map(|line| line.id.as_str())
+        .collect::<HashSet<_>>();
+    heading_levels.retain(|line_id, _| accepted.contains(line_id.as_str()));
+    heading_levels
 }
 
 fn endnote_heading(text: &str) -> bool {
@@ -1622,10 +1872,10 @@ fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
 fn classify_pages_with_source(
     pages: &mut [Page],
     separators: &[Option<f64>],
-    source_regions: Option<HashMap<String, String>>,
+    evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let article_body_size = if source_regions.is_some() {
+    let article_body_size = if evidence.source_regions.is_some() {
         article_body_font_size(pages)
     } else {
         0.0
@@ -1656,6 +1906,21 @@ fn classify_pages_with_source(
             (is_table, cells, notes)
         })
         .collect();
+
+    for (page, (_, table_cells, table_notes)) in pages.iter().zip(&table_pages) {
+        evidence.table_cell_line_ids.extend(
+            table_cells
+                .iter()
+                .filter_map(|index| page.lines.get(*index))
+                .map(|line| line.id.clone()),
+        );
+        evidence.table_note_line_ids.extend(
+            table_notes
+                .iter()
+                .filter_map(|index| page.lines.get(*index))
+                .map(|line| line.id.clone()),
+        );
+    }
 
     for (page, (table_page, table_cells, table_notes)) in pages.iter_mut().zip(table_pages) {
         let line_sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
@@ -2247,15 +2512,19 @@ fn classify_pages_with_source(
         diagnostics.extend(order_page(page, table_page, &table_notes));
         build_regions(std::slice::from_mut(page));
     }
-    apply_text_fidelity_headings(pages, article_body_size, source_regions.as_ref());
+    evidence.heading_levels =
+        apply_text_fidelity_headings(pages, article_body_size, evidence.source_regions.as_ref());
     build_regions(pages);
     diagnostics
 }
 
 #[cfg(test)]
 fn classify_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnostic> {
-    let source_regions = source_region_contract(pages);
-    classify_pages_with_source(pages, separators, source_regions)
+    let mut evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(pages),
+        ..PdfPrimitiveEvidence::default()
+    };
+    classify_pages_with_source(pages, separators, &mut evidence)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3640,110 +3909,6 @@ fn clean_markers(value: &str) -> String {
     marker_re().replace_all(value, "").trim().to_owned()
 }
 
-fn heading_kind(value: &str) -> Option<&'static str> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let token = RE
-        .get_or_init(|| {
-            Regex::new(
-                r"(?i)^(subclause|subcl|clause|cl|subparagraph|subpara|paragraph|para|par|subsection|subsec|section|sec|schedule|sched|article|art)\.?(?:[\s:_/-]|$)",
-            )
-            .unwrap()
-        })
-        .captures(value.trim())?
-        .get(1)?
-        .as_str()
-        .to_lowercase();
-    match token.as_str() {
-        "section" | "sec" => Some("section"),
-        "subsection" | "subsec" => Some("subsection"),
-        "paragraph" | "para" | "par" => Some("provision_paragraph"),
-        "subparagraph" | "subpara" => Some("subparagraph"),
-        "clause" | "cl" => Some("clause"),
-        "subclause" | "subcl" => Some("subclause"),
-        "schedule" | "sched" => Some("schedule"),
-        "article" | "art" => Some("article"),
-        _ => None,
-    }
-}
-
-fn leading_locator(value: &str) -> Option<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let captures = RE
-        .get_or_init(|| {
-            Regex::new(
-                r"(?i)^(?:(?:sections?|sec(?:tion)?s?|subsections?|subsecs?|paragraphs?|paras?|subparagraphs?|subparas?|clauses?|cls?|subclauses?|subcls?|schedules?|scheds?|articles?|arts?)\.?\s+)?((?:[0-9]{1,8}(?:[.-][0-9]{1,8}){0,4}|[IVXLCDM]+|[A-Z])(?:\s*\([^)]+\))*)\s*(?:[-.:;,–—]\s*|\s+|$)",
-            )
-            .unwrap()
-        })
-        .captures(value.trim())?;
-    Some(captures.get(1)?.as_str().split_whitespace().collect())
-}
-
-fn section_identity(heading: &str) -> (Option<String>, String, Vec<String>) {
-    let locator_kind = heading_kind(heading).map(str::to_owned);
-    let locator = leading_locator(heading).unwrap_or_else(|| heading.to_owned());
-    let mut aliases = vec![locator.clone()];
-    if let Some(kind) = &locator_kind {
-        if locator != heading {
-            aliases.push(format!(
-                "{} {locator}",
-                kind.replace("provision_", "").replace('_', " ")
-            ));
-        }
-    }
-    aliases.push(heading.to_owned());
-    aliases.dedup();
-    (locator_kind, locator, aliases)
-}
-
-fn build_sections(paragraphs: &[Paragraph]) -> Vec<Section> {
-    let heading_indexes: Vec<usize> = paragraphs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, paragraph)| (paragraph.region_type == "heading").then_some(index))
-        .collect();
-    let mut sections = Vec::new();
-    for (ordinal, &start) in heading_indexes.iter().enumerate() {
-        let end = heading_indexes
-            .get(ordinal + 1)
-            .copied()
-            .unwrap_or(paragraphs.len());
-        let content = &paragraphs[start..end];
-        let heading = clean_markers(&content[0].text);
-        let (locator_kind, locator, aliases) = section_identity(&heading);
-        sections.push(Section {
-            id: format!("section-{:06}", ordinal + 1),
-            heading_paragraph_id: content[0].id.clone(),
-            heading,
-            locator,
-            locator_kind,
-            aliases,
-            text: content
-                .iter()
-                .map(|paragraph| clean_markers(&paragraph.text))
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            paragraph_ids: content
-                .iter()
-                .map(|paragraph| paragraph.id.clone())
-                .collect(),
-            page_indexes: content.iter().fold(Vec::new(), |mut pages, paragraph| {
-                if !pages.contains(&paragraph.page_index) {
-                    pages.push(paragraph.page_index);
-                }
-                pages
-            }),
-            line_ids: content
-                .iter()
-                .flat_map(|paragraph| paragraph.line_ids.iter().cloned())
-                .collect(),
-            provenance: "heading-region".to_owned(),
-        });
-    }
-    sections
-}
-
 fn sentence_at(text: &str, offset: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut boundaries = Vec::<(usize, usize)>::new();
@@ -4140,47 +4305,589 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
     }
 }
 
-pub fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnostic> {
-    let source_regions = legal_pdf_support::profile::measure("prepare.source_regions", || {
-        source_region_contract(pages)
-    });
+fn add_observation(
+    observations: &mut Vec<CandidateObservationV2>,
+    observation: CandidateObservationV2,
+) {
+    if !observations.contains(&observation) {
+        observations.push(observation);
+    }
+}
+
+fn visual_source_region(region: &str) -> bool {
+    matches!(
+        region,
+        "table"
+            | "table_cell"
+            | "form"
+            | "figure"
+            | "image"
+            | "chart"
+            | "formula"
+            | "separator"
+            | "visual"
+    )
+}
+
+fn contents_row(text: &str) -> bool {
+    static LEADER: OnceLock<Regex> = OnceLock::new();
+    LEADER
+        .get_or_init(|| Regex::new(r"(?:\. ){3,}|\.{4,}").expect("contents leader regex"))
+        .is_match(text)
+}
+
+fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
+    const MIN_LINE_NUMBERS: u32 = 15;
+    pages
+        .iter()
+        .filter_map(|page| {
+            if page.width <= 0.0 {
+                return None;
+            }
+            let mut candidates = page
+                .lines
+                .iter()
+                .filter_map(|line| {
+                    let number = arabic_page_number(&line.text)?;
+                    (number <= 40).then_some((line.bbox[0], number))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let tolerance = page.width * 0.03;
+            let mut best = &candidates[0..0];
+            let mut start = 0;
+            for end in 0..candidates.len() {
+                while candidates[end].0 - candidates[start].0 > tolerance {
+                    start += 1;
+                }
+                if end + 1 - start > best.len() {
+                    best = &candidates[start..=end];
+                }
+            }
+            let values = best
+                .iter()
+                .map(|(_, number)| *number)
+                .collect::<HashSet<_>>();
+            (values.len() >= MIN_LINE_NUMBERS as usize
+                && (1..=MIN_LINE_NUMBERS).all(|number| values.contains(&number)))
+            .then_some(page.index)
+        })
+        .collect()
+}
+
+fn index_pages(pages: &[Page]) -> HashSet<usize> {
+    static ENTRY: OnceLock<Regex> = OnceLock::new();
+    let entry = ENTRY
+        .get_or_init(|| Regex::new(r"\[\d{1,3}\]\s+\d{1,3}:\d{1,3}").expect("index entry regex"));
+    pages
+        .iter()
+        .filter_map(|page| {
+            let text = page
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (entry.find_iter(&text).take(5).count() >= 5).then_some(page.index)
+        })
+        .collect()
+}
+
+impl PdfResolutionInput {
+    fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
+        let index = PdfTextIndex::from_pages(pages);
+        let runs = detect_structure_candidate_runs(index.text());
+        let contents_pages = pages
+            .iter()
+            .filter(|page| contents_grid(&page.lines, page.width))
+            .map(|page| page.index)
+            .collect::<HashSet<_>>();
+        let transcript_line_number_pages = transcript_line_number_pages(pages);
+        let index_pages = index_pages(pages);
+        let by_line = pages
+            .iter()
+            .flat_map(|page| {
+                page.lines
+                    .iter()
+                    .map(move |line| (line.id.as_str(), (page, line)))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut flow_lines = HashSet::new();
+        for page in pages {
+            let mut lines = page.lines.iter().collect::<Vec<_>>();
+            lines.sort_by(|left, right| {
+                left.reading_order
+                    .cmp(&right.reading_order)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            for pair in lines.windows(2) {
+                if pair.iter().all(|line| {
+                    !line.exclude_from_body
+                        && line.note_region_mode.is_empty()
+                        && line.region_type == "body"
+                }) && body_flow_edge(pair[0], pair[1])
+                {
+                    flow_lines.insert(pair[0].id.as_str());
+                    flow_lines.insert(pair[1].id.as_str());
+                }
+            }
+        }
+        let citation_spans = by_line
+            .iter()
+            .map(|(line_id, (_, line))| (*line_id, protected_citation_spans(&line.text)))
+            .collect::<HashMap<_, _>>();
+        let mut evidence = Vec::new();
+        for run in &runs {
+            let mut list_candidates = HashSet::new();
+            if !matches!(run.grammar, CandidateGrammar::Numeric) {
+                for candidate in &run.markers {
+                    let Some(indexed) = index.line_at(candidate.marker_range.start) else {
+                        continue;
+                    };
+                    let Some((page, line)) = by_line.get(indexed.line_id.as_str()) else {
+                        continue;
+                    };
+                    let aligned_siblings = run
+                        .markers
+                        .iter()
+                        .filter(|sibling| {
+                            if sibling.id == candidate.id || sibling.level != candidate.level {
+                                return false;
+                            }
+                            let Some(sibling_indexed) = index.line_at(sibling.marker_range.start)
+                            else {
+                                return false;
+                            };
+                            let Some((sibling_page, sibling_line)) =
+                                by_line.get(sibling_indexed.line_id.as_str())
+                            else {
+                                return false;
+                            };
+                            line.region_type == "body"
+                                && sibling_line.region_type == "body"
+                                && !line.exclude_from_body
+                                && !sibling_line.exclude_from_body
+                                && (line.bbox[0] - sibling_line.bbox[0]).abs()
+                                    <= page.width.max(sibling_page.width).max(1.0) * 0.008
+                        })
+                        .count();
+                    let list_context = candidate.parent_candidate_id.is_some()
+                        || (run.grammar == CandidateGrammar::Enumerator
+                            && run.rooted
+                            && run.consecutive);
+                    if aligned_siblings >= 1 && list_context {
+                        list_candidates.insert(candidate.id.as_str());
+                    }
+                }
+            }
+            for candidate in &run.markers {
+                let line_ids = index.line_ids(candidate.range);
+                let page_indexes = index.page_indexes(candidate.range);
+                let marker_line_ids = index.line_ids(candidate.marker_range);
+                let mut observations = Vec::new();
+
+                let body_prose = line_ids.iter().take(3).any(|line_id| {
+                    let Some((_, line)) = by_line.get(line_id.as_str()) else {
+                        return false;
+                    };
+                    if line.exclude_from_body
+                        || !line.note_region_mode.is_empty()
+                        || line.region_type != "body"
+                    {
+                        return false;
+                    }
+                    let start = index.line(line_id).map_or(0, |indexed| {
+                        candidate
+                            .content_start
+                            .saturating_sub(indexed.range.start)
+                            .min(line.text.chars().count())
+                    });
+                    let tail = char_slice(&line.text, start, line.text.chars().count());
+                    tail.chars()
+                        .filter(|character| character.is_alphabetic())
+                        .count()
+                        >= 8
+                        && (flow_lines.contains(line.id.as_str())
+                            || tail.split_whitespace().take(3).count() == 3)
+                });
+                if body_prose {
+                    add_observation(&mut observations, CandidateObservationV2::BodyProseFlow);
+                }
+                if marker_line_ids.iter().any(|line_id| {
+                    by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
+                        line.region_type == "heading"
+                            || primitives
+                                .source_regions
+                                .as_ref()
+                                .and_then(|regions| regions.get(&line.id))
+                                .is_some_and(|region| {
+                                    matches!(region.as_str(), "heading" | "paragraph_title")
+                                })
+                    })
+                }) {
+                    add_observation(&mut observations, CandidateObservationV2::SectionHeading);
+                }
+                if list_candidates.contains(candidate.id.as_str()) && body_prose {
+                    add_observation(&mut observations, CandidateObservationV2::ListItemLayout);
+                }
+                let marker_is_cross_reference = marker_line_ids.iter().any(|line_id| {
+                    let Some(indexed) = index.line(line_id) else {
+                        return false;
+                    };
+                    let local = ScalarRange {
+                        start: candidate
+                            .marker_range
+                            .start
+                            .saturating_sub(indexed.range.start),
+                        end: candidate
+                            .marker_range
+                            .end
+                            .saturating_sub(indexed.range.start)
+                            .min(indexed.range.end - indexed.range.start),
+                    };
+                    citation_spans.get(line_id.as_str()).is_some_and(|spans| {
+                        spans
+                            .iter()
+                            .any(|(start, end)| *start < local.end && local.start < *end)
+                    })
+                });
+                if marker_is_cross_reference {
+                    add_observation(&mut observations, CandidateObservationV2::CrossReference);
+                }
+                let table_or_form = marker_line_ids.iter().any(|line_id| {
+                    primitives.table_cell_line_ids.contains(line_id)
+                        || by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
+                            primitives
+                                .source_regions
+                                .as_ref()
+                                .and_then(|regions| regions.get(&line.id))
+                                .is_some_and(|region| visual_source_region(region))
+                        })
+                });
+                if table_or_form {
+                    add_observation(&mut observations, CandidateObservationV2::TableOrForm);
+                }
+                let contents = line_ids.iter().take(3).any(|line_id| {
+                    by_line.get(line_id.as_str()).is_some_and(|(page, line)| {
+                        contents_pages.contains(&page.index) || contents_row(&line.text)
+                    })
+                });
+                if contents {
+                    add_observation(&mut observations, CandidateObservationV2::ContentsRow);
+                }
+                let marker_pages = marker_line_ids
+                    .iter()
+                    .filter_map(|line_id| by_line.get(line_id.as_str()).map(|(page, _)| page.index))
+                    .collect::<HashSet<_>>();
+                if marker_pages.iter().any(|page| index_pages.contains(page)) {
+                    add_observation(&mut observations, CandidateObservationV2::IndexRow);
+                }
+                if marker_pages
+                    .iter()
+                    .any(|page| transcript_line_number_pages.contains(page))
+                {
+                    add_observation(
+                        &mut observations,
+                        CandidateObservationV2::TranscriptLineNumber,
+                    );
+                }
+                let furniture = marker_line_ids.iter().any(|line_id| {
+                    by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
+                        matches!(line.region_type.as_str(), "header" | "footer")
+                            || (line.exclude_from_body
+                                && !primitives.table_cell_line_ids.contains(&line.id)
+                                && !primitives.table_note_line_ids.contains(&line.id))
+                    })
+                });
+                if furniture {
+                    add_observation(&mut observations, CandidateObservationV2::Furniture);
+                }
+                evidence.push(CandidateEvidenceV2 {
+                    candidate_id: candidate.id.clone(),
+                    page_indexes,
+                    line_ids,
+                    observations,
+                });
+            }
+        }
+        Self {
+            index,
+            runs,
+            evidence,
+        }
+    }
+}
+
+fn map_note_pairs(
+    index: &PdfTextIndex,
+    pairs: &[NotePairClaim],
+) -> Result<(Vec<NotePairClaimV2>, Vec<StructureDiagnosticV2>)> {
+    let mut claims = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut pair_ids = HashSet::new();
+    for pair in pairs {
+        if pair.pair_id.is_empty() || !pair_ids.insert(pair.pair_id.as_str()) {
+            return Err(Error::Message(format!(
+                "paired note '{}' has an empty or duplicate pair id",
+                pair.pair_id
+            )));
+        }
+        let label_line = index.line(&pair.label_anchor.line_id).ok_or_else(|| {
+            Error::Message(format!(
+                "paired note {} has an unknown label line",
+                pair.pair_id
+            ))
+        })?;
+        let label_range = index
+            .global_range(
+                &pair.label_anchor.line_id,
+                pair.label_anchor.start,
+                pair.label_anchor.end,
+            )
+            .ok_or_else(|| {
+                Error::Message(format!(
+                    "paired note {} has an invalid label range",
+                    pair.pair_id
+                ))
+            })?;
+        let references = pair
+            .reference_anchors
+            .iter()
+            .map(|anchor| {
+                let line = index.line(&anchor.line_id).ok_or_else(|| {
+                    Error::Message(format!(
+                        "paired note {} has an unknown reference line",
+                        pair.pair_id
+                    ))
+                })?;
+                let range = index
+                    .global_range(&anchor.line_id, anchor.start, anchor.end)
+                    .ok_or_else(|| {
+                        Error::Message(format!(
+                            "paired note {} has an invalid reference range",
+                            pair.pair_id
+                        ))
+                    })?;
+                Ok(TextAnchorV2 {
+                    range,
+                    page_index: line.page_index,
+                    line_id: anchor.line_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if pair
+            .body_line_ids
+            .iter()
+            .any(|line_id| index.line(line_id).is_none())
+        {
+            return Err(Error::Message(format!(
+                "paired note {} has an unknown body line",
+                pair.pair_id
+            )));
+        }
+        let body_range = index.range_for_line_ids(&pair.body_line_ids);
+        if pair.reference_anchors.is_empty()
+            || body_range.is_none()
+            || body_range.is_some_and(|range| range.start == range.end)
+            || label_range.start == label_range.end
+            || references
+                .iter()
+                .any(|anchor| anchor.range.start == anchor.range.end)
+        {
+            diagnostics.push(StructureDiagnosticV2 {
+                code: "note_pair_unmaterialized".to_owned(),
+                severity: DiagnosticSeverity::Info,
+                run_id: None,
+                candidate_ids: vec![pair.pair_id.clone()],
+                rules: Vec::new(),
+                ranges: Vec::new(),
+                node_ids: Vec::new(),
+            });
+            continue;
+        }
+        claims.push(NotePairClaimV2 {
+            pair_id: pair.pair_id.clone(),
+            kind: match pair.kind {
+                NotePairKind::Footnote => NoteKindV2::Footnote,
+                NotePairKind::Endnote => NoteKindV2::Endnote,
+            },
+            label: TextAnchorV2 {
+                range: label_range,
+                page_index: label_line.page_index,
+                line_id: pair.label_anchor.line_id.clone(),
+            },
+            body: NoteBodyV2 {
+                range: body_range.unwrap(),
+                page_indexes: index.page_indexes_for_line_ids(&pair.body_line_ids),
+                line_ids: pair.body_line_ids.clone(),
+            },
+            references,
+        });
+    }
+    Ok((claims, diagnostics))
+}
+
+fn native_graph_parts(
+    index: &PdfTextIndex,
+    pages: &[Page],
+    paragraphs: &[Paragraph],
+    primitives: &PdfPrimitiveEvidence,
+) -> Result<(Vec<StructureNodeV2>, Vec<StructureBoundaryV2>)> {
+    const ORIGIN: &str = "legalpdf.pdf-structure.v2";
+    let mut nodes = Vec::new();
+    for page in pages {
+        let range = index.page_range(page.index).ok_or_else(|| {
+            Error::Message(format!("page {} is absent from the text index", page.index))
+        })?;
+        nodes.push(StructureNodeV2 {
+            id: page.id.clone(),
+            kind: NodeKind::Page,
+            range,
+            origin_id: ORIGIN.to_owned(),
+            source: Derivation::Native,
+            label: page.printed_label.clone(),
+            locator_kind: None,
+            aliases: None,
+            parent_id: None,
+            anchor: page.printed_label_line_id.clone(),
+            content_start: None,
+            marker_range: None,
+            page_indexes: vec![page.index],
+            line_ids: index
+                .lines()
+                .iter()
+                .filter(|line| line.page_index == page.index)
+                .map(|line| line.line_id.clone())
+                .collect(),
+            level: None,
+            grammar: None,
+            proof: None,
+        });
+    }
+    let mut boundaries = Vec::new();
+    for paragraph in paragraphs {
+        let range = index
+            .range_for_line_ids(&paragraph.line_ids)
+            .ok_or_else(|| {
+                Error::Message(format!("paragraph {} has no indexed lines", paragraph.id))
+            })?;
+        let heading = paragraph.region_type == "heading";
+        let heading_level = heading
+            .then(|| {
+                paragraph
+                    .line_ids
+                    .iter()
+                    .find_map(|line_id| primitives.heading_levels.get(line_id).copied())
+            })
+            .flatten();
+        nodes.push(StructureNodeV2 {
+            id: paragraph.id.clone(),
+            kind: if heading {
+                NodeKind::Heading
+            } else {
+                NodeKind::Prose
+            },
+            range,
+            origin_id: ORIGIN.to_owned(),
+            source: if heading {
+                Derivation::Heuristic
+            } else {
+                Derivation::Native
+            },
+            label: heading.then(|| char_slice(index.text(), range.start, range.end).to_owned()),
+            locator_kind: None,
+            aliases: None,
+            parent_id: None,
+            anchor: None,
+            content_start: None,
+            marker_range: None,
+            page_indexes: index.page_indexes_for_line_ids(&paragraph.line_ids),
+            line_ids: paragraph.line_ids.clone(),
+            level: heading_level,
+            grammar: heading.then(|| "accepted_heading".to_owned()),
+            proof: None,
+        });
+        boundaries.push(StructureBoundaryV2 {
+            kind: if heading {
+                BoundaryKind::Paragraph
+            } else {
+                BoundaryKind::Prose
+            },
+            at: range.end,
+            origin_id: ORIGIN.to_owned(),
+            source: if heading {
+                Derivation::Heuristic
+            } else {
+                Derivation::Native
+            },
+        });
+    }
+    Ok((nodes, boundaries))
+}
+
+pub fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> PdfPreparation {
+    let mut primitives = PdfPrimitiveEvidence {
+        source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
+            source_region_contract(pages)
+        }),
+        ..PdfPrimitiveEvidence::default()
+    };
     legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
     legal_pdf_support::profile::measure("prepare.detached_references", || {
         associate_detached_references(pages, separators)
     });
     let mut diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
-        classify_pages_with_source(pages, separators, source_regions)
+        classify_pages_with_source(pages, separators, &mut primitives)
     });
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
     ));
-    diagnostics
+    PdfPreparation {
+        diagnostics,
+        primitives,
+        resolution: None,
+    }
 }
 
-pub fn prepare_derivation(pages: &mut [Page], mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+pub fn prepare_derivation(pages: &mut [Page], mut prepared: PdfPreparation) -> PdfPreparation {
     legal_pdf_support::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
-    diagnostics.extend(legal_pdf_support::profile::measure(
-        "derive.text_flow",
-        || text_flow_faults(pages),
+    prepared
+        .diagnostics
+        .extend(legal_pdf_support::profile::measure(
+            "derive.text_flow",
+            || text_flow_faults(pages),
+        ));
+    prepared.resolution = Some(legal_pdf_support::profile::measure(
+        "derive.structure_candidates",
+        || PdfResolutionInput::from_pages(pages, &prepared.primitives),
     ));
-    diagnostics
+    prepared
 }
 
 pub fn finish_derivation(
     pages: &mut [Page],
-    mut diagnostics: Vec<Diagnostic>,
+    mut prepared: PdfPreparation,
     pairing: PairingOutput,
-) -> StructureOutput {
+    identity: StructureIdentity,
+) -> Result<StructureOutput> {
+    let resolution = prepared.resolution.take().ok_or_else(|| {
+        Error::Message("PDF structure candidates were not prepared before pairing".to_owned())
+    })?;
+    let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let marker_summary = pairing.summary.clone();
+    let pairing_summary = pairing.summary;
+    let markers = pairing.markers;
+    let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
+    let mut diagnostics = prepared.diagnostics;
     diagnostics.extend(pairing.diagnostics);
     diagnostics.extend(legal_pdf_support::profile::measure(
         "derive.unmatched_references",
-        || unmatched_reference_diagnostics(pages, &footnotes, &pairing.anchors),
+        || unmatched_reference_diagnostics(pages, &footnotes, &anchors),
     ));
     let paragraphs = legal_pdf_support::profile::measure("derive.paragraphs", || {
-        build_paragraphs(pages, &pairing.anchors)
+        build_paragraphs(pages, &anchors)
     });
     legal_pdf_support::profile::measure("derive.propositions", || {
         attach_propositions(&mut footnotes, &paragraphs)
@@ -4188,17 +4895,32 @@ pub fn finish_derivation(
     legal_pdf_support::profile::measure("derive.crossrefs", || {
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
-    let sections =
-        legal_pdf_support::profile::measure("derive.sections", || build_sections(&paragraphs));
-    StructureOutput {
+    let (nodes, boundaries) =
+        native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
+    let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
+        resolve_structure_graph(
+            identity.document_id,
+            resolution.index.text(),
+            Some(identity.source_sha256),
+            nodes,
+            boundaries,
+            Vec::new(),
+            &resolution.runs,
+            &resolution.evidence,
+            &note_pairs,
+            graph_diagnostics,
+        )
+    })
+    .map_err(|error| Error::Message(error.to_string()))?;
+    Ok(StructureOutput {
         paragraphs,
-        sections,
         footnotes,
         diagnostics,
-        markers: pairing.markers,
+        markers,
         marker_summary,
-        pairing_summary: pairing.summary,
-    }
+        pairing_summary,
+        structure_graph,
+    })
 }
 
 pub fn validate_input(pages: &[Page], separators: &[Option<f64>]) -> Result<()> {
@@ -4400,61 +5122,52 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             )));
         }
     }
-    let heading_indexes: Vec<_> = document
-        .paragraphs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, paragraph)| (paragraph.region_type == "heading").then_some(index))
-        .collect();
-    if heading_indexes.len() != document.sections.len() {
+    if document.structure_graph.document_id != document.document_id
+        || document.structure_graph.source_sha256.as_deref() != Some(&document.source_sha256)
+    {
         return Err(Error::Message(
-            "document sections do not cover every heading paragraph".to_owned(),
+            "structure graph identity disagrees with the document".to_owned(),
         ));
     }
-    for (ordinal, (&start, section)) in heading_indexes.iter().zip(&document.sections).enumerate() {
-        let end = heading_indexes
-            .get(ordinal + 1)
-            .copied()
-            .unwrap_or(document.paragraphs.len());
-        let content = &document.paragraphs[start..end];
-        let heading = clean_markers(&content[0].text).trim().to_owned();
-        let (locator_kind, locator, aliases) = section_identity(&heading);
-        let text = content
-            .iter()
-            .map(|paragraph| clean_markers(&paragraph.text).trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let page_indexes = content.iter().fold(Vec::new(), |mut pages, paragraph| {
-            if !pages.contains(&paragraph.page_index) {
-                pages.push(paragraph.page_index);
-            }
-            pages
-        });
-        let line_ids: Vec<_> = content
-            .iter()
-            .flat_map(|paragraph| paragraph.line_ids.iter().cloned())
-            .collect();
-        let paragraph_ids: Vec<_> = content
-            .iter()
-            .map(|paragraph| paragraph.id.clone())
-            .collect();
-        if section.id != format!("section-{:06}", ordinal + 1)
-            || section.heading_paragraph_id != content[0].id
-            || section.heading != heading
-            || section.locator != locator
-            || section.locator_kind != locator_kind
-            || section.aliases != aliases
-            || section.text != text
-            || section.page_indexes != page_indexes
-            || section.line_ids != line_ids
-            || section.paragraph_ids != paragraph_ids
+    let text_length = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| line.text.chars().count())
+                .sum::<usize>()
+        })
+        .sum::<usize>()
+        + document.line_count().saturating_sub(1);
+    let mut node_ids = HashSet::new();
+    for node in &document.structure_graph.nodes {
+        if node.id.is_empty()
+            || !node_ids.insert(node.id.as_str())
+            || node.range.start > node.range.end
+            || node.range.end > text_length
+            || node.line_ids.iter().any(|line| !known_lines.contains(line))
+            || (node.kind == NodeKind::Section
+                && (node.locator_kind.as_deref().is_none_or(str::is_empty)
+                    || node
+                        .proof
+                        .as_ref()
+                        .is_none_or(|proof| proof.rule != ResolutionRuleV2::HierarchySection)))
         {
             return Err(Error::Message(format!(
-                "section {} has invalid boundaries",
-                section.id
+                "structure node {} is invalid",
+                node.id
             )));
         }
+    }
+    if document.structure_graph.nodes.iter().any(|node| {
+        node.parent_id
+            .as_deref()
+            .is_some_and(|parent| !node_ids.contains(parent))
+    }) {
+        return Err(Error::Message(
+            "structure graph contains an unknown parent".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -4463,6 +5176,381 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
 mod tests {
     use super::*;
     use legal_pdf_core::model::Word;
+
+    #[test]
+    fn pdf_text_index_preserves_exact_lines_and_scalar_offsets() {
+        let pages: Vec<Page> = serde_json::from_value(json!([
+            {
+                "id": "p2",
+                "index": 1,
+                "number": 2,
+                "width": 100.0,
+                "height": 100.0,
+                "lines": [{
+                    "id": "excluded",
+                    "page_index": 1,
+                    "page_number": 2,
+                    "source_index": 0,
+                    "reading_order": 0,
+                    "block_index": 0,
+                    "text": "EXCLUDED",
+                    "bbox": [0.0, 0.0, 10.0, 10.0],
+                    "exclude_from_body": true
+                }],
+                "regions": []
+            },
+            {
+                "id": "p1",
+                "index": 0,
+                "number": 1,
+                "width": 100.0,
+                "height": 100.0,
+                "lines": [
+                    {
+                        "id": "unicode",
+                        "page_index": 0,
+                        "page_number": 1,
+                        "source_index": 1,
+                        "reading_order": 1,
+                        "block_index": 0,
+                        "text": "\u{1f600}e\u{301}",
+                        "bbox": [0.0, 10.0, 10.0, 20.0]
+                    },
+                    {
+                        "id": "alpha",
+                        "page_index": 0,
+                        "page_number": 1,
+                        "source_index": 0,
+                        "reading_order": 0,
+                        "block_index": 0,
+                        "text": "\u{3b1}",
+                        "bbox": [0.0, 0.0, 10.0, 10.0]
+                    }
+                ],
+                "regions": []
+            }
+        ]))
+        .unwrap();
+
+        let index = PdfTextIndex::from_pages(&pages);
+
+        assert_eq!(index.text(), "\u{3b1}\n\u{1f600}e\u{301}\nEXCLUDED");
+        assert_eq!(
+            index.line("alpha").unwrap().range,
+            ScalarRange { start: 0, end: 1 }
+        );
+        assert_eq!(
+            index.line("unicode").unwrap().range,
+            ScalarRange { start: 2, end: 5 }
+        );
+        assert_eq!(
+            index.global_range("unicode", 0, 1),
+            Some(ScalarRange { start: 2, end: 3 })
+        );
+        assert_eq!(
+            index.line_ids(ScalarRange { start: 0, end: 5 }),
+            ["alpha", "unicode"]
+        );
+        assert_eq!(index.page_range(0), Some(ScalarRange { start: 0, end: 5 }));
+        assert_eq!(index.page_range(1), Some(ScalarRange { start: 6, end: 14 }));
+    }
+
+    #[test]
+    fn pdf_adapter_maps_raw_numeric_candidates_to_exact_line_ids_once() {
+        let pages: Vec<Page> = serde_json::from_value(json!([{
+            "id": "page-1",
+            "index": 0,
+            "number": 1,
+            "width": 600.0,
+            "height": 800.0,
+            "lines": [
+                {
+                    "id": "line-1",
+                    "page_index": 0,
+                    "page_number": 1,
+                    "source_index": 0,
+                    "reading_order": 0,
+                    "block_index": 0,
+                    "text": "1. First paragraph has prose.",
+                    "bbox": [72.0, 100.0, 400.0, 112.0],
+                    "region_type": "body"
+                },
+                {
+                    "id": "line-2",
+                    "page_index": 0,
+                    "page_number": 1,
+                    "source_index": 1,
+                    "reading_order": 1,
+                    "block_index": 1,
+                    "text": "2. Second paragraph has prose.",
+                    "bbox": [72.0, 120.0, 410.0, 132.0],
+                    "region_type": "body"
+                }
+            ],
+            "regions": []
+        }]))
+        .unwrap();
+
+        let adapter = PdfResolutionInput::from_pages(&pages, &PdfPrimitiveEvidence::default());
+        let run = adapter
+            .runs
+            .iter()
+            .find(|run| run.grammar == CandidateGrammar::Numeric)
+            .expect("numeric candidate run");
+        let mapped = run
+            .markers
+            .iter()
+            .map(|candidate| {
+                adapter
+                    .evidence
+                    .iter()
+                    .find(|evidence| evidence.candidate_id == candidate.id)
+                    .expect("mapped candidate")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(mapped[0].line_ids, ["line-1"]);
+        assert_eq!(mapped[1].line_ids, ["line-2"]);
+        assert!(mapped.iter().all(|evidence| evidence
+            .observations
+            .contains(&CandidateObservationV2::BodyProseFlow)));
+    }
+
+    #[test]
+    fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
+        assert!(contents_row("1.1 Background ........ 3"));
+        assert!(!contents_row("1.1 Background and application"));
+
+        let mut contents = test_page(
+            (1..=3)
+                .map(|number| {
+                    let mut line = test_line(
+                        &format!("{number}. Topic heading ........ {}", number + 4),
+                        [72.0, 80.0 + f64::from(number) * 20.0, 500.0, 94.0],
+                        vec![],
+                    );
+                    line.region_type = "body".to_owned();
+                    line
+                })
+                .collect(),
+        );
+        contents.index = 7;
+        contents.number = 8;
+        for line in &mut contents.lines {
+            line.page_index = 7;
+            line.page_number = 8;
+        }
+        let contents_adapter =
+            PdfResolutionInput::from_pages(&[contents], &PdfPrimitiveEvidence::default());
+        assert!(contents_adapter.evidence.iter().any(|item| item
+            .observations
+            .contains(&CandidateObservationV2::ContentsRow)));
+
+        let mut transcript = test_page(
+            (1..=25)
+                .map(|number| {
+                    test_line(
+                        &number.to_string(),
+                        [112.0, 60.0 + f64::from(number) * 20.0, 140.0, 74.0],
+                        vec![],
+                    )
+                })
+                .chain((1..=25).map(|number| {
+                    let mut line = test_line(
+                        &format!("Counsel continues speaking on transcript line {number}."),
+                        [154.0, 60.0 + f64::from(number) * 20.0, 500.0, 74.0],
+                        vec![],
+                    );
+                    line.region_type = "body".to_owned();
+                    line
+                }))
+                .collect(),
+        );
+        transcript.index = 3;
+        transcript.number = 4;
+        for line in &mut transcript.lines {
+            line.page_index = 3;
+            line.page_number = 4;
+        }
+        let transcript_adapter =
+            PdfResolutionInput::from_pages(&[transcript], &PdfPrimitiveEvidence::default());
+        assert!(!transcript_adapter.evidence.is_empty());
+        assert!(transcript_adapter.evidence.iter().all(|item| item
+            .observations
+            .contains(&CandidateObservationV2::TranscriptLineNumber)));
+
+        let index = test_page(
+            (1..=5)
+                .flat_map(|number| {
+                    [
+                        test_line(
+                            &format!("term-{number}"),
+                            [72.0, 80.0 + f64::from(number) * 20.0, 150.0, 94.0],
+                            vec![],
+                        ),
+                        test_line(
+                            &format!("[{number}] {}:{}", number + 20, number + 1),
+                            [180.0, 80.0 + f64::from(number) * 20.0, 300.0, 94.0],
+                            vec![],
+                        ),
+                    ]
+                })
+                .collect(),
+        );
+        assert!(index_pages(&[index]).contains(&0));
+    }
+
+    #[test]
+    fn typed_note_pairs_keep_every_exact_reference_anchor() {
+        let pages: Vec<Page> = serde_json::from_value(json!([{
+            "id": "page-1",
+            "index": 0,
+            "number": 1,
+            "width": 600.0,
+            "height": 800.0,
+            "lines": [
+                {
+                    "id": "reference",
+                    "page_index": 0,
+                    "page_number": 1,
+                    "source_index": 0,
+                    "reading_order": 0,
+                    "block_index": 0,
+                    "text": "x¹ y¹",
+                    "bbox": [72.0, 100.0, 200.0, 112.0]
+                },
+                {
+                    "id": "label",
+                    "page_index": 0,
+                    "page_number": 1,
+                    "source_index": 1,
+                    "reading_order": 1,
+                    "block_index": 1,
+                    "text": "1 Note body",
+                    "bbox": [72.0, 700.0, 300.0, 712.0]
+                }
+            ],
+            "regions": []
+        }]))
+        .unwrap();
+        let index = PdfTextIndex::from_pages(&pages);
+        let (pairs, diagnostics) = map_note_pairs(
+            &index,
+            &[NotePairClaim {
+                pair_id: "pair-1".to_owned(),
+                label: "1".to_owned(),
+                kind: NotePairKind::Footnote,
+                label_anchor: legal_pdf_core::SourceAnchor {
+                    line_id: "label".to_owned(),
+                    start: 0,
+                    end: 1,
+                },
+                reference_anchors: vec![
+                    legal_pdf_core::SourceAnchor {
+                        line_id: "reference".to_owned(),
+                        start: 1,
+                        end: 2,
+                    },
+                    legal_pdf_core::SourceAnchor {
+                        line_id: "reference".to_owned(),
+                        start: 4,
+                        end: 5,
+                    },
+                ],
+                body_line_ids: vec!["label".to_owned()],
+            }],
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(pairs[0].label.range, ScalarRange { start: 6, end: 7 });
+        assert_eq!(pairs[0].references.len(), 2);
+        assert_eq!(
+            pairs[0]
+                .references
+                .iter()
+                .map(|reference| reference.range)
+                .collect::<Vec<_>>(),
+            [
+                ScalarRange { start: 1, end: 2 },
+                ScalarRange { start: 4, end: 5 }
+            ]
+        );
+        assert_eq!(pairs[0].body.line_ids, ["label"]);
+    }
+
+    #[test]
+    fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
+        let pages: Vec<Page> = serde_json::from_value(json!([{
+            "id": "page-1", "index": 0, "number": 1, "width": 600.0, "height": 800.0,
+            "lines": [
+                {"id":"reference","page_index":0,"page_number":1,"source_index":0,"reading_order":0,"block_index":0,"text":"1","bbox":[0.0,0.0,1.0,1.0]},
+                {"id":"empty","page_index":0,"page_number":1,"source_index":1,"reading_order":1,"block_index":1,"text":"","bbox":[0.0,2.0,1.0,3.0]},
+                {"id":"body","page_index":0,"page_number":1,"source_index":2,"reading_order":2,"block_index":2,"text":"1 body","bbox":[0.0,4.0,10.0,5.0]}
+            ], "regions": []
+        }])).unwrap();
+        let index = PdfTextIndex::from_pages(&pages);
+        let mut pairs = (0..346)
+            .map(|number| NotePairClaim {
+                pair_id: format!("no-body-{number:03}"),
+                label: "1".to_owned(),
+                kind: NotePairKind::Footnote,
+                label_anchor: legal_pdf_core::SourceAnchor {
+                    line_id: "body".to_owned(),
+                    start: 0,
+                    end: 1,
+                },
+                reference_anchors: vec![legal_pdf_core::SourceAnchor {
+                    line_id: "reference".to_owned(),
+                    start: 0,
+                    end: 1,
+                }],
+                body_line_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        pairs.push(NotePairClaim {
+            pair_id: "zero-label".to_owned(),
+            label: "1".to_owned(),
+            kind: NotePairKind::Footnote,
+            label_anchor: legal_pdf_core::SourceAnchor {
+                line_id: "empty".to_owned(),
+                start: 0,
+                end: 0,
+            },
+            reference_anchors: vec![legal_pdf_core::SourceAnchor {
+                line_id: "reference".to_owned(),
+                start: 0,
+                end: 1,
+            }],
+            body_line_ids: vec!["body".to_owned()],
+        });
+        pairs.push(NotePairClaim {
+            pair_id: "zero-reference".to_owned(),
+            label: "1".to_owned(),
+            kind: NotePairKind::Footnote,
+            label_anchor: legal_pdf_core::SourceAnchor {
+                line_id: "body".to_owned(),
+                start: 0,
+                end: 1,
+            },
+            reference_anchors: vec![legal_pdf_core::SourceAnchor {
+                line_id: "empty".to_owned(),
+                start: 0,
+                end: 0,
+            }],
+            body_line_ids: vec!["body".to_owned()],
+        });
+
+        let (claims, diagnostics) = map_note_pairs(&index, &pairs).unwrap();
+
+        assert!(claims.is_empty());
+        assert_eq!(diagnostics.len(), 348);
+        assert!(diagnostics
+            .iter()
+            .all(|item| item.code == "note_pair_unmaterialized"));
+        assert_eq!(diagnostics[346].candidate_ids, ["zero-label"]);
+        assert_eq!(diagnostics[347].candidate_ids, ["zero-reference"]);
+    }
 
     fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
         Line {
@@ -5849,16 +6937,6 @@ mod tests {
             "The proceeding ended."
         );
         assert_eq!(sentence_at("R v X at para.20", 15), "R v X at para.20");
-    }
-
-    #[test]
-    fn ordinary_heading_initial_is_not_a_provision_locator() {
-        assert_eq!(leading_locator("Les voies de recours"), None);
-        assert_eq!(
-            leading_locator("Section 12(3) - Standard of review"),
-            Some("12(3)".to_owned())
-        );
-        assert_eq!(heading_kind("Sections and headings"), None);
     }
 
     #[test]

@@ -135,7 +135,9 @@ pub fn lookup_footnote(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legal_pdf_core::model::{Paragraph, PARSER_VERSION, SCHEMA_VERSION};
+    use legal_pdf_core::model::{
+        GraphStatus, Paragraph, StructureGraphV2, PARSER_VERSION, SCHEMA_VERSION,
+    };
     use serde_json::Map;
 
     fn note(pair_id: &str, occurrence: usize, reference_page: u32) -> Footnote {
@@ -158,6 +160,19 @@ mod tests {
         }
     }
 
+    fn structure_graph() -> StructureGraphV2 {
+        StructureGraphV2::from_parts(
+            "doc".to_owned(),
+            "",
+            Some("00".repeat(32)),
+            GraphStatus::Complete,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+    }
+
     fn document() -> LegalDocument {
         LegalDocument {
             document_id: "doc".to_owned(),
@@ -174,10 +189,10 @@ mod tests {
                 line_ids: vec!["line-2".to_owned()],
                 anchors: vec![],
             }],
-            sections: vec![],
             footnotes: vec![note("pair-1", 1, 1), note("pair-2", 2, 1)],
             tables: vec![],
             images: vec![],
+            structure_graph: structure_graph(),
             diagnostics: vec![],
             repairs: vec![],
             metadata: Map::new(),

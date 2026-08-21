@@ -1,4 +1,4 @@
-use crate::{EvidenceKind, NativeClaim, NodeKind, StructureGraphV1};
+use crate::{EvidenceKind, NativeClaim, NodeKind, StructureGraphV2};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -529,7 +529,7 @@ pub(crate) fn project_graph(
     text: String,
     revision: String,
     originals: &HashMap<String, SourceDocBlock>,
-    graph: StructureGraphV1,
+    graph: StructureGraphV2,
     order: ProjectionOrder,
 ) -> SourceDoc {
     let scalar_to_utf16 = utf16_offsets(&text);
@@ -555,7 +555,11 @@ pub(crate) fn project_graph(
                 NodeKind::Page => SourceDocKind::Page,
                 NodeKind::Section => SourceDocKind::Section,
                 NodeKind::Footnote => SourceDocKind::Footnote,
-                NodeKind::Heading | NodeKind::Endnote => return None,
+                NodeKind::Heading
+                | NodeKind::Endnote
+                | NodeKind::List
+                | NodeKind::ListItem
+                | NodeKind::Navigation => return None,
             };
             let label = if node.kind == NodeKind::Prose {
                 prose += 1;
@@ -664,7 +668,11 @@ pub(crate) fn native_blocks(
             EvidenceKind::Page => SourceDocKind::Page,
             EvidenceKind::Section => SourceDocKind::Section,
             EvidenceKind::Footnote => SourceDocKind::Footnote,
-            EvidenceKind::Prose | EvidenceKind::Heading | EvidenceKind::Endnote => continue,
+            EvidenceKind::Prose
+            | EvidenceKind::Heading
+            | EvidenceKind::Endnote
+            | EvidenceKind::List
+            | EvidenceKind::Navigation => continue,
         };
         let Some(label) = &claim.label else { continue };
         let mut block = SourceDocBlock::new(

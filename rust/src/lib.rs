@@ -13,7 +13,7 @@ compile_error!("profiling and fast-allocator cannot select two global allocators
 pub use contract::document_request;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
-pub use engine::digest_cached_extraction;
+pub use engine::{corpus_check_cached_extraction, digest_cached_extraction};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
@@ -44,4 +44,4 @@ pub use legal_pdf_support::{
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
-pub use structure_engine::{DocumentInput, EvidenceError, StructureGraphV1};
+pub use structure_engine::{DocumentInput, EvidenceError, StructureGraphV2};

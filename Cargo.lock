@@ -706,6 +706,7 @@ name = "legal-pdf-core"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "legal-structure",
  "ort",
  "serde",
  "serde_json",
@@ -789,6 +790,7 @@ dependencies = [
  "legal-pdf-structure",
  "legal-pdf-support",
  "legal-structure",
+ "lopdf",
  "mimalloc",
  "serde",
  "serde_json",
@@ -801,6 +803,7 @@ version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
  "legal-pdf-support",
+ "legal-structure",
  "regex",
  "serde_json",
 ]

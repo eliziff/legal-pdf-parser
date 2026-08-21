@@ -3,29 +3,40 @@
 use crate::Result;
 use legal_pdf_core::model::Page;
 
-pub use legal_pdf_structure::{status, validate_document, StructureOutput, StructureReplay};
+pub use legal_pdf_structure::{
+    status, validate_document, StructureIdentity, StructureOutput, StructureReplay,
+};
 
 fn derive_prepared(
     pages: &mut [Page],
-    diagnostics: Vec<legal_pdf_core::model::Diagnostic>,
-) -> StructureOutput {
-    let diagnostics = legal_pdf_structure::prepare_derivation(pages, diagnostics);
+    prepared: legal_pdf_structure::PdfPreparation,
+    identity: StructureIdentity,
+) -> Result<StructureOutput> {
+    let prepared = legal_pdf_structure::prepare_derivation(pages, prepared);
     let pairing = legal_pdf_pairing::pair_footnotes(pages);
-    legal_pdf_structure::finish_derivation(pages, diagnostics, pairing)
+    legal_pdf_structure::finish_derivation(pages, prepared, pairing, identity)
 }
 
-pub fn derive(pages: &mut [Page], separators: &[Option<f64>]) -> Result<StructureOutput> {
+pub fn derive(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    identity: StructureIdentity,
+) -> Result<StructureOutput> {
     legal_pdf_structure::validate_input(pages, separators)?;
-    let diagnostics = legal_pdf_structure::prepare_pages(pages, separators);
-    Ok(derive_prepared(pages, diagnostics))
+    let prepared = legal_pdf_structure::prepare_pages(pages, separators);
+    derive_prepared(pages, prepared, identity)
 }
 
-pub fn replay(pages: &mut [Page], separators: &[Option<f64>]) -> Result<StructureReplay> {
+pub fn replay(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    identity: StructureIdentity,
+) -> Result<StructureReplay> {
     legal_pdf_structure::validate_input(pages, separators)?;
     legal_pdf_support::profile::begin();
-    let diagnostics = legal_pdf_structure::prepare_pages(pages, separators);
+    let prepared = legal_pdf_structure::prepare_pages(pages, separators);
     let prepared_pages = pages.to_vec();
-    let derived = derive_prepared(pages, diagnostics);
+    let derived = derive_prepared(pages, prepared, identity)?;
     legal_pdf_support::profile::end();
     Ok(StructureReplay {
         prepared_pages,

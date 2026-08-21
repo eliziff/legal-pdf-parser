@@ -1,5 +1,7 @@
 use legal_pdf_core::model::{Diagnostic, Footnote, Line, Page};
-use legal_pdf_core::{line_font_size, Anchor, PairingOutput};
+use legal_pdf_core::{
+    line_font_size, Anchor, NotePairClaim, NotePairKind, PairingOutput, SourceAnchor,
+};
 use legal_pdf_support::pairing_support;
 use legal_structure::{select_numeric_sequence, NumericSequenceCandidate, NumericSequencePolicy};
 use regex::Regex;
@@ -3844,6 +3846,7 @@ fn materialize(
     let mut footnotes = Vec::new();
     let mut diagnostics = Vec::new();
     let mut anchors: HashMap<String, Vec<Anchor>> = HashMap::new();
+    let mut pair_claims = Vec::new();
     for (index, pair) in pairs.iter().enumerate() {
         let label_line = &lines[pair.label.line];
         let next = pairs.get(index + 1);
@@ -4003,11 +4006,36 @@ fn materialize(
             warnings,
             crossrefs: Vec::new(),
         });
+        pair_claims.push(NotePairClaim {
+            pair_id: pair.pair_id.clone(),
+            label: pair.label.note_id(),
+            kind: if pair.endnote {
+                NotePairKind::Endnote
+            } else {
+                NotePairKind::Footnote
+            },
+            label_anchor: SourceAnchor {
+                line_id: label_line.id.clone(),
+                start: pair.label.start,
+                end: pair.label.end,
+            },
+            reference_anchors: pair
+                .refs
+                .iter()
+                .map(|reference| SourceAnchor {
+                    line_id: lines[reference.line].id.clone(),
+                    start: reference.start,
+                    end: reference.end,
+                })
+                .collect(),
+            body_line_ids: body_lines.iter().map(|line| line.id.clone()).collect(),
+        });
     }
     PairingOutput {
         footnotes,
         diagnostics,
         anchors,
+        pair_claims,
         markers: Vec::new(),
         summary,
     }
@@ -4295,6 +4323,16 @@ mod tests {
             ["label", "continuation", "tail"]
         );
         assert_eq!(output.footnotes[0].body, "First line. Continued. Tail.");
+        assert_eq!(output.pair_claims.len(), 2);
+        assert_eq!(output.pair_claims[0].pair_id, "pair-1");
+        assert_eq!(output.pair_claims[0].kind, NotePairKind::Footnote);
+        assert_eq!(output.pair_claims[0].label_anchor.line_id, "label");
+        assert_eq!(output.pair_claims[0].label_anchor.start, 0);
+        assert_eq!(output.pair_claims[0].label_anchor.end, 1);
+        assert_eq!(
+            output.pair_claims[0].body_line_ids,
+            ["label", "continuation", "tail"]
+        );
     }
 
     #[test]
