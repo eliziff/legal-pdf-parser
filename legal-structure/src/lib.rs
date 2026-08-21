@@ -1293,10 +1293,6 @@ mod recovery {
         cached_regex!(VALUE, r"^(?:\([\p{L}\p{N}]{1,5}\)|\p{L}[.)]|[IVXLCDM]{1,4}[.)]|[ivxlcdm]{1,4}[.)]|\d{1,3}(?:\.\d{1,3})*[.)])$").is_match(value)
     }
 
-    fn first_significant(value: &str) -> Option<char> {
-        value.chars().find(|character| character.is_alphanumeric())
-    }
-
     fn level_opens(value: &str) -> bool {
         value
             .chars()
@@ -2026,12 +2022,8 @@ mod recovery {
     }
 
     fn page_markers(text: &ScalarText<'_>, report_start: Option<u32>) -> Vec<PageMarker> {
-        if !text
-            .value
-            .as_bytes()
-            .windows(4)
-            .any(|word| word.eq_ignore_ascii_case(b"page"))
-        {
+        let page_word = cached_regex!(PAGE_WORD, r"(?iu)\bpage\b");
+        if !page_word.is_match(text.value) {
             return Vec::new();
         }
         let regex = cached_regex!(
@@ -2668,6 +2660,7 @@ mod recovery {
             STATUS,
             r"(?iu)^(?:\[\s*)?(?:repealed|revoked|abrog(?:ated|é|ée|és|ées)|renumbered|spent|not (?:yet )?in force|omitted)\b"
         );
+        let heading = cached_regex!(HEADING, r#"^(?:(?:["'“«]\s*)?\p{Lu}|\(\d+\))"#);
         let source = lines(text).collect::<Vec<_>>();
         let mut candidates = collect_sections(text, SectionFamily::Bare);
         candidates.extend(collect_sections(text, SectionFamily::DotTerm));
@@ -2700,13 +2693,12 @@ mod recovery {
                     invalid = true;
                     continue;
                 };
-                let first = first_significant(next.text);
                 let parenthetical = next.text.trim_start().starts_with('(')
                     && next.text.trim_start()[1..]
                         .chars()
                         .next()
                         .is_some_and(char::is_numeric);
-                if !first.is_some_and(char::is_uppercase)
+                if !heading.is_match(next.text.trim_start())
                     && !parenthetical
                     && !status.is_match(next.text.trim_start())
                 {
@@ -3738,15 +3730,14 @@ mod recovery {
                     start: block_start,
                     end,
                 });
-                let block_start = if cached_regex!(PAGE, r"(?iu)^\[page [^\]\n]{1,40}\]")
-                    .is_match(value)
-                {
-                    value
-                        .find('\n')
-                        .map_or(end, |at| block_start + value[..=at].chars().count())
-                } else {
-                    block_start
-                };
+                let block_start =
+                    if cached_regex!(PAGE, r"(?iu)^\[page [^\]\n]{1,40}\]").is_match(value) {
+                        value
+                            .find('\n')
+                            .map_or(end, |at| block_start + value[..=at].chars().count())
+                    } else {
+                        block_start
+                    };
                 if block_start < end {
                     result.push(Block {
                         kind: NodeKind::Prose,
@@ -4161,9 +4152,7 @@ pub(crate) fn compose_journal_source_doc(
     }
     let has = |kind| {
         blocks.iter().any(|block| match kind {
-            EvidenceKind::Paragraph | EvidenceKind::Prose => {
-                block.kind == SourceDocKind::Paragraph
-            }
+            EvidenceKind::Paragraph | EvidenceKind::Prose => block.kind == SourceDocKind::Paragraph,
             EvidenceKind::Page => block.kind == SourceDocKind::Page,
             EvidenceKind::Section => block.kind == SourceDocKind::Section,
             EvidenceKind::Footnote => block.kind == SourceDocKind::Footnote,
@@ -4702,7 +4691,7 @@ mod tests {
         assert_eq!(node("sec1(1)").range.start, 0);
         assert_eq!(
             node("sec1(1)").range.end,
-            text[..text.find("(2) Sibling").unwrap()].chars().count()
+            text[..text.find("(a) First").unwrap()].chars().count()
         );
         assert_eq!(
             node("sec1(1)(a)").parent_id.as_deref(),
@@ -4728,12 +4717,10 @@ mod tests {
             .iter()
             .find(|node| node.label.as_deref() == Some("sec231(4)"))
             .unwrap();
-        let sibling = criminal
-            .nodes
-            .iter()
-            .find(|node| node.label.as_deref() == Some("sec231(5)"))
-            .unwrap();
-        assert_eq!(subsection.range.end, sibling.range.start);
+        assert_eq!(
+            subsection.range.end,
+            "**231** (4) Parent subsection.\n".chars().count()
+        );
         assert!(["a", "b", "c"].into_iter().all(|label| {
             let label = format!("sec231(4)({label})");
             criminal.nodes.iter().any(|node| {
@@ -4754,12 +4741,10 @@ mod tests {
             .iter()
             .find(|node| node.label.as_deref() == Some("sec22.1(a)"))
             .unwrap();
-        let sibling = section_map
-            .nodes
-            .iter()
-            .find(|node| node.label.as_deref() == Some("sec22.1(b)"))
-            .unwrap();
-        assert_eq!(paragraph.range.end, sibling.range.start);
+        assert_eq!(
+            paragraph.range.end,
+            "**22.1** (a) Parent paragraph.\n".chars().count()
+        );
         assert!(["i", "ii"].into_iter().all(|label| {
             let label = format!("sec22.1(a)({label})");
             section_map.nodes.iter().any(|node| {

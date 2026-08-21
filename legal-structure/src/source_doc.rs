@@ -583,6 +583,49 @@ pub(crate) fn project_graph(
             Some(block)
         })
         .collect::<Vec<_>>();
+    if matches!(order, ProjectionOrder::Legislation) {
+        let public_label = |value: &str| {
+            let mut result = String::with_capacity(value.len());
+            let mut rest = value;
+            while let Some(at) = rest.find('@') {
+                result.push_str(&rest[..at]);
+                let digits = rest[at + 1..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count();
+                if digits == 0 {
+                    result.push('@');
+                    rest = &rest[at + 1..];
+                } else {
+                    rest = &rest[at + 1 + digits..];
+                }
+            }
+            result.push_str(rest);
+            result
+        };
+        for block in &mut blocks {
+            block.label = public_label(&block.label);
+            block.parent_label = block.parent_label.as_deref().map(public_label);
+        }
+        let parents = blocks
+            .iter()
+            .map(|block| (block.label.clone(), block.parent_label.clone()))
+            .collect::<HashMap<_, _>>();
+        for block in &mut blocks {
+            let mut parent = block.parent_label.clone();
+            let mut seen = HashSet::new();
+            while let Some(label) = parent.clone() {
+                if !seen.insert(label.clone()) {
+                    break;
+                }
+                match parents.get(&label).cloned().flatten() {
+                    Some(next) => parent = Some(next),
+                    None => break,
+                }
+            }
+            block.parent_label = parent;
+        }
+    }
     match order {
         ProjectionOrder::StablePosition => {
             blocks.sort_by_key(|block| (block.start, block.end));

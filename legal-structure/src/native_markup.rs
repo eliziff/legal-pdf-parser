@@ -1107,7 +1107,7 @@ fn render_markup(
                     identity.page_scheme.as_deref(),
                 ),
             });
-        } else if let Some(mut identity) = identity {
+        } else if let Some(mut identity) = identity.filter(|value| value.kind != Kind::Page) {
             append_break(&mut parts, &mut position);
             identity.tag = tag.clone();
             identity.start = position;
@@ -1477,4 +1477,28 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         original_claims: originals,
     };
     compose_trusted(evidence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn courtlistener_ignores_page_markers_inside_footnotes() {
+        let markup = r#"
+            <p><span class="star-pagination" label="200">*200</span>Body</p>
+            <p><span class="star-pagination" label="201">*201</span>More</p>
+            <div class="footnotes"><div class="footnote" id="fn1" label="1">
+              <p><span class="star-pagination" label="200">*200</span>Note</p>
+            </div></div>
+        "#;
+        let rendered = render_markup(SourceDocProvider::CourtListener, markup, &[]).unwrap();
+        let pages = rendered
+            .blocks
+            .iter()
+            .filter(|block| block.kind == Kind::Page)
+            .map(|block| block.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pages, ["page200", "page201"]);
+    }
 }
