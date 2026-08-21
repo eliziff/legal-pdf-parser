@@ -31,6 +31,7 @@ struct PageRegion {
     order: Option<f64>,
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(default)]
     text: String,
     #[serde(default)]
     lines: Vec<PageLine>,
@@ -39,6 +40,8 @@ struct PageRegion {
 #[derive(Deserialize)]
 struct PageLine {
     codex_text_order: Option<usize>,
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -243,7 +246,15 @@ pub fn journal_source_doc(
                 .partial_cmp(&right.order.unwrap_or(*right_index as f64))
                 .unwrap_or(Ordering::Equal)
         });
-        for (_, region) in regions {
+        for (_, mut region) in regions {
+            if region.text.is_empty() {
+                region.text = region
+                    .lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
             if region.text.is_empty() {
                 continue;
             }
@@ -368,7 +379,7 @@ mod tests {
     #[test]
     fn authoritative_pages_preserve_every_native_region() {
         let pages = concat!(
-            r#"{"article_id":"1","text":"TITLE\nBody\n7\n1 Note","pdf_page":1,"regions":[{"order":0,"type":"paragraph_title","text":"TITLE"},{"order":1,"type":"text","text":"Body"},{"order":2,"type":"number","text":"7"},{"order":3,"type":"footnote","text":"1 Note","lines":[{"codex_text_order":7}]}],"annotations":[{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_ref"},{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_label","note_id":"1","start_line_order":7}]}"#,
+            r#"{"article_id":"1","text":"TITLE\nBody\n7\n1 Note","pdf_page":1,"regions":[{"order":0,"type":"paragraph_title","text":"TITLE"},{"order":1,"type":"text","lines":[{"text":"Body"}]},{"order":2,"type":"number","text":"7"},{"order":3,"type":"footnote","text":"1 Note","lines":[{"codex_text_order":7}]}],"annotations":[{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_ref"},{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_label","note_id":"1","start_line_order":7}]}"#,
             "\n",
         );
         let doc = journal_source_doc(

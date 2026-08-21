@@ -1,0 +1,15 @@
+[package]
+name = "source-structure-parity-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+flate2 = "1.1"
+legal-structure = { path = "../../legal-structure", features = ["a2aj", "journal"] }
+rayon = "1.11"
+regex = "1.11"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
