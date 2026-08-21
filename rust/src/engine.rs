@@ -1,8 +1,8 @@
-use crate::structure::{derive, status, validate_document};
+use crate::structure::{derive, status, validate_document, StructureIdentity};
 use crate::structure_engine::{derive_pdf_pages, PdfReplayProjection};
 use legal_pdf_core::model::{
-    Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Section, Span, Word,
-    PARSER_VERSION, SCHEMA_VERSION,
+    Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Span, Word, PARSER_VERSION,
+    SCHEMA_VERSION,
 };
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction::{extract_pdf, ExtractedPdf};
@@ -425,7 +425,15 @@ fn build_document(
     let (ocr_provider, layout_variant, layout_identity) = providers;
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
-    let derived = derive(&mut extracted.pages, &extracted.separators)?;
+    let document_id = format!("doc-{}", &source_hash[..20]);
+    let derived = derive(
+        &mut extracted.pages,
+        &extracted.separators,
+        StructureIdentity {
+            document_id: document_id.clone(),
+            source_sha256: source_hash.to_owned(),
+        },
+    )?;
     extracted.diagnostics.extend(derived.diagnostics);
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), Value::Object(extracted.metadata));
@@ -468,17 +476,17 @@ fn build_document(
         .file_name()
         .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
     let document = LegalDocument {
-        document_id: format!("doc-{}", &source_hash[..20]),
+        document_id,
         source_name,
         source_sha256: source_hash.to_owned(),
         page_count: extracted.pages.len(),
         status,
         pages: extracted.pages,
         paragraphs: derived.paragraphs,
-        sections: derived.sections,
         footnotes: derived.footnotes,
         tables: extracted.tables,
         images: extracted.images,
+        structure_graph: derived.structure_graph,
         diagnostics: extracted.diagnostics,
         repairs: vec![],
         metadata,
@@ -779,7 +787,6 @@ frozen_type!(Line: bbox block_index detached_references exclude_from_body id not
 frozen_type!(Region: bbox id line_ids page_index reading_order kind => "type");
 frozen_type!(Page: height id index [lines] number printed_label printed_label_line_id printed_label_source [regions] source text_quality width);
 frozen_type!(Paragraph: anchors id line_ids page_index region_type text);
-frozen_type!(Section: aliases heading heading_paragraph_id id line_ids locator locator_kind page_indexes paragraph_ids provenance text);
 frozen_type!(Footnote: body body_line_ids body_pages confidence crossrefs label occurrence pair_id passage_since_prior_note provenance reference_line_id reference_page restart_sequence sentence_proposition warnings);
 frozen_type!(Diagnostic: code details line_ids message page_index severity);
 struct FrozenReplay<'a>(&'a PdfReplayProjection);
@@ -797,7 +804,6 @@ impl Serialize for FrozenReplay<'_> {
         map.serialize_entry("paragraphs", &FrozenSlice(&value.paragraphs))?;
         map.serialize_entry("prepared_pages", &FrozenSlice(&value.prepared_pages))?;
         map.serialize_entry("schema_version", "legalpdf.common-input-result.v1")?;
-        map.serialize_entry("sections", &FrozenSlice(&value.sections))?;
         map.serialize_entry("source_sha256", &value.source_sha256)?;
         map.serialize_entry("status", &value.status)?;
         map.serialize_entry("validation", value.validation)?;
@@ -821,6 +827,185 @@ impl Write for DigestWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+fn serialization_sha256(value: &impl Serialize) -> Result<String> {
+    let mut writer = DigestWriter::default();
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(format!("{:x}", writer.digest.finalize()))
+}
+
+fn structure_examples(document: &LegalDocument) -> Value {
+    let index = legal_pdf_structure::PdfTextIndex::from_pages(&document.pages);
+    let text = index.text().chars().collect::<Vec<_>>();
+    let mut examples = BTreeMap::<String, Vec<Value>>::new();
+    for kind in [
+        legal_structure::NodeKind::Heading,
+        legal_structure::NodeKind::Section,
+        legal_structure::NodeKind::Paragraph,
+        legal_structure::NodeKind::ListItem,
+        legal_structure::NodeKind::Footnote,
+        legal_structure::NodeKind::Endnote,
+    ] {
+        let nodes = document
+            .structure_graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == kind)
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            continue;
+        }
+        let mut slots = vec![0, nodes.len() / 2, nodes.len() - 1];
+        slots.sort_unstable();
+        slots.dedup();
+        let values = slots
+            .into_iter()
+            .map(|slot| {
+                let node = nodes[slot];
+                let end = node.range.end.min(text.len());
+                let start = node.range.start.min(end);
+                let value = text[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(240)
+                    .collect::<String>();
+                json!({
+                    "id": node.id,
+                    "text": value,
+                    "label": node.label,
+                    "locator_kind": node.locator_kind,
+                    "parent_id": node.parent_id,
+                    "page_indexes": node.page_indexes,
+                    "line_ids": node.line_ids,
+                    "rule": node.proof.as_ref().map(|proof| proof.rule),
+                })
+            })
+            .collect();
+        let name = serde_json::to_value(kind)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        examples.insert(name, values);
+    }
+    json!(examples)
+}
+
+#[doc(hidden)]
+pub fn corpus_check_cached_extraction(
+    input: impl AsRef<Path>,
+    source_name: String,
+) -> Result<Value> {
+    let cached: CachedExtraction = read_gzip_json(input.as_ref())?;
+    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
+        || cached.source_sha256.len() != 64
+        || cached.extraction.pages.len() != cached.extraction.separators.len()
+    {
+        return Err(Error::Message("invalid extraction cache".to_owned()));
+    }
+    let page_count = cached.extraction.pages.len();
+    let line_count = cached
+        .extraction
+        .pages
+        .iter()
+        .map(|page| page.lines.len())
+        .sum::<usize>();
+    let source_sha256 = cached.source_sha256.clone();
+    let cache_key = cached.cache_key.clone();
+    let document = build_document(
+        Path::new(&source_name),
+        &source_sha256,
+        &cache_key,
+        &engine_identity(),
+        (None, None, None),
+        cached.extraction,
+    )?;
+    let mut by_kind = BTreeMap::<String, usize>::new();
+    let mut sections_by_locator_kind = BTreeMap::<String, usize>::new();
+    for node in &document.structure_graph.nodes {
+        let kind = serde_json::to_value(node.kind)?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        *by_kind.entry(kind).or_default() += 1;
+        if node.kind == legal_structure::NodeKind::Section {
+            *sections_by_locator_kind
+                .entry(
+                    node.locator_kind
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                )
+                .or_default() += 1;
+        }
+    }
+    let proofs = document
+        .structure_graph
+        .nodes
+        .iter()
+        .filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof)))
+        .collect::<Vec<_>>();
+    let mut by_rule = BTreeMap::<String, usize>::new();
+    for (_, proof) in &proofs {
+        let rule = serde_json::to_value(proof.rule)?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        *by_rule.entry(rule).or_default() += 1;
+    }
+    let abstentions = document
+        .structure_graph
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "structure_run_abstained")
+        .count();
+    let partial_resolutions = document
+        .structure_graph
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "structure_run_partially_resolved")
+        .count();
+    let heading_derived_sections = document
+        .structure_graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == legal_structure::NodeKind::Section
+                && node.grammar.as_deref() == Some("accepted_heading")
+        })
+        .count();
+    let mut diagnostics_by_code = BTreeMap::<String, usize>::new();
+    for diagnostic in &document.structure_graph.diagnostics {
+        *diagnostics_by_code
+            .entry(diagnostic.code.clone())
+            .or_default() += 1;
+    }
+    let structure = json!({
+        "schema_version": document.structure_graph.schema_version,
+        "node_count": document.structure_graph.nodes.len(),
+        "relation_count": document.structure_graph.relations.len(),
+        "diagnostic_count": document.structure_graph.diagnostics.len(),
+        "by_kind": by_kind,
+        "by_rule": by_rule,
+        "sections_by_locator_kind": sections_by_locator_kind,
+        "diagnostics_by_code": diagnostics_by_code,
+        "heading_derived_section_count": heading_derived_sections,
+        "abstention_count": abstentions,
+        "partial_resolution_count": partial_resolutions,
+        "graph_sha256": serialization_sha256(&document.structure_graph)?,
+        "proofs_sha256": serialization_sha256(&proofs)?,
+        "examples": structure_examples(&document),
+    });
+    Ok(json!({
+        "source_sha256": source_sha256,
+        "page_count": page_count,
+        "line_count": line_count,
+        "product_sha256": serialization_sha256(&document)?,
+        "structure": structure,
+    }))
 }
 
 #[doc(hidden)]
@@ -854,11 +1039,16 @@ pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) ->
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
     let source_sha256 = value.source_sha256.clone();
     let _ = source_name;
+    let structure = json!({
+        "paragraph_count": value.paragraphs.len(),
+        "paragraphs_sha256": serialization_sha256(&FrozenSlice(&value.paragraphs))?,
+        "graph_sha256": serialization_sha256(&value.structure_graph)?,
+    });
     serde_json::to_writer_pretty(&mut writer, &FrozenReplay(&value))?;
     writer.write_all(b"\n").expect("digest writer cannot fail");
     let writer = writer.into_inner().expect("digest writer cannot fail");
     Ok(
-        json!({"input_lines": input_lines, "output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256}),
+        json!({"input_lines": input_lines, "output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256, "structure": structure}),
     )
 }
 

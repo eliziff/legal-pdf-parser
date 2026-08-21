@@ -26,7 +26,7 @@ resolver = "2"
 
 [features]
 default = []
-pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction", "dep:legal-pdf-pairing", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
+pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction", "dep:legal-pdf-pairing", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2", "legal-structure/recovery"]
 language = ["dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr", "legal-pdf-ocr/ocr"]
 kraken = ["ocr", "legal-pdf-ocr/kraken"]
@@ -45,6 +45,11 @@ name = "legalpdf"
 path = "rust/src/main.rs"
 required-features = ["pdf"]
 
+[[bin]]
+name = "legalpdf-corpus-check"
+path = "rust/src/bin/legalpdf-corpus-check.rs"
+required-features = ["pdf"]
+
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
 legal-pdf-extraction = { path = "legal-pdf-extraction", optional = true }
@@ -58,6 +63,9 @@ mimalloc = { version = "0.1.52", default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+lopdf = { version = "0.42.0", default-features = false }
 
 [profile.dev]
 debug = 0

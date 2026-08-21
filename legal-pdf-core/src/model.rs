@@ -1,3 +1,6 @@
+pub use legal_structure::{
+    Derivation, GraphStatus, NodeKind, ScalarRange, StructureGraphV2, StructureNodeV2,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -142,26 +145,6 @@ pub struct Paragraph {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Section {
-    pub id: String,
-    pub heading_paragraph_id: String,
-    pub heading: String,
-    pub locator: String,
-    pub locator_kind: Option<String>,
-    pub aliases: Vec<String>,
-    pub text: String,
-    pub paragraph_ids: Vec<String>,
-    pub page_indexes: Vec<usize>,
-    pub line_ids: Vec<String>,
-    #[serde(default = "heading_provenance")]
-    pub provenance: String,
-}
-
-fn heading_provenance() -> String {
-    "heading-region".to_owned()
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Footnote {
     pub pair_id: String,
     pub label: String,
@@ -249,10 +232,10 @@ pub struct LegalDocument {
     pub status: String,
     pub pages: Vec<Page>,
     pub paragraphs: Vec<Paragraph>,
-    pub sections: Vec<Section>,
     pub footnotes: Vec<Footnote>,
     pub tables: Vec<TableBlock>,
     pub images: Vec<ImageBlock>,
+    pub structure_graph: StructureGraphV2,
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default)]
     pub repairs: Vec<RepairRecord>,
@@ -296,10 +279,35 @@ pub struct Anchor {
     pub end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotePairKind {
+    Footnote,
+    Endnote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchor {
+    pub line_id: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotePairClaim {
+    pub pair_id: String,
+    pub label: String,
+    pub kind: NotePairKind,
+    pub label_anchor: SourceAnchor,
+    pub reference_anchors: Vec<SourceAnchor>,
+    pub body_line_ids: Vec<String>,
+}
+
 pub struct PairingOutput {
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
     pub anchors: HashMap<String, Vec<Anchor>>,
+    pub pair_claims: Vec<NotePairClaim>,
     pub markers: Vec<Value>,
     pub summary: Value,
 }

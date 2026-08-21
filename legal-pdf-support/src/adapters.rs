@@ -171,7 +171,9 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legal_pdf_core::model::{Footnote, Paragraph, PARSER_VERSION, SCHEMA_VERSION};
+    use legal_pdf_core::model::{
+        Footnote, GraphStatus, Paragraph, StructureGraphV2, PARSER_VERSION, SCHEMA_VERSION,
+    };
 
     fn note(pair_id: &str, body: &str, usable: bool) -> Footnote {
         Footnote {
@@ -193,6 +195,19 @@ mod tests {
             warnings: vec![],
             crossrefs: vec![],
         }
+    }
+
+    fn structure_graph() -> StructureGraphV2 {
+        StructureGraphV2::from_parts(
+            "doc".to_owned(),
+            "",
+            Some("00".repeat(32)),
+            GraphStatus::Complete,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
     }
 
     fn document() -> LegalDocument {
@@ -219,7 +234,6 @@ mod tests {
                 text,
                 line_ids: vec!["body-line".to_owned()],
             }],
-            sections: vec![],
             footnotes: vec![
                 note(first, "First note.", true),
                 note(second, "Second note.", true),
@@ -227,6 +241,7 @@ mod tests {
             ],
             tables: vec![],
             images: vec![],
+            structure_graph: structure_graph(),
             diagnostics: vec![],
             repairs: vec![],
             metadata: Map::new(),

@@ -395,7 +395,8 @@ fn prepare_summary(document: &crate::LegalDocument, selected: Option<&[usize]>) 
         "ocr_routed_pages": physical_pages(pdf.get("ocr_routed_pages")),
         "counts": {
             "paragraphs": document.paragraphs.len(),
-            "sections": document.sections.len(),
+            "sections": document.structure_graph.nodes.iter()
+                .filter(|node| node.kind == legal_structure::NodeKind::Section).count(),
             "footnotes": document.footnotes.len(),
             "tables": document.tables.len(),
             "images": document.images.len(),
@@ -675,6 +676,17 @@ mod tests {
             "footnotes": [],
             "tables": [],
             "images": [],
+            "structure_graph": {
+                "schema_version": "legalpdf.structure-graph.v2",
+                "document_id": "document",
+                "text_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "source_sha256": "a".repeat(64),
+                "status": "complete",
+                "nodes": [],
+                "boundaries": [],
+                "relations": [],
+                "diagnostics": []
+            },
             "diagnostics": [],
             "metadata": {"pdf": {
                 "pdf_type": "Scanned",
