@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_MISSING: usize = 64;
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceDocKind {
     Paragraph,
@@ -34,6 +34,18 @@ pub enum SourceDocProvider {
 }
 
 impl SourceDocProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::A2aj => "a2aj",
+            Self::CourtListener => "courtlistener",
+            Self::Tna => "tna",
+            Self::GovInfo => "govinfo",
+            Self::GovUkEt => "govuk-et",
+            Self::Journal => "journal",
+            Self::LocalPdf => "local-pdf",
+        }
+    }
+
     pub(crate) fn from_name(value: &str) -> Option<Self> {
         Some(match value {
             "a2aj" => Self::A2aj,
@@ -55,7 +67,7 @@ pub enum SourceDocType {
     Laws,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceDocOrigin {
     Native,
@@ -67,12 +79,13 @@ pub(crate) enum BlockFieldOrder {
     #[default]
     Projected,
     Native,
+    NativeWithAliases,
     AliasesBeforeOrigin,
     AliasesAnchorBeforeOrigin,
     EndLast,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
 pub struct SourceDocBlock {
     pub kind: SourceDocKind,
     pub label: String,
@@ -80,8 +93,11 @@ pub struct SourceDocBlock {
     pub end: usize,
     pub origin: SourceDocOrigin,
     pub anchor: Option<String>,
+    #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(rename = "parentLabel")]
     pub parent_label: Option<String>,
+    #[serde(skip)]
     pub(crate) field_order: BlockFieldOrder,
 }
 
@@ -109,6 +125,32 @@ impl SourceDocBlock {
     pub(crate) fn with_field_order(mut self, field_order: BlockFieldOrder) -> Self {
         self.field_order = field_order;
         self
+    }
+
+    pub fn preserve_field_order(&mut self, fields: &[String]) {
+        let position = |name: &str| fields.iter().position(|field| field == name);
+        self.field_order = match (
+            position("end"),
+            position("origin"),
+            position("aliases"),
+            position("anchor"),
+        ) {
+            (Some(_), Some(origin), Some(aliases), Some(anchor))
+                if anchor < aliases && aliases < origin =>
+            {
+                BlockFieldOrder::Native
+            }
+            (Some(_), Some(origin), Some(aliases), Some(anchor))
+                if aliases < anchor && anchor < origin =>
+            {
+                BlockFieldOrder::AliasesAnchorBeforeOrigin
+            }
+            (Some(end), Some(origin), Some(aliases), _) if aliases < origin && end < aliases => {
+                BlockFieldOrder::AliasesBeforeOrigin
+            }
+            (Some(end), Some(origin), _, _) if origin < end => BlockFieldOrder::EndLast,
+            _ => BlockFieldOrder::Projected,
+        };
     }
 
     fn fields(&self) -> usize {
@@ -145,6 +187,14 @@ impl Serialize for SourceDocBlock {
                 }
                 row.serialize_field("origin", &self.origin)?;
             }
+            BlockFieldOrder::NativeWithAliases => {
+                row.serialize_field("end", &self.end)?;
+                if let Some(anchor) = &self.anchor {
+                    row.serialize_field("anchor", anchor)?;
+                }
+                row.serialize_field("aliases", &self.aliases)?;
+                row.serialize_field("origin", &self.origin)?;
+            }
             BlockFieldOrder::AliasesBeforeOrigin => {
                 row.serialize_field("end", &self.end)?;
                 if !self.aliases.is_empty() {
@@ -166,6 +216,9 @@ impl Serialize for SourceDocBlock {
                 row.serialize_field("origin", &self.origin)?;
             }
             BlockFieldOrder::EndLast => {
+                if let Some(anchor) = &self.anchor {
+                    row.serialize_field("anchor", anchor)?;
+                }
                 if !self.aliases.is_empty() {
                     row.serialize_field("aliases", &self.aliases)?;
                 }
@@ -206,6 +259,13 @@ impl SourceDocIndex {
     pub fn get(&self, label: &str) -> Option<usize> {
         self.0.get(&label.to_lowercase()).copied()
     }
+
+    pub fn entries(&self) -> Vec<(String, usize)> {
+        self.0
+            .iter()
+            .map(|(label, position)| (label.clone(), *position))
+            .collect()
+    }
 }
 
 // JavaScript serializes its in-memory Map as `{}`. Keep the useful lookup map
@@ -236,6 +296,47 @@ pub struct SourceDoc {
     pub blocks: Vec<SourceDocBlock>,
     pub index: SourceDocIndex,
     pub ranges: SourceDocRanges,
+}
+
+#[derive(Serialize)]
+struct StoredSourceDoc<'a> {
+    provider: Option<SourceDocProvider>,
+    id: &'a str,
+    url: &'a Option<String>,
+    revision: &'a str,
+    #[serde(rename = "docType")]
+    doc_type: Option<SourceDocType>,
+    status: &'a SourceDocStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    blocks: &'a [SourceDocBlock],
+    index: &'a SourceDocIndex,
+    ranges: &'a SourceDocRanges,
+}
+
+impl SourceDoc {
+    fn stored(&self, include_text: bool) -> StoredSourceDoc<'_> {
+        StoredSourceDoc {
+            provider: self.provider,
+            id: &self.id,
+            url: &self.url,
+            revision: &self.revision,
+            doc_type: self.doc_type,
+            status: &self.status,
+            text: include_text.then_some(&self.text),
+            blocks: &self.blocks,
+            index: &self.index,
+            ranges: &self.ranges,
+        }
+    }
+
+    pub fn json_value(&self, include_text: bool) -> serde_json::Result<serde_json::Value> {
+        serde_json::to_value(self.stored(include_text))
+    }
+
+    pub fn json_bytes(&self, include_text: bool) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&self.stored(include_text))
+    }
 }
 
 fn number(kind: SourceDocKind, label: &str) -> Option<usize> {
@@ -358,6 +459,19 @@ pub fn create_source_doc(
     text: String,
     blocks: Vec<SourceDocBlock>,
 ) -> SourceDoc {
+    let revision = format!("{:x}", Sha256::digest(text.as_bytes()));
+    create_source_doc_with_revision(provider, id, url, doc_type, text, revision, blocks)
+}
+
+fn create_source_doc_with_revision(
+    provider: Option<SourceDocProvider>,
+    id: String,
+    url: Option<String>,
+    doc_type: Option<SourceDocType>,
+    text: String,
+    revision: String,
+    blocks: Vec<SourceDocBlock>,
+) -> SourceDoc {
     let ranges = SourceDocRanges {
         paragraph: range(SourceDocKind::Paragraph, &blocks),
         page: range(SourceDocKind::Page, &blocks),
@@ -384,7 +498,7 @@ pub fn create_source_doc(
         provider,
         id,
         url,
-        revision: format!("{:x}", Sha256::digest(text.as_bytes())),
+        revision,
         doc_type,
         status: if blocks.is_empty() {
             SourceDocStatus::Unavailable
@@ -413,6 +527,7 @@ pub(crate) fn project_graph(
     url: Option<String>,
     doc_type: Option<SourceDocType>,
     text: String,
+    revision: String,
     originals: &HashMap<String, SourceDocBlock>,
     graph: StructureGraphV1,
     order: ProjectionOrder,
@@ -485,7 +600,7 @@ pub(crate) fn project_graph(
         }),
         ProjectionOrder::Case | ProjectionOrder::Native => {}
     }
-    create_source_doc(provider, id, url, doc_type, text, blocks)
+    create_source_doc_with_revision(provider, id, url, doc_type, text, revision, blocks)
 }
 
 pub(crate) fn native_blocks(
@@ -493,6 +608,9 @@ pub(crate) fn native_blocks(
     claims: &[NativeClaim],
     mut originals: HashMap<String, SourceDocBlock>,
 ) -> HashMap<String, SourceDocBlock> {
+    if claims.iter().all(|claim| originals.contains_key(&claim.id)) {
+        return originals;
+    }
     let scalar_to_utf16 = utf16_offsets(text);
     for claim in claims {
         if originals.contains_key(&claim.id) {

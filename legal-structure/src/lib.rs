@@ -13,12 +13,16 @@ use std::sync::OnceLock;
 mod a2aj;
 #[cfg(feature = "journal")]
 mod journal;
+#[cfg(all(feature = "recovery", feature = "source-doc"))]
+mod native_markup;
 #[cfg(feature = "source-doc")]
 mod source_doc;
 #[cfg(feature = "a2aj")]
 pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
 #[cfg(feature = "journal")]
-pub use journal::{journal_source_doc, JournalPageLabel};
+pub use journal::{journal_source_doc, journal_text_source_doc, JournalPageLabel};
+#[cfg(all(feature = "recovery", feature = "source-doc"))]
+pub use native_markup::{native_markup_source_doc, NativeMarkupInput};
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
     create_source_doc, ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind,
@@ -28,6 +32,7 @@ pub use source_doc::{
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const RESULT_SCHEMA: &str = "legalpdf.structure-graph.v1";
 pub const SIDECAR_PROTOCOL: &str = "legalpdf.structure-sidecar.v1";
+pub const SOURCE_DOC_VERSION: u32 = 1;
 const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
 const MAX_DOCUMENTS: usize = 25;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -476,6 +481,11 @@ impl EvidenceKind {
 }
 
 impl DocumentInput {
+    #[cfg(feature = "source-doc")]
+    pub fn set_original_claims(&mut self, claims: HashMap<String, SourceDocBlock>) {
+        self.original_claims = claims;
+    }
+
     fn validate(&self) -> Result<(), EngineError> {
         let length = self.text.chars().count();
         if self.schema_version != EVIDENCE_SCHEMA
@@ -864,58 +874,140 @@ pub struct StructureGraphV1 {
 }
 
 #[cfg(feature = "recovery")]
+#[derive(Clone, Copy)]
+struct OffsetCheckpoint {
+    scalar: usize,
+    byte: usize,
+    utf16: usize,
+}
+
+#[cfg(feature = "recovery")]
 struct ScalarText<'a> {
     value: &'a str,
-    scalar_bytes: Vec<usize>,
-    utf16: Vec<usize>,
+    offsets: Vec<OffsetCheckpoint>,
+    scalar_len: usize,
+    utf16_len: usize,
     lines: Vec<(usize, usize, usize)>,
 }
 
 #[cfg(feature = "recovery")]
 impl<'a> ScalarText<'a> {
     fn new(value: &'a str) -> Self {
-        let mut scalar_bytes = Vec::new();
-        let mut utf16 = Vec::new();
+        if value.is_ascii() {
+            let mut lines = Vec::new();
+            let mut line_start = 0;
+            for (at, byte) in value.bytes().enumerate() {
+                if byte != b'\n' {
+                    continue;
+                }
+                let end = at - usize::from(at > line_start && value.as_bytes()[at - 1] == b'\r');
+                lines.push((line_start, end, line_start));
+                line_start = at + 1;
+            }
+            let end = value.len() - usize::from(value.as_bytes().last() == Some(&b'\r'));
+            lines.push((line_start, end, line_start));
+            return Self {
+                value,
+                offsets: Vec::new(),
+                scalar_len: value.len(),
+                utf16_len: value.len(),
+                lines,
+            };
+        }
+        const STRIDE: usize = 256;
+        let mut offsets = Vec::new();
         let mut lines = Vec::new();
-        let mut count = 0;
+        let mut utf16_len = 0;
+        let mut scalar_len = 0;
         let mut line_start = (0, 0);
         for (scalar, (at, character)) in value.char_indices().enumerate() {
-            scalar_bytes.push(at);
-            utf16.push(count);
+            if scalar % STRIDE == 0 {
+                offsets.push(OffsetCheckpoint {
+                    scalar,
+                    byte: at,
+                    utf16: utf16_len,
+                });
+            }
             if character == '\n' {
                 let end = at - usize::from(at > line_start.0 && value.as_bytes()[at - 1] == b'\r');
                 lines.push((line_start.0, end, line_start.1));
                 line_start = (at + 1, scalar + 1);
             }
-            count += character.len_utf16();
+            scalar_len = scalar + 1;
+            utf16_len += character.len_utf16();
         }
-        scalar_bytes.push(value.len());
-        utf16.push(count);
+        if offsets
+            .last()
+            .is_none_or(|offset| offset.scalar != scalar_len)
+        {
+            offsets.push(OffsetCheckpoint {
+                scalar: scalar_len,
+                byte: value.len(),
+                utf16: utf16_len,
+            });
+        }
         let end = value.len() - usize::from(value.as_bytes().last() == Some(&b'\r'));
         lines.push((line_start.0, end, line_start.1));
         Self {
             value,
-            scalar_bytes,
-            utf16,
+            offsets,
+            scalar_len,
+            utf16_len,
             lines,
         }
     }
     fn len(&self) -> usize {
-        self.scalar_bytes.len() - 1
+        self.scalar_len
+    }
+    fn checkpoint_for_scalar(&self, scalar: usize) -> OffsetCheckpoint {
+        self.offsets[self
+            .offsets
+            .partition_point(|offset| offset.scalar <= scalar)
+            - 1]
+    }
+    fn checkpoint_for_byte(&self, byte: usize) -> OffsetCheckpoint {
+        self.offsets[self.offsets.partition_point(|offset| offset.byte <= byte) - 1]
     }
     fn scalar(&self, byte: usize) -> usize {
-        self.scalar_bytes
-            .binary_search(&byte)
-            .expect("detector offset is a scalar boundary")
+        if self.offsets.is_empty() {
+            byte
+        } else {
+            let offset = self.checkpoint_for_byte(byte);
+            offset.scalar + self.value[offset.byte..byte].chars().count()
+        }
+    }
+    fn byte(&self, scalar: usize) -> usize {
+        if self.offsets.is_empty() {
+            scalar
+        } else {
+            let offset = self.checkpoint_for_scalar(scalar);
+            if offset.scalar == scalar {
+                offset.byte
+            } else {
+                offset.byte
+                    + self.value[offset.byte..]
+                        .char_indices()
+                        .nth(scalar - offset.scalar)
+                        .map_or(self.value.len() - offset.byte, |(byte, _)| byte)
+            }
+        }
     }
     fn utf16(&self, scalar: usize) -> usize {
-        self.utf16[scalar]
+        if self.offsets.is_empty() {
+            scalar
+        } else {
+            let offset = self.checkpoint_for_scalar(scalar);
+            offset.utf16
+                + self.value[offset.byte..self.byte(scalar)]
+                    .encode_utf16()
+                    .count()
+        }
     }
     fn utf16_len(&self) -> usize {
-        *self.utf16.last().unwrap()
+        self.utf16_len
     }
     fn slice(&self, range: ScalarRange) -> &'a str {
-        &self.value[self.scalar_bytes[range.start]..self.scalar_bytes[range.end]]
+        &self.value[self.byte(range.start)..self.byte(range.end)]
     }
 }
 
@@ -1016,6 +1108,40 @@ mod recovery {
             })
     }
 
+    fn javascript_lines<'a>(text: &'a ScalarText<'a>) -> Vec<Line<'a>> {
+        let mut result = Vec::new();
+        let mut chars = text.value.char_indices().peekable();
+        let (mut byte_start, mut scalar_start, mut scalar) = (0, 0, 0);
+        while let Some((byte, character)) = chars.next() {
+            if matches!(character, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                result.push(Line {
+                    byte_start,
+                    byte_end: byte,
+                    scalar_start,
+                    text: &text.value[byte_start..byte],
+                });
+                scalar += 1;
+                let mut next_byte = byte + character.len_utf8();
+                if character == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                    let (next, _) = chars.next().unwrap();
+                    next_byte = next + 1;
+                    scalar += 1;
+                }
+                byte_start = next_byte;
+                scalar_start = scalar;
+            } else {
+                scalar += 1;
+            }
+        }
+        result.push(Line {
+            byte_start,
+            byte_end: text.value.len(),
+            scalar_start,
+            text: &text.value[byte_start..],
+        });
+        result
+    }
+
     fn leading_ascii_space(value: &str) -> usize {
         value
             .bytes()
@@ -1056,7 +1182,9 @@ mod recovery {
                         && rest[1..].chars().next().is_some_and(char::is_uppercase)
                     {
                         Some((number, MarkerStyle::Dot))
-                    } else if rest.chars().next().is_some_and(char::is_whitespace) {
+                    } else if rest.chars().next().is_some_and(char::is_whitespace)
+                        || (rest.is_empty() && line.byte_end < text.value.len())
+                    {
                         Some((
                             number,
                             if contiguous {
@@ -1116,22 +1244,35 @@ mod recovery {
             .any(|range| range.start <= marker.start && marker.start < range.end)
     }
 
-    fn words_regex() -> &'static Regex {
-        cached_regex!(VALUE, r"[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*")
-    }
-
-    fn letters_regex() -> &'static Regex {
-        cached_regex!(VALUE, r"\p{L}+(?:['’]\p{L}+)*")
-    }
-
     fn word_count(value: &str, letters_only: bool) -> usize {
-        if letters_only {
-            letters_regex()
-        } else {
-            words_regex()
+        let mut count = 0;
+        let mut inside = false;
+        let mut characters = value.chars().peekable();
+        while let Some(character) = characters.next() {
+            let member = if letters_only {
+                character.is_alphabetic()
+            } else {
+                character.is_alphanumeric()
+            };
+            if member {
+                count += usize::from(!inside);
+                inside = true;
+            } else if matches!(character, '\'' | '’')
+                && inside
+                && characters.peek().is_some_and(|next| {
+                    if letters_only {
+                        next.is_alphabetic()
+                    } else {
+                        next.is_alphanumeric()
+                    }
+                })
+            {
+                continue;
+            } else {
+                inside = false;
+            }
         }
-        .find_iter(value)
-        .count()
+        count
     }
 
     fn median(values: &[usize]) -> f64 {
@@ -1259,29 +1400,65 @@ mod recovery {
         known: &HashSet<usize>,
         style: MarkerStyle,
     ) -> Vec<Marker> {
-        let regex = match style {
-            MarkerStyle::Bracket => cached_regex!(BRACKET, r"\[(\d{1,4})\]"),
-            MarkerStyle::Dot => cached_regex!(DOT, r"(\d{1,4})\.(?:\s|$)"),
-            MarkerStyle::Bare => return Vec::new(),
-        };
+        if style == MarkerStyle::Bare {
+            return Vec::new();
+        }
         let mut result = Vec::new();
         for line in lines(text) {
-            for capture in regex.captures_iter(line.text) {
-                let whole = capture.get(0).unwrap();
-                let start = line.scalar_start + line.text[..whole.start()].chars().count();
-                if known.contains(&start) {
+            let bytes = line.text.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                let digits = if style == MarkerStyle::Bracket && bytes[at] == b'[' {
+                    at + 1
+                } else if style == MarkerStyle::Dot && bytes[at].is_ascii_digit() {
+                    at
+                } else {
+                    at += 1;
+                    continue;
+                };
+                let length = bytes[digits..]
+                    .iter()
+                    .take(4)
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+                if length == 0 {
+                    at += 1;
                     continue;
                 }
-                let heading = &line.text[..whole.start()];
+                let tail = digits + length;
+                let end = if style == MarkerStyle::Bracket {
+                    (bytes.get(tail) == Some(&b']')).then_some(tail + 1)
+                } else if bytes.get(tail) == Some(&b'.') {
+                    let after = tail + 1;
+                    if after == bytes.len() {
+                        Some(after)
+                    } else {
+                        line.text[after..]
+                            .chars()
+                            .next()
+                            .filter(|character| character.is_whitespace())
+                            .map(|character| after + character.len_utf8())
+                    }
+                } else {
+                    None
+                };
+                let Some(end) = end else {
+                    at += 1;
+                    continue;
+                };
+                let start = line.scalar_start + line.text[..at].chars().count();
+                if known.contains(&start) {
+                    at = end;
+                    continue;
+                }
+                let heading = &line.text[..at];
                 let formal = formal_heading(heading)
                     && (style == MarkerStyle::Bracket || !heading.contains('.'));
-                let marker_end =
-                    capture.get(1).unwrap().end() + usize::from(style == MarkerStyle::Bracket);
                 let sentence = style == MarkerStyle::Bracket
-                    && sentence_heading(heading, &line.text[marker_end..]);
+                    && sentence_heading(heading, &text.value[line.byte_start + end..]);
                 if formal || sentence {
                     result.push(Marker {
-                        number: capture[1].parse().unwrap(),
+                        number: line.text[digits..tail].parse().unwrap(),
                         start,
                         style,
                         score: if formal { 0.6 } else { 0.35 },
@@ -1289,6 +1466,7 @@ mod recovery {
                         sentence,
                     });
                 }
+                at = end;
             }
         }
         result
@@ -1523,7 +1701,7 @@ mod recovery {
         if marker.style != MarkerStyle::Dot {
             return false;
         }
-        let start = text.scalar_bytes[marker.start];
+        let start = text.byte(marker.start);
         let end = text.value[start..]
             .find('\n')
             .map_or(text.value.len(), |at| start + at);
@@ -1848,7 +2026,12 @@ mod recovery {
     }
 
     fn page_markers(text: &ScalarText<'_>, report_start: Option<u32>) -> Vec<PageMarker> {
-        if !cached_regex!(HAS_PAGE, r"(?iu)\bpage\b").is_match(text.value) {
+        if !text
+            .value
+            .as_bytes()
+            .windows(4)
+            .any(|word| word.eq_ignore_ascii_case(b"page"))
+        {
             return Vec::new();
         }
         let regex = cached_regex!(
@@ -1961,10 +2144,12 @@ mod recovery {
 
     fn detect_case(
         text: &ScalarText<'_>,
-        evidence: &DocumentInput,
+        profile: DetectionProfile,
+        report_start_page: Option<u32>,
+        require_report_start: bool,
         excluded: &[ScalarRange],
     ) -> Vec<Block> {
-        let mut paragraphs = match evidence.profile {
+        let mut paragraphs = match profile {
             DetectionProfile::CaseContiguousComplete => {
                 let complete = clipped_case_paragraphs(
                     detect_paragraphs(text, DetectionProfile::CaseLossy, excluded),
@@ -1979,11 +2164,7 @@ mod recovery {
             }
             profile => detect_paragraphs(text, profile, excluded),
         };
-        paragraphs.extend(detect_pages(
-            text,
-            evidence.report_start_page,
-            evidence.require_report_start,
-        ));
+        paragraphs.extend(detect_pages(text, report_start_page, require_report_start));
         paragraphs
     }
 
@@ -2469,7 +2650,7 @@ mod recovery {
     }
 
     fn inline_section(text: &ScalarText<'_>, mark: &SectionMark) -> bool {
-        let start = text.scalar_bytes[mark.content_start];
+        let start = text.byte(mark.content_start);
         let end = text.value[start..]
             .find('\n')
             .map_or(text.value.len(), |value| start + value);
@@ -2507,7 +2688,7 @@ mod recovery {
         candidates.retain(|value| matches!(value.label.as_str(), "1" | "2"));
         let mut invalid = false;
         for marker in &mut candidates {
-            let start = text.scalar_bytes[marker.content_start];
+            let start = text.byte(marker.content_start);
             let end = text.value[start..]
                 .find('\n')
                 .map_or(text.value.len(), |value| start + value);
@@ -2841,6 +3022,12 @@ mod recovery {
         label: String,
     }
 
+    struct ChildMark<'a> {
+        token: &'a str,
+        start: usize,
+        content_start: usize,
+    }
+
     #[derive(Default)]
     struct StructureState {
         nodes: Vec<(Block, usize)>,
@@ -2895,6 +3082,52 @@ mod recovery {
         character.is_whitespace() || character == '\u{feff}'
     }
 
+    fn legislation_marker(value: &str, followed_by_newline: bool) -> Option<(&str, usize, usize)> {
+        let found = cached_regex!(
+            MARKER,
+            r"^\((\d+(?:\.\d+)?|[A-Za-z](?:\.\d+)?|[ivxlcdmIVXLCDM]+)\)"
+        )
+        .captures(value)?;
+        let whole = found.get(0).unwrap();
+        let rest = &value[whole.end()..];
+        (rest.chars().next().is_some_and(char::is_whitespace)
+            || (rest.is_empty() && followed_by_newline))
+            .then(|| {
+                (
+                    found.get(1).unwrap().as_str(),
+                    whole.end() + leading_ascii_space(rest),
+                    whole.end() - 1,
+                )
+            })
+    }
+
+    fn compare_child_values(left: &str, right: &str) -> std::cmp::Ordering {
+        let left = left.split('.').collect::<Vec<_>>();
+        let right = right.split('.').collect::<Vec<_>>();
+        for index in 0..left.len().max(right.len()) {
+            let (left, right) = (
+                left.get(index).copied().unwrap_or_default(),
+                right.get(index).copied().unwrap_or_default(),
+            );
+            if left == right {
+                continue;
+            }
+            let ordered = if index == 0 {
+                left.parse::<f64>()
+                    .unwrap_or_default()
+                    .partial_cmp(&right.parse::<f64>().unwrap_or_default())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                let width = left.len().max(right.len());
+                format!("{left:0<width$}").cmp(&format!("{right:0<width$}"))
+            };
+            if !ordered.is_eq() {
+                return ordered;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
     fn admitted_dialects(text: &ScalarText<'_>) -> (bool, bool) {
         let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
         let mut best = [0, 0];
@@ -2921,6 +3154,29 @@ mod recovery {
     }
 
     impl StructureState {
+        fn emit_child(
+            &mut self,
+            token: &str,
+            start: usize,
+            content_start: usize,
+            parent: String,
+            depth: usize,
+            code: &'static str,
+        ) -> String {
+            let base = format!("{parent}({token})");
+            let occurrence = self.used.entry(base.clone()).or_insert(1);
+            let label = (*occurrence > 1)
+                .then(|| format!("{base}@{occurrence}"))
+                .unwrap_or(base);
+            *occurrence += 1;
+            let mut block = Block::labelled(NodeKind::Section, label.clone(), start, usize::MAX);
+            block.parent_label = Some(parent);
+            block.content_start = Some(content_start);
+            block.diagnostic = Some(code);
+            self.nodes.push((block, depth));
+            label
+        }
+
         fn child(&mut self, token: &str, start: usize, content_start: usize) {
             let (root, root_depth) = self.section.clone().unwrap();
             let readings = enum_readings(token);
@@ -2979,20 +3235,108 @@ mod recovery {
                 (3, _) => "instrument_ladder_midcounter_open",
                 _ => "instrument_ladder_violation",
             };
-            let base = format!("{parent}({token})");
-            let occurrence = self.used.entry(base.clone()).or_insert(1);
-            let label = (*occurrence > 1)
-                .then(|| format!("{base}@{occurrence}"))
-                .unwrap_or(base);
-            *occurrence += 1;
+            let label = self.emit_child(token, start, content_start, parent, depth, code);
             if pass < 4 {
                 self.stack.last_mut().unwrap().label = label.clone();
             }
-            let mut block = Block::labelled(NodeKind::Section, label, start, usize::MAX);
-            block.parent_label = Some(parent);
-            block.content_start = Some(content_start);
-            block.diagnostic = Some(code);
-            self.nodes.push((block, depth));
+        }
+
+        fn legislation_child(
+            &mut self,
+            token: &str,
+            next: Option<&str>,
+            start: usize,
+            content_start: usize,
+        ) {
+            let (head, suffix) = token.split_once('.').unwrap_or((token, ""));
+            let numeric = token
+                .as_bytes()
+                .first()
+                .is_some_and(|value| value.is_ascii_digit());
+            let roman = roman_value(head);
+            let upper = head != head.to_ascii_lowercase();
+            let alpha_level = if upper { 4 } else { 2 };
+            let alpha_value = head
+                .as_bytes()
+                .first()
+                .filter(|value| value.is_ascii_alphabetic())
+                .map(|value| u32::from(value.to_ascii_lowercase() - b'a' + 1));
+            let prior = |family| {
+                self.stack
+                    .iter()
+                    .find(|frame| frame.family == family)
+                    .map(|frame| frame.value.as_str())
+            };
+            let roman_preferred = if head.len() > 1 {
+                true
+            } else if let Some(value) = roman {
+                if prior(3)
+                    .and_then(|prior| prior.parse::<u32>().ok())
+                    .is_some_and(|prior| prior + 1 == value)
+                {
+                    true
+                } else if alpha_value.is_some_and(|value| {
+                    prior(alpha_level)
+                        .and_then(|prior| prior.parse::<u32>().ok())
+                        .is_some_and(|prior| prior + 1 == value)
+                }) {
+                    head.eq_ignore_ascii_case("i")
+                        && next.is_some_and(|next| next.eq_ignore_ascii_case("ii"))
+                } else {
+                    !upper && head == "i" && self.stack.iter().any(|frame| frame.family == 2)
+                }
+            } else {
+                false
+            };
+            let (family, value) = if numeric {
+                (1, token.to_owned())
+            } else if roman_preferred {
+                (3, roman.unwrap().to_string())
+            } else {
+                let Some(alpha) = alpha_value else { return };
+                (
+                    alpha_level,
+                    if suffix.is_empty() {
+                        alpha.to_string()
+                    } else {
+                        format!("{alpha}.{suffix}")
+                    },
+                )
+            };
+            if prior(family).is_some_and(|prior| !compare_child_values(&value, prior).is_gt()) {
+                return;
+            }
+
+            self.stack.retain(|frame| frame.family <= family);
+            let at = self.stack.iter().position(|frame| frame.family == family);
+            let (root, root_depth) = self.section.clone().unwrap();
+            let parent = at
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| self.stack.get(index))
+                .or_else(|| self.stack.iter().rev().find(|frame| frame.family < family))
+                .map_or_else(|| root.clone(), |frame| frame.label.clone());
+            if let Some(index) = at {
+                self.stack[index].value = value.clone();
+            } else {
+                self.stack.push(EnumFrame {
+                    family,
+                    value,
+                    label: String::new(),
+                });
+            }
+            let label = self.emit_child(
+                token,
+                start,
+                content_start,
+                parent,
+                root_depth + usize::from(family),
+                "legislation_child",
+            );
+            self.stack
+                .iter_mut()
+                .find(|frame| frame.family == family)
+                .unwrap()
+                .label = label;
         }
     }
 
@@ -3002,49 +3346,85 @@ mod recovery {
         root: String,
         root_depth: usize,
         content_start: usize,
+        inline_at_root: bool,
+        leading_label: Option<&str>,
     ) -> Vec<Block> {
         let text = ScalarText::new(value);
+        let public_parent = root.clone();
         let mut state = StructureState {
             section: Some((root, root_depth)),
             ..Default::default()
         };
-        let inline = &text.value[text.scalar_bytes[content_start]..];
-        if let Some((token, at)) =
-            instrument_marker(inline.lines().next().unwrap_or_default(), false, false)
-        {
-            state.child(
+        let mut markers = Vec::new();
+        let leading = leading_label.and_then(|label| {
+            let lead = leading_ascii_space(value);
+            let rest = value[lead..].strip_prefix(label)?;
+            let gap = leading_ascii_space(rest);
+            let prefix = lead + label.len() + gap;
+            let line = value[prefix..].lines().next().unwrap_or_default();
+            let newline = line.len() < value[prefix..].len();
+            let (token, content, close) = legislation_marker(line, newline)?;
+            Some(ChildMark {
                 token,
-                content_start,
-                content_start + inline[..at].chars().count(),
-            );
+                start: value[..prefix + close].chars().count(),
+                content_start: value[..prefix + content].chars().count(),
+            })
+        });
+        if let Some(marker) = leading {
+            markers.push(marker);
+        } else {
+            let inline = &text.value[text.byte(content_start)..];
+            let inline_line = inline.lines().next().unwrap_or_default();
+            if let Some((token, at, _)) = legislation_marker(inline_line, inline.contains('\n')) {
+                markers.push(ChildMark {
+                    token,
+                    start: if inline_at_root { 0 } else { content_start },
+                    content_start: content_start + inline_line[..at].chars().count(),
+                });
+            }
         }
         for line in lines(&text) {
-            let value = line.text.trim_matches(instrument_space);
-            if let Some((token, at)) = instrument_marker(value, false, false) {
-                let content = line.scalar_start + value[..at].chars().count();
-                if !state
-                    .nodes
+            let value = line.text.trim_start_matches(instrument_space);
+            if let Some((token, at, _)) =
+                legislation_marker(value, line.byte_end < text.value.len())
+            {
+                if !markers
                     .iter()
-                    .any(|(block, _)| block.range.start == line.scalar_start)
+                    .any(|marker| marker.start == line.scalar_start)
                 {
-                    state.child(token, line.scalar_start, content);
+                    markers.push(ChildMark {
+                        token,
+                        start: line.scalar_start,
+                        content_start: line.scalar_start
+                            + line.text[..line.text.len() - value.len()].chars().count()
+                            + value[..at].chars().count(),
+                    });
                 }
             }
         }
+        markers.sort_by_key(|marker| marker.start);
+        for index in 0..markers.len() {
+            let marker = &markers[index];
+            state.legislation_child(
+                marker.token,
+                markers.get(index + 1).map(|next| next.token),
+                marker.start,
+                marker.content_start,
+            );
+        }
         for index in 0..state.nodes.len() {
-            let depth = state.nodes[index].1;
-            let end = state
-                .nodes
+            let start = state.nodes[index].0.range.start;
+            let end = markers
                 .iter()
-                .skip(index + 1)
-                .find(|(_, candidate)| *candidate <= depth)
-                .map_or(text.len(), |(block, _)| block.range.start);
+                .find(|marker| marker.start > start)
+                .map_or(text.len(), |marker| marker.start);
             state.nodes[index].0.range.end = end;
             state.nodes[index].0.range.start += offset;
             state.nodes[index].0.range.end += offset;
             if let Some(at) = &mut state.nodes[index].0.content_start {
                 *at += offset;
             }
+            state.nodes[index].0.parent_label = Some(public_parent.clone());
         }
         state.nodes.into_iter().map(|(block, _)| block).collect()
     }
@@ -3056,7 +3436,7 @@ mod recovery {
         offset: usize,
     ) -> Vec<SourceDocBlock> {
         let text = ScalarText::new(value);
-        enumerated_children(value, 0, format!("sec{label}"), 0, 0)
+        enumerated_children(value, 0, format!("sec{label}"), 0, 0, false, Some(label))
             .into_iter()
             .map(|block| {
                 let mut projected = SourceDocBlock::new(
@@ -3156,7 +3536,7 @@ mod recovery {
                     state.section = None;
                 } else {
                     state.section = Some((label, depth));
-                    let inline = &text.value[text.scalar_bytes[content_start]..line.byte_end];
+                    let inline = &text.value[text.byte(content_start)..line.byte_end];
                     if let Some((token, at)) = instrument_marker(inline, false, false) {
                         state.child(
                             token,
@@ -3187,8 +3567,12 @@ mod recovery {
         state.nodes.into_iter().map(|(block, _)| block).collect()
     }
 
-    fn detect_legislation(text: &ScalarText<'_>, evidence: &DocumentInput) -> Vec<Block> {
-        let sections = selected_sections(text, evidence.allow_hyphenated_sections);
+    fn detect_legislation(
+        text: &ScalarText<'_>,
+        allow_hyphenated_sections: bool,
+        native_claims: &[NativeClaim],
+    ) -> Vec<Block> {
+        let sections = selected_sections(text, allow_hyphenated_sections);
         let mut result = Vec::new();
         for (index, section) in sections.iter().enumerate() {
             let end = sections
@@ -3213,10 +3597,11 @@ mod recovery {
                 format!("sec{}", section.label),
                 0,
                 section.content_start - section.start,
+                matches!(section.family, SectionFamily::Bare | SectionFamily::DotTerm),
+                None,
             ));
         }
-        for claim in evidence
-            .native_claims
+        for claim in native_claims
             .iter()
             .filter(|claim| claim.kind == EvidenceKind::Section && claim.parent_label.is_none())
         {
@@ -3239,21 +3624,14 @@ mod recovery {
                 .map_or(claim.range.start, |_| {
                     claim.range.start + value[..lead].chars().count() + label.chars().count()
                 });
-            let section = SectionMark {
-                label: label.to_owned(),
-                start: claim.range.start,
-                content_start,
-                style: section_style(label, false),
-                family: SectionFamily::Emphasis,
-                aliases: Vec::new(),
-            };
-            let value = text.slice(claim.range);
             let children = enumerated_children(
                 value,
                 claim.range.start,
                 format!("sec{label}"),
                 0,
-                section.content_start - claim.range.start,
+                content_start - claim.range.start,
+                false,
+                Some(label),
             );
             result.retain(|block| {
                 !block
@@ -3278,46 +3656,57 @@ mod recovery {
     }
 
     fn detect_journal(text: &ScalarText<'_>) -> Vec<Block> {
+        let source = javascript_lines(text);
         let mut result = add_ranges(
-            cached_regex!(
-                SECTION,
-                r"(?mu)^[ \t]*([IVXLCDM]+|[A-Z])\.[ \t]+([^\n\x08]{3,180})$"
-            )
-            .captures_iter(text.value)
-            .map(|capture| {
-                let whole = capture.get(0).unwrap();
-                let title = capture[2].split_whitespace().collect::<Vec<_>>().join(" ");
-                let alias = title
-                    .to_lowercase()
-                    .chars()
-                    .map(|value| if value.is_alphanumeric() { value } else { ' ' })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let mut block = Block::labelled(
-                    NodeKind::Section,
-                    format!("sec{}", &capture[1]),
-                    text.scalar(whole.start()),
-                    0,
-                );
-                block.aliases = std::iter::once(capture[1].to_owned())
-                    .chain((!alias.is_empty()).then(|| format!("sectitle:{alias}")))
-                    .collect();
-                block
-            })
-            .collect(),
+            source
+                .iter()
+                .filter_map(|line| {
+                    cached_regex!(
+                        SECTION,
+                        r"(?u)^[ \t]*([IVXLCDM]+|[A-Z])\.[ \t]+([^\x08]{3,180})$"
+                    )
+                    .captures(line.text)
+                    .map(|capture| (line, capture))
+                })
+                .map(|(line, capture)| {
+                    let whole = capture.get(0).unwrap();
+                    let title = capture[2].split_whitespace().collect::<Vec<_>>().join(" ");
+                    let alias = title
+                        .to_lowercase()
+                        .chars()
+                        .map(|value| if value.is_alphanumeric() { value } else { ' ' })
+                        .collect::<String>()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut block = Block::labelled(
+                        NodeKind::Section,
+                        format!("sec{}", &capture[1]),
+                        line.scalar_start + line.text[..whole.start()].chars().count(),
+                        0,
+                    );
+                    block.aliases = std::iter::once(capture[1].to_owned())
+                        .chain((!alias.is_empty()).then(|| format!("sectitle:{alias}")))
+                        .collect();
+                    block
+                })
+                .collect(),
             text.len(),
         );
         result.extend(add_ranges(
-            cached_regex!(NOTE, r"(?mu)^[ \t]*(\d{1,5})\t[ \t]*(?:\r?\n)?")
-                .captures_iter(text.value)
-                .map(|capture| {
+            source
+                .iter()
+                .filter_map(|line| {
+                    cached_regex!(NOTE, r"(?u)^[ \t]*(\d{1,5})\t[ \t]*$")
+                        .captures(line.text)
+                        .map(|capture| (line, capture))
+                })
+                .map(|(line, capture)| {
                     let whole = capture.get(0).unwrap();
                     let mut block = Block::labelled(
                         NodeKind::Footnote,
                         format!("fn{}", capture[1].parse::<u32>().unwrap()),
-                        text.scalar(whole.start()),
+                        line.scalar_start + line.text[..whole.start()].chars().count(),
                         0,
                     );
                     block.aliases.push(capture[1].to_owned());
@@ -3326,7 +3715,6 @@ mod recovery {
                 .collect(),
             text.len(),
         ));
-        let source = lines(text).collect::<Vec<_>>();
         let mut start = None;
         for (index, line) in source.iter().enumerate() {
             let blank = line.text.trim_matches([' ', '\t', '\r']).is_empty();
@@ -3350,7 +3738,16 @@ mod recovery {
                     start: block_start,
                     end,
                 });
-                if !cached_regex!(PAGE, r"(?iu)^\[page [^\]\n]{1,40}\]").is_match(value) {
+                let block_start = if cached_regex!(PAGE, r"(?iu)^\[page [^\]\n]{1,40}\]")
+                    .is_match(value)
+                {
+                    value
+                        .find('\n')
+                        .map_or(end, |at| block_start + value[..=at].chars().count())
+                } else {
+                    block_start
+                };
+                if block_start < end {
                     result.push(Block {
                         kind: NodeKind::Prose,
                         range: ScalarRange {
@@ -3371,18 +3768,89 @@ mod recovery {
     }
 
     pub(super) fn inferred_blocks(evidence: &DocumentInput, text: &ScalarText<'_>) -> Vec<Block> {
-        let paragraph_exclusions = evidence
+        let mut paragraph_exclusions = evidence
             .exclusions
             .iter()
             .filter(|value| value.applies_to.iter().any(|name| name == "paragraph"))
             .map(|value| value.range)
             .collect::<Vec<_>>();
+        paragraph_exclusions.sort_by_key(|range| (range.start, range.end));
         match evidence.profile {
-            DetectionProfile::Legislation => detect_legislation(text, evidence),
+            DetectionProfile::Legislation => detect_legislation(
+                text,
+                evidence.allow_hyphenated_sections,
+                &evidence.native_claims,
+            ),
             DetectionProfile::Instrument => detect_instrument(text),
             DetectionProfile::Journal => detect_journal(text),
-            _ => detect_case(text, evidence, &paragraph_exclusions),
+            _ => detect_case(
+                text,
+                evidence.profile,
+                evidence.report_start_page,
+                evidence.require_report_start,
+                &paragraph_exclusions,
+            ),
         }
+    }
+
+    #[cfg(all(feature = "a2aj", feature = "source-doc"))]
+    pub(super) fn a2aj_source_doc_blocks(
+        text: &str,
+        profile: DetectionProfile,
+        report_start_page: Option<u32>,
+        require_report_start: bool,
+        allow_hyphenated_sections: bool,
+    ) -> Vec<SourceDocBlock> {
+        let scalar = ScalarText::new(text);
+        let inferred = if profile == DetectionProfile::Legislation {
+            detect_legislation(&scalar, allow_hyphenated_sections, &[])
+        } else {
+            detect_case(
+                &scalar,
+                profile,
+                report_start_page,
+                require_report_start,
+                &[],
+            )
+        };
+        let mut prose = 0;
+        let mut blocks = inferred
+            .into_iter()
+            .filter_map(|block| {
+                let kind = match block.kind {
+                    NodeKind::Paragraph | NodeKind::Prose => SourceDocKind::Paragraph,
+                    NodeKind::Page => SourceDocKind::Page,
+                    NodeKind::Section => SourceDocKind::Section,
+                    NodeKind::Footnote => SourceDocKind::Footnote,
+                    NodeKind::Heading | NodeKind::Endnote => return None,
+                };
+                let label = if block.kind == NodeKind::Prose {
+                    prose += 1;
+                    format!("par{prose}")
+                } else {
+                    block.label?
+                };
+                let mut projected = SourceDocBlock::new(
+                    kind,
+                    label,
+                    scalar.utf16(block.range.start),
+                    scalar.utf16(block.range.end),
+                    SourceDocOrigin::Heuristic,
+                );
+                projected.aliases = block.aliases;
+                projected.parent_label = block.parent_label;
+                Some(projected)
+            })
+            .collect::<Vec<_>>();
+        if profile == DetectionProfile::Legislation {
+            blocks.sort_by(|left, right| {
+                left.start
+                    .cmp(&right.start)
+                    .then_with(|| right.end.cmp(&left.end))
+                    .then_with(|| left.label.cmp(&right.label))
+            });
+        }
+        blocks
     }
 }
 
@@ -3603,13 +4071,20 @@ fn projection(profile: DetectionProfile) -> (ProjectionOrder, Option<SourceDocTy
 }
 
 #[cfg(feature = "source-doc")]
-fn compose_with(mut input: DocumentInput, recovery: bool) -> Result<SourceDoc, EngineError> {
-    input.validate()?;
+fn compose_with(
+    mut input: DocumentInput,
+    recovery: bool,
+    validate: bool,
+) -> Result<SourceDoc, EngineError> {
+    if validate {
+        input.validate()?;
+    }
     let (order, inferred_type) = projection(input.profile);
     let provider = SourceDocProvider::from_name(&input.provider);
     let id = input.document_id.clone();
     let url = input.url.take();
     let doc_type = input.doc_type.or(inferred_type);
+    let revision = input.text_sha256.clone();
     let originals = source_doc::native_blocks(
         &input.text,
         &input.native_claims,
@@ -3627,18 +4102,133 @@ fn compose_with(mut input: DocumentInput, recovery: bool) -> Result<SourceDoc, E
     let text = std::mem::take(&mut input.text);
     let graph = infer_graph(input, inferred, recovery);
     Ok(source_doc::project_graph(
-        provider, id, url, doc_type, text, &originals, graph, order,
+        provider, id, url, doc_type, text, revision, &originals, graph, order,
     ))
 }
 
 #[cfg(feature = "source-doc")]
 pub fn compose_native(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    compose_with(input, false)
+    compose_with(input, false, true)
 }
 
 #[cfg(all(feature = "recovery", feature = "source-doc"))]
 pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    compose_with(input, true)
+    compose_with(input, true, true)
+}
+
+#[cfg(all(feature = "recovery", feature = "source-doc"))]
+pub(crate) fn compose_trusted(input: DocumentInput) -> Result<SourceDoc, EngineError> {
+    compose_with(input, true, false)
+}
+
+#[cfg(all(feature = "journal", feature = "recovery", feature = "source-doc"))]
+pub(crate) fn compose_journal_source_doc(
+    article_id: usize,
+    url: Option<String>,
+    text: String,
+    blocks: Vec<SourceDocBlock>,
+) -> Result<SourceDoc, EngineError> {
+    let offsets = source_doc::utf16_offsets(&text);
+    let scalar = |offset: usize| {
+        offsets
+            .binary_search(&offset)
+            .map_err(|_| EngineError::source("journal range splits a Unicode scalar"))
+    };
+    let mut originals = HashMap::new();
+    let mut claims = Vec::with_capacity(blocks.len());
+    for (index, block) in blocks.iter().enumerate() {
+        let id = format!("native-{:06}", index + 1);
+        claims.push(NativeClaim {
+            id: id.clone(),
+            kind: match block.kind {
+                SourceDocKind::Paragraph => EvidenceKind::Paragraph,
+                SourceDocKind::Page => EvidenceKind::Page,
+                SourceDocKind::Section => EvidenceKind::Section,
+                SourceDocKind::Footnote => EvidenceKind::Footnote,
+            },
+            label: Some(block.label.clone()),
+            aliases: block.aliases.clone(),
+            parent_label: block.parent_label.clone(),
+            anchor: block.anchor.clone(),
+            range: ScalarRange {
+                start: scalar(block.start)?,
+                end: scalar(block.end)?,
+            },
+            provider_order: index,
+            origin_id: "journal".to_owned(),
+        });
+        originals.insert(id, block.clone());
+    }
+    let has = |kind| {
+        blocks.iter().any(|block| match kind {
+            EvidenceKind::Paragraph | EvidenceKind::Prose => {
+                block.kind == SourceDocKind::Paragraph
+            }
+            EvidenceKind::Page => block.kind == SourceDocKind::Page,
+            EvidenceKind::Section => block.kind == SourceDocKind::Section,
+            EvidenceKind::Footnote => block.kind == SourceDocKind::Footnote,
+            EvidenceKind::Heading | EvidenceKind::Endnote => false,
+        })
+    };
+    let length = text.chars().count();
+    let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    compose_trusted(DocumentInput {
+        schema_version: EVIDENCE_SCHEMA.to_owned(),
+        document_id: article_id.to_string(),
+        provider: "journal".to_owned(),
+        url,
+        doc_type: None,
+        provider_revision: "journal-adapter-v1".to_owned(),
+        profile: DetectionProfile::Journal,
+        report_start_page: None,
+        require_report_start: false,
+        allow_hyphenated_sections: false,
+        text,
+        text_sha256,
+        source_sha256: None,
+        offset_unit: "unicode-scalar".to_owned(),
+        scope: Scope {
+            kind: ScopeKind::Complete,
+            excerpt_of: None,
+        },
+        origins: vec![Origin {
+            id: "journal".to_owned(),
+            producer: "journal".to_owned(),
+            representation: "provider-rendered-text".to_owned(),
+            revision: "journal-adapter-v1".to_owned(),
+            authority: "provider-native-claims".to_owned(),
+        }],
+        units: Vec::new(),
+        native_claims: claims,
+        coverage: [
+            EvidenceKind::Paragraph,
+            EvidenceKind::Prose,
+            EvidenceKind::Page,
+            EvidenceKind::Section,
+            EvidenceKind::Heading,
+            EvidenceKind::Footnote,
+            EvidenceKind::Endnote,
+        ]
+        .into_iter()
+        .map(|kind| Coverage {
+            kind,
+            range: ScalarRange {
+                start: 0,
+                end: length,
+            },
+            state: if has(kind) {
+                CoverageState::Complete
+            } else {
+                CoverageState::Absent
+            },
+            reason: "journal native coverage".to_owned(),
+            origin_id: has(kind).then(|| "journal".to_owned()),
+        })
+        .collect(),
+        exclusions: Vec::new(),
+        paragraph_breaks: Vec::new(),
+        original_claims: originals,
+    })
 }
 
 #[derive(Deserialize)]
@@ -4101,6 +4691,82 @@ mod tests {
             .nodes
             .iter()
             .any(|node| node.label.as_deref() == Some(label))));
+        let text = "1 (1) Parent provision.\n(a) First paragraph.\n(i) First subparagraph.\n(ii) Second subparagraph.\n(a) Duplicate paragraph marker.\n(b) Second paragraph.\n(2) Sibling subsection.\n2 Next provision.";
+        let law = derive(evidence(text, DetectionProfile::Legislation));
+        let node = |label| {
+            law.nodes
+                .iter()
+                .find(|node| node.label.as_deref() == Some(label))
+                .unwrap()
+        };
+        assert_eq!(node("sec1(1)").range.start, 0);
+        assert_eq!(
+            node("sec1(1)").range.end,
+            text[..text.find("(2) Sibling").unwrap()].chars().count()
+        );
+        assert_eq!(
+            node("sec1(1)(a)").parent_id.as_deref(),
+            Some(node("sec1").id.as_str())
+        );
+        assert_eq!(
+            law.nodes
+                .iter()
+                .filter(|node| node.label.as_deref() == Some("sec1(1)(a)"))
+                .count(),
+            1
+        );
+
+        let criminal = "**231** (4) Parent subsection.\n(a) First paragraph.\n(b) Second paragraph.\n(c) Third paragraph.\n(5) Sibling subsection.";
+        let criminal = derive(evidence(criminal, DetectionProfile::Legislation));
+        let section = criminal
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec231"))
+            .unwrap();
+        let subsection = criminal
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec231(4)"))
+            .unwrap();
+        let sibling = criminal
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec231(5)"))
+            .unwrap();
+        assert_eq!(subsection.range.end, sibling.range.start);
+        assert!(["a", "b", "c"].into_iter().all(|label| {
+            let label = format!("sec231(4)({label})");
+            criminal.nodes.iter().any(|node| {
+                node.label.as_deref() == Some(label.as_str())
+                    && node.parent_id.as_deref() == Some(section.id.as_str())
+            })
+        }));
+
+        let section_map = "**22.1** (a) Parent paragraph.\n(i) First subparagraph.\n(ii) Second subparagraph.\n(b) Sibling paragraph.";
+        let section_map = derive(evidence(section_map, DetectionProfile::Legislation));
+        let section = section_map
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec22.1"))
+            .unwrap();
+        let paragraph = section_map
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec22.1(a)"))
+            .unwrap();
+        let sibling = section_map
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some("sec22.1(b)"))
+            .unwrap();
+        assert_eq!(paragraph.range.end, sibling.range.start);
+        assert!(["i", "ii"].into_iter().all(|label| {
+            let label = format!("sec22.1(a)({label})");
+            section_map.nodes.iter().any(|node| {
+                node.label.as_deref() == Some(label.as_str())
+                    && node.parent_id.as_deref() == Some(section.id.as_str())
+            })
+        }));
         let instrument = derive(evidence(
             "Section 1.01 Nested.\n(a) alpha\n(i) roman\n(A) upper\n(I) roman\n(1) digit\nSection 1.02 Doubled.\n(a) alpha\n(z) jump\n(aa) double\n(bb) double",
             DetectionProfile::Instrument,
@@ -4158,6 +4824,22 @@ mod tests {
         assert!(formal_heading("Qualified Privilege"));
         assert!(!formal_heading("*429"));
         assert!(!formal_heading("() Heading"));
+        let case = "[1] This opening paragraph contains enough ordinary words to establish substantive reasons for decision.\nAll Canadian people affected by the breach [1]\nClass Period\n[2] This second paragraph contains enough ordinary words to establish substantive reasons for decision.\n[3] This third paragraph contains enough ordinary words to establish substantive reasons for decision.\n[4] This fourth paragraph contains enough ordinary words to establish substantive reasons for decision.\n[5] This fifth paragraph contains enough ordinary words to establish substantive reasons for decision.";
+        let case_graph =
+            derive_structure_evidence(evidence(case, DetectionProfile::CaseRootedComplete))
+                .expect("valid case evidence");
+        assert_eq!(
+            case_graph
+                .nodes
+                .iter()
+                .find(|node| node.label.as_deref() == Some("par1"))
+                .unwrap()
+                .range
+                .end,
+            case[..case.find("[1]\nClass Period").unwrap()]
+                .chars()
+                .count()
+        );
         assert_eq!(utf16_prefix("😀ab", 1), "");
         assert_eq!(utf16_prefix("😀ab", 3), "😀a");
         let journal = derive_structure_evidence(evidence(
