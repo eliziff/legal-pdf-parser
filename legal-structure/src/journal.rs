@@ -1,7 +1,7 @@
 use crate::source_doc::BlockFieldOrder;
 use crate::{
-    compose_journal_source_doc, create_source_doc, EngineError, SourceDoc, SourceDocBlock,
-    SourceDocKind, SourceDocOrigin, SourceDocProvider,
+    create_source_doc, EngineError, SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    SourceDocProvider,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -120,6 +120,13 @@ fn value_text(value: Option<&Value>) -> String {
     }
 }
 
+fn page_marker(line: &str) -> Option<&str> {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let label = line.strip_prefix("[page ")?.strip_suffix(']')?.trim();
+    (!label.is_empty() && label.len() <= 40 && !label.contains(']')).then_some(label)
+}
+
 fn positive_usize(value: Option<&Value>) -> Option<usize> {
     let value = match value? {
         Value::Number(value) => value.as_u64()?,
@@ -138,30 +145,21 @@ pub fn journal_text_source_doc(
     page_labels: &[JournalPageLabel],
 ) -> Result<SourceDoc, EngineError> {
     let mut starts = Vec::new();
-    let mut cursor = 0;
-    for row in page_labels {
-        let label = row.label.trim();
-        if label.is_empty() {
-            continue;
-        }
-        let marker = format!("[page {label}]");
-        let mut found = text[cursor..].find(&marker).map(|at| cursor + at);
-        while let Some(at) = found {
-            let line_start = text[..at].rfind('\n').map_or(0, |value| value + 1);
-            let line_end = at + marker.len();
-            let next_break = text[line_end..]
-                .find('\n')
-                .map_or(text.len(), |value| line_end + value);
-            if text[line_start..at].trim_matches([' ', '\t']).is_empty()
-                && text[line_end..next_break]
-                    .trim_matches([' ', '\t', '\r'])
-                    .is_empty()
-            {
-                starts.push((label.to_owned(), row.pdf_page, line_start));
-                cursor = line_end;
-                break;
-            }
-            found = text[line_end..].find(&marker).map(|value| line_end + value);
+    let mut clean = String::with_capacity(text.len());
+    let mut page_cursor = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(label) = page_marker(line) {
+            let row = page_labels[page_cursor..]
+                .iter()
+                .position(|row| row.label.trim() == label)
+                .map(|index| page_cursor + index);
+            let pdf_page = row.map(|index| {
+                page_cursor = index + 1;
+                page_labels[index].pdf_page
+            });
+            starts.push((label.to_owned(), pdf_page, utf16_len(&clean)));
+        } else {
+            clean.push_str(line);
         }
     }
     let mut blocks = Vec::with_capacity(starts.len());
@@ -169,16 +167,25 @@ pub fn journal_text_source_doc(
         let mut block = SourceDocBlock::new(
             SourceDocKind::Page,
             public_label("page", label),
-            utf16_len(&text[..*start]),
-            utf16_len(&text[..starts.get(index + 1).map_or(text.len(), |value| value.2)]),
+            *start,
+            starts
+                .get(index + 1)
+                .map_or_else(|| utf16_len(&clean), |value| value.2),
             SourceDocOrigin::Native,
         )
         .with_field_order(BlockFieldOrder::EndLast);
-        block.anchor = Some(format!("page={pdf_page}"));
+        block.anchor = pdf_page.map(|pdf_page| format!("page={pdf_page}"));
         block.aliases.push(label.clone());
         blocks.push(block);
     }
-    compose_journal_source_doc(article_id, url, text, blocks)
+    Ok(create_source_doc(
+        Some(SourceDocProvider::Journal),
+        article_id.to_string(),
+        url,
+        None,
+        clean,
+        blocks,
+    ))
 }
 
 pub fn journal_source_doc(
@@ -407,31 +414,57 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_uses_page_markers_and_unnumbered_prose_recovery() {
-        let text = "[page 9]\nA first journal paragraph.\n\nA second journal paragraph.";
+    fn plain_text_uses_only_page_markers() {
+        let text = "[page 9]\nFirst page.\n\n[page x]\nSecond page.";
         let doc = journal_text_source_doc(
             3,
             Some("https://example.test/article".into()),
             text.into(),
-            &[JournalPageLabel {
-                label: "9".into(),
-                pdf_page: 4,
-            }],
+            &[
+                JournalPageLabel {
+                    label: "9".into(),
+                    pdf_page: 4,
+                },
+                JournalPageLabel {
+                    label: "x".into(),
+                    pdf_page: 5,
+                },
+            ],
         )
         .unwrap();
         assert_eq!(doc.url.as_deref(), Some("https://example.test/article"));
-        assert!(doc.blocks.iter().any(|block| {
-            block.kind == SourceDocKind::Page
-                && block.label == "page9"
-                && block.anchor.as_deref() == Some("page=4")
-                && block.origin == SourceDocOrigin::Native
-        }));
+        assert_eq!(doc.text, "First page.\n\nSecond page.");
         assert_eq!(
             doc.blocks
                 .iter()
-                .filter(|block| block.kind == SourceDocKind::Paragraph)
-                .count(),
-            2
+                .map(|block| (
+                    block.label.as_str(),
+                    block.start,
+                    block.end,
+                    block.anchor.as_deref(),
+                    block.origin,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "page9",
+                    0,
+                    "First page.\n\n".len(),
+                    Some("page=4"),
+                    SourceDocOrigin::Native,
+                ),
+                (
+                    "pagex",
+                    "First page.\n\n".len(),
+                    "First page.\n\nSecond page.".len(),
+                    Some("page=5"),
+                    SourceDocOrigin::Native,
+                ),
+            ]
         );
+        assert!(doc
+            .blocks
+            .iter()
+            .all(|block| block.kind == SourceDocKind::Page));
     }
 }

@@ -6,7 +6,7 @@ use legal_structure::{
 use napi::Error;
 use napi_derive::napi;
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::BufReader;
 
 #[napi(js_name = "sourceDocVersion")]
 pub fn source_doc_version() -> u32 {
@@ -62,21 +62,12 @@ fn journal_document(request: &serde_json::Value) -> napi::Result<SourceDoc> {
         return journal_source_doc(article_id as usize, url, BufReader::new(file), &labels)
             .map_err(|error| Error::from_reason(error.to_string()));
     }
-    if let Some(jsonl) = request.get("jsonl").and_then(serde_json::Value::as_str) {
-        return journal_source_doc(
-            article_id as usize,
-            url,
-            Cursor::new(jsonl.as_bytes()),
-            &labels,
-        )
-        .map_err(|error| Error::from_reason(error.to_string()));
-    }
     if let Some(text) = request.get("text").and_then(serde_json::Value::as_str) {
         return journal_text_source_doc(article_id as usize, url, text.to_owned(), &labels)
             .map_err(|error| Error::from_reason(error.to_string()));
     }
     Err(Error::from_reason(
-        "journal request requires filename, jsonl, or text",
+        "journal request requires filename or text",
     ))
 }
 

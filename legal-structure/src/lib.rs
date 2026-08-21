@@ -1016,23 +1016,6 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-#[cfg(feature = "recovery")]
-fn utf16_prefix(value: &str, maximum: usize) -> &str {
-    let end = value
-        .char_indices()
-        .take_while(|(_, character)| character.len_utf16() <= maximum)
-        .scan(0, |used, (at, character)| {
-            *used += character.len_utf16();
-            Some((at, *used))
-        })
-        .take_while(|(_, used)| *used <= maximum)
-        .last()
-        .map_or(0, |(at, _)| {
-            at + value[at..].chars().next().unwrap().len_utf8()
-        });
-    &value[..end]
-}
-
 #[derive(Clone)]
 struct Block {
     kind: NodeKind,
@@ -3421,29 +3404,6 @@ mod recovery {
         state.nodes.into_iter().map(|(block, _)| block).collect()
     }
 
-    #[cfg(all(feature = "a2aj", feature = "source-doc"))]
-    pub(super) fn source_doc_children(
-        label: &str,
-        value: &str,
-        offset: usize,
-    ) -> Vec<SourceDocBlock> {
-        let text = ScalarText::new(value);
-        enumerated_children(value, 0, format!("sec{label}"), 0, 0, false, Some(label))
-            .into_iter()
-            .map(|block| {
-                let mut projected = SourceDocBlock::new(
-                    SourceDocKind::Section,
-                    block.label.unwrap(),
-                    offset + text.utf16(block.range.start),
-                    offset + text.utf16(block.range.end),
-                    SourceDocOrigin::Heuristic,
-                );
-                projected.parent_label = block.parent_label;
-                projected
-            })
-            .collect()
-    }
-
     fn direct_section(value: &str) -> Option<(String, usize)> {
         let found = cached_regex!(SECTION,
             r#"^(?:(?:Section|SECTION)\s+(\d{1,3}(?:\.\d{1,3})*[A-Za-z]?)[.)]?\s*[—–\-:]?\s*(["'“(A-Z].*|)|(\d{1,3}\.\d{1,3}(?:\.\d{1,3})*)\s+(["'“(A-Z].*)|((?:[0-4]?\d{1,2}|500))[.)]\s+(["'“(A-Z].*)|(\d{1,3}(?:\.\d{1,3}){0,3})[ \t]+(\(\d.*))$"#
@@ -3783,66 +3743,6 @@ mod recovery {
             ),
         }
     }
-
-    #[cfg(all(feature = "a2aj", feature = "source-doc"))]
-    pub(super) fn a2aj_source_doc_blocks(
-        text: &str,
-        profile: DetectionProfile,
-        report_start_page: Option<u32>,
-        require_report_start: bool,
-        allow_hyphenated_sections: bool,
-    ) -> Vec<SourceDocBlock> {
-        let scalar = ScalarText::new(text);
-        let inferred = if profile == DetectionProfile::Legislation {
-            detect_legislation(&scalar, allow_hyphenated_sections, &[])
-        } else {
-            detect_case(
-                &scalar,
-                profile,
-                report_start_page,
-                require_report_start,
-                &[],
-            )
-        };
-        let mut prose = 0;
-        let mut blocks = inferred
-            .into_iter()
-            .filter_map(|block| {
-                let kind = match block.kind {
-                    NodeKind::Paragraph | NodeKind::Prose => SourceDocKind::Paragraph,
-                    NodeKind::Page => SourceDocKind::Page,
-                    NodeKind::Section => SourceDocKind::Section,
-                    NodeKind::Footnote => SourceDocKind::Footnote,
-                    NodeKind::Heading | NodeKind::Endnote => return None,
-                };
-                let label = if block.kind == NodeKind::Prose {
-                    prose += 1;
-                    format!("par{prose}")
-                } else {
-                    block.label?
-                };
-                let mut projected = SourceDocBlock::new(
-                    kind,
-                    label,
-                    scalar.utf16(block.range.start),
-                    scalar.utf16(block.range.end),
-                    SourceDocOrigin::Heuristic,
-                );
-                projected.aliases = block.aliases;
-                projected.parent_label = block.parent_label;
-                Some(projected)
-            })
-            .collect::<Vec<_>>();
-        if profile == DetectionProfile::Legislation {
-            blocks.sort_by(|left, right| {
-                left.start
-                    .cmp(&right.start)
-                    .then_with(|| right.end.cmp(&left.end))
-                    .then_with(|| left.label.cmp(&right.label))
-            });
-        }
-        blocks
-    }
 }
 
 fn native_kind(kind: EvidenceKind) -> NodeKind {
@@ -4110,114 +4010,6 @@ pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
 #[cfg(all(feature = "recovery", feature = "source-doc"))]
 pub(crate) fn compose_trusted(input: DocumentInput) -> Result<SourceDoc, EngineError> {
     compose_with(input, true, false)
-}
-
-#[cfg(all(feature = "journal", feature = "recovery", feature = "source-doc"))]
-pub(crate) fn compose_journal_source_doc(
-    article_id: usize,
-    url: Option<String>,
-    text: String,
-    blocks: Vec<SourceDocBlock>,
-) -> Result<SourceDoc, EngineError> {
-    let offsets = source_doc::utf16_offsets(&text);
-    let scalar = |offset: usize| {
-        offsets
-            .binary_search(&offset)
-            .map_err(|_| EngineError::source("journal range splits a Unicode scalar"))
-    };
-    let mut originals = HashMap::new();
-    let mut claims = Vec::with_capacity(blocks.len());
-    for (index, block) in blocks.iter().enumerate() {
-        let id = format!("native-{:06}", index + 1);
-        claims.push(NativeClaim {
-            id: id.clone(),
-            kind: match block.kind {
-                SourceDocKind::Paragraph => EvidenceKind::Paragraph,
-                SourceDocKind::Page => EvidenceKind::Page,
-                SourceDocKind::Section => EvidenceKind::Section,
-                SourceDocKind::Footnote => EvidenceKind::Footnote,
-            },
-            label: Some(block.label.clone()),
-            aliases: block.aliases.clone(),
-            parent_label: block.parent_label.clone(),
-            anchor: block.anchor.clone(),
-            range: ScalarRange {
-                start: scalar(block.start)?,
-                end: scalar(block.end)?,
-            },
-            provider_order: index,
-            origin_id: "journal".to_owned(),
-        });
-        originals.insert(id, block.clone());
-    }
-    let has = |kind| {
-        blocks.iter().any(|block| match kind {
-            EvidenceKind::Paragraph | EvidenceKind::Prose => block.kind == SourceDocKind::Paragraph,
-            EvidenceKind::Page => block.kind == SourceDocKind::Page,
-            EvidenceKind::Section => block.kind == SourceDocKind::Section,
-            EvidenceKind::Footnote => block.kind == SourceDocKind::Footnote,
-            EvidenceKind::Heading | EvidenceKind::Endnote => false,
-        })
-    };
-    let length = text.chars().count();
-    let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    compose_trusted(DocumentInput {
-        schema_version: EVIDENCE_SCHEMA.to_owned(),
-        document_id: article_id.to_string(),
-        provider: "journal".to_owned(),
-        url,
-        doc_type: None,
-        provider_revision: "journal-adapter-v1".to_owned(),
-        profile: DetectionProfile::Journal,
-        report_start_page: None,
-        require_report_start: false,
-        allow_hyphenated_sections: false,
-        text,
-        text_sha256,
-        source_sha256: None,
-        offset_unit: "unicode-scalar".to_owned(),
-        scope: Scope {
-            kind: ScopeKind::Complete,
-            excerpt_of: None,
-        },
-        origins: vec![Origin {
-            id: "journal".to_owned(),
-            producer: "journal".to_owned(),
-            representation: "provider-rendered-text".to_owned(),
-            revision: "journal-adapter-v1".to_owned(),
-            authority: "provider-native-claims".to_owned(),
-        }],
-        units: Vec::new(),
-        native_claims: claims,
-        coverage: [
-            EvidenceKind::Paragraph,
-            EvidenceKind::Prose,
-            EvidenceKind::Page,
-            EvidenceKind::Section,
-            EvidenceKind::Heading,
-            EvidenceKind::Footnote,
-            EvidenceKind::Endnote,
-        ]
-        .into_iter()
-        .map(|kind| Coverage {
-            kind,
-            range: ScalarRange {
-                start: 0,
-                end: length,
-            },
-            state: if has(kind) {
-                CoverageState::Complete
-            } else {
-                CoverageState::Absent
-            },
-            reason: "journal native coverage".to_owned(),
-            origin_id: has(kind).then(|| "journal".to_owned()),
-        })
-        .collect(),
-        exclusions: Vec::new(),
-        paragraph_breaks: Vec::new(),
-        original_claims: originals,
-    })
 }
 
 #[derive(Deserialize)]
@@ -4825,8 +4617,6 @@ mod tests {
                 .chars()
                 .count()
         );
-        assert_eq!(utf16_prefix("😀ab", 1), "");
-        assert_eq!(utf16_prefix("😀ab", 3), "😀a");
         let journal = derive_structure_evidence(evidence(
             "\u{85}alpha\n\n\u{feff}beta",
             DetectionProfile::Journal,
