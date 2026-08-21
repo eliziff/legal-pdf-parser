@@ -7,7 +7,6 @@ description = "Fast local-first structural parsing for legal PDFs"
 
 [workspace]
 members = [
-    "experiments/source-structure-parity-rust",
     "legal-structure",
     "legal-structure-node",
     "legal-structure-store",
