@@ -36,9 +36,9 @@ pub fn derive_instrument_structure_node(
         .map(serde_json::from_value::<InstrumentReferenceEvidence>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| Error::from_reason(error.to_string()))?;
-    let (selected, graph, contents) = derive_instrument_structure(&text, documents, &references)
+    let analysis = derive_instrument_structure(&text, documents, &references)
         .map_err(|error| Error::from_reason(error.to_string()))?;
-    Ok(serde_json::json!({ "selected": selected, "graph": graph, "contents": contents }))
+    serde_json::to_value(analysis).map_err(|error| Error::from_reason(error.to_string()))
 }
 
 #[napi(js_name = "deriveStructures")]

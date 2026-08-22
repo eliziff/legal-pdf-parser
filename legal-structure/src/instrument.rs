@@ -128,9 +128,25 @@ pub struct InstrumentContentsOutline {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentContentsRefusal {
+    NoContentsMarker,
+    NoContentsEntries,
+    TooFewContentsEntries,
+    ContentsWithoutPageNumbers,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct InstrumentContentsReading {
     pub outline: Option<InstrumentContentsOutline>,
-    pub refusal: Option<String>,
+    pub refusal: Option<InstrumentContentsRefusal>,
+}
+
+#[derive(Serialize)]
+pub struct InstrumentStructureAnalysis {
+    pub selected: usize,
+    pub graph: StructureGraphV2,
+    pub contents: InstrumentContentsReading,
 }
 
 // Contents entries advertise provision labels and printed pages; they are not
@@ -603,20 +619,20 @@ pub fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
     if anchors.is_empty() {
         return InstrumentContentsReading {
             outline: None,
-            refusal: Some("no_contents_marker".to_owned()),
+            refusal: Some(InstrumentContentsRefusal::NoContentsMarker),
         };
     }
-    let mut refusal = "no_contents_entries";
+    let mut refusal = InstrumentContentsRefusal::NoContentsEntries;
     for (from_byte, from_utf16) in anchors {
         let Some(outline) = instrument_contents_region(text, from_byte, from_utf16) else {
             continue;
         };
         if outline.entries.len() < MIN_CONTENTS_ENTRIES {
-            refusal = "too_few_contents_entries";
+            refusal = InstrumentContentsRefusal::TooFewContentsEntries;
             continue;
         }
         if outline.pages_cited as f64 / (outline.entries.len() as f64) < MIN_CONTENTS_PAGE_SHARE {
-            refusal = "contents_without_page_numbers";
+            refusal = InstrumentContentsRefusal::ContentsWithoutPageNumbers;
             continue;
         }
         return InstrumentContentsReading {
@@ -626,7 +642,7 @@ pub fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
     }
     InstrumentContentsReading {
         outline: None,
-        refusal: Some(refusal.to_owned()),
+        refusal: Some(refusal),
     }
 }
 
@@ -771,7 +787,7 @@ pub fn derive_instrument_structure(
     text: &str,
     documents: Vec<DocumentInput>,
     references: &[InstrumentReferenceEvidence],
-) -> Result<(usize, StructureGraphV2, InstrumentContentsReading), EngineError> {
+) -> Result<InstrumentStructureAnalysis, EngineError> {
     if documents
         .iter()
         .any(|document| document.profile != DetectionProfile::Instrument)
@@ -789,7 +805,11 @@ pub fn derive_instrument_structure(
         .into_iter()
         .nth(selected)
         .ok_or_else(|| EngineError::invalid("selected instrument graph is missing"))?;
-    Ok((selected, graph, instrument_contents_outline(text)))
+    Ok(InstrumentStructureAnalysis {
+        selected,
+        graph,
+        contents: instrument_contents_outline(text),
+    })
 }
 
 #[cfg(test)]
@@ -819,22 +839,32 @@ mod tests {
     #[test]
     fn contents_match_all_refusals() {
         let cases = [
-            ("The contents are discussed in prose.", "no_contents_marker"),
-            ("CONTENTS\nnot an outline", "no_contents_entries"),
+            (
+                "The contents are discussed in prose.",
+                InstrumentContentsRefusal::NoContentsMarker,
+            ),
+            (
+                "CONTENTS\nnot an outline",
+                InstrumentContentsRefusal::NoContentsEntries,
+            ),
             (
                 "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4",
-                "too_few_contents_entries",
+                InstrumentContentsRefusal::TooFewContentsEntries,
             ),
             (
                 "CONTENTS\nSection 1. First 1\nSection 2. Second\nSection 3. Third 2\nSection 4. Fourth\nSection 5. Fifth",
-                "contents_without_page_numbers",
+                InstrumentContentsRefusal::ContentsWithoutPageNumbers,
             ),
         ];
         for (text, expected) in cases {
             let reading = instrument_contents_outline(text);
             assert_eq!(reading.outline, None, "{text}");
-            assert_eq!(reading.refusal.as_deref(), Some(expected), "{text}");
+            assert_eq!(reading.refusal, Some(expected), "{text}");
         }
+        assert_eq!(
+            serde_json::to_string(&instrument_contents_outline("plain text")).unwrap(),
+            r#"{"outline":null,"refusal":"no_contents_marker"}"#
+        );
     }
 
     #[test]
@@ -884,8 +914,8 @@ mod tests {
     fn contents_stop_on_decrease_duplicate_and_pageless_run() {
         let decrease = "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 2\nSection 5. Fifth 5";
         assert_eq!(
-            instrument_contents_outline(decrease).refusal.as_deref(),
-            Some("too_few_contents_entries")
+            instrument_contents_outline(decrease).refusal,
+            Some(InstrumentContentsRefusal::TooFewContentsEntries)
         );
 
         let duplicate = "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4\nSection 5. Fifth 5\nSection 3. Body 6\nSection 6. Sixth 6";
