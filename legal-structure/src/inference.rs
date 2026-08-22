@@ -34,32 +34,11 @@ struct Line<'a> {
 }
 
 fn lines<'a>(text: &'a ScalarText<'a>) -> impl Iterator<Item = Line<'a>> + 'a {
-    let mut rest = text.value;
-    let mut byte_start = 0;
-    let mut scalar_start = 0;
-    let mut finished = false;
-    std::iter::from_fn(move || {
-        if finished {
-            return None;
-        }
-        let (raw, consumed) = rest.find('\n').map_or_else(
-            || {
-                finished = true;
-                (rest, rest.len())
-            },
-            |newline| (&rest[..newline], newline + 1),
-        );
-        let line_text = raw.strip_suffix('\r').unwrap_or(raw);
-        let line = Line {
-            byte_start,
-            byte_end: byte_start + line_text.len(),
-            scalar_start,
-            text: line_text,
-        };
-        scalar_start += rest[..consumed].chars().count();
-        byte_start += consumed;
-        rest = &rest[consumed..];
-        Some(line)
+    text.lines().iter().map(move |line| Line {
+        byte_start: line[0],
+        byte_end: line[1],
+        scalar_start: line[2],
+        text: &text.value[line[0]..line[1]],
     })
 }
 

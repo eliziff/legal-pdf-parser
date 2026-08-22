@@ -402,9 +402,8 @@ fn instrument_contents_region(
     from_byte: usize,
     from_utf16: usize,
 ) -> Option<InstrumentContentsOutline> {
-    // Every reported offset stays on the original, unnormalized instrument
-    // text. The historical window floors a split surrogate; the final-entry
-    // lookahead below ceils one. Exact regex boundaries need no rounding.
+    // Original-text offsets: the window floors a split surrogate and the
+    // final-entry lookahead ceils one; exact regex boundaries never round.
     let requested_utf16 = CONTENTS_WINDOW_UTF16.min(text.utf16_len() - from_utf16);
     let region_end = text
         .byte_at_utf16_floor(from_utf16 + requested_utf16)

@@ -1,26 +1,18 @@
 //! Coordinates over one unchanged Rust string.
 //!
-//! Byte offsets are UTF-8 boundaries, scalar offsets count Rust `char` values,
-//! and UTF-16 offsets count JavaScript code units. Exact conversions reject an
-//! offset inside a UTF-8 sequence or surrogate pair. The explicitly named
-//! floor/ceil conversions are the only rounding operations. CR, LF, and CRLF
-//! are never normalized: each character occupies one scalar and one UTF-16
-//! unit in the borrowed text.
+//! Bytes are UTF-8 boundaries, scalars are Rust `char`s, and UTF-16 offsets are
+//! JavaScript code units. Exact conversions reject split characters; only the
+//! named floor/ceil methods round. CR, LF, and CRLF are never normalized.
 
-use std::ops::Range;
-
-#[derive(Clone, Copy)]
-struct OffsetCheckpoint {
-    scalar: usize,
-    byte: usize,
-    utf16: usize,
-}
+use std::{ops::Range, sync::OnceLock};
 
 pub(crate) struct ScalarText<'a> {
     pub(crate) value: &'a str,
-    offsets: Vec<OffsetCheckpoint>,
+    /// Sparse `[scalar, byte, utf16]` checkpoints; ASCII is identity.
+    offsets: Vec<[usize; 3]>,
     scalar_len: usize,
     utf16_len: usize,
+    lines: OnceLock<Vec<[usize; 3]>>,
 }
 
 impl<'a> ScalarText<'a> {
@@ -31,39 +23,29 @@ impl<'a> ScalarText<'a> {
                 offsets: Vec::new(),
                 scalar_len: value.len(),
                 utf16_len: value.len(),
+                lines: OnceLock::new(),
             };
         }
-
         const STRIDE: usize = 256;
         let mut offsets = Vec::new();
         let mut scalar_len = 0;
         let mut utf16_len = 0;
         for (scalar, (byte, character)) in value.char_indices().enumerate() {
             if scalar % STRIDE == 0 {
-                offsets.push(OffsetCheckpoint {
-                    scalar,
-                    byte,
-                    utf16: utf16_len,
-                });
+                offsets.push([scalar, byte, utf16_len]);
             }
             scalar_len = scalar + 1;
             utf16_len += character.len_utf16();
         }
-        if offsets
-            .last()
-            .is_none_or(|offset| offset.scalar != scalar_len)
-        {
-            offsets.push(OffsetCheckpoint {
-                scalar: scalar_len,
-                byte: value.len(),
-                utf16: utf16_len,
-            });
+        if offsets.last().is_none_or(|offset| offset[0] != scalar_len) {
+            offsets.push([scalar_len, value.len(), utf16_len]);
         }
         Self {
             value,
             offsets,
             scalar_len,
             utf16_len,
+            lines: OnceLock::new(),
         }
     }
 
@@ -75,19 +57,27 @@ impl<'a> ScalarText<'a> {
         self.utf16_len
     }
 
-    fn checkpoint_for_scalar(&self, scalar: usize) -> OffsetCheckpoint {
-        self.offsets[self
-            .offsets
-            .partition_point(|offset| offset.scalar <= scalar)
-            - 1]
+    pub(crate) fn lines(&self) -> &[[usize; 3]] {
+        self.lines.get_or_init(|| {
+            let mut lines = Vec::new();
+            let (mut byte_start, mut scalar_start) = (0, 0);
+            for raw in self.value.split('\n') {
+                let text = raw.strip_suffix('\r').unwrap_or(raw);
+                lines.push([byte_start, byte_start + text.len(), scalar_start]);
+                let newline = usize::from(byte_start + raw.len() < self.value.len());
+                byte_start += raw.len() + newline;
+                if self.offsets.is_empty() {
+                    scalar_start = byte_start;
+                } else {
+                    scalar_start += raw.chars().count() + newline;
+                }
+            }
+            lines
+        })
     }
 
-    fn checkpoint_for_byte(&self, byte: usize) -> OffsetCheckpoint {
-        self.offsets[self.offsets.partition_point(|offset| offset.byte <= byte) - 1]
-    }
-
-    fn checkpoint_for_utf16(&self, utf16: usize) -> OffsetCheckpoint {
-        self.offsets[self.offsets.partition_point(|offset| offset.utf16 <= utf16) - 1]
+    fn checkpoint(&self, value: usize, axis: usize) -> [usize; 3] {
+        self.offsets[self.offsets.partition_point(|offset| offset[axis] <= value) - 1]
     }
 
     pub(crate) fn scalar_at_byte(&self, byte: usize) -> Option<usize> {
@@ -97,8 +87,8 @@ impl<'a> ScalarText<'a> {
         if self.offsets.is_empty() {
             return Some(byte);
         }
-        let offset = self.checkpoint_for_byte(byte);
-        Some(offset.scalar + self.value[offset.byte..byte].chars().count())
+        let offset = self.checkpoint(byte, 1);
+        Some(offset[0] + self.value[offset[1]..byte].chars().count())
     }
 
     pub(crate) fn scalar(&self, byte: usize) -> usize {
@@ -113,14 +103,14 @@ impl<'a> ScalarText<'a> {
         if self.offsets.is_empty() {
             return Some(scalar);
         }
-        let offset = self.checkpoint_for_scalar(scalar);
-        if offset.scalar == scalar {
-            return Some(offset.byte);
+        let offset = self.checkpoint(scalar, 0);
+        if offset[0] == scalar {
+            return Some(offset[1]);
         }
-        self.value[offset.byte..]
+        self.value[offset[1]..]
             .char_indices()
-            .nth(scalar - offset.scalar)
-            .map(|(byte, _)| offset.byte + byte)
+            .nth(scalar - offset[0])
+            .map(|(byte, _)| offset[1] + byte)
     }
 
     pub(crate) fn byte(&self, scalar: usize) -> usize {
@@ -133,8 +123,8 @@ impl<'a> ScalarText<'a> {
         if self.offsets.is_empty() {
             return Some(scalar);
         }
-        let offset = self.checkpoint_for_scalar(scalar);
-        Some(offset.utf16 + self.value[offset.byte..byte].encode_utf16().count())
+        let offset = self.checkpoint(scalar, 0);
+        Some(offset[2] + self.value[offset[1]..byte].encode_utf16().count())
     }
 
     pub(crate) fn utf16(&self, scalar: usize) -> usize {
@@ -152,6 +142,11 @@ impl<'a> ScalarText<'a> {
             .and_then(|scalar| self.utf16_at_scalar(scalar))
     }
 
+    pub(crate) fn byte_at_utf16(&self, utf16: usize) -> Option<usize> {
+        self.byte_bounds_at_utf16(utf16)
+            .and_then(|(floor, ceil)| (floor == ceil).then_some(floor))
+    }
+
     fn byte_bounds_at_utf16(&self, utf16: usize) -> Option<(usize, usize)> {
         if utf16 > self.utf16_len {
             return None;
@@ -159,13 +154,13 @@ impl<'a> ScalarText<'a> {
         if self.offsets.is_empty() {
             return Some((utf16, utf16));
         }
-        let offset = self.checkpoint_for_utf16(utf16);
-        if offset.utf16 == utf16 {
-            return Some((offset.byte, offset.byte));
+        let offset = self.checkpoint(utf16, 2);
+        if offset[2] == utf16 {
+            return Some((offset[1], offset[1]));
         }
-        let mut used = offset.utf16;
-        for (relative, character) in self.value[offset.byte..].char_indices() {
-            let byte = offset.byte + relative;
+        let mut used = offset[2];
+        for (relative, character) in self.value[offset[1]..].char_indices() {
+            let byte = offset[1] + relative;
             let next = used + character.len_utf16();
             if utf16 < next {
                 return Some((byte, byte + character.len_utf8()));
@@ -179,11 +174,6 @@ impl<'a> ScalarText<'a> {
         None
     }
 
-    pub(crate) fn byte_at_utf16(&self, utf16: usize) -> Option<usize> {
-        self.byte_bounds_at_utf16(utf16)
-            .and_then(|(floor, ceil)| (floor == ceil).then_some(floor))
-    }
-
     pub(crate) fn byte_at_utf16_floor(&self, utf16: usize) -> Option<usize> {
         self.byte_bounds_at_utf16(utf16).map(|(floor, _)| floor)
     }
@@ -193,9 +183,6 @@ impl<'a> ScalarText<'a> {
     }
 
     pub(crate) fn slice(&self, range: Range<usize>) -> Option<&'a str> {
-        if range.start > range.end {
-            return None;
-        }
         self.value
             .get(self.byte_at_scalar(range.start)?..self.byte_at_scalar(range.end)?)
     }
@@ -208,25 +195,7 @@ pub(crate) fn utf16_len(value: &str) -> usize {
 /// The code points matched by ECMAScript `\s`: Unicode WhiteSpace plus line
 /// terminators and BOM, deliberately excluding U+0085.
 pub(crate) fn javascript_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'
-            | '\u{000a}'
-            | '\u{000b}'
-            | '\u{000c}'
-            | '\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            ..='\u{200a}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202f}'
-                | '\u{205f}'
-                | '\u{3000}'
-                | '\u{feff}'
-    )
+    character == '\u{feff}' || (character != '\u{0085}' && character.is_whitespace())
 }
 
 /// Collapse ECMAScript whitespace runs to one ASCII space and trim runs at
@@ -278,6 +247,12 @@ mod tests {
         assert_eq!(text.utf16_at_scalar(text.len()), Some(utf16));
         assert_eq!(text.byte_at_utf16(utf16), Some(value.len()));
         assert_eq!(text.scalar_at_utf16(utf16), Some(text.len()));
+    }
+
+    #[test]
+    fn non_ascii_coordinate_index_stays_sparse() {
+        let value = format!("\u{201c}{}", "a".repeat(1024));
+        assert!(ScalarText::new(&value).offsets.len() < 10);
     }
 
     #[test]
