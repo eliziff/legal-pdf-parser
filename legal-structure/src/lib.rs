@@ -285,6 +285,32 @@ pub fn select_instrument_lineation(
     Ok(selected)
 }
 
+#[cfg(feature = "structure-inference")]
+pub fn derive_instrument_structure(
+    text: &str,
+    documents: Vec<DocumentInput>,
+    references: &[InstrumentReferenceEvidence],
+) -> Result<(usize, StructureGraphV2), EngineError> {
+    if documents
+        .iter()
+        .any(|document| document.profile != DetectionProfile::Instrument)
+    {
+        return Err(EngineError::invalid(
+            "instrument structure derivation requires instrument-profile evidence",
+        ));
+    }
+    let graphs = documents
+        .into_iter()
+        .map(derive_structure_evidence)
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = select_instrument_lineation(text, &graphs, references)?;
+    let graph = graphs
+        .into_iter()
+        .nth(selected)
+        .ok_or_else(|| EngineError::invalid("selected instrument graph is missing"))?;
+    Ok((selected, graph))
+}
+
 #[derive(Clone, Copy)]
 pub struct NumericSequenceCandidate {
     pub index: usize,
