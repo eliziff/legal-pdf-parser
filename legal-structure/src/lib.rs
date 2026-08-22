@@ -1,4 +1,4 @@
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,14 +6,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, Write};
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 use std::sync::OnceLock;
 
 #[cfg(feature = "a2aj")]
 mod a2aj;
 #[cfg(feature = "journal")]
 mod journal;
-#[cfg(all(feature = "recovery", feature = "source-doc"))]
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 mod native_markup;
 #[cfg(feature = "source-doc")]
 mod source_doc;
@@ -21,7 +21,7 @@ mod source_doc;
 pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
 #[cfg(feature = "journal")]
 pub use journal::{journal_source_doc, journal_text_source_doc, JournalPageLabel};
-#[cfg(all(feature = "recovery", feature = "source-doc"))]
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use native_markup::{native_markup_source_doc, NativeMarkupInput};
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
@@ -37,7 +37,7 @@ const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
 const MAX_DOCUMENTS: usize = 25;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn javascript_whitespace(character: char) -> bool {
     matches!(
         character,
@@ -55,7 +55,7 @@ fn javascript_whitespace(character: char) -> bool {
     )
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn split_instrument_space_runs(text: &str) -> String {
     let characters = text.chars().collect::<Vec<_>>();
     let mut recovered = String::with_capacity(text.len());
@@ -86,7 +86,7 @@ fn split_instrument_space_runs(text: &str) -> String {
     recovered
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn split_instrument_sentence_joins(text: &str) -> String {
     static HEAD: OnceLock<Regex> = OnceLock::new();
     let head = HEAD.get_or_init(|| {
@@ -124,7 +124,7 @@ fn split_instrument_sentence_joins(text: &str) -> String {
 
 /// Offset-preserving lineation hypotheses used by the instrument structure profile.
 /// The source lineation is first, so downstream selection keeps it on a tie.
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
     let joined = split_instrument_sentence_joins(text);
     let hypotheses = [
@@ -140,6 +140,149 @@ pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
         }
     }
     unique
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct InstrumentReferenceEvidence {
+    pub key: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_roman(mut value: usize) -> String {
+    let mut result = String::new();
+    for (amount, numeral) in [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ] {
+        while value >= amount {
+            result.push_str(numeral);
+            value -= amount;
+        }
+    }
+    result
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_reference_index(
+    graph: &StructureGraphV2,
+    scalar_to_utf16: &[usize],
+) -> Result<HashMap<String, usize>, EngineError> {
+    let mut index = HashMap::new();
+    let mut duplicates = HashSet::new();
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Section)
+    {
+        let Some(label) = node.label.as_deref() else {
+            continue;
+        };
+        let start = scalar_to_utf16
+            .get(node.range.start)
+            .copied()
+            .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
+        let mut keys = vec![label.to_ascii_lowercase()];
+        for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
+            if let Some(value) = label
+                .strip_prefix(prefix)
+                .and_then(|value| value.parse().ok())
+            {
+                keys.push(format!("{word} {}", instrument_roman(value)));
+            }
+        }
+        for key in keys {
+            if index.insert(key.clone(), start).is_some() {
+                duplicates.insert(key);
+            }
+        }
+    }
+    for key in duplicates {
+        index.remove(&key);
+    }
+    Ok(index)
+}
+
+/// Select the instrument graph whose provision inventory is best endorsed by
+/// typed references from the source text. Candidate zero wins every tie.
+#[cfg(feature = "structure-inference")]
+pub fn select_instrument_lineation(
+    text: &str,
+    graphs: &[StructureGraphV2],
+    references: &[InstrumentReferenceEvidence],
+) -> Result<usize, EngineError> {
+    if graphs.is_empty() {
+        return Err(EngineError::invalid(
+            "instrument lineation selection requires a graph",
+        ));
+    }
+    let mut scalar_to_utf16 = Vec::with_capacity(text.chars().count() + 1);
+    scalar_to_utf16.push(0);
+    for character in text.chars() {
+        scalar_to_utf16.push(scalar_to_utf16.last().copied().unwrap() + character.len_utf16());
+    }
+    let text_length = *scalar_to_utf16.last().unwrap();
+    let score = |graph: &StructureGraphV2| -> Result<usize, EngineError> {
+        let index = instrument_reference_index(graph, &scalar_to_utf16)?;
+        Ok(references
+            .iter()
+            .filter(|reference| {
+                index
+                    .get(&reference.key.to_lowercase())
+                    .is_some_and(|start| *start < reference.start || *start >= reference.end)
+            })
+            .count())
+    };
+    let head_span = |graph: &StructureGraphV2| -> Result<f64, EngineError> {
+        let starts = graph.nodes.iter().filter_map(|node| {
+            let label = node.label.as_deref()?;
+            (node.kind == NodeKind::Section && label.starts_with("sec") && !label.contains('('))
+                .then_some(node.range.start)
+        });
+        let mut low = usize::MAX;
+        let mut high = 0;
+        let mut found = false;
+        for start in starts {
+            let start = scalar_to_utf16
+                .get(start)
+                .copied()
+                .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
+            low = low.min(start);
+            high = high.max(start);
+            found = true;
+        }
+        Ok(if found && text_length > 0 {
+            (high - low) as f64 / text_length as f64
+        } else {
+            0.0
+        })
+    };
+
+    let mut selected = 0;
+    let mut best = score(&graphs[0])?;
+    for (index, graph) in graphs.iter().enumerate().skip(1) {
+        if head_span(graph)? < 0.05 {
+            continue;
+        }
+        let candidate = score(graph)?;
+        if candidate > best {
+            selected = index;
+            best = candidate;
+        }
+    }
+    Ok(selected)
 }
 
 #[derive(Clone, Copy)]
@@ -831,7 +974,7 @@ impl DocumentInput {
         })
     }
 
-    fn needs_recovery(&self) -> bool {
+    fn needs_inference(&self) -> bool {
         self.coverage
             .iter()
             .any(|value| value.state != CoverageState::Complete)
@@ -1042,7 +1185,7 @@ impl StructureGraphV2 {
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CandidateGrammar {
     Numeric,
@@ -1050,7 +1193,7 @@ pub enum CandidateGrammar {
     Enumerator,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureMarkerCandidate {
     pub id: String,
@@ -1063,7 +1206,7 @@ pub struct StructureMarkerCandidate {
     pub content_start: usize,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureCandidateRun {
     pub id: String,
@@ -1074,7 +1217,7 @@ pub struct StructureCandidateRun {
     pub markers: Vec<StructureMarkerCandidate>,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateEvidenceV2 {
     pub candidate_id: String,
@@ -1097,7 +1240,7 @@ pub enum CandidateObservationV2 {
     TranscriptLineNumber,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextAnchorV2 {
     pub range: ScalarRange,
@@ -1105,7 +1248,7 @@ pub struct TextAnchorV2 {
     pub line_id: String,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NoteBodyV2 {
     pub range: ScalarRange,
@@ -1113,7 +1256,7 @@ pub struct NoteBodyV2 {
     pub line_ids: Vec<String>,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotePairClaimV2 {
     pub pair_id: String,
@@ -1141,7 +1284,7 @@ pub struct ResolutionProofV2 {
     pub observations: Vec<CandidateObservationV2>,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedRole {
     NumberedParagraph,
@@ -1149,7 +1292,7 @@ pub enum ResolvedRole {
     ListItem,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 impl ResolvedRole {
     pub fn node_kind(self) -> NodeKind {
         match self {
@@ -1160,7 +1303,7 @@ impl ResolvedRole {
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedCandidate {
     pub candidate: StructureMarkerCandidate,
@@ -1170,7 +1313,7 @@ pub struct ResolvedCandidate {
     pub line_ids: Vec<String>,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 #[derive(Clone, Copy)]
 struct OffsetCheckpoint {
     scalar: usize,
@@ -1178,7 +1321,7 @@ struct OffsetCheckpoint {
     utf16: usize,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 struct ScalarText<'a> {
     value: &'a str,
     offsets: Vec<OffsetCheckpoint>,
@@ -1187,7 +1330,7 @@ struct ScalarText<'a> {
     lines: Vec<(usize, usize, usize)>,
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 impl<'a> ScalarText<'a> {
     fn new(value: &'a str) -> Self {
         if value.is_ascii() {
@@ -1308,7 +1451,7 @@ impl<'a> ScalarText<'a> {
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
@@ -1338,8 +1481,8 @@ impl Block {
     }
 }
 
-#[cfg(feature = "recovery")]
-mod recovery {
+#[cfg(feature = "structure-inference")]
+mod inference {
     use super::*;
 
     macro_rules! cached_regex {
@@ -2136,7 +2279,11 @@ mod recovery {
         result
     }
 
-    fn recover_lossy(text: &ScalarText<'_>, spine: &[Marker], style: MarkerStyle) -> Vec<Marker> {
+    fn fill_lossy_marker_gaps(
+        text: &ScalarText<'_>,
+        spine: &[Marker],
+        style: MarkerStyle,
+    ) -> Vec<Marker> {
         let candidates = heading_joined(
             text,
             &spine.iter().map(|value| value.start).collect(),
@@ -2207,11 +2354,11 @@ mod recovery {
         selected: &[Marker],
         all: &[Marker],
         style: MarkerStyle,
-        recover: bool,
+        fill_gaps: bool,
         extra: &[usize],
     ) -> Vec<Block> {
-        let selected = if recover && style != MarkerStyle::Bare {
-            recover_lossy(text, selected, style)
+        let selected = if fill_gaps && style != MarkerStyle::Bare {
+            fill_lossy_marker_gaps(text, selected, style)
         } else {
             selected.to_vec()
         };
@@ -2413,7 +2560,7 @@ mod recovery {
             let median = median(bounded);
             let mean = bounded.iter().sum::<usize>() as f64 / bounded.len().max(1) as f64;
             let maximum = bounded.iter().copied().max().unwrap_or(0);
-            // SourceDocs scores the unmodified hypothesis. Lossy heading recovery
+            // SourceDocs scores the unmodified hypothesis. Lossy heading inference
             // changes only the returned ranges after that hypothesis is accepted.
             let start = text.utf16(preliminary[0].start) as f64 / text.utf16_len().max(1) as f64;
             let span = (text.utf16(preliminary.last().unwrap().start)
@@ -4302,12 +4449,12 @@ mod recovery {
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn detect_structure_candidate_runs(value: &str) -> Vec<StructureCandidateRun> {
     let text = ScalarText::new(value);
-    let mut runs = recovery::raw_numeric_runs(&text);
-    let mut raw_enumerators = recovery::raw_enumerator_runs(&text);
-    let points = recovery::detect_instrument_grammar(&text);
+    let mut runs = inference::raw_numeric_runs(&text);
+    let mut raw_enumerators = inference::raw_enumerator_runs(&text);
+    let points = inference::detect_instrument_grammar(&text);
     let parent_indexes = points
         .iter()
         .enumerate()
@@ -4430,7 +4577,7 @@ pub fn detect_structure_candidate_runs(value: &str) -> Vec<StructureCandidateRun
     runs
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn resolve_structure_candidates(
     runs: &[StructureCandidateRun],
     evidence: &[CandidateEvidenceV2],
@@ -4552,7 +4699,7 @@ pub fn resolve_structure_candidates(
     Ok(resolved)
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn next_relation_id(
     prefix: &str,
     counter: &mut usize,
@@ -4567,7 +4714,7 @@ fn next_relation_id(
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 fn push_unique_relation(
     relations: &mut Vec<StructureRelationV2>,
     keys: &mut HashSet<(RelationKind, RelationEndpointV2, RelationEndpointV2)>,
@@ -4578,7 +4725,7 @@ fn push_unique_relation(
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn resolve_structure_graph(
     document_id: String,
     text: &str,
@@ -5198,10 +5345,10 @@ fn native_kind(kind: EvidenceKind) -> NodeKind {
 fn infer_graph(
     evidence: DocumentInput,
     inferred: Vec<Block>,
-    recovery_available: bool,
+    inference_available: bool,
 ) -> StructureGraphV2 {
     let complete = evidence.scope.kind == ScopeKind::Complete
-        && (recovery_available || !evidence.needs_recovery());
+        && (inference_available || !evidence.needs_inference());
     let mut nodes = evidence
         .native_claims
         .iter()
@@ -5388,11 +5535,11 @@ fn infer_graph(
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn derive_structure_evidence(evidence: DocumentInput) -> Result<StructureGraphV2, EngineError> {
-    let inferred = if evidence.needs_recovery() {
+    let inferred = if evidence.needs_inference() {
         let text = ScalarText::new(&evidence.text);
-        recovery::inferred_blocks(&evidence, &text)
+        inference::inferred_blocks(&evidence, &text)
     } else {
         Vec::new()
     };
@@ -5421,7 +5568,7 @@ fn projection(profile: DetectionProfile) -> (ProjectionOrder, Option<SourceDocTy
 #[cfg(feature = "source-doc")]
 fn compose_with(
     mut input: DocumentInput,
-    recovery: bool,
+    inference_enabled: bool,
     validate: bool,
 ) -> Result<SourceDoc, EngineError> {
     if validate {
@@ -5438,17 +5585,17 @@ fn compose_with(
         &input.native_claims,
         std::mem::take(&mut input.original_claims),
     );
-    #[cfg(feature = "recovery")]
-    let inferred = if recovery && input.needs_recovery() {
+    #[cfg(feature = "structure-inference")]
+    let inferred = if inference_enabled && input.needs_inference() {
         let text = ScalarText::new(&input.text);
-        recovery::inferred_blocks(&input, &text)
+        inference::inferred_blocks(&input, &text)
     } else {
         Vec::new()
     };
-    #[cfg(not(feature = "recovery"))]
+    #[cfg(not(feature = "structure-inference"))]
     let inferred = Vec::new();
     let text = std::mem::take(&mut input.text);
-    let graph = infer_graph(input, inferred, recovery);
+    let graph = infer_graph(input, inferred, inference_enabled);
     Ok(source_doc::project_graph(
         provider, id, url, doc_type, text, revision, &originals, graph, order,
     ))
@@ -5459,12 +5606,12 @@ pub fn compose_native(input: DocumentInput) -> Result<SourceDoc, EngineError> {
     compose_with(input, false, true)
 }
 
-#[cfg(all(feature = "recovery", feature = "source-doc"))]
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
     compose_with(input, true, true)
 }
 
-#[cfg(all(feature = "recovery", feature = "source-doc"))]
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub(crate) fn compose_trusted(input: DocumentInput) -> Result<SourceDoc, EngineError> {
     compose_with(input, true, false)
 }
@@ -5628,7 +5775,7 @@ fn sidecar_with(
     }
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn sidecar(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(), EngineError> {
     sidecar_with(
         reader,
@@ -5650,7 +5797,7 @@ pub fn native_sidecar(
     )
 }
 
-#[cfg(feature = "recovery")]
+#[cfg(feature = "structure-inference")]
 pub fn stdio_sidecar() -> Result<(), EngineError> {
     sidecar(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }
@@ -5661,12 +5808,12 @@ pub fn native_stdio_sidecar() -> Result<(), EngineError> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "recovery")]
-    use super::recovery::{formal_heading, statute_spine};
+    #[cfg(feature = "structure-inference")]
+    use super::inference::{formal_heading, statute_spine};
     use super::*;
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn instrument_lineation_hypotheses_preserve_the_typescript_contract() {
         let source = "AGREEMENT  ARTICLE I DEFINITIONS. Section 1.01 Terms.\t( a ) stays prose.";
         assert_eq!(
@@ -5682,6 +5829,63 @@ mod tests {
             instrument_lineation_hypotheses("already\nlineated"),
             ["already\nlineated"]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_lineation_selection_uses_endorsed_spans_and_source_ties() {
+        let text = "x".repeat(200);
+        let graph = |labels: &[(&str, usize)]| StructureGraphV2 {
+            schema_version: RESULT_SCHEMA.to_owned(),
+            document_id: "test".to_owned(),
+            text_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+            source_sha256: None,
+            status: GraphStatus::Complete,
+            nodes: labels
+                .iter()
+                .enumerate()
+                .map(|(index, (label, start))| StructureNodeV2 {
+                    id: format!("node-{index}"),
+                    kind: NodeKind::Section,
+                    range: ScalarRange {
+                        start: *start,
+                        end: text.len(),
+                    },
+                    origin_id: ENGINE_ORIGIN.to_owned(),
+                    source: Derivation::Heuristic,
+                    label: Some((*label).to_owned()),
+                    locator_kind: None,
+                    aliases: None,
+                    parent_id: None,
+                    anchor: None,
+                    content_start: Some(*start),
+                    marker_range: None,
+                    page_indexes: Vec::new(),
+                    line_ids: Vec::new(),
+                    level: None,
+                    grammar: None,
+                    proof: None,
+                })
+                .collect(),
+            boundaries: Vec::new(),
+            relations: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let graphs = [graph(&[("sec1", 0)]), graph(&[("sec1", 0), ("sec2", 150)])];
+        assert_eq!(
+            select_instrument_lineation(
+                &text,
+                &graphs,
+                &[InstrumentReferenceEvidence {
+                    key: "sec2".to_owned(),
+                    start: 20,
+                    end: 24,
+                }],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(select_instrument_lineation(&text, &graphs, &[]).unwrap(), 0);
     }
 
     fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
@@ -5769,7 +5973,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn weighted_numeric_sequence_policies_preserve_lane_rules() {
         let candidate =
             |index, value, position, page, score, start_supported| NumericSequenceCandidate {
@@ -5815,7 +6019,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn joined_page_tokens_are_not_reporter_pages() {
         let graph = derive_structure_evidence(evidence(
             "Quoted text [page624] continues.\nMore [page625] text.\nLast [page626] text.",
@@ -5899,7 +6103,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn native_parent_wins_and_children_survive() {
         let derive = |value| derive_structure_evidence(value).expect("valid fixture evidence");
         let flat = derive(evidence(
@@ -6036,7 +6240,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn instrument_heads_keep_token_and_heading_boundaries() {
         let text = concat!(
             "PART 4.20(a) of the Disclosure Schedule\n",
@@ -6059,7 +6263,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn typed_hierarchy_candidates_use_the_production_detector() {
         let runs = detect_structure_candidate_runs(
             "Section 1.01 Opening.\n(a) First clause.\n(b) Second clause.\nSection 1.02 Closing.",
@@ -6083,14 +6287,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn bare_section_label_without_inline_content_is_safe() {
         let _ =
             detect_structure_candidate_runs("1\nProvision text.\n2\nMore text.\n3\nFinal text.");
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn raw_numeric_candidates_keep_late_and_gapped_runs_for_resolution() {
         let runs = detect_structure_candidate_runs(
             "7. First excerpt paragraph.\n9. A gap remains visible.\n12. Another item.",
@@ -6111,7 +6315,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn typed_evidence_resolves_numeric_prose_and_reports_each_run() {
         let text = "1. First paragraph.\n2. Second paragraph.";
         let run = detect_structure_candidate_runs(text)
@@ -6159,7 +6363,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn contents_and_transcript_number_evidence_force_abstention() {
         let text = "1. First paragraph.\n2. Second paragraph.";
         let run = detect_structure_candidate_runs(text)
@@ -6192,7 +6396,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn local_candidate_parent_ids_create_honest_list_items() {
         let text = "Section 1\n(a) item";
         let length = text.chars().count();
@@ -6285,7 +6489,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn paired_note_claim_keeps_every_anchor_and_deduplicates_relations() {
         let text = "Body ref 1.\n1 Note body.";
         let reference_start = text.find('1').unwrap();
@@ -6372,7 +6576,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn short_root_preserves_crlf_offset_semantics() {
         let labels = statute_spine(
             &ScalarText::new("1\r\n\r\n________________\r\n2\r\n\r\n________________\r\n"),
@@ -6385,7 +6589,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn heading_and_utf16_edges_match_javascript() {
         assert!(formal_heading("Qualified Privilege"));
         assert!(!formal_heading("*429"));
@@ -6423,7 +6627,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn bare_label_alone_extends_substantive_statute_spines() {
         let labels = |text: &str| {
             statute_spine(&ScalarText::new(text), false)
@@ -6436,7 +6640,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
+    #[cfg(feature = "structure-inference")]
     fn dotterm_inline_child_preserves_bare_spine_precedence() {
         let body = "This section provides for the administration of the enactment in force across the territory.";
         let text = format!("1. There is established a board. {body}\n2.(1) A term has the prescribed meaning. {body}\n2.1. This inserted provision governs administration. {body}\n3. The Minister may make regulations. {body}\n4. This Act comes into force. {body}");
