@@ -1,8 +1,8 @@
 use legal_structure::{
-    a2aj_source_doc, compose, derive_instrument_structure, derive_structure_evidence,
+    a2aj_source_doc, derive_instrument_structure, derive_structure_evidence,
     instrument_lineation_hypotheses, journal_source_doc, journal_text_source_doc,
     native_markup_source_doc, A2ajInput, DocumentInput, InstrumentReferenceEvidence,
-    JournalPageLabel, NativeMarkupInput, SourceDoc, SourceDocBlock,
+    JournalPageLabel, NativeMarkupInput, SourceDoc,
 };
 use napi::Error;
 use napi_derive::napi;
@@ -114,38 +114,6 @@ fn derive_source_doc(request: &serde_json::Value) -> napi::Result<SourceDoc> {
             )
             .map_err(|error| Error::from_reason(error.to_string()))?;
             a2aj_source_doc(input).map_err(|error| Error::from_reason(error.to_string()))?
-        }
-        "evidence" => {
-            let mut input = DocumentInput::try_from(
-                request
-                    .get("input")
-                    .cloned()
-                    .ok_or_else(|| Error::from_reason("evidence input is required"))?,
-            )
-            .map_err(|error| Error::from_reason(error.to_string()))?;
-            let original_values = request.get("original_claims").cloned().unwrap_or_default();
-            let mut originals = serde_json::from_value::<
-                std::collections::HashMap<String, SourceDocBlock>,
-            >(original_values.clone())
-            .map_err(|error| Error::from_reason(error.to_string()))?;
-            let orders = request
-                .get("original_claim_orders")
-                .and_then(serde_json::Value::as_object);
-            for (id, block) in &mut originals {
-                if let Some(fields) = orders
-                    .and_then(|orders| orders.get(id))
-                    .and_then(serde_json::Value::as_array)
-                {
-                    let fields = fields
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    block.preserve_field_order(&fields);
-                }
-            }
-            input.set_original_claims(originals);
-            compose(input).map_err(|error| Error::from_reason(error.to_string()))?
         }
         "native_markup" => {
             let input = serde_json::from_value::<NativeMarkupInput>(
