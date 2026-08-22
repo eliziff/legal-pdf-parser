@@ -882,8 +882,7 @@ fn render_markup(
         if markup.as_bytes()[at] != b'<' {
             let end = markup[at..].find('<').map_or(markup.len(), |end| at + end);
             let raw = &markup[at..end];
-            let rendered =
-                trim_js(&normalize_javascript_whitespace(&decode_entities(raw))).to_owned();
+            let rendered = normalize_javascript_whitespace(&decode_entities(raw));
             if let Some(pending) = unlabelled_footnotes.last().cloned() {
                 if !rendered.is_empty() {
                     unlabelled_footnotes.pop();

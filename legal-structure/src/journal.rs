@@ -140,8 +140,7 @@ pub fn journal_text_source_doc(
     text: String,
     page_labels: &[JournalPageLabel],
 ) -> Result<SourceDoc, EngineError> {
-    // Marker lines are removed first. Page offsets therefore address the clean
-    // rendered text, retaining every CR/LF code unit on non-marker lines.
+    // Page UTF-16 addresses marker-free rendered text; other CR/LF is retained.
     let mut starts = Vec::new();
     let mut clean = String::with_capacity(text.len());
     let mut page_cursor = 0;
@@ -217,9 +216,7 @@ pub fn journal_source_doc(
             offset += 1;
         }
         pages += 1;
-        // JSON page text is appended unchanged, with one synthetic LF between
-        // pages. Region matches are byte offsets in the original page string
-        // and are converted exactly into that final rendered UTF-16 plane.
+        // Original-page byte matches enter page text joined by one synthetic LF.
         let page_start = offset;
         let page_coordinates = ScalarText::new(&page.text);
         text.push_str(&page.text);

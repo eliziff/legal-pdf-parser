@@ -532,8 +532,7 @@ pub(crate) fn project_graph(
     graph: StructureGraphV2,
     order: ProjectionOrder,
 ) -> SourceDoc {
-    // Graph ranges are Unicode-scalar offsets in this final SourceDoc text;
-    // serialized block ranges are exact JavaScript UTF-16 offsets in it.
+    // Final SourceDoc plane: graph scalars become exact JavaScript UTF-16.
     let coordinates = ScalarText::new(&text);
     let labels = graph
         .nodes
@@ -572,12 +571,8 @@ pub(crate) fn project_graph(
             let mut block = SourceDocBlock::new(
                 kind,
                 label,
-                coordinates
-                    .utf16_at_scalar(node.range.start)
-                    .expect("graph node start is bounded by source text"),
-                coordinates
-                    .utf16_at_scalar(node.range.end)
-                    .expect("graph node end is bounded by source text"),
+                coordinates.utf16(node.range.start),
+                coordinates.utf16(node.range.end),
                 SourceDocOrigin::Heuristic,
             );
             if matches!(order, ProjectionOrder::StablePosition) && node.kind != NodeKind::Prose {
@@ -664,8 +659,7 @@ pub(crate) fn native_blocks(
     if claims.iter().all(|claim| originals.contains_key(&claim.id)) {
         return originals;
     }
-    // Non-original native claims use scalar offsets in the same final text.
-    // Provider blocks already carrying their own UTF-16 plane stay untouched.
+    // Final-text claim scalars become UTF-16; original provider blocks stay as-is.
     let coordinates = ScalarText::new(text);
     for claim in claims {
         if originals.contains_key(&claim.id) {
@@ -686,12 +680,8 @@ pub(crate) fn native_blocks(
         let mut block = SourceDocBlock::new(
             kind,
             label,
-            coordinates
-                .utf16_at_scalar(claim.range.start)
-                .expect("native claim start is bounded by source text"),
-            coordinates
-                .utf16_at_scalar(claim.range.end)
-                .expect("native claim end is bounded by source text"),
+            coordinates.utf16(claim.range.start),
+            coordinates.utf16(claim.range.end),
             SourceDocOrigin::Native,
         );
         block.aliases.clone_from(&claim.aliases);
