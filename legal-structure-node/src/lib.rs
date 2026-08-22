@@ -1,7 +1,7 @@
 use legal_structure::{
-    a2aj_source_doc, compose, derive_structure_evidence, journal_source_doc,
-    journal_text_source_doc, native_markup_source_doc, A2ajInput, DocumentInput, JournalPageLabel,
-    NativeMarkupInput, SourceDoc, SourceDocBlock,
+    a2aj_source_doc, compose, derive_structure_evidence, instrument_lineation_hypotheses,
+    journal_source_doc, journal_text_source_doc, native_markup_source_doc, A2ajInput,
+    DocumentInput, JournalPageLabel, NativeMarkupInput, SourceDoc, SourceDocBlock,
 };
 use napi::Error;
 use napi_derive::napi;
@@ -11,6 +11,11 @@ use std::io::BufReader;
 #[napi(js_name = "sourceDocVersion")]
 pub fn source_doc_version() -> u32 {
     legal_structure::SOURCE_DOC_VERSION
+}
+
+#[napi(js_name = "instrumentLineationHypotheses")]
+pub fn instrument_lineation_hypotheses_node(text: String) -> Vec<String> {
+    instrument_lineation_hypotheses(&text)
 }
 
 #[napi(js_name = "deriveStructures")]

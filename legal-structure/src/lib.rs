@@ -37,6 +37,111 @@ const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
 const MAX_DOCUMENTS: usize = 25;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 
+#[cfg(feature = "recovery")]
+fn javascript_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+#[cfg(feature = "recovery")]
+fn split_instrument_space_runs(text: &str) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut recovered = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if matches!(characters[index], ' ' | '\t') {
+            let start = index;
+            while index < characters.len() && matches!(characters[index], ' ' | '\t') {
+                index += 1;
+            }
+            let internal_run = index - start >= 2
+                && start > 0
+                && index < characters.len()
+                && !javascript_whitespace(characters[start - 1])
+                && !javascript_whitespace(characters[index]);
+            for (offset, character) in characters[start..index].iter().enumerate() {
+                recovered.push(if internal_run && offset == 0 {
+                    '\n'
+                } else {
+                    *character
+                });
+            }
+            continue;
+        }
+        recovered.push(characters[index]);
+        index += 1;
+    }
+    recovered
+}
+
+#[cfg(feature = "recovery")]
+fn split_instrument_sentence_joins(text: &str) -> String {
+    static HEAD: OnceLock<Regex> = OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Regex::new(
+            r"^(?:(?:ARTICLE|Article|PART|Part|DIVISION|Division|Section|SECTION|SCHEDULE|Schedule|EXHIBIT|Exhibit|ANNEX|Annex|APPENDIX|Appendix)[\s\u{feff}]+[IVXLCDM0-9]|[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})*[\s\u{feff}]+\S|\([A-Za-z0-9_]{1,3}\)[\s\u{feff}])",
+        )
+        .expect("valid instrument sentence-join grammar")
+    });
+    let positions = text.char_indices().collect::<Vec<_>>();
+    let characters = positions
+        .iter()
+        .map(|(_, character)| *character)
+        .collect::<Vec<_>>();
+    let mut recovered = String::with_capacity(text.len());
+    for (index, (byte, character)) in positions.iter().copied().enumerate() {
+        let preceded_by_terminator = index > 0
+            && (matches!(characters[index - 1], '.' | ';' | ':')
+                || (matches!(
+                    characters[index - 1],
+                    ')' | ']' | '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}'
+                ) && index > 1
+                    && matches!(characters[index - 2], '.' | ';' | ':')));
+        let after = byte + character.len_utf8();
+        if matches!(character, ' ' | '\t')
+            && preceded_by_terminator
+            && head.is_match(&text[after..])
+        {
+            recovered.push('\n');
+        } else {
+            recovered.push(character);
+        }
+    }
+    recovered
+}
+
+/// Offset-preserving lineation hypotheses used by the instrument structure profile.
+/// The source lineation is first, so downstream selection keeps it on a tie.
+#[cfg(feature = "recovery")]
+pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
+    let joined = split_instrument_sentence_joins(text);
+    let hypotheses = [
+        text.to_owned(),
+        split_instrument_space_runs(text),
+        joined.clone(),
+        split_instrument_space_runs(&joined),
+    ];
+    let mut unique = Vec::with_capacity(hypotheses.len());
+    for hypothesis in hypotheses {
+        if !unique.contains(&hypothesis) {
+            unique.push(hypothesis);
+        }
+    }
+    unique
+}
+
 #[derive(Clone, Copy)]
 pub struct NumericSequenceCandidate {
     pub index: usize,
@@ -5559,6 +5664,25 @@ mod tests {
     #[cfg(feature = "recovery")]
     use super::recovery::{formal_heading, statute_spine};
     use super::*;
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn instrument_lineation_hypotheses_preserve_the_typescript_contract() {
+        let source = "AGREEMENT  ARTICLE I DEFINITIONS. Section 1.01 Terms.\t( a ) stays prose.";
+        assert_eq!(
+            instrument_lineation_hypotheses(source),
+            [
+                source,
+                "AGREEMENT\n ARTICLE I DEFINITIONS. Section 1.01 Terms.\t( a ) stays prose.",
+                "AGREEMENT  ARTICLE I DEFINITIONS.\nSection 1.01 Terms.\t( a ) stays prose.",
+                "AGREEMENT\n ARTICLE I DEFINITIONS.\nSection 1.01 Terms.\t( a ) stays prose.",
+            ]
+        );
+        assert_eq!(
+            instrument_lineation_hypotheses("already\nlineated"),
+            ["already\nlineated"]
+        );
+    }
 
     fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
         let range = ScalarRange {
