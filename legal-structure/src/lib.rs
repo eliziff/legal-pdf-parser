@@ -1,11 +1,10 @@
 #[cfg(feature = "structure-inference")]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::io::{BufRead, Write};
 #[cfg(feature = "structure-inference")]
 use std::sync::OnceLock;
 
@@ -13,16 +12,24 @@ use std::sync::OnceLock;
 mod a2aj;
 #[cfg(feature = "journal")]
 mod journal;
+mod instrument;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 mod native_markup;
+mod numeric_sequence;
+mod sidecar;
 #[cfg(feature = "source-doc")]
 mod source_doc;
 #[cfg(feature = "a2aj")]
 pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
 #[cfg(feature = "journal")]
 pub use journal::{journal_source_doc, journal_text_source_doc, JournalPageLabel};
+pub use instrument::*;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use native_markup::{native_markup_source_doc, NativeMarkupInput};
+pub use numeric_sequence::*;
+pub use sidecar::{native_sidecar, native_stdio_sidecar};
+#[cfg(feature = "structure-inference")]
+pub use sidecar::{sidecar, stdio_sidecar};
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
     create_source_doc, ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind,
@@ -39,433 +46,7 @@ const MAX_BYTES: usize = 128 * 1024 * 1024;
 
 #[cfg(feature = "structure-inference")]
 fn javascript_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'..='\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
-    )
-}
-
-#[cfg(feature = "structure-inference")]
-fn split_instrument_space_runs(text: &str) -> String {
-    let characters = text.chars().collect::<Vec<_>>();
-    let mut recovered = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < characters.len() {
-        if matches!(characters[index], ' ' | '\t') {
-            let start = index;
-            while index < characters.len() && matches!(characters[index], ' ' | '\t') {
-                index += 1;
-            }
-            let internal_run = index - start >= 2
-                && start > 0
-                && index < characters.len()
-                && !javascript_whitespace(characters[start - 1])
-                && !javascript_whitespace(characters[index]);
-            for (offset, character) in characters[start..index].iter().enumerate() {
-                recovered.push(if internal_run && offset == 0 {
-                    '\n'
-                } else {
-                    *character
-                });
-            }
-            continue;
-        }
-        recovered.push(characters[index]);
-        index += 1;
-    }
-    recovered
-}
-
-#[cfg(feature = "structure-inference")]
-fn split_instrument_sentence_joins(text: &str) -> String {
-    static HEAD: OnceLock<Regex> = OnceLock::new();
-    let head = HEAD.get_or_init(|| {
-        Regex::new(
-            r"^(?:(?:ARTICLE|Article|PART|Part|DIVISION|Division|Section|SECTION|SCHEDULE|Schedule|EXHIBIT|Exhibit|ANNEX|Annex|APPENDIX|Appendix)[\s\u{feff}]+[IVXLCDM0-9]|[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})*[\s\u{feff}]+\S|\([A-Za-z0-9_]{1,3}\)[\s\u{feff}])",
-        )
-        .expect("valid instrument sentence-join grammar")
-    });
-    let positions = text.char_indices().collect::<Vec<_>>();
-    let characters = positions
-        .iter()
-        .map(|(_, character)| *character)
-        .collect::<Vec<_>>();
-    let mut recovered = String::with_capacity(text.len());
-    for (index, (byte, character)) in positions.iter().copied().enumerate() {
-        let preceded_by_terminator = index > 0
-            && (matches!(characters[index - 1], '.' | ';' | ':')
-                || (matches!(
-                    characters[index - 1],
-                    ')' | ']' | '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}'
-                ) && index > 1
-                    && matches!(characters[index - 2], '.' | ';' | ':')));
-        let after = byte + character.len_utf8();
-        if matches!(character, ' ' | '\t')
-            && preceded_by_terminator
-            && head.is_match(&text[after..])
-        {
-            recovered.push('\n');
-        } else {
-            recovered.push(character);
-        }
-    }
-    recovered
-}
-
-/// Offset-preserving lineation hypotheses used by the instrument structure profile.
-/// The source lineation is first, so downstream selection keeps it on a tie.
-#[cfg(feature = "structure-inference")]
-pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
-    let joined = split_instrument_sentence_joins(text);
-    let hypotheses = [
-        text.to_owned(),
-        split_instrument_space_runs(text),
-        joined.clone(),
-        split_instrument_space_runs(&joined),
-    ];
-    let mut unique = Vec::with_capacity(hypotheses.len());
-    for hypothesis in hypotheses {
-        if !unique.contains(&hypothesis) {
-            unique.push(hypothesis);
-        }
-    }
-    unique
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct InstrumentReferenceEvidence {
-    pub key: String,
-    pub start: usize,
-    pub end: usize,
-}
-
-#[cfg(feature = "structure-inference")]
-fn instrument_roman(mut value: usize) -> String {
-    let mut result = String::new();
-    for (amount, numeral) in [
-        (1000, "m"),
-        (900, "cm"),
-        (500, "d"),
-        (400, "cd"),
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ] {
-        while value >= amount {
-            result.push_str(numeral);
-            value -= amount;
-        }
-    }
-    result
-}
-
-#[cfg(feature = "structure-inference")]
-fn instrument_reference_index(
-    graph: &StructureGraphV2,
-    scalar_to_utf16: &[usize],
-) -> Result<HashMap<String, usize>, EngineError> {
-    let mut index = HashMap::new();
-    let mut duplicates = HashSet::new();
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NodeKind::Section)
-    {
-        let Some(label) = node.label.as_deref() else {
-            continue;
-        };
-        let start = scalar_to_utf16
-            .get(node.range.start)
-            .copied()
-            .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
-        let mut keys = vec![label.to_ascii_lowercase()];
-        for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
-            if let Some(value) = label
-                .strip_prefix(prefix)
-                .and_then(|value| value.parse().ok())
-            {
-                keys.push(format!("{word} {}", instrument_roman(value)));
-            }
-        }
-        for key in keys {
-            if index.insert(key.clone(), start).is_some() {
-                duplicates.insert(key);
-            }
-        }
-    }
-    for key in duplicates {
-        index.remove(&key);
-    }
-    Ok(index)
-}
-
-/// Select the instrument graph whose provision inventory is best endorsed by
-/// typed references from the source text. Candidate zero wins every tie.
-#[cfg(feature = "structure-inference")]
-pub fn select_instrument_lineation(
-    text: &str,
-    graphs: &[StructureGraphV2],
-    references: &[InstrumentReferenceEvidence],
-) -> Result<usize, EngineError> {
-    if graphs.is_empty() {
-        return Err(EngineError::invalid(
-            "instrument lineation selection requires a graph",
-        ));
-    }
-    let mut scalar_to_utf16 = Vec::with_capacity(text.chars().count() + 1);
-    scalar_to_utf16.push(0);
-    for character in text.chars() {
-        scalar_to_utf16.push(scalar_to_utf16.last().copied().unwrap() + character.len_utf16());
-    }
-    let text_length = *scalar_to_utf16.last().unwrap();
-    let score = |graph: &StructureGraphV2| -> Result<usize, EngineError> {
-        let index = instrument_reference_index(graph, &scalar_to_utf16)?;
-        Ok(references
-            .iter()
-            .filter(|reference| {
-                index
-                    .get(&reference.key.to_lowercase())
-                    .is_some_and(|start| *start < reference.start || *start >= reference.end)
-            })
-            .count())
-    };
-    let head_span = |graph: &StructureGraphV2| -> Result<f64, EngineError> {
-        let starts = graph.nodes.iter().filter_map(|node| {
-            let label = node.label.as_deref()?;
-            (node.kind == NodeKind::Section && label.starts_with("sec") && !label.contains('('))
-                .then_some(node.range.start)
-        });
-        let mut low = usize::MAX;
-        let mut high = 0;
-        let mut found = false;
-        for start in starts {
-            let start = scalar_to_utf16
-                .get(start)
-                .copied()
-                .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
-            low = low.min(start);
-            high = high.max(start);
-            found = true;
-        }
-        Ok(if found && text_length > 0 {
-            (high - low) as f64 / text_length as f64
-        } else {
-            0.0
-        })
-    };
-
-    let mut selected = 0;
-    let mut best = score(&graphs[0])?;
-    for (index, graph) in graphs.iter().enumerate().skip(1) {
-        if head_span(graph)? < 0.05 {
-            continue;
-        }
-        let candidate = score(graph)?;
-        if candidate > best {
-            selected = index;
-            best = candidate;
-        }
-    }
-    Ok(selected)
-}
-
-#[cfg(feature = "structure-inference")]
-pub fn derive_instrument_structure(
-    text: &str,
-    documents: Vec<DocumentInput>,
-    references: &[InstrumentReferenceEvidence],
-) -> Result<(usize, StructureGraphV2), EngineError> {
-    if documents
-        .iter()
-        .any(|document| document.profile != DetectionProfile::Instrument)
-    {
-        return Err(EngineError::invalid(
-            "instrument structure derivation requires instrument-profile evidence",
-        ));
-    }
-    let graphs = documents
-        .into_iter()
-        .map(derive_structure_evidence)
-        .collect::<Result<Vec<_>, _>>()?;
-    let selected = select_instrument_lineation(text, &graphs, references)?;
-    let graph = graphs
-        .into_iter()
-        .nth(selected)
-        .ok_or_else(|| EngineError::invalid("selected instrument graph is missing"))?;
-    Ok((selected, graph))
-}
-
-#[derive(Clone, Copy)]
-pub struct NumericSequenceCandidate {
-    pub index: usize,
-    pub value: u32,
-    pub position: (usize, usize),
-    pub page: u32,
-    pub score: f64,
-    pub start_supported: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum NumericSequencePolicy {
-    RootedConsecutive,
-    FootnoteBackbone,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct NumericSequenceSelection {
-    pub indices: Vec<usize>,
-    pub score: f64,
-}
-
-pub fn select_numeric_sequence(
-    mut candidates: Vec<NumericSequenceCandidate>,
-    policy: NumericSequencePolicy,
-) -> NumericSequenceSelection {
-    candidates.sort_by_key(|candidate| (candidate.position, candidate.value));
-    if candidates.is_empty() {
-        return NumericSequenceSelection {
-            indices: Vec::new(),
-            score: 0.0,
-        };
-    }
-    let mut best = vec![f64::NEG_INFINITY; candidates.len()];
-    let mut parent = vec![None; candidates.len()];
-    let mut prior_page_best = HashMap::<u32, usize>::new();
-    let mut same_page_best = HashMap::<u32, usize>::new();
-    let mut current_page = None;
-    let mut group = 0;
-    while group < candidates.len() {
-        let end = (group + 1..candidates.len())
-            .find(|index| candidates[*index].position != candidates[group].position)
-            .unwrap_or(candidates.len());
-        let page = candidates[group].page;
-        if current_page != Some(page) {
-            for (value, index) in same_page_best.drain() {
-                if prior_page_best
-                    .get(&value)
-                    .is_none_or(|prior| best[index] > best[*prior] + 1e-9)
-                {
-                    prior_page_best.insert(value, index);
-                }
-            }
-            current_page = Some(page);
-        }
-        for index in group..end {
-            let candidate = candidates[index];
-            match policy {
-                NumericSequencePolicy::RootedConsecutive if candidate.value == 1 => {
-                    best[index] = candidate.score
-                }
-                NumericSequencePolicy::FootnoteBackbone => {
-                    best[index] = if candidate.start_supported {
-                        candidate.score
-                    } else {
-                        candidate.score
-                            + (-0.25 * f64::from(candidate.value.saturating_sub(1))).max(-4.0)
-                    }
-                }
-                NumericSequencePolicy::RootedConsecutive => {}
-            }
-            let first = match policy {
-                NumericSequencePolicy::RootedConsecutive => candidate.value.saturating_sub(1),
-                NumericSequencePolicy::FootnoteBackbone => {
-                    candidate.value.saturating_sub(201).max(1)
-                }
-            };
-            let mut options = (first..candidate.value)
-                .flat_map(|value| {
-                    [
-                        prior_page_best
-                            .get(&value)
-                            .copied()
-                            .map(|index| (index, false)),
-                        same_page_best
-                            .get(&value)
-                            .copied()
-                            .map(|index| (index, true)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                })
-                .collect::<Vec<_>>();
-            options.sort_unstable();
-            for (previous, same_page) in options {
-                let gap = candidate.value - candidates[previous].value - 1;
-                let penalty = match policy {
-                    NumericSequencePolicy::RootedConsecutive => 0.0,
-                    NumericSequencePolicy::FootnoteBackbone => {
-                        ((if same_page { -0.4 } else { -0.12 }) * f64::from(gap)).max(-4.0)
-                    }
-                };
-                let score =
-                    best[previous] + candidate.score + penalty + if gap == 0 { 0.3 } else { 0.0 };
-                if score > best[index] + 1e-9 {
-                    best[index] = score;
-                    parent[index] = Some(previous);
-                }
-            }
-        }
-        for index in group..end {
-            let value = candidates[index].value;
-            if same_page_best
-                .get(&value)
-                .is_none_or(|prior| best[index] > best[*prior] + 1e-9)
-            {
-                same_page_best.insert(value, index);
-            }
-        }
-        group = end;
-    }
-    let tail = match policy {
-        NumericSequencePolicy::RootedConsecutive => (0..candidates.len())
-            .filter(|index| best[*index].is_finite())
-            .reduce(|left, right| {
-                if best[right] > best[left] + 1e-9 {
-                    right
-                } else {
-                    left
-                }
-            }),
-        NumericSequencePolicy::FootnoteBackbone => (0..candidates.len()).max_by(|left, right| {
-            best[*left]
-                .total_cmp(&best[*right])
-                .then_with(|| candidates[*right].position.cmp(&candidates[*left].position))
-        }),
-    };
-    let Some(mut tail) = tail else {
-        return NumericSequenceSelection {
-            indices: Vec::new(),
-            score: 0.0,
-        };
-    };
-    let score = best[tail];
-    let mut indices = Vec::new();
-    loop {
-        indices.push(candidates[tail].index);
-        if let Some(previous) = parent[tail] {
-            tail = previous;
-        } else {
-            break;
-        }
-    }
-    indices.reverse();
-    NumericSequenceSelection { indices, score }
+    character == '\u{feff}' || (character != '\u{85}' && character.is_whitespace())
 }
 
 #[derive(Debug)]
@@ -1511,6 +1092,115 @@ impl Block {
 mod inference {
     use super::*;
 
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_preserves_packed_entries_and_nesting() {
+        let text = "TABLE OF CONTENTS Page ARTICLE I DEFINITIONS 2 Section 1.01 Defined Terms 2 Section 1.02 Interpretation 4 ARTICLE II THE MERGER 5 Section 2.01 The Merger 5 Section 2.02 Closing 6";
+        let reading = instrument_contents_outline(text);
+        let outline = reading.outline.as_ref().expect("accepted outline");
+        assert_eq!(
+            outline
+                .entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            ["art1", "sec1.01", "sec1.02", "art2", "sec2.01", "sec2.02"]
+        );
+        assert_eq!(outline.entries[0].heading, "DEFINITIONS");
+        assert_eq!(outline.entries[1].parent_label.as_deref(), Some("art1"));
+        assert_eq!(outline.entries[1].depth, 1);
+        assert_eq!(outline.entries[4].parent_label.as_deref(), Some("art2"));
+        assert_eq!(reading.refusal, None);
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_matches_all_refusals() {
+        let cases = [
+            ("The contents are discussed in prose.", "no_contents_marker"),
+            ("CONTENTS\nnot an outline", "no_contents_entries"),
+            (
+                "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4",
+                "too_few_contents_entries",
+            ),
+            (
+                "CONTENTS\nSection 1. First 1\nSection 2. Second\nSection 3. Third 2\nSection 4. Fourth\nSection 5. Fifth",
+                "contents_without_page_numbers",
+            ),
+        ];
+        for (text, expected) in cases {
+            let reading = instrument_contents_outline(text);
+            assert_eq!(reading.outline, None, "{text}");
+            assert_eq!(reading.refusal.as_deref(), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_cuts_page_footers_at_blank_lines() {
+        let text = "TABLE OF CONTENTS\nARTICLE I DEFINITIONS 60\nSection 1.01 Defined Terms 61\n\n2\n\nSection 1.02 Interpretation 62\nSection 1.03 Currency 63\nSection 1.04 Notices 64\nSection 1.05 Time 65";
+        let reading = instrument_contents_outline(text);
+        let outline = reading.outline.as_ref().expect("accepted outline");
+        assert_eq!(
+            outline
+                .entries
+                .iter()
+                .map(|entry| entry.page)
+                .collect::<Vec<_>>(),
+            [Some(60), Some(61), Some(62), Some(63), Some(64), Some(65)]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_resumes_inside_a_guarded_schedule() {
+        let text = "TABLE OF CONTENTS\nSection 0. First 1\nSection 1. Company Schedule 2. Closing 2\nSection 3. Third 3\nSection 4. Fourth 4\nSection 5. Fifth 5";
+        let reading = instrument_contents_outline(text);
+        let outline = reading.outline.as_ref().expect("accepted outline");
+        assert_eq!(
+            outline
+                .entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            ["sec0", "sec1", "sec2", "sec3", "sec4", "sec5"]
+        );
+        assert_eq!(outline.entries[1].heading, "Company Schedule");
+        assert_eq!(outline.entries[1].page, None);
+        assert_eq!(outline.entries[2].heading, "Closing");
+        assert_eq!(outline.entries[2].page, Some(2));
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_reports_javascript_utf16_offsets() {
+        let text = "\u{1f9ab}\nINDEX\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4\nSection 5. Fifth 5";
+        let reading = instrument_contents_outline(text);
+        let outline = reading.outline.as_ref().expect("accepted outline");
+        assert_eq!(outline.region_start, 9);
+        assert_eq!(outline.entries[0].contents_line_start, 9);
+    }
+
+    #[test]
+    #[cfg(feature = "structure-inference")]
+    fn instrument_contents_outline_stops_on_decrease_duplicate_and_pageless_run() {
+        let decrease = "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 2\nSection 5. Fifth 5";
+        assert_eq!(
+            instrument_contents_outline(decrease).refusal.as_deref(),
+            Some("too_few_contents_entries")
+        );
+
+        let duplicate = "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4\nSection 5. Fifth 5\nSection 3. Body 6\nSection 6. Sixth 6";
+        let outline = instrument_contents_outline(duplicate).outline.unwrap();
+        assert_eq!(outline.entries.len(), 5);
+        assert_eq!(outline.entries.last().unwrap().label, "sec5");
+
+        let pageless = "CONTENTS\nSection 1. First 1\nSection 2. Second 2\nSection 3. Third 3\nSection 4. Fourth 4\nSection 5. Fifth 5\nSection 6. Sixth\nSection 7. Seventh\nSection 8. Eighth\nSection 9. Ninth";
+        let outline = instrument_contents_outline(pageless).outline.unwrap();
+        assert_eq!(outline.entries.len(), 5);
+        assert_eq!(outline.entries.last().unwrap().label, "sec5");
+    }
+
     macro_rules! cached_regex {
         ($name:ident, $pattern:expr) => {{
             static $name: OnceLock<Regex> = OnceLock::new();
@@ -1597,10 +1287,6 @@ mod inference {
             .bytes()
             .take_while(|byte| matches!(byte, b' ' | b'\t'))
             .count()
-    }
-
-    fn javascript_whitespace(value: char) -> bool {
-        value == '\u{feff}' || (value != '\u{85}' && value.is_whitespace())
     }
 
     fn decimal_prefix(value: &str, maximum: usize) -> Option<(&str, usize)> {
@@ -5640,196 +5326,6 @@ pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub(crate) fn compose_trusted(input: DocumentInput) -> Result<SourceDoc, EngineError> {
     compose_with(input, true, false)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeriveBatch {
-    #[serde(rename = "type")]
-    kind: String,
-    request_id: String,
-    documents: Vec<Value>,
-}
-
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    code: &'a str,
-    message: &'a str,
-}
-
-#[derive(Serialize)]
-struct ItemError<'a> {
-    id: &'a str,
-    ok: bool,
-    error: ErrorBody<'a>,
-}
-
-#[derive(Serialize)]
-struct ItemResult<'a> {
-    id: &'a str,
-    ok: bool,
-    result: StructureGraphV2,
-}
-
-fn io<T>(value: std::io::Result<T>) -> Result<T, EngineError> {
-    value.map_err(|error| EngineError {
-        code: "sidecar_io",
-        message: error.to_string(),
-    })
-}
-
-fn json_error(error: serde_json::Error) -> EngineError {
-    EngineError {
-        code: "sidecar_json",
-        message: error.to_string(),
-    }
-}
-
-fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<usize, EngineError> {
-    loop {
-        let buffer = io(reader.fill_buf())?;
-        if buffer.is_empty() {
-            return Ok(line.len());
-        }
-        let used = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buffer.len(), |index| index + 1);
-        if line.len() + used > MAX_BYTES + 1 {
-            return Err(EngineError::invalid("oversized sidecar line"));
-        }
-        line.extend_from_slice(&buffer[..used]);
-        reader.consume(used);
-        if line.last() == Some(&b'\n') {
-            return Ok(line.len());
-        }
-    }
-}
-
-fn sidecar_with(
-    reader: &mut impl BufRead,
-    writer: &mut impl Write,
-    derive: fn(DocumentInput) -> Result<StructureGraphV2, EngineError>,
-    capabilities: &[&str],
-) -> Result<(), EngineError> {
-    let executable = std::env::current_exe().map_err(|error| EngineError {
-        code: "sidecar_identity",
-        message: error.to_string(),
-    })?;
-    let engine_sha256 = format!(
-        "{:x}",
-        Sha256::digest(std::fs::read(executable).map_err(|error| EngineError {
-            code: "sidecar_identity",
-            message: error.to_string()
-        })?)
-    );
-    serde_json::to_writer(&mut *writer, &json!({ "type": "hello", "protocol": SIDECAR_PROTOCOL, "evidence_schema": EVIDENCE_SCHEMA,
-        "result_schema": RESULT_SCHEMA, "engine_sha256": engine_sha256, "capabilities": capabilities,
-        "max_documents": MAX_DOCUMENTS, "max_bytes": MAX_BYTES })).map_err(json_error)?;
-    io(writer.write_all(b"\n"))?;
-    io(writer.flush())?;
-    loop {
-        let mut line = Vec::new();
-        if read_line(reader, &mut line)? == 0 {
-            return Err(EngineError::invalid("sidecar received unexpected EOF"));
-        }
-        if line.last() != Some(&b'\n')
-            || line.len() - 1 > MAX_BYTES
-            || line[..line.len() - 1].contains(&b'\r')
-        {
-            return Err(EngineError::invalid("invalid sidecar line"));
-        }
-        line.pop();
-        let batch: DeriveBatch = serde_json::from_slice(&line).map_err(json_error)?;
-        if batch.kind != "derive_batch"
-            || batch.request_id.is_empty()
-            || batch.documents.is_empty()
-            || batch.documents.len() > MAX_DOCUMENTS
-        {
-            return Err(EngineError::invalid("invalid derive_batch envelope"));
-        }
-        let ids = batch
-            .documents
-            .iter()
-            .map(|value| {
-                value
-                    .get("document_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| EngineError::invalid("derive_batch document ID is missing"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
-            return Err(EngineError::invalid(
-                "derive_batch document IDs are duplicated",
-            ));
-        }
-        io(writer.write_all(b"{\"type\":\"result_batch\",\"request_id\":"))?;
-        serde_json::to_writer(&mut *writer, &batch.request_id).map_err(json_error)?;
-        io(writer.write_all(b",\"items\":["))?;
-        for (index, (id, value)) in ids.iter().zip(batch.documents).enumerate() {
-            if index > 0 {
-                io(writer.write_all(b","))?;
-            }
-            match DocumentInput::try_from(value).and_then(derive) {
-                Ok(result) => serde_json::to_writer(
-                    &mut *writer,
-                    &ItemResult {
-                        id,
-                        ok: true,
-                        result,
-                    },
-                )
-                .map_err(json_error)?,
-                Err(error) => serde_json::to_writer(
-                    &mut *writer,
-                    &ItemError {
-                        id,
-                        ok: false,
-                        error: ErrorBody {
-                            code: error.code,
-                            message: &error.message,
-                        },
-                    },
-                )
-                .map_err(json_error)?,
-            }
-        }
-        io(writer.write_all(b"]}\n"))?;
-        io(writer.flush())?;
-    }
-}
-
-#[cfg(feature = "structure-inference")]
-pub fn sidecar(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(), EngineError> {
-    sidecar_with(
-        reader,
-        writer,
-        derive_structure_evidence,
-        &["native_claims", "raw_recovery"],
-    )
-}
-
-pub fn native_sidecar(
-    reader: &mut impl BufRead,
-    writer: &mut impl Write,
-) -> Result<(), EngineError> {
-    sidecar_with(
-        reader,
-        writer,
-        derive_native_structure_evidence,
-        &["native_claims"],
-    )
-}
-
-#[cfg(feature = "structure-inference")]
-pub fn stdio_sidecar() -> Result<(), EngineError> {
-    sidecar(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
-}
-
-pub fn native_stdio_sidecar() -> Result<(), EngineError> {
-    native_sidecar(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
 }
 
 #[cfg(test)]
