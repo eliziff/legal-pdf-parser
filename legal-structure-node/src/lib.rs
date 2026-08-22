@@ -1,7 +1,8 @@
 use legal_structure::{
     a2aj_source_doc, compose, derive_structure_evidence, instrument_lineation_hypotheses,
-    journal_source_doc, journal_text_source_doc, native_markup_source_doc, A2ajInput,
-    DocumentInput, JournalPageLabel, NativeMarkupInput, SourceDoc, SourceDocBlock,
+    journal_source_doc, journal_text_source_doc, native_markup_source_doc,
+    select_instrument_lineation, A2ajInput, DocumentInput, InstrumentReferenceEvidence,
+    JournalPageLabel, NativeMarkupInput, SourceDoc, SourceDocBlock, StructureGraphV2,
 };
 use napi::Error;
 use napi_derive::napi;
@@ -16,6 +17,27 @@ pub fn source_doc_version() -> u32 {
 #[napi(js_name = "instrumentLineationHypotheses")]
 pub fn instrument_lineation_hypotheses_node(text: String) -> Vec<String> {
     instrument_lineation_hypotheses(&text)
+}
+
+#[napi(js_name = "selectInstrumentLineation")]
+pub fn select_instrument_lineation_node(
+    text: String,
+    graphs: Vec<serde_json::Value>,
+    references: Vec<serde_json::Value>,
+) -> napi::Result<u32> {
+    let graphs = graphs
+        .into_iter()
+        .map(serde_json::from_value::<StructureGraphV2>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    let references = references
+        .into_iter()
+        .map(serde_json::from_value::<InstrumentReferenceEvidence>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    let selected = select_instrument_lineation(&text, &graphs, &references)
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    u32::try_from(selected).map_err(|_| Error::from_reason("too many lineation graphs"))
 }
 
 #[napi(js_name = "deriveStructures")]

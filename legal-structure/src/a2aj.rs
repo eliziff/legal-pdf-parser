@@ -62,7 +62,7 @@ fn provision_label(value: &str) -> bool {
 }
 
 fn compare_labels(left: &str, right: &str, fraction: bool) -> Ordering {
-    crate::recovery::compare_labels(left, right, fraction)
+    crate::inference::compare_labels(left, right, fraction)
 }
 
 fn dotted_order(source: &[(usize, &str, &str)]) -> Option<bool> {

@@ -35,13 +35,13 @@ legal PDF at **70.8 pages/second**.
 
 ```powershell
 cargo build --release --locked --package legal-structure --no-default-features --bin legal-structure-native
-cargo build --release --locked --package legal-structure --no-default-features --features recovery --bin legal-structure
+cargo build --release --locked --package legal-structure --no-default-features --features structure-inference --bin legal-structure
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
 legalpdf contract request.json
 ```
 
 The native structure host accepts provider claims without shipping raw-text
-recovery or regex. The recovery host adds the provider-neutral raw detector.
+structure inference or regex. The structure-inference host adds the provider-neutral raw detector.
 The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
 `ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
 separate runtime/model pack are required. The root package has no default

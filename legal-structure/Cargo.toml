@@ -6,9 +6,9 @@ license = "MIT"
 
 [features]
 default = []
-recovery = ["dep:regex"]
+structure-inference = ["dep:regex"]
 source-doc = []
-a2aj = ["recovery", "source-doc"]
+a2aj = ["structure-inference", "source-doc"]
 journal = ["source-doc"]
 
 [dependencies]
@@ -20,7 +20,7 @@ sha2 = "0.10"
 [[bin]]
 name = "legal-structure"
 path = "src/main.rs"
-required-features = ["recovery"]
+required-features = ["structure-inference"]
 
 [[bin]]
 name = "legal-structure-native"
