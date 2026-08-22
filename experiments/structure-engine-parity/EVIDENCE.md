@@ -1,35 +1,11 @@
-# Structure-engine extraction and parity plan
+# Structure-engine parity evidence
 
-This plan governs the factor-out of a shared structure engine from Legal PDF
-Parser and SourceDocs. The first promotion step is deliberately behavioural:
-move the settled derivation behind one boundary without changing one output
-byte. Quality changes follow as separately measured commits. A cached replay is
-not an end-to-end PDF proof, and a silver or candidate set is not gold.
+Status: retained measurements and corpus identities, not an implementation
+plan. Beaver's `docs/roadmap/document-structure.md` governs current work.
 
-## Acceptance sequence
-
-1. Freeze the current public outputs and the exact input denominator.
-2. Factor the structure engine while the 748-document native replay remains
-   byte-identical and all existing SourceDocs provider tests remain green.
-   Provider-native structure stays an input/oracle; it is not displaced.
-3. Remove the process/raw-output bottleneck. A fresh full replay must cover all
-   24,707 pages in at most 30 seconds and at least 1,000 pages/second on the
-   same machine. Resumed receipts do not count as fresh throughput.
-4. Exercise the public PDF/cache contract from source PDFs. This proves the
-   extraction-to-common-input boundary that the replay intentionally bypasses.
-5. Improve numbered sequences, footnotes/endnotes, pages, headings, citations,
-   and geometry-derived unnumbered paragraphs. Each quality change gets a
-   before/after corpus receipt and an explicit baseline update only after the
-   unchanged-output refactor has landed.
-6. Run provider breadth in SourceDocs. For every provider, compare native
-   structure, the shared engine's derived structure, and the integrated product
-   result; require monotonic sequence coverage without regressing a non-native
-   path.
-
-Rust is justified for the deterministic, data-parallel hot path only after a
-profile identifies it. Provider adapters, orchestration, and grammar authoring
-stay outside that core. `cargo quick` remains the iteration gate; no full build
-belongs in the edit loop.
+This record preserves the exact parity history, local evidence inventory, and
+anti-skip/staleness rules. A cached replay proves derivation only; it is not an
+end-to-end PDF proof, and a silver or candidate set is not gold.
 
 ## Frozen native parity gate
 
