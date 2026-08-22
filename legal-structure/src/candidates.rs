@@ -286,8 +286,8 @@ pub fn resolve_structure_graph(
     note_pairs: &[NotePairClaimV2],
     mut diagnostics: Vec<StructureDiagnosticV2>,
 ) -> Result<StructureGraphV2, EngineError> {
-    let scalar_len = text.chars().count();
     let scalar_text = ScalarText::new(text);
+    let scalar_len = scalar_text.len();
     let mut node_ids = HashSet::new();
     for node in &nodes {
         if node.id.is_empty() || !node_ids.insert(node.id.clone()) {
@@ -362,6 +362,10 @@ pub fn resolve_structure_graph(
         }
     }
     let resolved_candidates = resolve_structure_candidates(runs, evidence)?;
+    let resolved_by_candidate = resolved_candidates
+        .iter()
+        .map(|resolved| (resolved.candidate.id.as_str(), resolved))
+        .collect::<HashMap<_, _>>();
 
     let mut relation_keys = HashSet::new();
     relations.retain(|relation| {
@@ -656,9 +660,7 @@ pub fn resolve_structure_graph(
             .markers
             .iter()
             .filter_map(|candidate| {
-                let resolved = resolved_candidates
-                    .iter()
-                    .find(|resolved| resolved.candidate.id == candidate.id)?;
+                let resolved = resolved_by_candidate.get(candidate.id.as_str()).copied()?;
                 (resolved.role == Some(ResolvedRole::ListItem)).then_some(resolved)
             })
             .collect::<Vec<_>>();
@@ -732,11 +734,6 @@ pub fn resolve_structure_graph(
         }
     }
 
-    let section_ids = nodes
-        .iter()
-        .filter(|node| node.kind == NodeKind::Section)
-        .map(|node| node.id.clone())
-        .collect::<HashSet<_>>();
     for index in 0..nodes.len() {
         if nodes[index].kind != NodeKind::Heading || nodes[index].parent_id.is_some() {
             continue;
@@ -744,7 +741,7 @@ pub fn resolve_structure_graph(
         nodes[index].parent_id = nodes
             .iter()
             .filter(|section| {
-                section_ids.contains(&section.id)
+                section.kind == NodeKind::Section
                     && section.range.start <= nodes[index].range.start
                     && nodes[index].range.end <= section.range.end
             })
@@ -821,55 +818,47 @@ pub fn resolve_structure_graph(
             },
         );
     }
-    let resolved_by_candidate = resolved_candidates
-        .iter()
-        .map(|resolved| (resolved.candidate.id.as_str(), resolved))
-        .collect::<HashMap<_, _>>();
-    diagnostics.extend(
-        runs.iter()
-            .map(|run| {
-                let node_ids = run
-                    .markers
-                    .iter()
-                    .filter_map(|candidate| candidate_node_ids.get(&candidate.id).cloned())
-                    .collect::<Vec<_>>();
-                let resolved_count = node_ids.len();
-                let mut seen_rules = HashSet::new();
-                let rules = run
-                    .markers
-                    .iter()
-                    .filter_map(|candidate| {
-                        let rule = if paired_candidate_nodes.contains_key(&candidate.id) {
-                            ResolutionRuleV2::PairedNote
-                        } else {
-                            resolved_by_candidate.get(candidate.id.as_str())?.proof.rule
-                        };
-                        seen_rules.insert(rule).then_some(rule)
-                    })
-                    .collect();
-                StructureDiagnosticV2 {
-                    code: if resolved_count == 0 {
-                        "structure_run_abstained"
-                    } else if resolved_count == run.markers.len() {
-                        "structure_run_resolved"
-                    } else {
-                        "structure_run_partially_resolved"
-                    }
-                    .to_owned(),
-                    severity: DiagnosticSeverity::Info,
-                    run_id: Some(run.id.clone()),
-                    candidate_ids: run
-                        .markers
-                        .iter()
-                        .map(|candidate| candidate.id.clone())
-                        .collect(),
-                    rules,
-                    ranges: vec![run.range],
-                    node_ids,
-                }
+    diagnostics.extend(runs.iter().map(|run| {
+        let node_ids = run
+            .markers
+            .iter()
+            .filter_map(|candidate| candidate_node_ids.get(&candidate.id).cloned())
+            .collect::<Vec<_>>();
+        let resolved_count = node_ids.len();
+        let mut seen_rules = HashSet::new();
+        let rules = run
+            .markers
+            .iter()
+            .filter_map(|candidate| {
+                let rule = if paired_candidate_nodes.contains_key(&candidate.id) {
+                    ResolutionRuleV2::PairedNote
+                } else {
+                    resolved_by_candidate.get(candidate.id.as_str())?.proof.rule
+                };
+                seen_rules.insert(rule).then_some(rule)
             })
-            .collect::<Vec<_>>(),
-    );
+            .collect();
+        StructureDiagnosticV2 {
+            code: if resolved_count == 0 {
+                "structure_run_abstained"
+            } else if resolved_count == run.markers.len() {
+                "structure_run_resolved"
+            } else {
+                "structure_run_partially_resolved"
+            }
+            .to_owned(),
+            severity: DiagnosticSeverity::Info,
+            run_id: Some(run.id.clone()),
+            candidate_ids: run
+                .markers
+                .iter()
+                .map(|candidate| candidate.id.clone())
+                .collect(),
+            rules,
+            ranges: vec![run.range],
+            node_ids,
+        }
+    }));
     Ok(StructureGraphV2::from_parts(
         document_id,
         text,
