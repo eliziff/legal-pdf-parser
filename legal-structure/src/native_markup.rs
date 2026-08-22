@@ -1137,9 +1137,8 @@ fn render_markup(
             });
         }
     }
-    // Raw renderer offsets are UTF-16 positions in normalized provider text
-    // before the outer JavaScript trim. Subtracting leading_trim projects them
-    // onto rendered SourceDoc text; split-surrogate positions remain invalid.
+    // Pre-trim normalized-provider UTF-16 becomes rendered SourceDoc UTF-16;
+    // leading trim is subtracted and split-surrogate positions stay invalid.
     let normalized_coordinates = ScalarText::new(&normalized);
     let text_utf16 = utf16_len(&text);
     let normalized_utf16 = normalized_coordinates.utf16_len();
@@ -1310,8 +1309,7 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         "{:x}",
         Sha256::digest(serde_json::to_vec(&adapter).map_err(EngineError::source)?)
     );
-    // At this boundary all provider ranges are exact UTF-16 offsets in the
-    // final rendered (or fallback) SourceDoc text, never in source markup.
+    // Exact UTF-16 in final rendered/fallback text, never source markup.
     let coordinates = ScalarText::new(&text);
     let scalar = |offset: usize| {
         coordinates
@@ -1349,7 +1347,6 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
                 start: scalar(raw.start)?,
                 end: scalar(claim_end)?,
             },
-            provider_order: index,
             origin_id: ORIGIN.to_owned(),
             parent_label: raw.parent_label.clone(),
             anchor: raw.anchor.clone(),
@@ -1381,8 +1378,6 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         } else {
             CoverageState::Absent
         },
-        reason: "shared-engine recovery lane".to_owned(),
-        origin_id: native_kinds.contains(&kind).then(|| ORIGIN.to_owned()),
     })
     .collect();
     let exclusions = rendered_exclusions
@@ -1394,8 +1389,6 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
                     end: scalar(range.end)?,
                 },
                 applies_to: vec!["paragraph".to_owned()],
-                reason: "provider-marked non-opinion region".to_owned(),
-                origin_id: ORIGIN.to_owned(),
             })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
@@ -1428,12 +1421,7 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         },
         origins: vec![Origin {
             id: ORIGIN.to_owned(),
-            producer: provider.as_str().to_owned(),
-            representation: "provider-rendered-text".to_owned(),
-            revision: representation_revision,
-            authority: "provider-native-claims".to_owned(),
         }],
-        units: Vec::new(),
         native_claims: claims,
         coverage,
         exclusions,

@@ -750,7 +750,6 @@ mod tests {
             label: Some("sec\u{6587}".to_owned()),
             aliases: Vec::new(),
             range: crate::ScalarRange { start: 1, end: 3 },
-            provider_order: 0,
             origin_id: "provider".to_owned(),
             parent_label: None,
             anchor: None,

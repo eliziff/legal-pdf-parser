@@ -150,8 +150,7 @@ fn utf16_at(text: &str, byte: usize) -> usize {
 }
 
 fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<SourceDocBlock>) {
-    // Appended map values and synthetic LFs directly form final provider text;
-    // block offsets are JavaScript UTF-16 positions in that rendered string.
+    // Map values plus synthetic LFs form final provider-text UTF-16.
     if !text.trim().is_empty() || entries.is_empty() {
         return (text, Vec::new());
     }
@@ -181,7 +180,7 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<S
 
 fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
     static PRINTED: OnceLock<Regex> = OnceLock::new();
-    // Unique matches are UTF-8 byte ranges in final provider-rendered text.
+    // Unique byte matches are in final provider-rendered text.
     let coordinates = ScalarText::new(text);
     map.iter()
         .filter_map(|(raw_label, value)| {
@@ -249,7 +248,6 @@ fn evidence(
                     start: scalar(block.start)?,
                     end: scalar(block.end)?,
                 },
-                provider_order: index,
                 origin_id: ORIGIN.to_owned(),
                 parent_label: block.parent_label.clone(),
                 anchor: block.anchor.clone(),
@@ -280,8 +278,6 @@ fn evidence(
         } else {
             CoverageState::Absent
         },
-        reason: "shared-engine recovery lane".to_owned(),
-        origin_id: (kind == EvidenceKind::Section && !claims.is_empty()).then(|| ORIGIN.to_owned()),
     })
     .collect();
     let source_kind = input.source_kind;
@@ -334,12 +330,7 @@ fn evidence(
         },
         origins: vec![Origin {
             id: ORIGIN.to_owned(),
-            producer: "a2aj".to_owned(),
-            representation: "provider-rendered-text".to_owned(),
-            revision: "a2aj-adapter-v1".to_owned(),
-            authority: "provider-native-claims".to_owned(),
         }],
-        units: Vec::new(),
         native_claims: claims,
         coverage,
         exclusions: Vec::new(),

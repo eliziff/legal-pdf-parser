@@ -106,12 +106,7 @@ fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
         },
         origins: vec![Origin {
             id: "native".into(),
-            producer: "test".into(),
-            representation: "text".into(),
-            revision: "1".into(),
-            authority: "test".into(),
         }],
-        units: Vec::new(),
         native_claims: Vec::new(),
         coverage: [
             EvidenceKind::Paragraph,
@@ -127,8 +122,6 @@ fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
             kind,
             range,
             state: CoverageState::Absent,
-            reason: "test".into(),
-            origin_id: None,
         })
         .collect(),
         exclusions: Vec::new(),
@@ -154,7 +147,6 @@ fn validates_scope_and_ranges() {
         label: Some("page1".into()),
         aliases: Vec::new(),
         range: ScalarRange { start: 0, end: 4 },
-        provider_order: 0,
         origin_id: "native".into(),
         parent_label: None,
         anchor: None,
@@ -235,8 +227,6 @@ fn clips_at_complete_native_coverage() {
             kind: EvidenceKind::Section,
             range: ScalarRange { start, end },
             state,
-            reason: "test".into(),
-            origin_id: None,
         }),
     );
     assert_eq!(
@@ -275,7 +265,6 @@ fn native_projection_preserves_claims_without_recovery() {
             start: 0,
             end: text.chars().count(),
         },
-        provider_order: 1,
         origin_id: "native".into(),
         parent_label: None,
         anchor: Some("section-1".into()),
@@ -324,7 +313,6 @@ fn native_parent_wins_and_children_survive() {
             start: 0,
             end: text.chars().count(),
         },
-        provider_order: 0,
         origin_id: "native".into(),
         parent_label: None,
         anchor: None,

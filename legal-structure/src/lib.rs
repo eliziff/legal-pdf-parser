@@ -110,16 +110,6 @@ enum EvidenceKind {
     Navigation,
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[serde(rename_all = "snake_case")]
-enum UnitRole {
-    Page,
-    Region,
-    Line,
-    Word,
-    Span,
-}
-
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum CoverageState {
@@ -157,88 +147,6 @@ struct Scope {
 #[serde(deny_unknown_fields)]
 struct Origin {
     id: String,
-    producer: String,
-    representation: String,
-    revision: String,
-    authority: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Geometry {
-    coordinate_space: String,
-    page_width: f64,
-    page_height: f64,
-    bbox: [f64; 4],
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PageLayout {
-    column_separator: Option<f64>,
-    source: Option<String>,
-    text_quality: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegionLayout {
-    kind: Option<String>,
-    member_line_ids: Option<Vec<String>>,
-    reading_order: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DetachedReference {
-    note_id: Option<String>,
-    range: Option<ScalarRange>,
-    selected_text: Option<String>,
-    source_line_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LineLayout {
-    source_index: Option<usize>,
-    reading_order: Option<usize>,
-    block_index: Option<usize>,
-    source: Option<String>,
-    exclude_from_body: Option<bool>,
-    region_id: Option<String>,
-    region_type: Option<String>,
-    note_region_mode: Option<String>,
-    suppress_footnote_label: Option<bool>,
-    detached_references: Option<Vec<DetachedReference>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpanStyle {
-    font: Option<String>,
-    size: Option<f64>,
-    flags: Option<i64>,
-    superscript: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Unit {
-    id: String,
-    role: UnitRole,
-    source_order: usize,
-    range: ScalarRange,
-    origin_id: String,
-    parent_id: Option<String>,
-    provider_order: Option<usize>,
-    page_index: Option<usize>,
-    page_number: Option<usize>,
-    flow_id: Option<String>,
-    raw_geometry: Option<Geometry>,
-    page_layout: Option<PageLayout>,
-    region_layout: Option<RegionLayout>,
-    line_layout: Option<LineLayout>,
-    span_style: Option<SpanStyle>,
 }
 
 #[derive(Deserialize)]
@@ -249,7 +157,6 @@ struct NativeClaim {
     label: Option<String>,
     aliases: Vec<String>,
     range: ScalarRange,
-    provider_order: usize,
     origin_id: String,
     parent_label: Option<String>,
     anchor: Option<String>,
@@ -261,8 +168,6 @@ struct Coverage {
     kind: EvidenceKind,
     range: ScalarRange,
     state: CoverageState,
-    reason: String,
-    origin_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -270,8 +175,6 @@ struct Coverage {
 struct Exclusion {
     range: ScalarRange,
     applies_to: Vec<String>,
-    reason: String,
-    origin_id: String,
 }
 
 #[derive(Deserialize)]
@@ -279,9 +182,6 @@ struct Exclusion {
 struct ParagraphBreak {
     at: usize,
     origin_id: String,
-    strength: String,
-    before_unit: Option<String>,
-    after_unit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -305,7 +205,6 @@ pub struct DocumentInput {
     offset_unit: String,
     scope: Scope,
     origins: Vec<Origin>,
-    units: Vec<Unit>,
     native_claims: Vec<NativeClaim>,
     coverage: Vec<Coverage>,
     exclusions: Vec<Exclusion>,
@@ -401,74 +300,8 @@ impl DocumentInput {
             .iter()
             .map(|value| value.id.as_str())
             .collect::<HashSet<_>>();
-        if origins.len() != self.origins.len()
-            || self.origins.iter().any(|value| {
-                !nonempty([
-                    &value.id,
-                    &value.producer,
-                    &value.representation,
-                    &value.revision,
-                    &value.authority,
-                ])
-            })
-        {
+        if origins.len() != self.origins.len() || origins.contains("") {
             return Err(EngineError::invalid("origins are invalid or duplicated"));
-        }
-        let unit_ids = self
-            .units
-            .iter()
-            .map(|value| value.id.as_str())
-            .collect::<HashSet<_>>();
-        let mut orders = BTreeMap::<UnitRole, Vec<usize>>::new();
-        for unit in &self.units {
-            let geometry = unit.raw_geometry.as_ref().is_none_or(|value| {
-                !value.coordinate_space.is_empty()
-                    && value.page_width.is_finite()
-                    && value.page_height.is_finite()
-                    && value.bbox.iter().all(|number| number.is_finite())
-            });
-            let layout = unit.page_layout.as_ref().is_none_or(|value| {
-                unit.role == UnitRole::Page
-                    && value.column_separator.is_none_or(f64::is_finite)
-                    && value.text_quality.is_none_or(f64::is_finite)
-            }) && unit
-                .region_layout
-                .as_ref()
-                .is_none_or(|_| unit.role == UnitRole::Region)
-                && unit.line_layout.as_ref().is_none_or(|value| {
-                    unit.role == UnitRole::Line
-                        && value.detached_references.as_ref().is_none_or(|refs| {
-                            refs.iter().all(|reference| {
-                                reference.range.is_none_or(|range| range.valid(length))
-                            })
-                        })
-                })
-                && unit.span_style.as_ref().is_none_or(|value| {
-                    unit.role == UnitRole::Span && value.size.is_none_or(f64::is_finite)
-                });
-            if unit.id.is_empty()
-                || !unit.range.valid(length)
-                || !origins.contains(unit.origin_id.as_str())
-                || unit
-                    .parent_id
-                    .as_deref()
-                    .is_some_and(|id| !unit_ids.contains(id))
-                || !geometry
-                || !layout
-            {
-                return Err(EngineError::invalid(
-                    "unit identity, range, or layout is invalid",
-                ));
-            }
-            orders.entry(unit.role).or_default().push(unit.source_order);
-        }
-        if unit_ids.len() != self.units.len()
-            || orders.values_mut().any(|values| {
-                values.sort_unstable();
-                values.iter().copied().ne(1..=values.len())
-            })
-        {
-            return Err(EngineError::invalid("unit IDs or source order are invalid"));
         }
         let claims = self
             .native_claims
@@ -491,13 +324,7 @@ impl DocumentInput {
         }
         let mut coverage = BTreeMap::<EvidenceKind, Vec<ScalarRange>>::new();
         for value in &self.coverage {
-            if !value.range.valid(length)
-                || value.reason.is_empty()
-                || value
-                    .origin_id
-                    .as_deref()
-                    .is_some_and(|id| !origins.contains(id))
-            {
+            if !value.range.valid(length) {
                 return Err(EngineError::invalid("coverage is invalid"));
             }
             coverage.entry(value.kind).or_default().push(value.range);
@@ -528,22 +355,10 @@ impl DocumentInput {
         }
         if self.exclusions.iter().any(|value| {
             !value.range.valid(length)
-                || value.reason.is_empty()
                 || value.applies_to.is_empty()
                 || !nonempty(value.applies_to.iter())
-                || !origins.contains(value.origin_id.as_str())
         }) || self.paragraph_breaks.iter().any(|value| {
-            value.at > length
-                || value.strength.is_empty()
-                || !origins.contains(value.origin_id.as_str())
-                || value
-                    .before_unit
-                    .as_deref()
-                    .is_some_and(|id| !unit_ids.contains(id))
-                || value
-                    .after_unit
-                    .as_deref()
-                    .is_some_and(|id| !unit_ids.contains(id))
+            value.at > length || !origins.contains(value.origin_id.as_str())
         }) {
             return Err(EngineError::invalid(
                 "exclusion or paragraph break is invalid",
