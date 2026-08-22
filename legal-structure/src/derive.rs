@@ -189,12 +189,11 @@ fn infer_graph(
                 source: Derivation::Heuristic,
             }),
     );
-    StructureGraphV2 {
-        schema_version: RESULT_SCHEMA.to_owned(),
-        document_id: evidence.document_id,
-        text_sha256: evidence.text_sha256,
-        source_sha256: evidence.source_sha256,
-        status: if complete {
+    StructureGraphV2::from_parts(
+        evidence.document_id,
+        &evidence.text,
+        evidence.source_sha256,
+        if complete {
             GraphStatus::Complete
         } else {
             GraphStatus::Partial
@@ -203,7 +202,7 @@ fn infer_graph(
         boundaries,
         relations,
         diagnostics,
-    }
+    )
 }
 
 #[cfg(feature = "structure-inference")]
