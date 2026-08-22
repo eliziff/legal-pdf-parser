@@ -1,7 +1,9 @@
 # Structure-engine parity gate
 
-The corpus-wide acceptance order and anti-skip/staleness rules are specified in
-[`PARITY_PLAN.md`](PARITY_PLAN.md).
+The active architecture, port discipline, and acceptance order are specified
+in Beaver's `docs/roadmap/document-structure.md`. [Parity evidence](EVIDENCE.md)
+retains the corpus identities, measured history, and anti-skip/staleness rules;
+this README keeps the runnable gate.
 
 This is the fast first gate for factoring structure derivation out of the PDF
 parser. It reconstructs the structure engine's consumed common-input fields
