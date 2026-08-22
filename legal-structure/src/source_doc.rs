@@ -1,4 +1,4 @@
-use crate::{EvidenceKind, NativeClaim, NodeKind, StructureGraphV2};
+use crate::{EvidenceKind, NativeClaim, NodeKind, ScalarText, StructureGraphV2};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -532,7 +532,9 @@ pub(crate) fn project_graph(
     graph: StructureGraphV2,
     order: ProjectionOrder,
 ) -> SourceDoc {
-    let scalar_to_utf16 = utf16_offsets(&text);
+    // Graph ranges are Unicode-scalar offsets in this final SourceDoc text;
+    // serialized block ranges are exact JavaScript UTF-16 offsets in it.
+    let coordinates = ScalarText::new(&text);
     let labels = graph
         .nodes
         .iter()
@@ -570,8 +572,12 @@ pub(crate) fn project_graph(
             let mut block = SourceDocBlock::new(
                 kind,
                 label,
-                scalar_to_utf16[node.range.start],
-                scalar_to_utf16[node.range.end],
+                coordinates
+                    .utf16_at_scalar(node.range.start)
+                    .expect("graph node start is bounded by source text"),
+                coordinates
+                    .utf16_at_scalar(node.range.end)
+                    .expect("graph node end is bounded by source text"),
                 SourceDocOrigin::Heuristic,
             );
             if matches!(order, ProjectionOrder::StablePosition) && node.kind != NodeKind::Prose {
@@ -658,7 +664,9 @@ pub(crate) fn native_blocks(
     if claims.iter().all(|claim| originals.contains_key(&claim.id)) {
         return originals;
     }
-    let scalar_to_utf16 = utf16_offsets(text);
+    // Non-original native claims use scalar offsets in the same final text.
+    // Provider blocks already carrying their own UTF-16 plane stay untouched.
+    let coordinates = ScalarText::new(text);
     for claim in claims {
         if originals.contains_key(&claim.id) {
             continue;
@@ -678,8 +686,12 @@ pub(crate) fn native_blocks(
         let mut block = SourceDocBlock::new(
             kind,
             label,
-            scalar_to_utf16[claim.range.start],
-            scalar_to_utf16[claim.range.end],
+            coordinates
+                .utf16_at_scalar(claim.range.start)
+                .expect("native claim start is bounded by source text"),
+            coordinates
+                .utf16_at_scalar(claim.range.end)
+                .expect("native claim end is bounded by source text"),
             SourceDocOrigin::Native,
         );
         block.aliases.clone_from(&claim.aliases);
@@ -688,15 +700,6 @@ pub(crate) fn native_blocks(
         originals.insert(claim.id.clone(), block);
     }
     originals
-}
-
-pub(crate) fn utf16_offsets(text: &str) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(text.chars().scan(0, |used, character| {
-            *used += character.len_utf16();
-            Some(*used)
-        }))
-        .collect()
 }
 
 #[cfg(test)]
@@ -737,5 +740,24 @@ mod tests {
                 r#"{"provider":"a2aj","id":"fixture","url":null,"revision":"4963dc1b70ed75305b19feedabe3e6e7a8f5fcd639a2dedf2905dcc44e7fb54b","docType":"laws","status":"usable","text":"1 First\n3 Third","blocks":[{"kind":"section","label":"sec1","start":0,"end":7,"origin":"native"},{"kind":"section","label":"sec3","start":8,"end":15,"origin":"heuristic"}],"index":{},"ranges":{"paragraph":{"kind":"paragraph","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false},"page":{"kind":"page","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false},"section":{"kind":"section","count":2,"first":"sec1","last":"sec3","missing":["sec2"],"missingTruncated":false},"footnote":{"kind":"footnote","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false}}}"#
             )
         );
+    }
+
+    #[test]
+    fn native_claim_scalars_project_onto_final_text_utf16_offsets() {
+        let claim = NativeClaim {
+            id: "native".to_owned(),
+            kind: EvidenceKind::Section,
+            label: Some("sec\u{6587}".to_owned()),
+            aliases: Vec::new(),
+            range: crate::ScalarRange { start: 1, end: 3 },
+            provider_order: 0,
+            origin_id: "provider".to_owned(),
+            parent_label: None,
+            anchor: None,
+        };
+        let blocks = native_blocks("\u{1f9ab}e\u{301}", &[claim], HashMap::new());
+        let block = blocks.get("native").expect("projected native block");
+        assert_eq!((block.start, block.end), (2, 4));
+        assert_eq!(block.label, "sec\u{6587}");
     }
 }

@@ -1,9 +1,10 @@
-use crate::source_doc::{utf16_offsets, BlockFieldOrder};
+use crate::source_doc::BlockFieldOrder;
+use crate::text::{javascript_whitespace, normalize_javascript_whitespace};
 use crate::{
-    compose_trusted, Coverage, CoverageState, DetectionProfile, DocumentInput, EngineError,
-    EvidenceKind, Exclusion, NativeClaim, Origin, ParagraphBreak, ScalarRange, Scope, ScopeKind,
-    SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin, SourceDocProvider, SourceDocType,
-    EVIDENCE_SCHEMA,
+    compose_trusted, utf16_len, Coverage, CoverageState, DetectionProfile, DocumentInput,
+    EngineError, EvidenceKind, Exclusion, NativeClaim, Origin, ParagraphBreak, ScalarRange,
+    ScalarText, Scope, ScopeKind, SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    SourceDocProvider, SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -125,24 +126,8 @@ struct RenderedMarkup {
     harvard_casebody: bool,
 }
 
-fn js_space(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}' | '\u{000b}' | '\u{000c}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
-            ..='\u{200a}'
-                | '\u{202f}'
-                | '\u{205f}'
-                | '\u{3000}'
-                | '\u{feff}'
-                | '\n'
-                | '\r'
-                | '\u{2028}'
-                | '\u{2029}'
-    )
-}
-
 fn trim_js(value: &str) -> &str {
-    value.trim_matches(js_space)
+    value.trim_matches(javascript_whitespace)
 }
 
 fn contains_ascii_word(value: &str, word: &str, insensitive: bool) -> bool {
@@ -164,23 +149,6 @@ fn contains_ascii_word(value: &str, word: &str, insensitive: bool) -> bool {
                 .get(start + found.len())
                 .is_none_or(|byte| !ascii_word(*byte))
     })
-}
-
-fn collapse_js_space(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut pending = false;
-    for character in value.chars() {
-        if js_space(character) {
-            pending = !result.is_empty();
-        } else {
-            if pending {
-                result.push(' ');
-                pending = false;
-            }
-            result.push(character);
-        }
-    }
-    result
 }
 
 fn replace_regex(
@@ -240,7 +208,7 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
     while at < raw.len() {
         while at < raw.len() {
             let character = raw[at..].chars().next().unwrap();
-            if !js_space(character) {
+            if !javascript_whitespace(character) {
                 break;
             }
             at += character.len_utf8();
@@ -248,7 +216,8 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
         let name_start = at;
         while at < raw.len() {
             let character = raw[at..].chars().next().unwrap();
-            if js_space(character) || matches!(character, '=' | '"' | '\'' | '<' | '>') {
+            if javascript_whitespace(character) || matches!(character, '=' | '"' | '\'' | '<' | '>')
+            {
                 break;
             }
             at += character.len_utf8();
@@ -258,14 +227,14 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
             continue;
         }
         let name = raw[name_start..at].to_ascii_lowercase();
-        while at < raw.len() && raw[at..].chars().next().is_some_and(js_space) {
+        while at < raw.len() && raw[at..].chars().next().is_some_and(javascript_whitespace) {
             at += raw[at..].chars().next().unwrap().len_utf8();
         }
         if raw.as_bytes().get(at) != Some(&b'=') {
             continue;
         }
         at += 1;
-        while at < raw.len() && raw[at..].chars().next().is_some_and(js_space) {
+        while at < raw.len() && raw[at..].chars().next().is_some_and(javascript_whitespace) {
             at += raw[at..].chars().next().unwrap().len_utf8();
         }
         let Some(first) = raw[at..].chars().next() else {
@@ -287,7 +256,9 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
             let start = at;
             while at < raw.len() {
                 let character = raw[at..].chars().next().unwrap();
-                if js_space(character) || matches!(character, '"' | '\'' | '=' | '<' | '>') {
+                if javascript_whitespace(character)
+                    || matches!(character, '"' | '\'' | '=' | '<' | '>')
+                {
                     break;
                 }
                 at += character.len_utf8();
@@ -306,10 +277,6 @@ fn attribute(attributes: &HashMap<String, String>, name: &str) -> String {
         .get(&name.to_ascii_lowercase())
         .cloned()
         .unwrap_or_default()
-}
-
-fn utf16_len(value: &str) -> usize {
-    value.encode_utf16().count()
 }
 
 fn clean_section_id(raw: &str) -> String {
@@ -361,13 +328,13 @@ fn page_value(raw: &str) -> String {
     let star = STAR.get_or_init(|| Regex::new(r"^\*+").unwrap());
     let mut value = raw;
     if let Some(found) = star.find(value) {
-        value = value[found.end()..].trim_start_matches(js_space);
+        value = value[found.end()..].trim_start_matches(javascript_whitespace);
     }
     let page = PAGE.get_or_init(|| Regex::new(r"(?i)^(?:page|p\.)").unwrap());
     if let Some(found) = page.find(value) {
         let rest = &value[found.end()..];
-        if rest.chars().next().is_some_and(js_space) {
-            value = rest.trim_start_matches(js_space);
+        if rest.chars().next().is_some_and(javascript_whitespace) {
+            value = rest.trim_start_matches(javascript_whitespace);
         }
     }
     trim_js(value).to_owned()
@@ -391,7 +358,7 @@ fn page_identity(
             "page{}",
             page_label
                 .chars()
-                .filter(|value| !js_space(*value))
+                .filter(|value| !javascript_whitespace(*value))
                 .collect::<String>()
         )
     };
@@ -464,7 +431,7 @@ fn footnote_identity(raw: &str, id: &str, anchor: Option<String>) -> Option<Pend
     }
     let compact = id
         .chars()
-        .filter(|value| !js_space(*value))
+        .filter(|value| !javascript_whitespace(*value))
         .collect::<String>();
     let id_symbol = compact
         .to_ascii_lowercase()
@@ -684,11 +651,11 @@ fn courtlistener_footnote_container(
 }
 
 fn citation_page_alias(citation: &str, label: &str) -> String {
-    let trimmed = citation.trim_end_matches(js_space);
+    let trimmed = citation.trim_end_matches(javascript_whitespace);
     let start = trimmed
         .char_indices()
         .rev()
-        .find(|(_, value)| js_space(*value))
+        .find(|(_, value)| javascript_whitespace(*value))
         .map_or(0, |(at, value)| at + value.len_utf8());
     if start == trimmed.len() {
         citation.to_owned()
@@ -751,7 +718,10 @@ fn leading_footnote_marker(value: &str) -> Option<&str> {
     };
     (end > 0
         && value[..end].chars().count() <= 7
-        && value[end..].chars().next().is_none_or(js_space))
+        && value[end..]
+            .chars()
+            .next()
+            .is_none_or(javascript_whitespace))
     .then(|| &value[..end])
 }
 
@@ -809,9 +779,11 @@ fn void_tag(tag: &str) -> bool {
 
 fn parse_tag(raw: &str, closing: bool) -> Option<(String, String)> {
     let mut value = raw.strip_prefix('<')?;
-    value = value.trim_start_matches(js_space);
+    value = value.trim_start_matches(javascript_whitespace);
     if closing {
-        value = value.strip_prefix('/')?.trim_start_matches(js_space);
+        value = value
+            .strip_prefix('/')?
+            .trim_start_matches(javascript_whitespace);
     } else if value
         .chars()
         .next()
@@ -837,17 +809,15 @@ fn append_text(parts: &mut Vec<String>, position: &mut usize, value: &str) {
         return;
     }
     let prior = parts.last().map(String::as_str).unwrap_or_default();
-    let separated = prior
-        .chars()
-        .next_back()
-        .is_some_and(|value| js_space(value) || matches!(value, '(' | '[' | '{' | '/' | '-'))
-        || value.chars().next().is_some_and(|value| {
-            js_space(value)
-                || matches!(
-                    value,
-                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | '}' | ']' | '/' | '-'
-                )
-        });
+    let separated = prior.chars().next_back().is_some_and(|value| {
+        javascript_whitespace(value) || matches!(value, '(' | '[' | '{' | '/' | '-')
+    }) || value.chars().next().is_some_and(|value| {
+        javascript_whitespace(value)
+            || matches!(
+                value,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | '}' | ']' | '/' | '-'
+            )
+    });
     if !prior.is_empty() && !separated {
         parts.push(" ".to_owned());
         *position += 1;
@@ -912,7 +882,8 @@ fn render_markup(
         if markup.as_bytes()[at] != b'<' {
             let end = markup[at..].find('<').map_or(markup.len(), |end| at + end);
             let raw = &markup[at..end];
-            let rendered = trim_js(&collapse_js_space(&decode_entities(raw))).to_owned();
+            let rendered =
+                trim_js(&normalize_javascript_whitespace(&decode_entities(raw))).to_owned();
             if let Some(pending) = unlabelled_footnotes.last().cloned() {
                 if !rendered.is_empty() {
                     unlabelled_footnotes.pop();
@@ -937,7 +908,7 @@ fn render_markup(
                             "page{}",
                             label
                                 .chars()
-                                .filter(|value| !js_space(*value))
+                                .filter(|value| !javascript_whitespace(*value))
                                 .collect::<String>()
                         )
                     },
@@ -1025,11 +996,11 @@ fn render_markup(
             continue;
         };
         let syntactic_self_closing = raw[..raw.len() - 1]
-            .trim_end_matches(js_space)
+            .trim_end_matches(javascript_whitespace)
             .ends_with('/');
         let attrs = if syntactic_self_closing {
             attrs
-                .trim_end_matches(js_space)
+                .trim_end_matches(javascript_whitespace)
                 .strip_suffix('/')
                 .unwrap_or(&attrs)
         } else {
@@ -1124,7 +1095,7 @@ fn render_markup(
         at = end;
     }
     let normalized = normalized_text(parts);
-    let leading = normalized.len() - normalized.trim_start_matches(js_space).len();
+    let leading = normalized.len() - normalized.trim_start_matches(javascript_whitespace).len();
     let leading_trim = utf16_len(&normalized[..leading]);
     let text = trim_js(&normalized).to_owned();
     let raw_end = leading_trim + utf16_len(&text);
@@ -1166,8 +1137,12 @@ fn render_markup(
             });
         }
     }
+    // Raw renderer offsets are UTF-16 positions in normalized provider text
+    // before the outer JavaScript trim. Subtracting leading_trim projects them
+    // onto rendered SourceDoc text; split-surrogate positions remain invalid.
+    let normalized_coordinates = ScalarText::new(&normalized);
     let text_utf16 = utf16_len(&text);
-    let normalized_utf16 = utf16_len(&normalized);
+    let normalized_utf16 = normalized_coordinates.utf16_len();
     let mut projected = Vec::with_capacity(blocks.len());
     for block in blocks {
         let start = block.start.checked_sub(leading_trim).ok_or_else(|| {
@@ -1190,11 +1165,15 @@ fn render_markup(
                     "native block has an invalid trim overhang",
                 ));
             }
-            let from = utf16_byte(&normalized, raw_end)?;
-            let until = utf16_byte(&normalized, block.end)?;
+            let from = normalized_coordinates
+                .byte_at_utf16(raw_end)
+                .ok_or_else(|| EngineError::source("UTF-16 range splits a Unicode scalar"))?;
+            let until = normalized_coordinates
+                .byte_at_utf16(block.end)
+                .ok_or_else(|| EngineError::source("UTF-16 range splits a Unicode scalar"))?;
             if normalized[from..until]
                 .chars()
-                .any(|value| !js_space(value))
+                .any(|value| !javascript_whitespace(value))
             {
                 return Err(EngineError::source(
                     "native block trim overhang contains text",
@@ -1232,23 +1211,6 @@ fn render_markup(
         source_hash: format!("{:x}", Sha256::digest(markup.as_bytes())),
         harvard_casebody,
     })
-}
-
-fn utf16_byte(value: &str, target: usize) -> Result<usize, EngineError> {
-    if target == utf16_len(value) {
-        return Ok(value.len());
-    }
-    let mut used = 0;
-    for (at, character) in value.char_indices() {
-        if used == target {
-            return Ok(at);
-        }
-        used += character.len_utf16();
-        if used > target {
-            break;
-        }
-    }
-    Err(EngineError::source("UTF-16 range splits a Unicode scalar"))
 }
 
 fn report_start(citation: Option<&str>) -> Option<u32> {
@@ -1348,15 +1310,17 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         "{:x}",
         Sha256::digest(serde_json::to_vec(&adapter).map_err(EngineError::source)?)
     );
-    let offsets = utf16_offsets(&text);
+    // At this boundary all provider ranges are exact UTF-16 offsets in the
+    // final rendered (or fallback) SourceDoc text, never in source markup.
+    let coordinates = ScalarText::new(&text);
     let scalar = |offset: usize| {
-        offsets
-            .binary_search(&offset)
-            .map_err(|_| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
+        coordinates
+            .scalar_at_utf16(offset)
+            .ok_or_else(|| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
     };
     let mut originals = HashMap::new();
     let mut claims = Vec::new();
-    let text_utf16 = *offsets.last().unwrap();
+    let text_utf16 = coordinates.utf16_len();
     for (index, raw) in rendered_blocks.iter().enumerate() {
         let id = format!("native-{:06}", index + 1);
         let claim_end = raw.end.min(text_utf16);
@@ -1395,7 +1359,7 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         .iter()
         .map(|block| block.kind.evidence())
         .collect::<HashSet<_>>();
-    let scalar_end = offsets.len() - 1;
+    let scalar_end = coordinates.len();
     let coverage = [
         EvidenceKind::Paragraph,
         EvidenceKind::Prose,
@@ -1500,5 +1464,27 @@ mod tests {
             .map(|block| block.label.as_str())
             .collect::<Vec<_>>();
         assert_eq!(pages, ["page200", "page201"]);
+    }
+
+    #[test]
+    fn provider_blocks_keep_rendered_utf16_offsets_across_astral_text() {
+        let document = native_markup_source_doc(NativeMarkupInput {
+            provider: "courtlistener".to_owned(),
+            id: "astral".to_owned(),
+            url: None,
+            text: String::new(),
+            markup: Some("<p id=\"paragraph-1\">\u{1f9ab}e\u{301}</p>".to_owned()),
+            citation: None,
+            page_citations: Vec::new(),
+            scope: default_scope(),
+        })
+        .unwrap();
+        assert_eq!(document.text, "\u{1f9ab}e\u{301}");
+        let paragraph = document
+            .blocks
+            .iter()
+            .find(|block| block.kind == SourceDocKind::Paragraph)
+            .expect("provider paragraph");
+        assert_eq!((paragraph.start, paragraph.end), (0, 4));
     }
 }

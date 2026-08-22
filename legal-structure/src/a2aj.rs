@@ -1,7 +1,7 @@
 use crate::{
-    compose_trusted, Coverage, CoverageState, DetectionProfile, DocumentInput, EngineError,
-    EvidenceKind, NativeClaim, Origin, ParagraphBreak, Scope, ScopeKind, SourceDoc, SourceDocBlock,
-    SourceDocKind, SourceDocOrigin, SourceDocType, EVIDENCE_SCHEMA,
+    compose_trusted, utf16_len, Coverage, CoverageState, DetectionProfile, DocumentInput,
+    EngineError, EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarText, Scope, ScopeKind,
+    SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin, SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -150,6 +150,8 @@ fn utf16_at(text: &str, byte: usize) -> usize {
 }
 
 fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<SourceDocBlock>) {
+    // Appended map values and synthetic LFs directly form final provider text;
+    // block offsets are JavaScript UTF-16 positions in that rendered string.
     if !text.trim().is_empty() || entries.is_empty() {
         return (text, Vec::new());
     }
@@ -165,7 +167,7 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<S
         }
         let start = utf16;
         text.push_str(value);
-        utf16 += value.encode_utf16().count();
+        utf16 += utf16_len(value);
         blocks.push(SourceDocBlock::new(
             SourceDocKind::Section,
             format!("sec{}", label.trim()),
@@ -179,7 +181,8 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<S
 
 fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
     static PRINTED: OnceLock<Regex> = OnceLock::new();
-    let utf16 = |byte| text[..byte].encode_utf16().count();
+    // Unique matches are UTF-8 byte ranges in final provider-rendered text.
+    let coordinates = ScalarText::new(text);
     map.iter()
         .filter_map(|(raw_label, value)| {
             let label = raw_label.trim();
@@ -207,8 +210,12 @@ fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
             Some(SourceDocBlock::new(
                 SourceDocKind::Section,
                 format!("sec{label}"),
-                utf16(start),
-                utf16(end),
+                coordinates
+                    .utf16_at_byte(start)
+                    .expect("matched provider section starts at a UTF-8 boundary"),
+                coordinates
+                    .utf16_at_byte(end)
+                    .expect("matched provider section ends at a UTF-8 boundary"),
                 SourceDocOrigin::Native,
             ))
         })
@@ -221,11 +228,11 @@ fn evidence(
     blocks: Vec<SourceDocBlock>,
 ) -> Result<DocumentInput, EngineError> {
     const ORIGIN: &str = "provider-adapter";
-    let offsets = crate::source_doc::utf16_offsets(&text);
+    let coordinates = ScalarText::new(&text);
     let scalar = |offset: usize| {
-        offsets
-            .binary_search(&offset)
-            .map_err(|_| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
+        coordinates
+            .scalar_at_utf16(offset)
+            .ok_or_else(|| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
     };
     let mut originals = HashMap::new();
     let claims = blocks
@@ -251,7 +258,7 @@ fn evidence(
             Ok(claim)
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    let scalar_end = offsets.len() - 1;
+    let scalar_end = coordinates.len();
     let coverage = [
         EvidenceKind::Paragraph,
         EvidenceKind::Prose,
@@ -355,6 +362,8 @@ fn report_start(input: &A2ajInput) -> Option<u32> {
 
 fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
     static RE: OnceLock<Regex> = OnceLock::new();
+    // Keep these running totals local: tokenization already walks provider text
+    // once and needs byte and UTF-16 spans for every match.
     let mut previous = 0;
     let mut utf16 = 0;
     RE.get_or_init(|| Regex::new(r"[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*").unwrap())
@@ -454,9 +463,7 @@ fn apply_provider_section_evidence(
                     .map(|body_end| {
                         let body_utf16_start = tokens[first_token].1 - phrase[0].1;
                         let body_utf16_end = tokens[last_token].2
-                            + provider_text[phrase[phrase.len() - 1].4..]
-                                .encode_utf16()
-                                .count();
+                            + utf16_len(&provider_text[phrase[phrase.len() - 1].4..]);
                         (body_start, body_end, body_utf16_start, body_utf16_end)
                     })
             });
@@ -485,7 +492,7 @@ fn apply_provider_section_evidence(
                 )
                 .find(|printed| printed.eq_ignore_ascii_case(label));
             let start = printed.map_or(body_utf16_start, |_| {
-                body_utf16_start - text[line_start + lead..body_start].encode_utf16().count()
+                body_utf16_start - utf16_len(&text[line_start + lead..body_start])
             });
             blocks.push(SourceDocBlock::new(
                 SourceDocKind::Section,

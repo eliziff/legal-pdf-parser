@@ -1,7 +1,8 @@
+use crate::StructureGraphV2;
 #[cfg(feature = "structure-inference")]
 use crate::{
-    derive_structure_evidence, javascript_whitespace, DetectionProfile, DocumentInput, EngineError,
-    NodeKind, StructureGraphV2,
+    derive_structure_evidence, javascript_whitespace, text::normalize_javascript_whitespace,
+    DetectionProfile, DocumentInput, EngineError, NodeKind, ScalarText,
 };
 #[cfg(feature = "structure-inference")]
 use regex::Regex;
@@ -187,53 +188,7 @@ struct InstrumentContentsHead {
 }
 
 #[cfg(feature = "structure-inference")]
-fn utf16_boundaries(text: &str) -> Vec<(usize, usize)> {
-    let mut boundaries = Vec::new();
-    let mut utf16 = 0;
-    boundaries.push((0, 0));
-    for (byte, character) in text.char_indices() {
-        utf16 += character.len_utf16();
-        boundaries.push((byte + character.len_utf8(), utf16));
-    }
-    boundaries
-}
-
-#[cfg(feature = "structure-inference")]
-fn utf16_at_byte(boundaries: &[(usize, usize)], byte: usize) -> usize {
-    boundaries
-        .binary_search_by_key(&byte, |(at, _)| *at)
-        .map(|index| boundaries[index].1)
-        .unwrap_or_else(|index| boundaries[index.saturating_sub(1)].1)
-}
-
-#[cfg(feature = "structure-inference")]
-fn byte_at_utf16(boundaries: &[(usize, usize)], utf16: usize) -> usize {
-    boundaries
-        .binary_search_by_key(&utf16, |(_, at)| *at)
-        .map(|index| boundaries[index].0)
-        .unwrap_or_else(|index| boundaries[index.min(boundaries.len() - 1)].0)
-}
-
-#[cfg(feature = "structure-inference")]
-fn normalize_javascript_whitespace(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut separating = false;
-    for character in value.chars() {
-        if javascript_whitespace(character) {
-            separating = !normalized.is_empty();
-        } else {
-            if separating {
-                normalized.push(' ');
-            }
-            normalized.push(character);
-            separating = false;
-        }
-    }
-    normalized
-}
-
-#[cfg(feature = "structure-inference")]
-fn instrument_contents_anchors(text: &str) -> Vec<(usize, usize)> {
+fn instrument_contents_anchors(text: &str) -> Vec<usize> {
     static TABLE: OnceLock<Regex> = OnceLock::new();
     static BARE: OnceLock<Regex> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
@@ -280,28 +235,15 @@ fn instrument_contents_anchors(text: &str) -> Vec<(usize, usize)> {
         }
         start = end + text[end..].chars().next().unwrap().len_utf8();
     }
-    anchors
-        .into_iter()
-        .map(|(_, end)| (end, text[..end].encode_utf16().count()))
-        .collect()
-}
-
-#[cfg(feature = "structure-inference")]
-fn utf8_prefix_for_utf16(text: &str, limit: usize) -> usize {
-    let mut utf16 = 0;
-    for (byte, character) in text.char_indices() {
-        if utf16 + character.len_utf16() > limit {
-            return byte;
-        }
-        utf16 += character.len_utf16();
-    }
-    text.len()
+    anchors.into_iter().map(|(_, end)| end).collect()
 }
 
 #[cfg(feature = "structure-inference")]
 fn instrument_contents_heads(
     region: &str,
-    boundaries: &[(usize, usize)],
+    text: &ScalarText<'_>,
+    region_start_byte: usize,
+    region_start_utf16: usize,
 ) -> Vec<InstrumentContentsHead> {
     // Heads, not line breaks, delimit entries because source formats variously
     // pack entries, preserve spacing, or break them mid-entry. Schedule-like
@@ -371,8 +313,14 @@ fn instrument_contents_heads(
             heads.push(InstrumentContentsHead {
                 start_byte,
                 end_byte: trail.start(),
-                start_utf16: utf16_at_byte(boundaries, start_byte),
-                end_utf16: utf16_at_byte(boundaries, trail.start()),
+                start_utf16: text
+                    .utf16_at_byte(region_start_byte + start_byte)
+                    .expect("regex start is a UTF-8 boundary")
+                    - region_start_utf16,
+                end_utf16: text
+                    .utf16_at_byte(region_start_byte + trail.start())
+                    .expect("regex end is a UTF-8 boundary")
+                    - region_start_utf16,
                 kind,
             });
             search = trail.start();
@@ -450,16 +398,23 @@ fn instrument_roman_value(value: &str) -> Option<u32> {
 
 #[cfg(feature = "structure-inference")]
 fn instrument_contents_region(
-    text: &str,
+    text: &ScalarText<'_>,
     from_byte: usize,
     from_utf16: usize,
 ) -> Option<InstrumentContentsOutline> {
-    let suffix = &text[from_byte..];
-    let region_end = utf8_prefix_for_utf16(suffix, CONTENTS_WINDOW_UTF16);
-    let region = &suffix[..region_end];
-    let region_boundaries = utf16_boundaries(region);
-    let region_utf16 = region_boundaries.last().map_or(0, |(_, utf16)| *utf16);
-    let heads = instrument_contents_heads(region, &region_boundaries);
+    // Every reported offset stays on the original, unnormalized instrument
+    // text. The historical window floors a split surrogate; the final-entry
+    // lookahead below ceils one. Exact regex boundaries need no rounding.
+    let requested_utf16 = CONTENTS_WINDOW_UTF16.min(text.utf16_len() - from_utf16);
+    let region_end = text
+        .byte_at_utf16_floor(from_utf16 + requested_utf16)
+        .expect("bounded UTF-16 window");
+    let region_utf16 = text
+        .utf16_at_byte(region_end)
+        .expect("contents window ends at a UTF-8 boundary")
+        - from_utf16;
+    let region = &text.value[from_byte..region_end];
+    let heads = instrument_contents_heads(region, text, from_byte, from_utf16);
     if heads.is_empty() || heads[0].start_utf16 > CONTENTS_MAX_ENTRY_GAP_UTF16 {
         return None;
     }
@@ -482,7 +437,9 @@ fn instrument_contents_region(
         {
             heads[index + 1].start_byte
         } else {
-            byte_at_utf16(&region_boundaries, (head.end_utf16 + 200).min(region_utf16))
+            text.byte_at_utf16_ceil(from_utf16 + (head.end_utf16 + 200).min(region_utf16))
+                .expect("bounded UTF-16 contents cut")
+                - from_byte
         };
         let raw = &region[head.end_byte..until_byte];
         let raw = instrument_contents_unit_end(raw).map_or(raw, |cut| &raw[..cut]);
@@ -622,8 +579,20 @@ pub fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
             refusal: Some(InstrumentContentsRefusal::NoContentsMarker),
         };
     }
+    let text = ScalarText::new(text);
+    instrument_contents_outline_from_anchors(&text, anchors)
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_contents_outline_from_anchors(
+    text: &ScalarText<'_>,
+    anchors: Vec<usize>,
+) -> InstrumentContentsReading {
     let mut refusal = InstrumentContentsRefusal::NoContentsEntries;
-    for (from_byte, from_utf16) in anchors {
+    for from_byte in anchors {
+        let from_utf16 = text
+            .utf16_at_byte(from_byte)
+            .expect("contents anchor end is a UTF-8 boundary");
         let Some(outline) = instrument_contents_region(text, from_byte, from_utf16) else {
             continue;
         };
@@ -643,6 +612,19 @@ pub fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
     InstrumentContentsReading {
         outline: None,
         refusal: Some(refusal),
+    }
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_contents_outline_indexed(text: &ScalarText<'_>) -> InstrumentContentsReading {
+    let anchors = instrument_contents_anchors(text.value);
+    if anchors.is_empty() {
+        InstrumentContentsReading {
+            outline: None,
+            refusal: Some(InstrumentContentsRefusal::NoContentsMarker),
+        }
+    } else {
+        instrument_contents_outline_from_anchors(text, anchors)
     }
 }
 
@@ -675,7 +657,7 @@ fn instrument_roman(mut value: usize) -> String {
 #[cfg(feature = "structure-inference")]
 fn instrument_reference_index(
     graph: &StructureGraphV2,
-    scalar_to_utf16: &[usize],
+    text: &ScalarText<'_>,
 ) -> Result<HashMap<String, usize>, EngineError> {
     let mut index = HashMap::new();
     let mut duplicates = HashSet::new();
@@ -687,9 +669,8 @@ fn instrument_reference_index(
         let Some(label) = node.label.as_deref() else {
             continue;
         };
-        let start = scalar_to_utf16
-            .get(node.range.start)
-            .copied()
+        let start = text
+            .utf16_at_scalar(node.range.start)
             .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
         let mut keys = vec![label.to_ascii_lowercase()];
         for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
@@ -720,19 +701,23 @@ pub fn select_instrument_lineation(
     graphs: &[StructureGraphV2],
     references: &[InstrumentReferenceEvidence],
 ) -> Result<usize, EngineError> {
+    select_instrument_lineation_indexed(&ScalarText::new(text), graphs, references)
+}
+
+#[cfg(feature = "structure-inference")]
+fn select_instrument_lineation_indexed(
+    text: &ScalarText<'_>,
+    graphs: &[StructureGraphV2],
+    references: &[InstrumentReferenceEvidence],
+) -> Result<usize, EngineError> {
     if graphs.is_empty() {
         return Err(EngineError::invalid(
             "instrument lineation selection requires a graph",
         ));
     }
-    let mut scalar_to_utf16 = Vec::with_capacity(text.chars().count() + 1);
-    scalar_to_utf16.push(0);
-    for character in text.chars() {
-        scalar_to_utf16.push(scalar_to_utf16.last().copied().unwrap() + character.len_utf16());
-    }
-    let text_length = *scalar_to_utf16.last().unwrap();
+    let text_length = text.utf16_len();
     let score = |graph: &StructureGraphV2| -> Result<usize, EngineError> {
-        let index = instrument_reference_index(graph, &scalar_to_utf16)?;
+        let index = instrument_reference_index(graph, text)?;
         Ok(references
             .iter()
             .filter(|reference| {
@@ -752,9 +737,8 @@ pub fn select_instrument_lineation(
         let mut high = 0;
         let mut found = false;
         for start in starts {
-            let start = scalar_to_utf16
-                .get(start)
-                .copied()
+            let start = text
+                .utf16_at_scalar(start)
                 .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
             low = low.min(start);
             high = high.max(start);
@@ -800,7 +784,8 @@ pub fn derive_instrument_structure(
         .into_iter()
         .map(derive_structure_evidence)
         .collect::<Result<Vec<_>, _>>()?;
-    let selected = select_instrument_lineation(text, &graphs, references)?;
+    let text = ScalarText::new(text);
+    let selected = select_instrument_lineation_indexed(&text, &graphs, references)?;
     let graph = graphs
         .into_iter()
         .nth(selected)
@@ -808,11 +793,11 @@ pub fn derive_instrument_structure(
     Ok(InstrumentStructureAnalysis {
         selected,
         graph,
-        contents: instrument_contents_outline(text),
+        contents: instrument_contents_outline_indexed(&text),
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "structure-inference"))]
 mod tests {
     use super::*;
 
@@ -908,6 +893,16 @@ mod tests {
         let outline = reading.outline.as_ref().expect("accepted outline");
         assert_eq!(outline.region_start, 9);
         assert_eq!(outline.entries[0].contents_line_start, 9);
+    }
+
+    #[test]
+    fn contents_keep_astral_combining_text_and_crlf_offsets() {
+        let text = "\u{1f9ab}\r\nINDEX\r\nSection 1. First \u{1f9ab} e\u{301} 1\rSection 2. Second 2\nSection 3. Third 3\r\nSection 4. Fourth 4\nSection 5. Fifth 5";
+        let outline = instrument_contents_outline(text).outline.unwrap();
+        assert_eq!(outline.region_start, 11);
+        assert_eq!(outline.entries[0].contents_line_start, 11);
+        assert_eq!(outline.entries[0].heading, "First \u{1f9ab} e\u{301}");
+        assert_eq!(outline.entries.last().unwrap().label, "sec5");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::source_doc::BlockFieldOrder;
 use crate::{
-    create_source_doc, EngineError, SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
-    SourceDocProvider,
+    create_source_doc, utf16_len, EngineError, ScalarText, SourceDoc, SourceDocBlock,
+    SourceDocKind, SourceDocOrigin, SourceDocProvider,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -65,10 +65,6 @@ struct Title {
     start: usize,
     label: Option<String>,
     aliases: Vec<String>,
-}
-
-fn utf16_len(value: &str) -> usize {
-    value.encode_utf16().count()
 }
 
 fn public_label(prefix: &str, value: &str) -> String {
@@ -144,6 +140,8 @@ pub fn journal_text_source_doc(
     text: String,
     page_labels: &[JournalPageLabel],
 ) -> Result<SourceDoc, EngineError> {
+    // Marker lines are removed first. Page offsets therefore address the clean
+    // rendered text, retaining every CR/LF code unit on non-marker lines.
     let mut starts = Vec::new();
     let mut clean = String::with_capacity(text.len());
     let mut page_cursor = 0;
@@ -219,9 +217,13 @@ pub fn journal_source_doc(
             offset += 1;
         }
         pages += 1;
+        // JSON page text is appended unchanged, with one synthetic LF between
+        // pages. Region matches are byte offsets in the original page string
+        // and are converted exactly into that final rendered UTF-16 plane.
         let page_start = offset;
+        let page_coordinates = ScalarText::new(&page.text);
         text.push_str(&page.text);
-        offset += utf16_len(&page.text);
+        offset += page_coordinates.utf16_len();
         let pdf_page = page.pdf_page.filter(|value| *value > 0);
         if let Some(pdf_page) = pdf_page {
             let label = page_labels
@@ -271,8 +273,14 @@ pub fn journal_source_doc(
             let start_byte = cursor + found;
             cursor = start_byte + region.text.len();
             let placed = Region {
-                start: page_start + utf16_len(&page.text[..start_byte]),
-                end: page_start + utf16_len(&page.text[..cursor]),
+                start: page_start
+                    + page_coordinates
+                        .utf16_at_byte(start_byte)
+                        .expect("matched journal region starts at a UTF-8 boundary"),
+                end: page_start
+                    + page_coordinates
+                        .utf16_at_byte(cursor)
+                        .expect("matched journal region ends at a UTF-8 boundary"),
                 pdf_page,
             };
             if region.kind.as_deref() == Some("text") {
@@ -466,5 +474,57 @@ mod tests {
             .blocks
             .iter()
             .all(|block| block.kind == SourceDocKind::Page));
+    }
+
+    #[test]
+    fn plain_text_page_offsets_use_clean_text_utf16_coordinates() {
+        let doc = journal_text_source_doc(
+            4,
+            None,
+            "[page 1]\r\n\u{1f9ab}e\u{301}\r\n[page 2]\nZ".to_owned(),
+            &[
+                JournalPageLabel {
+                    label: "1".to_owned(),
+                    pdf_page: 1,
+                },
+                JournalPageLabel {
+                    label: "2".to_owned(),
+                    pdf_page: 2,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(doc.text, "\u{1f9ab}e\u{301}\r\nZ");
+        assert_eq!(
+            doc.blocks
+                .iter()
+                .map(|block| (block.start, block.end))
+                .collect::<Vec<_>>(),
+            [(0, 6), (6, 7)]
+        );
+    }
+
+    #[test]
+    fn json_regions_convert_original_page_bytes_to_rendered_utf16() {
+        let pages = concat!(
+            r#"{"article_id":"5","text":"\ud83e\uddab\nBody","pdf_page":1,"regions":[{"order":0,"type":"text","text":"Body"}]}"#,
+            "\n",
+        );
+        let doc = journal_source_doc(
+            5,
+            None,
+            Cursor::new(pages),
+            &[JournalPageLabel {
+                label: "1".to_owned(),
+                pdf_page: 1,
+            }],
+        )
+        .unwrap();
+        let paragraph = doc
+            .blocks
+            .iter()
+            .find(|block| block.kind == SourceDocKind::Paragraph)
+            .expect("native paragraph");
+        assert_eq!((paragraph.start, paragraph.end), (3, 7));
     }
 }
