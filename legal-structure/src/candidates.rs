@@ -39,10 +39,8 @@ pub fn detect_structure_candidate_runs(value: &str) -> Vec<StructureCandidateRun
             )
         );
         let label = text
-            .slice(ScalarRange {
-                start: point.range.start,
-                end: content_start,
-            })
+            .slice(point.range.start..content_start)
+            .expect("grammar point range is bounded")
             .trim()
             .to_owned();
         entry.0.push(StructureMarkerCandidate {
@@ -479,7 +477,13 @@ pub fn resolve_structure_graph(
                 range: pair.body.range,
                 origin_id: ENGINE_ORIGIN.to_owned(),
                 source: Derivation::Heuristic,
-                label: Some(scalar_text.slice(pair.label.range).trim().to_owned()),
+                label: Some(
+                    scalar_text
+                        .slice(pair.label.range.start..pair.label.range.end)
+                        .expect("validated note label range")
+                        .trim()
+                        .to_owned(),
+                ),
                 locator_kind: None,
                 aliases: None,
                 parent_id: None,

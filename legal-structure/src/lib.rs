@@ -10,20 +10,22 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "a2aj")]
 mod a2aj;
+mod instrument;
 #[cfg(feature = "journal")]
 mod journal;
-mod instrument;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 mod native_markup;
 mod numeric_sequence;
 mod sidecar;
 #[cfg(feature = "source-doc")]
 mod source_doc;
+#[cfg(any(test, feature = "structure-inference", feature = "source-doc"))]
+mod text;
 #[cfg(feature = "a2aj")]
 pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
+pub use instrument::*;
 #[cfg(feature = "journal")]
 pub use journal::{journal_source_doc, journal_text_source_doc, JournalPageLabel};
-pub use instrument::*;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use native_markup::{native_markup_source_doc, NativeMarkupInput};
 pub use numeric_sequence::*;
@@ -35,6 +37,12 @@ pub use source_doc::{
     create_source_doc, ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind,
     SourceDocOrigin, SourceDocProvider, SourceDocType,
 };
+#[cfg(feature = "structure-inference")]
+pub(crate) use text::javascript_whitespace;
+#[cfg(any(feature = "structure-inference", feature = "a2aj", feature = "journal"))]
+pub(crate) use text::utf16_len;
+#[cfg(any(feature = "structure-inference", feature = "source-doc"))]
+pub(crate) use text::ScalarText;
 
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const RESULT_SCHEMA: &str = "legalpdf.structure-graph.v2";
@@ -43,11 +51,6 @@ pub const SOURCE_DOC_VERSION: u32 = 1;
 const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
 const MAX_DOCUMENTS: usize = 25;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
-
-#[cfg(feature = "structure-inference")]
-fn javascript_whitespace(character: char) -> bool {
-    character == '\u{feff}' || (character != '\u{85}' && character.is_whitespace())
-}
 
 #[derive(Debug)]
 pub struct EngineError {
@@ -920,149 +923,6 @@ pub struct ResolvedCandidate {
     pub line_ids: Vec<String>,
 }
 
-#[cfg(feature = "structure-inference")]
-#[derive(Clone, Copy)]
-struct OffsetCheckpoint {
-    scalar: usize,
-    byte: usize,
-    utf16: usize,
-}
-
-#[cfg(feature = "structure-inference")]
-struct ScalarText<'a> {
-    value: &'a str,
-    offsets: Vec<OffsetCheckpoint>,
-    scalar_len: usize,
-    utf16_len: usize,
-    lines: Vec<(usize, usize, usize)>,
-}
-
-#[cfg(feature = "structure-inference")]
-impl<'a> ScalarText<'a> {
-    fn new(value: &'a str) -> Self {
-        if value.is_ascii() {
-            let mut lines = Vec::new();
-            let mut line_start = 0;
-            for (at, byte) in value.bytes().enumerate() {
-                if byte != b'\n' {
-                    continue;
-                }
-                let end = at - usize::from(at > line_start && value.as_bytes()[at - 1] == b'\r');
-                lines.push((line_start, end, line_start));
-                line_start = at + 1;
-            }
-            let end = value.len() - usize::from(value.as_bytes().last() == Some(&b'\r'));
-            lines.push((line_start, end, line_start));
-            return Self {
-                value,
-                offsets: Vec::new(),
-                scalar_len: value.len(),
-                utf16_len: value.len(),
-                lines,
-            };
-        }
-        const STRIDE: usize = 256;
-        let mut offsets = Vec::new();
-        let mut lines = Vec::new();
-        let mut utf16_len = 0;
-        let mut scalar_len = 0;
-        let mut line_start = (0, 0);
-        for (scalar, (at, character)) in value.char_indices().enumerate() {
-            if scalar % STRIDE == 0 {
-                offsets.push(OffsetCheckpoint {
-                    scalar,
-                    byte: at,
-                    utf16: utf16_len,
-                });
-            }
-            if character == '\n' {
-                let end = at - usize::from(at > line_start.0 && value.as_bytes()[at - 1] == b'\r');
-                lines.push((line_start.0, end, line_start.1));
-                line_start = (at + 1, scalar + 1);
-            }
-            scalar_len = scalar + 1;
-            utf16_len += character.len_utf16();
-        }
-        if offsets
-            .last()
-            .is_none_or(|offset| offset.scalar != scalar_len)
-        {
-            offsets.push(OffsetCheckpoint {
-                scalar: scalar_len,
-                byte: value.len(),
-                utf16: utf16_len,
-            });
-        }
-        let end = value.len() - usize::from(value.as_bytes().last() == Some(&b'\r'));
-        lines.push((line_start.0, end, line_start.1));
-        Self {
-            value,
-            offsets,
-            scalar_len,
-            utf16_len,
-            lines,
-        }
-    }
-    fn len(&self) -> usize {
-        self.scalar_len
-    }
-    fn checkpoint_for_scalar(&self, scalar: usize) -> OffsetCheckpoint {
-        self.offsets[self
-            .offsets
-            .partition_point(|offset| offset.scalar <= scalar)
-            - 1]
-    }
-    fn checkpoint_for_byte(&self, byte: usize) -> OffsetCheckpoint {
-        self.offsets[self.offsets.partition_point(|offset| offset.byte <= byte) - 1]
-    }
-    fn scalar(&self, byte: usize) -> usize {
-        if self.offsets.is_empty() {
-            byte
-        } else {
-            let offset = self.checkpoint_for_byte(byte);
-            offset.scalar + self.value[offset.byte..byte].chars().count()
-        }
-    }
-    fn byte(&self, scalar: usize) -> usize {
-        if self.offsets.is_empty() {
-            scalar
-        } else {
-            let offset = self.checkpoint_for_scalar(scalar);
-            if offset.scalar == scalar {
-                offset.byte
-            } else {
-                offset.byte
-                    + self.value[offset.byte..]
-                        .char_indices()
-                        .nth(scalar - offset.scalar)
-                        .map_or(self.value.len() - offset.byte, |(byte, _)| byte)
-            }
-        }
-    }
-    fn utf16(&self, scalar: usize) -> usize {
-        if self.offsets.is_empty() {
-            scalar
-        } else {
-            let offset = self.checkpoint_for_scalar(scalar);
-            offset.utf16
-                + self.value[offset.byte..self.byte(scalar)]
-                    .encode_utf16()
-                    .count()
-        }
-    }
-    fn utf16_len(&self) -> usize {
-        self.utf16_len
-    }
-    fn slice(&self, range: ScalarRange) -> &'a str {
-        &self.value[self.byte(range.start)..self.byte(range.end)]
-    }
-}
-
-#[cfg(feature = "structure-inference")]
-fn utf16_len(value: &str) -> usize {
-    value.encode_utf16().count()
-}
-
 #[derive(Clone)]
 struct Block {
     kind: NodeKind,
@@ -1099,15 +959,15 @@ mod derive;
 pub use candidates::{
     detect_structure_candidate_runs, resolve_structure_candidates, resolve_structure_graph,
 };
-pub use derive::derive_native_structure_evidence;
-#[cfg(feature = "structure-inference")]
-pub use derive::derive_structure_evidence;
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
+pub use derive::compose;
 #[cfg(feature = "source-doc")]
 pub use derive::compose_native;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub use derive::compose;
-#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub(crate) use derive::compose_trusted;
+pub use derive::derive_native_structure_evidence;
+#[cfg(feature = "structure-inference")]
+pub use derive::derive_structure_evidence;
 
 #[cfg(test)]
 mod tests;

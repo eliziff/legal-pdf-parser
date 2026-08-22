@@ -34,20 +34,38 @@ struct Line<'a> {
 }
 
 fn lines<'a>(text: &'a ScalarText<'a>) -> impl Iterator<Item = Line<'a>> + 'a {
-    text.lines
-        .iter()
-        .map(|&(byte_start, byte_end, scalar_start)| {
-            let text = &text.value[byte_start..byte_end];
-            Line {
-                byte_start,
-                byte_end,
-                scalar_start,
-                text,
-            }
-        })
+    let mut rest = text.value;
+    let mut byte_start = 0;
+    let mut scalar_start = 0;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        let (raw, consumed) = rest.find('\n').map_or_else(
+            || {
+                finished = true;
+                (rest, rest.len())
+            },
+            |newline| (&rest[..newline], newline + 1),
+        );
+        let line_text = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = Line {
+            byte_start,
+            byte_end: byte_start + line_text.len(),
+            scalar_start,
+            text: line_text,
+        };
+        scalar_start += rest[..consumed].chars().count();
+        byte_start += consumed;
+        rest = &rest[consumed..];
+        Some(line)
+    })
 }
 
 fn javascript_lines<'a>(text: &'a ScalarText<'a>) -> Vec<Line<'a>> {
+    // This is JavaScript regexp line segmentation, not coordinate conversion:
+    // CRLF is one break while its two source scalars remain counted.
     let mut result = Vec::new();
     let mut chars = text.value.char_indices().peekable();
     let (mut byte_start, mut scalar_start, mut scalar) = (0, 0, 0);
@@ -541,10 +559,8 @@ pub(super) fn raw_numeric_runs(text: &ScalarText<'_>) -> Vec<StructureCandidateR
                         .find(|boundary| *boundary > marker.start)
                         .unwrap_or(text.len());
                     let surface_label = text
-                        .slice(ScalarRange {
-                            start: marker.start,
-                            end: marker.content_start,
-                        })
+                        .slice(marker.start..marker.content_start)
+                        .expect("numeric marker range is bounded")
                         .trim()
                         .to_owned();
                     StructureMarkerCandidate {
@@ -663,10 +679,8 @@ pub(super) fn raw_enumerator_runs(text: &ScalarText<'_>) -> Vec<StructureCandida
                         .find(|boundary| *boundary > marker.start)
                         .unwrap_or(text.len());
                     let surface_label = text
-                        .slice(ScalarRange {
-                            start: marker.start,
-                            end: marker.content_start,
-                        })
+                        .slice(marker.start..marker.content_start)
+                        .expect("enumerator marker range is bounded")
                         .trim()
                         .to_owned();
                     StructureMarkerCandidate {
@@ -1053,7 +1067,11 @@ fn detect_paragraphs(
             .iter()
             .map(|range| {
                 if range.end >= range.start {
-                    word_count(text.slice(*range), contiguous)
+                    word_count(
+                        text.slice(range.start..range.end)
+                            .expect("section range is bounded"),
+                        contiguous,
+                    )
                 } else {
                     0
                 }
@@ -1150,7 +1168,11 @@ fn clipped_case_paragraphs(
             block.range.end = range.start;
         }
         block.range.end > block.range.start
-            && text.slice(block.range).chars().any(char::is_alphabetic)
+            && text
+                .slice(block.range.start..block.range.end)
+                .expect("block range is bounded")
+                .chars()
+                .any(char::is_alphabetic)
     });
     blocks
 }
@@ -2225,6 +2247,8 @@ fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)
 }
 
 fn instrument_space(character: char) -> bool {
+    // Instrument grammar historically admits Rust whitespace, including U+0085;
+    // it is therefore not the shared ECMAScript whitespace contract.
     character.is_whitespace() || character == '\u{feff}'
 }
 
@@ -2738,10 +2762,9 @@ fn detect_legislation(
             .collect();
         top.content_start = Some(section.content_start);
         result.push(top);
-        let value = text.slice(ScalarRange {
-            start: section.start,
-            end,
-        });
+        let value = text
+            .slice(section.start..end)
+            .expect("instrument section range is bounded");
         result.extend(enumerated_children(
             value,
             section.start,
@@ -2767,7 +2790,9 @@ fn detect_legislation(
         {
             continue;
         }
-        let value = text.slice(claim.range);
+        let value = text
+            .slice(claim.range.start..claim.range.end)
+            .expect("native claim range is bounded");
         let lead = leading_ascii_space(value);
         let content_start = value[lead..]
             .strip_prefix(label)
@@ -2884,10 +2909,9 @@ fn detect_journal(text: &ScalarText<'_>) -> Vec<Block> {
             } else {
                 line.scalar_start + line.text.chars().count()
             };
-            let value = text.slice(ScalarRange {
-                start: block_start,
-                end,
-            });
+            let value = text
+                .slice(block_start..end)
+                .expect("journal block range is bounded");
             let block_start =
                 if cached_regex!(PAGE, r"(?iu)^\[page [^\]\n]{1,40}\]").is_match(value) {
                     value
