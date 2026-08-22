@@ -43,16 +43,6 @@ fn infer_graph(
             proof: None,
         })
         .collect::<Vec<_>>();
-    let native = nodes
-        .iter()
-        .map(|node| {
-            (
-                node.kind,
-                node.label.as_deref(),
-                node.aliases.as_deref().unwrap_or(&[]),
-            )
-        })
-        .collect::<Vec<_>>();
     let mut counters = HashMap::<NodeKind, usize>::new();
     let generated = inferred
         .into_iter()
@@ -63,11 +53,15 @@ fn infer_graph(
             }) {
                 return None;
             }
-            (!native.iter().any(|(kind, label, aliases)| {
-                *kind == block.kind
+            (!evidence.native_claims.iter().any(|claim| {
+                claim.kind == block.kind.evidence()
                     && block.label.as_deref().is_some_and(|candidate| {
-                        label.is_some_and(|value| value.eq_ignore_ascii_case(candidate))
-                            || aliases
+                        claim
+                            .label
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(candidate))
+                            || claim
+                                .aliases
                                 .iter()
                                 .any(|value| value.eq_ignore_ascii_case(candidate))
                     })
