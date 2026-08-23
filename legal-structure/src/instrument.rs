@@ -98,16 +98,17 @@ fn split_instrument_sentence_joins(text: &str) -> Option<String> {
 /// The source lineation is first, so downstream selection keeps it on a tie.
 #[cfg(feature = "structure-inference")]
 fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = String> + '_ {
-    let spaced = split_instrument_space_runs(text);
-    let joined = split_instrument_sentence_joins(text);
-    let combined = spaced
-        .is_some()
-        .then(|| joined.as_deref().and_then(split_instrument_space_runs))
-        .flatten();
-    std::iter::once(text.to_owned())
-        .chain(spaced)
-        .chain(joined)
-        .chain(combined)
+    std::iter::once_with(|| text.to_owned())
+        .chain(std::iter::once_with(|| split_instrument_space_runs(text)).flatten())
+        .chain(std::iter::once_with(|| split_instrument_sentence_joins(text)).flatten())
+        .chain(
+            std::iter::once_with(|| {
+                split_instrument_space_runs(text)?;
+                split_instrument_sentence_joins(text)
+                    .and_then(|joined| split_instrument_space_runs(&joined))
+            })
+            .flatten(),
+        )
 }
 
 #[cfg(feature = "structure-inference")]
@@ -2038,7 +2039,7 @@ mod provision_reference_tests {
         assert_eq!(reference.shape, ProvisionReferenceShape::Numeric);
         assert!(!reference.external);
 
-        let astral = find("ðŸ˜€ Section 5.3");
+        let astral = find("\u{1f600} Section 5.3");
         assert_eq!((astral[0].start, astral[0].end), (3, 14));
     }
 

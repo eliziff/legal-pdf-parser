@@ -947,6 +947,7 @@ pub(crate) use candidates::resolve_structure_candidates;
 pub use candidates::{detect_structure_candidate_runs, resolve_structure_graph};
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use derive::derive_document_structure;
+#[cfg(any(feature = "journal", test))]
 pub(crate) use derive::derive_native_structure_evidence;
 #[cfg(all(feature = "structure-inference", test))]
 pub(crate) use derive::derive_structure_evidence;

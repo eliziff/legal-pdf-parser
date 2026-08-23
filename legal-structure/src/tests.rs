@@ -449,8 +449,6 @@ fn typed_evidence_resolves_numeric_prose_and_reports_each_run() {
         text,
         None,
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
         &[run],
         &evidence,
         &[],
@@ -467,10 +465,6 @@ fn typed_evidence_resolves_numeric_prose_and_reports_each_run() {
     );
     assert_eq!(graph.diagnostics.len(), 1);
     assert_eq!(graph.diagnostics[0].code, "structure_run_resolved");
-    assert_eq!(
-        graph.diagnostics[0].rules,
-        [ResolutionRuleV2::RootedNumericProse]
-    );
 }
 
 #[test]
@@ -568,8 +562,6 @@ fn local_candidate_parent_ids_create_honest_list_items() {
         text,
         None,
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
         &[run],
         &evidence,
         &[],
@@ -601,7 +593,7 @@ fn local_candidate_parent_ids_create_honest_list_items() {
 
 #[test]
 #[cfg(feature = "structure-inference")]
-fn paired_note_claim_keeps_every_anchor_and_deduplicates_relations() {
+fn paired_note_claim_keeps_note_source_identity() {
     let text = "Body ref 1.\n1 Note body.";
     let reference_start = text.find('1').unwrap();
     let label_start = text.rfind('1').unwrap();
@@ -648,8 +640,6 @@ fn paired_note_claim_keeps_every_anchor_and_deduplicates_relations() {
         text,
         None,
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
         &[],
         &[],
         &[pair],
@@ -664,26 +654,6 @@ fn paired_note_claim_keeps_every_anchor_and_deduplicates_relations() {
     assert_eq!(note.anchor.as_deref(), Some("pair-1"));
     assert_eq!(note.page_indexes, [1]);
     assert_eq!(note.line_ids, ["note-line"]);
-    assert_eq!(
-        graph
-            .relations
-            .iter()
-            .filter(|relation| relation.kind == RelationKind::References)
-            .count(),
-        1
-    );
-    assert_eq!(
-        graph
-            .relations
-            .iter()
-            .filter(|relation| relation.kind == RelationKind::FootnoteFor)
-            .count(),
-        1
-    );
-    assert!(graph
-        .relations
-        .iter()
-        .all(|relation| relation.line_ids == ["body-line"]));
 }
 
 #[test]

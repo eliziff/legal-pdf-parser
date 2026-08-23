@@ -4,14 +4,14 @@
 //! JavaScript code units. Exact conversions reject split characters; only the
 //! named floor/ceil methods round. CR, LF, and CRLF are never normalized.
 
-use std::{ops::Range, sync::OnceLock};
+use std::{borrow::Cow, ops::Range, sync::OnceLock};
 
 pub(crate) const JS_WHITESPACE_CLASS: &str = r"[\u{0009}-\u{000d}\u{0020}\u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}]";
 
 pub struct ScalarText<'a> {
     pub(crate) value: &'a str,
     /// Sparse `[scalar, byte, utf16]` checkpoints; ASCII is identity.
-    offsets: Vec<[usize; 3]>,
+    offsets: Cow<'a, [[usize; 3]]>,
     scalar_len: usize,
     utf16_len: usize,
     lines: OnceLock<Vec<[usize; 3]>>,
@@ -22,7 +22,7 @@ impl<'a> ScalarText<'a> {
         if value.is_ascii() {
             return Self {
                 value,
-                offsets: Vec::new(),
+                offsets: Cow::Owned(Vec::new()),
                 scalar_len: value.len(),
                 utf16_len: value.len(),
                 lines: OnceLock::new(),
@@ -44,14 +44,14 @@ impl<'a> ScalarText<'a> {
         }
         Self {
             value,
-            offsets,
+            offsets: Cow::Owned(offsets),
             scalar_len,
             utf16_len,
             lines: OnceLock::new(),
         }
     }
 
-    pub(crate) fn with_same_coordinates<'b>(&self, value: &'b str) -> ScalarText<'b> {
+    pub(crate) fn with_same_coordinates<'b>(&'b self, value: &'b str) -> ScalarText<'b> {
         debug_assert!(self
             .value
             .char_indices()
@@ -61,7 +61,7 @@ impl<'a> ScalarText<'a> {
                 .map(|(byte, character)| (byte, character.len_utf8()))));
         ScalarText {
             value,
-            offsets: self.offsets.clone(),
+            offsets: Cow::Borrowed(self.offsets.as_ref()),
             scalar_len: self.scalar_len,
             utf16_len: self.utf16_len,
             lines: OnceLock::new(),
@@ -290,6 +290,17 @@ mod tests {
     fn non_ascii_coordinate_index_stays_sparse() {
         let value = format!("\u{201c}{}", "a".repeat(1024));
         assert!(ScalarText::new(&value).offsets.len() < 10);
+    }
+
+    #[test]
+    fn same_length_view_borrows_coordinates_but_indexes_its_own_lines() {
+        let original = ScalarText::new("\u{1f9ab} a");
+        let recovered = original.with_same_coordinates("\u{1f98a}\na");
+
+        assert!(matches!(&recovered.offsets, Cow::Borrowed(_)));
+        assert_eq!(recovered.utf16_at_byte(5), original.utf16_at_byte(5));
+        assert_eq!(recovered.lines(), &[[0, 4, 0], [5, 6, 2]]);
+        assert_eq!(original.lines(), &[[0, 6, 0]]);
     }
 
     #[test]
