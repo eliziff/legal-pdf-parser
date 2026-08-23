@@ -10,7 +10,10 @@ mod structure_engine;
 compile_error!("profiling and fast-allocator cannot select two global allocators");
 
 #[cfg(feature = "pdf")]
-pub use contract::document_request;
+pub use contract::{
+    derive_pdf_document, document_request, pdf_document_snapshot, query_pdf_document,
+    PdfDocumentResult,
+};
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
 pub use engine::{corpus_check_cached_extraction, digest_cached_extraction};
@@ -44,4 +47,4 @@ pub use legal_pdf_support::{
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
-pub use structure_engine::{DocumentInput, EvidenceError, StructureGraphV2};
+pub use structure_engine::{DocumentInput, DocumentStructure, EvidenceError};

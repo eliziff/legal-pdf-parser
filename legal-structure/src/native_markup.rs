@@ -1,16 +1,18 @@
-use crate::source_doc::BlockFieldOrder;
 use crate::text::{javascript_whitespace, normalize_javascript_whitespace};
 use crate::{
-    compose_trusted, utf16_len, Coverage, CoverageState, DetectionProfile, DocumentInput,
-    EngineError, EvidenceKind, Exclusion, NativeClaim, Origin, ParagraphBreak, ScalarRange,
-    ScalarText, Scope, ScopeKind, SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
-    SourceDocProvider, SourceDocType, EVIDENCE_SCHEMA,
+    derive::derive_trusted, utf16_len, CitedAuthority, Coverage, CoverageState, DetectionProfile,
+    DocumentInput, DocumentStructure, EngineError, EvidenceKind, Exclusion, NativeClaim, Origin,
+    ParagraphBreak, ScalarRange, ScalarText, Scope, ScopeKind, SourceDoc, SourceDocProvider,
+    SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+
+#[cfg(test)]
+use crate::SourceDocKind;
 
 const ORIGIN: &str = "provider-adapter";
 
@@ -52,15 +54,6 @@ enum Kind {
 }
 
 impl Kind {
-    fn source(self) -> SourceDocKind {
-        match self {
-            Self::Paragraph => SourceDocKind::Paragraph,
-            Self::Page => SourceDocKind::Page,
-            Self::Section => SourceDocKind::Section,
-            Self::Footnote => SourceDocKind::Footnote,
-        }
-    }
-
     fn evidence(self) -> EvidenceKind {
         match self {
             Self::Paragraph => EvidenceKind::Paragraph,
@@ -122,6 +115,7 @@ struct RenderedMarkup {
     text: String,
     blocks: Vec<RawBlock>,
     exclusions: Vec<ScalarRange>,
+    cited_authorities: Vec<CitedAuthority>,
     source_hash: String,
     harvard_casebody: bool,
 }
@@ -873,6 +867,9 @@ fn render_markup(
     let mut open_excluded = Vec::<OpenRange>::new();
     let mut unlabelled_footnotes = Vec::<OpenRange>::new();
     let mut exclusions = Vec::<ScalarRange>::new();
+    let mut open_cited_authorities = Vec::<(usize, CitedAuthority)>::new();
+    let mut cited_authorities = Vec::<CitedAuthority>::new();
+    let mut cited_authority_keys = HashSet::<String>::new();
     let mut text_page = None::<TextPage>;
     let mut position = 0;
     let mut harvard_casebody = false;
@@ -882,7 +879,11 @@ fn render_markup(
         if markup.as_bytes()[at] != b'<' {
             let end = markup[at..].find('<').map_or(markup.len(), |end| at + end);
             let raw = &markup[at..end];
-            let rendered = normalize_javascript_whitespace(&decode_entities(raw));
+            let decoded = decode_entities(raw);
+            for (_, authority) in &mut open_cited_authorities {
+                authority.citation.push_str(&decoded);
+            }
+            let rendered = normalize_javascript_whitespace(&decoded);
             if let Some(pending) = unlabelled_footnotes.last().cloned() {
                 if !rendered.is_empty() {
                     unlabelled_footnotes.pop();
@@ -947,6 +948,26 @@ fn render_markup(
         let raw = &markup[at..end];
         if let Some((tag, _)) = parse_tag(raw, true) {
             if let Some(depth) = tag_stack.iter().rposition(|value| value == &tag) {
+                if tag == "ref" {
+                    if let Some(index) = open_cited_authorities
+                        .iter()
+                        .rposition(|authority| authority.0 == depth)
+                    {
+                        let (_, mut authority) = open_cited_authorities.remove(index);
+                        authority.citation = normalize_javascript_whitespace(&authority.citation);
+                        if authority.citation.is_empty() {
+                            authority.citation = authority.canonical.clone().unwrap_or_default();
+                        }
+                        let key = authority
+                            .canonical
+                            .as_ref()
+                            .unwrap_or(&authority.citation)
+                            .to_lowercase();
+                        if !key.is_empty() && cited_authority_keys.insert(key) {
+                            cited_authorities.push(authority);
+                        }
+                    }
+                }
                 if let Some(index) = open_excluded
                     .iter()
                     .rposition(|entry| entry.tag == tag && entry.depth == depth)
@@ -1014,6 +1035,18 @@ fn render_markup(
         }
         let self_closing = syntactic_self_closing || void_tag(&tag);
         let depth = tag_stack.len();
+        if tag == "ref" && !self_closing {
+            let canonical = attribute(&attributes, "uk:canonical");
+            let kind = attribute(&attributes, "uk:type");
+            open_cited_authorities.push((
+                depth,
+                CitedAuthority {
+                    citation: String::new(),
+                    canonical: (!canonical.is_empty()).then_some(canonical),
+                    kind: (!kind.is_empty()).then_some(kind),
+                },
+            ));
+        }
         let mut identity = native_identity(provider, &tag, &attributes);
         let footnote_body = courtlistener_footnote_body(provider, &tag, &attributes);
         if !self_closing {
@@ -1206,6 +1239,7 @@ fn render_markup(
             })
             .collect(),
         exclusions: projected_exclusions,
+        cited_authorities,
         source_hash: format!("{:x}", Sha256::digest(markup.as_bytes())),
         harvard_casebody,
     })
@@ -1238,7 +1272,9 @@ struct AdapterRevision<'a> {
     profile: &'a str,
 }
 
-pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, EngineError> {
+fn native_markup_evidence(
+    input: NativeMarkupInput,
+) -> Result<(DocumentInput, Vec<CitedAuthority>), EngineError> {
     let NativeMarkupInput {
         provider: provider_name,
         id,
@@ -1257,35 +1293,39 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
     let rendered = use_markup
         .then(|| render_markup(provider, markup.as_deref().unwrap(), &page_citations))
         .transpose()?;
-    let (text, rendered_blocks, rendered_exclusions, representation_revision, harvard) =
-        if let Some(rendered) = rendered {
-            let RenderedMarkup {
-                text,
-                blocks,
-                exclusions,
-                source_hash,
-                harvard_casebody,
-            } = rendered;
-            (
-                if text.is_empty() { fallback_text } else { text },
-                blocks,
-                exclusions,
-                source_hash,
-                harvard_casebody,
-            )
-        } else {
-            let revision = format!(
-                "{:x}",
-                Sha256::digest(
-                    markup
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or(&fallback_text)
-                        .as_bytes(),
-                ),
-            );
-            (fallback_text, Vec::new(), Vec::new(), revision, false)
-        };
+    let rendered = if let Some(mut rendered) = rendered {
+        if rendered.text.is_empty() {
+            rendered.text = fallback_text;
+        }
+        rendered
+    } else {
+        let source_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                markup
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&fallback_text)
+                    .as_bytes(),
+            ),
+        );
+        RenderedMarkup {
+            text: fallback_text,
+            blocks: Vec::new(),
+            exclusions: Vec::new(),
+            cited_authorities: Vec::new(),
+            source_hash,
+            harvard_casebody: false,
+        }
+    };
+    let RenderedMarkup {
+        text,
+        blocks: rendered_blocks,
+        exclusions: rendered_exclusions,
+        cited_authorities,
+        source_hash: representation_revision,
+        harvard_casebody: harvard,
+    } = rendered;
     let profile = if harvard {
         "case_lossy"
     } else if matches!(provider, SourceDocProvider::CourtListener) {
@@ -1315,28 +1355,11 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
             .scalar_at_utf16(offset)
             .ok_or_else(|| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
     };
-    let mut originals = HashMap::new();
     let mut claims = Vec::new();
     let text_utf16 = coordinates.utf16_len();
     for (index, raw) in rendered_blocks.iter().enumerate() {
         let id = format!("native-{:06}", index + 1);
         let claim_end = raw.end.min(text_utf16);
-        let mut block = SourceDocBlock::new(
-            raw.kind.source(),
-            raw.label.clone(),
-            raw.start,
-            raw.end,
-            SourceDocOrigin::Native,
-        )
-        .with_field_order(if raw.kind == Kind::Page {
-            BlockFieldOrder::NativeWithAliases
-        } else {
-            BlockFieldOrder::Native
-        });
-        block.anchor.clone_from(&raw.anchor);
-        block.aliases.clone_from(&raw.aliases);
-        block.parent_label.clone_from(&raw.parent_label);
-        originals.insert(id.clone(), block);
         claims.push(NativeClaim {
             id,
             kind: raw.kind.evidence(),
@@ -1425,9 +1448,19 @@ pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, E
         coverage,
         exclusions,
         paragraph_breaks: Vec::<ParagraphBreak>::new(),
-        original_claims: originals,
     };
-    compose_trusted(evidence)
+    Ok((evidence, cited_authorities))
+}
+
+pub fn analyze_native_markup(input: NativeMarkupInput) -> Result<DocumentStructure, EngineError> {
+    let (evidence, cited_authorities) = native_markup_evidence(input)?;
+    let mut structure = derive_trusted(evidence)?;
+    structure.cited_authorities = cited_authorities;
+    Ok(structure)
+}
+
+pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, EngineError> {
+    analyze_native_markup(input).map(crate::project_document_structure)
 }
 
 #[cfg(test)]
@@ -1454,8 +1487,33 @@ mod tests {
     }
 
     #[test]
+    fn cited_authorities_preserve_source_order_and_javascript_parity() {
+        let rendered = render_markup(
+            SourceDocProvider::Tna,
+            r#"<p><ref uk:canonical="[2016] UKSC 11" uk:type="case">Patel <em>v</em> Mirza &amp; Co</ref><ref uk:canonical="[2016] uksc 11">duplicate</ref><ref uk:canonical="1996&#32;c.&#32;18" uk:type="legislation"></ref></p>"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.cited_authorities,
+            [
+                CitedAuthority {
+                    citation: "Patel v Mirza & Co".to_owned(),
+                    canonical: Some("[2016] UKSC 11".to_owned()),
+                    kind: Some("case".to_owned()),
+                },
+                CitedAuthority {
+                    citation: "1996 c. 18".to_owned(),
+                    canonical: Some("1996 c. 18".to_owned()),
+                    kind: Some("legislation".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn provider_blocks_keep_rendered_utf16_offsets_across_astral_text() {
-        let document = native_markup_source_doc(NativeMarkupInput {
+        let document = analyze_native_markup(NativeMarkupInput {
             provider: "courtlistener".to_owned(),
             id: "astral".to_owned(),
             url: None,
@@ -1465,6 +1523,8 @@ mod tests {
             page_citations: Vec::new(),
             scope: default_scope(),
         })
+        .unwrap()
+        .source_doc
         .unwrap();
         assert_eq!(document.text, "\u{1f9ab}e\u{301}");
         let paragraph = document

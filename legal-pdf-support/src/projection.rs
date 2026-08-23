@@ -1,4 +1,4 @@
-use legal_pdf_core::model::{Derivation, LegalDocument, NodeKind, Page, StructureNodeV2};
+use legal_pdf_core::model::{Derivation, LegalDocument, NodeKind, Page, StructureNode};
 use legal_pdf_core::Result;
 use regex::Regex;
 use serde::Serialize;
@@ -220,7 +220,7 @@ fn scalar_slice(value: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-fn section_nodes(document: &LegalDocument) -> Vec<&StructureNodeV2> {
+fn section_nodes(document: &LegalDocument) -> Vec<&StructureNode> {
     document
         .structure_graph
         .nodes
@@ -402,7 +402,14 @@ fn section_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .map(|(index, section)| {
             let mut page_numbers = Vec::new();
             let mut qualities = Vec::new();
-            for page_index in &section.page_indexes {
+            let page_indexes = document
+                .pdf_source_map
+                .nodes
+                .iter()
+                .find(|extent| extent.id == section.id)
+                .map(|extent| extent.page_indexes.as_slice())
+                .unwrap_or_default();
+            for page_index in page_indexes {
                 if let Some(page) = pages.get(page_index) {
                     if !page_numbers.contains(&page.number) {
                         page_numbers.push(page.number);
@@ -535,7 +542,7 @@ fn section_alias(raw: &str) -> String {
     })
 }
 
-fn section_matches(section: &StructureNodeV2, requested_kind: &str, requested: &str) -> bool {
+fn section_matches(section: &StructureNode, requested_kind: &str, requested: &str) -> bool {
     if requested_kind != "section" && section.locator_kind.as_deref() != Some(requested_kind) {
         return false;
     }
@@ -948,12 +955,12 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        GraphStatus, Paragraph, ScalarRange, StructureGraphV2, PARSER_VERSION, SCHEMA_VERSION,
+        GraphStatus, Paragraph, ScalarRange, DocumentStructure, PARSER_VERSION, SCHEMA_VERSION,
     };
     use serde_json::Map;
 
-    fn structure_graph() -> StructureGraphV2 {
-        StructureGraphV2::from_parts(
+    fn structure_graph() -> DocumentStructure {
+        DocumentStructure::from_parts(
             "doc".to_owned(),
             "",
             Some("00".repeat(32)),
@@ -1009,6 +1016,8 @@ mod tests {
             tables: vec![],
             images: vec![],
             structure_graph: structure_graph(),
+            pdf_source_map: Default::default(),
+            pairing_audit: None,
             diagnostics: vec![],
             repairs: vec![],
             metadata: Map::new(),
@@ -1046,7 +1055,7 @@ mod tests {
 
     #[test]
     fn source_doc_section_ids_are_exact_lookup_locators() {
-        let section = StructureNodeV2 {
+        let section = StructureNode {
             id: "section-000001".to_owned(),
             kind: NodeKind::Section,
             range: ScalarRange { start: 0, end: 18 },
@@ -1107,6 +1116,8 @@ mod tests {
             tables: vec![],
             images: vec![],
             structure_graph: structure_graph(),
+            pdf_source_map: Default::default(),
+            pairing_audit: None,
             diagnostics: vec![],
             repairs: vec![],
             metadata: Map::new(),

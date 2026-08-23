@@ -7,7 +7,7 @@ use legal_pdf_core::model::{
 #[cfg(feature = "pdf")]
 use serde_json::{Map, Value};
 
-pub use legal_structure::{DocumentInput, EngineError as EvidenceError, StructureGraphV2};
+pub use legal_structure::{DocumentInput, DocumentStructure, EngineError as EvidenceError};
 
 #[cfg(feature = "pdf")]
 #[derive(Debug)]
@@ -23,7 +23,7 @@ pub(crate) struct PdfReplayProjection {
     pub markers: Vec<Value>,
     pub marker_summary: Value,
     pub pairing_summary: Value,
-    pub structure_graph: StructureGraphV2,
+    pub structure_graph: DocumentStructure,
 }
 
 #[cfg(feature = "pdf")]
@@ -62,7 +62,9 @@ pub(crate) fn derive_pdf_pages(
         footnotes: structure.derived.footnotes,
         tables: Vec::new(),
         images: Vec::new(),
-        structure_graph: structure.derived.structure_graph,
+        structure_graph: structure.derived.structure_graph.clone(),
+        pdf_source_map: structure.derived.pdf_source_map.clone(),
+        pairing_audit: Some(structure.derived.pairing_audit.clone()),
         diagnostics: structure.derived.diagnostics,
         repairs: Vec::new(),
         metadata: Map::new(),
@@ -74,6 +76,18 @@ pub(crate) fn derive_pdf_pages(
         code: "invalid_evidence",
         message: error.to_string(),
     })?;
+    let mut structure_graph = document.structure_graph;
+    for node in &mut structure_graph.nodes {
+        if let Some(extent) = document
+            .pdf_source_map
+            .nodes
+            .iter()
+            .find(|extent| extent.id == node.id)
+        {
+            node.page_indexes.clone_from(&extent.page_indexes);
+            node.line_ids.clone_from(&extent.line_ids);
+        }
+    }
     Ok(PdfReplayProjection {
         source_sha256,
         status: document.status,
@@ -83,9 +97,9 @@ pub(crate) fn derive_pdf_pages(
         paragraphs: document.paragraphs,
         footnotes: document.footnotes,
         diagnostics: document.diagnostics,
-        markers: structure.derived.markers,
-        marker_summary: structure.derived.marker_summary,
-        pairing_summary: structure.derived.pairing_summary,
-        structure_graph: document.structure_graph,
+        markers: structure.derived.pairing_audit.markers,
+        marker_summary: structure.derived.pairing_audit.marker_summary,
+        pairing_summary: structure.derived.pairing_audit.pairing_summary,
+        structure_graph,
     })
 }

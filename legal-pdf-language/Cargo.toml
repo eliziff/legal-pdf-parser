@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+legal-grammar-tables = { path = "../legal-grammar-tables" }
 legal-pdf-core = { path = "../legal-pdf-core" }
 fancy-regex = "0.19"
 quick-xml = "0.41"

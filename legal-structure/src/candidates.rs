@@ -248,44 +248,16 @@ pub fn resolve_structure_candidates(
 }
 
 #[cfg(feature = "structure-inference")]
-fn next_relation_id(
-    prefix: &str,
-    counter: &mut usize,
-    relation_ids: &mut HashSet<String>,
-) -> String {
-    loop {
-        *counter += 1;
-        let id = format!("{prefix}-{counter:06}");
-        if relation_ids.insert(id.clone()) {
-            return id;
-        }
-    }
-}
-
-#[cfg(feature = "structure-inference")]
-fn push_unique_relation(
-    relations: &mut Vec<StructureRelationV2>,
-    keys: &mut HashSet<(RelationKind, RelationEndpointV2, RelationEndpointV2)>,
-    relation: StructureRelationV2,
-) {
-    if keys.insert((relation.kind, relation.from.clone(), relation.to.clone())) {
-        relations.push(relation);
-    }
-}
-
-#[cfg(feature = "structure-inference")]
 pub fn resolve_structure_graph(
     document_id: String,
     text: &str,
     source_sha256: Option<String>,
-    mut nodes: Vec<StructureNodeV2>,
-    boundaries: Vec<StructureBoundaryV2>,
-    mut relations: Vec<StructureRelationV2>,
+    mut nodes: Vec<StructureNode>,
     runs: &[StructureCandidateRun],
     evidence: &[CandidateEvidenceV2],
     note_pairs: &[NotePairClaimV2],
-    mut diagnostics: Vec<StructureDiagnosticV2>,
-) -> Result<StructureGraphV2, EngineError> {
+    mut diagnostics: Vec<StructureDiagnostic>,
+) -> Result<DocumentStructure, EngineError> {
     let scalar_text = ScalarText::new(text);
     let scalar_len = scalar_text.len();
     let mut node_ids = HashSet::new();
@@ -318,11 +290,6 @@ pub fn resolve_structure_graph(
                 "node '{}' has an invalid parent",
                 node.id
             )));
-        }
-    }
-    for boundary in &boundaries {
-        if boundary.at > scalar_len {
-            return Err(EngineError::invalid("boundary falls outside document text"));
         }
     }
     let mut all_candidate_ids = HashSet::new();
@@ -367,43 +334,6 @@ pub fn resolve_structure_graph(
         .map(|resolved| (resolved.candidate.id.as_str(), resolved))
         .collect::<HashMap<_, _>>();
 
-    let mut relation_keys = HashSet::new();
-    relations.retain(|relation| {
-        relation_keys.insert((relation.kind, relation.from.clone(), relation.to.clone()))
-    });
-    let mut relation_ids = HashSet::new();
-    for relation in &relations {
-        if relation.id.is_empty() || !relation_ids.insert(relation.id.clone()) {
-            return Err(EngineError::invalid(format!(
-                "relation id '{}' is empty or duplicated",
-                relation.id
-            )));
-        }
-        if relation.line_ids.iter().any(String::is_empty) {
-            return Err(EngineError::invalid(format!(
-                "relation '{}' has an empty line id",
-                relation.id
-            )));
-        }
-        for endpoint in [&relation.from, &relation.to] {
-            match endpoint {
-                RelationEndpointV2::Node { node_id } if !node_ids.contains(node_id) => {
-                    return Err(EngineError::invalid(format!(
-                        "relation '{}' names unknown node '{}'",
-                        relation.id, node_id
-                    )));
-                }
-                RelationEndpointV2::Range { range } if !range.valid(scalar_len) => {
-                    return Err(EngineError::invalid(format!(
-                        "relation '{}' has an invalid range",
-                        relation.id
-                    )));
-                }
-                _ => {}
-            }
-        }
-    }
-
     let mut identities = nodes
         .iter()
         .map(|node| {
@@ -424,7 +354,7 @@ pub fn resolve_structure_graph(
     for node in &nodes {
         *counters.entry(node.kind).or_default() += 1;
     }
-    let mut relation_counter = relations.len();
+    let mut notes = Vec::with_capacity(note_pairs.len());
     let mut pair_ids = HashSet::new();
     for pair in note_pairs {
         if pair.pair_id.is_empty()
@@ -475,34 +405,32 @@ pub fn resolve_structure_graph(
             line_ids.extend(pair.body.line_ids.iter().cloned());
             let mut seen_lines = HashSet::new();
             line_ids.retain(|line_id| seen_lines.insert(line_id.clone()));
-            nodes.push(StructureNodeV2 {
-                id: id.clone(),
+            let mut node = StructureNode::new(
+                id.clone(),
                 kind,
-                range: pair.body.range,
-                origin_id: ENGINE_ORIGIN.to_owned(),
-                source: Derivation::Heuristic,
-                label: Some(
-                    scalar_text
-                        .slice(pair.label.range.start..pair.label.range.end)
-                        .expect("validated note label range")
-                        .trim()
-                        .to_owned(),
-                ),
-                locator_kind: None,
-                aliases: None,
-                parent_id: None,
-                anchor: Some(pair.pair_id.clone()),
-                content_start: Some(pair.body.range.start),
-                marker_range: Some(pair.label.range),
-                page_indexes,
-                line_ids,
-                level: None,
-                grammar: Some("note_pair".to_owned()),
-                proof: Some(ResolutionProofV2 {
-                    rule: ResolutionRuleV2::PairedNote,
-                    observations: Vec::new(),
-                }),
+                pair.body.range,
+                ENGINE_ORIGIN,
+                Derivation::Heuristic,
+                None,
+            );
+            node.label = Some(
+                scalar_text
+                    .slice(pair.label.range.start..pair.label.range.end)
+                    .expect("validated note label range")
+                    .trim()
+                    .to_owned(),
+            );
+            node.anchor = Some(pair.pair_id.clone());
+            node.content_start = Some(pair.body.range.start);
+            node.marker_range = Some(pair.label.range);
+            node.page_indexes = page_indexes;
+            node.line_ids = line_ids;
+            node.grammar = Some("note_pair".to_owned());
+            node.proof = Some(ResolutionProofV2 {
+                rule: ResolutionRuleV2::PairedNote,
+                observations: Vec::new(),
             });
+            nodes.push(node);
             identities.insert((kind, pair.label.range.start), id.clone());
             generated_node_ids.insert(id.clone());
             id
@@ -522,50 +450,24 @@ pub fn resolve_structure_graph(
                 }
             }
         }
-        for reference in &pair.references {
-            let from = RelationEndpointV2::Range {
+        let mut seen = HashSet::new();
+        let references = pair
+            .references
+            .iter()
+            .filter(|reference| seen.insert(reference.range))
+            .map(|reference| NoteReference {
                 range: reference.range,
-            };
-            let to = RelationEndpointV2::Node {
-                node_id: note_node_id.clone(),
-            };
-            push_unique_relation(
-                &mut relations,
-                &mut relation_keys,
-                StructureRelationV2 {
-                    id: next_relation_id(
-                        "resolved-references",
-                        &mut relation_counter,
-                        &mut relation_ids,
-                    ),
-                    kind: RelationKind::References,
-                    from: from.clone(),
-                    to: to.clone(),
-                    origin_id: ENGINE_ORIGIN.to_owned(),
-                    source: Derivation::Heuristic,
-                    page_indexes: vec![reference.page_index],
-                    line_ids: vec![reference.line_id.clone()],
-                },
-            );
-            push_unique_relation(
-                &mut relations,
-                &mut relation_keys,
-                StructureRelationV2 {
-                    id: next_relation_id(
-                        "resolved-footnote-for",
-                        &mut relation_counter,
-                        &mut relation_ids,
-                    ),
-                    kind: RelationKind::FootnoteFor,
-                    from: to,
-                    to: from,
-                    origin_id: ENGINE_ORIGIN.to_owned(),
-                    source: Derivation::Heuristic,
-                    page_indexes: vec![reference.page_index],
-                    line_ids: vec![reference.line_id.clone()],
-                },
-            );
-        }
+            })
+            .collect::<Vec<_>>();
+        notes.push(Note {
+            id: pair.pair_id.clone(),
+            node_id: note_node_id,
+            kind: pair.kind,
+            label_range: pair.label.range,
+            body_range: pair.body.range,
+            primary_reference: references.first().map(|reference| reference.range),
+            references,
+        });
     }
 
     let mut candidate_node_ids = paired_candidate_nodes.clone();
@@ -627,32 +529,31 @@ pub fn resolve_structure_graph(
             }
             .to_owned()
         });
-        nodes.push(StructureNodeV2 {
+        let mut node = StructureNode::new(
             id,
             kind,
-            range: resolved.candidate.range,
-            origin_id: ENGINE_ORIGIN.to_owned(),
-            source: Derivation::Heuristic,
-            label: Some(label),
-            locator_kind,
-            aliases,
-            parent_id: None,
-            anchor: None,
-            content_start: Some(resolved.candidate.content_start),
-            marker_range: Some(resolved.candidate.marker_range),
-            page_indexes: resolved.page_indexes.clone(),
-            line_ids: resolved.line_ids.clone(),
-            level: Some(resolved.candidate.level),
-            grammar: Some(
-                match role {
-                    ResolvedRole::NumberedParagraph => "numeric",
-                    ResolvedRole::Section => "hierarchy",
-                    ResolvedRole::ListItem => "enumerator",
-                }
-                .to_owned(),
-            ),
-            proof: Some(resolved.proof.clone()),
-        });
+            resolved.candidate.range,
+            ENGINE_ORIGIN,
+            Derivation::Heuristic,
+            None,
+        );
+        node.label = Some(label);
+        node.locator_kind = locator_kind;
+        node.aliases = aliases;
+        node.content_start = Some(resolved.candidate.content_start);
+        node.marker_range = Some(resolved.candidate.marker_range);
+        node.page_indexes.clone_from(&resolved.page_indexes);
+        node.line_ids.clone_from(&resolved.line_ids);
+        node.grammar = Some(
+            match role {
+                ResolvedRole::NumberedParagraph => "numeric",
+                ResolvedRole::Section => "hierarchy",
+                ResolvedRole::ListItem => "enumerator",
+            }
+            .to_owned(),
+        );
+        node.proof = Some(resolved.proof.clone());
+        nodes.push(node);
     }
 
     for run in runs {
@@ -688,10 +589,10 @@ pub fn resolve_structure_graph(
             .collect::<Vec<_>>();
         let mut seen_lines = HashSet::new();
         line_ids.retain(|line_id| seen_lines.insert(line_id.clone()));
-        nodes.push(StructureNodeV2 {
-            id: id.clone(),
-            kind: NodeKind::List,
-            range: ScalarRange {
+        let mut node = StructureNode::new(
+            id.clone(),
+            NodeKind::List,
+            ScalarRange {
                 start: items
                     .iter()
                     .map(|item| item.candidate.range.start)
@@ -703,24 +604,18 @@ pub fn resolve_structure_graph(
                     .max()
                     .unwrap(),
             },
-            origin_id: ENGINE_ORIGIN.to_owned(),
-            source: Derivation::Heuristic,
-            label: None,
-            locator_kind: None,
-            aliases: None,
-            parent_id: None,
-            anchor: None,
-            content_start: None,
-            marker_range: None,
-            page_indexes,
-            line_ids,
-            level: None,
-            grammar: Some("enumerator_hierarchy".to_owned()),
-            proof: Some(ResolutionProofV2 {
-                rule: ResolutionRuleV2::ListItemLayout,
-                observations: vec![CandidateObservationV2::ListItemLayout],
-            }),
+            ENGINE_ORIGIN,
+            Derivation::Heuristic,
+            None,
+        );
+        node.page_indexes = page_indexes;
+        node.line_ids = line_ids;
+        node.grammar = Some("enumerator_hierarchy".to_owned());
+        node.proof = Some(ResolutionProofV2 {
+            rule: ResolutionRuleV2::ListItemLayout,
+            observations: vec![CandidateObservationV2::ListItemLayout],
         });
+        nodes.push(node);
         generated_node_ids.insert(id.clone());
         for item in items
             .iter()
@@ -794,30 +689,6 @@ pub fn resolve_structure_graph(
         nodes[index].parent_id = candidate_parent.or(enclosing);
     }
 
-    for node in nodes.iter().filter(|node| node.parent_id.is_some()) {
-        push_unique_relation(
-            &mut relations,
-            &mut relation_keys,
-            StructureRelationV2 {
-                id: next_relation_id(
-                    "resolved-contains",
-                    &mut relation_counter,
-                    &mut relation_ids,
-                ),
-                kind: RelationKind::Contains,
-                from: RelationEndpointV2::Node {
-                    node_id: node.parent_id.clone().unwrap(),
-                },
-                to: RelationEndpointV2::Node {
-                    node_id: node.id.clone(),
-                },
-                origin_id: ENGINE_ORIGIN.to_owned(),
-                source: node.source,
-                page_indexes: node.page_indexes.clone(),
-                line_ids: node.line_ids.clone(),
-            },
-        );
-    }
     diagnostics.extend(runs.iter().map(|run| {
         let node_ids = run
             .markers
@@ -825,20 +696,7 @@ pub fn resolve_structure_graph(
             .filter_map(|candidate| candidate_node_ids.get(&candidate.id).cloned())
             .collect::<Vec<_>>();
         let resolved_count = node_ids.len();
-        let mut seen_rules = HashSet::new();
-        let rules = run
-            .markers
-            .iter()
-            .filter_map(|candidate| {
-                let rule = if paired_candidate_nodes.contains_key(&candidate.id) {
-                    ResolutionRuleV2::PairedNote
-                } else {
-                    resolved_by_candidate.get(candidate.id.as_str())?.proof.rule
-                };
-                seen_rules.insert(rule).then_some(rule)
-            })
-            .collect();
-        StructureDiagnosticV2 {
+        StructureDiagnostic {
             code: if resolved_count == 0 {
                 "structure_run_abstained"
             } else if resolved_count == run.markers.len() {
@@ -848,25 +706,26 @@ pub fn resolve_structure_graph(
             }
             .to_owned(),
             severity: DiagnosticSeverity::Info,
-            run_id: Some(run.id.clone()),
-            candidate_ids: run
-                .markers
-                .iter()
-                .map(|candidate| candidate.id.clone())
-                .collect(),
-            rules,
             ranges: vec![run.range],
             node_ids,
         }
     }));
-    Ok(StructureGraphV2::from_parts(
+    let mut origins = nodes
+        .iter()
+        .map(|node| node.origin_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|id| Origin { id })
+        .collect::<Vec<_>>();
+    origins.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(DocumentStructure::from_scalar_parts(
         document_id,
-        text,
+        text.to_owned(),
         source_sha256,
-        GraphStatus::Complete,
+        Scope::complete(),
+        origins,
         nodes,
-        boundaries,
-        relations,
+        notes,
         diagnostics,
     ))
 }

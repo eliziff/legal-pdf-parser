@@ -1,7 +1,7 @@
 use crate::{
-    compose_trusted, utf16_len, Coverage, CoverageState, DetectionProfile, DocumentInput,
-    EngineError, EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarText, Scope, ScopeKind,
-    SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin, SourceDocType, EVIDENCE_SCHEMA,
+    utf16_len, Block, Coverage, CoverageState, Derivation, DetectionProfile, DocumentInput,
+    DocumentStructure, EngineError, EvidenceKind, NativeClaim, NodeKind, Origin, ParagraphBreak,
+    ScalarRange, ScalarText, Scope, ScopeKind, SourceDoc, SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+const ORIGIN: &str = "provider-adapter";
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -61,28 +63,26 @@ fn provision_label(value: &str) -> bool {
         .is_match(value)
 }
 
-fn compare_labels(left: &str, right: &str, fraction: bool) -> Ordering {
-    crate::inference::compare_labels(left, right, fraction)
-}
-
 fn dotted_order(source: &[(usize, &str, &str)]) -> Option<bool> {
-    let labels = source
-        .iter()
-        .map(|(_, label, _)| label)
-        .filter(|label| label.contains('.') && !label.contains('-'))
-        .collect::<Vec<_>>();
+    let labels = || {
+        source
+            .iter()
+            .map(|(_, label, _)| label)
+            .filter(|label| label.contains('.') && !label.contains('-'))
+    };
+    let pairs = || labels().zip(labels().skip(1));
     let inversions = |order| {
-        labels
-            .windows(2)
-            .filter(|pair| compare_labels(pair[0], pair[1], order).is_gt())
+        pairs()
+            .filter(|(left, right)| crate::inference::compare_labels(left, right, order).is_gt())
             .count()
     };
     let (component, fraction) = (inversions(false), inversions(true));
     if component != fraction {
         return Some(fraction < component);
     }
-    (!labels.windows(2).any(|pair| {
-        compare_labels(pair[0], pair[1], false) != compare_labels(pair[0], pair[1], true)
+    (!pairs().any(|(left, right)| {
+        crate::inference::compare_labels(left, right, false)
+            != crate::inference::compare_labels(left, right, true)
     }))
     .then_some(false)
 }
@@ -119,17 +119,18 @@ fn ordered_sections(map: &A2ajSectionMap) -> Result<Vec<(&str, &str)>, EngineErr
         let (a, b) = (left.1.trim(), right.1.trim());
         let preamble =
             |value: &str| matches!(value.to_lowercase().as_str(), "preamble" | "préambule");
+        let provisions = (provision_label(a), provision_label(b));
         preamble(b)
             .cmp(&preamble(a))
-            .then_with(|| provision_label(b).cmp(&provision_label(a)))
+            .then_with(|| provisions.1.cmp(&provisions.0))
             .then_with(|| {
-                if !provision_label(a) {
+                if !provisions.0 {
                     Ordering::Equal
                 } else if let Some(order) = order {
-                    compare_labels(a, b, order)
+                    crate::inference::compare_labels(a, b, order)
                 } else {
-                    let component = compare_labels(a, b, false);
-                    let fraction = compare_labels(a, b, true);
+                    let component = crate::inference::compare_labels(a, b, false);
+                    let fraction = crate::inference::compare_labels(a, b, true);
                     if component == fraction {
                         component
                     } else {
@@ -149,36 +150,38 @@ fn utf16_at(text: &str, byte: usize) -> usize {
     text[..byte].encode_utf16().count()
 }
 
-fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<SourceDocBlock>) {
-    // Map values plus synthetic LFs form final provider-text UTF-16.
+fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<NativeClaim>) {
     if !text.trim().is_empty() || entries.is_empty() {
         return (text, Vec::new());
     }
     text.clear();
-    let mut blocks = Vec::new();
-    let mut utf16 = 0;
+    let mut claims = Vec::new();
+    let mut scalar = 0;
     for (label, value) in entries.iter().filter(|(_, value)| {
         !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("[blank]")
     }) {
         if !text.is_empty() {
             text.push('\n');
-            utf16 += 1;
+            scalar += 1;
         }
-        let start = utf16;
+        let start = scalar;
         text.push_str(value);
-        utf16 += utf16_len(value);
-        blocks.push(SourceDocBlock::new(
-            SourceDocKind::Section,
-            format!("sec{}", label.trim()),
-            start,
-            utf16,
-            SourceDocOrigin::Native,
-        ));
+        scalar += value.chars().count();
+        claims.push(NativeClaim {
+            id: format!("native-{:06}", claims.len() + 1),
+            kind: EvidenceKind::Section,
+            label: Some(format!("sec{}", label.trim())),
+            aliases: Vec::new(),
+            range: ScalarRange { start, end: scalar },
+            origin_id: ORIGIN.to_owned(),
+            parent_label: None,
+            anchor: None,
+        });
     }
-    (text, blocks)
+    (text, claims)
 }
 
-fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
+fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<NativeClaim> {
     static PRINTED: OnceLock<Regex> = OnceLock::new();
     // Unique byte matches are in final provider-rendered text.
     let coordinates = ScalarText::new(text);
@@ -206,17 +209,24 @@ fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
                 return None;
             }
             let end = start + value.len();
-            Some(SourceDocBlock::new(
-                SourceDocKind::Section,
-                format!("sec{label}"),
-                coordinates
-                    .utf16_at_byte(start)
-                    .expect("matched provider section starts at a UTF-8 boundary"),
-                coordinates
-                    .utf16_at_byte(end)
-                    .expect("matched provider section ends at a UTF-8 boundary"),
-                SourceDocOrigin::Native,
-            ))
+            Some(NativeClaim {
+                id: String::new(),
+                kind: EvidenceKind::Section,
+                label: Some(format!("sec{label}")),
+                aliases: Vec::new(),
+                range: ScalarRange {
+                    start: coordinates.scalar(start),
+                    end: coordinates.scalar(end),
+                },
+                origin_id: ORIGIN.to_owned(),
+                parent_label: None,
+                anchor: None,
+            })
+        })
+        .enumerate()
+        .map(|(index, mut claim)| {
+            claim.id = format!("native-{:06}", index + 1);
+            claim
         })
         .collect()
 }
@@ -224,38 +234,9 @@ fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<SourceDocBlock> {
 fn evidence(
     input: &A2ajInput,
     text: String,
-    blocks: Vec<SourceDocBlock>,
+    claims: Vec<NativeClaim>,
 ) -> Result<DocumentInput, EngineError> {
-    const ORIGIN: &str = "provider-adapter";
     let coordinates = ScalarText::new(&text);
-    let scalar = |offset: usize| {
-        coordinates
-            .scalar_at_utf16(offset)
-            .ok_or_else(|| EngineError::source("provider UTF-16 range splits a Unicode scalar"))
-    };
-    let mut originals = HashMap::new();
-    let claims = blocks
-        .into_iter()
-        .enumerate()
-        .map(|(index, block)| {
-            let id = format!("native-{:06}", index + 1);
-            let claim = NativeClaim {
-                id: id.clone(),
-                kind: EvidenceKind::Section,
-                label: Some(block.label.clone()),
-                aliases: block.aliases.clone(),
-                range: crate::ScalarRange {
-                    start: scalar(block.start)?,
-                    end: scalar(block.end)?,
-                },
-                origin_id: ORIGIN.to_owned(),
-                parent_label: block.parent_label.clone(),
-                anchor: block.anchor.clone(),
-            };
-            originals.insert(id, block);
-            Ok(claim)
-        })
-        .collect::<Result<Vec<_>, EngineError>>()?;
     let scalar_end = coordinates.len();
     let coverage = [
         EvidenceKind::Paragraph,
@@ -335,7 +316,6 @@ fn evidence(
         coverage,
         exclusions: Vec::new(),
         paragraph_breaks: Vec::<ParagraphBreak>::new(),
-        original_claims: originals,
     })
 }
 
@@ -377,10 +357,12 @@ fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
 
 fn apply_provider_section_evidence(
     text: &str,
-    blocks: &mut Vec<SourceDocBlock>,
+    blocks: &mut Vec<Block>,
+    native_claims: &[NativeClaim],
     map: &A2ajSectionMap,
 ) {
     let tokens = words(text);
+    let coordinates = ScalarText::new(text);
     let mut postings = HashMap::<&str, Vec<usize>>::new();
     for (index, (word, ..)) in tokens.iter().enumerate() {
         postings.entry(word).or_default().push(index);
@@ -389,9 +371,9 @@ fn apply_provider_section_evidence(
     for (index, block) in blocks
         .iter()
         .enumerate()
-        .filter(|(_, block)| block.kind == SourceDocKind::Section && block.parent_label.is_none())
+        .filter(|(_, block)| block.kind == NodeKind::Section && block.parent_label.is_none())
     {
-        for label in std::iter::once(&block.label).chain(&block.aliases) {
+        for label in block.label.iter().chain(&block.aliases) {
             let candidates = top_sections.entry(label.to_lowercase()).or_default();
             if candidates.last() != Some(&index) {
                 candidates.push(index);
@@ -460,13 +442,28 @@ fn apply_provider_section_evidence(
             });
         let provider_label = format!("sec{label}");
         let key = provider_label.to_lowercase();
+        if native_claims.iter().any(|claim| {
+            claim.kind == EvidenceKind::Section
+                && claim.parent_label.is_none()
+                && claim
+                    .label
+                    .iter()
+                    .chain(&claim.aliases)
+                    .any(|label| label.to_lowercase() == key)
+        }) {
+            continue;
+        }
         let candidates = top_sections.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         if candidates.len() == 1 {
             let index = candidates[0];
-            if spans[0].1 < blocks[index].start || spans[0].2 > blocks[index].end {
+            if spans[0].1 < coordinates.utf16(blocks[index].range.start)
+                || spans[0].2 > coordinates.utf16(blocks[index].range.end)
+            {
                 continue;
             }
-            blocks[index].origin = SourceDocOrigin::Native;
+            blocks[index].source = Derivation::Native;
+            blocks[index].origin_id = ORIGIN;
+            blocks[index].diagnostic = None;
         } else if candidates.is_empty() {
             let Some((body_start, _, body_utf16_start, body_utf16_end)) = body else {
                 continue;
@@ -485,21 +482,23 @@ fn apply_provider_section_evidence(
             let start = printed.map_or(body_utf16_start, |_| {
                 body_utf16_start - utf16_len(&text[line_start + lead..body_start])
             });
-            blocks.push(SourceDocBlock::new(
-                SourceDocKind::Section,
+            let mut block = Block::labelled(
+                NodeKind::Section,
                 provider_label,
-                start,
-                body_utf16_end,
-                SourceDocOrigin::Native,
-            ));
+                coordinates.scalar_at_utf16(start).unwrap(),
+                coordinates.scalar_at_utf16(body_utf16_end).unwrap(),
+            );
+            block.source = Derivation::Native;
+            block.origin_id = ORIGIN;
+            blocks.push(block);
         }
     }
     let mut seen = std::collections::HashSet::new();
-    blocks.retain(|block| seen.insert((block.label.clone(), block.start, block.end)));
-    blocks.sort_by_key(|block| (block.start, block.parent_label.is_some()));
+    blocks.retain(|block| seen.insert((block.label.clone(), block.range)));
+    blocks.sort_by_key(|block| (block.range.start, block.parent_label.is_some()));
 }
 
-pub fn a2aj_source_doc(mut input: A2ajInput) -> Result<SourceDoc, EngineError> {
+pub fn a2aj_document_structure(mut input: A2ajInput) -> Result<DocumentStructure, EngineError> {
     let has_text = !input.text.trim().is_empty();
     let ordered = match (&input.section_map, has_text) {
         (Some(map), true) => {
@@ -509,32 +508,42 @@ pub fn a2aj_source_doc(mut input: A2ajInput) -> Result<SourceDoc, EngineError> {
         (Some(map), false) => ordered_sections(map)?,
         (None, _) => Vec::new(),
     };
-    let (text, mut blocks) = provider_source(std::mem::take(&mut input.text), &ordered);
+    let (text, mut claims) = provider_source(std::mem::take(&mut input.text), &ordered);
     if has_text {
         if let Some(map) = &input.section_map {
-            blocks = provider_claims(&text, map);
+            claims = provider_claims(&text, map);
         }
     }
-    let mut document = compose_trusted(evidence(&input, text, blocks)?)?;
-    if input.source_kind == A2ajSourceKind::Laws && has_text {
-        if let Some(map) = &input.section_map {
-            apply_provider_section_evidence(&document.text, &mut document.blocks, map);
-            document = crate::create_source_doc(
-                document.provider,
-                document.id,
-                document.url,
-                document.doc_type,
-                document.text,
-                document.blocks,
-            );
-        }
+    let evidence = evidence(&input, text, claims)?;
+    let mut structure = if let (A2ajSourceKind::Laws, true, Some(map)) =
+        (input.source_kind, has_text, input.section_map.as_ref())
+    {
+        let mut inferred =
+            crate::inference::inferred_blocks(&evidence, &ScalarText::new(&evidence.text));
+        apply_provider_section_evidence(
+            &evidence.text,
+            &mut inferred,
+            &evidence.native_claims,
+            map,
+        );
+        crate::derive::derive_trusted_inferred(evidence, inferred)?
+    } else {
+        crate::derive::derive_trusted(evidence)?
+    };
+    if input.source_kind == A2ajSourceKind::Laws {
+        structure.cross_references = Some(crate::instrument::cross_reference_graph(&structure)?);
     }
-    Ok(document)
+    Ok(structure)
+}
+
+pub fn a2aj_source_doc(input: A2ajInput) -> Result<SourceDoc, EngineError> {
+    a2aj_document_structure(input).map(crate::project_document_structure)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SourceDocKind, SourceDocOrigin};
 
     #[test]
     fn map_rendering_and_provider_evidence_match_a2aj() {

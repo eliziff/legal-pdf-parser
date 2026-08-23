@@ -2,7 +2,7 @@
 
 use legal_pdf_core::model::{
     Diagnostic, Footnote, LegalDocument, Line, NotePairClaim, NotePairKind, Page, Paragraph,
-    Region, Span,
+    PdfPageIdentity, PdfPairingAudit, PdfSourceExtent, PdfSourceMap, PdfSourceSpan, Region, Span,
 };
 use legal_pdf_core::{line_font_size, union_bbox, Anchor, Error, PairingOutput, Result};
 use legal_pdf_support::{
@@ -10,10 +10,10 @@ use legal_pdf_support::{
     protected_citation_spans,
 };
 use legal_structure::{
-    detect_structure_candidate_runs, resolve_structure_graph, BoundaryKind, CandidateEvidenceV2,
-    CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity, NodeKind, NoteBodyV2,
-    NoteKindV2, NotePairClaimV2, ResolutionRuleV2, ScalarRange, StructureBoundaryV2,
-    StructureCandidateRun, StructureDiagnosticV2, StructureGraphV2, StructureNodeV2, TextAnchorV2,
+    detect_structure_candidate_runs, resolve_structure_graph, CandidateEvidenceV2,
+    CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity, DocumentStructure,
+    NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ResolutionRuleV2, ScalarRange,
+    StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -78,6 +78,7 @@ struct PdfResolutionInput {
     index: PdfTextIndex,
     runs: Vec<StructureCandidateRun>,
     evidence: Vec<CandidateEvidenceV2>,
+    citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
 }
 
 impl PdfTextIndex {
@@ -237,10 +238,9 @@ pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
-    pub markers: Vec<Value>,
-    pub marker_summary: Value,
-    pub pairing_summary: Value,
-    pub structure_graph: StructureGraphV2,
+    pub pairing_audit: PdfPairingAudit,
+    pub pdf_source_map: PdfSourceMap,
+    pub structure_graph: DocumentStructure,
 }
 
 pub struct StructureReplay {
@@ -4434,7 +4434,7 @@ impl PdfResolutionInput {
         }
         let citation_spans = by_line
             .iter()
-            .map(|(line_id, (_, line))| (*line_id, protected_citation_spans(&line.text)))
+            .map(|(line_id, (_, line))| ((*line_id).to_owned(), protected_citation_spans(&line.text)))
             .collect::<HashMap<_, _>>();
         let mut evidence = Vec::new();
         for run in &runs {
@@ -4614,14 +4614,60 @@ impl PdfResolutionInput {
             index,
             runs,
             evidence,
+            citation_spans: citation_spans
+                .into_iter()
+                .map(|(line_id, spans)| (line_id, spans.into_iter()
+                    .map(|(start, end)| PdfSourceSpan { start, end }).collect()))
+                .collect(),
         }
+    }
+}
+
+fn pdf_source_map(
+    index: &PdfTextIndex,
+    pages: &[Page],
+    structure: &mut DocumentStructure,
+    protected_citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
+) -> PdfSourceMap {
+    PdfSourceMap {
+        pages: pages
+            .iter()
+            .map(|page| PdfPageIdentity {
+                physical_index: page.index,
+                physical_number: page.number,
+                printed_folio: page.printed_label.clone(),
+            })
+            .collect(),
+        nodes: structure
+            .nodes
+            .iter_mut()
+            .map(|node| PdfSourceExtent {
+                id: node.id.clone(),
+                page_indexes: std::mem::take(&mut node.page_indexes),
+                line_ids: std::mem::take(&mut node.line_ids),
+            })
+            .collect(),
+        note_references: structure
+            .notes
+            .iter()
+            .flat_map(|note| note.references.iter().enumerate().map(move |(reference, value)| {
+                PdfSourceExtent {
+                    id: format!("{}:reference:{reference}", note.id),
+                    page_indexes: index.page_indexes(value.range),
+                    line_ids: index.line_ids(value.range),
+                }
+            }))
+            .collect(),
+        protected_citation_spans,
+        table_ids: Vec::new(),
+        image_ids: Vec::new(),
     }
 }
 
 fn map_note_pairs(
     index: &PdfTextIndex,
     pairs: &[NotePairClaim],
-) -> Result<(Vec<NotePairClaimV2>, Vec<StructureDiagnosticV2>)> {
+) -> Result<(Vec<NotePairClaimV2>, Vec<StructureDiagnostic>)> {
     let mut claims = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pair_ids = HashSet::new();
@@ -4694,12 +4740,9 @@ fn map_note_pairs(
                 .iter()
                 .any(|anchor| anchor.range.start == anchor.range.end)
         {
-            diagnostics.push(StructureDiagnosticV2 {
+            diagnostics.push(StructureDiagnostic {
                 code: "note_pair_unmaterialized".to_owned(),
                 severity: DiagnosticSeverity::Info,
-                run_id: None,
-                candidate_ids: vec![pair.pair_id.clone()],
-                rules: Vec::new(),
                 ranges: Vec::new(),
                 node_ids: Vec::new(),
             });
@@ -4731,15 +4774,14 @@ fn native_graph_parts(
     index: &PdfTextIndex,
     pages: &[Page],
     paragraphs: &[Paragraph],
-    primitives: &PdfPrimitiveEvidence,
-) -> Result<(Vec<StructureNodeV2>, Vec<StructureBoundaryV2>)> {
+) -> Result<Vec<StructureNode>> {
     const ORIGIN: &str = "legalpdf.pdf-structure.v2";
     let mut nodes = Vec::new();
     for page in pages {
         let range = index.page_range(page.index).ok_or_else(|| {
             Error::Message(format!("page {} is absent from the text index", page.index))
         })?;
-        nodes.push(StructureNodeV2 {
+        nodes.push(StructureNode {
             id: page.id.clone(),
             kind: NodeKind::Page,
             range,
@@ -4759,12 +4801,10 @@ fn native_graph_parts(
                 .filter(|line| line.page_index == page.index)
                 .map(|line| line.line_id.clone())
                 .collect(),
-            level: None,
             grammar: None,
             proof: None,
         });
     }
-    let mut boundaries = Vec::new();
     for paragraph in paragraphs {
         let range = index
             .range_for_line_ids(&paragraph.line_ids)
@@ -4772,15 +4812,7 @@ fn native_graph_parts(
                 Error::Message(format!("paragraph {} has no indexed lines", paragraph.id))
             })?;
         let heading = paragraph.region_type == "heading";
-        let heading_level = heading
-            .then(|| {
-                paragraph
-                    .line_ids
-                    .iter()
-                    .find_map(|line_id| primitives.heading_levels.get(line_id).copied())
-            })
-            .flatten();
-        nodes.push(StructureNodeV2 {
+        nodes.push(StructureNode {
             id: paragraph.id.clone(),
             kind: if heading {
                 NodeKind::Heading
@@ -4803,26 +4835,11 @@ fn native_graph_parts(
             marker_range: None,
             page_indexes: index.page_indexes_for_line_ids(&paragraph.line_ids),
             line_ids: paragraph.line_ids.clone(),
-            level: heading_level,
             grammar: heading.then(|| "accepted_heading".to_owned()),
             proof: None,
         });
-        boundaries.push(StructureBoundaryV2 {
-            kind: if heading {
-                BoundaryKind::Paragraph
-            } else {
-                BoundaryKind::Prose
-            },
-            at: range.end,
-            origin_id: ORIGIN.to_owned(),
-            source: if heading {
-                Derivation::Heuristic
-            } else {
-                Derivation::Native
-            },
-        });
     }
-    Ok((nodes, boundaries))
+    Ok(nodes)
 }
 
 pub fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> PdfPreparation {
@@ -4895,16 +4912,13 @@ pub fn finish_derivation(
     legal_pdf_support::profile::measure("derive.crossrefs", || {
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
-    let (nodes, boundaries) =
-        native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
-    let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
+    let nodes = native_graph_parts(&resolution.index, pages, &paragraphs)?;
+    let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         resolve_structure_graph(
             identity.document_id,
             resolution.index.text(),
             Some(identity.source_sha256),
             nodes,
-            boundaries,
-            Vec::new(),
             &resolution.runs,
             &resolution.evidence,
             &note_pairs,
@@ -4912,13 +4926,22 @@ pub fn finish_derivation(
         )
     })
     .map_err(|error| Error::Message(error.to_string()))?;
+    let pdf_source_map = pdf_source_map(
+        &resolution.index,
+        pages,
+        &mut structure_graph,
+        resolution.citation_spans,
+    );
     Ok(StructureOutput {
         paragraphs,
         footnotes,
         diagnostics,
-        markers,
-        marker_summary,
-        pairing_summary,
+        pairing_audit: PdfPairingAudit {
+            markers,
+            marker_summary,
+            pairing_summary,
+        },
+        pdf_source_map,
         structure_graph,
     })
 }

@@ -36,7 +36,10 @@ static LIST: LazyLock<R> = LazyLock::new(|| {
 impl DefinitionOccurrence {
     fn at(&self, document: &ScalarText<'_>, start: usize, end: usize) -> Self {
         let mut hit = self.clone();
-        (hit.range.start, hit.range.end) = (document.scalar(start), document.scalar(end));
+        (hit.range.start, hit.range.end) = (
+            document.utf16_at_byte(start).unwrap(),
+            document.utf16_at_byte(end).unwrap(),
+        );
         hit
     }
 }
@@ -53,8 +56,9 @@ pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> Def
     let slices = paragraphs
         .iter()
         .map(|p| {
-            let base = document.byte(p.range.start);
-            (base, document.slice(p.range.start..p.range.end).unwrap())
+            let base = document.byte_at_utf16(p.range.start).unwrap();
+            let end = document.byte_at_utf16(p.range.end).unwrap();
+            (base, &text[base..end])
         })
         .collect::<Vec<_>>();
     let mut terms = Vec::<(String, Vec<(usize, DefinitionOccurrence)>)>::new();

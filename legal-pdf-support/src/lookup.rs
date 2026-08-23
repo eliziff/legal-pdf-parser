@@ -136,7 +136,7 @@ pub fn lookup_footnote(
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        GraphStatus, Paragraph, StructureGraphV2, PARSER_VERSION, SCHEMA_VERSION,
+        GraphStatus, Paragraph, DocumentStructure, PARSER_VERSION, SCHEMA_VERSION,
     };
     use serde_json::Map;
 
@@ -160,8 +160,8 @@ mod tests {
         }
     }
 
-    fn structure_graph() -> StructureGraphV2 {
-        StructureGraphV2::from_parts(
+    fn structure_graph() -> DocumentStructure {
+        DocumentStructure::from_parts(
             "doc".to_owned(),
             "",
             Some("00".repeat(32)),
@@ -193,6 +193,8 @@ mod tests {
             tables: vec![],
             images: vec![],
             structure_graph: structure_graph(),
+            pdf_source_map: Default::default(),
+            pairing_audit: None,
             diagnostics: vec![],
             repairs: vec![],
             metadata: Map::new(),

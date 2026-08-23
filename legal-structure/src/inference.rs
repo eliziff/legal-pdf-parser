@@ -512,6 +512,13 @@ fn contiguous_scopes(markers: &[Marker]) -> Vec<Vec<Marker>> {
     scopes
 }
 
+fn next_boundary(boundaries: &[usize], start: usize, end: usize) -> usize {
+    boundaries
+        .get(boundaries.partition_point(|boundary| *boundary <= start))
+        .copied()
+        .unwrap_or(end)
+}
+
 pub(super) fn raw_numeric_runs(text: &ScalarText<'_>) -> Vec<StructureCandidateRun> {
     let all = paragraph_markers(text, false);
     let mut boundaries = all.iter().map(|marker| marker.start).collect::<Vec<_>>();
@@ -532,11 +539,7 @@ pub(super) fn raw_numeric_runs(text: &ScalarText<'_>) -> Vec<StructureCandidateR
             let mut candidates = scope
                 .iter()
                 .map(|marker| {
-                    let end = boundaries
-                        .iter()
-                        .copied()
-                        .find(|boundary| *boundary > marker.start)
-                        .unwrap_or(text.len());
+                    let end = next_boundary(&boundaries, marker.start, text.len());
                     let surface_label = text
                         .slice(marker.start..marker.content_start)
                         .expect("numeric marker range is bounded")
@@ -652,11 +655,7 @@ pub(super) fn raw_enumerator_runs(text: &ScalarText<'_>) -> Vec<StructureCandida
             let mut candidates = scope
                 .iter()
                 .map(|marker| {
-                    let end = boundaries
-                        .iter()
-                        .copied()
-                        .find(|boundary| *boundary > marker.start)
-                        .unwrap_or(text.len());
+                    let end = next_boundary(&boundaries, marker.start, text.len());
                     let surface_label = text
                         .slice(marker.start..marker.content_start)
                         .expect("enumerator marker range is bounded")
@@ -877,11 +876,7 @@ fn paragraph_ranges(
     selected
         .into_iter()
         .map(|marker| {
-            let end = boundaries
-                .iter()
-                .copied()
-                .find(|value| *value > marker.start)
-                .unwrap_or(text.len());
+            let end = next_boundary(&boundaries, marker.start, text.len());
             Block::labelled(
                 NodeKind::Paragraph,
                 format!("par{}", marker.number),
@@ -2171,6 +2166,8 @@ impl GrammarPoint {
             parent_label: self.parent_label,
             content_start: Some(self.content_start),
             diagnostic: self.diagnostic,
+            source: Derivation::Heuristic,
+            origin_id: ENGINE_ORIGIN,
         }
     }
 }
@@ -2911,6 +2908,8 @@ fn detect_journal(text: &ScalarText<'_>) -> Vec<Block> {
                     parent_label: None,
                     content_start: None,
                     diagnostic: None,
+                    source: Derivation::Heuristic,
+                    origin_id: ENGINE_ORIGIN,
                 });
             }
             start = None;

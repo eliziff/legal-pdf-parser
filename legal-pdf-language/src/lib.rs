@@ -3,7 +3,6 @@ mod deterministic_citations;
 mod docx;
 mod error;
 mod grammar_tables;
-mod grammar_word;
 
 pub use deterministic_citations::{
     extract_fields as extract_citation_fields, split_footnote as split_citations,

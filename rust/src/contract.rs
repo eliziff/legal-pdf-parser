@@ -18,6 +18,12 @@ const RESULT_SCHEMA: &str = "legalpdf.document-result.v1";
 const MAX_SELECTED_PAGES: usize = 1_000;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+#[derive(Debug)]
+pub struct PdfDocumentResult {
+    document: crate::LegalDocument,
+    source_doc: Option<Value>,
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -401,6 +407,59 @@ fn prepare_summary(document: &crate::LegalDocument, selected: Option<&[usize]>) 
             "tables": document.tables.len(),
             "images": document.images.len(),
             "diagnostics": document.diagnostics.len(),
+        },
+    })
+}
+
+pub fn derive_pdf_document(
+    value: &Value,
+    include_source_doc: bool,
+    include_pairing_audit: bool,
+) -> Result<PdfDocumentResult> {
+    let options = parse_options(value, "prepare")?;
+    let selected = options.ocr_pages.clone();
+    let mut document = parse_pdf(string(value, "source_pdf")?, &options)?;
+    validate_selected_pages(value, selected.as_deref(), document.page_count)?;
+    let source_doc = include_source_doc.then(|| {
+        source_doc(
+            &document,
+            value.get("id").and_then(Value::as_str),
+            value.get("url").and_then(Value::as_str),
+        )["source_doc"]
+            .clone()
+    });
+    if !include_pairing_audit {
+        document.pairing_audit = None;
+    }
+    Ok(PdfDocumentResult {
+        document,
+        source_doc,
+    })
+}
+
+pub fn query_pdf_document(document: &PdfDocumentResult, query: &Value) -> Result<Value> {
+    structure_lookup(&document.document, query)
+}
+
+pub fn pdf_document_snapshot(document: &PdfDocumentResult) -> Value {
+    let pdf = document
+        .document
+        .metadata
+        .get("pdf")
+        .unwrap_or(&Value::Null);
+    json!({
+        "structure": &document.document.structure_graph,
+        "pdf_source_map": &document.document.pdf_source_map,
+        "source_doc": &document.source_doc,
+        "pairing_audit": &document.document.pairing_audit,
+        "source": {
+            "sha256": &document.document.source_sha256,
+            "parser_version": &document.document.parser_version,
+            "cache_key": document.document.provenance.get("deterministic_cache_key"),
+            "page_count": document.document.page_count,
+            "status": &document.document.status,
+            "pages_needing_ocr": pdf.get("pages_needing_ocr"),
+            "ocr_routed_pages": pdf.get("ocr_routed_pages"),
         },
     })
 }

@@ -437,7 +437,10 @@ fn build_document(
     extracted.diagnostics.extend(derived.diagnostics);
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), Value::Object(extracted.metadata));
-    metadata.insert("pairing".to_owned(), derived.pairing_summary);
+    metadata.insert(
+        "pairing".to_owned(),
+        derived.pairing_audit.pairing_summary.clone(),
+    );
     let mut provenance = Map::new();
     provenance.insert("engine".to_owned(), Value::String("legalpdf".to_owned()));
     provenance.insert(
@@ -475,6 +478,17 @@ fn build_document(
     let source_name = path
         .file_name()
         .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
+    let mut pdf_source_map = derived.pdf_source_map;
+    pdf_source_map.table_ids = extracted
+        .tables
+        .iter()
+        .map(|table| table.id.clone())
+        .collect();
+    pdf_source_map.image_ids = extracted
+        .images
+        .iter()
+        .map(|image| image.id.clone())
+        .collect();
     let document = LegalDocument {
         document_id,
         source_name,
@@ -487,6 +501,8 @@ fn build_document(
         tables: extracted.tables,
         images: extracted.images,
         structure_graph: derived.structure_graph,
+        pdf_source_map,
+        pairing_audit: Some(derived.pairing_audit),
         diagnostics: extracted.diagnostics,
         repairs: vec![],
         metadata,
@@ -863,6 +879,11 @@ fn structure_examples(document: &LegalDocument) -> Value {
             .into_iter()
             .map(|slot| {
                 let node = nodes[slot];
+                let extent = document
+                    .pdf_source_map
+                    .nodes
+                    .iter()
+                    .find(|extent| extent.id == node.id);
                 let end = node.range.end.min(text.len());
                 let start = node.range.start.min(end);
                 let value = text[start..end]
@@ -880,8 +901,8 @@ fn structure_examples(document: &LegalDocument) -> Value {
                     "label": node.label,
                     "locator_kind": node.locator_kind,
                     "parent_id": node.parent_id,
-                    "page_indexes": node.page_indexes,
-                    "line_ids": node.line_ids,
+                    "page_indexes": extent.map(|value| &value.page_indexes).unwrap_or(&node.page_indexes),
+                    "line_ids": extent.map(|value| &value.line_ids).unwrap_or(&node.line_ids),
                     "rule": node.proof.as_ref().map(|proof| proof.rule),
                 })
             })
@@ -986,7 +1007,7 @@ pub fn corpus_check_cached_extraction(
     let structure = json!({
         "schema_version": document.structure_graph.schema_version,
         "node_count": document.structure_graph.nodes.len(),
-        "relation_count": document.structure_graph.relations.len(),
+        "note_count": document.structure_graph.notes.len(),
         "diagnostic_count": document.structure_graph.diagnostics.len(),
         "by_kind": by_kind,
         "by_rule": by_rule,

@@ -10,37 +10,28 @@ fn native_kind(kind: EvidenceKind) -> NodeKind {
         EvidenceKind::Footnote => NodeKind::Footnote,
         EvidenceKind::Endnote => NodeKind::Endnote,
         EvidenceKind::List => NodeKind::List,
-        EvidenceKind::Navigation => NodeKind::Navigation,
+        EvidenceKind::Table => NodeKind::Table,
+        EvidenceKind::Row => NodeKind::Row,
+        EvidenceKind::Cell => NodeKind::Cell,
     }
 }
-fn infer_graph(
-    evidence: DocumentInput,
-    inferred: Vec<Block>,
-    inference_available: bool,
-) -> StructureGraphV2 {
-    let complete = evidence.scope.kind == ScopeKind::Complete
-        && (inference_available || !evidence.needs_inference());
+fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStructure {
     let mut nodes = evidence
         .native_claims
         .iter()
-        .map(|claim| StructureNodeV2 {
-            id: claim.id.clone(),
-            kind: native_kind(claim.kind),
-            range: claim.range,
-            origin_id: claim.origin_id.clone(),
-            source: Derivation::Native,
-            label: claim.label.clone(),
-            locator_kind: None,
-            aliases: (!claim.aliases.is_empty()).then(|| claim.aliases.clone()),
-            parent_id: None,
-            anchor: claim.anchor.clone(),
-            content_start: None,
-            marker_range: None,
-            page_indexes: Vec::new(),
-            line_ids: Vec::new(),
-            level: None,
-            grammar: None,
-            proof: None,
+        .map(|claim| {
+            let mut node = StructureNode::new(
+                claim.id.clone(),
+                native_kind(claim.kind),
+                claim.range,
+                claim.origin_id.clone(),
+                Derivation::Native,
+                None,
+            );
+            node.label.clone_from(&claim.label);
+            node.aliases = (!claim.aliases.is_empty()).then(|| claim.aliases.clone());
+            node.anchor.clone_from(&claim.anchor);
+            node
         })
         .collect::<Vec<_>>();
     let mut counters = HashMap::<NodeKind, usize>::new();
@@ -71,7 +62,12 @@ fn infer_graph(
         .map(|block| {
             let ordinal = counters.entry(block.kind).or_default();
             *ordinal += 1;
-            let id = format!("heuristic-{}-{:06}", block.kind.name(), ordinal);
+            let source = match block.source {
+                Derivation::Native => "native",
+                Derivation::Heuristic => "heuristic",
+                Derivation::Model => "model",
+            };
+            let id = format!("{source}-{}-{:06}", block.kind.name(), ordinal);
             (block, id)
         })
         .collect::<Vec<_>>();
@@ -99,20 +95,16 @@ fn infer_graph(
             .and_then(|label| labels.get(&label.to_ascii_lowercase()))
             .cloned();
     }
-    let mut relations = Vec::new();
     let diagnostics = generated
         .iter()
         .filter_map(|(block, id)| {
-            block.diagnostic.map(|code| StructureDiagnosticV2 {
+            block.diagnostic.map(|code| StructureDiagnostic {
                 code: code.to_owned(),
                 severity: if code.ends_with("violation") {
                     DiagnosticSeverity::Warning
                 } else {
                     DiagnosticSeverity::Info
                 },
-                run_id: None,
-                candidate_ids: Vec::new(),
-                rules: Vec::new(),
                 ranges: vec![block.range],
                 node_ids: vec![id.clone()],
             })
@@ -124,158 +116,163 @@ fn infer_graph(
             .as_ref()
             .and_then(|label| labels.get(&label.to_ascii_lowercase()))
             .cloned();
-        if let Some(parent) = &parent_id {
-            relations.push(StructureRelationV2 {
-                id: format!("heuristic-contains-{:06}", relations.len() + 1),
-                kind: RelationKind::Contains,
-                from: RelationEndpointV2::Node {
-                    node_id: parent.clone(),
-                },
-                to: RelationEndpointV2::Node {
-                    node_id: id.clone(),
-                },
-                origin_id: ENGINE_ORIGIN.to_owned(),
-                source: Derivation::Heuristic,
-                page_indexes: Vec::new(),
-                line_ids: Vec::new(),
-            });
-        }
-        nodes.push(StructureNodeV2 {
+        let mut node = StructureNode::new(
             id,
-            kind: block.kind,
-            range: block.range,
-            origin_id: ENGINE_ORIGIN.to_owned(),
-            source: Derivation::Heuristic,
-            label: block.label,
-            locator_kind: None,
-            aliases: (!block.aliases.is_empty()).then_some(block.aliases),
+            block.kind,
+            block.range,
+            block.origin_id,
+            block.source,
             parent_id,
-            anchor: None,
-            content_start: block.content_start,
-            marker_range: None,
-            page_indexes: Vec::new(),
-            line_ids: Vec::new(),
-            level: None,
-            grammar: None,
-            proof: None,
-        });
+        );
+        node.label = block.label;
+        node.aliases = (!block.aliases.is_empty()).then_some(block.aliases);
+        node.content_start = block.content_start;
+        nodes.push(node);
     }
-    let mut boundaries = evidence
-        .paragraph_breaks
-        .iter()
-        .map(|value| StructureBoundaryV2 {
-            kind: BoundaryKind::Prose,
-            at: value.at,
-            origin_id: value.origin_id.clone(),
-            source: Derivation::Native,
-        })
-        .collect::<Vec<_>>();
-    boundaries.extend(
-        nodes
-            .iter()
-            .filter(|node| {
-                node.kind == NodeKind::Prose && matches!(node.source, Derivation::Heuristic)
-            })
-            .map(|node| StructureBoundaryV2 {
-                kind: BoundaryKind::Prose,
-                at: node.range.end,
-                origin_id: ENGINE_ORIGIN.to_owned(),
-                source: Derivation::Heuristic,
-            }),
-    );
-    StructureGraphV2::from_parts(
-        evidence.document_id,
-        &evidence.text,
-        evidence.source_sha256,
-        if complete {
-            GraphStatus::Complete
-        } else {
-            GraphStatus::Partial
-        },
+    let document_id = std::mem::take(&mut evidence.document_id);
+    let provider = std::mem::take(&mut evidence.provider);
+    let profile = evidence.profile;
+    let revision = evidence.text_sha256.clone();
+    #[cfg(feature = "source-doc")]
+    let url = evidence.url.take();
+    #[cfg(feature = "source-doc")]
+    let doc_type = evidence.doc_type.map(|value| value.as_str().to_owned());
+    let text = std::mem::take(&mut evidence.text);
+    let source_sha256 = evidence.source_sha256.take();
+    let scope = evidence.scope;
+    let origins = evidence.origins;
+    let mut structure = DocumentStructure::from_scalar_parts(
+        document_id,
+        text,
+        source_sha256,
+        scope,
+        origins,
         nodes,
-        boundaries,
-        relations,
+        Vec::new(),
         diagnostics,
-    )
+    );
+    structure.provider = provider;
+    structure.profile = Some(profile);
+    structure.revision = revision;
+    #[cfg(feature = "source-doc")]
+    {
+        structure.url = url;
+        structure.doc_type = doc_type;
+    }
+    structure
 }
 
 #[cfg(feature = "structure-inference")]
-pub fn derive_structure_evidence(evidence: DocumentInput) -> Result<StructureGraphV2, EngineError> {
+pub fn derive_structure_evidence(
+    evidence: DocumentInput,
+) -> Result<DocumentStructure, EngineError> {
     let inferred = if evidence.needs_inference() {
         let text = ScalarText::new(&evidence.text);
         inference::inferred_blocks(&evidence, &text)
     } else {
         Vec::new()
     };
-    Ok(infer_graph(evidence, inferred, true))
+    Ok(infer_graph(evidence, inferred))
 }
 
 pub fn derive_native_structure_evidence(
     evidence: DocumentInput,
-) -> Result<StructureGraphV2, EngineError> {
-    Ok(infer_graph(evidence, Vec::new(), false))
+) -> Result<DocumentStructure, EngineError> {
+    Ok(infer_graph(evidence, Vec::new()))
 }
 
 #[cfg(feature = "source-doc")]
-fn projection(profile: DetectionProfile) -> (ProjectionOrder, Option<SourceDocType>) {
+fn projection(profile: Option<DetectionProfile>) -> (ProjectionOrder, Option<SourceDocType>) {
     match profile {
-        DetectionProfile::CaseRootedComplete => (ProjectionOrder::Case, Some(SourceDocType::Cases)),
-        DetectionProfile::CaseContiguousComplete | DetectionProfile::CaseLossy => {
+        Some(DetectionProfile::CaseRootedComplete) => {
+            (ProjectionOrder::Case, Some(SourceDocType::Cases))
+        }
+        Some(DetectionProfile::CaseContiguousComplete | DetectionProfile::CaseLossy) => {
             (ProjectionOrder::Position, Some(SourceDocType::Cases))
         }
-        DetectionProfile::Legislation => (ProjectionOrder::Legislation, Some(SourceDocType::Laws)),
-        DetectionProfile::Instrument => (ProjectionOrder::Legislation, None),
-        DetectionProfile::Journal => (ProjectionOrder::StablePosition, None),
+        Some(DetectionProfile::Legislation) => {
+            (ProjectionOrder::Legislation, Some(SourceDocType::Laws))
+        }
+        Some(DetectionProfile::Instrument) => (ProjectionOrder::Legislation, None),
+        Some(DetectionProfile::Journal) => (ProjectionOrder::StablePosition, None),
+        None => (ProjectionOrder::Position, None),
     }
 }
 
 #[cfg(feature = "source-doc")]
 fn compose_with(
-    mut input: DocumentInput,
+    input: DocumentInput,
     inference_enabled: bool,
     validate: bool,
-) -> Result<SourceDoc, EngineError> {
+    precomputed: Option<Vec<Block>>,
+) -> Result<DocumentStructure, EngineError> {
     if validate {
         input.validate()?;
     }
-    let (order, inferred_type) = projection(input.profile);
-    let provider = SourceDocProvider::from_name(&input.provider);
-    let id = input.document_id.clone();
-    let url = input.url.take();
-    let doc_type = input.doc_type.or(inferred_type);
-    let revision = input.text_sha256.clone();
-    let originals = source_doc::native_blocks(
-        &input.text,
-        &input.native_claims,
-        std::mem::take(&mut input.original_claims),
-    );
     #[cfg(feature = "structure-inference")]
-    let inferred = if inference_enabled && input.needs_inference() {
-        let text = ScalarText::new(&input.text);
-        inference::inferred_blocks(&input, &text)
-    } else {
+    let inferred = precomputed.unwrap_or_else(|| {
+        if inference_enabled && input.needs_inference() {
+            let text = ScalarText::new(&input.text);
+            inference::inferred_blocks(&input, &text)
+        } else {
+            Vec::new()
+        }
+    });
+    #[cfg(not(feature = "structure-inference"))]
+    let inferred = {
+        let _ = precomputed;
         Vec::new()
     };
-    #[cfg(not(feature = "structure-inference"))]
-    let inferred = Vec::new();
-    let text = std::mem::take(&mut input.text);
-    let graph = infer_graph(input, inferred, inference_enabled);
-    Ok(source_doc::project_graph(
-        provider, id, url, doc_type, text, revision, &originals, graph, order,
-    ))
+    Ok(infer_graph(input, inferred))
+}
+
+#[cfg(feature = "source-doc")]
+fn project_with(
+    input: DocumentInput,
+    inference_enabled: bool,
+    validate: bool,
+    precomputed: Option<Vec<Block>>,
+) -> Result<SourceDoc, EngineError> {
+    let structure = compose_with(input, inference_enabled, validate, precomputed)?;
+    Ok(project_document_structure(structure))
+}
+
+#[cfg(feature = "source-doc")]
+pub fn project_document_structure(structure: DocumentStructure) -> SourceDoc {
+    let (order, inferred_type) = projection(structure.profile);
+    source_doc::project_graph(structure, order, inferred_type)
+}
+
+#[cfg(feature = "source-doc")]
+pub fn project_document_structure_view(structure: &DocumentStructure) -> SourceDoc {
+    let (order, inferred_type) = projection(structure.profile);
+    source_doc::project_graph_view(structure, order, inferred_type)
+}
+
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
+pub fn derive_document_structure(input: DocumentInput) -> Result<DocumentStructure, EngineError> {
+    compose_with(input, true, true, None)
 }
 
 #[cfg(feature = "source-doc")]
 pub fn compose_native(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    compose_with(input, false, true)
+    project_with(input, false, true, None)
 }
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    compose_with(input, true, true)
+    project_with(input, true, true, None)
 }
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub(crate) fn compose_trusted(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    compose_with(input, true, false)
+pub(crate) fn derive_trusted(input: DocumentInput) -> Result<DocumentStructure, EngineError> {
+    compose_with(input, true, false, None)
+}
+
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
+pub(super) fn derive_trusted_inferred(
+    input: DocumentInput,
+    inferred: Vec<Block>,
+) -> Result<DocumentStructure, EngineError> {
+    compose_with(input, true, false, Some(inferred))
 }

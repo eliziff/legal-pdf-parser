@@ -1,11 +1,9 @@
-pub use legal_structure::{
-    Derivation, GraphStatus, NodeKind, ScalarRange, StructureGraphV2, StructureNodeV2,
-};
+pub use legal_structure::{Derivation, DocumentStructure, NodeKind, ScalarRange, StructureNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-pub const SCHEMA_VERSION: &str = "legalpdf.document.v2";
+pub const SCHEMA_VERSION: &str = "legalpdf.document.v3";
 pub const PARSER_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +221,43 @@ pub struct RepairRecord {
     pub scope_pages: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdfSourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdfSourceExtent {
+    pub id: String,
+    pub page_indexes: Vec<usize>,
+    pub line_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdfPageIdentity {
+    pub physical_index: usize,
+    pub physical_number: u32,
+    pub printed_folio: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PdfSourceMap {
+    pub pages: Vec<PdfPageIdentity>,
+    pub nodes: Vec<PdfSourceExtent>,
+    pub note_references: Vec<PdfSourceExtent>,
+    pub protected_citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
+    pub table_ids: Vec<String>,
+    pub image_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PdfPairingAudit {
+    pub markers: Vec<Value>,
+    pub marker_summary: Value,
+    pub pairing_summary: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegalDocument {
     pub document_id: String,
@@ -235,7 +270,9 @@ pub struct LegalDocument {
     pub footnotes: Vec<Footnote>,
     pub tables: Vec<TableBlock>,
     pub images: Vec<ImageBlock>,
-    pub structure_graph: StructureGraphV2,
+    pub structure_graph: DocumentStructure,
+    pub pdf_source_map: PdfSourceMap,
+    pub pairing_audit: Option<PdfPairingAudit>,
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default)]
     pub repairs: Vec<RepairRecord>,
@@ -348,6 +385,6 @@ mod tests {
         let value = serde_json::to_value(region).unwrap();
         assert_eq!(value["type"], "body");
         assert!(value.get("kind").is_none());
-        assert_eq!(SCHEMA_VERSION, "legalpdf.document.v2");
+        assert_eq!(SCHEMA_VERSION, "legalpdf.document.v3");
     }
 }
