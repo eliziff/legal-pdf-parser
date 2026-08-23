@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "a2aj")]
 mod a2aj;
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
+mod amendments;
 mod definitions;
 mod docx_lint;
 mod docx_numbering;
@@ -25,6 +27,8 @@ mod tables;
 mod text;
 #[cfg(feature = "a2aj")]
 pub use a2aj::{a2aj_document_structure, A2ajInput, A2ajSectionMap, A2ajSourceKind};
+#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
+pub use amendments::*;
 pub use definitions::*;
 pub use docx_lint::*;
 pub use docx_numbering::*;

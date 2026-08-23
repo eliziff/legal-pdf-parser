@@ -233,6 +233,106 @@ pub fn query_pdf_document_node(
         .map_err(|error| Error::from_reason(error.to_string()))
 }
 
+#[napi(js_name = "joinAmendmentLocator")]
+pub fn join_amendment_locator_node(head: String, sub: Option<String>) -> String {
+    legal_structure::join_locator(&head, sub.as_deref())
+}
+
+#[napi(js_name = "parseAmendmentInstructions")]
+pub fn parse_amendment_instructions_node(text: String) -> napi::Result<Buffer> {
+    amendment_buffer(&legal_structure::parse_amendment_instructions(&text))
+}
+
+fn amendment_buffer(value: &impl Serialize) -> napi::Result<Buffer> {
+    serde_json::to_vec(value)
+        .map(Buffer::from)
+        .map_err(|error| Error::from_reason(error.to_string()))
+}
+
+macro_rules! json_task {
+    ($name:ident { $($field:ident: $ty:ty),+ $(,)? }, $compute:expr) => {
+        pub struct $name { $($field: $ty),+ }
+        impl Task for $name {
+            type Output = serde_json::Value;
+            type JsValue = Buffer;
+            fn compute(&mut self) -> napi::Result<Self::Output> { $compute(self).map_err(native_error) }
+            fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Buffer> { amendment_buffer(&output) }
+        }
+    };
+}
+
+json_task!(ApplyAmendTask { source: String, ops: Vec<serde_json::Value>, reconstruct_lineation: bool }, |task: &mut ApplyAmendTask| {
+    legal_structure::apply_amend_ops(&task.source, std::mem::take(&mut task.ops), task.reconstruct_lineation)
+});
+
+#[napi(js_name = "applyAmendOps")]
+pub fn apply_amend_ops_node(
+    source: String,
+    ops: serde_json::Value,
+    reconstruct_lineation: Option<bool>,
+) -> napi::Result<AsyncTask<ApplyAmendTask>> {
+    let Some(ops) = ops.as_array().cloned() else {
+        return Err(Error::from_reason("amendment operations must be an array"));
+    };
+    Ok(AsyncTask::new(ApplyAmendTask {
+        source,
+        ops,
+        reconstruct_lineation: reconstruct_lineation.unwrap_or(true),
+    }))
+}
+
+json_task!(
+    DeleteAndRenumberTask {
+        source: String,
+        target: String,
+        reconstruct_lineation: bool
+    },
+    |task: &mut DeleteAndRenumberTask| {
+        legal_structure::delete_provision_and_renumber_siblings(
+            &task.source,
+            &task.target,
+            task.reconstruct_lineation,
+        )
+    }
+);
+
+#[napi(js_name = "deleteProvisionAndRenumberSiblings")]
+pub fn delete_provision_and_renumber_siblings_node(
+    source: String,
+    target: String,
+    reconstruct_lineation: Option<bool>,
+) -> AsyncTask<DeleteAndRenumberTask> {
+    AsyncTask::new(DeleteAndRenumberTask {
+        source,
+        target,
+        reconstruct_lineation: reconstruct_lineation.unwrap_or(true),
+    })
+}
+
+json_task!(
+    ConsolidateAmendmentTask {
+        source: String,
+        amendment: String,
+        reconstruct_lineation: bool
+    },
+    |task: &mut ConsolidateAmendmentTask| {
+        legal_structure::consolidate_amendment(&task.source, &task.amendment, task.reconstruct_lineation)
+    }
+);
+
+#[napi(js_name = "consolidateAmendment")]
+pub fn consolidate_amendment_node(
+    source: String,
+    amendment: String,
+    reconstruct_lineation: Option<bool>,
+) -> AsyncTask<ConsolidateAmendmentTask> {
+    AsyncTask::new(ConsolidateAmendmentTask {
+        source,
+        amendment,
+        reconstruct_lineation: reconstruct_lineation.unwrap_or(true),
+    })
+}
+
 fn native_error(error: legal_structure::EngineError) -> Error {
     Error::from_reason(error.to_string())
 }
