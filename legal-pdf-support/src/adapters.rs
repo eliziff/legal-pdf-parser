@@ -171,9 +171,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legal_pdf_core::model::{
-        DocumentStructure, Footnote, GraphStatus, Paragraph, PARSER_VERSION, SCHEMA_VERSION,
-    };
+    use legal_pdf_core::model::{Footnote, Paragraph, PARSER_VERSION, SCHEMA_VERSION};
 
     fn note(pair_id: &str, body: &str, usable: bool) -> Footnote {
         Footnote {
@@ -195,19 +193,6 @@ mod tests {
             warnings: vec![],
             crossrefs: vec![],
         }
-    }
-
-    fn structure_graph() -> DocumentStructure {
-        DocumentStructure::from_parts(
-            "doc".to_owned(),
-            "",
-            Some("00".repeat(32)),
-            GraphStatus::Complete,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        )
     }
 
     fn document() -> LegalDocument {
@@ -241,7 +226,12 @@ mod tests {
             ],
             tables: vec![],
             images: vec![],
-            structure_graph: structure_graph(),
+            structure_graph: serde_json::from_value(serde_json::json!({
+                "schema_version": "legalpdf.document-structure.v1", "document_id": "doc",
+                "offset_unit": "utf16", "text": "", "text_sha256": "00",
+                "scope": {"kind": "complete"}, "origins": [], "nodes": [], "diagnostics": []
+            }))
+            .unwrap(),
             pdf_source_map: Default::default(),
             pairing_audit: None,
             diagnostics: vec![],

@@ -2,7 +2,7 @@ use legal_pdf_core::{model::TableBlock, PdfOcrProvider};
 use std::path::Path;
 
 pub use legal_pdf_extraction_processor::{
-    inspect_pdf, union_bbox, Error, ExtractedPdf, PdfInspection, Result,
+    inspect_pdf, pdf_page_count, union_bbox, Error, ExtractedPdf, PdfInspection, Result,
 };
 
 pub fn extract_pdf(

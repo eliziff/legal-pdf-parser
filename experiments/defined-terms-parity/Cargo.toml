@@ -7,6 +7,6 @@ publish = false
 [workspace]
 
 [dependencies]
-legal-structure = { path = "../../legal-structure" }
+legal-structure = { path = "../../../legal-structure" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

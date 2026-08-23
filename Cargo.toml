@@ -6,12 +6,7 @@ license = "MIT"
 description = "Fast local-first structural parsing for legal PDFs"
 
 [workspace]
-members = [
-    "legal-grammar-tables",
-    "legal-structure",
-    "legal-structure-node",
-    "legal-structure-python",
-]
+members = []
 exclude = [
     "legal-pdf-core",
     "legal-pdf-extraction",
@@ -59,7 +54,7 @@ legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
 legal-pdf-pairing = { path = "legal-pdf-pairing", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
-legal-structure = { path = "legal-structure" }
+legal-structure = { path = "../legal-structure" }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
@@ -76,3 +71,8 @@ incremental = true
 codegen-units = 16
 incremental = false
 strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
