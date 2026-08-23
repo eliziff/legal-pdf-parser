@@ -19,6 +19,139 @@
       },
       "entries": [
         {
+          "id": "cite.in-text",
+          "pattern": "\\b(?:19|20)\\d{2}\\s+[A-Z]{2,8}\\s+\\d+\\b|\\[\\d{4}\\]\\s+[A-Z](?:\\.[A-Z]){1,4}\\.?\\s+No\\.?\\s+\\d+(?:\\s+\\([A-Z.]+\\))?|\\[\\d{4}\\]\\s+(?:\\d+\\s+)?[A-Z][A-Za-z.]{1,12}(?:\\s+[A-Z][A-Za-z.]{0,12}){0,3}\\s+\\d+|\\b\\d+\\s+[A-Z][A-Za-z.']{1,14}\\s*(?:\\(\\d[a-z]{0,2}\\))?\\s+\\d+\\b|\\bCanLII\\s+\\d+\\b|\\(\\d{4}\\),?\\s+\\d+\\s+[A-Z][A-Za-z.]{1,14}",
+          "flags": "",
+          "canonical": {},
+          "provenance": "Extracted verbatim from Beaver citationKey.ts CITATION_IN_TEXT_SOURCE before the Rust cutover; broad in-text detection only, with identification remaining a separate operation.",
+          "vectors": [
+            {
+              "input": "Applying 2024 SCC 6 and [2019] 4 S.C.R. 653.",
+              "groups": {}
+            },
+            {
+              "input": "the decision at CanLII 123 is short",
+              "groups": {}
+            },
+            {
+              "input": "notice served on every party",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.us.law.common",
+          "pattern": "(?<![A-Za-z0-9])\\d+\\s+U\\.?\\s*S\\.?\\s*C\\.?(?:\\s*§+\\s*|\\s+)\\d(?:[A-Za-z0-9().-]*[A-Za-z0-9)])?(?![A-Za-z0-9])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "Extracted verbatim from Beaver citationKey.ts COMMON_US_LAW before the Rust cutover; the cheap always-on U.S.C. family remains distinct from the extended U.S. fallback.",
+          "vectors": [
+            {
+              "input": "The claim arises under 42 U.S.C. § 1983.",
+              "groups": {}
+            },
+            {
+              "input": "See 18 USC 1833(b).",
+              "groups": {}
+            },
+            {
+              "input": "A42 U.S.C. § 1983B",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.us.reporter.standard.full",
+          "pattern": "(?<![A-Za-z0-9])(?<volume>[1-9][0-9]*) (?<reporter>{{us_reporters}}),? (?<page>[0-9]+|_+)(?![A-Za-z0-9])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "The numeric-page standard-reporter branch used by Beaver's always-on in-text scanner, expressed against the shared reporter catalogue instead of a runtime surface map.",
+          "vectors": [
+            {
+              "input": "410 U.S. 113",
+              "groups": {}
+            },
+            {
+              "input": "12 U.S. ix",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.us.reporter.standard.short",
+          "pattern": "(?<![A-Za-z0-9])(?<volume>[1-9][0-9]*) (?<reporter>{{us_reporters}}),? at\\s?(?:p(?:\\.|age)?)? (?<page>[0-9]+|_+)(?![A-Za-z0-9])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "The numeric-page standard-reporter short branch used by Beaver's always-on in-text scanner, expressed against the shared reporter catalogue instead of a runtime surface map.",
+          "vectors": [
+            {
+              "input": "410 U.S. at 115",
+              "groups": {}
+            },
+            {
+              "input": "12 U.S. at ix",
+              "groups": null
+            }
+          ]
+        },
+
+        {
+          "id": "cite.us.journal.standard.full",
+          "pattern": "(?<![A-Za-z0-9])(?<volume>[1-9]\\d*) (?<reporter>{{us_journals}}),? (?<page>[0-9]+|_+)(?![A-Za-z0-9])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "The standard-journal branch of cite.us.journal.full, exposed separately to preserve Beaver's cheap always-on scanner without copying the reporter catalogue.",
+          "vectors": [
+            {
+              "input": "123 Harv. L. Rev. 456",
+              "groups": {}
+            },
+            {
+              "input": "T.C.M. (RIA) 2004-279",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.us.journal.standard.short",
+          "pattern": "(?<![A-Za-z0-9])(?<volume>[1-9]\\d*) (?<reporter>{{us_journals}}),? at\\s?(?:p(?:\\.|age)?)? (?<page>[0-9]+|_+)(?![A-Za-z0-9])",
+          "flags": "",
+          "canonical": {},
+          "provenance": "The standard-journal branch of cite.us.journal.short, exposed separately to preserve Beaver's cheap always-on scanner without copying the reporter catalogue.",
+          "vectors": [
+            {
+              "input": "123 Harv. L. Rev. at 460",
+              "groups": {}
+            },
+            {
+              "input": "Imaginary Journal at 460",
+              "groups": null
+            }
+          ]
+        },
+        {
+          "id": "cite.us.fallback-cue",
+          "pattern": "§|\\b(?:admin\\.|cas\\.|code|comp\\.|gov't|lab\\.|misc\\.?|reg\\.|stat\\.|t\\.?c\\.?m\\.?)\\b",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "Extracted verbatim from Beaver citationKey.ts RESIDUAL_US_CUE before the Rust cutover; it limits expensive custom U.S. grammar scans to the original source lines.",
+          "vectors": [
+            {
+              "input": "See T.C.M. (RIA) 2004-279.",
+              "groups": {}
+            },
+            {
+              "input": "Under Am. Samoa Code Ann. § 15.4.",
+              "groups": {}
+            },
+            {
+              "input": "ordinary prose without a legal cue",
+              "groups": null
+            }
+          ]
+        },
+
+        {
           "id": "cite.neutral",
           "pattern": "\\b(?<year>(?:17|18|19|20)\\d{2})\\s+(?<court>[A-Z][A-Z0-9-]{1,15})\\s+(?<num>\\d+)\\b",
           "flags": "",

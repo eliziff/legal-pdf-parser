@@ -1,11 +1,13 @@
 use legal_structure::{
-    a2aj_document_structure, analyze_instrument, analyze_native_markup, derive_document_structure,
-    docx_structure_lint, journal_document_structure, journal_text_document_structure,
+    a2aj_document_structure, analyze_instrument, analyze_native_markup,
+    caselaw_citation_lookup_key, citation_lookup_key, citations_in_text, classify_citator_excerpt,
+    derive_document_structure, docx_structure_lint, grounded_prose_errors, has_citation_in_text,
+    journal_document_structure, journal_text_document_structure, marked_quote_spans,
     normalize_source_doc_locator, parse_address, phrase_spans, project_document_structure_view,
-    quote_words, text_fragment_directives, tokenize_source_text, A2ajInput, AuthoritativeTableCell,
-    DocumentInput, DocumentStructure, FollowDirection, InstrumentCrossReferenceGraph,
-    JournalPageLabel, NativeMarkupInput, PhraseOptions, SourceDoc, SourceDocKind, SourceDocOrigin,
-    SourceDocQuery,
+    quote_repair_suggestion, quote_words, text_fragment_directives, tokenize_source_text,
+    A2ajInput, AuthoritativeTableCell, DocumentInput, DocumentStructure, FollowDirection,
+    InstrumentCrossReferenceGraph, JournalPageLabel, NativeMarkupInput, PhraseOptions, SourceDoc,
+    SourceDocKind, SourceDocOrigin, SourceDocQuery, VisibleEvidenceText,
 };
 use napi::{
     bindgen_prelude::{AsyncTask, Buffer, External, ExternalRef},
@@ -512,6 +514,56 @@ pub fn tokenize_source_text_node(env: Env, text: String) -> napi::Result<Unknown
 #[napi(js_name = "sourceDocQuoteWords")]
 pub fn source_doc_quote_words_node(text: String) -> Vec<String> {
     quote_words(&text)
+}
+
+#[napi(js_name = "citationLookupKey")]
+pub fn citation_lookup_key_node(text: String) -> String {
+    citation_lookup_key(&text)
+}
+
+#[napi(js_name = "citationsInText")]
+pub fn citations_in_text_node(
+    env: Env,
+    text: String,
+    extended_us_fallback: bool,
+) -> napi::Result<Unknown<'static>> {
+    js_value(env, &citations_in_text(&text, extended_us_fallback))
+}
+
+#[napi(js_name = "caselawCitationLookupKey")]
+pub fn caselaw_citation_lookup_key_node(text: String) -> napi::Result<String> {
+    caselaw_citation_lookup_key(&text).map_err(Error::from_reason)
+}
+
+#[napi(js_name = "hasCitationInText")]
+pub fn has_citation_in_text_node(text: String) -> bool {
+    has_citation_in_text(&text)
+}
+
+#[napi(js_name = "classifyCitatorExcerpt")]
+pub fn classify_citator_excerpt_node(env: Env, text: String) -> napi::Result<Unknown<'static>> {
+    js_value(env, &classify_citator_excerpt(&text))
+}
+
+#[napi(js_name = "groundedProseErrors")]
+pub fn grounded_prose_errors_node(
+    text: String,
+    cited_evidence_ids: Vec<String>,
+    visible_evidence: serde_json::Value,
+) -> napi::Result<Vec<String>> {
+    let visible: Vec<VisibleEvidenceText> = serde_json::from_value(visible_evidence)
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    Ok(grounded_prose_errors(&text, &cited_evidence_ids, &visible))
+}
+
+#[napi(js_name = "quoteRepairSuggestion")]
+pub fn quote_repair_suggestion_node(claim: String, spans: Vec<String>) -> Option<String> {
+    quote_repair_suggestion(&claim, &spans)
+}
+
+#[napi(js_name = "markedQuoteSpans")]
+pub fn marked_quote_spans_node(env: Env, text: String) -> napi::Result<Unknown<'static>> {
+    js_value(env, &marked_quote_spans(&text))
 }
 
 #[napi(js_name = "lookupSourceDoc")]

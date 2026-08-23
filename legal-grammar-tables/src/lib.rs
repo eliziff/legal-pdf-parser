@@ -3,6 +3,7 @@ use regex::{Regex, RegexBuilder as LinearRegexBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::OnceLock;
 
 mod grammar_word;
@@ -27,6 +28,28 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 pub type CompiledGrammar = FancyRegex;
 pub type CompiledEcmascriptGrammar = Regex;
+
+pub struct AsciiBoundedGrammar {
+    regex: Regex,
+}
+
+impl AsciiBoundedGrammar {
+    pub fn find_spans(&self, text: &str) -> Vec<Range<usize>> {
+        let mut spans = Vec::new();
+        let mut cursor = 0;
+        while cursor <= text.len() {
+            let Some(captures) = self.regex.captures_at(text, cursor) else {
+                break;
+            };
+            let matched = captures
+                .name("__legal_grammar_span")
+                .expect("bounded grammar span");
+            spans.push(matched.start()..matched.end());
+            cursor = matched.end();
+        }
+        spans
+    }
+}
 
 pub const GRAMMAR_CORPUS_FORMAT: &str = "legal-grammar-corpus:v1";
 pub const SOURCE_WHITESPACE: &str = concat!(
@@ -481,6 +504,53 @@ pub fn compile_ecmascript_table_entry(entry_id: &str) -> Result<CompiledEcmascri
         .get(entry_id)
         .ok_or_else(|| Error::Message(format!("unknown grammar entry: {entry_id}")))?;
     compile_ecmascript_entry(&value.entry, &value.defs)
+}
+
+fn ascii_bounded_source(entry_id: &str) -> Result<(String, String)> {
+    const LEFT: &str = "(?<![A-Za-z0-9])";
+    const RIGHT: &str = "(?![A-Za-z0-9])";
+
+    let tables = load_tables()?;
+    let value = tables
+        .get(entry_id)
+        .ok_or_else(|| Error::Message(format!("unknown grammar entry: {entry_id}")))?;
+    let expanded = expanded_entry(&value.entry, &value.defs)?;
+    let inner = expanded
+        .strip_prefix(LEFT)
+        .and_then(|pattern| pattern.strip_suffix(RIGHT))
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "{entry_id}: expected outer ASCII alphanumeric boundaries"
+            ))
+        })?
+        .replace("(?:(?!)|", "(?:");
+    let portable = expand_ecmascript_portable(&inner)?;
+    let source =
+        format!(r"(?:\A|[^A-Za-z0-9])(?<__legal_grammar_span>{portable})(?:\z|[^A-Za-z0-9])");
+    Ok((source, value.entry.flags.clone()))
+}
+
+fn compile_ascii_bounded_source(entry_id: &str, source: &str, flags: &str) -> Result<Regex> {
+    let mut builder = LinearRegexBuilder::new(source);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'));
+    if entry_id == "cite.us.reporter.custom.short" {
+        builder.dfa_size_limit(8 << 20);
+    }
+    builder.build().map_err(|error| {
+        Error::Message(format!(
+            "{entry_id}: does not compile as an ASCII-bounded linear grammar: {error}"
+        ))
+    })
+}
+
+pub fn compile_ascii_bounded_table_entry(entry_id: &str) -> Result<AsciiBoundedGrammar> {
+    let (source, flags) = ascii_bounded_source(entry_id)?;
+    Ok(AsciiBoundedGrammar {
+        regex: compile_ascii_bounded_source(entry_id, &source, &flags)?,
+    })
 }
 
 const MIN_WINDOW_TEXT: usize = 4096;

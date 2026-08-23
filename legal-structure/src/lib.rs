@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 mod a2aj;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 mod amendments;
+#[cfg(feature = "structure-inference")]
+mod citator;
 mod definitions;
 mod docx_lint;
 mod docx_numbering;
@@ -23,6 +25,8 @@ mod locator;
 mod native_markup;
 mod numeric_sequence;
 #[cfg(feature = "source-doc")]
+mod quote_verification;
+#[cfg(feature = "source-doc")]
 mod source_doc;
 #[cfg(feature = "source-doc")]
 mod source_doc_query;
@@ -32,6 +36,8 @@ mod text;
 pub use a2aj::{a2aj_document_structure, A2ajInput, A2ajSectionMap, A2ajSourceKind};
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use amendments::*;
+#[cfg(feature = "structure-inference")]
+pub use citator::*;
 pub use definitions::*;
 pub use docx_lint::*;
 pub use docx_numbering::*;
@@ -44,6 +50,8 @@ pub use journal::{
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use native_markup::{analyze_native_markup, NativeMarkupInput};
 pub use numeric_sequence::*;
+#[cfg(feature = "source-doc")]
+pub use quote_verification::*;
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
     SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind, SourceDocOrigin, SourceDocProvider,
