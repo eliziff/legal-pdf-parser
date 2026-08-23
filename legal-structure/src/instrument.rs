@@ -190,7 +190,15 @@ struct InstrumentContentsHead {
 #[cfg(feature = "structure-inference")]
 fn instrument_contents_anchors(text: &str) -> Vec<usize> {
     static TABLE: OnceLock<Regex> = OnceLock::new();
-    let table = TABLE.get_or_init(|| Regex::new(r"(?i:TABLE[ \t]+OF[ \t]+CONTENTS)").unwrap());
+    static BARE: OnceLock<Regex> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        Regex::new(r"(?i:TABLE[ \t]+OF[ \t]+CONTENTS)")
+            .expect("valid instrument contents anchor grammar")
+    });
+    let bare = BARE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:CONTENTS|INDEX)$")
+            .expect("valid bare instrument contents anchor grammar")
+    });
     let mut anchors = Vec::with_capacity(CONTENTS_MAX_ANCHORS);
     let mut start = 0;
     loop {
@@ -216,7 +224,7 @@ fn instrument_contents_anchors(text: &str) -> Vec<usize> {
             break;
         }
         let core = line.trim_matches([' ', '\t']);
-        if core.eq_ignore_ascii_case("CONTENTS") || core.eq_ignore_ascii_case("INDEX") {
+        if bare.is_match(core) {
             anchors.push((start, end));
             if anchors.len() == CONTENTS_MAX_ANCHORS {
                 break;
@@ -394,7 +402,8 @@ fn instrument_contents_region(
     from_byte: usize,
     from_utf16: usize,
 ) -> Option<InstrumentContentsOutline> {
-    // Original offsets; the window floors split surrogates and final lookahead ceils them.
+    // Original-text offsets: the window floors a split surrogate and the
+    // final-entry lookahead ceils one; exact regex boundaries never round.
     let requested_utf16 = CONTENTS_WINDOW_UTF16.min(text.utf16_len() - from_utf16);
     let region_end = text
         .byte_at_utf16_floor(from_utf16 + requested_utf16)
