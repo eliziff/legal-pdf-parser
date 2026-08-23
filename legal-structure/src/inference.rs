@@ -2653,18 +2653,17 @@ impl StructureState {
 }
 
 fn enumerated_children(
-    value: &str,
-    offset: usize,
+    text: &ScalarText<'_>,
+    range: std::ops::Range<usize>,
     root: String,
-    root_depth: usize,
     content_start: usize,
     inline_at_root: bool,
     leading_label: Option<&str>,
 ) -> Vec<Block> {
-    let text = ScalarText::new(value);
-    let public_parent = root.clone();
+    let bytes = text.byte(range.start)..text.byte(range.end);
+    let value = &text.value[bytes.clone()];
     let mut state = StructureState {
-        section: Some((root, root_depth)),
+        section: Some((root.clone(), 0)),
         ..Default::default()
     };
     let mut markers = Vec::new();
@@ -2678,37 +2677,46 @@ fn enumerated_children(
         let (token, content, close) = legislation_marker(line, newline)?;
         Some(ChildMark {
             token,
-            start: value[..prefix + close].chars().count(),
-            content_start: value[..prefix + content].chars().count(),
+            start: range.start + value[..prefix + close].chars().count(),
+            content_start: range.start + value[..prefix + content].chars().count(),
         })
     });
     if let Some(marker) = leading {
         markers.push(marker);
     } else {
-        let inline = &text.value[text.byte(content_start)..];
+        let inline = &text.value[text.byte(content_start)..bytes.end];
         let inline_line = inline.lines().next().unwrap_or_default();
         if let Some((token, at, _)) = legislation_marker(inline_line, inline.contains('\n')) {
+            let start = inline_at_root
+                .then_some(range.start)
+                .unwrap_or(content_start);
             markers.push(ChildMark {
                 token,
-                start: if inline_at_root { 0 } else { content_start },
+                start,
                 content_start: content_start + inline_line[..at].chars().count(),
             });
         }
     }
     let seeded_start = markers.first().map(|marker| marker.start);
-    for line in lines(&text) {
-        let value = line.text.trim_start_matches(instrument_space);
-        if let Some((token, at, _)) = legislation_marker(value, line.byte_end < text.value.len()) {
-            if seeded_start != Some(line.scalar_start) {
+    let (mut line_byte, mut line_scalar) = (bytes.start, range.start);
+    for raw in value.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim_start_matches(instrument_space);
+        let newline = line_byte + line.len() < bytes.end;
+        if let Some((token, at, _)) = legislation_marker(trimmed, newline) {
+            if seeded_start != Some(line_scalar) {
                 markers.push(ChildMark {
                     token,
-                    start: line.scalar_start,
-                    content_start: line.scalar_start
-                        + line.text[..line.text.len() - value.len()].chars().count()
-                        + value[..at].chars().count(),
+                    start: line_scalar,
+                    content_start: line_scalar
+                        + line[..line.len() - trimmed.len()].chars().count()
+                        + trimmed[..at].chars().count(),
                 });
             }
         }
+        line_byte += raw.len();
+        line_scalar += raw.chars().count();
     }
     markers.sort_by_key(|marker| marker.start);
     for index in 0..markers.len() {
@@ -2730,11 +2738,8 @@ fn enumerated_children(
         }
         node.range.end = markers
             .get(next_marker)
-            .map_or(text.len(), |marker| marker.start);
-        node.range.start += offset;
-        node.range.end += offset;
-        node.content_start += offset;
-        node.parent_label = Some(public_parent.clone());
+            .map_or(range.end, |marker| marker.start);
+        node.parent_label = Some(root.clone());
     }
     state
         .nodes
@@ -2933,15 +2938,11 @@ fn detect_legislation(
             .collect();
         top.content_start = Some(section.content_start);
         result.push(top);
-        let value = text
-            .slice(section.start..end)
-            .expect("instrument section range is bounded");
         let children = enumerated_children(
-            value,
-            section.start,
+            text,
+            section.start..end,
             parent.clone(),
-            0,
-            section.content_start - section.start,
+            section.content_start,
             matches!(section.family, SectionFamily::Bare | SectionFamily::DotTerm),
             None,
         );
@@ -2978,11 +2979,10 @@ fn detect_legislation(
             });
         let parent = format!("sec{label}");
         let children = enumerated_children(
-            value,
-            claim.range.start,
+            text,
+            claim.range.start..claim.range.end,
             parent.clone(),
-            0,
-            content_start - claim.range.start,
+            content_start,
             false,
             Some(label),
         );
