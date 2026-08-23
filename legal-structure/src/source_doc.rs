@@ -310,11 +310,7 @@ fn number(kind: SourceDocKind, label: &str) -> Option<usize> {
         .flatten()
 }
 
-fn range(kind: SourceDocKind, all: &[SourceDocBlock]) -> SourceDocRange {
-    let blocks = all
-        .iter()
-        .filter(|block| block.kind == kind)
-        .collect::<Vec<_>>();
+fn range(kind: SourceDocKind, blocks: &[&SourceDocBlock]) -> SourceDocRange {
     let physical = blocks
         .iter()
         .map(|block| block.label.to_lowercase())
@@ -344,11 +340,11 @@ fn range(kind: SourceDocKind, all: &[SourceDocBlock]) -> SourceDocRange {
     let labels = spine
         .iter()
         .flat_map(|block| std::iter::once(&block.label).chain(block.aliases.iter()))
-        .filter(|label| seen.insert((*label).clone()))
+        .filter(|label| seen.insert(label.as_str()))
         .collect::<Vec<_>>();
     let numbered = labels
         .iter()
-        .filter_map(|label| number(kind, label).map(|value| ((*label).clone(), value)))
+        .filter_map(|label| number(kind, label).map(|value| (*label, value)))
         .collect::<Vec<_>>();
     if numbered.len() != labels.len() {
         return SourceDocRange {
@@ -408,21 +404,24 @@ fn range(kind: SourceDocKind, all: &[SourceDocBlock]) -> SourceDocRange {
 fn source_doc_navigation(
     blocks: &[SourceDocBlock],
 ) -> (SourceDocStatus, SourceDocIndex, SourceDocRanges) {
-    let ranges = SourceDocRanges {
-        paragraph: range(SourceDocKind::Paragraph, &blocks),
-        page: range(SourceDocKind::Page, &blocks),
-        section: range(SourceDocKind::Section, &blocks),
-        footnote: range(SourceDocKind::Footnote, &blocks),
-    };
+    let (mut paragraphs, mut pages, mut sections, mut footnotes) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut positions = HashMap::new();
     let mut order = Vec::new();
     let mut duplicates = HashSet::new();
     for (position, block) in blocks.iter().enumerate() {
+        match block.kind {
+            SourceDocKind::Paragraph => paragraphs.push(block),
+            SourceDocKind::Page => pages.push(block),
+            SourceDocKind::Section => sections.push(block),
+            SourceDocKind::Footnote => footnotes.push(block),
+            SourceDocKind::Table | SourceDocKind::Row | SourceDocKind::Cell => {}
+        }
         let mut labels = HashSet::new();
         for label in std::iter::once(&block.label)
             .chain(block.aliases.iter())
             .chain(block.anchor.iter())
-            .filter(|label| labels.insert((*label).clone()))
+            .filter(|label| labels.insert(label.as_str()))
         {
             let key = label.to_lowercase();
             if positions.contains_key(&key) {
@@ -433,6 +432,12 @@ fn source_doc_navigation(
             }
         }
     }
+    let ranges = SourceDocRanges {
+        paragraph: range(SourceDocKind::Paragraph, &paragraphs),
+        page: range(SourceDocKind::Page, &pages),
+        section: range(SourceDocKind::Section, &sections),
+        footnote: range(SourceDocKind::Footnote, &footnotes),
+    };
     positions.retain(|label, _| !duplicates.contains(label));
     order.retain(|label| !duplicates.contains(label));
     (

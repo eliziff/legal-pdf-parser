@@ -1803,9 +1803,10 @@ fn instrument_head_span_sections<'a>(
 fn derive_instrument_structure(
     text: &str,
     document_id: String,
+    original_sha256: &str,
     tables: &AuthoritativeTables,
     mut hypotheses: impl Iterator<Item = String>,
-) -> Result<DocumentStructure, EngineError> {
+) -> Result<(DocumentStructure, bool), EngineError> {
     let text = ScalarText::new(text);
     let references =
         find_provision_references(text.value, FindProvisionReferencesOptions::default());
@@ -1814,13 +1815,23 @@ fn derive_instrument_structure(
         .next()
         .ok_or_else(|| EngineError::invalid("instrument lineation selection requires a graph"))?;
     let mut selected_text = tables.masked_text(first);
-    let mut selected_blocks = crate::inference::detect_instrument(&ScalarText::new(&selected_text));
+    let selected_view = if selected_text.len() == text.value.len() {
+        text.with_same_coordinates(&selected_text)
+    } else {
+        ScalarText::new(&selected_text)
+    };
+    let mut selected_blocks = crate::inference::detect_instrument(&selected_view);
     let mut selected = 0;
     let mut best = instrument_lineation_score_blocks(&selected_blocks, &endorsed);
     if best < endorsed.len() {
         for (index, hypothesis) in hypotheses.enumerate() {
             let candidate_text = tables.masked_text(hypothesis);
-            let candidate = crate::inference::detect_instrument(&ScalarText::new(&candidate_text));
+            let candidate_view = if candidate_text.len() == text.value.len() {
+                text.with_same_coordinates(&candidate_text)
+            } else {
+                ScalarText::new(&candidate_text)
+            };
+            let candidate = crate::inference::detect_instrument(&candidate_view);
             if instrument_block_head_span(&candidate, text.utf16_len()) < 0.05 {
                 continue;
             }
@@ -1836,8 +1847,8 @@ fn derive_instrument_structure(
             }
         }
     }
+    let selected_original = selected == 0 && tables.is_empty();
     let scalar_end = selected_text.chars().count();
-    let text_sha256 = format!("{:x}", Sha256::digest(selected_text.as_bytes()));
     let input = DocumentInput {
         schema_version: EVIDENCE_SCHEMA.to_owned(),
         document_id,
@@ -1852,7 +1863,9 @@ fn derive_instrument_structure(
         require_report_start: false,
         allow_hyphenated_sections: false,
         text: selected_text,
-        text_sha256,
+        text_sha256: selected_original
+            .then(|| original_sha256.to_owned())
+            .unwrap_or_default(),
         source_sha256: None,
         offset_unit: "unicode-scalar".to_owned(),
         scope: Scope::complete(),
@@ -1943,7 +1956,7 @@ fn derive_instrument_structure(
         })
         .collect();
     structure.definitions = definitions;
-    Ok(structure)
+    Ok((structure, selected_original))
 }
 
 #[cfg(feature = "structure-inference")]
@@ -1959,7 +1972,9 @@ pub fn analyze_instrument(
         .flatten()
         .chain((!reconstruct_lineation).then(|| text.to_owned()));
     let tables = AuthoritativeTables::new(text, table_cells)?;
-    let mut structure = derive_instrument_structure(text, document_id, &tables, hypotheses)?;
+    let original_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let (mut structure, selected_original) =
+        derive_instrument_structure(text, document_id, &original_sha256, &tables, hypotheses)?;
     structure
         .nodes
         .extend(tables.nodes(&structure.nodes, "provider-adapter"));
@@ -1970,9 +1985,11 @@ pub fn analyze_instrument(
     structure
         .nodes
         .sort_by_key(|node| (node.range.start, depths[node.id.as_str()]));
-    structure.text = text.to_owned();
-    structure.text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    structure.revision.clone_from(&structure.text_sha256);
+    if !selected_original {
+        structure.text = text.to_owned();
+        structure.text_sha256.clone_from(&original_sha256);
+        structure.revision = original_sha256;
+    }
     Ok(structure)
 }
 

@@ -1326,69 +1326,85 @@ pub(super) struct SectionMark {
 }
 
 #[derive(Clone)]
-struct LabelPart {
+struct LabelPart<'a> {
     separator: char,
-    digits: Option<String>,
-    text: String,
+    digits: Option<&'a str>,
+    text: &'a str,
     suffix: u32,
 }
 
 fn suffix_value(value: &str) -> u32 {
-    value
-        .to_ascii_uppercase()
-        .bytes()
-        .fold(0, |total, value| total * 26 + u32::from(value - b'A' + 1))
+    value.bytes().fold(0, |total, value| {
+        total * 26 + u32::from(value.to_ascii_uppercase() - b'A' + 1)
+    })
 }
 
-fn label_parts(label: &str) -> Vec<LabelPart> {
+fn label_parts(label: &str) -> impl Iterator<Item = LabelPart<'_>> {
     let mut separator = '\0';
-    label
-        .split_inclusive(['.', '-'])
-        .filter_map(|piece| {
-            let (body, next) = piece
-                .strip_suffix('.')
-                .map(|value| (value, '.'))
-                .or_else(|| piece.strip_suffix('-').map(|value| (value, '-')))
-                .unwrap_or((piece, '\0'));
-            if body.is_empty() {
-                separator = next;
-                return None;
-            }
-            let digits = body.bytes().take_while(u8::is_ascii_digit).count();
-            let numeric = (digits > 0
-                && body[digits..]
-                    .chars()
-                    .all(|value| value.is_ascii_alphabetic()))
-            .then(|| body[..digits].to_owned());
-            let value = LabelPart {
-                separator,
-                digits: numeric,
-                text: body.to_owned(),
-                suffix: suffix_value(&body[digits..]),
-            };
+    label.split_inclusive(['.', '-']).filter_map(move |piece| {
+        let (body, next) = piece
+            .strip_suffix('.')
+            .map(|value| (value, '.'))
+            .or_else(|| piece.strip_suffix('-').map(|value| (value, '-')))
+            .unwrap_or((piece, '\0'));
+        if body.is_empty() {
             separator = next;
-            Some(value)
-        })
-        .collect()
+            return None;
+        }
+        let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+        let numeric = (digits > 0
+            && body[digits..]
+                .chars()
+                .all(|value| value.is_ascii_alphabetic()))
+        .then_some(&body[..digits]);
+        let value = LabelPart {
+            separator,
+            digits: numeric,
+            text: body,
+            suffix: suffix_value(&body[digits..]),
+        };
+        separator = next;
+        Some(value)
+    })
 }
 
-fn compare_parts(left: &[LabelPart], right: &[LabelPart], fraction: bool) -> std::cmp::Ordering {
+pub(super) fn compare_labels(left: &str, right: &str, fraction: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
-    for index in 0..left.len().max(right.len()) {
-        let (Some(a), Some(b)) = (left.get(index), right.get(index)) else {
-            return left.len().cmp(&right.len());
+    let (mut left, mut right) = (label_parts(left), label_parts(right));
+    loop {
+        let (a, b) = match (left.next(), right.next()) {
+            (None, None) => return Equal,
+            (None, Some(_)) => return Less,
+            (Some(_), None) => return Greater,
+            (Some(a), Some(b)) => (a, b),
         };
         if a.separator != b.separator {
             return a.separator.cmp(&b.separator);
         }
-        match (&a.digits, &b.digits) {
+        match (a.digits, b.digits) {
             (Some(a_digits), Some(b_digits)) => {
                 let width = a_digits.len().max(b_digits.len());
                 let ordered = if fraction && a.separator == '.' {
-                    format!("{a_digits:0<width$}").cmp(&format!("{b_digits:0<width$}"))
+                    (0..width)
+                        .map(|index| *a_digits.as_bytes().get(index).unwrap_or(&b'0'))
+                        .cmp(
+                            (0..width)
+                                .map(|index| *b_digits.as_bytes().get(index).unwrap_or(&b'0')),
+                        )
                 } else {
-                    format!("{:0>width$}", a_digits.trim_start_matches('0'))
-                        .cmp(&format!("{:0>width$}", b_digits.trim_start_matches('0')))
+                    let a_digits = a_digits.trim_start_matches('0').as_bytes();
+                    let b_digits = b_digits.trim_start_matches('0').as_bytes();
+                    (0..width)
+                        .map(|index| {
+                            index
+                                .checked_sub(width - a_digits.len())
+                                .map_or(b'0', |index| a_digits[index])
+                        })
+                        .cmp((0..width).map(|index| {
+                            index
+                                .checked_sub(width - b_digits.len())
+                                .map_or(b'0', |index| b_digits[index])
+                        }))
                 };
                 if ordered != Equal {
                     return ordered;
@@ -1413,17 +1429,42 @@ fn compare_parts(left: &[LabelPart], right: &[LabelPart], fraction: bool) -> std
             }
         }
     }
-    Equal
-}
-
-pub(super) fn compare_labels(left: &str, right: &str, fraction: bool) -> std::cmp::Ordering {
-    compare_parts(&label_parts(left), &label_parts(right), fraction)
 }
 
 fn numeric_label(value: &str, markdown: bool) -> Option<(&str, usize)> {
-    let matched = cached_regex!(VALUE, r"^\d{1,8}(?:[.-]\d{1,8}){0,3}[A-Z]{0,2}").find(value)?;
-    let label = matched.as_str();
-    (!markdown || label.contains(['.', '-'])).then_some((label, matched.end()))
+    let bytes = value.as_bytes();
+    let mut end = bytes
+        .iter()
+        .take(8)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if end == 0 {
+        return None;
+    }
+    for _ in 0..3 {
+        if !bytes
+            .get(end)
+            .is_some_and(|byte| matches!(byte, b'.' | b'-'))
+        {
+            break;
+        }
+        let digits = bytes[end + 1..]
+            .iter()
+            .take(8)
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            break;
+        }
+        end += digits + 1;
+    }
+    end += bytes[end..]
+        .iter()
+        .take(2)
+        .take_while(|byte| byte.is_ascii_uppercase())
+        .count();
+    let label = &value[..end];
+    (!markdown || label.contains(['.', '-'])).then_some((label, end))
 }
 
 fn provision_label(value: &str) -> Option<(&str, usize)> {
@@ -1550,17 +1591,16 @@ fn section_mark(
     })
 }
 
-fn collect_section_families(text: &ScalarText<'_>) -> [Vec<SectionMark>; 3] {
+fn collect_section_families(text: &ScalarText<'_>, source: &[Line<'_>]) -> [Vec<SectionMark>; 3] {
     const FAMILIES: [SectionFamily; 3] = [
         SectionFamily::Bare,
         SectionFamily::DotTerm,
         SectionFamily::Markdown,
     ];
-    let source = lines(text).collect::<Vec<_>>();
     let mut result = std::array::from_fn(|_| Vec::new());
     for index in 0..source.len() {
         for (family, marks) in FAMILIES.into_iter().zip(&mut result) {
-            if let Some(mark) = section_mark(text, &source, index, family) {
+            if let Some(mark) = section_mark(text, source, index, family) {
                 marks.push(mark);
             }
         }
@@ -1587,14 +1627,14 @@ fn section_scopes(
 ) -> Vec<Vec<SectionMark>> {
     let mut scopes = Vec::<Vec<SectionMark>>::new();
     for mark in marks.iter().filter(|value| styles.contains(&value.style)) {
-        let parts = label_parts(&mark.label);
+        let parts = label_parts(&mark.label).count();
         let best = scopes
             .iter()
             .enumerate()
             .filter(|(_, scope)| {
                 let last = scope.last().unwrap();
-                let prior = label_parts(&last.label);
-                parts.len() == prior.len() && compare_parts(&parts, &prior, fraction).is_gt()
+                parts == label_parts(&last.label).count()
+                    && compare_labels(&mark.label, &last.label, fraction).is_gt()
             })
             .reduce(|best, candidate| {
                 if compare_labels(
@@ -1794,15 +1834,23 @@ fn next_nonblank<'a>(source: &'a [Line<'a>], start: usize) -> Option<&'a Line<'a
         .find(|line| line.scalar_start > start && !line.text.trim().is_empty())
 }
 
-fn short_root(text: &ScalarText<'_>, families: &[Vec<SectionMark>; 3]) -> Vec<SectionMark> {
+fn short_root(
+    text: &ScalarText<'_>,
+    families: &[Vec<SectionMark>; 3],
+    source: &[Line<'_>],
+) -> Vec<SectionMark> {
     let status = cached_regex!(
         STATUS,
         r"(?iu)^(?:\[\s*)?(?:repealed|revoked|abrog(?:ated|é|ée|és|ées)|renumbered|spent|not (?:yet )?in force|omitted)\b"
     );
     let heading = cached_regex!(HEADING, r#"^(?:(?:["'“«]\s*)?\p{Lu}|\(\d+\))"#);
-    let source = lines(text).collect::<Vec<_>>();
-    let mut candidates = families.iter().flatten().cloned().collect::<Vec<_>>();
-    for line in &source {
+    let mut candidates = families
+        .iter()
+        .flatten()
+        .filter(|value| matches!(value.label.as_str(), "1" | "2"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for line in source {
         let value = line.text.trim_matches([' ', '\t']);
         if matches!(value, "1" | "2") {
             candidates.push(SectionMark {
@@ -1815,7 +1863,6 @@ fn short_root(text: &ScalarText<'_>, families: &[Vec<SectionMark>; 3]) -> Vec<Se
             });
         }
     }
-    candidates.retain(|value| matches!(value.label.as_str(), "1" | "2"));
     let mut invalid = false;
     for marker in &mut candidates {
         let start = text.byte(marker.content_start);
@@ -1826,7 +1873,7 @@ fn short_root(text: &ScalarText<'_>, families: &[Vec<SectionMark>; 3]) -> Vec<Se
         // label ending immediately before `\r` is not "at" the `\n` line
         // end, even though the intervening scalar is whitespace.
         if start >= end {
-            let Some(next) = next_nonblank(&source, marker.start) else {
+            let Some(next) = next_nonblank(source, marker.start) else {
                 invalid = true;
                 continue;
             };
@@ -1883,20 +1930,27 @@ fn statute_spine_over(
     allow_hyphen: bool,
     inline_only: bool,
     all_families: &[Vec<SectionMark>; 3],
+    source: &[Line<'_>],
 ) -> Vec<SectionMark> {
-    let families = all_families.clone().map(|marks| {
-        marks
-            .into_iter()
-            .filter(|mark| !inline_only || inline_section(text, mark))
-            .collect::<Vec<_>>()
-    });
+    let filtered;
+    let families = if inline_only {
+        filtered = all_families.clone().map(|marks| {
+            marks
+                .into_iter()
+                .filter(|mark| inline_section(text, mark))
+                .collect::<Vec<_>>()
+        });
+        &filtered
+    } else {
+        all_families
+    };
     let mut candidates = families
         .iter()
         .filter_map(|marks| statute_winner(marks, text, allow_hyphen))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|value| value[0].start);
     if candidates.is_empty() {
-        return short_root(text, all_families);
+        return short_root(text, all_families, source);
     }
     let mut best = candidates[0].clone();
     let first_start = best[0].start;
@@ -1919,14 +1973,22 @@ fn statute_spine_over(
     }
 }
 
-pub(super) fn statute_spine(text: &ScalarText<'_>, allow_hyphen: bool) -> Vec<SectionMark> {
-    let families = collect_section_families(text);
-    let result = statute_spine_over(text, allow_hyphen, false, &families);
+fn statute_spine_from_lines(
+    text: &ScalarText<'_>,
+    allow_hyphen: bool,
+    source: &[Line<'_>],
+) -> Vec<SectionMark> {
+    let families = collect_section_families(text, source);
+    let result = statute_spine_over(text, allow_hyphen, false, &families, source);
     if result.is_empty() || result.iter().any(|value| inline_section(text, value)) {
         result
     } else {
-        statute_spine_over(text, allow_hyphen, true, &families)
+        statute_spine_over(text, allow_hyphen, true, &families, source)
     }
+}
+
+pub(super) fn statute_spine(text: &ScalarText<'_>, allow_hyphen: bool) -> Vec<SectionMark> {
+    statute_spine_from_lines(text, allow_hyphen, &lines(text).collect::<Vec<_>>())
 }
 
 fn dotted_order(marks: &[SectionMark]) -> Option<bool> {
@@ -1956,6 +2018,9 @@ fn dotted_order(marks: &[SectionMark]) -> Option<bool> {
 }
 
 fn emphasis_sections(text: &ScalarText<'_>) -> Vec<SectionMark> {
+    if !text.value.contains("**") {
+        return Vec::new();
+    }
     let mut candidates = Vec::new();
     for line in lines(text) {
         let lead = leading_ascii_space(line.text);
@@ -2218,15 +2283,68 @@ fn enum_readings(token: &str) -> [Option<(u8, String)>; 2] {
     }
 }
 
-fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InstrumentMarkerKind {
+    Parenthesized,
+    Tail,
+    Dot,
+}
+
+#[derive(Clone, Copy)]
+struct InstrumentLine<'a> {
+    line: Line<'a>,
+    value: &'a str,
+    start: usize,
+    marker: Option<(&'a str, usize, InstrumentMarkerKind)>,
+}
+
+fn any_instrument_marker(value: &str) -> Option<(&str, usize, InstrumentMarkerKind)> {
+    if !value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'(' || byte.is_ascii_lowercase())
+    {
+        return None;
+    }
     let found = cached_regex!(MARKER,
         r"^(?:\((\d{1,3}(?:\.\d{1,3})?|[a-z]{1,2}|[ivxlcdm]{1,6}|[A-Z]{1,2}|[IVXLCDM]{1,6})\)[ \t]*(.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\)[ \t]+(\S.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\.[ \t]+(\S.*))$"
     ).captures(value)?;
-    [(1, 2, true), (3, 4, tail), (5, 6, dot)]
-        .into_iter()
-        .find_map(|(token, rest, enabled)| {
-            enabled.then_some((found.get(token)?.as_str(), found.get(rest)?.start()))
+    [
+        (1, 2, InstrumentMarkerKind::Parenthesized),
+        (3, 4, InstrumentMarkerKind::Tail),
+        (5, 6, InstrumentMarkerKind::Dot),
+    ]
+    .into_iter()
+    .find_map(|(token, rest, kind)| {
+        Some((found.get(token)?.as_str(), found.get(rest)?.start(), kind))
+    })
+}
+
+fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)> {
+    any_instrument_marker(value).and_then(|(token, at, kind)| match kind {
+        InstrumentMarkerKind::Parenthesized => Some((token, at)),
+        InstrumentMarkerKind::Tail if tail => Some((token, at)),
+        InstrumentMarkerKind::Dot if dot => Some((token, at)),
+        _ => None,
+    })
+}
+
+fn instrument_lines<'a>(source: &[Line<'a>]) -> Vec<InstrumentLine<'a>> {
+    source
+        .iter()
+        .copied()
+        .filter_map(|line| {
+            let trimmed = line.text.trim_start_matches(instrument_space);
+            let value = trimmed.trim_end_matches(instrument_space);
+            (!value.is_empty()).then(|| InstrumentLine {
+                line,
+                value,
+                start: line.scalar_start
+                    + line.text[..line.text.len() - trimmed.len()].chars().count(),
+                marker: any_instrument_marker(value),
+            })
         })
+        .collect()
 }
 
 fn instrument_space(character: char) -> bool {
@@ -2281,26 +2399,26 @@ fn compare_child_values(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-fn admitted_dialects(text: &ScalarText<'_>) -> (bool, bool) {
+fn admitted_dialects(source: &[InstrumentLine<'_>]) -> (bool, bool) {
     let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
     let mut best = [0, 0];
-    for line in lines(text) {
-        let value = line.text.trim_matches(instrument_space);
-        if instrument_marker(value, false, false).is_some() {
+    for line in source {
+        let Some((token, _, kind)) = line.marker else {
             continue;
-        }
-        for (index, dialect) in [(true, false), (false, true)].into_iter().enumerate() {
-            if let Some((token, _)) = instrument_marker(value, dialect.0, dialect.1) {
-                for (family, value) in enum_readings(token).into_iter().flatten() {
-                    let state = live[index].entry(family).or_default();
-                    if value == "1" {
-                        *state = (value, 1);
-                    } else if state.1 > 0 && compare_labels(&value, &state.0, true).is_gt() {
-                        *state = (value, state.1 + 1);
-                    }
-                    best[index] = best[index].max(state.1);
-                }
+        };
+        let index = match kind {
+            InstrumentMarkerKind::Parenthesized => continue,
+            InstrumentMarkerKind::Tail => 0,
+            InstrumentMarkerKind::Dot => 1,
+        };
+        for (family, value) in enum_readings(token).into_iter().flatten() {
+            let state = live[index].entry(family).or_default();
+            if value == "1" {
+                *state = (value, 1);
+            } else if state.1 > 0 && compare_labels(&value, &state.0, true).is_gt() {
+                *state = (value, state.1 + 1);
             }
+            best[index] = best[index].max(state.1);
         }
     }
     (best[0] >= 3, best[1] >= 3)
@@ -2591,6 +2709,12 @@ fn enumerated_children(
 }
 
 fn direct_section(value: &str) -> Option<(String, usize)> {
+    if !value.starts_with("Section")
+        && !value.starts_with("SECTION")
+        && !value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return None;
+    }
     let found = cached_regex!(SECTION,
         r#"^(?:(?:Section|SECTION)\s+(\d{1,3}(?:\.\d{1,3})*[A-Za-z]?)[.)]?\s*[—–\-:]?\s*(["'“(A-Z].*|)|(\d{1,3}\.\d{1,3}(?:\.\d{1,3})*)\s+(["'“(A-Z].*)|((?:[0-4]?\d{1,2}|500))[.)]\s+(["'“(A-Z].*)|(\d{1,3}(?:\.\d{1,3}){0,3})[ \t]+(\(\d.*))$"#
     ).captures(value)?;
@@ -2601,7 +2725,12 @@ fn direct_section(value: &str) -> Option<(String, usize)> {
 }
 
 fn instrument_top(value: &str, direct: bool) -> Option<(String, usize, bool)> {
-    if let Some(found) = cached_regex!(TOP,
+    let possible_top = value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'A' | b'P' | b'D' | b'S' | b'E'));
+    if possible_top {
+        if let Some(found) = cached_regex!(TOP,
         r"^(?:(ARTICLE|Article|PART|Part|DIVISION|Division)\s+([IVXLCDM]+|\d{1,3})\b\s*[—–\-.:]?\s*(.*)|(SCHEDULE|Schedule|EXHIBIT|Exhibit|ANNEX|Annex|APPENDIX|Appendix)\s+([A-Z0-9][\w.\-]*)\s*[—–\-.:]?\s*(.*))$"
     ).captures(value) {
         let container = found.get(1).is_some();
@@ -2631,6 +2760,7 @@ fn instrument_top(value: &str, direct: bool) -> Option<(String, usize, bool)> {
             found[token].to_ascii_lowercase()
         };
         return Some((format!("{prefix}{suffix}"), found.get(rest)?.start(), true));
+        }
     }
     direct
         .then_some(value)
@@ -2639,20 +2769,16 @@ fn instrument_top(value: &str, direct: bool) -> Option<(String, usize, bool)> {
 }
 
 pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoint> {
-    let mut spine = statute_spine(text, false).into_iter().peekable();
+    let lines = lines(text).collect::<Vec<_>>();
+    let mut spine = statute_spine_from_lines(text, false, &lines)
+        .into_iter()
+        .peekable();
     let direct = spine.peek().is_none();
-    let dialects = admitted_dialects(text);
+    let source = instrument_lines(&lines);
+    let dialects = admitted_dialects(&source);
     let mut state = StructureState::default();
-    for line in lines(text) {
-        let trimmed_start = line.text.trim_start_matches(instrument_space);
-        let value = trimmed_start.trim_end_matches(instrument_space);
-        if value.is_empty() {
-            continue;
-        }
-        let start = line.scalar_start
-            + line.text[..line.text.len() - trimmed_start.len()]
-                .chars()
-                .count();
+    for source in source {
+        let (line, value, start) = (source.line, source.value, source.start);
         let selected = spine
             .next_if(|mark| mark.start == start)
             .map(|mark| (format!("sec{}", mark.label), mark.content_start, false))
@@ -2698,10 +2824,13 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
             }
             continue;
         }
-        if let (Some((token, at)), Some(_)) = (
-            instrument_marker(value, dialects.0, dialects.1),
-            state.section.as_ref(),
-        ) {
+        let marker = source.marker.and_then(|(token, at, kind)| match kind {
+            InstrumentMarkerKind::Parenthesized => Some((token, at)),
+            InstrumentMarkerKind::Tail if dialects.0 => Some((token, at)),
+            InstrumentMarkerKind::Dot if dialects.1 => Some((token, at)),
+            _ => None,
+        });
+        if let (Some((token, at)), Some(_)) = (marker, state.section.as_ref()) {
             state.child(token, start, start + value[..at].chars().count());
         }
     }

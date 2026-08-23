@@ -32,6 +32,10 @@ pub struct AuthoritativeTables<'a> {
 }
 
 impl<'a> AuthoritativeTables<'a> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
     pub fn new(text: &'a str, facts: &'a [AuthoritativeTableCell]) -> Result<Self, EngineError> {
         if facts.is_empty() {
             return Ok(Self { cells: Vec::new() });

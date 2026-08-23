@@ -49,6 +49,23 @@ impl<'a> ScalarText<'a> {
         }
     }
 
+    pub(crate) fn with_same_coordinates<'b>(&self, value: &'b str) -> ScalarText<'b> {
+        debug_assert!(self
+            .value
+            .char_indices()
+            .map(|(byte, character)| (byte, character.len_utf8()))
+            .eq(value
+                .char_indices()
+                .map(|(byte, character)| (byte, character.len_utf8()))));
+        ScalarText {
+            value,
+            offsets: self.offsets.clone(),
+            scalar_len: self.scalar_len,
+            utf16_len: self.utf16_len,
+            lines: OnceLock::new(),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.scalar_len
     }
