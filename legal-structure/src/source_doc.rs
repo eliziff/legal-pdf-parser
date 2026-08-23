@@ -1,4 +1,4 @@
-use crate::{EvidenceKind, NativeClaim, NodeKind, ScalarText, StructureGraphV2};
+use crate::{public_structure_label, DocumentStructure, NodeKind};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -13,6 +13,9 @@ pub enum SourceDocKind {
     Page,
     Section,
     Footnote,
+    Table,
+    Row,
+    Cell,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -67,6 +70,23 @@ pub enum SourceDocType {
     Laws,
 }
 
+impl SourceDocType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Cases => "cases",
+            Self::Laws => "laws",
+        }
+    }
+
+    pub(crate) fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "cases" => Some(Self::Cases),
+            "laws" => Some(Self::Laws),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceDocOrigin {
@@ -79,7 +99,6 @@ pub(crate) enum BlockFieldOrder {
     #[default]
     Projected,
     Native,
-    NativeWithAliases,
     AliasesBeforeOrigin,
     AliasesAnchorBeforeOrigin,
     EndLast,
@@ -187,14 +206,6 @@ impl Serialize for SourceDocBlock {
                 }
                 row.serialize_field("origin", &self.origin)?;
             }
-            BlockFieldOrder::NativeWithAliases => {
-                row.serialize_field("end", &self.end)?;
-                if let Some(anchor) = &self.anchor {
-                    row.serialize_field("anchor", anchor)?;
-                }
-                row.serialize_field("aliases", &self.aliases)?;
-                row.serialize_field("origin", &self.origin)?;
-            }
             BlockFieldOrder::AliasesBeforeOrigin => {
                 row.serialize_field("end", &self.end)?;
                 if !self.aliases.is_empty() {
@@ -261,18 +272,24 @@ impl SourceDocIndex {
     }
 
     pub fn entries(&self) -> Vec<(String, usize)> {
-        self.0
+        let mut entries = self
+            .0
             .iter()
             .map(|(label, position)| (label.clone(), *position))
-            .collect()
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        entries
     }
 }
 
-// JavaScript serializes its in-memory Map as `{}`. Keep the useful lookup map
-// in Rust while preserving the existing public SourceDoc byte contract.
 impl Serialize for SourceDocIndex {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_map(Some(0))?.end()
+        let entries = self.entries();
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (label, position) in entries {
+            map.serialize_entry(&label, &position)?;
+        }
+        map.end()
     }
 }
 
@@ -292,6 +309,7 @@ pub struct SourceDoc {
     #[serde(rename = "docType")]
     pub doc_type: Option<SourceDocType>,
     pub status: SourceDocStatus,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub text: String,
     pub blocks: Vec<SourceDocBlock>,
     pub index: SourceDocIndex,
@@ -438,6 +456,9 @@ fn range(kind: SourceDocKind, all: &[SourceDocBlock]) -> SourceDocRange {
             SourceDocKind::Paragraph => "par",
             SourceDocKind::Page => "page",
             SourceDocKind::Footnote => "fn",
+            SourceDocKind::Table | SourceDocKind::Row | SourceDocKind::Cell => {
+                unreachable!("non-locator blocks have no advertised numeric range")
+            }
         };
         missing.push(format!("{prefix}{value}"));
     }
@@ -472,6 +493,24 @@ fn create_source_doc_with_revision(
     revision: String,
     blocks: Vec<SourceDocBlock>,
 ) -> SourceDoc {
+    let (status, index, ranges) = source_doc_navigation(&blocks);
+    SourceDoc {
+        provider,
+        id,
+        url,
+        revision,
+        doc_type,
+        status,
+        text,
+        blocks,
+        index,
+        ranges,
+    }
+}
+
+fn source_doc_navigation(
+    blocks: &[SourceDocBlock],
+) -> (SourceDocStatus, SourceDocIndex, SourceDocRanges) {
     let ranges = SourceDocRanges {
         paragraph: range(SourceDocKind::Paragraph, &blocks),
         page: range(SourceDocKind::Page, &blocks),
@@ -494,22 +533,15 @@ fn create_source_doc_with_revision(
         }
     }
     index.retain(|label, _| !duplicates.contains(label));
-    SourceDoc {
-        provider,
-        id,
-        url,
-        revision,
-        doc_type,
-        status: if blocks.is_empty() {
+    (
+        if blocks.is_empty() {
             SourceDocStatus::Unavailable
         } else {
             SourceDocStatus::Usable
         },
-        text,
-        blocks,
-        index: SourceDocIndex(index),
+        SourceDocIndex(index),
         ranges,
-    }
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -522,20 +554,36 @@ pub enum ProjectionOrder {
 }
 
 pub(crate) fn project_graph(
-    provider: Option<SourceDocProvider>,
-    id: String,
-    url: Option<String>,
-    doc_type: Option<SourceDocType>,
-    text: String,
-    revision: String,
-    originals: &HashMap<String, SourceDocBlock>,
-    graph: StructureGraphV2,
+    mut graph: DocumentStructure,
     order: ProjectionOrder,
+    inferred_type: Option<SourceDocType>,
 ) -> SourceDoc {
-    // Final SourceDoc plane: graph scalars become exact JavaScript UTF-16.
-    let coordinates = ScalarText::new(&text);
-    let labels = graph
-        .nodes
+    let text = std::mem::take(&mut graph.text);
+    project_graph_with_text(&graph, text, order, inferred_type)
+}
+
+pub(crate) fn project_graph_view(
+    graph: &DocumentStructure,
+    order: ProjectionOrder,
+    inferred_type: Option<SourceDocType>,
+) -> SourceDoc {
+    project_graph_with_text(graph, graph.text.clone(), order, inferred_type)
+}
+
+fn project_graph_with_text(
+    graph: &DocumentStructure,
+    text: String,
+    order: ProjectionOrder,
+    inferred_type: Option<SourceDocType>,
+) -> SourceDoc {
+    let provider = SourceDocProvider::from_name(&graph.provider);
+    let doc_type = graph
+        .doc_type
+        .as_deref()
+        .and_then(SourceDocType::from_name)
+        .or(inferred_type);
+    let nodes = &graph.nodes;
+    let labels = nodes
         .iter()
         .filter_map(|node| {
             node.label
@@ -544,23 +592,20 @@ pub(crate) fn project_graph(
         })
         .collect::<HashMap<_, _>>();
     let mut prose = 0;
-    let mut blocks = graph
-        .nodes
+    let mut blocks = nodes
         .iter()
         .filter_map(|node| {
-            if let Some(original) = originals.get(&node.id) {
-                return Some(original.clone());
-            }
             let kind = match node.kind {
                 NodeKind::Paragraph | NodeKind::Prose => SourceDocKind::Paragraph,
                 NodeKind::Page => SourceDocKind::Page,
                 NodeKind::Section => SourceDocKind::Section,
                 NodeKind::Footnote => SourceDocKind::Footnote,
-                NodeKind::Heading
-                | NodeKind::Endnote
-                | NodeKind::List
-                | NodeKind::ListItem
-                | NodeKind::Navigation => return None,
+                NodeKind::Table => SourceDocKind::Table,
+                NodeKind::Row => SourceDocKind::Row,
+                NodeKind::Cell => SourceDocKind::Cell,
+                NodeKind::Heading | NodeKind::Endnote | NodeKind::List | NodeKind::ListItem => {
+                    return None
+                }
             };
             let label = if node.kind == NodeKind::Prose {
                 prose += 1;
@@ -571,9 +616,13 @@ pub(crate) fn project_graph(
             let mut block = SourceDocBlock::new(
                 kind,
                 label,
-                coordinates.utf16(node.range.start),
-                coordinates.utf16(node.range.end),
-                SourceDocOrigin::Heuristic,
+                node.range.start,
+                node.range.end,
+                if node.source == crate::Derivation::Native {
+                    SourceDocOrigin::Native
+                } else {
+                    SourceDocOrigin::Heuristic
+                },
             );
             if matches!(order, ProjectionOrder::StablePosition) && node.kind != NodeKind::Prose {
                 block.field_order = BlockFieldOrder::EndLast;
@@ -589,28 +638,9 @@ pub(crate) fn project_graph(
         })
         .collect::<Vec<_>>();
     if matches!(order, ProjectionOrder::Legislation) {
-        let public_label = |value: &str| {
-            let mut result = String::with_capacity(value.len());
-            let mut rest = value;
-            while let Some(at) = rest.find('@') {
-                result.push_str(&rest[..at]);
-                let digits = rest[at + 1..]
-                    .bytes()
-                    .take_while(u8::is_ascii_digit)
-                    .count();
-                if digits == 0 {
-                    result.push('@');
-                    rest = &rest[at + 1..];
-                } else {
-                    rest = &rest[at + 1 + digits..];
-                }
-            }
-            result.push_str(rest);
-            result
-        };
         for block in &mut blocks {
-            block.label = public_label(&block.label);
-            block.parent_label = block.parent_label.as_deref().map(public_label);
+            block.label = public_structure_label(&block.label);
+            block.parent_label = block.parent_label.as_deref().map(public_structure_label);
         }
         let parents = blocks
             .iter()
@@ -648,48 +678,19 @@ pub(crate) fn project_graph(
         }),
         ProjectionOrder::Case | ProjectionOrder::Native => {}
     }
-    create_source_doc_with_revision(provider, id, url, doc_type, text, revision, blocks)
-}
-
-pub(crate) fn native_blocks(
-    text: &str,
-    claims: &[NativeClaim],
-    mut originals: HashMap<String, SourceDocBlock>,
-) -> HashMap<String, SourceDocBlock> {
-    if claims.iter().all(|claim| originals.contains_key(&claim.id)) {
-        return originals;
+    let (status, index, ranges) = source_doc_navigation(&blocks);
+    SourceDoc {
+        provider,
+        id: graph.document_id.clone(),
+        url: graph.url.clone(),
+        revision: graph.revision.clone(),
+        doc_type,
+        status,
+        text,
+        blocks,
+        index,
+        ranges,
     }
-    // Final-text claim scalars become UTF-16; original provider blocks stay as-is.
-    let coordinates = ScalarText::new(text);
-    for claim in claims {
-        if originals.contains_key(&claim.id) {
-            continue;
-        }
-        let kind = match claim.kind {
-            EvidenceKind::Paragraph => SourceDocKind::Paragraph,
-            EvidenceKind::Page => SourceDocKind::Page,
-            EvidenceKind::Section => SourceDocKind::Section,
-            EvidenceKind::Footnote => SourceDocKind::Footnote,
-            EvidenceKind::Prose
-            | EvidenceKind::Heading
-            | EvidenceKind::Endnote
-            | EvidenceKind::List
-            | EvidenceKind::Navigation => continue,
-        };
-        let Some(label) = &claim.label else { continue };
-        let mut block = SourceDocBlock::new(
-            kind,
-            label,
-            coordinates.utf16(claim.range.start),
-            coordinates.utf16(claim.range.end),
-            SourceDocOrigin::Native,
-        );
-        block.aliases.clone_from(&claim.aliases);
-        block.anchor.clone_from(&claim.anchor);
-        block.parent_label.clone_from(&claim.parent_label);
-        originals.insert(claim.id.clone(), block);
-    }
-    originals
 }
 
 #[cfg(test)]

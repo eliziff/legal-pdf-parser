@@ -25,8 +25,8 @@ fn instrument_lineation_hypotheses_preserve_the_typescript_contract() {
 #[cfg(feature = "structure-inference")]
 fn instrument_lineation_selection_uses_endorsed_spans_and_source_ties() {
     let text = "x".repeat(200);
-    let graph = |labels: &[(&str, usize)]| StructureGraphV2 {
-        schema_version: RESULT_SCHEMA.to_owned(),
+    let graph = |labels: &[(&str, usize)]| DocumentStructure {
+        schema_version: DOCUMENT_STRUCTURE_SCHEMA.to_owned(),
         document_id: "test".to_owned(),
         text_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
         source_sha256: None,
@@ -34,7 +34,7 @@ fn instrument_lineation_selection_uses_endorsed_spans_and_source_ties() {
         nodes: labels
             .iter()
             .enumerate()
-            .map(|(index, (label, start))| StructureNodeV2 {
+            .map(|(index, (label, start))| StructureNode {
                 id: format!("node-{index}"),
                 kind: NodeKind::Section,
                 range: ScalarRange {
@@ -273,12 +273,6 @@ fn native_projection_preserves_claims_without_recovery() {
     assert_eq!(graph.nodes.len(), 1);
     assert_eq!(graph.nodes[0].label.as_deref(), Some("sec1"));
     assert!(matches!(graph.nodes[0].source, Derivation::Native));
-    assert!(matches!(graph.status, GraphStatus::Complete));
-
-    let incomplete =
-        derive_native_structure_evidence(evidence(text, DetectionProfile::Legislation))
-            .expect("valid incomplete native evidence");
-    assert!(matches!(incomplete.status, GraphStatus::Partial));
 }
 
 #[test]

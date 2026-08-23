@@ -1,14 +1,23 @@
-use crate::StructureGraphV2;
 #[cfg(feature = "structure-inference")]
 use crate::{
-    derive_structure_evidence, javascript_whitespace, text::normalize_javascript_whitespace,
-    DetectionProfile, DocumentInput, EngineError, NodeKind, ScalarText,
+    derive_definitions, derive_structure_evidence, javascript_whitespace, node_depths,
+    text::normalize_javascript_whitespace, AuthoritativeTableCell, AuthoritativeTables, Coverage,
+    CoverageState, DefinitionParagraph, DetectionProfile, DocumentInput, DocumentStructure,
+    EngineError, EvidenceKind, NodeKind, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
+    EVIDENCE_SCHEMA,
+};
+#[cfg(feature = "structure-inference")]
+use legal_grammar_tables::{
+    compile_ecmascript_pattern, compile_ecmascript_table_entry, load_tables,
+    CompiledEcmascriptGrammar,
 };
 #[cfg(feature = "structure-inference")]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "structure-inference")]
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+#[cfg(feature = "structure-inference")]
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(feature = "structure-inference")]
 use std::sync::OnceLock;
 
@@ -99,14 +108,412 @@ pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
     unique
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct InstrumentReferenceEvidence {
-    pub key: String,
-    pub start: usize,
-    pub end: usize,
+#[cfg(feature = "structure-inference")]
+struct ProvisionGrammars {
+    numeric: CompiledEcmascriptGrammar,
+    roman: CompiledEcmascriptGrammar,
+    leading_subdivision: CompiledEcmascriptGrammar,
+    external_following: CompiledEcmascriptGrammar,
+    instrument_lead: CompiledEcmascriptGrammar,
+    list_continuation: CompiledEcmascriptGrammar,
+    hyphenated_number: CompiledEcmascriptGrammar,
+    thereof: CompiledEcmascriptGrammar,
+    list_owner: CompiledEcmascriptGrammar,
+    continuation: CompiledEcmascriptGrammar,
 }
 
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[cfg(feature = "structure-inference")]
+fn provision_grammars() -> &'static ProvisionGrammars {
+    static GRAMMARS: OnceLock<ProvisionGrammars> = OnceLock::new();
+    GRAMMARS.get_or_init(|| {
+        let tables = load_tables().expect("valid legal grammar corpus");
+        let defs = &tables
+            .get("provision.reference.numeric")
+            .expect("provision grammar table")
+            .defs;
+        let continuation = format!(
+            r"^\s*(,|and\b|or\b)\s*({}|{})",
+            defs.get("numeric_label").expect("numeric label grammar"),
+            defs.get("sub_only_label").expect("sub-only label grammar")
+        );
+        let table = |id| compile_ecmascript_table_entry(id).expect("valid provision grammar");
+        ProvisionGrammars {
+            numeric: table("provision.reference.numeric"),
+            roman: table("provision.reference.roman"),
+            leading_subdivision: table("provision.external.leading-subdivision"),
+            external_following: table("provision.external.following"),
+            instrument_lead: table("provision.external.instrument-lead"),
+            list_continuation: table("provision.external.list-continuation"),
+            hyphenated_number: table("provision.external.hyphenated-number"),
+            thereof: table("provision.external.thereof"),
+            list_owner: table("provision.external.list-owner"),
+            continuation: compile_ecmascript_pattern(
+                "provision.reference.continuation",
+                &continuation,
+                "i",
+            )
+            .expect("valid provision continuation grammar"),
+        }
+    })
+}
+
+#[cfg(feature = "structure-inference")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisionReferenceShape {
+    Numeric,
+    SubOnly,
+    Roman,
+}
+
+#[cfg(feature = "structure-inference")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionReference {
+    pub start: usize,
+    pub end: usize,
+    pub raw: String,
+    pub word: String,
+    pub plural: bool,
+    pub label: String,
+    pub shape: ProvisionReferenceShape,
+    pub locator: String,
+    pub alias_key: String,
+    pub external: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_of: Option<usize>,
+}
+
+#[cfg(feature = "structure-inference")]
+#[derive(Default)]
+struct FindProvisionReferencesOptions<'a> {
+    words: Option<&'a [&'a str]>,
+    window: Option<usize>,
+}
+
+#[cfg(feature = "structure-inference")]
+fn compact_provision_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !javascript_whitespace(*character))
+        .collect()
+}
+
+#[cfg(feature = "structure-inference")]
+fn trim_javascript_start(value: &str) -> &str {
+    value.trim_start_matches(javascript_whitespace)
+}
+
+#[cfg(feature = "structure-inference")]
+fn normalize_section_locator(locator: &str) -> String {
+    static PREFIX: OnceLock<Regex> = OnceLock::new();
+    static NUMERIC: OnceLock<Regex> = OnceLock::new();
+    static ALPHANUMERIC: OnceLock<Regex> = OnceLock::new();
+    let value = locator.trim_matches(javascript_whitespace);
+    let prefix = PREFIX.get_or_init(|| {
+        Regex::new(r"(?i)^(?:ss?\.?|sections?)").expect("valid section locator prefix")
+    });
+    let value = prefix.find(value).map_or(value, |matched| {
+        trim_javascript_start(&value[matched.end()..])
+    });
+    let compact = compact_provision_label(value);
+    let numeric = NUMERIC.get_or_init(|| {
+        Regex::new(r"^\d{1,8}[A-Za-z]{0,3}(?:[.-]\d{1,8}[A-Za-z]{0,3}){0,3}(?:\([^)]+\))*$")
+            .expect("valid numeric section locator grammar")
+    });
+    let alphanumeric = ALPHANUMERIC.get_or_init(|| {
+        Regex::new(r"^[A-Za-z]{1,3}(?:[.-][0-9A-Za-z]{1,8}){1,3}(?:\([^)]+\))*$")
+            .expect("valid alphanumeric section locator grammar")
+    });
+    if numeric.is_match(&compact) || alphanumeric.is_match(&compact) {
+        format!("sec{compact}")
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "structure-inference")]
+fn replace_first_match<'a>(regex: &CompiledEcmascriptGrammar, value: &'a str) -> &'a str {
+    regex
+        .find(value)
+        .map_or(value, |matched| &value[matched.end()..])
+}
+
+#[cfg(feature = "structure-inference")]
+fn is_external_reference(following: &str) -> bool {
+    let grammars = provision_grammars();
+    let trimmed = trim_javascript_start(replace_first_match(
+        &grammars.leading_subdivision,
+        following,
+    ));
+    let Some(captures) = grammars.external_following.captures(trimmed) else {
+        return false;
+    };
+    captures
+        .get(1)
+        .is_some_and(|owner| !owner.as_str().eq_ignore_ascii_case("this"))
+}
+
+#[cfg(feature = "structure-inference")]
+fn is_external_reference_in_context(before: &str, after: &str) -> bool {
+    let grammars = provision_grammars();
+    if grammars.instrument_lead.is_match(before)
+        || grammars.hyphenated_number.is_match(after)
+        || grammars.thereof.is_match(after)
+        || is_external_reference(after)
+    {
+        return true;
+    }
+    let skipped = replace_first_match(&grammars.list_continuation, after);
+    if skipped.len() == after.len() {
+        return false;
+    }
+    grammars
+        .list_owner
+        .captures(skipped)
+        .and_then(|captures| captures.get(1))
+        .is_some_and(|owner| !owner.as_str().eq_ignore_ascii_case("this"))
+}
+
+#[cfg(feature = "structure-inference")]
+fn provision_flanks<'a>(
+    text: &'a str,
+    start_byte: usize,
+    end_byte: usize,
+    window: usize,
+) -> (&'a str, &'a str) {
+    let mut before_byte = start_byte;
+    let mut units = 0;
+    for (byte, character) in text[..start_byte].char_indices().rev() {
+        if units >= window {
+            break;
+        }
+        before_byte = byte;
+        units += character.len_utf16();
+    }
+    let mut after_byte = end_byte;
+    units = 0;
+    for (byte, character) in text[end_byte..].char_indices() {
+        if units >= window {
+            break;
+        }
+        after_byte = end_byte + byte + character.len_utf8();
+        units += character.len_utf16();
+    }
+    (&text[before_byte..start_byte], &text[end_byte..after_byte])
+}
+
+#[cfg(feature = "structure-inference")]
+#[allow(clippy::too_many_arguments)]
+fn push_provision_reference(
+    found: &mut BTreeMap<usize, ProvisionReference>,
+    text: &str,
+    allowed: Option<&HashSet<&str>>,
+    window: usize,
+    start_byte: usize,
+    raw: &str,
+    word: &str,
+    plural: bool,
+    raw_label: &str,
+    shape: ProvisionReferenceShape,
+    external_override: Option<bool>,
+    continuation_of: Option<usize>,
+) {
+    if found.contains_key(&start_byte) {
+        return;
+    }
+    let lower = word.to_lowercase();
+    let singular = lower.strip_suffix('s').unwrap_or(&lower).to_owned();
+    if allowed.is_some_and(|allowed| !allowed.contains(singular.as_str())) {
+        return;
+    }
+    let label = compact_provision_label(raw_label);
+    let end_byte = start_byte + raw.len();
+    let external = external_override.unwrap_or_else(|| {
+        let (before, after) = provision_flanks(text, start_byte, end_byte, window);
+        is_external_reference_in_context(before, after)
+    });
+    let locator = if shape == ProvisionReferenceShape::Roman {
+        String::new()
+    } else {
+        normalize_section_locator(&label)
+    };
+    let alias_key = format!("{singular} {label}").to_lowercase();
+    found.insert(
+        start_byte,
+        ProvisionReference {
+            start: start_byte,
+            end: end_byte,
+            raw: raw.to_owned(),
+            word: singular,
+            plural,
+            label,
+            shape,
+            locator,
+            alias_key,
+            external,
+            continuation_of,
+        },
+    );
+}
+
+#[cfg(feature = "structure-inference")]
+fn find_provision_references(
+    text: &str,
+    options: FindProvisionReferencesOptions<'_>,
+) -> Vec<ProvisionReference> {
+    static TRAILING_SUBDIVISIONS: OnceLock<Regex> = OnceLock::new();
+    let grammars = provision_grammars();
+    let window = options.window.unwrap_or(40);
+    let allowed = options
+        .words
+        .map(|words| words.iter().copied().collect::<HashSet<_>>());
+    let mut found = BTreeMap::new();
+
+    for captures in grammars.numeric.captures_iter(text) {
+        let whole = captures.get(0).expect("numeric provision match");
+        let raw_label = captures
+            .get(3)
+            .or_else(|| captures.get(4))
+            .map_or("", |value| value.as_str());
+        let start_byte = whole.start();
+        let end_byte = whole.end();
+        let (before, after) = provision_flanks(text, start_byte, end_byte, window);
+        let external = is_external_reference_in_context(before, after);
+        let word = captures.get(1).expect("provision word").as_str();
+        push_provision_reference(
+            &mut found,
+            text,
+            allowed.as_ref(),
+            window,
+            start_byte,
+            whole.as_str(),
+            word,
+            captures.get(2).is_some(),
+            raw_label,
+            if captures.get(3).is_some() {
+                ProvisionReferenceShape::Numeric
+            } else {
+                ProvisionReferenceShape::SubOnly
+            },
+            Some(external),
+            None,
+        );
+
+        struct Continuation<'a> {
+            start_byte: usize,
+            raw: &'a str,
+            connector: String,
+            shape: ProvisionReferenceShape,
+        }
+        let mut continuations = Vec::new();
+        let mut cursor = end_byte;
+        for _ in 0..50 {
+            let Some(continuation) = grammars.continuation.captures(&text[cursor..]) else {
+                break;
+            };
+            let whole = continuation.get(0).expect("provision continuation match");
+            let label = continuation.get(2).expect("provision continuation label");
+            let label_at = whole.as_str().rfind(label.as_str()).unwrap();
+            let label_start = cursor + label_at;
+            continuations.push(Continuation {
+                start_byte: label_start,
+                raw: &text[label_start..label_start + label.as_str().len()],
+                connector: continuation
+                    .get(1)
+                    .expect("provision continuation connector")
+                    .as_str()
+                    .to_lowercase(),
+                shape: if label.as_str().starts_with('(') {
+                    ProvisionReferenceShape::SubOnly
+                } else {
+                    ProvisionReferenceShape::Numeric
+                },
+            });
+            cursor += whole.end();
+        }
+        let safe_to_expand = captures.get(2).is_some()
+            || continuations.len() > 1
+            || continuations.iter().any(|item| {
+                item.connector != "," || item.shape == ProvisionReferenceShape::SubOnly
+            });
+        if !safe_to_expand {
+            continue;
+        }
+        let numeric_head = TRAILING_SUBDIVISIONS
+            .get_or_init(|| Regex::new(r"(?:\([^()]+\))+$").expect("valid subdivision grammar"))
+            .replace(&compact_provision_label(raw_label), "")
+            .into_owned();
+        for continuation in continuations {
+            let label = if continuation.shape == ProvisionReferenceShape::SubOnly
+                && !numeric_head.is_empty()
+            {
+                format!(
+                    "{}{}",
+                    numeric_head,
+                    compact_provision_label(continuation.raw)
+                )
+            } else {
+                continuation.raw.to_owned()
+            };
+            push_provision_reference(
+                &mut found,
+                text,
+                allowed.as_ref(),
+                window,
+                continuation.start_byte,
+                continuation.raw,
+                word,
+                false,
+                &label,
+                ProvisionReferenceShape::Numeric,
+                Some(external),
+                Some(start_byte),
+            );
+        }
+    }
+    for captures in grammars.roman.captures_iter(text) {
+        let whole = captures.get(0).expect("roman provision match");
+        let word = captures.get(1).expect("roman provision word").as_str();
+        let lower = word.to_lowercase();
+        push_provision_reference(
+            &mut found,
+            text,
+            allowed.as_ref(),
+            window,
+            whole.start(),
+            whole.as_str(),
+            word,
+            lower.ends_with('s'),
+            captures.get(2).expect("roman provision label").as_str(),
+            ProvisionReferenceShape::Roman,
+            None,
+            None,
+        );
+    }
+    let mut byte = 0;
+    let mut utf16 = 0;
+    let mut head = (0, 0);
+    found
+        .into_values()
+        .map(|mut reference| {
+            let start_byte = reference.start;
+            utf16 += text[byte..start_byte].encode_utf16().count();
+            byte = start_byte;
+            if let Some(head_byte) = reference.continuation_of {
+                assert_eq!(head_byte, head.0, "coordinated-list head precedes member");
+                reference.continuation_of = Some(head.1);
+            } else {
+                head = (start_byte, utf16);
+            }
+            reference.start = utf16;
+            reference.end = utf16 + reference.raw.encode_utf16().count();
+            reference
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InstrumentContentsEntry {
     pub label: String,
@@ -119,7 +526,7 @@ pub struct InstrumentContentsEntry {
     pub contents_line_start: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InstrumentContentsOutline {
     pub entries: Vec<InstrumentContentsEntry>,
@@ -128,7 +535,7 @@ pub struct InstrumentContentsOutline {
     pub pages_cited: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstrumentContentsRefusal {
     NoContentsMarker,
@@ -137,17 +544,69 @@ pub enum InstrumentContentsRefusal {
     ContentsWithoutPageNumbers,
 }
 
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct InstrumentContentsReading {
     pub outline: Option<InstrumentContentsOutline>,
     pub refusal: Option<InstrumentContentsRefusal>,
 }
 
-#[derive(Serialize)]
-pub struct InstrumentStructureAnalysis {
-    pub selected: usize,
-    pub graph: StructureGraphV2,
-    pub contents: InstrumentContentsReading,
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentCrossReferenceStatus {
+    Resolved,
+    External,
+    Unresolved,
+    Abstained,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentCrossReferenceReason {
+    ExternalInstrument,
+    DocumentAbstained,
+    NoContainingSection,
+    AmbiguousLabel,
+    DepthNotNumbered,
+    NoSuchProvision,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstrumentCrossReferenceEdge {
+    pub source_start: usize,
+    pub source_end: usize,
+    pub source_label: Option<String>,
+    pub raw: String,
+    pub raw_label: String,
+    pub normalized_locator: String,
+    pub target_label: Option<String>,
+    pub target_start: Option<usize>,
+    pub target_end: Option<usize>,
+    pub status: InstrumentCrossReferenceStatus,
+    pub self_loop: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<InstrumentCrossReferenceReason>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstrumentCrossReferenceCounts {
+    pub detected: usize,
+    pub resolved: usize,
+    pub external: usize,
+    pub unresolved: usize,
+    pub abstained: usize,
+    pub self_loops: usize,
+    pub integrity: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstrumentCrossReferenceGraph {
+    pub edges: Vec<InstrumentCrossReferenceEdge>,
+    pub document_abstained: bool,
+    pub note: Option<String>,
+    pub counts: InstrumentCrossReferenceCounts,
 }
 
 // Contents entries advertise provision labels and printed pages; they are not
@@ -654,10 +1113,447 @@ fn instrument_roman(mut value: usize) -> String {
 }
 
 #[cfg(feature = "structure-inference")]
-fn instrument_reference_index(
-    graph: &StructureGraphV2,
+fn reference_node_kind(label: &str) -> &'static str {
+    if label.starts_with("art") {
+        "article"
+    } else if label.starts_with("part") {
+        "part"
+    } else if label.starts_with("div") {
+        "division"
+    } else if ["sched", "exh", "annex", "app"]
+        .iter()
+        .any(|prefix| label.starts_with(prefix))
+    {
+        "schedule"
+    } else if label.contains('(') {
+        "subsection"
+    } else {
+        "section"
+    }
+}
+
+#[cfg(feature = "structure-inference")]
+fn populate_instrument_node_metadata(structure: &mut DocumentStructure) {
+    for node in structure
+        .nodes
+        .iter_mut()
+        .filter(|node| node.kind == NodeKind::Section)
+    {
+        let Some(label) = node.label.as_deref().map(crate::public_structure_label) else {
+            continue;
+        };
+        node.locator_kind = Some(reference_node_kind(&label).to_owned());
+        node.marker_range = node.content_start.map(|end| ScalarRange {
+            start: node.range.start,
+            end,
+        });
+    }
+}
+
+#[cfg(feature = "structure-inference")]
+struct ReferenceNode {
+    label: String,
+    aliases: Vec<String>,
+    anchor: Option<String>,
+    parent_label: Option<String>,
+    kind: &'static str,
+    start: usize,
+    end: usize,
+    depth: usize,
+}
+
+#[cfg(feature = "structure-inference")]
+fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, EngineError> {
+    let by_id = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Section && node.label.is_some())
+        .map(|node| {
+            let label = crate::public_structure_label(node.label.as_deref().unwrap());
+            let kind = reference_node_kind(&label);
+            let mut depth = 0;
+            let mut parent = node
+                .parent_id
+                .as_deref()
+                .and_then(|id| by_id.get(id).copied());
+            while let Some(value) = parent {
+                depth += 1;
+                parent = value
+                    .parent_id
+                    .as_deref()
+                    .and_then(|id| by_id.get(id).copied());
+            }
+            let parent_label = node
+                .parent_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+                .and_then(|parent| parent.label.as_deref())
+                .map(crate::public_structure_label);
+            Ok(ReferenceNode {
+                label,
+                aliases: node.aliases.clone().unwrap_or_default(),
+                anchor: node.anchor.clone(),
+                parent_label,
+                kind,
+                start: node.range.start,
+                end: node.range.end,
+                depth,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "structure-inference")]
+fn node_keys(node: &ReferenceNode) -> Vec<String> {
+    let mut keys = vec![node.label.to_lowercase()];
+    let roman = match node.kind {
+        "article" => node
+            .label
+            .strip_prefix("art")
+            .map(|value| ("article", value)),
+        "part" => node.label.strip_prefix("part").map(|value| ("part", value)),
+        "division" => node
+            .label
+            .strip_prefix("div")
+            .map(|value| ("division", value)),
+        _ => None,
+    };
+    if let Some((word, value)) =
+        roman.and_then(|(word, value)| value.parse().ok().map(|n| (word, n)))
+    {
+        keys.push(format!("{word} {}", instrument_roman(value)).to_lowercase());
+    } else if matches!(node.kind, "section" | "subsection") {
+        keys.push(node.label.replacen("sec", "section ", 1).to_lowercase());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+#[cfg(feature = "structure-inference")]
+fn node_ambiguity_keys(node: &ReferenceNode) -> Vec<String> {
+    let mut keys = node_keys(node);
+    keys.extend(node.aliases.iter().map(|key| key.to_lowercase()));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+#[cfg(feature = "structure-inference")]
+fn node_lookup_keys(node: &ReferenceNode) -> Vec<String> {
+    let mut keys = node_ambiguity_keys(node);
+    keys.extend(node.anchor.iter().map(|key| key.to_lowercase()));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+#[cfg(feature = "structure-inference")]
+fn label_parent(locator: &str) -> String {
+    let Some(body) = locator.strip_prefix("sec") else {
+        return String::new();
+    };
+    let body = body.split('@').next().unwrap_or(body);
+    if !body.ends_with(')') {
+        return String::new();
+    }
+    let Some(open) = body.rfind('(') else {
+        return String::new();
+    };
+    format!("sec{}", &body[..open])
+}
+
+#[cfg(feature = "structure-inference")]
+fn label_depth(locator: &str) -> usize {
+    locator.strip_prefix("sec").map_or(1, |body| {
+        1 + body.split('@').next().unwrap_or(body).matches('(').count()
+    })
+}
+
+#[cfg(feature = "structure-inference")]
+fn containing_reference_node(
+    nodes: &[ReferenceNode],
+    ordered: &[usize],
+    by_label: &HashMap<&str, usize>,
+    position: usize,
+) -> Option<usize> {
+    let at = ordered.partition_point(|index| nodes[*index].start <= position);
+    let mut node = at.checked_sub(1).map(|index| ordered[index]);
+    while let Some(index) = node {
+        if position < nodes[index].end {
+            return Some(index);
+        }
+        node = nodes[index]
+            .parent_label
+            .as_deref()
+            .and_then(|label| by_label.get(label).copied());
+    }
+    None
+}
+
+#[cfg(feature = "structure-inference")]
+fn reference_locator(reference: &ProvisionReference, source: Option<&ReferenceNode>) -> String {
+    if !reference.locator.is_empty() {
+        return reference.locator.clone();
+    }
+    if reference.shape == ProvisionReferenceShape::Roman {
+        return reference.alias_key.clone();
+    }
+    if reference.shape != ProvisionReferenceShape::SubOnly {
+        return String::new();
+    }
+    let Some(source) = source else {
+        return String::new();
+    };
+    let Some(body) = source.label.strip_prefix("sec") else {
+        return String::new();
+    };
+    let head = body.split(['(', '@']).next().unwrap_or("");
+    (!head.is_empty())
+        .then(|| normalize_section_locator(&format!("{head}{}", reference.label)))
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "structure-inference")]
+fn js_percent(value: f64) -> u64 {
+    (value + 0.5).floor() as u64
+}
+
+#[cfg(feature = "structure-inference")]
+fn resolve_instrument_references(
     text: &ScalarText<'_>,
-) -> Result<HashMap<String, usize>, EngineError> {
+    graph: &DocumentStructure,
+    references: Vec<ProvisionReference>,
+) -> Result<InstrumentCrossReferenceGraph, EngineError> {
+    const MIN_ADDRESSABLE_NODES: usize = 3;
+    const MIN_TARGET_REACH: f64 = 0.05;
+    const MIN_TARGETS_FOR_REACH: usize = 3;
+    const INTEGRITY_GATE: f64 = 0.5;
+
+    let nodes = reference_nodes(graph)?;
+    let mut by_label = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        by_label.entry(node.label.as_str()).or_insert(index);
+    }
+    let mut ordered = (0..nodes.len()).collect::<Vec<_>>();
+    ordered.sort_by_key(|index| (nodes[*index].start, nodes[*index].depth));
+
+    let mut key_counts = HashMap::<String, usize>::new();
+    let mut index = HashMap::<String, Option<usize>>::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        for key in node_ambiguity_keys(node) {
+            *key_counts.entry(key.clone()).or_default() += 1;
+        }
+        for key in node_lookup_keys(node) {
+            index
+                .entry(key)
+                .and_modify(|value| *value = None)
+                .or_insert(Some(node_index));
+        }
+    }
+    let mut child_depths = HashSet::new();
+    let mut top_level_numeric = 0;
+    let mut containers = 0;
+    static TOP_LEVEL: OnceLock<Regex> = OnceLock::new();
+    let top_level = TOP_LEVEL.get_or_init(|| {
+        Regex::new(r"(?i)^sec\d{1,8}[a-z]{0,3}(?:[.-]\d{1,8}[a-z]{0,3}){0,3}$")
+            .expect("valid top-level provision grammar")
+    });
+    for node in &nodes {
+        let label = node.label.to_lowercase();
+        let parent = label_parent(&label);
+        if !parent.is_empty() {
+            child_depths.insert(format!("{parent}:{}", label_depth(&label)));
+        } else if top_level.is_match(&label) {
+            top_level_numeric += 1;
+        }
+        if matches!(node.kind, "article" | "part" | "division") {
+            containers += 1;
+        }
+    }
+    let numbers_here = |locator: &str| {
+        let parent = label_parent(locator);
+        if !parent.is_empty() {
+            child_depths.contains(&format!("{parent}:{}", label_depth(locator)))
+        } else if !locator.starts_with("sec") {
+            containers >= MIN_ADDRESSABLE_NODES
+        } else {
+            top_level.is_match(locator) && top_level_numeric >= MIN_ADDRESSABLE_NODES
+        }
+    };
+
+    let thin = nodes.len() < MIN_ADDRESSABLE_NODES;
+    let mut counts = InstrumentCrossReferenceCounts {
+        detected: references.len(),
+        resolved: 0,
+        external: 0,
+        unresolved: 0,
+        abstained: 0,
+        self_loops: 0,
+        integrity: 1.0,
+    };
+    let mut edges = Vec::with_capacity(references.len());
+    for reference in references {
+        let source_index = containing_reference_node(&nodes, &ordered, &by_label, reference.start);
+        let source = source_index.map(|index| &nodes[index]);
+        let locator = reference_locator(&reference, source);
+        let mut edge = InstrumentCrossReferenceEdge {
+            source_start: reference.start,
+            source_end: reference.end,
+            source_label: source.map(|node| node.label.clone()),
+            raw: reference.raw,
+            raw_label: reference.label,
+            normalized_locator: locator.clone(),
+            target_label: None,
+            target_start: None,
+            target_end: None,
+            status: InstrumentCrossReferenceStatus::External,
+            self_loop: false,
+            reason: None,
+        };
+        if reference.external {
+            counts.external += 1;
+            edge.reason = Some(InstrumentCrossReferenceReason::ExternalInstrument);
+        } else if thin {
+            counts.abstained += 1;
+            edge.status = InstrumentCrossReferenceStatus::Abstained;
+            edge.reason = Some(InstrumentCrossReferenceReason::DocumentAbstained);
+        } else if locator.is_empty() {
+            counts.abstained += 1;
+            edge.status = InstrumentCrossReferenceStatus::Abstained;
+            edge.reason = Some(InstrumentCrossReferenceReason::NoContainingSection);
+        } else if let Some(target) = index.get(&locator.to_lowercase()).and_then(|value| *value) {
+            counts.resolved += 1;
+            edge.status = InstrumentCrossReferenceStatus::Resolved;
+            edge.target_label = Some(nodes[target].label.clone());
+            edge.target_start = Some(nodes[target].start);
+            edge.target_end = Some(nodes[target].end);
+            edge.self_loop = source.is_some_and(|source| source.label == nodes[target].label);
+            counts.self_loops += usize::from(edge.self_loop);
+        } else if key_counts
+            .get(&locator.to_lowercase())
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            counts.abstained += 1;
+            edge.status = InstrumentCrossReferenceStatus::Abstained;
+            edge.reason = Some(InstrumentCrossReferenceReason::AmbiguousLabel);
+        } else if !numbers_here(&locator.to_lowercase()) {
+            counts.abstained += 1;
+            edge.status = InstrumentCrossReferenceStatus::Abstained;
+            edge.reason = Some(InstrumentCrossReferenceReason::DepthNotNumbered);
+        } else {
+            counts.unresolved += 1;
+            edge.status = InstrumentCrossReferenceStatus::Unresolved;
+            edge.reason = Some(InstrumentCrossReferenceReason::NoSuchProvision);
+        }
+        edges.push(edge);
+    }
+
+    let accepted = counts.resolved + counts.unresolved;
+    counts.integrity = if accepted == 0 {
+        1.0
+    } else {
+        counts.resolved as f64 / accepted as f64
+    };
+    if thin {
+        return Ok(InstrumentCrossReferenceGraph {
+            edges,
+            document_abstained: true,
+            note: Some(format!(
+                "Cross-reference resolution abstained: the document compiles to {} addressable provision(s), below the {MIN_ADDRESSABLE_NODES} needed for a numbering scheme to check against.",
+                nodes.len()
+            )),
+            counts,
+        });
+    }
+    let targets = edges
+        .iter()
+        .filter(|edge| edge.status == InstrumentCrossReferenceStatus::Resolved)
+        .filter_map(|edge| edge.target_start)
+        .collect::<Vec<_>>();
+    let reach = if text.utf16_len() == 0 {
+        1.0
+    } else {
+        targets.iter().copied().max().unwrap_or(0) as f64 / text.utf16_len() as f64
+    };
+    let contents_only = targets.len() >= MIN_TARGETS_FOR_REACH && reach < MIN_TARGET_REACH;
+    if contents_only || (accepted > 0 && counts.integrity < INTEGRITY_GATE) {
+        for edge in &mut edges {
+            if edge.status != InstrumentCrossReferenceStatus::External {
+                edge.status = InstrumentCrossReferenceStatus::Abstained;
+                edge.reason = Some(InstrumentCrossReferenceReason::DocumentAbstained);
+                edge.target_label = None;
+                edge.target_start = None;
+                edge.target_end = None;
+                edge.self_loop = false;
+            }
+        }
+        let note = if contents_only {
+            format!(
+                "Cross-reference resolution abstained: every one of {} resolved targets lands in the first {}% of the document, so the only numbering the compiler can see is a table of contents, not the provisions.",
+                targets.len(),
+                js_percent(reach * 100.0)
+            )
+        } else {
+            format!(
+                "Cross-reference resolution abstained: only {} of {accepted} resolvable references ({}%) landed on a compiled provision, below the {}% needed to trust this document's numbering scheme.",
+                counts.resolved,
+                js_percent(counts.integrity * 100.0),
+                js_percent(INTEGRITY_GATE * 100.0)
+            )
+        };
+        counts.abstained += accepted;
+        counts.resolved = 0;
+        counts.unresolved = 0;
+        counts.self_loops = 0;
+        return Ok(InstrumentCrossReferenceGraph {
+            edges,
+            document_abstained: true,
+            note: Some(note),
+            counts,
+        });
+    }
+    Ok(InstrumentCrossReferenceGraph {
+        edges,
+        document_abstained: false,
+        note: None,
+        counts,
+    })
+}
+
+#[cfg(feature = "structure-inference")]
+pub(crate) fn cross_reference_graph(
+    structure: &DocumentStructure,
+) -> Result<InstrumentCrossReferenceGraph, EngineError> {
+    let text = ScalarText::new(&structure.text);
+    let references =
+        find_provision_references(text.value, FindProvisionReferencesOptions::default());
+    resolve_instrument_references(&text, structure, references)
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_label_keys(label: &str) -> Vec<String> {
+    let mut keys = vec![label.to_ascii_lowercase()];
+    for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
+        if let Some(value) = label
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse().ok())
+        {
+            keys.push(format!("{word} {}", instrument_roman(value)));
+        }
+    }
+    keys
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_reference_index(graph: &DocumentStructure) -> HashMap<String, usize> {
     let mut index = HashMap::new();
     let mut duplicates = HashSet::new();
     for node in graph
@@ -668,19 +1564,8 @@ fn instrument_reference_index(
         let Some(label) = node.label.as_deref() else {
             continue;
         };
-        let start = text
-            .utf16_at_scalar(node.range.start)
-            .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
-        let mut keys = vec![label.to_ascii_lowercase()];
-        for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
-            if let Some(value) = label
-                .strip_prefix(prefix)
-                .and_then(|value| value.parse().ok())
-            {
-                keys.push(format!("{word} {}", instrument_roman(value)));
-            }
-        }
-        for key in keys {
+        let start = node.range.start;
+        for key in instrument_label_keys(label) {
             if index.insert(key.clone(), start).is_some() {
                 duplicates.insert(key);
             }
@@ -689,7 +1574,7 @@ fn instrument_reference_index(
     for key in duplicates {
         index.remove(&key);
     }
-    Ok(index)
+    index
 }
 
 /// Select the instrument graph whose provision inventory is best endorsed by
@@ -697,80 +1582,102 @@ fn instrument_reference_index(
 #[cfg(feature = "structure-inference")]
 pub fn select_instrument_lineation(
     text: &str,
-    graphs: &[StructureGraphV2],
-    references: &[InstrumentReferenceEvidence],
+    graphs: &[DocumentStructure],
 ) -> Result<usize, EngineError> {
-    select_instrument_lineation_indexed(&ScalarText::new(text), graphs, references)
+    let indexed = ScalarText::new(text);
+    let references = find_provision_references(text, FindProvisionReferencesOptions::default());
+    select_instrument_lineation_indexed(&indexed, graphs, &references)
 }
 
 #[cfg(feature = "structure-inference")]
 fn select_instrument_lineation_indexed(
     text: &ScalarText<'_>,
-    graphs: &[StructureGraphV2],
-    references: &[InstrumentReferenceEvidence],
+    graphs: &[DocumentStructure],
+    references: &[ProvisionReference],
 ) -> Result<usize, EngineError> {
     if graphs.is_empty() {
         return Err(EngineError::invalid(
             "instrument lineation selection requires a graph",
         ));
     }
-    let text_length = text.utf16_len();
-    let score = |graph: &StructureGraphV2| -> Result<usize, EngineError> {
-        let index = instrument_reference_index(graph, text)?;
-        Ok(references
-            .iter()
-            .filter(|reference| {
-                index
-                    .get(&reference.key.to_lowercase())
-                    .is_some_and(|start| *start < reference.start || *start >= reference.end)
-            })
-            .count())
-    };
-    let head_span = |graph: &StructureGraphV2| -> Result<f64, EngineError> {
-        let starts = graph.nodes.iter().filter_map(|node| {
-            let label = node.label.as_deref()?;
-            (node.kind == NodeKind::Section && label.starts_with("sec") && !label.contains('('))
-                .then_some(node.range.start)
-        });
-        let mut low = usize::MAX;
-        let mut high = 0;
-        let mut found = false;
-        for start in starts {
-            let start = text
-                .utf16_at_scalar(start)
-                .ok_or_else(|| EngineError::invalid("instrument node start exceeds source text"))?;
-            low = low.min(start);
-            high = high.max(start);
-            found = true;
-        }
-        Ok(if found && text_length > 0 {
-            (high - low) as f64 / text_length as f64
-        } else {
-            0.0
-        })
-    };
-
+    let endorsed = endorsed_references(references);
     let mut selected = 0;
-    let mut best = score(&graphs[0])?;
+    let mut best = instrument_lineation_score(&graphs[0], &endorsed);
     for (index, graph) in graphs.iter().enumerate().skip(1) {
-        if head_span(graph)? < 0.05 {
+        if instrument_head_span(graph, text.utf16_len()) < 0.05 {
             continue;
         }
-        let candidate = score(graph)?;
+        let candidate = instrument_lineation_score(graph, &endorsed);
         if candidate > best {
             selected = index;
             best = candidate;
+        }
+        if best == endorsed.len() {
+            break;
         }
     }
     Ok(selected)
 }
 
 #[cfg(feature = "structure-inference")]
+fn endorsed_references(references: &[ProvisionReference]) -> Vec<(String, usize, usize)> {
+    references
+        .iter()
+        .filter(|reference| !reference.external)
+        .filter_map(|reference| {
+            let key = if reference.shape == ProvisionReferenceShape::Roman {
+                reference.alias_key.clone()
+            } else {
+                reference.locator.to_lowercase()
+            };
+            (!key.is_empty()).then_some((key, reference.start, reference.end))
+        })
+        .collect()
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_lineation_score(
+    graph: &DocumentStructure,
+    endorsed: &[(String, usize, usize)],
+) -> usize {
+    let index = instrument_reference_index(graph);
+    endorsed
+        .iter()
+        .filter(|(key, start, end)| {
+            index
+                .get(key)
+                .is_some_and(|target| *target < *start || *target >= *end)
+        })
+        .count()
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_head_span(graph: &DocumentStructure, text_length: usize) -> f64 {
+    let mut starts = graph.nodes.iter().filter_map(|node| {
+        let label = node.label.as_deref()?;
+        (node.kind == NodeKind::Section && label.starts_with("sec") && !label.contains('('))
+            .then_some(node.range.start)
+    });
+    let Some(first) = starts.next() else {
+        return 0.0;
+    };
+    let (mut low, mut high) = (first, first);
+    for start in starts {
+        low = low.min(start);
+        high = high.max(start);
+    }
+    if text_length == 0 {
+        0.0
+    } else {
+        (high - low) as f64 / text_length as f64
+    }
+}
+
+#[cfg(feature = "structure-inference")]
 pub fn derive_instrument_structure(
     text: &str,
     documents: Vec<DocumentInput>,
-    references: &[InstrumentReferenceEvidence],
-) -> Result<InstrumentStructureAnalysis, EngineError> {
+) -> Result<DocumentStructure, EngineError> {
     if documents
         .iter()
         .any(|document| document.profile != DetectionProfile::Instrument)
@@ -779,21 +1686,151 @@ pub fn derive_instrument_structure(
             "instrument structure derivation requires instrument-profile evidence",
         ));
     }
-    let graphs = documents
-        .into_iter()
-        .map(derive_structure_evidence)
-        .collect::<Result<Vec<_>, _>>()?;
     let text = ScalarText::new(text);
-    let selected = select_instrument_lineation_indexed(&text, &graphs, references)?;
-    let graph = graphs
+    let references =
+        find_provision_references(text.value, FindProvisionReferencesOptions::default());
+    let endorsed = endorsed_references(&references);
+    let mut documents = documents.into_iter();
+    let mut structure =
+        derive_structure_evidence(documents.next().ok_or_else(|| {
+            EngineError::invalid("instrument lineation selection requires a graph")
+        })?)?;
+    let mut selected = 0;
+    let mut best = instrument_lineation_score(&structure, &endorsed);
+    if best < endorsed.len() {
+        for (index, document) in documents.enumerate() {
+            let candidate = derive_structure_evidence(document)?;
+            if instrument_head_span(&candidate, text.utf16_len()) < 0.05 {
+                continue;
+            }
+            let score = instrument_lineation_score(&candidate, &endorsed);
+            if score > best {
+                selected = index + 1;
+                best = score;
+                structure = candidate;
+            }
+            if best == endorsed.len() {
+                break;
+            }
+        }
+    }
+    structure.selected_hypothesis = Some(selected);
+    populate_instrument_node_metadata(&mut structure);
+    structure.contents = Some(instrument_contents_outline_indexed(&text));
+    structure.cross_references = Some(resolve_instrument_references(
+        &text, &structure, references,
+    )?);
+    let depths = node_depths(&structure.nodes);
+    let paragraphs = text
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(index, [start, end, _])| {
+            let range = ScalarRange {
+                start: text.utf16_at_byte(*start).unwrap(),
+                end: text.utf16_at_byte(*end).unwrap(),
+            };
+            let node_id = structure
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == NodeKind::Section
+                        && node.range.start <= range.start
+                        && range.start < node.range.end
+                })
+                .max_by_key(|node| depths[node.id.as_str()])
+                .map(|node| node.id.clone());
+            DefinitionParagraph {
+                range,
+                node_id,
+                source_paragraph_id: index.to_string(),
+                source_artifact_id: Some(structure.document_id.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    structure.definitions = derive_definitions(text.value, &paragraphs).terms;
+    Ok(structure)
+}
+
+#[cfg(feature = "structure-inference")]
+pub fn analyze_instrument(
+    text: &str,
+    document_id: String,
+    table_cells: &[AuthoritativeTableCell],
+    reconstruct_lineation: bool,
+) -> Result<DocumentStructure, EngineError> {
+    let hypotheses = if reconstruct_lineation {
+        instrument_lineation_hypotheses(text)
+    } else {
+        vec![text.to_owned()]
+    };
+    let tables = AuthoritativeTables::new(text, table_cells)?;
+    let documents = hypotheses
         .into_iter()
-        .nth(selected)
-        .ok_or_else(|| EngineError::invalid("selected instrument graph is missing"))?;
-    Ok(InstrumentStructureAnalysis {
-        selected,
-        graph,
-        contents: instrument_contents_outline_indexed(&text),
-    })
+        .map(|hypothesis| {
+            let masked = tables.masked_text(hypothesis);
+            let scalar_end = masked.chars().count();
+            Ok(DocumentInput {
+                schema_version: EVIDENCE_SCHEMA.to_owned(),
+                document_id: document_id.clone(),
+                provider: "internal".to_owned(),
+                #[cfg(feature = "source-doc")]
+                url: None,
+                #[cfg(feature = "source-doc")]
+                doc_type: None,
+                provider_revision: "legal-text-skeleton-v5".to_owned(),
+                profile: DetectionProfile::Instrument,
+                report_start_page: None,
+                require_report_start: false,
+                allow_hyphenated_sections: false,
+                text_sha256: format!("{:x}", Sha256::digest(masked.as_bytes())),
+                text: masked,
+                source_sha256: None,
+                offset_unit: "unicode-scalar".to_owned(),
+                scope: Scope::complete(),
+                origins: vec![Origin {
+                    id: "provider-adapter".to_owned(),
+                }],
+                native_claims: Vec::new(),
+                coverage: [
+                    EvidenceKind::Paragraph,
+                    EvidenceKind::Prose,
+                    EvidenceKind::Page,
+                    EvidenceKind::Section,
+                    EvidenceKind::Heading,
+                    EvidenceKind::Footnote,
+                    EvidenceKind::Endnote,
+                ]
+                .into_iter()
+                .map(|kind| Coverage {
+                    kind,
+                    range: ScalarRange {
+                        start: 0,
+                        end: scalar_end,
+                    },
+                    state: CoverageState::Absent,
+                })
+                .collect(),
+                exclusions: Vec::new(),
+                paragraph_breaks: Vec::<ParagraphBreak>::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let mut structure = derive_instrument_structure(text, documents)?;
+    structure
+        .nodes
+        .extend(tables.nodes(&structure.nodes, "provider-adapter"));
+    let depths = node_depths(&structure.nodes)
+        .into_iter()
+        .map(|(id, depth)| (id.to_owned(), depth))
+        .collect::<HashMap<_, _>>();
+    structure
+        .nodes
+        .sort_by_key(|node| (node.range.start, depths[node.id.as_str()]));
+    structure.text = text.to_owned();
+    structure.text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    structure.revision.clone_from(&structure.text_sha256);
+    Ok(structure)
 }
 
 #[cfg(all(test, feature = "structure-inference"))]
@@ -921,5 +1958,193 @@ mod tests {
         let outline = instrument_contents_outline(pageless).outline.unwrap();
         assert_eq!(outline.entries.len(), 5);
         assert_eq!(outline.entries.last().unwrap().label, "sec5");
+    }
+}
+
+#[cfg(all(test, feature = "structure-inference"))]
+mod provision_reference_tests {
+    use super::*;
+
+    const ACACIA_EXTERNAL: &str =
+        "â€œGroupâ€ has the meaning ascribed to such term under Section 13(d) of the Exchange Act.";
+    const ACACIA_INTERNAL: &str =
+        "in fulfilling its obligations under this Agreement, including under Section 5.3.";
+    const ACACIA_LIST: &str =
+        "the representations and warranties contained in Section 2.3(b), Section 6.3(a) and Section 7.1(f)), (J) any actions taken";
+    const ACACIA_ROMAN: &str =
+        "satisfaction or waiver of each of the conditions set forth in Article VI (other than those conditions that by their terms";
+    const ACACIA_ORIGINAL_AGREEMENT: &str =
+        "B. Pursuant to Section 7.4 of the Original Agreement, Parent, Sub and the Company";
+
+    fn find(text: &str) -> Vec<ProvisionReference> {
+        find_provision_references(text, FindProvisionReferencesOptions::default())
+    }
+
+    #[test]
+    fn requires_a_nonempty_label() {
+        assert!(find("as provided in this section hereof").is_empty());
+        assert!(find("each paragraph of this Agreement").is_empty());
+    }
+
+    #[test]
+    fn reports_utf16_spans_labels_and_locators() {
+        let found = find(ACACIA_INTERNAL);
+        assert_eq!(found.len(), 1);
+        let reference = &found[0];
+        assert_eq!(reference.raw, "Section 5.3");
+        assert_eq!(
+            &ACACIA_INTERNAL[reference.start..reference.end],
+            "Section 5.3"
+        );
+        assert_eq!(reference.word, "section");
+        assert_eq!(reference.label, "5.3");
+        assert_eq!(reference.locator, "sec5.3");
+        assert_eq!(reference.shape, ProvisionReferenceShape::Numeric);
+        assert!(!reference.external);
+
+        let astral = find("ðŸ˜€ Section 5.3");
+        assert_eq!((astral[0].start, astral[0].end), (3, 14));
+    }
+
+    #[test]
+    fn marks_references_to_another_instrument_external() {
+        let reference = &find(ACACIA_EXTERNAL)[0];
+        assert_eq!(reference.label, "13(d)");
+        assert!(reference.external);
+        let original = &find(ACACIA_ORIGINAL_AGREEMENT)[0];
+        assert_eq!(original.label, "7.4");
+        assert!(original.external);
+    }
+
+    #[test]
+    fn finds_every_member_of_an_explicitly_repeated_list() {
+        assert_eq!(
+            find(ACACIA_LIST)
+                .into_iter()
+                .map(|reference| reference.locator)
+                .collect::<Vec<_>>(),
+            ["sec2.3(b)", "sec6.3(a)", "sec7.1(f)"]
+        );
+    }
+
+    #[test]
+    fn expands_coordinated_lists_without_collapsing_decimals() {
+        let text = "sections 150 and 150.1, subsection 160(2) or (3), and sections 170, 171 or 172";
+        let found = find(text);
+        assert_eq!(
+            found
+                .iter()
+                .map(|reference| reference.locator.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "sec150",
+                "sec150.1",
+                "sec160(2)",
+                "sec160(3)",
+                "sec170",
+                "sec171",
+                "sec172"
+            ]
+        );
+        for reference in found {
+            assert_eq!(&text[reference.start..reference.end], reference.raw);
+        }
+    }
+
+    #[test]
+    fn inherits_external_status_across_a_coordinated_list() {
+        assert_eq!(
+            find("Sections 302 and 906 of the Sarbanes-Oxley Act")
+                .into_iter()
+                .map(|reference| (reference.locator, reference.external))
+                .collect::<Vec<_>>(),
+            [("sec302".to_owned(), true), ("sec906".to_owned(), true)]
+        );
+    }
+
+    #[test]
+    fn does_not_expand_an_ambiguous_singleton_comma() {
+        assert_eq!(find("Section 5, 2020 was a difficult year").len(), 1);
+    }
+
+    #[test]
+    fn reads_only_roman_container_numbering() {
+        let reference = &find(ACACIA_ROMAN)[0];
+        assert_eq!(reference.raw, "Article VI");
+        assert_eq!(reference.shape, ProvisionReferenceShape::Roman);
+        assert_eq!(reference.locator, "");
+        assert_eq!(reference.alias_key, "article vi");
+        assert!(find("Section IV of the deed").is_empty());
+    }
+
+    #[test]
+    fn carries_sub_only_labels_without_normalizing_them() {
+        let reference = &find("as described in paragraph (b) above")[0];
+        assert_eq!(reference.shape, ProvisionReferenceShape::SubOnly);
+        assert_eq!(reference.label, "(b)");
+        assert_eq!(reference.locator, "");
+        assert_eq!(normalize_section_locator("8.01(b)"), "sec8.01(b)");
+    }
+
+    #[test]
+    fn restricts_the_vocabulary_on_request() {
+        let text = "Section 5.3 and Schedule 2.1 and paragraph (b)";
+        let found = find_provision_references(
+            text,
+            FindProvisionReferencesOptions {
+                words: Some(&["section"]),
+                window: None,
+            },
+        );
+        assert_eq!(
+            found
+                .into_iter()
+                .map(|reference| reference.raw)
+                .collect::<Vec<_>>(),
+            ["Section 5.3"]
+        );
+    }
+
+    #[test]
+    fn accepts_an_empty_lookaround_window() {
+        let found = find_provision_references(
+            "Act Section 5 thereof",
+            FindProvisionReferencesOptions {
+                words: None,
+                window: Some(0),
+            },
+        );
+        assert!(!found[0].external);
+    }
+
+    #[test]
+    fn returns_source_order_without_duplicate_starts() {
+        let text = format!("{ACACIA_ROMAN} {ACACIA_LIST}");
+        let found = find(&text);
+        assert!(found.windows(2).all(|pair| pair[0].start < pair[1].start));
+    }
+
+    #[test]
+    fn classifies_both_flanks_and_external_numbering_literally() {
+        for text in [
+            "Code Section 59A applies",
+            "Treasury Regulation Section 1.482 applies",
+            "Exchange Act Section 13(d) applies",
+            "Section 1.6011-4(b)(2) applies",
+            "Section 262 thereof applies",
+        ] {
+            assert!(find(text)[0].external, "{text}");
+        }
+        assert!(!find("Section 8 of this Agreement")[0].external);
+        assert!(!find("Sections 7.2 or 7.3 to be satisfied")[0].external);
+    }
+
+    #[test]
+    fn serializes_the_complete_reference_contract_in_field_order() {
+        let serialized = serde_json::to_string(&find("Sections 160(2) or (3)")).unwrap();
+        assert_eq!(
+            serialized,
+            r#"[{"start":0,"end":15,"raw":"Sections 160(2)","word":"section","plural":true,"label":"160(2)","shape":"numeric","locator":"sec160(2)","aliasKey":"section 160(2)","external":false},{"start":19,"end":22,"raw":"(3)","word":"section","plural":false,"label":"160(3)","shape":"numeric","locator":"sec160(3)","aliasKey":"section 160(3)","external":false,"continuationOf":0}]"#
+        );
     }
 }

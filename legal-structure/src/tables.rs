@@ -67,8 +67,8 @@ impl<'a> AuthoritativeTables<'a> {
             cells.push(Cell {
                 fact,
                 range: ScalarRange {
-                    start: coordinates.scalar(start),
-                    end: coordinates.scalar(end),
+                    start: fact.start,
+                    end: fact.end,
                 },
                 bytes: start..end,
             });
@@ -300,7 +300,6 @@ mod tests {
     }
 
     fn semantics(text: &str, values: Vec<BenchNode>) -> Vec<StructureNode> {
-        let coordinates = ScalarText::new(text);
         values
             .into_iter()
             .map(|value| {
@@ -308,8 +307,8 @@ mod tests {
                     value.label,
                     NodeKind::Section,
                     ScalarRange {
-                        start: coordinates.scalar_at_utf16(value.start).unwrap(),
-                        end: coordinates.scalar_at_utf16(value.end).unwrap(),
+                        start: value.start,
+                        end: value.end,
                     },
                     "legacy",
                     Derivation::Native,
@@ -391,8 +390,8 @@ mod tests {
                     "display": display,
                     "heading": heading,
                     "depth": depth,
-                    "start": coordinates.utf16(node.range.start),
-                    "end": coordinates.utf16(node.range.end),
+                    "start": node.range.start,
+                    "end": node.range.end,
                 });
                 if let Some(parent) = &node.parent_id {
                     value["parentLabel"] = parent.clone().into();

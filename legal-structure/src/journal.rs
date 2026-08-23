@@ -1,13 +1,17 @@
 use crate::source_doc::BlockFieldOrder;
 use crate::{
-    create_source_doc, utf16_len, EngineError, ScalarText, SourceDoc, SourceDocBlock,
-    SourceDocKind, SourceDocOrigin, SourceDocProvider,
+    Coverage, CoverageState, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
+    EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope, SourceDoc,
+    SourceDocKind, EVIDENCE_SCHEMA,
 };
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+
+const ORIGIN: &str = "provider-adapter";
 
 #[derive(Clone)]
 pub struct JournalPageLabel {
@@ -134,16 +138,81 @@ fn positive_usize(value: Option<&Value>) -> Option<usize> {
         .and_then(|value| value.try_into().ok())
 }
 
-pub fn journal_text_source_doc(
+fn claim(kind: EvidenceKind, label: String, range: ScalarRange) -> NativeClaim {
+    NativeClaim {
+        id: String::new(),
+        kind,
+        label: Some(label),
+        aliases: Vec::new(),
+        range,
+        origin_id: ORIGIN.to_owned(),
+        parent_label: None,
+        anchor: None,
+    }
+}
+
+fn structure(
+    article_id: usize,
+    url: Option<String>,
+    text: String,
+    mut claims: Vec<NativeClaim>,
+) -> Result<DocumentStructure, EngineError> {
+    for (index, claim) in claims.iter_mut().enumerate() {
+        claim.id = format!("native-{:06}", index + 1);
+    }
+    let end = text.chars().count();
+    let coverage = [
+        EvidenceKind::Paragraph,
+        EvidenceKind::Prose,
+        EvidenceKind::Page,
+        EvidenceKind::Section,
+        EvidenceKind::Heading,
+        EvidenceKind::Footnote,
+        EvidenceKind::Endnote,
+    ]
+    .into_iter()
+    .map(|kind| Coverage {
+        kind,
+        range: ScalarRange { start: 0, end },
+        state: CoverageState::Complete,
+    })
+    .collect();
+    let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    crate::derive_native_structure_evidence(DocumentInput {
+        schema_version: EVIDENCE_SCHEMA.to_owned(),
+        document_id: article_id.to_string(),
+        provider: "journal".to_owned(),
+        url,
+        doc_type: None,
+        provider_revision: "journal-adapter-v1".to_owned(),
+        profile: DetectionProfile::Journal,
+        report_start_page: None,
+        require_report_start: false,
+        allow_hyphenated_sections: false,
+        text,
+        text_sha256,
+        source_sha256: None,
+        offset_unit: "unicode-scalar".to_owned(),
+        scope: Scope::complete(),
+        origins: vec![Origin {
+            id: ORIGIN.to_owned(),
+        }],
+        native_claims: claims,
+        coverage,
+        exclusions: Vec::new(),
+        paragraph_breaks: Vec::<ParagraphBreak>::new(),
+    })
+}
+
+pub fn journal_text_document_structure(
     article_id: usize,
     url: Option<String>,
     text: String,
     page_labels: &[JournalPageLabel],
-) -> Result<SourceDoc, EngineError> {
-    // Page UTF-16 addresses marker-free rendered text; other CR/LF is retained.
+) -> Result<DocumentStructure, EngineError> {
     let mut starts = Vec::new();
     let mut clean = String::with_capacity(text.len());
-    let mut page_cursor = 0;
+    let (mut clean_scalars, mut page_cursor) = (0, 0);
     for line in text.split_inclusive('\n') {
         if let Some(label) = page_marker(line) {
             let row = page_labels[page_cursor..]
@@ -154,45 +223,47 @@ pub fn journal_text_source_doc(
                 page_cursor = index + 1;
                 page_labels[index].pdf_page
             });
-            starts.push((label.to_owned(), pdf_page, utf16_len(&clean)));
+            starts.push((label.to_owned(), pdf_page, clean_scalars));
         } else {
             clean.push_str(line);
+            clean_scalars += line.chars().count();
         }
     }
-    let mut blocks = Vec::with_capacity(starts.len());
+    let mut claims = Vec::with_capacity(starts.len());
     for (index, (label, pdf_page, start)) in starts.iter().enumerate() {
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Page,
+        let mut item = claim(
+            EvidenceKind::Page,
             public_label("page", label),
-            *start,
-            starts
-                .get(index + 1)
-                .map_or_else(|| utf16_len(&clean), |value| value.2),
-            SourceDocOrigin::Native,
-        )
-        .with_field_order(BlockFieldOrder::EndLast);
-        block.anchor = pdf_page.map(|pdf_page| format!("page={pdf_page}"));
-        block.aliases.push(label.clone());
-        blocks.push(block);
+            ScalarRange {
+                start: *start,
+                end: starts.get(index + 1).map_or(clean_scalars, |value| value.2),
+            },
+        );
+        item.anchor = pdf_page.map(|pdf_page| format!("page={pdf_page}"));
+        item.aliases.push(label.clone());
+        claims.push(item);
     }
-    Ok(create_source_doc(
-        Some(SourceDocProvider::Journal),
-        article_id.to_string(),
-        url,
-        None,
-        clean,
-        blocks,
-    ))
+    structure(article_id, url, clean, claims)
 }
 
-pub fn journal_source_doc(
+pub fn journal_text_source_doc(
+    article_id: usize,
+    url: Option<String>,
+    text: String,
+    page_labels: &[JournalPageLabel],
+) -> Result<SourceDoc, EngineError> {
+    journal_text_document_structure(article_id, url, text, page_labels)
+        .map(crate::project_document_structure)
+}
+
+pub fn journal_document_structure(
     article_id: usize,
     url: Option<String>,
     reader: impl BufRead,
     page_labels: &[JournalPageLabel],
-) -> Result<SourceDoc, EngineError> {
+) -> Result<DocumentStructure, EngineError> {
     let mut text = String::new();
-    let mut blocks = Vec::new();
+    let mut claims = Vec::new();
     let mut titles = Vec::new();
     let mut paired_refs = HashSet::new();
     let mut notes = Vec::<(String, String, Option<Region>)>::new();
@@ -220,7 +291,7 @@ pub fn journal_source_doc(
         let page_start = offset;
         let page_coordinates = ScalarText::new(&page.text);
         text.push_str(&page.text);
-        offset += page_coordinates.utf16_len();
+        offset += page_coordinates.len();
         let pdf_page = page.pdf_page.filter(|value| *value > 0);
         if let Some(pdf_page) = pdf_page {
             let label = page_labels
@@ -230,17 +301,17 @@ pub fn journal_source_doc(
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| pdf_page.to_string());
-            let mut block = SourceDocBlock::new(
-                SourceDocKind::Page,
+            let mut item = claim(
+                EvidenceKind::Page,
                 public_label("page", &label),
-                page_start,
-                offset,
-                SourceDocOrigin::Native,
-            )
-            .with_field_order(BlockFieldOrder::Native);
-            block.anchor = Some(format!("page={pdf_page}"));
-            block.aliases.push(label);
-            blocks.push(block);
+                ScalarRange {
+                    start: page_start,
+                    end: offset,
+                },
+            );
+            item.anchor = Some(format!("page={pdf_page}"));
+            item.aliases.push(label);
+            claims.push(item);
         }
 
         let mut footnotes = HashMap::new();
@@ -272,22 +343,23 @@ pub fn journal_source_doc(
             let placed = Region {
                 start: page_start
                     + page_coordinates
-                        .utf16_at_byte(start_byte)
+                        .scalar_at_byte(start_byte)
                         .expect("matched journal region starts at a UTF-8 boundary"),
                 end: page_start
                     + page_coordinates
-                        .utf16_at_byte(cursor)
+                        .scalar_at_byte(cursor)
                         .expect("matched journal region ends at a UTF-8 boundary"),
                 pdf_page,
             };
             if region.kind.as_deref() == Some("text") {
                 paragraphs += 1;
-                blocks.push(SourceDocBlock::new(
-                    SourceDocKind::Paragraph,
+                claims.push(claim(
+                    EvidenceKind::Paragraph,
                     format!("par{paragraphs}"),
-                    placed.start,
-                    placed.end,
-                    SourceDocOrigin::Native,
+                    ScalarRange {
+                        start: placed.start,
+                        end: placed.end,
+                    },
                 ));
             }
             if region.kind.as_deref() == Some("paragraph_title") {
@@ -340,19 +412,19 @@ pub fn journal_source_doc(
     }
 
     for (index, title) in titles.iter().enumerate() {
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Section,
+        let mut item = claim(
+            EvidenceKind::Section,
             title.label.as_ref().map_or_else(
                 || format!("secTitle{}", index + 1),
                 |label| format!("sec{label}"),
             ),
-            title.start,
-            titles.get(index + 1).map_or(offset, |value| value.start),
-            SourceDocOrigin::Native,
-        )
-        .with_field_order(BlockFieldOrder::AliasesBeforeOrigin);
-        block.aliases.clone_from(&title.aliases);
-        blocks.push(block);
+            ScalarRange {
+                start: title.start,
+                end: titles.get(index + 1).map_or(offset, |value| value.start),
+            },
+        );
+        item.aliases.clone_from(&title.aliases);
+        claims.push(item);
     }
     let mut used_pairs = HashSet::new();
     for (pair, note, region) in notes {
@@ -360,32 +432,53 @@ pub fn journal_source_doc(
             continue;
         }
         let Some(region) = region else { continue };
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Footnote,
+        let mut item = claim(
+            EvidenceKind::Footnote,
             public_label("fn", &note),
-            region.start,
-            region.end,
-            SourceDocOrigin::Native,
-        )
-        .with_field_order(BlockFieldOrder::AliasesAnchorBeforeOrigin);
-        block.aliases.push(note);
-        block.anchor = region.pdf_page.map(|page| format!("page={page}"));
-        blocks.push(block);
+            ScalarRange {
+                start: region.start,
+                end: region.end,
+            },
+        );
+        item.aliases.push(note);
+        item.anchor = region.pdf_page.map(|page| format!("page={page}"));
+        claims.push(item);
     }
-    blocks.sort_by_key(|block| (block.start, block.end));
-    Ok(create_source_doc(
-        Some(SourceDocProvider::Journal),
-        article_id.to_string(),
+    claims.sort_by_key(|claim| claim.range);
+    structure(article_id, url, text, claims)
+}
+
+pub fn journal_source_doc(
+    article_id: usize,
+    url: Option<String>,
+    reader: impl BufRead,
+    page_labels: &[JournalPageLabel],
+) -> Result<SourceDoc, EngineError> {
+    let mut document = crate::project_document_structure(journal_document_structure(
+        article_id,
         url,
-        None,
-        text,
-        blocks,
-    ))
+        reader,
+        page_labels,
+    )?);
+    for block in &mut document.blocks {
+        let order = match block.kind {
+            SourceDocKind::Page => BlockFieldOrder::Native,
+            SourceDocKind::Section => BlockFieldOrder::AliasesBeforeOrigin,
+            SourceDocKind::Footnote => BlockFieldOrder::AliasesAnchorBeforeOrigin,
+            SourceDocKind::Paragraph => BlockFieldOrder::Projected,
+            SourceDocKind::Table | SourceDocKind::Row | SourceDocKind::Cell => {
+                BlockFieldOrder::Projected
+            }
+        };
+        *block = block.clone().with_field_order(order);
+    }
+    Ok(document)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SourceDocOrigin;
     use std::io::Cursor;
 
     #[test]

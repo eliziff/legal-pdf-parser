@@ -6,22 +6,14 @@ license = "MIT"
 
 [features]
 default = []
-structure-inference = []
+structure-inference = ["dep:legal-grammar-tables"]
 source-doc = []
 a2aj = ["structure-inference", "source-doc"]
 journal = ["source-doc"]
 
 [dependencies]
+legal-grammar-tables = { path = "../legal-grammar-tables", optional = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
-
-[[bin]]
-name = "legal-structure"
-path = "src/main.rs"
-required-features = ["structure-inference"]
-
-[[bin]]
-name = "legal-structure-native"
-path = "src/native_main.rs"
