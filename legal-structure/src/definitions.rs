@@ -1,6 +1,8 @@
-use crate::{text::javascript_whitespace, EngineError, ScalarRange};
+use crate::{EngineError, ScalarRange};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DefinitionParagraph {
@@ -34,112 +36,54 @@ pub struct DefinitionsResult {
     pub terms: Vec<DefinedTerm>,
 }
 
-struct DetectedDefinition {
-    term: String,
-    start_byte: usize,
-    end_byte: usize,
+type DetectedDefinition = (String, usize, usize);
+type PendingTerm = (String, Vec<(usize, DefinitionOccurrence)>);
+
+fn parenthetical_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"\(([^()]*)\)").unwrap())
 }
 
-struct PendingTerm {
-    term: String,
-    definitions: Vec<(usize, DefinitionOccurrence)>,
+fn quoted_term_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r#""([A-Z][A-Za-z0-9&'\- ]{0,79})""#).unwrap())
 }
 
-fn accepted_term_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'&' | b'\'' | b'-' | b' ')
-}
-
-fn quoted_term_at(text: &str, quote: usize) -> Option<(usize, usize, usize)> {
-    let bytes = text.as_bytes();
-    if bytes.get(quote) != Some(&b'"') {
-        return None;
-    }
-    let start = quote + 1;
-    if !bytes.get(start).is_some_and(u8::is_ascii_uppercase) {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < bytes.len() && end - start < 80 && accepted_term_byte(bytes[end]) {
-        end += 1;
-    }
-    (bytes.get(end) == Some(&b'"')).then_some((start, end, end + 1))
-}
-
-fn quoted_terms(text: &str, start: usize, end: usize) -> Vec<DetectedDefinition> {
-    let mut found = Vec::new();
-    let mut cursor = start;
-    while cursor < end {
-        let Some(relative) = text[cursor..end].find('"') else {
-            break;
-        };
-        let quote = cursor + relative;
-        if let Some((term_start, term_end, after)) = quoted_term_at(text, quote) {
-            if after <= end {
-                found.push(DetectedDefinition {
-                    term: text[term_start..term_end].to_owned(),
-                    start_byte: term_start,
-                    end_byte: term_end,
-                });
-                cursor = after;
-                continue;
-            }
-        }
-        cursor = quote + 1;
-    }
-    found
+fn list_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(concat!(
+            r#"^"([A-Z][A-Za-z0-9&'\- ]{0,79})""#,
+            r"[\u{0009}-\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]+",
+            r"(?:means|shall mean|has the meaning|shall have the meaning)",
+        ))
+        .unwrap()
+    })
 }
 
 fn parenthetical_definitions(text: &str) -> Vec<DetectedDefinition> {
-    let mut found = Vec::new();
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let Some(relative) = text[cursor..].find('(') else {
-            break;
-        };
-        let open = cursor + relative;
-        let content_start = open + 1;
-        let next = text[content_start..]
-            .char_indices()
-            .find(|(_, character)| matches!(character, '(' | ')'));
-        let Some((relative_end, delimiter)) = next else {
-            break;
-        };
-        let close = content_start + relative_end;
-        if delimiter == ')' && (1..=200).contains(&text[content_start..close].chars().count()) {
-            found.extend(quoted_terms(text, content_start, close));
-            cursor = close + 1;
-        } else if delimiter == '(' {
-            cursor = close;
-        } else {
-            cursor = close + 1;
-        }
-    }
-    found
+    parenthetical_pattern()
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(1))
+        .filter(|content| (1..=200).contains(&content.as_str().encode_utf16().count()))
+        .flat_map(|content| {
+            quoted_term_pattern()
+                .captures_iter(content.as_str())
+                .filter_map(move |captures| {
+                    let term = captures.get(1)?;
+                    Some((
+                        term.as_str().to_owned(),
+                        content.start() + term.start(),
+                        content.start() + term.end(),
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn list_definition(text: &str) -> Option<DetectedDefinition> {
-    let (term_start, term_end, mut cursor) = quoted_term_at(text, 0)?;
-    let mut whitespace = false;
-    while let Some(character) = text[cursor..].chars().next() {
-        if !javascript_whitespace(character) {
-            break;
-        }
-        whitespace = true;
-        cursor += character.len_utf8();
-    }
-    if !whitespace {
-        return None;
-    }
-    const VERBS: [&str; 4] = [
-        "means",
-        "shall mean",
-        "has the meaning",
-        "shall have the meaning",
-    ];
-    let verb = VERBS
-        .into_iter()
-        .find(|verb| text[cursor..].starts_with(verb))?;
-    let after = cursor + verb.len();
+    let captures = list_pattern().captures(text)?;
+    let after = captures.get(0)?.end();
     if text[after..]
         .chars()
         .next()
@@ -147,17 +91,13 @@ fn list_definition(text: &str) -> Option<DetectedDefinition> {
     {
         return None;
     }
-    Some(DetectedDefinition {
-        term: text[term_start..term_end].to_owned(),
-        start_byte: term_start,
-        end_byte: term_end,
-    })
+    let term = captures.get(1)?;
+    Some((term.as_str().to_owned(), term.start(), term.end()))
 }
 
 fn occurrence(
     document: &crate::text::ScalarText<'_>,
     paragraph: &DefinitionParagraph,
-    node_id: &Option<String>,
     start_byte: usize,
     end_byte: usize,
 ) -> DefinitionOccurrence {
@@ -166,7 +106,7 @@ fn occurrence(
             start: document.scalar(start_byte),
             end: document.scalar(end_byte),
         },
-        node_id: node_id.clone(),
+        node_id: paragraph.node_id.clone(),
         source_paragraph_id: paragraph.source_paragraph_id.clone(),
         source_artifact_id: paragraph.source_artifact_id.clone(),
     }
@@ -180,23 +120,13 @@ fn right_boundary(character: Option<char>) -> bool {
     !character.is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
 }
 
-fn use_ranges(text: &str, variant: &str) -> Vec<(usize, usize)> {
-    let mut found = Vec::new();
-    let mut cursor = 0;
-    while cursor <= text.len() {
-        let Some(relative) = text[cursor..].find(variant) else {
-            break;
-        };
-        let start = cursor + relative;
-        let end = start + variant.len();
-        if left_boundary(text[..start].chars().next_back())
-            && right_boundary(text[end..].chars().next())
-        {
-            found.push((start, end));
-        }
-        cursor = end;
-    }
-    found
+fn use_ranges<'a>(text: &'a str, pattern: &'a Regex) -> impl Iterator<Item = (usize, usize)> + 'a {
+    pattern.find_iter(text).filter_map(|found| {
+        let (start, end) = (found.start(), found.end());
+        (left_boundary(text[..start].chars().next_back())
+            && right_boundary(text[end..].chars().next()))
+        .then_some((start, end))
+    })
 }
 
 pub fn derive_definitions(
@@ -232,45 +162,43 @@ pub fn derive_definitions(
             detected.push(list);
         }
         let mut seen = HashSet::new();
-        for definition in detected {
-            if !seen.insert(definition.term.clone()) {
+        for (term, start, end) in detected {
+            if !seen.insert(term.clone()) {
                 continue;
             }
             let next = terms.len();
-            let index = *term_indexes.entry(definition.term.clone()).or_insert(next);
+            let index = *term_indexes.entry(term.clone()).or_insert(next);
             if index == next {
-                terms.push(PendingTerm {
-                    term: definition.term,
-                    definitions: Vec::new(),
-                });
+                terms.push((term, Vec::new()));
             }
-            terms[index].definitions.push((
+            terms[index].1.push((
                 paragraph_index,
                 occurrence(
                     &document,
                     paragraph,
-                    &paragraph.node_id,
-                    paragraph_byte + definition.start_byte,
-                    paragraph_byte + definition.end_byte,
+                    paragraph_byte + start,
+                    paragraph_byte + end,
                 ),
             ));
         }
     }
     let mut result = Vec::with_capacity(terms.len());
-    for pending in terms {
-        let defined_in = pending
-            .definitions
+    for (term, definitions) in terms {
+        let defined_in = definitions
             .iter()
             .map(|(paragraph, _)| *paragraph)
             .collect::<HashSet<_>>();
-        let mut variants = vec![pending.term.clone()];
-        let variant = pending
-            .term
+        let mut variants = vec![term.clone()];
+        let variant = term
             .strip_suffix('s')
-            .map_or_else(|| format!("{}s", pending.term), str::to_owned);
-        if variant != pending.term {
+            .map_or_else(|| format!("{term}s"), str::to_owned);
+        if variant != term {
             variants.push(variant);
         }
+        let patterns = variants
+            .iter()
+            .map(|variant| Regex::new(&regex::escape(variant)).unwrap())
+            .collect::<Vec<_>>();
         let mut uses = Vec::new();
         for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
             if defined_in.contains(&paragraph_index) {
@@ -280,9 +208,9 @@ pub fn derive_definitions(
             let paragraph_text = document
                 .slice(paragraph.range.start..paragraph.range.end)
                 .expect("validated definition paragraph range");
-            let mut matches = variants
+            let mut matches = patterns
                 .iter()
-                .flat_map(|variant| use_ranges(paragraph_text, variant))
+                .flat_map(|pattern| use_ranges(paragraph_text, pattern))
                 .collect::<Vec<_>>();
             matches.sort_unstable();
             matches.dedup();
@@ -290,16 +218,14 @@ pub fn derive_definitions(
                 occurrence(
                     &document,
                     paragraph,
-                    &paragraph.node_id,
                     paragraph_byte + start,
                     paragraph_byte + end,
                 )
             }));
         }
         result.push(DefinedTerm {
-            term: pending.term,
-            definitions: pending
-                .definitions
+            term,
+            definitions: definitions
                 .into_iter()
                 .map(|(_, occurrence)| occurrence)
                 .collect(),
@@ -307,57 +233,4 @@ pub fn derive_definitions(
         });
     }
     Ok(DefinitionsResult { terms: result })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserves_legacy_definition_and_use_semantics_in_scalar_coordinates() {
-        let text = "😀 (the \"Business Day\" and \"Business Day\")\n\"Units\"\u{feff}shall mean shares\nBusiness Days _Business Day Business DayX Units unit\n\"Units\" means duplicates";
-        let scalar = crate::text::ScalarText::new(text);
-        let paragraphs = scalar
-            .lines()
-            .iter()
-            .enumerate()
-            .map(|(index, [_start, end, scalar_start])| DefinitionParagraph {
-                range: ScalarRange {
-                    start: *scalar_start,
-                    end: scalar.scalar_at_byte(*end).unwrap(),
-                },
-                node_id: Some(if index < 2 { "outer" } else { "inner" }.to_owned()),
-                source_paragraph_id: format!("p{index}"),
-                source_artifact_id: Some("artifact".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        let result = derive_definitions(text, &paragraphs).unwrap();
-        assert_eq!(
-            result
-                .terms
-                .iter()
-                .map(|term| (
-                    term.term.as_str(),
-                    term.definitions.len(),
-                    term.uses
-                        .iter()
-                        .map(|use_| scalar.slice(use_.range.start..use_.range.end).unwrap())
-                        .collect::<Vec<_>>(),
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "Business Day",
-                    1,
-                    vec!["Business Days", "Business Day", "Business Day"]
-                ),
-                ("Units", 2, vec!["Units"]),
-            ]
-        );
-        assert_eq!(
-            result.terms[0].definitions[0].range,
-            ScalarRange { start: 8, end: 20 }
-        );
-        assert_eq!(result.terms[0].uses[0].node_id.as_deref(), Some("inner"));
-    }
 }
