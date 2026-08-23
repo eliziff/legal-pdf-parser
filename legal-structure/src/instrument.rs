@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "structure-inference")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "structure-inference")]
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 #[cfg(feature = "structure-inference")]
 use std::sync::OnceLock;
 
@@ -205,7 +205,6 @@ fn compact_provision_label(value: &str) -> String {
         .collect()
 }
 
-#[cfg(feature = "structure-inference")]
 #[cfg(feature = "structure-inference")]
 fn normalize_section_locator(locator: &str) -> String {
     static PREFIX: OnceLock<Regex> = OnceLock::new();
@@ -1141,10 +1140,8 @@ fn reference_node_kind(label: &str) -> &'static str {
 }
 
 #[cfg(feature = "structure-inference")]
-fn populate_instrument_node_metadata(structure: &mut DocumentStructure) {
-    let text = ScalarText::new(&structure.text);
-    for node in structure
-        .nodes
+fn populate_instrument_node_metadata(nodes: &mut [crate::StructureNode], text: &ScalarText<'_>) {
+    for node in nodes
         .iter_mut()
         .filter(|node| node.kind == NodeKind::Section)
     {
@@ -1612,29 +1609,29 @@ pub(crate) fn cross_reference_graph(
 }
 
 #[cfg(feature = "structure-inference")]
-fn instrument_label_keys(label: &str) -> Vec<String> {
-    let mut keys = vec![label.to_ascii_lowercase()];
-    for (prefix, word) in [("art", "article"), ("part", "part"), ("div", "division")] {
-        if let Some(value) = label
-            .strip_prefix(prefix)
-            .and_then(|value| value.parse().ok())
-        {
-            keys.push(format!("{word} {}", instrument_roman(value)));
-        }
-    }
-    keys
-}
-
-#[cfg(feature = "structure-inference")]
 fn instrument_reference_index<'a>(
     sections: impl Iterator<Item = (&'a str, usize)>,
 ) -> HashMap<String, usize> {
     let mut index = HashMap::new();
     let mut duplicates = HashSet::new();
     for (label, start) in sections {
-        for key in instrument_label_keys(label) {
-            if index.insert(key.clone(), start).is_some() {
-                duplicates.insert(key);
+        let aliases = [("art", "article"), ("part", "part"), ("div", "division")];
+        let keys = std::iter::once(label.to_ascii_lowercase()).chain(
+            aliases.into_iter().filter_map(|(prefix, word)| {
+                label
+                    .strip_prefix(prefix)
+                    .and_then(|value| value.parse().ok())
+                    .map(|value| format!("{word} {}", instrument_roman(value)))
+            }),
+        );
+        for key in keys {
+            match index.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(start);
+                }
+                Entry::Occupied(entry) => {
+                    duplicates.insert(entry.key().clone());
+                }
             }
         }
     }
@@ -1741,7 +1738,7 @@ fn derive_instrument_structure(
     let first = hypotheses
         .next()
         .ok_or_else(|| EngineError::invalid("instrument lineation selection requires a graph"))?;
-    let first_is_original = tables.is_empty() && first == text.value;
+    let first_is_original = tables.is_empty();
     let mut selected_text = tables.masked_text(first);
     let mut selected_blocks = if first_is_original {
         crate::inference::detect_instrument(&text)
@@ -1815,7 +1812,11 @@ fn derive_instrument_structure(
     };
     let mut structure = crate::derive::derive_trusted_inferred(input, selected_blocks)?;
     structure.selected_hypothesis = Some(selected);
-    populate_instrument_node_metadata(&mut structure);
+    let selected_coordinates = (!selected_original).then(|| ScalarText::new(&structure.text));
+    populate_instrument_node_metadata(
+        &mut structure.nodes,
+        selected_coordinates.as_ref().unwrap_or(&text),
+    );
     structure.contents = Some(instrument_contents_outline_indexed(&text));
     structure.cross_references = Some(resolve_instrument_references(
         &text, &structure, references,
