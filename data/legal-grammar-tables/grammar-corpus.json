@@ -40,6 +40,22 @@
           ]
         },
         {
+          "id": "cite.provider-routing",
+          "pattern": "(?<uk_neutral>\\[(?<uk_year>(?:19|20)\\d{2})\\]\\s+(?<uk_court>UKSC|UKPC|EWCA\\s+(?:Civ|Crim)|EWHC|EWCC|EWFC|EWCOP|EWCR|UKUT|UKFTT|EAT)\\s+(?<uk_num>\\d+)(?:\\s+\\((?:Admin|Admlty|Ch|Comm|Fam|KB|QB|TCC|Pat|IPEC|SCCO|AAC|IAC|LC|GRC|TC|B)\\))?)|(?<ca_reporter>\\b\\d+\\s+S\\.?C\\.?R\\.?\\s+\\d+\\b)|(?<ca_statute>\\bR\\.?S\\.?[A-Z]\\.?\\s+\\d{4}\\b)|(?<ca_neutral>\\b(?<ca_year>\\d{4})\\s+(?<ca_court>[A-Z][A-Z0-9]{1,12})\\s+(?<ca_num>\\d+)\\b)|(?<us_reporter>\\b(?<us_volume>\\d{1,4})\\s+(?<us_reporter_name>U\\.?\\s*S\\.?|S\\.?\\s*Ct\\.?|L\\.?\\s*Ed\\.?(?:\\s*2d)?|F\\.?(?:\\s*Supp\\.?)?(?:\\s*2d|\\s*3d|\\s*4th)?)\\s+(?<us_page>\\d{1,6})\\b)|(?<neutral>\\b(?<year>\\d{4})\\s+(?<court>[A-Za-z][A-Za-z0-9-]{1,15})\\s+(?<num>\\d+)\\b)|(?<local_reporter>\\b(?<volume>\\d{1,4})\\s+(?<reporter>[A-Za-z][A-Za-z0-9.\\s]*?)\\s+(?<page>\\d{1,7})\\b)",
+          "flags": "i",
+          "canonical": {},
+          "provenance": "The ordered union of the exact citation-routing contracts formerly embedded in Beaver's A2AJ, CanLII, National Archives, and CourtListener providers. Specialized branches precede generic neutral/reporter parsing; named outer branches classify each match without a second scan.",
+          "vectors": [
+            { "input": "Applying 2020 SCC 1.", "groups": { "ca_neutral": "2020 SCC 1", "ca_year": "2020", "ca_court": "SCC", "ca_num": "1" } },
+            { "input": "See 1 S.C.R. 5.", "groups": { "ca_reporter": "1 S.C.R. 5" } },
+            { "input": "Under R.S.C. 1985.", "groups": { "ca_statute": "R.S.C. 1985" } },
+            { "input": "R (Miller) v Prime Minister [2019] UKSC 41", "groups": { "uk_neutral": "[2019] UKSC 41", "uk_year": "2019", "uk_court": "UKSC", "uk_num": "41" } },
+            { "input": "See 410 U.S. 113.", "groups": { "us_reporter": "410 U.S. 113", "us_volume": "410", "us_reporter_name": "U.S.", "us_page": "113" } },
+            { "input": "2020 verylongcourtxy 12", "groups": { "neutral": "2020 verylongcourtxy 12", "year": "2020", "court": "verylongcourtxy", "num": "12" } },
+            { "input": "See 123 P.3d 456.", "groups": { "local_reporter": "123 P.3d 456", "volume": "123", "reporter": "P.3d", "page": "456" } }
+          ]
+        },
+        {
           "id": "cite.us.law.common",
           "pattern": "(?<![A-Za-z0-9])\\d+\\s+U\\.?\\s*S\\.?\\s*C\\.?(?:\\s*§+\\s*|\\s+)\\d(?:[A-Za-z0-9().-]*[A-Za-z0-9)])?(?![A-Za-z0-9])",
           "flags": "",
