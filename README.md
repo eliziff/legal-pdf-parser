@@ -34,21 +34,21 @@ legal PDF at **70.8 pages/second**.
 ## Use
 
 ```powershell
-cargo build --release --locked --package legal-structure --no-default-features --bin legal-structure-native
-cargo build --release --locked --package legal-structure --no-default-features --features structure-inference --bin legal-structure
+cargo build --release --locked --package legal-structure-node
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
-legalpdf contract request.json
+legalpdf --version
 ```
 
-The native structure host accepts provider claims without shipping raw-text
-structure inference or regex. The structure-inference host adds the provider-neutral raw detector.
+The Node binding exposes the provider-neutral structure detector and SourceDoc
+projection through one document operation.
 The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
 `ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
 separate runtime/model pack are required. The root package has no default
 features, so every shipped artifact declares its capabilities explicitly.
 
-The versioned contract supports `inspect`, `prepare`, `source_doc`, and
-`structure_lookup`.
+The Node binding derives the canonical PDF structure, source map, optional
+SourceDoc, and pairing audit in one operation while retaining the native PDF
+artifacts for exact lookups.
 
 ## Credits
 

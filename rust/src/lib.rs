@@ -11,8 +11,7 @@ compile_error!("profiling and fast-allocator cannot select two global allocators
 
 #[cfg(feature = "pdf")]
 pub use contract::{
-    derive_pdf_document, document_request, pdf_document_snapshot, query_pdf_document,
-    PdfDocumentResult,
+    derive_pdf_document, pdf_document_snapshot, query_pdf_document, PdfDocumentResult,
 };
 #[cfg(feature = "pdf")]
 #[doc(hidden)]

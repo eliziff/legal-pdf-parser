@@ -437,10 +437,6 @@ fn build_document(
     extracted.diagnostics.extend(derived.diagnostics);
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), Value::Object(extracted.metadata));
-    metadata.insert(
-        "pairing".to_owned(),
-        derived.pairing_audit.pairing_summary.clone(),
-    );
     let mut provenance = Map::new();
     provenance.insert("engine".to_owned(), Value::String("legalpdf".to_owned()));
     provenance.insert(
