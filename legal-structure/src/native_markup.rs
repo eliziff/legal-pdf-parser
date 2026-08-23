@@ -10,6 +10,7 @@ use crate::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -153,14 +154,32 @@ fn replace_regex(
     pattern: &str,
     replacement: &str,
 ) -> String {
-    slot.get_or_init(|| Regex::new(pattern).unwrap())
-        .replace_all(&value, replacement)
+    let regex = slot.get_or_init(|| Regex::new(pattern).unwrap());
+    if regex.is_match(&value) {
+        regex.replace_all(&value, replacement).into_owned()
+    } else {
+        value
+    }
+}
+
+fn replace_numeric_entities(value: String, regex: &Regex, radix: u32) -> String {
+    if !regex.is_match(&value) {
+        return value;
+    }
+    regex
+        .replace_all(&value, |captures: &regex::Captures<'_>| {
+            u32::from_str_radix(&captures[1], radix)
+                .ok()
+                .filter(|value| *value <= 0x10ffff)
+                .and_then(char::from_u32)
+                .map_or_else(|| captures[0].to_owned(), |value| value.to_string())
+        })
         .into_owned()
 }
 
-fn decode_entities(value: &str) -> String {
+fn decode_entities(value: &str) -> Cow<'_, str> {
     if !value.contains('&') {
-        return value.to_owned();
+        return Cow::Borrowed(value);
     }
     static NBSP: OnceLock<Regex> = OnceLock::new();
     static AMP: OnceLock<Regex> = OnceLock::new();
@@ -177,29 +196,13 @@ fn decode_entities(value: &str) -> String {
     let value = replace_regex(value, &QUOT, r"(?i)&quot;", "\"");
     let value = replace_regex(value, &APOS, r"(?i)&(?:apos|#39);", "'");
     let decimal = DECIMAL.get_or_init(|| Regex::new(r"&#(\d+);").unwrap());
-    let value = decimal
-        .replace_all(&value, |captures: &regex::Captures<'_>| {
-            captures[1]
-                .parse::<u32>()
-                .ok()
-                .filter(|value| *value <= 0x10ffff)
-                .and_then(char::from_u32)
-                .map_or_else(|| captures[0].to_owned(), |value| value.to_string())
-        })
-        .into_owned();
+    let value = replace_numeric_entities(value, decimal, 10);
     let hex = HEX.get_or_init(|| Regex::new(r"(?i)&#x([0-9a-f]+);").unwrap());
-    hex.replace_all(&value, |captures: &regex::Captures<'_>| {
-        u32::from_str_radix(&captures[1], 16)
-            .ok()
-            .filter(|value| *value <= 0x10ffff)
-            .and_then(char::from_u32)
-            .map_or_else(|| captures[0].to_owned(), |value| value.to_string())
-    })
-    .into_owned()
+    Cow::Owned(replace_numeric_entities(value, hex, 16))
 }
 
-fn parse_attributes(raw: &str) -> HashMap<String, String> {
-    let mut attributes = HashMap::new();
+fn parse_attributes(raw: &str, attributes: &mut HashMap<String, String>) {
+    attributes.clear();
     let mut at = 0;
     while at < raw.len() {
         while at < raw.len() {
@@ -261,11 +264,11 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
             }
             (start, at)
         };
-        attributes
-            .entry(name)
-            .or_insert_with(|| trim_js(&decode_entities(&raw[start..end])).to_owned());
+        attributes.entry(name).or_insert_with(|| {
+            let decoded = decode_entities(&raw[start..end]);
+            trim_js(&decoded).to_owned()
+        });
     }
-    attributes
 }
 
 fn attribute<'a>(attributes: &'a HashMap<String, String>, name: &str) -> &'a str {
@@ -797,7 +800,7 @@ fn parse_tag(raw: &str, closing: bool) -> Option<(String, &str)> {
     Some((tag, attrs))
 }
 
-fn append_text(parts: &mut Vec<String>, position: &mut usize, value: &str) {
+fn append_text(parts: &mut Vec<String>, position: &mut usize, value: String) {
     if value.is_empty() {
         return;
     }
@@ -815,8 +818,8 @@ fn append_text(parts: &mut Vec<String>, position: &mut usize, value: &str) {
         parts.push(" ".to_owned());
         *position += 1;
     }
-    parts.push(value.to_owned());
-    *position += utf16_len(value);
+    *position += utf16_len(&value);
+    parts.push(value);
 }
 
 fn append_break(parts: &mut Vec<String>, position: &mut usize) {
@@ -828,27 +831,19 @@ fn append_break(parts: &mut Vec<String>, position: &mut usize) {
 }
 
 fn normalized_text(parts: Vec<String>) -> String {
-    let joined = parts.concat();
-    let mut no_trailing_space = String::with_capacity(joined.len());
-    for character in joined.chars() {
-        if character == '\n' {
-            while no_trailing_space.ends_with(' ') || no_trailing_space.ends_with('\t') {
-                no_trailing_space.pop();
-            }
-        }
-        no_trailing_space.push(character);
-    }
-    let mut result = String::with_capacity(no_trailing_space.len());
-    let mut newlines = 0;
-    for character in no_trailing_space.chars() {
-        if character == '\n' {
-            newlines += 1;
-            if newlines <= 2 {
+    let mut result = String::with_capacity(parts.iter().map(String::len).sum());
+    for part in parts {
+        for character in part.chars() {
+            if character == '\n' {
+                while result.ends_with(' ') || result.ends_with('\t') {
+                    result.pop();
+                }
+                if !result.ends_with("\n\n") {
+                    result.push(character);
+                }
+            } else {
                 result.push(character);
             }
-        } else {
-            newlines = 0;
-            result.push(character);
         }
     }
     result
@@ -873,6 +868,7 @@ fn render_markup(
     let mut position = 0;
     let mut harvard_casebody = false;
     let mut page_starts = Vec::<PageStart>::new();
+    let mut attributes = HashMap::new();
     let mut at = 0;
     while at < markup.len() {
         if markup.as_bytes()[at] != b'<' {
@@ -921,7 +917,7 @@ fn render_markup(
                     ),
                 });
             }
-            append_text(&mut parts, &mut position, &rendered);
+            append_text(&mut parts, &mut position, rendered);
             at = end;
             continue;
         }
@@ -934,7 +930,7 @@ fn render_markup(
         if markup[at..].starts_with("<![CDATA[") {
             if let Some(end) = markup[at + 9..].find("]]>") {
                 let value = &markup[at + 9..at + 9 + end];
-                append_text(&mut parts, &mut position, value);
+                append_text(&mut parts, &mut position, value.to_owned());
                 at += 9 + end + 3;
                 continue;
             }
@@ -1025,7 +1021,7 @@ fn render_markup(
         } else {
             attrs
         };
-        let attributes = parse_attributes(attrs);
+        parse_attributes(attrs, &mut attributes);
         if !harvard_casebody
             && matches!(tag.as_str(), "section" | "article")
             && contains_ascii_word(raw, "casebody", true)
@@ -1125,11 +1121,13 @@ fn render_markup(
         }
         at = end;
     }
-    let normalized = normalized_text(parts);
+    let mut normalized = normalized_text(parts);
     let leading = normalized.len() - normalized.trim_start_matches(javascript_whitespace).len();
     let leading_trim = utf16_len(&normalized[..leading]);
-    let text = trim_js(&normalized).to_owned();
-    let raw_end = leading_trim + utf16_len(&text);
+    let trimmed = trim_js(&normalized);
+    let trailing = leading + trimmed.len();
+    let text_utf16 = utf16_len(trimmed);
+    let raw_end = leading_trim + text_utf16;
     for pending in open_excluded {
         if raw_end > pending.start {
             exclusions.push(ScalarRange {
@@ -1171,7 +1169,6 @@ fn render_markup(
     // Pre-trim normalized-provider UTF-16 becomes rendered SourceDoc UTF-16;
     // leading trim is subtracted and split-surrogate positions stay invalid.
     let normalized_coordinates = ScalarText::new(&normalized);
-    let text_utf16 = utf16_len(&text);
     let normalized_utf16 = normalized_coordinates.utf16_len();
     let mut projected = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -1227,8 +1224,10 @@ fn render_markup(
         }
         projected_exclusions.push(ScalarRange { start, end });
     }
+    normalized.truncate(trailing);
+    normalized.drain(..leading);
     Ok(RenderedMarkup {
-        text,
+        text: normalized,
         blocks: projected
             .into_iter()
             .map(|(mut block, start, end, _)| {
@@ -1465,15 +1464,16 @@ mod tests {
     fn cited_authorities_preserve_source_order_and_javascript_parity() {
         let rendered = render_markup(
             SourceDocProvider::Tna,
-            r#"<p><ref uk:canonical="[2016] UKSC 11" uk:type="case">Patel <em>v</em> Mirza &amp; Co</ref><ref uk:canonical="[2016] uksc 11">duplicate</ref><ref uk:canonical="1996&#32;c.&#32;18" uk:type="legislation"></ref></p>"#,
+            r#"<p><ref uk:canonical="[2016] UKSC 11" uk:type="case">Patel <em>v</em> Mirza &amp;lt;&amp;#160;Co</ref><ref uk:canonical="[2016] uksc 11">duplicate</ref><ref uk:canonical="1996&#32;c.&#32;18" uk:type="legislation"></ref></p>"#,
             &[],
         )
         .unwrap();
+        assert_eq!(normalized_text(vec!["\n\n\n \n".to_owned()]), "\n\n");
         assert_eq!(
             rendered.cited_authorities,
             [
                 CitedAuthority {
-                    citation: "Patel v Mirza & Co".to_owned(),
+                    citation: "Patel v Mirza < Co".to_owned(),
                     canonical: Some("[2016] UKSC 11".to_owned()),
                     kind: Some("case".to_owned()),
                 },
