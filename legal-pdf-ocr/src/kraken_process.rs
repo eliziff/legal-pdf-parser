@@ -1,8 +1,6 @@
-use crate::kraken::{
-    canonical_file, sha256_file, KrakenBackend, KrakenImageDiagnostics, KrakenOptions,
-};
+use crate::kraken::{canonical_file, KrakenBackend, KrakenImageDiagnostics, KrakenOptions};
 use image::{GrayImage, ImageFormat};
-use legal_pdf_core::{Error, Result};
+use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use legal_pdf_core::{OcrLine, OcrWord};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,11 +11,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RESOLVED_PYTHONS: OnceLock<Mutex<HashMap<(PathBuf, Option<OsString>), String>>> =
+    OnceLock::new();
+static PYTHON_ENVIRONMENTS: OnceLock<Mutex<HashMap<(PathBuf, OsString), String>>> = OnceLock::new();
 
 pub(crate) struct BllaRuntime {
     child: Child,
@@ -141,9 +142,9 @@ impl BllaRuntime {
         let identity = format!(
             "kraken-lite-process-v1:backend={}:device={device}:python={}:environment={}:runtime={}:blla={}:recognizer={}",
             options.backend.name(),
-            sha256_file(&python)?,
+            provider_asset_sha256(&python)?,
             sha256_bytes(environment.as_bytes()),
-            sha256_file(&wheel)?,
+            provider_asset_sha256(&wheel)?,
             blla.identity,
             recognizer.identity,
         );
@@ -582,14 +583,14 @@ fn verified_pack(path: Option<PathBuf>, kind: &str, label: &str) -> Result<Verif
         .transpose()?;
     let codec_identity = codec
         .as_ref()
-        .map(|path| sha256_file(path))
+        .map(|path| provider_asset_sha256(path))
         .transpose()?
         .map(|hash| format!(":codec={hash}"))
         .unwrap_or_default();
     let identity = format!(
         "manifest={}:model={}{}",
-        sha256_file(&manifest_path)?,
-        sha256_file(&model)?,
+        provider_asset_sha256(&manifest_path)?,
+        provider_asset_sha256(&model)?,
         codec_identity,
     );
     Ok(VerifiedPack { root, identity })
@@ -621,7 +622,7 @@ fn verified_member(root: &Path, manifest: &Value, key: &str, label: &str) -> Res
         )));
     }
     if let Some(expected) = spec.get("sha256").and_then(Value::as_str) {
-        let actual = sha256_file(&path)?;
+        let actual = provider_asset_sha256(&path)?;
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(Error::Message(format!(
                 "Kraken {label} hash mismatch: expected {expected}, found {actual}"
@@ -644,20 +645,39 @@ fn resolve_python(value: Option<&Path>) -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("LEGALPDF_KRAKEN_PYTHON").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("python"));
-    let output = small_output(
-        &command,
-        [
-            OsString::from("-c"),
-            OsString::from("import sys; print(sys.executable)"),
-        ],
-        None,
-    )?;
+    let key = (command.clone(), std::env::var_os("PATH"));
+    let mut cache = RESOLVED_PYTHONS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("Kraken Python cache lock");
+    let output = if let Some(output) = cache.get(&key) {
+        output.clone()
+    } else {
+        let output = small_output(
+            &command,
+            [
+                OsString::from("-c"),
+                OsString::from("import sys; print(sys.executable)"),
+            ],
+            None,
+        )?;
+        cache.insert(key, output.clone());
+        output
+    };
     let path = PathBuf::from(output.trim());
     canonical_file(&path, "Kraken Python executable")
 }
 
 fn python_environment(python: &Path, python_path: &OsStr) -> Result<String> {
-    small_output(
+    let key = (python.to_owned(), python_path.to_owned());
+    let mut cache = PYTHON_ENVIRONMENTS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("Kraken environment cache lock");
+    if let Some(environment) = cache.get(&key) {
+        return Ok(environment.clone());
+    }
+    let environment = small_output(
         python,
         [
             OsString::from("-c"),
@@ -666,7 +686,9 @@ fn python_environment(python: &Path, python_path: &OsStr) -> Result<String> {
             ),
         ],
         Some(python_path),
-    )
+    )?;
+    cache.insert(key, environment.clone());
+    Ok(environment)
 }
 
 fn small_output(

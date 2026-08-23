@@ -33,11 +33,10 @@ pub fn replay(
     identity: StructureIdentity,
 ) -> Result<StructureReplay> {
     legal_pdf_structure::validate_input(pages, separators)?;
-    legal_pdf_support::profile::begin();
+    let _profile = legal_pdf_support::profile::scope("structure_replay");
     let prepared = legal_pdf_structure::prepare_pages(pages, separators);
     let prepared_pages = pages.to_vec();
     let derived = derive_prepared(pages, prepared, identity)?;
-    legal_pdf_support::profile::end();
     Ok(StructureReplay {
         prepared_pages,
         derived,

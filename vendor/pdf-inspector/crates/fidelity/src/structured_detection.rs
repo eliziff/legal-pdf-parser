@@ -118,31 +118,14 @@ fn repeated_multi_cell_rows(table: &Table) -> bool {
     count >= 2 && count * 3 >= table.cells.len()
 }
 
-fn page_values<T: Clone>(
+fn page_values<T>(
     values: &[T],
     page_number: u32,
     page: impl Fn(&T) -> u32,
-    sorted: bool,
-    keep: impl Fn(&T) -> bool,
-) -> Vec<T> {
-    let values = if sorted {
-        let start = values.partition_point(|value| page(value) < page_number);
-        let end = start + values[start..].partition_point(|value| page(value) == page_number);
-        &values[start..end]
-    } else {
-        values
-    };
-    values
-        .iter()
-        .filter(|value| page(value) == page_number && keep(value))
-        .cloned()
-        .collect()
-}
-
-fn sorted_by_page<T>(values: &[T], page: impl Fn(&T) -> u32) -> bool {
-    values
-        .windows(2)
-        .all(|pair| page(&pair[0]) <= page(&pair[1]))
+) -> &[T] {
+    let start = values.partition_point(|value| page(value) < page_number);
+    let end = start + values[start..].partition_point(|value| page(value) == page_number);
+    &values[start..end]
 }
 
 fn table_rule(line: &PdfLine) -> bool {
@@ -171,48 +154,54 @@ fn simplified_rects(rects: &[PdfRect], page_area: f64) -> Vec<PdfRect> {
 }
 
 /// Detect structured data tables for the requested `(page, width, height)`
-/// triples. Text, rectangles, and lines may contain the whole document.
+/// triples. Inputs must be grouped by page and may contain the whole document.
 pub fn detect_structured_tables(
     items: &[TextItem],
     rects: &[PdfRect],
     lines: &[PdfLine],
     pages: &[(u32, f64, f64)],
 ) -> Vec<DetectedTable> {
-    let items_sorted = sorted_by_page(items, |item| item.page);
-    let rects_sorted = sorted_by_page(rects, |rect| rect.page);
-    let lines_sorted = sorted_by_page(lines, |line| line.page);
     let mut output = Vec::new();
 
     for &(page, width, height) in pages {
-        let page_items = merge_text_items_for_layout(page_values(
-            items,
-            page,
-            |item| item.page,
-            items_sorted,
-            |item| matches!(item.item_type, ItemType::Text),
-        ));
+        let page_items = merge_text_items_for_layout(
+            page_values(items, page, |item| item.page)
+                .iter()
+                .filter(|item| matches!(item.item_type, ItemType::Text))
+                .cloned()
+                .collect(),
+        );
         if page_items.is_empty() {
             continue;
         }
-        let page_rects = page_values(rects, page, |rect| rect.page, rects_sorted, |_| true);
-        let page_lines = page_values(lines, page, |line| line.page, lines_sorted, table_rule);
+        let page_rects = page_values(rects, page, |rect| rect.page);
+        let page_lines: Vec<_> = page_values(lines, page, |line| line.page)
+            .iter()
+            .filter(|line| table_rule(line))
+            .cloned()
+            .collect();
         let text_tables = || {
             let mut sizes: Vec<_> = page_items
                 .iter()
                 .map(|item| item.font_size)
                 .filter(|&size| size > 0.0)
                 .collect();
-            sizes.sort_by(f32::total_cmp);
+            let middle = sizes.len() / 2;
+            let median = if sizes.is_empty() {
+                10.0
+            } else {
+                *sizes.select_nth_unstable_by(middle, f32::total_cmp).1
+            };
             detect_tables(
                 &page_items,
-                sizes.get(sizes.len() / 2).copied().unwrap_or(10.0),
+                median,
                 false,
             )
         };
 
         let mut method = "rect";
         let mut confidence = 0.95;
-        let mut tables: Vec<_> = detect_tables_from_rects(&page_items, &page_rects, page)
+        let mut tables: Vec<_> = detect_tables_from_rects(&page_items, page_rects, page)
             .0
             .into_iter()
             .filter(|table| !is_table_of_contents(&table.cells))
@@ -227,7 +216,7 @@ pub fn detect_structured_tables(
             .collect();
 
         if tables.is_empty() {
-            let normalized = simplified_rects(&page_rects, width * height);
+            let normalized = simplified_rects(page_rects, width * height);
             if normalized.len() < page_rects.len() {
                 tables = detect_tables_from_rects(&page_items, &normalized, page)
                     .0

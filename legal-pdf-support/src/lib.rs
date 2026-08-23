@@ -7,11 +7,11 @@ mod ppdoc;
 mod ppdoc_openvino;
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 mod ppdoc_postprocess;
-pub mod profile;
+pub use legal_pdf_core::profile;
 mod projection;
 
 pub use adapters::{to_alr_payload, to_toa_text_units};
-pub use lookup::lookup_footnote;
+pub use lookup::{lookup_footnote, normalize_decimal_digit, normalize_note_symbol};
 pub use pairing_support::{
     enumerator_interpretations, has_citation_signal, has_legal_citation_cue,
     heading_text_plausible, is_legal_citation_continuation, parse_heading_ladder,

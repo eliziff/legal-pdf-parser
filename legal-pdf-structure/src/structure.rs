@@ -6,11 +6,11 @@ use legal_pdf_core::model::{
 };
 use legal_pdf_core::{line_font_size, union_bbox, Anchor, Error, PairingOutput, Result};
 use legal_pdf_support::{
-    enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
-    protected_citation_spans,
+    enumerator_interpretations, has_citation_signal, heading_text_plausible,
+    normalize_decimal_digit, normalize_note_symbol, parse_heading_ladder, protected_citation_spans,
 };
 use legal_structure::{
-    detect_structure_candidate_runs, resolve_structure_graph, CandidateEvidenceV2,
+    detect_structure_candidate_runs, resolve_structure_graph, utf16_len, CandidateEvidenceV2,
     CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity, DocumentStructure,
     NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ResolutionRuleV2, ScalarRange,
     StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
@@ -142,10 +142,6 @@ impl PdfTextIndex {
         &self.text
     }
 
-    pub fn lines(&self) -> &[IndexedPdfLine] {
-        &self.lines
-    }
-
     pub fn line(&self, line_id: &str) -> Option<&IndexedPdfLine> {
         self.line_slots
             .get(line_id)
@@ -252,19 +248,8 @@ fn normalize_label(value: &str) -> String {
     let translated: String = value
         .trim()
         .chars()
-        .map(|character| match character {
-            '⁰' => '0',
-            '¹' => '1',
-            '²' => '2',
-            '³' => '3',
-            '⁴' => '4',
-            '⁵' => '5',
-            '⁶' => '6',
-            '⁷' => '7',
-            '⁸' => '8',
-            '⁹' => '9',
-            '∗' | '\u{f02a}' => '*',
-            other => other,
+        .map(|character| {
+            normalize_decimal_digit(character).unwrap_or_else(|| normalize_note_symbol(character))
         })
         .collect();
     translated
@@ -671,18 +656,6 @@ fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSet<(usize, u
 }
 
 fn mark_repeated_furniture(pages: &mut [Page]) {
-    let normalized_lines: Vec<Vec<String>> =
-        legal_pdf_support::profile::measure("furniture.normalize", || {
-            pages
-                .iter()
-                .map(|page| {
-                    page.lines
-                        .iter()
-                        .map(|line| normalize_furniture(&line.text))
-                        .collect()
-                })
-                .collect()
-        });
     let mut candidates: HashMap<(bool, String), Vec<FurnitureHit>> = HashMap::new();
     legal_pdf_support::profile::measure("furniture.candidates", || {
         for (page_slot, page) in pages.iter().enumerate() {
@@ -697,10 +670,13 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 } else {
                     None
                 };
-                let normalized = &normalized_lines[page_slot][line_slot];
-                if let Some(top) = edge.filter(|_| !normalized.is_empty()) {
+                let Some(top) = edge else {
+                    continue;
+                };
+                let normalized = normalize_furniture(&line.text);
+                if !normalized.is_empty() {
                     candidates
-                        .entry((top, normalized.clone()))
+                        .entry((top, normalized))
                         .or_default()
                         .push(FurnitureHit {
                             page_slot,
@@ -789,19 +765,18 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 .flatten()
                 .collect();
             for (index, line) in page.lines.iter_mut().enumerate() {
-                let normalized = &normalized_lines[page_slot][index];
                 let line_size = line_sizes[index];
                 let at_top = line.bbox[3] < page.height * 0.12;
                 let at_bottom = line.bbox[1] > page.height * 0.90;
                 let page_number_at_top = line.bbox[3] < page.height * 0.14;
-                let plausible_number = normalized != "#" || line_size >= body_size * 0.75;
                 let compact_note =
                     at_bottom && line_size < body_size * 0.90 && compact_note_line(&line.text);
                 if sequence_folios.contains(&(page_slot, index)) {
                     line.region_type = "footer".to_owned();
                 } else if repeated.contains(&(page_slot, index))
                     && (at_top || at_bottom)
-                    && plausible_number
+                    && (line_size >= body_size * 0.75
+                        || normalize_furniture(&line.text) != "#")
                     && !compact_note
                     && !attached_labels.contains(&index)
                     && !attached_enumerators.contains(&index)
@@ -3809,6 +3784,7 @@ fn citation_shaped_tail(text: &str) -> bool {
 fn join_lines(lines: &[&Line]) -> (String, HashMap<String, (usize, usize)>) {
     let mut text = String::new();
     let mut offsets = HashMap::new();
+    let mut scalar_cursor = 0;
     for line in lines {
         let value = line.text.trim();
         if value.is_empty() {
@@ -3821,12 +3797,15 @@ fn join_lines(lines: &[&Line]) -> (String, HashMap<String, (usize, usize)>) {
             && value.chars().next().is_some_and(char::is_lowercase)
         {
             text.pop();
+            scalar_cursor -= 1;
         } else if !text.is_empty() {
             text.push(' ');
+            scalar_cursor += 1;
         }
-        let start = text.chars().count();
+        let start = scalar_cursor;
         text.push_str(value);
-        offsets.insert(line.id.clone(), (start, start + value.chars().count()));
+        scalar_cursor += value.chars().count();
+        offsets.insert(line.id.clone(), (start, scalar_cursor));
     }
     (text, offsets)
 }
@@ -3909,8 +3888,7 @@ fn clean_markers(value: &str) -> String {
     marker_re().replace_all(value, "").trim().to_owned()
 }
 
-fn sentence_at(text: &str, offset: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
+fn sentence_boundaries(chars: &[char]) -> Vec<(usize, usize)> {
     let mut boundaries = Vec::<(usize, usize)>::new();
     let mut index = 0;
     while index < chars.len() {
@@ -3938,15 +3916,15 @@ fn sentence_at(text: &str, offset: usize) -> String {
         }
         index += 1;
     }
-    let previous: Vec<(usize, usize)> = boundaries
-        .iter()
-        .copied()
-        .filter(|(_, end)| *end <= offset)
-        .collect();
+    boundaries
+}
+
+fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize)], offset: usize) -> String {
+    let previous = &boundaries[..boundaries.partition_point(|(_, end)| *end <= offset)];
     let (start, end) = if previous.last().is_some_and(|(_, end)| {
-        char_slice(text, *end, offset.min(chars.len()))
-            .trim()
-            .is_empty()
+        chars[*end..offset.min(chars.len())]
+            .iter()
+            .all(|character| character.is_whitespace())
     }) {
         (
             if previous.len() > 1 {
@@ -3964,7 +3942,13 @@ fn sentence_at(text: &str, offset: usize) -> String {
             .map_or(chars.len(), |(_, boundary_end)| *boundary_end);
         (start, end)
     };
-    clean_markers(char_slice(text, start, end))
+    clean_markers(&chars[start..end].iter().collect::<String>())
+}
+
+#[cfg(test)]
+fn sentence_at(text: &str, offset: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    sentence_at_boundaries(&chars, &sentence_boundaries(&chars), offset)
 }
 
 fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
@@ -3975,6 +3959,8 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
         .collect();
     let mut previous_tail = String::new();
     for paragraph in paragraphs {
+        let chars: Vec<char> = paragraph.text.chars().collect();
+        let boundaries = sentence_boundaries(&chars);
         let mut anchors = paragraph.anchors.clone();
         anchors.sort_by_key(|anchor| anchor.get("offset").and_then(Value::as_u64).unwrap_or(0));
         let mut previous_offset = 0;
@@ -3986,8 +3972,13 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
                 continue;
             };
             let offset = anchor.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-            footnotes[index].sentence_proposition = sentence_at(&paragraph.text, offset);
-            let passage = clean_markers(char_slice(&paragraph.text, previous_offset, offset));
+            footnotes[index].sentence_proposition =
+                sentence_at_boundaries(&chars, &boundaries, offset);
+            let passage_text: String = chars
+                [previous_offset.min(chars.len())..offset.min(chars.len())]
+                .iter()
+                .collect();
+            let passage = clean_markers(&passage_text);
             footnotes[index].passage_since_prior_note = if passage.is_empty() {
                 previous_tail.clone()
             } else {
@@ -3995,13 +3986,11 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
             };
             previous_offset = offset + format!("⟦FN:{pair_id}⟧").chars().count();
         }
-        previous_tail = char_slice(
-            &paragraph.text,
-            previous_offset,
-            paragraph.text.chars().count(),
-        )
-        .trim()
-        .to_owned();
+        previous_tail = chars[previous_offset.min(chars.len())..]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_owned();
     }
 }
 
@@ -4443,41 +4432,40 @@ impl PdfResolutionInput {
             let mut list_candidates = HashSet::new();
             if !matches!(run.grammar, CandidateGrammar::Numeric) {
                 for candidate in &run.markers {
+                    let list_context = candidate.parent_candidate_id.is_some()
+                        || (run.grammar == CandidateGrammar::Enumerator
+                            && run.rooted
+                            && run.consecutive);
+                    if !list_context {
+                        continue;
+                    }
                     let Some(indexed) = index.line_at(candidate.marker_range.start) else {
                         continue;
                     };
                     let Some((page, line)) = by_line.get(indexed.line_id.as_str()) else {
                         continue;
                     };
-                    let aligned_siblings = run
-                        .markers
-                        .iter()
-                        .filter(|sibling| {
-                            if sibling.id == candidate.id || sibling.level != candidate.level {
-                                return false;
-                            }
-                            let Some(sibling_indexed) = index.line_at(sibling.marker_range.start)
-                            else {
-                                return false;
-                            };
-                            let Some((sibling_page, sibling_line)) =
-                                by_line.get(sibling_indexed.line_id.as_str())
-                            else {
-                                return false;
-                            };
-                            line.region_type == "body"
-                                && sibling_line.region_type == "body"
-                                && !line.exclude_from_body
-                                && !sibling_line.exclude_from_body
-                                && (line.bbox[0] - sibling_line.bbox[0]).abs()
-                                    <= page.width.max(sibling_page.width).max(1.0) * 0.008
-                        })
-                        .count();
-                    let list_context = candidate.parent_candidate_id.is_some()
-                        || (run.grammar == CandidateGrammar::Enumerator
-                            && run.rooted
-                            && run.consecutive);
-                    if aligned_siblings >= 1 && list_context {
+                    let aligned_sibling = run.markers.iter().any(|sibling| {
+                        if sibling.id == candidate.id || sibling.level != candidate.level {
+                            return false;
+                        }
+                        let Some(sibling_indexed) = index.line_at(sibling.marker_range.start)
+                        else {
+                            return false;
+                        };
+                        let Some((sibling_page, sibling_line)) =
+                            by_line.get(sibling_indexed.line_id.as_str())
+                        else {
+                            return false;
+                        };
+                        line.region_type == "body"
+                            && sibling_line.region_type == "body"
+                            && !line.exclude_from_body
+                            && !sibling_line.exclude_from_body
+                            && (line.bbox[0] - sibling_line.bbox[0]).abs()
+                                <= page.width.max(sibling_page.width).max(1.0) * 0.008
+                    });
+                    if aligned_sibling {
                         list_candidates.insert(candidate.id.as_str());
                     }
                 }
@@ -4808,12 +4796,7 @@ fn native_graph_parts(
             content_start: None,
             marker_range: None,
             page_indexes: vec![page.index],
-            line_ids: index
-                .lines()
-                .iter()
-                .filter(|line| line.page_index == page.index)
-                .map(|line| line.line_id.clone())
-                .collect(),
+            line_ids: index.line_ids(range),
             grammar: None,
             proof: None,
         });
@@ -4986,14 +4969,14 @@ pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {
     }
 }
 
-fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
+fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {
     let mut ids = HashSet::new();
     let mut span_ids = HashSet::new();
     let mut word_ids = HashSet::new();
     for page in pages {
         let page_ids: HashSet<&str> = page.lines.iter().map(|line| line.id.as_str()).collect();
         if page_ids.len() != page.lines.len()
-            || page.lines.iter().any(|line| !ids.insert(line.id.clone()))
+            || page.lines.iter().any(|line| !ids.insert(line.id.as_str()))
         {
             return Err(Error::Message(
                 "document contains duplicate line IDs".to_owned(),
@@ -5021,7 +5004,7 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
             if !line
                 .spans
                 .iter()
-                .all(|span| span_ids.insert(span.id.clone()))
+                .all(|span| span_ids.insert(span.id.as_str()))
             {
                 return Err(Error::Message(
                     "document contains duplicate span IDs".to_owned(),
@@ -5030,7 +5013,7 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
             if !line
                 .words
                 .iter()
-                .all(|word| word_ids.insert(word.id.clone()))
+                .all(|word| word_ids.insert(word.id.as_str()))
             {
                 return Err(Error::Message(
                     "document contains duplicate word IDs".to_owned(),
@@ -5155,11 +5138,11 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
         if footnote
             .reference_line_id
             .as_ref()
-            .is_some_and(|line| !known_lines.contains(line))
+            .is_some_and(|line| !known_lines.contains(line.as_str()))
             || footnote
                 .body_line_ids
                 .iter()
-                .any(|line| !known_lines.contains(line))
+                .any(|line| !known_lines.contains(line.as_str()))
         {
             return Err(Error::Message(format!(
                 "footnote {} contains an unknown source line",
@@ -5173,7 +5156,7 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             || paragraph
                 .line_ids
                 .iter()
-                .any(|line| !known_lines.contains(line))
+                .any(|line| !known_lines.contains(line.as_str()))
         {
             return Err(Error::Message(format!(
                 "paragraph {} is invalid",
@@ -5194,7 +5177,7 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
         .map(|page| {
             page.lines
                 .iter()
-                .map(|line| line.text.encode_utf16().count())
+                .map(|line| utf16_len(&line.text))
                 .sum::<usize>()
         })
         .sum::<usize>()
@@ -5205,7 +5188,10 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             || !node_ids.insert(node.id.as_str())
             || node.range.start > node.range.end
             || node.range.end > text_length
-            || node.line_ids.iter().any(|line| !known_lines.contains(line))
+            || node
+                .line_ids
+                .iter()
+                .any(|line| !known_lines.contains(line.as_str()))
             || (node.kind == NodeKind::Section
                 && (node.locator_kind.as_deref().is_none_or(str::is_empty)
                     || node

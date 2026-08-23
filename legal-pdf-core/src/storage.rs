@@ -33,6 +33,14 @@ pub fn atomic_write_with(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
+    atomic_write_with_sync(path, true, write)
+}
+
+fn atomic_write_with_sync(
+    path: &Path,
+    sync: bool,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         io(parent, fs::create_dir_all(parent))?;
     }
@@ -62,7 +70,9 @@ pub fn atomic_write_with(
         let mut writer = BufWriter::new(file);
         write(&mut writer)?;
         io(&temporary, writer.flush())?;
-        io(&temporary, writer.get_ref().sync_all())?;
+        if sync {
+            io(&temporary, writer.get_ref().sync_all())?;
+        }
         drop(writer);
         if path.exists() {
             io(path, fs::remove_file(path))?;
@@ -128,9 +138,15 @@ impl Formatter for PythonFormatter {
 }
 
 pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    atomic_write_with(path, |writer| {
+    write_gzip_bytes(path, &serde_json::to_vec(value)?)
+}
+
+pub fn write_gzip_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_sync(path, false, |writer| {
         let mut gzip = GzBuilder::new().mtime(0).write(writer, Compression::fast());
-        serde_json::to_writer(&mut gzip, value)?;
+        gzip
+            .write_all(bytes)
+            .map_err(|source| Error::io(path, source))?;
         gzip.finish().map_err(|source| Error::io(path, source))?;
         Ok(())
     })

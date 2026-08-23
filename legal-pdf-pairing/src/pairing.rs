@@ -2,7 +2,7 @@ use legal_pdf_core::model::{Diagnostic, Footnote, Line, Page};
 use legal_pdf_core::{
     line_font_size, Anchor, NotePairClaim, NotePairKind, PairingOutput, SourceAnchor,
 };
-use legal_pdf_support::pairing_support;
+use legal_pdf_support::{normalize_decimal_digit, normalize_note_symbol, pairing_support};
 use legal_structure::{select_numeric_sequence, NumericSequenceCandidate, NumericSequencePolicy};
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -160,31 +160,8 @@ fn is_superscript(character: char) -> bool {
     SUPERSCRIPTS.contains(character)
 }
 
-fn normalized_digit(character: char) -> Option<char> {
-    match character {
-        '⁰' => Some('0'),
-        '¹' => Some('1'),
-        '²' => Some('2'),
-        '³' => Some('3'),
-        '⁴' => Some('4'),
-        '⁵' => Some('5'),
-        '⁶' => Some('6'),
-        '⁷' => Some('7'),
-        '⁸' => Some('8'),
-        '⁹' => Some('9'),
-        value if value.is_ascii_digit() => Some(value),
-        _ => None,
-    }
-}
-
 fn normalize_symbol(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| match character {
-            '∗' | '\u{f02a}' => '*',
-            other => other,
-        })
-        .collect()
+    value.chars().map(normalize_note_symbol).collect()
 }
 
 fn numeric_value(value: &str) -> Option<u32> {
@@ -193,7 +170,7 @@ fn numeric_value(value: &str) -> Option<u32> {
     for character in value.chars() {
         number = number
             .checked_mul(10)?
-            .checked_add(normalized_digit(character)?.to_digit(10)?)?;
+            .checked_add(normalize_decimal_digit(character)?.to_digit(10)?)?;
         found = true;
     }
     (found && (1..=MAX_VALUE).contains(&number)).then_some(number)
@@ -1841,7 +1818,7 @@ fn confusable_variants(value: &str) -> HashSet<u32> {
     }
     let mut result = String::new();
     for character in value.chars() {
-        let mapped = normalized_digit(character).or(match character {
+        let mapped = normalize_decimal_digit(character).or(match character {
             'l' | 'I' | 'i' | '|' | '!' | 'í' | 't' => Some('1'),
             'o' | 'O' | '°' | 'º' | 'ð' | 'D' | 'Q' => Some('0'),
             's' | 'S' => Some('5'),
@@ -2535,7 +2512,7 @@ fn select_refs(
 fn truncated_value_match(observed: &str, expected: u32) -> bool {
     let Some(digits) = observed
         .chars()
-        .map(normalized_digit)
+        .map(normalize_decimal_digit)
         .collect::<Option<String>>()
     else {
         return false;
@@ -3332,11 +3309,8 @@ fn normalized_observed(value: &str) -> String {
         .trim()
         .chars()
         .filter_map(|character| {
-            normalized_digit(character).or_else(|| {
-                (!character.is_whitespace()).then_some(match character {
-                    '\u{2217}' | '\u{f02a}' => '*',
-                    other => other,
-                })
+            normalize_decimal_digit(character).or_else(|| {
+                (!character.is_whitespace()).then_some(normalize_note_symbol(character))
             })
         })
         .collect::<String>()

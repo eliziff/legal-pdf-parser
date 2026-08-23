@@ -42,11 +42,34 @@ pub(super) struct ExpandedContent<'a> {
 pub(super) fn expand_page_content<'a>(
     doc: &'a Document,
     page_id: ObjectId,
-    operations: Vec<Operation>,
+    mut operations: Vec<Operation>,
     page_fonts: BTreeMap<Vec<u8>, &'a Dictionary>,
 ) -> ExpandedContent<'a> {
     let page_resources = page_resources(doc, page_id, page_fonts);
     let mut expander = Expander::new(doc, &page_resources);
+    if !page_resources
+        .xobjects
+        .values()
+        .any(|xobject| matches!(xobject, XObject::Form { .. }))
+    {
+        if operations.len() > MAX_EXPANDED_OPERATIONS {
+            expander.exceeded_limit = true;
+        } else {
+            if !page_resources.properties.is_empty() {
+                for operation in &mut operations {
+                    if operation.operator == "BDC" {
+                        if let Some(Object::Name(name)) = operation.operands.get(1) {
+                            if let Some(property) = page_resources.properties.get(name) {
+                                operation.operands[1] = (*property).clone();
+                            }
+                        }
+                    }
+                }
+            }
+            expander.operations = operations;
+        }
+        return expander.finish();
+    }
     expander.expand_stream(operations, &page_resources, false);
     expander.finish()
 }
@@ -65,13 +88,6 @@ struct Expander<'a> {
 impl<'a> Expander<'a> {
     fn new(doc: &'a Document, page_resources: &Resources<'a>) -> Self {
         let fonts = page_resources.fonts.clone();
-        let font_names = fonts
-            .keys()
-            .map(|name| {
-                let name = String::from_utf8_lossy(name).into_owned();
-                (name.clone(), name)
-            })
-            .collect();
         let images = page_resources
             .xobjects
             .iter()
@@ -86,7 +102,7 @@ impl<'a> Expander<'a> {
             doc,
             operations: Vec::new(),
             fonts,
-            font_names,
+            font_names: HashMap::new(),
             images,
             active_forms: HashSet::new(),
             next_name: 0,

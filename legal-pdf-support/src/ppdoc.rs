@@ -5,7 +5,7 @@ use crate::ppdoc_postprocess::{
 use image::{imageops, ImageReader, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
 pub use legal_pdf_core::OrtBackend as PPDocBackend;
-use legal_pdf_core::{Error, Result};
+use legal_pdf_core::{provider_asset_sha256, Error, Result};
 #[cfg(feature = "ppdoc")]
 use libloading::Library;
 #[cfg(feature = "ppdoc")]
@@ -14,12 +14,11 @@ use ort::{
     value::Tensor,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(feature = "ppdoc")]
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 const PACK_FORMAT: &str = "legalpdf.ppdoc-lite-model/1";
@@ -294,7 +293,7 @@ impl ModelPack {
             ));
         }
         let model = pack_file(&root, &manifest.model.file, "model")?;
-        let model_sha256 = sha256_file(&model)?;
+        let model_sha256 = provider_asset_sha256(&model)?;
         if model_sha256 != manifest.model.sha256.to_ascii_lowercase() {
             return Err(Error::Message(format!(
                 "PPdoc model hash mismatch: expected {}, found {model_sha256}",
@@ -307,7 +306,7 @@ impl ModelPack {
             .iter()
             .map(|companion| {
                 let path = pack_file(&root, &companion.file, "companion")?;
-                let actual = sha256_file(&path)?;
+                let actual = provider_asset_sha256(&path)?;
                 if actual != companion.sha256.to_ascii_lowercase() {
                     return Err(Error::Message(format!(
                         "PPdoc companion hash mismatch for {}: expected {}, found {actual}",
@@ -328,7 +327,7 @@ impl ModelPack {
         ) {
             (Some(file), Some(expected)) => {
                 let path = pack_file(&root, file, "parameter")?;
-                let actual = sha256_file(&path)?;
+                let actual = provider_asset_sha256(&path)?;
                 if actual != expected.to_ascii_lowercase() {
                     return Err(Error::Message(format!(
                         "PPdoc parameter hash mismatch: expected {expected}, found {actual}"
@@ -495,7 +494,7 @@ impl PPDocLayout {
                 pack.companion_sha256.join(",")
             },
             pack.params_sha256.as_deref().unwrap_or("none"),
-            sha256_file(&runtime)?,
+            provider_asset_sha256(&runtime)?,
             options.onednn,
             threshold,
             options.render_dpi,
@@ -1674,22 +1673,6 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|source| Error::io(path, source))
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut reader = BufReader::new(File::open(path).map_err(|source| Error::io(path, source))?);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|source| Error::io(path, source))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 #[cfg(feature = "ppdoc")]
 fn ort_error(error: ort::Error) -> Error {
     Error::Message(format!("PPdoc ONNX inference failed: {error}"))
@@ -1698,6 +1681,7 @@ fn ort_error(error: ort::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn decoded_boxes_are_clipped_filtered_and_keep_sequence_order() {

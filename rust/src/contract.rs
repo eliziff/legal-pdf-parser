@@ -106,6 +106,26 @@ fn selected_pages(value: &Value) -> Result<Option<Vec<usize>>> {
 }
 
 fn parse_options(value: &Value) -> Result<ParseOptions> {
+    let verified_source_sha256 = value
+        .get("verified_source_sha256")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::Message(
+                        "document request verified_source_sha256 must be lowercase SHA-256"
+                            .to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
     let mut options = ParseOptions {
         cache_dir: value
             .get("cache_dir")
@@ -113,6 +133,7 @@ fn parse_options(value: &Value) -> Result<ParseOptions> {
             .map(PathBuf::from),
         ocr_pages: selected_pages(value)?,
         use_cache: true,
+        verified_source_sha256,
         ..ParseOptions::default()
     };
 
@@ -248,9 +269,8 @@ pub fn derive_pdf_document(
     include_pairing_audit: bool,
 ) -> Result<PdfDocumentResult> {
     let options = parse_options(value)?;
-    let selected = options.ocr_pages.clone();
     let mut document = parse_pdf(string(value, "source_pdf")?, &options)?;
-    validate_selected_pages(selected.as_deref(), document.page_count)?;
+    validate_selected_pages(options.ocr_pages.as_deref(), document.page_count)?;
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         document.structure_graph.document_id = id.to_owned();
     }
