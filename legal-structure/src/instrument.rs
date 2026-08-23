@@ -1672,6 +1672,9 @@ fn select_instrument_lineation_indexed(
         ));
     }
     let endorsed = endorsed_references(references);
+    if endorsed.is_empty() {
+        return Ok(0);
+    }
     let mut selected = 0;
     let mut best = instrument_lineation_score(&graphs[0], &endorsed);
     for (index, graph) in graphs.iter().enumerate().skip(1) {
@@ -1822,7 +1825,11 @@ fn derive_instrument_structure(
     };
     let mut selected_blocks = crate::inference::detect_instrument(&selected_view);
     let mut selected = 0;
-    let mut best = instrument_lineation_score_blocks(&selected_blocks, &endorsed);
+    let mut best = if endorsed.is_empty() {
+        0
+    } else {
+        instrument_lineation_score_blocks(&selected_blocks, &endorsed)
+    };
     if best < endorsed.len() {
         for (index, hypothesis) in hypotheses.enumerate() {
             let candidate_text = tables.masked_text(hypothesis);

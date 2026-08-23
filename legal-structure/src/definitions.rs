@@ -111,6 +111,9 @@ pub(crate) fn derive_definitions_bytes(
     for paragraph in 0..paragraph_count {
         let (base, end) = span(paragraph);
         let text = &text[base..end];
+        if !text.contains('"') {
+            continue;
+        }
         let mut found = Vec::new();
         for content in PAREN.captures_iter(text).filter_map(|c| c.get(1)) {
             if !(1..=200).contains(&content.as_str().encode_utf16().count()) {
