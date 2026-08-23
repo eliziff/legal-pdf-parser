@@ -57,9 +57,11 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
         block.range = range;
         if block.content_start.is_some_and(|at| {
             block.kind != NodeKind::Section || at < block.range.start || at > block.range.end
-        }) || block.label.as_ref().is_some_and(|label| {
-            native_labels.contains(&(block.kind.evidence(), label.to_ascii_lowercase()))
-        }) {
+        }) || (!native_labels.is_empty()
+            && block.label.as_ref().is_some_and(|label| {
+                native_labels.contains(&(block.kind.evidence(), label.to_ascii_lowercase()))
+            }))
+        {
             continue;
         }
         let ordinal = counters.entry(block.kind).or_default();
@@ -165,6 +167,7 @@ pub(crate) fn derive_structure_evidence(
     Ok(infer_graph(evidence, inferred))
 }
 
+#[cfg(any(feature = "journal", test))]
 pub(crate) fn derive_native_structure_evidence(
     evidence: DocumentInput,
 ) -> Result<DocumentStructure, EngineError> {

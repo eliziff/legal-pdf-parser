@@ -1623,14 +1623,18 @@ fn section_key(label: &str) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
-fn section_scopes(
-    marks: &[SectionMark],
+fn section_scopes<'a>(
+    marks: &[&'a SectionMark],
     styles: &[SectionStyle],
     root: bool,
     fraction: bool,
-) -> Vec<Vec<SectionMark>> {
-    let mut scopes = Vec::<Vec<SectionMark>>::new();
-    for mark in marks.iter().filter(|value| styles.contains(&value.style)) {
+) -> Vec<Vec<&'a SectionMark>> {
+    let mut scopes = Vec::<Vec<&SectionMark>>::new();
+    for mark in marks
+        .iter()
+        .copied()
+        .filter(|value| styles.contains(&value.style))
+    {
         let parts = label_parts(&mark.label).count();
         let best = scopes
             .iter()
@@ -1655,9 +1659,9 @@ fn section_scopes(
             })
             .map(|value| value.0);
         if let Some(best) = best {
-            scopes[best].push(mark.clone());
+            scopes[best].push(mark);
         } else {
-            scopes.push(vec![mark.clone()]);
+            scopes.push(vec![mark]);
         }
         if scopes.len() > 8 {
             let smallest = (0..scopes.len())
@@ -1674,11 +1678,11 @@ fn section_scopes(
         .collect()
 }
 
-fn expand_descendants(
-    scope: Vec<SectionMark>,
-    marks: &[SectionMark],
+fn expand_descendants<'a>(
+    scope: Vec<&'a SectionMark>,
+    marks: &[&'a SectionMark],
     length: usize,
-) -> Vec<SectionMark> {
+) -> Vec<&'a SectionMark> {
     if scope
         .first()
         .is_none_or(|value| section_key(&value.label).count() != 1)
@@ -1703,7 +1707,7 @@ fn expand_descendants(
         let root = section_key(&parent.label).next();
         let mut descendants = Vec::new();
         let mut counts = HashMap::<&str, usize>::new();
-        for mark in &marks[begin..cursor] {
+        for &mark in &marks[begin..cursor] {
             if matches!(mark.style, SectionStyle::Dot | SectionStyle::DotTerm)
                 && mark.label.contains('.')
                 && section_key(&mark.label).next() == root
@@ -1716,14 +1720,13 @@ fn expand_descendants(
         result.extend(
             descendants
                 .into_iter()
-                .filter(|value| counts.get(value.label.as_str()) == Some(&1))
-                .cloned(),
+                .filter(|value| counts.get(value.label.as_str()) == Some(&1)),
         );
     }
     result
 }
 
-fn same_labels(left: &[SectionMark], right: &[SectionMark]) -> bool {
+fn same_labels(left: &[&SectionMark], right: &[&SectionMark]) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -1731,10 +1734,10 @@ fn same_labels(left: &[SectionMark], right: &[SectionMark]) -> bool {
             .all(|(left, right)| left.label == right.label)
 }
 
-fn choose_sections(
-    left: Option<Vec<SectionMark>>,
-    right: Option<Vec<SectionMark>>,
-) -> Option<Vec<SectionMark>> {
+fn choose_sections<'a>(
+    left: Option<Vec<&'a SectionMark>>,
+    right: Option<Vec<&'a SectionMark>>,
+) -> Option<Vec<&'a SectionMark>> {
     match (left, right) {
         (None, value) | (value, None) => value,
         (Some(left), Some(right)) if same_labels(&left, &right) => Some(left),
@@ -1756,17 +1759,17 @@ fn choose_sections(
     }
 }
 
-fn section_guard(value: &[SectionMark], text: &ScalarText<'_>) -> bool {
+fn section_guard(value: &[&SectionMark], text: &ScalarText<'_>) -> bool {
     !value.is_empty()
         && text.utf16_len() > 0
         && text.utf16(value[0].start) as f64 / text.utf16_len() as f64 <= 0.7
 }
 
-fn scope_winner(
-    scopes: Vec<Vec<SectionMark>>,
-    marks: &[SectionMark],
+fn scope_winner<'a>(
+    scopes: Vec<Vec<&'a SectionMark>>,
+    marks: &[&'a SectionMark],
     text: &ScalarText<'_>,
-) -> Option<Vec<SectionMark>> {
+) -> Option<Vec<&'a SectionMark>> {
     let mut values = scopes
         .into_iter()
         .map(|scope| {
@@ -1793,11 +1796,11 @@ fn scope_winner(
     unambiguous.then(|| values.swap_remove(0))
 }
 
-fn statute_winner(
-    marks: &[SectionMark],
+fn statute_winner<'a>(
+    marks: &[&'a SectionMark],
     text: &ScalarText<'_>,
     allow_hyphen: bool,
-) -> Option<Vec<SectionMark>> {
+) -> Option<Vec<&'a SectionMark>> {
     if marks.len() < 3 {
         return None;
     }
@@ -1937,17 +1940,21 @@ fn statute_spine_over(
     all_families: &[Vec<SectionMark>; 3],
     source: &[Line<'_>],
 ) -> Vec<SectionMark> {
+    let all = all_families
+        .each_ref()
+        .map(|marks| marks.iter().collect::<Vec<_>>());
     let filtered;
     let families = if inline_only {
-        filtered = all_families.clone().map(|marks| {
+        filtered = all.each_ref().map(|marks| {
             marks
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|mark| inline_section(text, mark))
                 .collect::<Vec<_>>()
         });
         &filtered
     } else {
-        all_families
+        &all
     };
     let mut candidates = families
         .iter()
@@ -1966,13 +1973,18 @@ fn statute_spine_over(
         };
         best = chosen;
     }
-    if best[0].family == SectionFamily::DotTerm {
-        let mut all = [families[0].clone(), families[1].clone()].concat();
-        all.sort_by_key(|value| value.start);
-        expand_descendants(best, &all, text.len())
+    let best = if best[0].family == SectionFamily::DotTerm {
+        let mut marks = families[0]
+            .iter()
+            .chain(&families[1])
+            .copied()
+            .collect::<Vec<_>>();
+        marks.sort_by_key(|value| value.start);
+        expand_descendants(best, &marks, text.len())
     } else {
         best
-    }
+    };
+    best.into_iter().cloned().collect()
 }
 
 fn statute_spine_from_lines(
