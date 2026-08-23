@@ -1673,23 +1673,14 @@ fn instrument_head_span(graph: &DocumentStructure, text_length: usize) -> f64 {
 }
 
 #[cfg(feature = "structure-inference")]
-pub fn derive_instrument_structure(
+fn derive_instrument_structure(
     text: &str,
-    documents: Vec<DocumentInput>,
+    mut documents: impl Iterator<Item = DocumentInput>,
 ) -> Result<DocumentStructure, EngineError> {
-    if documents
-        .iter()
-        .any(|document| document.profile != DetectionProfile::Instrument)
-    {
-        return Err(EngineError::invalid(
-            "instrument structure derivation requires instrument-profile evidence",
-        ));
-    }
     let text = ScalarText::new(text);
     let references =
         find_provision_references(text.value, FindProvisionReferencesOptions::default());
     let endorsed = endorsed_references(&references);
-    let mut documents = documents.into_iter();
     let mut structure =
         derive_structure_evidence(documents.next().ok_or_else(|| {
             EngineError::invalid("instrument lineation selection requires a graph")
@@ -1774,57 +1765,54 @@ pub fn analyze_instrument(
         vec![text.to_owned()]
     };
     let tables = AuthoritativeTables::new(text, table_cells)?;
-    let documents = hypotheses
-        .into_iter()
-        .map(|hypothesis| {
-            let masked = tables.masked_text(hypothesis);
-            let scalar_end = masked.chars().count();
-            Ok(DocumentInput {
-                schema_version: EVIDENCE_SCHEMA.to_owned(),
-                document_id: document_id.clone(),
-                provider: "internal".to_owned(),
-                #[cfg(feature = "source-doc")]
-                url: None,
-                #[cfg(feature = "source-doc")]
-                doc_type: None,
-                provider_revision: "legal-text-skeleton-v5".to_owned(),
-                profile: DetectionProfile::Instrument,
-                report_start_page: None,
-                require_report_start: false,
-                allow_hyphenated_sections: false,
-                text_sha256: format!("{:x}", Sha256::digest(masked.as_bytes())),
-                text: masked,
-                source_sha256: None,
-                offset_unit: "unicode-scalar".to_owned(),
-                scope: Scope::complete(),
-                origins: vec![Origin {
-                    id: "provider-adapter".to_owned(),
-                }],
-                native_claims: Vec::new(),
-                coverage: [
-                    EvidenceKind::Paragraph,
-                    EvidenceKind::Prose,
-                    EvidenceKind::Page,
-                    EvidenceKind::Section,
-                    EvidenceKind::Heading,
-                    EvidenceKind::Footnote,
-                    EvidenceKind::Endnote,
-                ]
-                .into_iter()
-                .map(|kind| Coverage {
-                    kind,
-                    range: ScalarRange {
-                        start: 0,
-                        end: scalar_end,
-                    },
-                    state: CoverageState::Absent,
-                })
-                .collect(),
-                exclusions: Vec::new(),
-                paragraph_breaks: Vec::<ParagraphBreak>::new(),
+    let documents = hypotheses.into_iter().map(|hypothesis| {
+        let masked = tables.masked_text(hypothesis);
+        let scalar_end = masked.chars().count();
+        DocumentInput {
+            schema_version: EVIDENCE_SCHEMA.to_owned(),
+            document_id: document_id.clone(),
+            provider: "internal".to_owned(),
+            #[cfg(feature = "source-doc")]
+            url: None,
+            #[cfg(feature = "source-doc")]
+            doc_type: None,
+            provider_revision: "legal-text-skeleton-v5".to_owned(),
+            profile: DetectionProfile::Instrument,
+            report_start_page: None,
+            require_report_start: false,
+            allow_hyphenated_sections: false,
+            text_sha256: format!("{:x}", Sha256::digest(masked.as_bytes())),
+            text: masked,
+            source_sha256: None,
+            offset_unit: "unicode-scalar".to_owned(),
+            scope: Scope::complete(),
+            origins: vec![Origin {
+                id: "provider-adapter".to_owned(),
+            }],
+            native_claims: Vec::new(),
+            coverage: [
+                EvidenceKind::Paragraph,
+                EvidenceKind::Prose,
+                EvidenceKind::Page,
+                EvidenceKind::Section,
+                EvidenceKind::Heading,
+                EvidenceKind::Footnote,
+                EvidenceKind::Endnote,
+            ]
+            .into_iter()
+            .map(|kind| Coverage {
+                kind,
+                range: ScalarRange {
+                    start: 0,
+                    end: scalar_end,
+                },
+                state: CoverageState::Absent,
             })
-        })
-        .collect::<Result<Vec<_>, EngineError>>()?;
+            .collect(),
+            exclusions: Vec::new(),
+            paragraph_breaks: Vec::<ParagraphBreak>::new(),
+        }
+    });
     let mut structure = derive_instrument_structure(text, documents)?;
     structure
         .nodes

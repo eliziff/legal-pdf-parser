@@ -1,4 +1,7 @@
-use legal_pdf_core::model::{Derivation, LegalDocument, NodeKind, Page, StructureNode};
+use legal_pdf_core::model::{
+    Derivation, LegalDocument, NodeKind, Page, SourceDoc, SourceDocBlock, SourceDocKind,
+    SourceDocOrigin, SourceDocProvider, StructureNode,
+};
 use legal_pdf_core::Result;
 use regex::Regex;
 use serde::Serialize;
@@ -827,10 +830,9 @@ fn append(text: &mut String, position: &mut usize, value: &str) {
     *position += utf16_len(value);
 }
 
-pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>) -> Value {
+pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>) -> SourceDoc {
     let mut text = String::new();
     let mut blocks = Vec::new();
-    let mut offsets = HashMap::new();
     let mut line_offsets = HashMap::new();
     let mut position = 0;
     let paragraphs = source_paragraphs(document);
@@ -864,20 +866,40 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
             } else {
                 paragraph.id.clone()
             };
-            offsets.insert(anchor.clone(), (start, end));
             for line_id in &paragraph.line_ids {
                 line_offsets.insert(line_id.clone(), (start, end));
             }
-            blocks.push(json!({"kind":"paragraph","label":format!("par{}",item.number),"start":start,"end":end,"origin":"heuristic","anchor":anchor}));
+            let mut block = SourceDocBlock::new(
+                SourceDocKind::Paragraph,
+                format!("par{}", item.number),
+                start,
+                end,
+                SourceDocOrigin::Heuristic,
+            );
+            block.anchor = Some(anchor);
+            blocks.push(block);
         }
         let label =
             normalized_locator("page", &display).unwrap_or_else(|| format!("page{}", page.number));
         let distinct_label = display != page.number.to_string();
-        let mut aliases = vec![Value::String(page.number.to_string())];
+        let mut aliases = vec![page.number.to_string()];
         if distinct_label {
-            aliases.push(Value::String(display));
+            aliases.push(display);
         }
-        blocks.push(json!({"kind":"page","label":label,"start":page_start,"end":position,"origin":if printed.is_some(){"heuristic"}else{"native"},"anchor":format!("page={}",page.number),"aliases":aliases}));
+        let mut block = SourceDocBlock::new(
+            SourceDocKind::Page,
+            label,
+            page_start,
+            position,
+            if printed.is_some() {
+                SourceDocOrigin::Heuristic
+            } else {
+                SourceDocOrigin::Native
+            },
+        );
+        block.anchor = Some(format!("page={}", page.number));
+        block.aliases = aliases;
+        blocks.push(block);
     }
     for section in section_nodes(document) {
         let positions = source_extent(document, &section.id)
@@ -899,12 +921,25 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
         let label = normalized_locator("section", locator.trim())
             .unwrap_or_else(|| format!("section:{id}"));
         let mut seen = HashSet::new();
-        let aliases: Vec<_> = std::iter::once(locator)
+        let aliases = std::iter::once(locator)
             .chain(section.aliases.iter().flatten().map(String::as_str))
             .filter(|value| !value.is_empty() && seen.insert((*value).to_owned()))
-            .map(|value| Value::String(value.to_owned()))
+            .map(str::to_owned)
             .collect();
-        blocks.push(json!({"kind":"section","label":label,"start":start,"end":end,"origin":match section.source { Derivation::Native => "native", Derivation::Heuristic => "heuristic", Derivation::Model => "model" },"anchor":id,"aliases":aliases}));
+        let mut block = SourceDocBlock::new(
+            SourceDocKind::Section,
+            label,
+            start,
+            end,
+            if section.source == Derivation::Native {
+                SourceDocOrigin::Native
+            } else {
+                SourceDocOrigin::Heuristic
+            },
+        );
+        block.anchor = Some(id);
+        block.aliases = aliases;
+        blocks.push(block);
     }
     for (order, note) in document.footnotes.iter().enumerate() {
         let body = clean_text(&note.body);
@@ -928,34 +963,38 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
         let end = position;
         let label = normalized_locator("footnote", note.label.trim())
             .unwrap_or_else(|| format!("fn{}", order + 1));
-        let aliases: Vec<_> = [&note.label, &note.pair_id]
+        let aliases = [&note.label, &note.pair_id]
             .into_iter()
             .filter(|value| !value.is_empty())
-            .map(|value| Value::String(value.clone()))
+            .cloned()
             .collect();
-        let mut block = json!({"kind":"footnote","label":label,"start":start,"end":end,"origin":"heuristic","aliases":aliases});
+        let mut block = SourceDocBlock::new(
+            SourceDocKind::Footnote,
+            label,
+            start,
+            end,
+            SourceDocOrigin::Heuristic,
+        );
+        block.aliases = aliases;
         if !note.pair_id.is_empty() {
-            block["anchor"] = Value::String(note.pair_id.clone());
+            block.anchor = Some(note.pair_id.clone());
         }
         blocks.push(block);
     }
     blocks.sort_by(|left, right| {
-        left["start"]
-            .as_u64()
-            .cmp(&right["start"].as_u64())
-            .then_with(|| left["end"].as_u64().cmp(&right["end"].as_u64()))
-            .then_with(|| left["label"].as_str().cmp(&right["label"].as_str()))
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.label.cmp(&right.label))
     });
-    json!({
-        "schema_version": "legalpdf.source-doc.v1",
-        "source_doc": {
-            "provider": "local-pdf",
-            "id": id.unwrap_or(&document.document_id),
-            "url": url,
-            "text": text,
-            "blocks": blocks,
-        }
-    })
+    SourceDoc::new(
+        Some(SourceDocProvider::LocalPdf),
+        id.unwrap_or(&document.document_id).to_owned(),
+        url.map(str::to_owned),
+        None,
+        text,
+        blocks,
+    )
 }
 
 #[cfg(test)]
@@ -1037,19 +1076,15 @@ mod tests {
                 ["status"],
             "invalid"
         );
-        assert_eq!(
-            source_doc(&document, Some("id"), None)["source_doc"]["id"],
-            "id"
-        );
+        assert_eq!(source_doc(&document, Some("id"), None).id, "id");
         let source = source_doc(&document, Some("id"), None);
-        let paragraph = source["source_doc"]["blocks"]
-            .as_array()
-            .unwrap()
+        let paragraph = source
+            .blocks
             .iter()
-            .find(|block| block["kind"] == "paragraph")
+            .find(|block| block.kind == SourceDocKind::Paragraph)
             .unwrap();
-        assert_eq!(paragraph["label"], "par1");
-        assert_eq!(paragraph["anchor"], "p");
+        assert_eq!(paragraph.label, "par1");
+        assert_eq!(paragraph.anchor.as_deref(), Some("p"));
         let lookup = structure_lookup(
             &document,
             &json!({"locator_kind":"paragraph","locator":"par1"}),
@@ -1134,25 +1169,23 @@ mod tests {
         };
 
         let source = source_doc(&document, None, None);
-        let blocks = source["source_doc"]["blocks"].as_array().unwrap();
         assert_eq!(
-            blocks
+            source
+                .blocks
                 .iter()
-                .filter(|block| block["kind"] == "section")
+                .filter(|block| block.kind == SourceDocKind::Section)
                 .count(),
             0
         );
         assert_eq!(
-            blocks
+            source
+                .blocks
                 .iter()
-                .filter(|block| block["kind"] == "paragraph")
+                .filter(|block| block.kind == SourceDocKind::Paragraph)
                 .count(),
             1
         );
-        assert!(source["source_doc"]["text"]
-            .as_str()
-            .unwrap()
-            .ends_with(&text));
+        assert!(source.text.ends_with(&text));
         let lookup = structure_lookup(
             &document,
             &json!({"locator_kind":"section","locator":"section:section-000001"}),
