@@ -2649,17 +2649,13 @@ impl StructureState {
 fn enumerated_children(
     text: &ScalarText<'_>,
     range: std::ops::Range<usize>,
-    root: String,
+    root: &str,
     content_start: usize,
     inline_at_root: bool,
     leading_label: Option<&str>,
 ) -> Vec<Block> {
     let bytes = text.byte(range.start)..text.byte(range.end);
     let value = &text.value[bytes.clone()];
-    let mut state = StructureState {
-        section: Some((root.clone(), 0)),
-        ..Default::default()
-    };
     let mut markers = Vec::new();
     let leading = leading_label.and_then(|label| {
         let lead = leading_ascii_space(value);
@@ -2680,7 +2676,9 @@ fn enumerated_children(
     } else {
         let inline = &text.value[text.byte(content_start)..bytes.end];
         let inline_line = inline.lines().next().unwrap_or_default();
-        if let Some((token, at, _)) = legislation_marker(inline_line, inline.contains('\n')) {
+        if let Some((token, at, _)) =
+            legislation_marker(inline_line, inline_line.len() < inline.len())
+        {
             let start = inline_at_root
                 .then_some(range.start)
                 .unwrap_or(content_start);
@@ -2712,7 +2710,14 @@ fn enumerated_children(
         line_byte += raw.len();
         line_scalar += raw.chars().count();
     }
+    if markers.is_empty() {
+        return Vec::new();
+    }
     markers.sort_by_key(|marker| marker.start);
+    let mut state = StructureState {
+        section: Some((root.to_owned(), 0)),
+        ..Default::default()
+    };
     for index in 0..markers.len() {
         let marker = &markers[index];
         state.legislation_child(
@@ -2733,7 +2738,7 @@ fn enumerated_children(
         node.range.end = markers
             .get(next_marker)
             .map_or(range.end, |marker| marker.start);
-        node.parent_label = Some(root.clone());
+        node.parent_label = Some(root.to_owned());
     }
     state
         .nodes
@@ -2935,7 +2940,7 @@ fn detect_legislation(
         let children = enumerated_children(
             text,
             section.start..end,
-            parent.clone(),
+            &parent,
             section.content_start,
             matches!(section.family, SectionFamily::Bare | SectionFamily::DotTerm),
             None,
@@ -2975,7 +2980,7 @@ fn detect_legislation(
         let children = enumerated_children(
             text,
             claim.range.start..claim.range.end,
-            parent.clone(),
+            &parent,
             content_start,
             false,
             Some(label),
