@@ -138,8 +138,14 @@ impl<'a> ScalarText<'a> {
     }
 
     pub(crate) fn utf16_at_byte(&self, byte: usize) -> Option<usize> {
-        self.scalar_at_byte(byte)
-            .and_then(|scalar| self.utf16_at_scalar(scalar))
+        if byte > self.value.len() || !self.value.is_char_boundary(byte) {
+            return None;
+        }
+        if self.offsets.is_empty() {
+            return Some(byte);
+        }
+        let offset = self.checkpoint(byte, 1);
+        Some(offset[2] + self.value[offset[1]..byte].encode_utf16().count())
     }
 
     pub(crate) fn byte_at_utf16(&self, utf16: usize) -> Option<usize> {
@@ -188,7 +194,7 @@ impl<'a> ScalarText<'a> {
     }
 }
 
-pub(crate) fn utf16_len(value: &str) -> usize {
+pub fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
@@ -200,7 +206,7 @@ pub(crate) fn javascript_whitespace(character: char) -> bool {
 
 /// Collapse ECMAScript whitespace runs to one ASCII space and trim runs at
 /// both ends. Non-whitespace code points, including U+0085, are unchanged.
-pub(crate) fn normalize_javascript_whitespace(value: &str) -> String {
+pub fn normalize_javascript_whitespace(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len());
     let mut separating = false;
     for character in value.chars() {

@@ -23,6 +23,8 @@ mod native_markup;
 mod numeric_sequence;
 #[cfg(feature = "source-doc")]
 mod source_doc;
+#[cfg(feature = "source-doc")]
+mod source_doc_query;
 mod tables;
 mod text;
 #[cfg(feature = "a2aj")]
@@ -43,11 +45,12 @@ pub use source_doc::{
     ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind, SourceDocOrigin,
     SourceDocProvider, SourceDocType,
 };
+#[cfg(feature = "source-doc")]
+pub use source_doc_query::*;
 pub use tables::{AuthoritativeTableCell, AuthoritativeTables};
 pub(crate) use text::javascript_whitespace;
-#[cfg(any(feature = "structure-inference", feature = "a2aj", feature = "journal"))]
-pub(crate) use text::utf16_len;
 pub(crate) use text::ScalarText;
+pub use text::{normalize_javascript_whitespace, utf16_len};
 
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const DOCUMENT_STRUCTURE_SCHEMA: &str = "legalpdf.document-structure.v1";

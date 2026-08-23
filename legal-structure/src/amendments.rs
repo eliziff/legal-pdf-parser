@@ -1,8 +1,12 @@
 use crate::{
-    analyze_instrument, javascript_whitespace, normalize_source_doc_locator, project_document_structure_view, AuthoritativeTableCell, DocumentStructure,
-    InstrumentCrossReferenceReason, InstrumentCrossReferenceStatus, ScalarText, SourceDoc, SourceDocKind, StructureNode,
+    analyze_instrument, javascript_whitespace, normalize_source_doc_locator,
+    project_document_structure_view, AuthoritativeTableCell, DocumentStructure,
+    InstrumentCrossReferenceReason, InstrumentCrossReferenceStatus, ScalarText, SourceDoc,
+    SourceDocKind, StructureNode,
 };
-use legal_grammar_tables::{compile_ecmascript_pattern, compile_table_entry, expand_pattern, load_tables, CompiledGrammar};
+use legal_grammar_tables::{
+    compile_ecmascript_pattern, compile_table_entry, expand_pattern, load_tables, CompiledGrammar,
+};
 use regex::{Captures, Regex};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -30,7 +34,10 @@ fn js_trim(value: &str) -> &str {
 }
 
 fn compact_label(value: &str) -> String {
-    value.chars().filter(|character| !javascript_whitespace(*character)).collect()
+    value
+        .chars()
+        .filter(|character| !javascript_whitespace(*character))
+        .collect()
 }
 
 fn table_pattern(id: &str) -> String {
@@ -132,7 +139,10 @@ pub fn join_locator(head: &str, sub: Option<&str>) -> String {
 }
 
 fn compact_label_fr(value: &str) -> String {
-    grammars().fr_unclosed.replace_all(&compact_label(value), "($1)").into_owned()
+    grammars()
+        .fr_unclosed
+        .replace_all(&compact_label(value), "($1)")
+        .into_owned()
 }
 
 #[derive(Clone)]
@@ -148,7 +158,11 @@ fn quotes(value: &str) -> Vec<Quote> {
     while cursor < value.len() {
         let mut open = [("“", "”"), ("``", "''"), ("‘", "’"), ("\"", "\"")]
             .into_iter()
-            .filter_map(|(left, right)| value[cursor..].find(left).map(|at| (cursor + at, left, right)))
+            .filter_map(|(left, right)| {
+                value[cursor..]
+                    .find(left)
+                    .map(|at| (cursor + at, left, right))
+            })
             .collect::<Vec<_>>();
         open.sort_by_key(|item| item.0);
         let Some((start, left, right)) = open.into_iter().next() else {
@@ -246,13 +260,21 @@ fn unquoted_block(body: &str) -> Option<String> {
             kept.push("");
             continue;
         }
-        if trimmed.to_lowercase().starts_with("marginal note:") || cached!(MARGINAL_FR, r"^note\s+marginale\s*:", "i").is_match(trimmed) {
+        if trimmed.to_lowercase().starts_with("marginal note:")
+            || cached!(MARGINAL_FR, r"^note\s+marginale\s*:", "i").is_match(trimmed)
+        {
             continue;
         }
         if saw_text && cached!(NEXT_INSTRUCTION, r"^\d{1,4}\s+\S", "").is_match(trimmed) {
             break;
         }
-        if cached!(UNQUOTED_STOP, r"^(?:R\.S\.|S\.C\.|L\.R\.C\.|L\.C\.|L\.R\.)[,.\s]", "").is_match(trimmed) {
+        if cached!(
+            UNQUOTED_STOP,
+            r"^(?:R\.S\.|S\.C\.|L\.R\.C\.|L\.C\.|L\.R\.)[,.\s]",
+            ""
+        )
+        .is_match(trimmed)
+        {
             break;
         }
         if saw_text
@@ -289,15 +311,25 @@ fn last_context(segment: &str) -> Option<String> {
 
 fn split_clauses(body: &str) -> Vec<Clause> {
     let masked = mask_quoted_runs(body);
-    let boundaries = cached!(BY, r"\bby\b\s+", "i").find_iter(&masked).collect::<Vec<_>>();
+    let boundaries = cached!(BY, r"\bby\b\s+", "i")
+        .find_iter(&masked)
+        .collect::<Vec<_>>();
     let mut clauses = Vec::new();
-    let mut pending = boundaries.first().and_then(|first| last_context(&masked[..first.start()]));
+    let mut pending = boundaries
+        .first()
+        .and_then(|first| last_context(&masked[..first.start()]));
     for (index, boundary) in boundaries.iter().enumerate() {
         let start = boundary.end();
-        let end = boundaries.get(index + 1).map_or(masked.len(), |next| next.start());
+        let end = boundaries
+            .get(index + 1)
+            .map_or(masked.len(), |next| next.start());
         let part = &body[start..end];
-        if cached!(CLAUSE_VERB, r"^(?:strik|insert|add|redesignat|renumber|repeal|substitut|replac|delet)", "i")
-            .is_match(part.trim_start_matches(javascript_whitespace))
+        if cached!(
+            CLAUSE_VERB,
+            r"^(?:strik|insert|add|redesignat|renumber|repeal|substitut|replac|delet)",
+            "i"
+        )
+        .is_match(part.trim_start_matches(javascript_whitespace))
         {
             clauses.push(Clause {
                 text: part.to_owned(),
@@ -339,8 +371,16 @@ fn punctuation(value: &str) -> Option<&'static str> {
 
 fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'static str> {
     let text = &clause.text;
-    let target = join_locator(head, clause.context.as_deref().map(compact_label).as_deref());
-    let every = cached!(EVERY, r"each\s+place\s+(?:it|such\s+term)\s+appears|wherever\s+appearing", "i").is_match(text);
+    let target = join_locator(
+        head,
+        clause.context.as_deref().map(compact_label).as_deref(),
+    );
+    let every = cached!(
+        EVERY,
+        r"each\s+place\s+(?:it|such\s+term)\s+appears|wherever\s+appearing",
+        "i"
+    )
+    .is_match(text);
     let lower = text.to_lowercase();
     let side = |word: &str| {
         if word.eq_ignore_ascii_case("before") {
@@ -353,9 +393,14 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
         let rest = &text[strike.end()..];
         if let Some(reference) = grammars().lead_ref.captures(rest) {
             if let Some(label) = reference.get(1) {
-                let replace = cached!(INSERT_FOLLOWING, r"insert(?:ing)?\s+the\s+following", "i").is_match(rest);
+                let replace = cached!(INSERT_FOLLOWING, r"insert(?:ing)?\s+the\s+following", "i")
+                    .is_match(rest);
                 let mut op = op(
-                    if replace { "replace_provision" } else { "strike_provision" },
+                    if replace {
+                        "replace_provision"
+                    } else {
+                        "strike_provision"
+                    },
                     join_locator(head, Some(&compact_label(label.as_str()))),
                     raw,
                 );
@@ -372,8 +417,16 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
             let scoped = end_of
                 .as_ref()
                 .and_then(|capture| capture.get(1))
-                .map_or_else(|| target.clone(), |label| join_locator(head, Some(&compact_label(label.as_str()))));
-            let insert = cached!(INSERT_SUBSTITUTE, r"\b(?:and\s+)?(?:insert(?:ing)?|substitut(?:ing|e))\b", "i").find(rest);
+                .map_or_else(
+                    || target.clone(),
+                    |label| join_locator(head, Some(&compact_label(label.as_str()))),
+                );
+            let insert = cached!(
+                INSERT_SUBSTITUTE,
+                r"\b(?:and\s+)?(?:insert(?:ing)?|substitut(?:ing|e))\b",
+                "i"
+            )
+            .find(rest);
             if let Some(insert) = insert {
                 if let Some(value) = quotes(&rest[insert.end()..]).first() {
                     let mut op = op("substitute_text", scoped, raw);
@@ -407,7 +460,15 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
             let insert = cached!(INSERT_AFTER, r"\b(?:and\s+)?insert(?:ing)?\b", "i")
                 .find(rest)
                 .and_then(|matched| quotes(&rest[matched.end()..]).first().cloned());
-            let mut op = op(if insert.is_some() { "substitute_text" } else { "strike_text" }, target, raw);
+            let mut op = op(
+                if insert.is_some() {
+                    "substitute_text"
+                } else {
+                    "strike_text"
+                },
+                target,
+                raw,
+            );
             put(&mut op, "oldText", mark);
             if let Some(value) = insert {
                 put(&mut op, "newText", value.value);
@@ -421,7 +482,10 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
     if let Some(insert) = cached!(INSERT, r"insert(?:ing)?\s+", "i").find(text) {
         let rest = &text[insert.end()..];
         let found = quotes(rest);
-        if let (Some(value), Some(placement)) = (found.first(), cached!(PLACEMENT, r"\b(after|before)\b", "i").captures(rest)) {
+        if let (Some(value), Some(placement)) = (
+            found.first(),
+            cached!(PLACEMENT, r"\b(after|before)\b", "i").captures(rest),
+        ) {
             let position = side(&placement[1]);
             let tail = &rest[placement.get(0).unwrap().end()..];
             if let Some(anchor) = quotes(tail).first() {
@@ -434,9 +498,13 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
                 }
                 return Ok(op);
             }
-            if let Some(mark) = cached!(TERMINAL_ANCHOR, r"^\s*the\s+(period|comma|semicolon)\b", "i")
-                .captures(tail)
-                .and_then(|capture| punctuation(&capture[1]))
+            if let Some(mark) = cached!(
+                TERMINAL_ANCHOR,
+                r"^\s*the\s+(period|comma|semicolon)\b",
+                "i"
+            )
+            .captures(tail)
+            .and_then(|capture| punctuation(&capture[1]))
             {
                 let mut op = op("insert_text", target, raw);
                 put(&mut op, "newText", &value.value);
@@ -450,7 +518,11 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
             if cached!(THE_FOLLOWING, r"the\s+following", "i").is_match(rest) {
                 let mut op = op("add_provision", target, raw);
                 put(&mut op, "position", side(&reference[1]));
-                put(&mut op, "afterChild", join_locator(head, Some(&compact_label(&reference[2]))));
+                put(
+                    &mut op,
+                    "afterChild",
+                    join_locator(head, Some(&compact_label(&reference[2]))),
+                );
                 if let Some(value) = found.first() {
                     put(&mut op, "newText", &value.value);
                 }
@@ -468,18 +540,32 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
         let rest = &text[adding.end()..];
         if let Some(value) = quotes(rest).first().filter(|value| value.start == 0) {
             if let Some(reference) = grammars().at_end_ref.captures(&rest[value.end..]) {
-                let mut op = op("append_text", join_locator(head, Some(&compact_label(&reference[1]))), raw);
+                let mut op = op(
+                    "append_text",
+                    join_locator(head, Some(&compact_label(&reference[1]))),
+                    raw,
+                );
                 put(&mut op, "newText", &value.value);
                 return Ok(op);
             }
         }
     }
-    if let Some(adding) = cached!(ADD_FOLLOWING, r"adding\s+the\s+following\s+(after|before)\s+", "i").captures(text) {
+    if let Some(adding) = cached!(
+        ADD_FOLLOWING,
+        r"adding\s+the\s+following\s+(after|before)\s+",
+        "i"
+    )
+    .captures(text)
+    {
         let tail = &text[adding.get(0).unwrap().end()..];
         if let Some(reference) = grammars().lead_anchored_ref.captures(tail) {
             let mut op = op("add_provision", target, raw);
             put(&mut op, "position", side(&adding[1]));
-            put(&mut op, "afterChild", join_locator(head, Some(&compact_label(&reference[1]))));
+            put(
+                &mut op,
+                "afterChild",
+                join_locator(head, Some(&compact_label(&reference[1]))),
+            );
             if let Some(value) = quoted_block(text).or_else(|| unquoted_block(text)) {
                 put(&mut op, "newText", value);
             }
@@ -496,7 +582,11 @@ fn op_from_clause(clause: &Clause, head: &str, raw: &str) -> Result<Value, &'sta
     }
     if lower.contains("redesignat") {
         if let Some(reference) = grammars().redesignate_ref.captures(text) {
-            let mut op = op("redesignate", join_locator(head, Some(&compact_label(&reference[1]))), raw);
+            let mut op = op(
+                "redesignate",
+                join_locator(head, Some(&compact_label(&reference[1]))),
+                raw,
+            );
             put(&mut op, "newLabel", compact_label(&reference[2]));
             return Ok(op);
         }
@@ -551,7 +641,12 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
         .head
         .captures_iter(text)
         .filter_map(|capture| capture_head(capture, false))
-        .chain(grammars().fr_head.captures_iter(text).filter_map(|capture| capture_head(capture, true)))
+        .chain(
+            grammars()
+                .fr_head
+                .captures_iter(text)
+                .filter_map(|capture| capture_head(capture, true)),
+        )
         .collect::<Vec<_>>();
     heads.sort_by_key(|head| head.start);
     let (mut ops, mut unparsed) = (Vec::new(), Vec::new());
@@ -578,7 +673,12 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
             .last()
             .unwrap_or(head.start);
         let scoped = if head.french {
-            cached!(FR_SCOPED, r"(?:\bpassage\s+d[eu]\b|\bdéfinitions?\s+d(?:e|u|es)\b).{0,80}$", "is").is_match(&text[prefix_start..head.start])
+            cached!(
+                FR_SCOPED,
+                r"(?:\bpassage\s+d[eu]\b|\bdéfinitions?\s+d(?:e|u|es)\b).{0,80}$",
+                "is"
+            )
+            .is_match(&text[prefix_start..head.start])
         } else {
             cached!(
                 SCOPED,
@@ -588,7 +688,10 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
             .is_match(&text[prefix_start..head.start])
         };
         if scoped {
-            unparsed.push(miss(raw, "scoped amendment (portion/heading) — not applied"));
+            unparsed.push(miss(
+                raw,
+                "scoped amendment (portion/heading) — not applied",
+            ));
             continue;
         }
         let target = join_locator(&head.label, None);
@@ -616,7 +719,9 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
             }
             continue;
         }
-        if cached!(READ_FOLLOWS, r"to\s+read\s+as\s+follows", "i").is_match(&body[..body.char_indices().nth(80).map_or(body.len(), |(at, _)| at)]) {
+        if cached!(READ_FOLLOWS, r"to\s+read\s+as\s+follows", "i")
+            .is_match(&body[..body.char_indices().nth(80).map_or(body.len(), |(at, _)| at)])
+        {
             if let Some(block) = quoted_block(body).or_else(|| unquoted_block(body)) {
                 let mut op = op("replace_provision", target, raw);
                 put(&mut op, "newText", block);
@@ -632,7 +737,10 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
         for clause in clauses {
             match op_from_clause(&clause, &head.label, raw) {
                 Ok(op) => ops.push(op),
-                Err(reason) => unparsed.push(miss(&js_trim(&clause.text).chars().take(160).collect::<String>(), reason)),
+                Err(reason) => unparsed.push(miss(
+                    &js_trim(&clause.text).chars().take(160).collect::<String>(),
+                    reason,
+                )),
             }
         }
     }
@@ -645,12 +753,25 @@ struct Analyzed {
 }
 
 fn analyze(text: &str, reconstruct_lineation: bool) -> Result<Analyzed, crate::EngineError> {
-    let structure = analyze_instrument(text, String::new(), &[] as &[AuthoritativeTableCell], reconstruct_lineation)?;
+    let structure = analyze_instrument(
+        text,
+        String::new(),
+        &[] as &[AuthoritativeTableCell],
+        reconstruct_lineation,
+    )?;
     let source_doc = project_document_structure_view(&structure);
-    Ok(Analyzed { structure, source_doc })
+    Ok(Analyzed {
+        structure,
+        source_doc,
+    })
 }
 
-fn utf16_slice_at<'a>(text: &'a str, coordinates: &ScalarText<'_>, start: usize, end: usize) -> &'a str {
+fn utf16_slice_at<'a>(
+    text: &'a str,
+    coordinates: &ScalarText<'_>,
+    start: usize,
+    end: usize,
+) -> &'a str {
     let Some(start) = coordinates.byte_at_utf16(start) else {
         return "";
     };
@@ -683,7 +804,12 @@ fn literal_pattern(literal: &str) -> Regex {
     compile(&pattern, "")
 }
 
-fn find_in_span(text: &str, coordinates: &ScalarText<'_>, span: (usize, usize), literal: &str) -> Vec<(usize, usize)> {
+fn find_in_span(
+    text: &str,
+    coordinates: &ScalarText<'_>,
+    span: (usize, usize),
+    literal: &str,
+) -> Vec<(usize, usize)> {
     let Some(low) = coordinates.byte_at_utf16(span.0) else {
         return Vec::new();
     };
@@ -708,7 +834,10 @@ struct Target {
 
 fn resolve_target(doc: &SourceDoc, target: &str, length: usize) -> Option<Target> {
     if target.is_empty() {
-        return Some(Target { span: (0, length), node: None });
+        return Some(Target {
+            span: (0, length),
+            node: None,
+        });
     }
     let normalized = normalize_source_doc_locator(SourceDocKind::Section, target);
     for key in [target.to_lowercase(), normalized] {
@@ -738,7 +867,10 @@ fn is_word_unit(units: &[u16], at: usize) -> bool {
     if (0xd800..=0xdfff).contains(&unit) {
         return false;
     }
-    char::from_u32(unit.into()).is_some_and(|character| WORD.get_or_init(|| Regex::new(r"^[\p{L}\p{N}]$").unwrap()).is_match(&character.to_string()))
+    char::from_u32(unit.into()).is_some_and(|character| {
+        WORD.get_or_init(|| Regex::new(r"^[\p{L}\p{N}]$").unwrap())
+            .is_match(&character.to_string())
+    })
 }
 
 fn ensure_block(value: &str) -> String {
@@ -756,7 +888,11 @@ fn amend_failure(op: &Value, code: &str, detail: String) -> Value {
     json!({ "op": op, "code": code, "detail": detail })
 }
 
-pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: bool) -> Result<Value, crate::EngineError> {
+pub fn apply_amend_ops(
+    source: &str,
+    ops: Vec<Value>,
+    reconstruct_lineation: bool,
+) -> Result<Value, crate::EngineError> {
     let before = analyze(source, reconstruct_lineation)?;
     let coordinates = ScalarText::new(source);
     let length = coordinates.utf16_len();
@@ -793,7 +929,10 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                 };
                 let mut hits = find_in_span(source, &coordinates, target.span, old);
                 if flag(op, "wholeWord") {
-                    hits.retain(|(start, end)| (*start == 0 || !is_word_unit(&units, *start - 1)) && (*end >= units.len() || !is_word_unit(&units, *end)));
+                    hits.retain(|(start, end)| {
+                        (*start == 0 || !is_word_unit(&units, *start - 1))
+                            && (*end >= units.len() || !is_word_unit(&units, *end))
+                    });
                 }
                 if hits.is_empty() {
                     reject!("old_text_not_found", old.chars().take(80).collect());
@@ -805,7 +944,11 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                             "{} occurrences of \"{}\" in {}",
                             hits.len(),
                             old.chars().take(60).collect::<String>(),
-                            if target_name.is_empty() { "document" } else { target_name }
+                            if target_name.is_empty() {
+                                "document"
+                            } else {
+                                target_name
+                            }
                         ),
                     );
                 }
@@ -826,7 +969,8 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                 }
             }
             "insert_text" => {
-                let (Some(anchor), Some(value)) = (field(op, "anchorText"), field(op, "newText")) else {
+                let (Some(anchor), Some(value)) = (field(op, "anchorText"), field(op, "newText"))
+                else {
                     reject!("anchor_not_found", "missing anchor or text".to_owned());
                 };
                 if js_trim(anchor).is_empty() {
@@ -839,7 +983,11 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                 if hits.len() > 1 && !flag(op, "everyOccurrence") && !flag(op, "anchorLast") {
                     reject!(
                         "anchor_ambiguous",
-                        format!("{} occurrences of \"{}\"", hits.len(), anchor.chars().take(60).collect::<String>()),
+                        format!(
+                            "{} occurrences of \"{}\"",
+                            hits.len(),
+                            anchor.chars().take(60).collect::<String>()
+                        ),
                     );
                 }
                 let chosen = if flag(op, "everyOccurrence") {
@@ -849,7 +997,10 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                 } else {
                     &hits[..1]
                 };
-                let glue = if matches!(anchor, "." | "," | ";") || value.starts_with(' ') || value.starts_with('\n') {
+                let glue = if matches!(anchor, "." | "," | ";")
+                    || value.starts_with(' ')
+                    || value.starts_with('\n')
+                {
                     ""
                 } else {
                     " "
@@ -860,7 +1011,11 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                         op,
                         if before { start } else { end },
                         if before { start } else { end },
-                        if before { format!("{value}{glue}") } else { format!("{glue}{value}") },
+                        if before {
+                            format!("{value}{glue}")
+                        } else {
+                            format!("{glue}{value}")
+                        },
                     );
                 }
             }
@@ -870,20 +1025,30 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
             },
             "strike_provision" | "repeal_provision" => {
                 if target.node.is_none() {
-                    failures.push(fail("target_not_found", "cannot repeal whole document".to_owned()));
+                    failures.push(fail(
+                        "target_not_found",
+                        "cannot repeal whole document".to_owned(),
+                    ));
                 } else {
                     push(op, target.span.0, target.span.1, String::new());
                 }
             }
             "add_at_end" => match field(op, "newText") {
-                Some(value) => push(op, target.span.1, target.span.1, format!("\n{}", ensure_block(value))),
+                Some(value) => push(
+                    op,
+                    target.span.1,
+                    target.span.1,
+                    format!("\n{}", ensure_block(value)),
+                ),
                 None => failures.push(fail("missing_new_text", target_name.to_owned())),
             },
             "append_text" => {
-                let Some(value) = field(op, "newText").filter(|value| !js_trim(value).is_empty()) else {
+                let Some(value) = field(op, "newText").filter(|value| !js_trim(value).is_empty())
+                else {
                     reject!("missing_new_text", target_name.to_owned());
                 };
-                let trimmed = utf16_slice_at(source, &coordinates, target.span.0, target.span.1).trim_end_matches(javascript_whitespace);
+                let trimmed = utf16_slice_at(source, &coordinates, target.span.0, target.span.1)
+                    .trim_end_matches(javascript_whitespace);
                 let terminal = trimmed.chars().next_back();
                 let at = target.span.0 + trimmed.encode_utf16().count();
                 match terminal {
@@ -893,7 +1058,10 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                         "unsupported_apply",
                         format!(
                             "append_text needs a \".\" or \";\" terminal, saw {}",
-                            serde_json::to_string(&terminal.map(|value| value.to_string()).unwrap_or_default()).unwrap()
+                            serde_json::to_string(
+                                &terminal.map(|value| value.to_string()).unwrap_or_default()
+                            )
+                            .unwrap()
                         ),
                     )),
                 }
@@ -903,7 +1071,10 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
                     reject!("missing_new_text", target_name.to_owned());
                 };
                 let child_name = field(op, "afterChild");
-                let child = child_name.and_then(|label| resolve_target(&before.source_doc, label, length).filter(|target| target.node.is_some()));
+                let child = child_name.and_then(|label| {
+                    resolve_target(&before.source_doc, label, length)
+                        .filter(|target| target.node.is_some())
+                });
                 if child_name.is_some() && child.is_none() {
                     reject!("target_not_found", child_name.unwrap().to_owned());
                 }
@@ -918,23 +1089,45 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
             }
             "redesignate" => {
                 let Some(label) = field(op, "newLabel").filter(|_| target.node.is_some()) else {
-                    reject!("unsupported_apply", "redesignation needs a labelled node".to_owned(),);
+                    reject!(
+                        "unsupported_apply",
+                        "redesignation needs a labelled node".to_owned(),
+                    );
                 };
                 let lead_end = (target.span.0 + 40).min(target.span.1);
                 let lead = utf16_slice_at(source, &coordinates, target.span.0, lead_end);
-                let Some(token) = cached!(LEAD_TOKEN, r"^(\s*)(\([^\s()]{1,12}\)|\d+[A-Za-z]?(?:\.\d+)*\.?)", "").captures(lead) else {
-                    reject!("unsupported_apply", "no leading label token found".to_owned(),);
+                let Some(token) = cached!(
+                    LEAD_TOKEN,
+                    r"^(\s*)(\([^\s()]{1,12}\)|\d+[A-Za-z]?(?:\.\d+)*\.?)",
+                    ""
+                )
+                .captures(lead) else {
+                    reject!(
+                        "unsupported_apply",
+                        "no leading label token found".to_owned(),
+                    );
                 };
                 let start = target.span.0 + token[1].encode_utf16().count();
-                push(op, start, start + token[2].encode_utf16().count(), label.to_owned());
+                push(
+                    op,
+                    start,
+                    start + token[2].encode_utf16().count(),
+                    label.to_owned(),
+                );
             }
-            _ => failures.push(fail("unsupported_apply", "unsupported amendment operation".to_owned())),
+            _ => failures.push(fail(
+                "unsupported_apply",
+                "unsupported amendment operation".to_owned(),
+            )),
         }
     }
     splices.sort_by_key(|splice| (splice.start, splice.end));
     let mut accepted = Vec::<Splice>::new();
     for splice in splices {
-        if let Some(previous) = accepted.last().filter(|previous| splice.start < previous.end) {
+        if let Some(previous) = accepted
+            .last()
+            .filter(|previous| splice.start < previous.end)
+        {
             failures.push(json!({
                 "op": splice.receipt["op"].clone(), "code": "overlapping_ops",
                 "detail": format!("overlaps op at {}-{}", previous.start, previous.end)
@@ -945,8 +1138,12 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
     }
     let mut text = source.to_owned();
     for splice in accepted.iter().rev() {
-        let start = coordinates.byte_at_utf16(splice.start).expect("splice start boundary");
-        let end = coordinates.byte_at_utf16(splice.end).expect("splice end boundary");
+        let start = coordinates
+            .byte_at_utf16(splice.start)
+            .expect("splice start boundary");
+        let end = coordinates
+            .byte_at_utf16(splice.end)
+            .expect("splice end boundary");
         text.replace_range(start..end, &splice.replacement);
     }
     let after_owned;
@@ -970,16 +1167,37 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
     for splice in &accepted {
         let op = &splice.receipt["op"];
         if has_text(field(op, "newText")) {
-            if find_in_span(&text, &after_coordinates, (0, after_length), field(op, "newText").unwrap()).is_empty() {
+            if find_in_span(
+                &text,
+                &after_coordinates,
+                (0, after_length),
+                field(op, "newText").unwrap(),
+            )
+            .is_empty()
+            {
                 missing += 1;
             } else {
                 present += 1;
             }
         }
-        if matches!(field(op, "kind"), Some("strike_text" | "substitute_text")) && has_text(field(op, "oldText")) {
-            let lingering = resolve_target(&after.source_doc, field(op, "target").unwrap_or(""), after_length)
-                .map(|target| find_in_span(&text, &after_coordinates, target.span, field(op, "oldText").unwrap()).len())
-                .unwrap_or(0);
+        if matches!(field(op, "kind"), Some("strike_text" | "substitute_text"))
+            && has_text(field(op, "oldText"))
+        {
+            let lingering = resolve_target(
+                &after.source_doc,
+                field(op, "target").unwrap_or(""),
+                after_length,
+            )
+            .map(|target| {
+                find_in_span(
+                    &text,
+                    &after_coordinates,
+                    target.span,
+                    field(op, "oldText").unwrap(),
+                )
+                .len()
+            })
+            .unwrap_or(0);
             if lingering == 0 {
                 gone += 1;
             } else {
@@ -996,7 +1214,11 @@ pub fn apply_amend_ops(source: &str, ops: Vec<Value>, reconstruct_lineation: boo
     }))
 }
 
-pub fn consolidate_amendment(source: &str, amendment: &str, reconstruct_lineation: bool) -> Result<Value, crate::EngineError> {
+pub fn consolidate_amendment(
+    source: &str,
+    amendment: &str,
+    reconstruct_lineation: bool,
+) -> Result<Value, crate::EngineError> {
     let parse = parse_amendment_instructions(amendment);
     let ops = parse["ops"].as_array().cloned().unwrap_or_default();
     let mut result = apply_amend_ops(source, ops, reconstruct_lineation)?;
@@ -1022,12 +1244,15 @@ fn numbering_parent(label: &str) -> String {
     if body.ends_with(')') {
         return format!("sec{}", &body[..body.rfind('(').unwrap_or(0)]);
     }
-    body.rfind('.').map_or_else(String::new, |at| format!("sec{}", &body[..at]))
+    body.rfind('.')
+        .map_or_else(String::new, |at| format!("sec{}", &body[..at]))
 }
 
 fn at_or_below(label: &str, root: &str) -> bool {
     let label = occurrence_base(label);
-    label == root || label.starts_with(&format!("{root}(")) || label.starts_with(&format!("{root}."))
+    label == root
+        || label.starts_with(&format!("{root}("))
+        || label.starts_with(&format!("{root}."))
 }
 
 fn numbering_family(label: &str, family: &str) -> bool {
@@ -1050,13 +1275,20 @@ fn closes_one_step(from: &str, to: &str) -> bool {
         ]
     });
     for pattern in patterns {
-        let (Some(next), Some(previous)) = (pattern.captures(occurrence_base(from)), pattern.captures(occurrence_base(to))) else {
+        let (Some(next), Some(previous)) = (
+            pattern.captures(occurrence_base(from)),
+            pattern.captures(occurrence_base(to)),
+        ) else {
             continue;
         };
         if next[1] != previous[1] {
             continue;
         }
-        let ordinal = |value: &str| value.parse::<u32>().unwrap_or_else(|_| value.chars().next().unwrap() as u32);
+        let ordinal = |value: &str| {
+            value
+                .parse::<u32>()
+                .unwrap_or_else(|_| value.chars().next().unwrap() as u32)
+        };
         return ordinal(&next[2]) == ordinal(&previous[2]) + 1;
     }
     false
@@ -1078,14 +1310,26 @@ fn mapped_locator(locator: &str, mapping: &[Move]) -> Option<String> {
         .map(|item| format!("{}{}", item.to, &locator[item.from.len()..]))
 }
 
-fn leading_label_span(source: &str, coordinates: &ScalarText<'_>, node: &StructureNode) -> Option<(usize, usize, String)> {
+fn leading_label_span(
+    source: &str,
+    coordinates: &ScalarText<'_>,
+    node: &StructureNode,
+) -> Option<(usize, usize, String)> {
     let range = node.marker_range?;
     let marker = utf16_slice_at(source, coordinates, range.start, range.end);
-    let found = cached!(LEADING_LABEL, r"(\([^\s()]{1,12}\)|\d+[A-Za-z]?(?:[.-]\d+[A-Za-z]?)*\.?)\s*$", "")
-        .captures(marker)?
-        .get(1)?;
+    let found = cached!(
+        LEADING_LABEL,
+        r"(\([^\s()]{1,12}\)|\d+[A-Za-z]?(?:[.-]\d+[A-Za-z]?)*\.?)\s*$",
+        ""
+    )
+    .captures(marker)?
+    .get(1)?;
     let start = range.start + marker[..found.start()].encode_utf16().count();
-    Some((start, start + found.as_str().encode_utf16().count(), found.as_str().to_owned()))
+    Some((
+        start,
+        start + found.as_str().encode_utf16().count(),
+        found.as_str().to_owned(),
+    ))
 }
 
 fn heading_token(label: &str, old: &str) -> String {
@@ -1105,7 +1349,11 @@ fn reference_text(raw: &str, raw_label: &str, locator: &str) -> String {
     let full = locator.strip_prefix("sec").unwrap_or(locator);
     let label = if raw_label.starts_with('(') {
         let depth = raw_label.matches('(').count();
-        let subs = Regex::new(r"\([^()]+\)").unwrap().find_iter(full).map(|item| item.as_str()).collect::<Vec<_>>();
+        let subs = Regex::new(r"\([^()]+\)")
+            .unwrap()
+            .find_iter(full)
+            .map(|item| item.as_str())
+            .collect::<Vec<_>>();
         subs[subs.len().saturating_sub(depth)..].join("")
     } else {
         full.to_owned()
@@ -1113,10 +1361,10 @@ fn reference_text(raw: &str, raw_label: &str, locator: &str) -> String {
     if label == raw_label {
         return raw.to_owned();
     }
-    Regex::new(r"[\d(]")
-        .unwrap()
-        .find(raw)
-        .map_or_else(|| raw.to_owned(), |at| format!("{}{}", &raw[..at.start()], label))
+    Regex::new(r"[\d(]").unwrap().find(raw).map_or_else(
+        || raw.to_owned(),
+        |at| format!("{}{}", &raw[..at.start()], label),
+    )
 }
 
 fn delete_failure(code: &str, detail: String, range: Option<(usize, usize)>) -> Value {
@@ -1141,15 +1389,29 @@ fn delete_failed(source: &str, mapping: &[Move], failures: Vec<Value>) -> Value 
     })
 }
 
-fn delete_error(source: &str, mapping: &[Move], code: &str, detail: String, range: Option<(usize, usize)>) -> Value {
+fn delete_error(
+    source: &str,
+    mapping: &[Move],
+    code: &str,
+    detail: String,
+    range: Option<(usize, usize)>,
+) -> Value {
     delete_failed(source, mapping, vec![delete_failure(code, detail, range)])
 }
 
 fn serialized_name(value: impl Serialize) -> String {
-    serde_json::to_value(value).unwrap().as_str().unwrap().to_owned()
+    serde_json::to_value(value)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
-pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, reconstruct_lineation: bool) -> Result<Value, crate::EngineError> {
+pub fn delete_provision_and_renumber_siblings(
+    source: &str,
+    target: &str,
+    reconstruct_lineation: bool,
+) -> Result<Value, crate::EngineError> {
     let before = analyze(source, reconstruct_lineation)?;
     let coordinates = ScalarText::new(source);
     let requested = if target.to_lowercase().starts_with("sec") {
@@ -1162,11 +1424,21 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.label.as_deref().is_some_and(|label| occurrence_base(label).to_lowercase() == requested))
+        .filter(|(_, node)| {
+            node.label
+                .as_deref()
+                .is_some_and(|label| occurrence_base(label).to_lowercase() == requested)
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if requested.is_empty() || matches.is_empty() {
-        return Ok(delete_error(source, &[], "target_not_found", target.to_owned(), None));
+        return Ok(delete_error(
+            source,
+            &[],
+            "target_not_found",
+            target.to_owned(),
+            None,
+        ));
     }
     if matches.len() > 1 {
         return Ok(delete_error(
@@ -1179,12 +1451,18 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
     }
     let selected = &before.structure.nodes[matches[0]];
     let selected_label = selected.label.as_deref().unwrap();
-    if !matches!(selected.locator_kind.as_deref(), Some("section" | "subsection")) {
+    if !matches!(
+        selected.locator_kind.as_deref(),
+        Some("section" | "subsection")
+    ) {
         return Ok(delete_error(
             source,
             &[],
             "unsupported_target",
-            format!("{selected_label} is a {} locator", selected.locator_kind.as_deref().unwrap_or("non-provision")),
+            format!(
+                "{selected_label} is a {} locator",
+                selected.locator_kind.as_deref().unwrap_or("non-provision")
+            ),
             None,
         ));
     }
@@ -1197,7 +1475,10 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
         .filter(|(_, node)| {
             node.locator_kind == selected.locator_kind
                 && node.parent_id == selected.parent_id
-                && node.label.as_deref().is_some_and(|label| numbering_parent(label) == family)
+                && node
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| numbering_parent(label) == family)
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -1215,7 +1496,10 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
             None,
         ));
     }
-    let selected_at = siblings.iter().position(|index| *index == matches[0]).unwrap();
+    let selected_at = siblings
+        .iter()
+        .position(|index| *index == matches[0])
+        .unwrap();
     let following = &siblings[selected_at + 1..];
     let mapping = following
         .iter()
@@ -1225,12 +1509,18 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
             to: if index == 0 {
                 selected_label.to_owned()
             } else {
-                before.structure.nodes[following[index - 1]].label.clone().unwrap()
+                before.structure.nodes[following[index - 1]]
+                    .label
+                    .clone()
+                    .unwrap()
             },
             node: *node,
         })
         .collect::<Vec<_>>();
-    if let Some(step) = mapping.iter().find(|step| !closes_one_step(&step.from, &step.to)) {
+    if let Some(step) = mapping
+        .iter()
+        .find(|step| !closes_one_step(&step.from, &step.to))
+    {
         return Ok(delete_error(
             source,
             &mapping,
@@ -1277,7 +1567,13 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
             }),
         });
     }
-    for edge in before.structure.cross_references.as_ref().into_iter().flat_map(|graph| &graph.edges) {
+    for edge in before
+        .structure
+        .cross_references
+        .as_ref()
+        .into_iter()
+        .flat_map(|graph| &graph.edges)
+    {
         if edge.source_start >= selected.range.start && edge.source_end <= selected.range.end {
             continue;
         }
@@ -1295,12 +1591,21 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
             };
             failures.push(delete_failure(
                 code,
-                format!("{}: {}", edge.raw, edge.reason.map_or_else(|| serialized_name(edge.status), serialized_name)),
+                format!(
+                    "{}: {}",
+                    edge.raw,
+                    edge.reason
+                        .map_or_else(|| serialized_name(edge.status), serialized_name)
+                ),
                 Some((edge.source_start, edge.source_end)),
             ));
             continue;
         }
-        if edge.target_label.as_deref().is_some_and(|label| at_or_below(label, selected_label)) {
+        if edge
+            .target_label
+            .as_deref()
+            .is_some_and(|label| at_or_below(label, selected_label))
+        {
             failures.push(delete_failure(
                 "reference_to_deleted_target",
                 format!("{} points to {selected_label}", edge.raw),
@@ -1311,7 +1616,10 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
         let Some(moved) = mapped_locator(locator, &mapping) else {
             continue;
         };
-        if heading_spans.iter().any(|(start, end)| edge.source_start < *end && edge.source_end > *start) {
+        if heading_spans
+            .iter()
+            .any(|(start, end)| edge.source_start < *end && edge.source_end > *start)
+        {
             continue;
         }
         let inserted = reference_text(&edge.raw, &edge.raw_label, &moved);
@@ -1340,7 +1648,10 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
                 &mapping,
                 vec![delete_failure(
                     "overlapping_ops",
-                    format!("{}-{} overlaps {}-{}", pair[1].start, pair[1].end, pair[0].start, pair[0].end),
+                    format!(
+                        "{}-{} overlaps {}-{}",
+                        pair[1].start, pair[1].end, pair[0].start, pair[0].end
+                    ),
                     None,
                 )],
             ));
@@ -1354,11 +1665,18 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
     }
     let after = analyze(&text, reconstruct_lineation)?;
     let mut counts = HashMap::<String, usize>::new();
-    for label in after.structure.nodes.iter().filter_map(|node| node.label.as_deref()) {
+    for label in after
+        .structure
+        .nodes
+        .iter()
+        .filter_map(|node| node.label.as_deref())
+    {
         *counts.entry(occurrence_base(label).to_owned()).or_default() += 1;
     }
     let vacated = mapping.last().map_or(selected_label, |step| &step.from);
-    if mapping.iter().any(|step| counts.get(&step.to) != Some(&1)) || counts.get(vacated).copied().unwrap_or(0) != 0 {
+    if mapping.iter().any(|step| counts.get(&step.to) != Some(&1))
+        || counts.get(vacated).copied().unwrap_or(0) != 0
+    {
         return Ok(delete_failed(
             source,
             &mapping,
@@ -1369,8 +1687,14 @@ pub fn delete_provision_and_renumber_siblings(source: &str, target: &str, recons
             )],
         ));
     }
-    let headings = splices.iter().filter(|splice| splice.receipt["kind"] == "renumber_heading").count();
-    let references = splices.iter().filter(|splice| splice.receipt["kind"] == "update_cross_reference").count();
+    let headings = splices
+        .iter()
+        .filter(|splice| splice.receipt["kind"] == "renumber_heading")
+        .count();
+    let references = splices
+        .iter()
+        .filter(|splice| splice.receipt["kind"] == "update_cross_reference")
+        .count();
     Ok(json!({
         "text": text,
         "mapping": mapping,

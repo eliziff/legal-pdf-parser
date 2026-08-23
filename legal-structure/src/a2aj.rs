@@ -7,7 +7,7 @@ use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const ORIGIN: &str = "provider-adapter";
@@ -88,7 +88,7 @@ fn dotted_order(source: &[(usize, &str, &str)]) -> Option<bool> {
 }
 
 fn validate_section_map(map: &A2ajSectionMap) -> Result<(), EngineError> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     if map.iter().any(|(key, _)| !seen.insert(key)) {
         return Err(EngineError::source("duplicate A2AJ section-map key"));
     }
@@ -384,6 +384,12 @@ fn apply_provider_section_evidence(
     for (label, _) in map {
         *counts.entry(label.trim().to_lowercase()).or_insert(0) += 1;
     }
+    let native_top_sections = native_claims
+        .iter()
+        .filter(|claim| claim.kind == EvidenceKind::Section && claim.parent_label.is_none())
+        .flat_map(|claim| claim.label.iter().chain(&claim.aliases))
+        .map(|label| label.to_lowercase())
+        .collect::<HashSet<_>>();
     for (label, provider_text) in map {
         let label = label.trim();
         if label.is_empty()
@@ -442,15 +448,7 @@ fn apply_provider_section_evidence(
             });
         let provider_label = format!("sec{label}");
         let key = provider_label.to_lowercase();
-        if native_claims.iter().any(|claim| {
-            claim.kind == EvidenceKind::Section
-                && claim.parent_label.is_none()
-                && claim
-                    .label
-                    .iter()
-                    .chain(&claim.aliases)
-                    .any(|label| label.to_lowercase() == key)
-        }) {
+        if native_top_sections.contains(&key) {
             continue;
         }
         let candidates = top_sections.get(&key).map(Vec::as_slice).unwrap_or(&[]);
@@ -493,7 +491,7 @@ fn apply_provider_section_evidence(
             blocks.push(block);
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     blocks.retain(|block| seen.insert((block.label.clone(), block.range)));
     blocks.sort_by_key(|block| (block.range.start, block.parent_label.is_some()));
 }

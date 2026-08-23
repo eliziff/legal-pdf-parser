@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -1055,6 +1055,7 @@ struct XmlElement {
     local: String,
     attributes: Vec<XmlAttribute>,
     children: Vec<XmlNode>,
+    self_closing: bool,
 }
 
 #[derive(Clone)]
@@ -1090,6 +1091,7 @@ fn parse_element(
     reader: &NsReader<&[u8]>,
     start: &BytesStart<'_>,
     namespace: Option<String>,
+    self_closing: bool,
 ) -> Result<XmlElement> {
     let qname = std::str::from_utf8(start.name().as_ref())
         .map_err(|error| Error::Message(format!("XML name is not UTF-8: {error}")))?
@@ -1120,6 +1122,7 @@ fn parse_element(
         local,
         attributes,
         children: Vec::new(),
+        self_closing,
     })
 }
 
@@ -1134,11 +1137,11 @@ fn parse_xml(raw: &[u8]) -> Result<XmlDocument> {
         match event {
             Event::Start(start) => {
                 let namespace = namespace_value(reader.resolver().resolve_element(start.name()).0);
-                stack.push(parse_element(&reader, &start, namespace)?);
+                stack.push(parse_element(&reader, &start, namespace, false)?);
             }
             Event::Empty(start) => {
                 let namespace = namespace_value(reader.resolver().resolve_element(start.name()).0);
-                let node = XmlNode::Element(parse_element(&reader, &start, namespace)?);
+                let node = XmlNode::Element(parse_element(&reader, &start, namespace, true)?);
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(node);
                 } else {
@@ -1381,6 +1384,254 @@ fn paragraph_style(paragraph: &XmlElement) -> String {
         .and_then(|element| element.attribute(None, "val"))
         .unwrap_or_default()
         .to_owned()
+}
+
+fn docx_paragraph_text(element: &XmlElement, output: &mut String) -> Result<()> {
+    if element.is(W_NS, "del") {
+        return Ok(());
+    }
+    if element.is(W_NS, "t") {
+        output.push_str(&element_text(element)?);
+        return Ok(());
+    }
+    for child in element.direct_elements() {
+        docx_paragraph_text(child, output)?;
+    }
+    Ok(())
+}
+
+fn normalize_docx_text(text: &str) -> String {
+    let text = text
+        .replace(['\u{201c}', '\u{201d}'], "\"")
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{00a0}', '\u{2007}', '\u{202f}'], " ");
+    legal_structure::normalize_javascript_whitespace(&text)
+}
+
+fn normalized_docx_paragraph(paragraph: &XmlElement) -> Result<String> {
+    let mut text = String::new();
+    docx_paragraph_text(paragraph, &mut text)?;
+    Ok(normalize_docx_text(&text))
+}
+
+fn tolerant_docx_paragraphs(xml: &str) -> Result<Vec<String>> {
+    let paragraphs = Regex::new(r"(?s)<w:p\b[^>]*>.*?</w:p>").expect("literal DOCX regex");
+    let deletions = Regex::new(r"(?s)<w:del\b[^>]*>.*?</w:del>").expect("literal DOCX regex");
+    let text = Regex::new(r"(?s)<w:t\b[^>]*>(.*?)</w:t>").expect("literal DOCX regex");
+    paragraphs
+        .find_iter(xml)
+        .map(|paragraph| {
+            let accepted = deletions.replace_all(paragraph.as_str(), "");
+            let mut value = String::new();
+            for captures in text.captures_iter(&accepted) {
+                value.push_str(
+                    &quick_xml::escape::unescape(captures.get(1).unwrap().as_str())
+                        .map_err(|error| Error::Message(error.to_string()))?,
+                );
+            }
+            Ok(normalize_docx_text(&value))
+        })
+        .collect()
+}
+
+fn nested_word_elements<'a>(element: &'a XmlElement, wanted: &str) -> Vec<&'a XmlElement> {
+    let mut found = Vec::new();
+    for child in element.direct_elements() {
+        if child.is(W_NS, wanted) {
+            found.push(child);
+        } else if child.is(W_NS, "sdt") || child.is(W_NS, "sdtContent") {
+            found.extend(nested_word_elements(child, wanted));
+        }
+    }
+    found
+}
+
+fn paragraphs_under<'a>(
+    element: &'a XmlElement,
+    indexed: &HashMap<*const XmlElement, (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut pending = vec![element];
+    while let Some(current) = pending.pop() {
+        if let Some(index) = indexed.get(&(current as *const XmlElement)) {
+            found.push(*index);
+        } else {
+            let children = current.direct_elements().collect::<Vec<_>>();
+            pending.extend(children.into_iter().rev());
+        }
+    }
+    found
+}
+
+fn positive_word_int(element: Option<&XmlElement>, name: &str) -> usize {
+    element
+        .and_then(|element| element.direct_elements().find(|child| child.is(W_NS, name)))
+        .and_then(|element| element.attribute(None, "val"))
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
+    const MAX_DOCX_BYTES: usize = 50 * 1024 * 1024;
+    const MAX_XML_BYTES: u64 = 32 * 1024 * 1024;
+    if bytes.is_empty() || bytes.len() > MAX_DOCX_BYTES {
+        return Err(Error::Message(
+            "DOCX is empty or exceeds the read limit".to_owned(),
+        ));
+    }
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    if archive.len() > 10_000 {
+        return Err(Error::Message(
+            "DOCX has too many package entries".to_owned(),
+        ));
+    }
+    let mut document = archive
+        .by_name("word/document.xml")
+        .map_err(|_| Error::Message("DOCX has no word/document.xml".to_owned()))?;
+    if document.size() > MAX_XML_BYTES {
+        return Err(Error::Message(
+            "DOCX document XML exceeds the read limit".to_owned(),
+        ));
+    }
+    let mut xml = Vec::with_capacity(document.size() as usize);
+    document
+        .read_to_end(&mut xml)
+        .map_err(|source| Error::io("word/document.xml", source))?;
+    Ok(xml)
+}
+
+/// Parse the accepted DOCX text and authoritative table coordinates once, then
+/// feed the canonical Rust detector directly.
+pub fn analyze_docx_bytes(
+    bytes: &[u8],
+    document_id: String,
+) -> Result<(
+    legal_structure::DocumentStructure,
+    Vec<legal_structure::AuthoritativeTableCell>,
+)> {
+    let xml = docx_document_xml(bytes)?;
+    let document = match parse_xml(&xml) {
+        Ok(document) => document,
+        Err(_) => {
+            let xml = std::str::from_utf8(&xml)
+                .map_err(|error| Error::Message(format!("DOCX XML is not UTF-8: {error}")))?;
+            let paragraphs = tolerant_docx_paragraphs(xml)?;
+            let structure = legal_structure::analyze_docx(document_id, paragraphs, &[])
+                .map_err(|error| Error::Message(error.to_string()))?;
+            return Ok((structure, Vec::new()));
+        }
+    };
+    let root = document.root()?;
+    let body = root
+        .direct_elements()
+        .find(|element| element.is(W_NS, "body"))
+        .ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
+
+    let mut all = Vec::new();
+    walk_elements(root, &mut all);
+    let canonical_elements = all
+        .iter()
+        .copied()
+        .filter(|element| element.is(W_NS, "p") && !element.self_closing)
+        .collect::<Vec<_>>();
+    let paragraphs = canonical_elements
+        .iter()
+        .map(|paragraph| normalized_docx_paragraph(paragraph))
+        .collect::<Result<Vec<_>>>()?;
+    let mut starts = Vec::with_capacity(paragraphs.len());
+    let mut text_length = 0;
+    for (index, paragraph) in paragraphs.iter().enumerate() {
+        text_length += usize::from(index > 0);
+        starts.push(text_length);
+        text_length += legal_structure::utf16_len(paragraph);
+    }
+
+    let mut by_element = canonical_elements
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| {
+            let start = starts[index];
+            (
+                *paragraph as *const XmlElement,
+                (
+                    start,
+                    start + legal_structure::utf16_len(&paragraphs[index]),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut entry_paragraph = HashMap::new();
+    let mut preceding = 0;
+    for element in &all {
+        entry_paragraph.insert(*element as *const XmlElement, preceding);
+        if element.is(W_NS, "p") {
+            if element.self_closing {
+                let offset = starts.get(preceding).copied().unwrap_or(text_length);
+                by_element.insert(*element as *const XmlElement, (offset, offset));
+            } else {
+                preceding += 1;
+            }
+        }
+    }
+
+    let mut table_cells = Vec::new();
+    for (table_index, table) in nested_word_elements(body, "tbl").into_iter().enumerate() {
+        for (row_index, row) in nested_word_elements(table, "tr").into_iter().enumerate() {
+            let row_properties = row
+                .direct_elements()
+                .find(|element| element.is(W_NS, "trPr"));
+            let mut column = positive_word_int(row_properties, "gridBefore");
+            for cell in nested_word_elements(row, "tc") {
+                let cell_properties = cell
+                    .direct_elements()
+                    .find(|element| element.is(W_NS, "tcPr"));
+                let column_span = positive_word_int(cell_properties, "gridSpan");
+                let merged = cell_properties.is_some_and(|properties| {
+                    ["vMerge", "hMerge"].into_iter().any(|name| {
+                        properties
+                            .direct_elements()
+                            .find(|element| element.is(W_NS, name))
+                            .is_some_and(|element| {
+                                !element
+                                    .attribute(None, "val")
+                                    .unwrap_or_default()
+                                    .eq_ignore_ascii_case("restart")
+                            })
+                    })
+                });
+                if !merged {
+                    let contents = paragraphs_under(cell, &by_element);
+                    let empty_at = || {
+                        let preceding = entry_paragraph
+                            .get(&(cell as *const XmlElement))
+                            .copied()
+                            .unwrap_or(paragraphs.len());
+                        preceding.checked_sub(1).map_or(0, |index| {
+                            starts[index] + legal_structure::utf16_len(&paragraphs[index])
+                        })
+                    };
+                    let start = contents.first().map_or_else(empty_at, |(start, _)| *start);
+                    let end = contents.last().map_or_else(empty_at, |(_, end)| *end);
+                    table_cells.push(legal_structure::AuthoritativeTableCell {
+                        table: table_index + 1,
+                        table_name: None,
+                        row: row_index + 1,
+                        column,
+                        row_span: None,
+                        column_span: Some(column_span),
+                        address: None,
+                        start,
+                        end,
+                    });
+                }
+                column += column_span;
+            }
+        }
+    }
+    let structure = legal_structure::analyze_docx(document_id, paragraphs, &table_cells)
+        .map_err(|error| Error::Message(error.to_string()))?;
+    Ok((structure, table_cells))
 }
 
 fn marker_re() -> &'static Regex {
@@ -1706,6 +1957,7 @@ fn new_element(qname: &str, namespace: &str, local: &str) -> XmlElement {
         local: local.to_owned(),
         attributes: Vec::new(),
         children: Vec::new(),
+        self_closing: true,
     }
 }
 

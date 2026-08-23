@@ -730,6 +730,7 @@ dependencies = [
  "fancy-regex",
  "legal-grammar-tables",
  "legal-pdf-core",
+ "legal-structure",
  "quick-xml",
  "regex",
  "serde",
@@ -815,6 +816,7 @@ dependencies = [
 name = "legal-structure"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "legal-grammar-tables",
  "regex",
  "serde",

@@ -1,7 +1,11 @@
 use crate::{text::ScalarText, ScalarRange};
+use aho_corasick::AhoCorasick;
 use regex::Regex as R;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DefinitionOccurrence {
@@ -53,6 +57,14 @@ fn bounded(text: &str, start: usize, end: usize) -> bool {
 
 pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> DefinitionsResult {
     let document = ScalarText::new(text);
+    derive_definitions_indexed(&document, paragraphs)
+}
+
+pub(crate) fn derive_definitions_indexed(
+    document: &ScalarText<'_>,
+    paragraphs: &[DefinitionParagraph],
+) -> DefinitionsResult {
+    let text = document.value;
     let slices = paragraphs
         .iter()
         .map(|p| {
@@ -62,6 +74,7 @@ pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> Def
         })
         .collect::<Vec<_>>();
     let mut terms = Vec::<(String, Vec<(usize, DefinitionOccurrence)>)>::new();
+    let mut term_indices = HashMap::<&str, usize>::new();
     for (paragraph_index, ((base, text), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
         let mut found = Vec::new();
         for content in PAREN.captures_iter(text).filter_map(|c| c.get(1)) {
@@ -83,43 +96,69 @@ pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> Def
         }
         let mut seen = HashSet::new();
         for (term, start, end) in found.into_iter().filter(|(term, _, _)| seen.insert(*term)) {
-            let hit = paragraph.at(&document, base + start, base + end);
-            if let Some((_, definitions)) = terms.iter_mut().find(|(known, _)| known == term) {
-                definitions.push((paragraph_index, hit));
+            let hit = paragraph.at(document, base + start, base + end);
+            if let Some(&term_index) = term_indices.get(term) {
+                terms[term_index].1.push((paragraph_index, hit));
             } else {
+                term_indices.insert(term, terms.len());
                 terms.push((term.to_owned(), vec![(paragraph_index, hit)]));
             }
         }
     }
-    let terms = terms
-        .into_iter()
-        .map(|(term, definitions)| {
-            let variants = [
+
+    let patterns = terms
+        .iter()
+        .flat_map(|(term, _)| {
+            [
                 term.clone(),
                 term.strip_suffix('s')
                     .map_or_else(|| format!("{term}s"), str::to_owned),
-            ];
-            let mut uses = Vec::new();
-            for (index, ((base, text), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
-                if definitions.iter().any(|(defined, _)| *defined == index) {
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let mut uses = vec![Vec::<(usize, usize, usize)>::new(); terms.len()];
+    if !patterns.is_empty() {
+        let matcher = AhoCorasick::new(&patterns).unwrap();
+        let mut pattern_ends = vec![0; patterns.len()];
+        for (paragraph_index, (_, text)) in slices.iter().enumerate() {
+            pattern_ends.fill(0);
+            for hit in matcher.find_overlapping_iter(text) {
+                let pattern_index = hit.pattern().as_usize();
+                if hit.start() < pattern_ends[pattern_index] {
                     continue;
                 }
-                let mut hits = variants
-                    .iter()
-                    .flat_map(|variant| text.match_indices(variant))
-                    .map(|(start, found)| (start, start + found.len()))
-                    .filter(|(start, end)| bounded(text, *start, *end))
-                    .collect::<Vec<_>>();
-                hits.sort_unstable();
-                uses.extend(
-                    hits.into_iter()
-                        .map(|(start, end)| paragraph.at(&document, base + start, base + end)),
-                );
+                pattern_ends[pattern_index] = hit.end();
+                if !bounded(text, hit.start(), hit.end()) {
+                    continue;
+                }
+                let term_index = pattern_index / 2;
+                if terms[term_index]
+                    .1
+                    .binary_search_by_key(&paragraph_index, |(defined, _)| *defined)
+                    .is_err()
+                {
+                    uses[term_index].push((paragraph_index, hit.start(), hit.end()));
+                }
             }
+        }
+    }
+
+    let terms = terms
+        .into_iter()
+        .zip(uses)
+        .map(|((term, definitions), mut uses)| {
+            uses.sort_unstable();
             DefinedTerm {
                 term,
                 definitions: definitions.into_iter().map(|(_, hit)| hit).collect(),
-                uses,
+                uses: uses
+                    .into_iter()
+                    .map(|(paragraph_index, start, end)| {
+                        let (base, _) = slices[paragraph_index];
+                        paragraphs[paragraph_index].at(document, base + start, base + end)
+                    })
+                    .collect(),
             }
         })
         .collect();

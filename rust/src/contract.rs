@@ -6,6 +6,7 @@ use crate::PPDocOptions;
 use crate::{source_doc, structure_lookup, Error, Result, SourceDoc};
 #[cfg(feature = "ocr")]
 use crate::{OcrOptions, TesseractOptions};
+use legal_structure::{InstrumentCrossReferenceGraph, NodeKind};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -13,7 +14,12 @@ const MAX_SELECTED_PAGES: usize = 1_000;
 
 pub struct PdfDocumentResult {
     document: crate::LegalDocument,
-    source_doc: Option<SourceDoc>,
+}
+
+impl PdfDocumentResult {
+    pub fn cross_references(&self) -> Option<&InstrumentCrossReferenceGraph> {
+        self.document.structure_graph.cross_references.as_ref()
+    }
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -235,27 +241,21 @@ fn validate_selected_pages(selected: Option<&[usize]>, count: usize) -> Result<(
 
 pub fn derive_pdf_document(
     value: &Value,
-    include_source_doc: bool,
     include_pairing_audit: bool,
-) -> Result<PdfDocumentResult> {
+) -> Result<(PdfDocumentResult, SourceDoc)> {
     let options = parse_options(value)?;
     let selected = options.ocr_pages.clone();
     let mut document = parse_pdf(string(value, "source_pdf")?, &options)?;
     validate_selected_pages(selected.as_deref(), document.page_count)?;
-    let source_doc = include_source_doc.then(|| {
-        source_doc(
-            &document,
-            value.get("id").and_then(Value::as_str),
-            value.get("url").and_then(Value::as_str),
-        )
-    });
+    let source_doc = source_doc(
+        &document,
+        value.get("id").and_then(Value::as_str),
+        value.get("url").and_then(Value::as_str),
+    );
     if !include_pairing_audit {
         document.pairing_audit = None;
     }
-    Ok(PdfDocumentResult {
-        document,
-        source_doc,
-    })
+    Ok((PdfDocumentResult { document }, source_doc))
 }
 
 pub fn query_pdf_document(document: &PdfDocumentResult, query: &Value) -> Result<Value> {
@@ -271,7 +271,6 @@ pub fn pdf_document_snapshot(document: &PdfDocumentResult) -> Value {
     json!({
         "structure": &document.document.structure_graph,
         "pdf_source_map": &document.document.pdf_source_map,
-        "source_doc": &document.source_doc,
         "pairing_audit": &document.document.pairing_audit,
         "source": {
             "sha256": &document.document.source_sha256,
@@ -281,6 +280,29 @@ pub fn pdf_document_snapshot(document: &PdfDocumentResult) -> Value {
             "status": &document.document.status,
             "pages_needing_ocr": pdf.get("pages_needing_ocr"),
             "ocr_routed_pages": pdf.get("ocr_routed_pages"),
+        },
+    })
+}
+
+pub fn pdf_document_summary(document: &PdfDocumentResult) -> Value {
+    let document = &document.document;
+    let pdf = document.metadata.get("pdf").unwrap_or(&Value::Null);
+    let nodes = &document.structure_graph.nodes;
+    json!({
+        "sha256": &document.source_sha256,
+        "parserVersion": &document.parser_version,
+        "cacheKey": document.provenance.get("deterministic_cache_key"),
+        "pageCount": document.page_count,
+        "projectionPageCount": document.pdf_source_map.pages.len(),
+        "status": &document.status,
+        "pagesNeedingOcr": pdf.get("pages_needing_ocr"),
+        "ocrRoutedPages": pdf.get("ocr_routed_pages"),
+        "counts": {
+            "paragraphs": nodes.iter().filter(|node| node.kind == NodeKind::Paragraph).count(),
+            "sections": nodes.iter().filter(|node| node.kind == NodeKind::Section).count(),
+            "footnotes": document.structure_graph.notes.len(),
+            "tables": document.pdf_source_map.table_ids.len(),
+            "images": document.pdf_source_map.image_ids.len(),
         },
     })
 }

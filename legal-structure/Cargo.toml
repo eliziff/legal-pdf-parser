@@ -12,6 +12,7 @@ a2aj = ["structure-inference", "source-doc"]
 journal = ["source-doc"]
 
 [dependencies]
+aho-corasick = "1.1"
 legal-grammar-tables = { path = "../legal-grammar-tables", optional = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
