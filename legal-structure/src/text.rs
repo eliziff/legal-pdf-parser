@@ -212,7 +212,11 @@ impl<'a> ScalarText<'a> {
 }
 
 pub fn utf16_len(value: &str) -> usize {
-    value.encode_utf16().count()
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    }
 }
 
 /// The code points matched by ECMAScript `\s`: Unicode WhiteSpace plus line
