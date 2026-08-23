@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "a2aj")]
 mod a2aj;
+mod definitions;
 mod instrument;
 #[cfg(feature = "journal")]
 mod journal;
@@ -19,10 +20,10 @@ mod numeric_sequence;
 mod sidecar;
 #[cfg(feature = "source-doc")]
 mod source_doc;
-#[cfg(any(test, feature = "structure-inference", feature = "source-doc"))]
 mod text;
 #[cfg(feature = "a2aj")]
 pub use a2aj::{a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind};
+pub use definitions::*;
 pub use instrument::*;
 #[cfg(feature = "journal")]
 pub use journal::{journal_source_doc, journal_text_source_doc, JournalPageLabel};
