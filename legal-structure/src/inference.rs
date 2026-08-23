@@ -2296,14 +2296,6 @@ enum InstrumentMarkerKind {
     Dot,
 }
 
-#[derive(Clone, Copy)]
-struct InstrumentLine<'a> {
-    line: Line<'a>,
-    value: &'a str,
-    start: usize,
-    marker: Option<(&'a str, usize, InstrumentMarkerKind)>,
-}
-
 fn any_instrument_marker(value: &str) -> Option<(&str, usize, InstrumentMarkerKind)> {
     if !value
         .as_bytes()
@@ -2382,19 +2374,6 @@ fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)
     })
 }
 
-fn instrument_lines<'a>(source: &'a [Line<'a>]) -> impl Iterator<Item = InstrumentLine<'a>> + 'a {
-    source.iter().copied().filter_map(|line| {
-        let trimmed = line.text.trim_start_matches(instrument_space);
-        let value = trimmed.trim_end_matches(instrument_space);
-        (!value.is_empty()).then(|| InstrumentLine {
-            line,
-            value,
-            start: line.scalar_start + line.text[..line.text.len() - trimmed.len()].chars().count(),
-            marker: any_instrument_marker(value),
-        })
-    })
-}
-
 fn instrument_space(character: char) -> bool {
     // Instrument grammar historically admits Rust whitespace, including U+0085;
     // it is therefore not the shared ECMAScript whitespace contract.
@@ -2448,7 +2427,7 @@ fn compare_child_values(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 fn admitted_dialects(source: &[Line<'_>]) -> (bool, bool) {
-    let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
+    let mut live: [[(String, usize); 5]; 2] = Default::default();
     let mut best = [0, 0];
     for line in source {
         let Some((token, _, kind)) =
@@ -2462,7 +2441,7 @@ fn admitted_dialects(source: &[Line<'_>]) -> (bool, bool) {
             InstrumentMarkerKind::Dot => 1,
         };
         for (family, value) in enum_readings(token).into_iter().flatten() {
-            let state = live[index].entry(family).or_default();
+            let state = &mut live[index][usize::from(family)];
             if value == "1" {
                 *state = (value, 1);
             } else if state.1 > 0 && compare_labels(&value, &state.0, true).is_gt() {
@@ -2507,12 +2486,16 @@ impl StructureState {
     }
 
     fn child(&mut self, token: &str, start: usize, content_start: usize) {
-        let (root, root_depth) = self.section.clone().unwrap();
-        let readings = enum_readings(token);
+        let (root, root_depth) = self.section.as_ref().unwrap();
+        let readings = enum_readings(token).map(|reading| {
+            reading.map(|(family, value)| {
+                let at = self.stack.iter().rposition(|frame| frame.family == family);
+                (family, value, at)
+            })
+        });
         let selected = (0..4).find_map(|pass| {
-            readings.iter().flatten().find_map(|(family, value)| {
-                let at = self.stack.iter().rposition(|frame| frame.family == *family);
-                match (pass, at) {
+            readings.iter().flatten().find_map(|(family, value, at)| {
+                match (pass, *at) {
                     (0, Some(index)) => {
                         let prior = &self.stack[index].value;
                         match (prior.parse::<u32>(), value.parse::<u32>()) {
@@ -2528,15 +2511,15 @@ impl StructureState {
                     (3, None) => self.stack.len() < 6,
                     _ => false,
                 }
-                .then(|| (pass, *family, value.clone(), at))
+                .then(|| (pass, *family, value.as_str(), *at))
             })
         });
-        let (pass, family, value, at) = selected.unwrap_or_else(|| (4, 0, String::new(), None));
+        let (pass, family, value, at) = selected.unwrap_or((4, 0, "", None));
         let (parent, depth) = if pass == 4 {
             (root.clone(), root_depth + 1)
         } else if let Some(index) = at {
             self.stack.truncate(index + 1);
-            self.stack[index].value = value.clone();
+            self.stack[index].value = value.to_owned();
             (
                 index
                     .checked_sub(1)
@@ -2551,12 +2534,12 @@ impl StructureState {
             let depth = root_depth + self.stack.len() + 1;
             self.stack.push(EnumFrame {
                 family,
-                value: value.clone(),
+                value: value.to_owned(),
                 label: String::new(),
             });
             (parent, depth)
         };
-        let code = match (pass, value.as_str()) {
+        let code = match (pass, value) {
             (0, _) => "instrument_ladder_increment",
             (1, _) => "instrument_ladder_level_open",
             (2, "1") => "instrument_ladder_restart",
@@ -2839,8 +2822,14 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
     let direct = spine.peek().is_none();
     let dialects = admitted_dialects(&lines);
     let mut state = StructureState::default();
-    for source in instrument_lines(&lines) {
-        let (line, value, start) = (source.line, source.value, source.start);
+    for line in lines.iter().copied() {
+        let trimmed = line.text.trim_start_matches(instrument_space);
+        let value = trimmed.trim_end_matches(instrument_space);
+        if value.is_empty() {
+            continue;
+        }
+        let start =
+            line.scalar_start + line.text[..line.text.len() - trimmed.len()].chars().count();
         let selected = spine
             .next_if(|mark| mark.start == start)
             .map(|mark| (format!("sec{}", mark.label), mark.content_start, false))
@@ -2886,13 +2875,16 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
             }
             continue;
         }
-        let marker = source.marker.and_then(|(token, at, kind)| match kind {
+        if state.section.is_none() {
+            continue;
+        }
+        let marker = any_instrument_marker(value).and_then(|(token, at, kind)| match kind {
             InstrumentMarkerKind::Parenthesized => Some((token, at)),
             InstrumentMarkerKind::Tail if dialects.0 => Some((token, at)),
             InstrumentMarkerKind::Dot if dialects.1 => Some((token, at)),
             _ => None,
         });
-        if let (Some((token, at)), Some(_)) = (marker, state.section.as_ref()) {
+        if let Some((token, at)) = marker {
             state.child(token, start, start + value[..at].chars().count());
         }
     }
