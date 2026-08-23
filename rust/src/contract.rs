@@ -3,7 +3,7 @@ use crate::engine::{parse_pdf, ParseOptions};
 use crate::KrakenOptions;
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use crate::PPDocOptions;
-use crate::{source_doc, structure_lookup, Error, Result};
+use crate::{source_doc, structure_lookup, Error, Result, SourceDoc};
 #[cfg(feature = "ocr")]
 use crate::{OcrOptions, TesseractOptions};
 use serde_json::{json, Value};
@@ -11,10 +11,9 @@ use std::path::PathBuf;
 
 const MAX_SELECTED_PAGES: usize = 1_000;
 
-#[derive(Debug)]
 pub struct PdfDocumentResult {
     document: crate::LegalDocument,
-    source_doc: Option<Value>,
+    source_doc: Option<SourceDoc>,
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -248,8 +247,7 @@ pub fn derive_pdf_document(
             &document,
             value.get("id").and_then(Value::as_str),
             value.get("url").and_then(Value::as_str),
-        )["source_doc"]
-            .clone()
+        )
     });
     if !include_pairing_audit {
         document.pairing_audit = None;

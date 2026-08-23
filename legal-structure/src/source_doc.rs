@@ -1,6 +1,7 @@
 use crate::{public_structure_label, DocumentStructure, NodeKind};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const MAX_MISSING: usize = 64;
@@ -249,6 +250,44 @@ pub struct SourceDoc {
     pub blocks: Vec<SourceDocBlock>,
     pub index: SourceDocIndex,
     pub ranges: SourceDocRanges,
+}
+
+impl SourceDoc {
+    pub fn new(
+        provider: Option<SourceDocProvider>,
+        id: String,
+        url: Option<String>,
+        doc_type: Option<SourceDocType>,
+        text: String,
+        blocks: Vec<SourceDocBlock>,
+    ) -> Self {
+        let revision = format!("{:x}", Sha256::digest(text.as_bytes()));
+        Self::with_revision(provider, id, url, doc_type, text, revision, blocks)
+    }
+
+    fn with_revision(
+        provider: Option<SourceDocProvider>,
+        id: String,
+        url: Option<String>,
+        doc_type: Option<SourceDocType>,
+        text: String,
+        revision: String,
+        blocks: Vec<SourceDocBlock>,
+    ) -> Self {
+        let (status, index, ranges) = source_doc_navigation(&blocks);
+        Self {
+            provider,
+            id,
+            url,
+            revision,
+            doc_type,
+            status,
+            text,
+            blocks,
+            index,
+            ranges,
+        }
+    }
 }
 
 fn number(kind: SourceDocKind, label: &str) -> Option<usize> {
@@ -536,17 +575,13 @@ fn project_graph_with_text(
         }),
         ProjectionOrder::Case | ProjectionOrder::Native => {}
     }
-    let (status, index, ranges) = source_doc_navigation(&blocks);
-    SourceDoc {
+    SourceDoc::with_revision(
         provider,
-        id: graph.document_id.clone(),
-        url: graph.url.clone(),
-        revision: graph.revision.clone(),
+        graph.document_id.clone(),
+        graph.url.clone(),
         doc_type,
-        status,
         text,
+        graph.revision.clone(),
         blocks,
-        index,
-        ranges,
-    }
+    )
 }
