@@ -1,7 +1,8 @@
 use crate::{
-    javascript_whitespace, text::trim_javascript_whitespace as js_trim,
-    InstrumentCrossReferenceGraph, InstrumentCrossReferenceStatus, ScalarText, SourceDoc,
-    SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    javascript_whitespace, locator::normalize_numbered_section_locator,
+    text::trim_javascript_whitespace as js_trim, InstrumentCrossReferenceGraph,
+    InstrumentCrossReferenceStatus, ScalarText, SourceDoc, SourceDocBlock, SourceDocKind,
+    SourceDocOrigin,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -764,8 +765,7 @@ pub fn normalize_source_doc_locator(kind: SourceDocKind, locator: &str) -> Strin
     static PARAGRAPH: OnceLock<Regex> = OnceLock::new();
     static PAGE: OnceLock<Regex> = OnceLock::new();
     static PREFIX: OnceLock<Regex> = OnceLock::new();
-    static NUMBERED: OnceLock<Regex> = OnceLock::new();
-    static ALPHA: OnceLock<Regex> = OnceLock::new();
+    static CANONICAL_PREFIX: OnceLock<Regex> = OnceLock::new();
     static HEADING: OnceLock<Regex> = OnceLock::new();
     static NON_TITLE: OnceLock<Regex> = OnceLock::new();
     let value = js_trim(locator);
@@ -810,23 +810,12 @@ pub fn normalize_source_doc_locator(kind: SourceDocKind, locator: &str) -> Strin
         _ => return String::new(),
     }
     let without_prefix =
-        regex_parts(&[r"(?iu)^(?:ss?\.?|sections?)", JS_WS, "*"], &PREFIX).replace(value, "");
-    let compact = without_prefix
-        .chars()
-        .filter(|character| !javascript_whitespace(*character))
-        .collect::<String>();
-    if regex(
-        r"^\d{1,8}[A-Za-z]{0,3}(?:[.-]\d{1,8}[A-Za-z]{0,3}){0,3}(?:\([^)]+\))*$",
-        &NUMBERED,
-    )
-    .is_match(&compact)
-        || regex(
-            r"^[A-Za-z]{1,3}(?:[.-][0-9A-Za-z]{1,8}){1,3}(?:\([^)]+\))*$",
-            &ALPHA,
-        )
-        .is_match(&compact)
-    {
-        return format!("sec{compact}");
+        regex_parts(&[r"(?iu)^(?:sections?|ss?\.?)", JS_WS, "+"], &PREFIX).replace(value, "");
+    let without_prefix =
+        regex(r"(?iu)^sec([\p{L}\p{N}])", &CANONICAL_PREFIX).replace(&without_prefix, "$1");
+    let numbered = normalize_numbered_section_locator(&without_prefix);
+    if !numbered.is_empty() {
+        return numbered;
     }
     let heading = without_prefix
         .trim_end_matches(|character| character == '.' || javascript_whitespace(character));

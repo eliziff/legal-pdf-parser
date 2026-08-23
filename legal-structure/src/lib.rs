@@ -18,6 +18,7 @@ mod docx_numbering;
 mod instrument;
 #[cfg(feature = "journal")]
 mod journal;
+mod locator;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 mod native_markup;
 mod numeric_sequence;
