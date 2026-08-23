@@ -11,7 +11,7 @@ use crate::{
 };
 #[cfg(feature = "structure-inference")]
 use legal_grammar_tables::{
-    compile_ecmascript_pattern, compile_ecmascript_table_entry, load_tables,
+    compile_ecmascript_pattern, compile_ecmascript_table_entry, expand_pattern, load_tables,
     CompiledEcmascriptGrammar,
 };
 #[cfg(feature = "structure-inference")]
@@ -112,8 +112,7 @@ fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = Stri
 
 #[cfg(feature = "structure-inference")]
 struct ProvisionGrammars {
-    numeric: CompiledEcmascriptGrammar,
-    roman: CompiledEcmascriptGrammar,
+    reference: CompiledEcmascriptGrammar,
     leading_subdivision: CompiledEcmascriptGrammar,
     external_following: CompiledEcmascriptGrammar,
     instrument_lead: CompiledEcmascriptGrammar,
@@ -129,10 +128,9 @@ fn provision_grammars() -> &'static ProvisionGrammars {
     static GRAMMARS: OnceLock<ProvisionGrammars> = OnceLock::new();
     GRAMMARS.get_or_init(|| {
         let tables = load_tables().expect("valid legal grammar corpus");
-        let defs = &tables
-            .get("provision.reference.numeric")
-            .expect("provision grammar table")
-            .defs;
+        let numeric = &tables["provision.reference.numeric"];
+        let roman = &tables["provision.reference.roman"];
+        let defs = &numeric.defs;
         let continuation = format!(
             r"^\s*(,|and\b|or\b)\s*({}|{})",
             defs.get("numeric_label").expect("numeric label grammar"),
@@ -140,8 +138,16 @@ fn provision_grammars() -> &'static ProvisionGrammars {
         );
         let table = |id| compile_ecmascript_table_entry(id).expect("valid provision grammar");
         ProvisionGrammars {
-            numeric: table("provision.reference.numeric"),
-            roman: table("provision.reference.roman"),
+            reference: compile_ecmascript_pattern(
+                "provision.reference",
+                &format!(
+                    "(?:{})|(?:{})",
+                    expand_pattern(&numeric.entry.pattern, &numeric.defs).unwrap(),
+                    expand_pattern(&roman.entry.pattern, &roman.defs).unwrap()
+                ),
+                "i",
+            )
+            .expect("valid provision grammar"),
             leading_subdivision: table("provision.external.leading-subdivision"),
             external_following: table("provision.external.following"),
             instrument_lead: table("provision.external.instrument-lead"),
@@ -332,7 +338,26 @@ fn find_provision_references(
     let text = coordinates.value;
     let mut found = BTreeMap::new();
 
-    for captures in grammars.numeric.captures_iter(text) {
+    for captures in grammars.reference.captures_iter(text) {
+        if captures.get(1).is_none() {
+            let whole = captures.get(0).expect("roman provision match");
+            let word = captures.get(5).expect("roman provision word").as_str();
+            push_provision_reference(
+                &mut found,
+                text,
+                allowed.as_ref(),
+                window,
+                whole.start(),
+                whole.as_str(),
+                word,
+                word.to_lowercase().ends_with('s'),
+                captures.get(6).expect("roman provision label").as_str(),
+                ProvisionReferenceShape::Roman,
+                None,
+                None,
+            );
+            continue;
+        }
         let whole = captures.get(0).expect("numeric provision match");
         let raw_label = captures
             .get(3)
@@ -433,25 +458,6 @@ fn find_provision_references(
                 Some(start_byte),
             );
         }
-    }
-    for captures in grammars.roman.captures_iter(text) {
-        let whole = captures.get(0).expect("roman provision match");
-        let word = captures.get(1).expect("roman provision word").as_str();
-        let lower = word.to_lowercase();
-        push_provision_reference(
-            &mut found,
-            text,
-            allowed.as_ref(),
-            window,
-            whole.start(),
-            whole.as_str(),
-            word,
-            lower.ends_with('s'),
-            captures.get(2).expect("roman provision label").as_str(),
-            ProvisionReferenceShape::Roman,
-            None,
-            None,
-        );
     }
     let mut head = (0, 0);
     found
@@ -1183,11 +1189,11 @@ fn populate_instrument_node_metadata(nodes: &mut [crate::StructureNode], text: &
 }
 
 #[cfg(feature = "structure-inference")]
-struct ReferenceNode {
-    label: String,
-    aliases: Vec<String>,
-    anchor: Option<String>,
-    parent_label: Option<String>,
+struct ReferenceNode<'a> {
+    label: &'a str,
+    aliases: &'a [String],
+    anchor: Option<&'a str>,
+    parent_label: Option<&'a str>,
     kind: &'static str,
     start: usize,
     end: usize,
@@ -1195,7 +1201,7 @@ struct ReferenceNode {
 }
 
 #[cfg(feature = "structure-inference")]
-fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, EngineError> {
+fn reference_nodes(graph: &DocumentStructure) -> Vec<ReferenceNode<'_>> {
     let by_id = graph
         .nodes
         .iter()
@@ -1206,7 +1212,7 @@ fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, Engi
         .iter()
         .filter(|node| node.kind == NodeKind::Section && node.label.is_some())
         .map(|node| {
-            let label = node.label.as_deref().unwrap().to_owned();
+            let label = node.label.as_deref().unwrap();
             let kind = reference_node_kind(&label);
             let mut depth = 0;
             let mut parent = node
@@ -1224,18 +1230,17 @@ fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, Engi
                 .parent_id
                 .as_deref()
                 .and_then(|id| by_id.get(id))
-                .and_then(|parent| parent.label.as_deref())
-                .map(str::to_owned);
-            Ok(ReferenceNode {
+                .and_then(|parent| parent.label.as_deref());
+            ReferenceNode {
                 label,
-                aliases: node.aliases.clone().unwrap_or_default(),
-                anchor: node.anchor.clone(),
+                aliases: node.aliases.as_deref().unwrap_or_default(),
+                anchor: node.anchor.as_deref(),
                 parent_label,
                 kind,
                 start: node.range.start,
                 end: node.range.end,
                 depth,
-            })
+            }
         })
         .collect()
 }
@@ -1262,15 +1267,6 @@ fn node_keys(node: &ReferenceNode) -> Vec<String> {
     } else if matches!(node.kind, "section" | "subsection") {
         keys.push(node.label.replacen("sec", "section ", 1).to_lowercase());
     }
-    keys.sort();
-    keys.dedup();
-    keys
-}
-
-#[cfg(feature = "structure-inference")]
-fn node_ambiguity_keys(node: &ReferenceNode) -> Vec<String> {
-    let mut keys = node_keys(node);
-    keys.extend(node.aliases.iter().map(|key| key.to_lowercase()));
     keys.sort();
     keys.dedup();
     keys
@@ -1358,29 +1354,32 @@ fn resolve_instrument_references(
     const MIN_TARGETS_FOR_REACH: usize = 3;
     const INTEGRITY_GATE: f64 = 0.5;
 
-    let nodes = reference_nodes(graph)?;
+    let nodes = reference_nodes(graph);
     let mut by_label = HashMap::new();
     for (index, node) in nodes.iter().enumerate() {
-        by_label.entry(node.label.as_str()).or_insert(index);
+        by_label.entry(node.label).or_insert(index);
     }
     let mut ordered = (0..nodes.len()).collect::<Vec<_>>();
     ordered.sort_by_key(|index| (nodes[*index].start, nodes[*index].depth));
 
-    let mut key_counts = HashMap::<String, usize>::new();
-    let mut index = HashMap::<String, Option<usize>>::new();
+    let mut targets = HashMap::<String, (Option<usize>, usize)>::new();
     for (node_index, node) in nodes.iter().enumerate() {
-        let mut keys = node_ambiguity_keys(node);
-        for key in &keys {
-            *key_counts.entry(key.clone()).or_default() += 1;
-        }
-        keys.extend(node.anchor.iter().map(|key| key.to_lowercase()));
+        let mut add = |key, ambiguity| {
+            let target = targets.entry(key).or_insert((Some(node_index), 0));
+            target.1 += usize::from(ambiguity);
+            if target.0 != Some(node_index) {
+                target.0 = None;
+            }
+        };
+        let mut keys = node_keys(node);
+        keys.extend(node.aliases.iter().map(|key| key.to_lowercase()));
         keys.sort();
         keys.dedup();
         for key in keys {
-            index
-                .entry(key)
-                .and_modify(|value| *value = None)
-                .or_insert(Some(node_index));
+            add(key, true);
+        }
+        if let Some(anchor) = node.anchor {
+            add(anchor.to_lowercase(), false);
         }
     }
     let mut child_depths = HashSet::new();
@@ -1432,7 +1431,7 @@ fn resolve_instrument_references(
         let mut edge = InstrumentCrossReferenceEdge {
             source_start: reference.start,
             source_end: reference.end,
-            source_label: source.map(|node| node.label.clone()),
+            source_label: source.map(|node| node.label.to_owned()),
             raw: reference.raw,
             raw_label: reference.label,
             normalized_locator: locator.clone(),
@@ -1456,15 +1455,16 @@ fn resolve_instrument_references(
             edge.reason = Some(InstrumentCrossReferenceReason::NoContainingSection);
         } else {
             let locator_key = locator.to_lowercase();
-            if let Some(target) = index.get(&locator_key).and_then(|value| *value) {
+            let target = targets.get(&locator_key);
+            if let Some(target) = target.and_then(|value| value.0) {
                 counts.resolved += 1;
                 edge.status = InstrumentCrossReferenceStatus::Resolved;
-                edge.target_label = Some(nodes[target].label.clone());
+                edge.target_label = Some(nodes[target].label.to_owned());
                 edge.target_start = Some(nodes[target].start);
                 edge.target_end = Some(nodes[target].end);
                 edge.self_loop = source.is_some_and(|source| source.label == nodes[target].label);
                 counts.self_loops += usize::from(edge.self_loop);
-            } else if key_counts.get(&locator_key).copied().unwrap_or(0) > 1 {
+            } else if target.is_some_and(|value| value.1 > 1) {
                 counts.abstained += 1;
                 edge.status = InstrumentCrossReferenceStatus::Abstained;
                 edge.reason = Some(InstrumentCrossReferenceReason::AmbiguousLabel);
