@@ -1693,8 +1693,9 @@ fn expand_descendants(
     }
     let mut result = Vec::with_capacity(scope.len());
     let mut cursor = 0;
-    for (index, parent) in scope.iter().enumerate() {
-        let end = scope.get(index + 1).map_or(length, |value| value.start);
+    let mut parents = scope.into_iter().peekable();
+    while let Some(parent) = parents.next() {
+        let end = parents.peek().map_or(length, |value| value.start);
         while marks
             .get(cursor)
             .is_some_and(|mark| mark.start <= parent.start)
@@ -1717,7 +1718,7 @@ fn expand_descendants(
                 *counts.entry(mark.label.as_str()).or_default() += 1;
             }
         }
-        result.push(parent.clone());
+        result.push(parent);
         result.extend(
             descendants
                 .into_iter()
@@ -1791,11 +1792,11 @@ fn scope_winner(
             .cmp(&left.len())
             .then(left[0].start.cmp(&right[0].start))
     });
-    let best = values.first()?.clone();
-    (!values.iter().skip(1).any(|value| {
-        value.len() == best.len() && value[0].start == best[0].start && !same_labels(value, &best)
-    }))
-    .then_some(best)
+    let best = values.first()?;
+    let unambiguous = !values.iter().skip(1).any(|value| {
+        value.len() == best.len() && value[0].start == best[0].start && !same_labels(value, best)
+    });
+    unambiguous.then(|| values.swap_remove(0))
 }
 
 fn statute_winner(
@@ -1962,13 +1963,10 @@ fn statute_spine_over(
     if candidates.is_empty() {
         return short_root(text, all_families, source);
     }
-    let mut best = candidates[0].clone();
+    let mut candidates = candidates.into_iter();
+    let mut best = candidates.next().unwrap();
     let first_start = best[0].start;
-    for candidate in candidates
-        .into_iter()
-        .skip(1)
-        .take_while(|value| value[0].start == first_start)
-    {
+    for candidate in candidates.take_while(|value| value[0].start == first_start) {
         let Some(chosen) = choose_sections(Some(best), Some(candidate)) else {
             return Vec::new();
         };
