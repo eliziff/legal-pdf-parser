@@ -25,17 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let input = serde_json::from_str::<Input>(&line)?;
-        let output = match derive_definitions(&input.text, &input.paragraphs) {
-            Ok(result) => Output {
-                id: input.id,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => Output {
-                id: input.id,
-                result: None,
-                error: Some(error.to_string()),
-            },
+        let output = Output {
+            id: input.id,
+            result: Some(derive_definitions(&input.text, &input.paragraphs)),
+            error: None,
         };
         serde_json::to_writer(&mut stdout, &output)?;
         stdout.write_all(b"\n")?;
