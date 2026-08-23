@@ -155,8 +155,9 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<N
     (text, claims)
 }
 
-fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<NativeClaim> {
+fn provider_claims(coordinates: &ScalarText<'_>, map: &A2ajSectionMap) -> Vec<NativeClaim> {
     static PRINTED: OnceLock<Regex> = OnceLock::new();
+    let text = coordinates.value;
     let candidates = map
         .iter()
         .filter_map(|(raw_label, value)| {
@@ -178,7 +179,6 @@ fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<NativeClaim> {
             *matched = (found.start(), found.end(), matched.2 + 1);
         }
     }
-    let coordinates = ScalarText::new(text);
     let mut claims = Vec::new();
     for ((label, value), (start, _, count)) in candidates.into_iter().zip(matches) {
         let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
@@ -211,14 +211,6 @@ fn evidence(
     text: String,
     claims: Vec<NativeClaim>,
 ) -> Result<DocumentInput, EngineError> {
-    let scalar_end = text.chars().count();
-    let coverage = crate::whole_document_coverage(scalar_end, |kind| {
-        if kind == EvidenceKind::Section && !claims.is_empty() {
-            CoverageState::Augment
-        } else {
-            CoverageState::Absent
-        }
-    });
     let profile = if input.source_kind == A2ajSourceKind::Cases {
         DetectionProfile::CaseRootedComplete
     } else {
@@ -270,7 +262,7 @@ fn evidence(
             id: ORIGIN.to_owned(),
         }],
         native_claims: claims,
-        coverage,
+        coverage: Vec::new(),
         exclusions: Vec::new(),
         paragraph_breaks: Vec::new(),
     })
@@ -458,21 +450,26 @@ pub fn a2aj_document_structure(mut input: A2ajInput) -> Result<DocumentStructure
         (Some(map), false) => ordered_sections(map)?,
         (None, _) => Vec::new(),
     };
-    let (text, mut claims) = provider_source(std::mem::take(&mut input.text), &ordered);
+    let (text, claims) = provider_source(std::mem::take(&mut input.text), &ordered);
+    let mut evidence = evidence(&input, text, claims)?;
+    let coordinates = ScalarText::new(&evidence.text);
     if let (true, Some(map)) = (has_text, &input.section_map) {
-        claims = provider_claims(&text, map);
+        evidence.native_claims = provider_claims(&coordinates, map);
     }
-    let evidence = evidence(&input, text, claims)?;
-    let mut structure = if let (A2ajSourceKind::Laws, true, Some(map)) =
+    evidence.coverage = crate::whole_document_coverage(coordinates.len(), |kind| {
+        if kind == EvidenceKind::Section && !evidence.native_claims.is_empty() {
+            CoverageState::Augment
+        } else {
+            CoverageState::Absent
+        }
+    });
+    let mut inferred = crate::inference::inferred_blocks(&evidence, &coordinates);
+    if let (A2ajSourceKind::Laws, true, Some(map)) =
         (input.source_kind, has_text, input.section_map.as_ref())
     {
-        let coordinates = ScalarText::new(&evidence.text);
-        let mut inferred = crate::inference::inferred_blocks(&evidence, &coordinates);
         apply_provider_section_evidence(&coordinates, &mut inferred, &evidence.native_claims, map);
-        crate::derive::derive_trusted_inferred(evidence, inferred)?
-    } else {
-        crate::derive::derive_trusted(evidence)?
-    };
+    }
+    let mut structure = crate::derive::derive_trusted_inferred(evidence, inferred)?;
     if input.source_kind == A2ajSourceKind::Laws {
         structure.cross_references = Some(crate::instrument::cross_reference_graph(&structure)?);
     }
