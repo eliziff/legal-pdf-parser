@@ -37,7 +37,10 @@ pub use docx_lint::*;
 pub use docx_numbering::*;
 pub use instrument::*;
 #[cfg(feature = "journal")]
-pub use journal::{journal_document_structure, journal_text_document_structure, JournalPageLabel};
+pub use journal::{
+    journal_document_structure, journal_text_document_structure, pair_journal_footnotes,
+    JournalFootnotePairing, JournalPageLabel, JournalPairNote,
+};
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use native_markup::{analyze_native_markup, NativeMarkupInput};
 pub use numeric_sequence::*;
