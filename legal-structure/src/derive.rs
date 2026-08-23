@@ -48,60 +48,30 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
         })
         .collect::<Vec<_>>();
     let mut counters = HashMap::<NodeKind, usize>::new();
-    let generated = inferred
-        .into_iter()
-        .filter_map(|mut block| {
-            block.range = evidence.clip_inference(block.kind.evidence(), block.range)?;
-            if block.content_start.is_some_and(|at| {
-                block.kind != NodeKind::Section || at < block.range.start || at > block.range.end
-            }) {
-                return None;
-            }
-            (!block.label.as_ref().is_some_and(|label| {
-                native_labels.contains(&(block.kind.evidence(), label.to_ascii_lowercase()))
-            }))
-            .then_some(block)
-        })
-        .map(|block| {
-            let ordinal = counters.entry(block.kind).or_default();
-            *ordinal += 1;
-            let source = match block.source {
-                Derivation::Native => "native",
-                Derivation::Heuristic => "heuristic",
-                Derivation::Model => "model",
-            };
-            let id = format!("{source}-{}-{:06}", block.kind.name(), ordinal);
-            (block, id)
-        })
-        .collect::<Vec<_>>();
-    let mut labels = nodes
-        .iter()
-        .flat_map(|node| {
-            node.label
-                .iter()
-                .chain(node.aliases.iter().flatten())
-                .map(|label| (label.to_ascii_lowercase(), node.id.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    for (block, id) in &generated {
-        if let Some(label) = &block.label {
-            labels.insert(label.to_ascii_lowercase(), id.clone());
+    let mut generated_parents = Vec::new();
+    let mut diagnostics = Vec::new();
+    for mut block in inferred {
+        let Some(range) = evidence.clip_inference(block.kind.evidence(), block.range) else {
+            continue;
+        };
+        block.range = range;
+        if block.content_start.is_some_and(|at| {
+            block.kind != NodeKind::Section || at < block.range.start || at > block.range.end
+        }) || block.label.as_ref().is_some_and(|label| {
+            native_labels.contains(&(block.kind.evidence(), label.to_ascii_lowercase()))
+        }) {
+            continue;
         }
-        for alias in &block.aliases {
-            labels.insert(alias.to_ascii_lowercase(), id.clone());
-        }
-    }
-    for (claim, node) in evidence.native_claims.iter().zip(nodes.iter_mut()) {
-        node.parent_id = claim
-            .parent_label
-            .as_ref()
-            .and_then(|label| labels.get(&label.to_ascii_lowercase()))
-            .cloned();
-    }
-    let diagnostics = generated
-        .iter()
-        .filter_map(|(block, id)| {
-            block.diagnostic.map(|code| StructureDiagnostic {
+        let ordinal = counters.entry(block.kind).or_default();
+        *ordinal += 1;
+        let source = match block.source {
+            Derivation::Native => "native",
+            Derivation::Heuristic => "heuristic",
+            Derivation::Model => "model",
+        };
+        let id = format!("{source}-{}-{:06}", block.kind.name(), ordinal);
+        if let Some(code) = block.diagnostic {
+            diagnostics.push(StructureDiagnostic {
                 code: code.to_owned(),
                 severity: if code.ends_with("violation") {
                     DiagnosticSeverity::Warning
@@ -110,27 +80,44 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
                 },
                 ranges: vec![block.range],
                 node_ids: vec![id.clone()],
-            })
-        })
-        .collect();
-    for (block, id) in generated {
-        let parent_id = block
-            .parent_label
-            .as_ref()
-            .and_then(|label| labels.get(&label.to_ascii_lowercase()))
-            .cloned();
+            });
+        }
+        generated_parents.push(block.parent_label);
         let mut node = StructureNode::new(
             id,
             block.kind,
             block.range,
             block.origin_id,
             block.source,
-            parent_id,
+            None,
         );
         node.label = block.label;
         node.aliases = (!block.aliases.is_empty()).then_some(block.aliases);
         node.content_start = block.content_start;
         nodes.push(node);
+    }
+    let mut labels = HashMap::with_capacity(nodes.len());
+    for (position, node) in nodes.iter().enumerate() {
+        for label in node.label.iter().chain(node.aliases.iter().flatten()) {
+            labels.insert(label.to_ascii_lowercase(), position);
+        }
+    }
+    for (position, parent) in evidence
+        .native_claims
+        .iter()
+        .map(|claim| claim.parent_label.as_ref())
+        .chain(generated_parents.iter().map(Option::as_ref))
+        .enumerate()
+    {
+        nodes[position].parent_id = parent
+            .and_then(|label| match labels.get(label) {
+                Some(&position) => Some(position),
+                None if label.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                    labels.get(&label.to_ascii_lowercase()).copied()
+                }
+                None => None,
+            })
+            .map(|parent_position| nodes[parent_position].id.clone());
     }
     let document_id = std::mem::take(&mut evidence.document_id);
     let provider = std::mem::take(&mut evidence.provider);

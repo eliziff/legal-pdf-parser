@@ -8,6 +8,7 @@ macro_rules! cached_regex {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(usize)]
 enum MarkerStyle {
     Bracket,
     Dot,
@@ -331,26 +332,19 @@ fn sentence_heading(value: &str, following: &str) -> bool {
             .is_some_and(char::is_uppercase)
 }
 
-fn heading_joined(
-    text: &ScalarText<'_>,
-    known: &HashSet<usize>,
-    style: MarkerStyle,
-) -> Vec<Marker> {
-    if style == MarkerStyle::Bare {
-        return Vec::new();
-    }
-    let mut result = Vec::new();
+fn heading_joined(text: &ScalarText<'_>, known: [Option<&HashSet<usize>>; 2]) -> [Vec<Marker>; 2] {
+    let mut result = std::array::from_fn(|_| Vec::new());
     for line in lines(text) {
         let bytes = line.text.as_bytes();
         let mut at = 0;
         while at < bytes.len() {
-            let digits = if style == MarkerStyle::Bracket && bytes[at] == b'[' {
-                at + 1
-            } else if style == MarkerStyle::Dot && bytes[at].is_ascii_digit() {
-                at
-            } else {
-                at += 1;
-                continue;
+            let (style, index, digits) = match bytes[at] {
+                b'[' if known[0].is_some() => (MarkerStyle::Bracket, 0, at + 1),
+                byte if byte.is_ascii_digit() && known[1].is_some() => (MarkerStyle::Dot, 1, at),
+                _ => {
+                    at += 1;
+                    continue;
+                }
             };
             let length = bytes[digits..]
                 .iter()
@@ -383,7 +377,7 @@ fn heading_joined(
                 continue;
             };
             let start = line.scalar_start + line.text[..at].chars().count();
-            if known.contains(&start) {
+            if known[index].is_some_and(|known| known.contains(&start)) {
                 at = end;
                 continue;
             }
@@ -393,7 +387,7 @@ fn heading_joined(
             let sentence = style == MarkerStyle::Bracket
                 && sentence_heading(heading, &text.value[line.byte_start + end..]);
             if formal || sentence {
-                result.push(Marker {
+                result[index].push(Marker {
                     number: line.text[digits..tail].parse().unwrap(),
                     start,
                     content_start: line.scalar_start + line.text[..end].chars().count(),
@@ -409,7 +403,7 @@ fn heading_joined(
     result
 }
 
-fn rooted_chain(candidates: Vec<Marker>) -> (Vec<Marker>, f64) {
+fn rooted_chain(candidates: &[Marker]) -> (Vec<Marker>, f64) {
     let selected = select_numeric_sequence(
         candidates
             .iter()
@@ -705,29 +699,20 @@ pub(super) fn raw_enumerator_runs(text: &ScalarText<'_>) -> Vec<StructureCandida
 
 fn recover_contiguous(
     text: &ScalarText<'_>,
-    markers: &[Marker],
-    style: MarkerStyle,
+    line: Vec<Marker>,
+    candidates: &[Marker],
 ) -> Vec<Marker> {
-    let line = markers
-        .iter()
-        .filter(|value| value.style == style)
-        .cloned()
-        .collect::<Vec<_>>();
     if line.is_empty() {
         return line;
     }
-    let candidates = heading_joined(text, &line.iter().map(|value| value.start).collect(), style);
     let within = |number: u32, from: usize, to: usize, formal: bool, sentence: bool| {
-        candidates
-            .iter()
-            .filter(|value| {
-                value.number == number
-                    && value.start > from
-                    && value.start < to
-                    && ((!formal || value.formal) && (!sentence || value.sentence))
-            })
-            .cloned()
-            .collect::<Vec<_>>()
+        let start = candidates.partition_point(|value| value.start <= from);
+        let end = candidates.partition_point(|value| value.start < to);
+        let mut matching = candidates[start..end].iter().filter(|value| {
+            value.number == number && ((!formal || value.formal) && (!sentence || value.sentence))
+        });
+        let candidate = matching.next()?;
+        matching.next().is_none().then_some(candidate)
     };
     let mut recovered = HashMap::<usize, Marker>::new();
     for pair in line.windows(2) {
@@ -736,42 +721,38 @@ fn recover_contiguous(
         }
         let mut found = Vec::new();
         for number in pair[0].number + 1..pair[1].number {
-            let candidates = within(number, pair[0].start, pair[1].start, true, false);
-            if candidates.len() != 1 {
+            let Some(candidate) = within(number, pair[0].start, pair[1].start, true, false) else {
                 found.clear();
                 break;
-            }
-            found.push(candidates[0].clone());
+            };
+            found.push(candidate);
         }
         for marker in found {
-            recovered.insert(marker.start, marker);
+            recovered.insert(marker.start, marker.clone());
         }
         if pair[1].number == pair[0].number + 2 {
-            let candidates = within(
+            if let Some(candidate) = within(
                 pair[0].number + 1,
                 pair[0].start,
                 pair[1].start,
                 false,
                 true,
-            );
-            if candidates.len() == 1 {
-                recovered.insert(candidates[0].start, candidates[0].clone());
+            ) {
+                recovered.insert(candidate.start, candidate.clone());
             }
         }
     }
     if let Some(first) = line.first().filter(|value| value.number > 1) {
-        let candidates = candidates
-            .iter()
-            .filter(|value| {
-                value.number == first.number - 1
-                    && value.start < first.start
-                    && value.formal
-                    && text.utf16(first.start) - text.utf16(value.start) <= 2_000
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if candidates.len() == 1 {
-            recovered.insert(candidates[0].start, candidates[0].clone());
+        let end = candidates.partition_point(|value| value.start < first.start);
+        let mut matching = candidates[..end].iter().filter(|value| {
+            value.number == first.number - 1
+                && value.formal
+                && text.utf16(first.start) - text.utf16(value.start) <= 2_000
+        });
+        if let Some(candidate) = matching.next() {
+            if matching.next().is_none() {
+                recovered.insert(candidate.start, candidate.clone());
+            }
         }
     }
     let mut result = line;
@@ -785,18 +766,21 @@ fn fill_lossy_marker_gaps(
     spine: &[Marker],
     style: MarkerStyle,
 ) -> Vec<Marker> {
-    let candidates = heading_joined(
-        text,
-        &spine.iter().map(|value| value.start).collect(),
-        style,
-    );
+    let known = spine
+        .iter()
+        .map(|value| value.start)
+        .collect::<HashSet<_>>();
+    let known = match style {
+        MarkerStyle::Bracket => [Some(&known), None],
+        MarkerStyle::Dot => [None, Some(&known)],
+        MarkerStyle::Bare => return spine.to_vec(),
+    };
+    let mut candidates = heading_joined(text, known);
+    let candidates = std::mem::take(&mut candidates[style as usize]);
     let mut recovered = HashMap::<u32, Vec<Marker>>::new();
     for candidate in candidates {
-        let before = spine
-            .iter()
-            .rev()
-            .find(|value| value.start < candidate.start);
-        let after = spine.iter().find(|value| value.start > candidate.start);
+        let before = spine[..spine.partition_point(|value| value.start < candidate.start)].last();
+        let after = spine.get(spine.partition_point(|value| value.start <= candidate.start));
         let between = before.zip(after).is_some_and(|(left, right)| {
             left.number < candidate.number && candidate.number < right.number
         });
@@ -865,7 +849,6 @@ fn paragraph_ranges(
     };
     let mut boundaries = all
         .iter()
-        .filter(|value| value.style == style)
         .map(|value| value.start)
         .chain(selected.iter().map(|value| value.start))
         .chain(extra.iter().copied())
@@ -894,25 +877,37 @@ fn detect_paragraphs(
 ) -> Vec<Block> {
     let strict = profile != DetectionProfile::CaseLossy;
     let contiguous = profile == DetectionProfile::CaseContiguousComplete;
+    let rooted = profile == DetectionProfile::CaseRootedComplete;
     let markers = paragraph_markers(text, contiguous);
-    let visible = markers
-        .iter()
-        .filter(|value| marker_visible(value, excluded) && (!strict || !quoted_dot(text, value)))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut by_style: [Vec<Marker>; 3] = std::array::from_fn(|_| Vec::new());
+    for marker in &markers {
+        let filtered = rooted || (contiguous && marker.style != MarkerStyle::Bare);
+        if !filtered || marker_visible(marker, excluded) && (!strict || !quoted_dot(text, marker)) {
+            by_style[marker.style as usize].push(marker.clone());
+        }
+    }
+    let mut joined: [Vec<Marker>; 2] = std::array::from_fn(|_| Vec::new());
+    if rooted || contiguous {
+        let known: [HashSet<usize>; 2] = std::array::from_fn(|index| {
+            by_style[index].iter().map(|marker| marker.start).collect()
+        });
+        joined = heading_joined(
+            text,
+            [
+                (rooted || !by_style[0].is_empty()).then_some(&known[0]),
+                (rooted || !by_style[1].is_empty()).then_some(&known[1]),
+            ],
+        );
+    }
     let mut hypotheses = Vec::<Hypothesis>::new();
     for style in [MarkerStyle::Bracket, MarkerStyle::Dot, MarkerStyle::Bare] {
-        if profile == DetectionProfile::CaseRootedComplete {
-            let mut candidates = visible
-                .iter()
-                .filter(|value| value.style == style)
-                .cloned()
-                .collect::<Vec<_>>();
+        let style_index = style as usize;
+        if rooted {
+            let mut candidates = std::mem::take(&mut by_style[style_index]);
             if style != MarkerStyle::Bare {
-                let known = candidates.iter().map(|value| value.start).collect();
-                candidates.extend(heading_joined(text, &known, style));
+                candidates.append(&mut joined[style_index]);
             }
-            let (chain, score) = rooted_chain(candidates.clone());
+            let (chain, score) = rooted_chain(&candidates);
             if chain.len() < 2 || endnote_shaped(text, &chain) {
                 continue;
             }
@@ -936,16 +931,16 @@ fn detect_paragraphs(
             continue;
         }
         let style_markers: Vec<Marker> = if contiguous && style != MarkerStyle::Bare {
-            recover_contiguous(text, &visible, style)
-                .into_iter()
-                .filter(|value| marker_visible(value, excluded))
-                .collect()
+            recover_contiguous(
+                text,
+                std::mem::take(&mut by_style[style_index]),
+                &joined[style_index],
+            )
+            .into_iter()
+            .filter(|value| marker_visible(value, excluded))
+            .collect()
         } else {
-            markers
-                .iter()
-                .filter(|value| value.style == style)
-                .cloned()
-                .collect()
+            std::mem::take(&mut by_style[style_index])
         };
         let scopes = if contiguous {
             contiguous_scopes(&style_markers)
@@ -1019,7 +1014,6 @@ fn detect_paragraphs(
         let offsets = hypothesis
             .all
             .iter()
-            .filter(|value| value.style == hypothesis.style)
             .map(|value| value.start)
             .collect::<Vec<_>>();
         let mut next = HashMap::new();

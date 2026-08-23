@@ -390,8 +390,8 @@ fn source_doc_navigation(
 ) -> (SourceDocStatus, SourceDocIndex, SourceDocRanges) {
     let (mut paragraphs, mut pages, mut sections, mut footnotes) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut positions = HashMap::new();
-    let mut duplicates = HashSet::new();
+    let (mut positions, mut duplicates, mut labels) =
+        (HashMap::new(), HashSet::new(), HashSet::new());
     for (position, block) in blocks.iter().enumerate() {
         match block.kind {
             SourceDocKind::Paragraph => paragraphs.push(block),
@@ -400,7 +400,7 @@ fn source_doc_navigation(
             SourceDocKind::Footnote => footnotes.push(block),
             SourceDocKind::Table | SourceDocKind::Row | SourceDocKind::Cell => {}
         }
-        let mut labels = HashSet::new();
+        labels.clear();
         for label in std::iter::once(&block.label)
             .chain(block.aliases.iter())
             .chain(block.anchor.iter())
@@ -532,19 +532,17 @@ fn project_graph_with_text(
             .iter()
             .map(|block| (block.label.clone(), block.parent_label.clone()))
             .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
         for block in &mut blocks {
-            let mut parent = block.parent_label.clone();
-            let mut seen = HashSet::new();
-            while let Some(label) = parent.clone() {
-                if !seen.insert(label.clone()) {
-                    break;
-                }
-                match parents.get(&label).cloned().flatten() {
+            seen.clear();
+            let mut parent = parents.get(&block.label).and_then(Option::as_deref);
+            while let Some(label) = parent.filter(|label| seen.insert(*label)) {
+                match parents.get(label).and_then(Option::as_deref) {
                     Some(next) => parent = Some(next),
                     None => break,
                 }
             }
-            block.parent_label = parent;
+            block.parent_label = parent.map(str::to_owned);
         }
     }
     match order {

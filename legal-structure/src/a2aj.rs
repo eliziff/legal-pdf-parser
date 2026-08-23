@@ -129,7 +129,8 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<N
         return (text, Vec::new());
     }
     text.clear();
-    let mut claims = Vec::new();
+    text.reserve(entries.iter().map(|(_, value)| value.len() + 1).sum());
+    let mut claims = Vec::with_capacity(entries.len());
     let mut scalar = 0;
     for (label, value) in entries.iter().filter(|(_, value)| {
         !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("[blank]")
