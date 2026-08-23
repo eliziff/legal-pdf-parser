@@ -1,7 +1,8 @@
 use crate::{
     analyze_instrument, javascript_whitespace, normalize_source_doc_locator,
-    AuthoritativeTableCell, DocumentStructure, InstrumentCrossReferenceReason,
-    InstrumentCrossReferenceStatus, NodeKind, ScalarText, SourceDocKind, StructureNode,
+    text::trim_javascript_whitespace as js_trim, AuthoritativeTableCell, DocumentStructure,
+    InstrumentCrossReferenceReason, InstrumentCrossReferenceStatus, NodeKind, ScalarText,
+    SourceDocKind, StructureNode,
 };
 use legal_grammar_tables::{
     compile_ecmascript_pattern, compile_table_entry, expand_pattern, load_tables, CompiledGrammar,
@@ -26,10 +27,6 @@ fn field<'a>(op: &'a Value, key: &str) -> Option<&'a str> {
 
 fn flag(op: &Value, key: &str) -> bool {
     op.get(key).and_then(Value::as_bool) == Some(true)
-}
-
-fn js_trim(value: &str) -> &str {
-    value.trim_matches(javascript_whitespace)
 }
 
 fn compact_label(value: &str) -> String {

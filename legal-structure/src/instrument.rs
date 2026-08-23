@@ -2,11 +2,10 @@
 use crate::{
     definitions::{derive_definitions_bytes, DefinitionHit},
     javascript_whitespace, node_depths,
-    text::normalize_javascript_whitespace,
-    AuthoritativeTableCell, AuthoritativeTables, Block, Coverage, CoverageState, DefinedTerm,
+    text::{normalize_javascript_whitespace, trim_javascript_start},
+    AuthoritativeTableCell, AuthoritativeTables, Block, CoverageState, DefinedTerm,
     DefinitionOccurrence, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
-    EvidenceKind, NodeKind, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
-    EVIDENCE_SCHEMA,
+    NodeKind, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope, EVIDENCE_SCHEMA,
 };
 #[cfg(feature = "structure-inference")]
 use legal_grammar_tables::{
@@ -207,10 +206,6 @@ fn compact_provision_label(value: &str) -> String {
 }
 
 #[cfg(feature = "structure-inference")]
-fn trim_javascript_start(value: &str) -> &str {
-    value.trim_start_matches(javascript_whitespace)
-}
-
 #[cfg(feature = "structure-inference")]
 fn normalize_section_locator(locator: &str) -> String {
     static PREFIX: OnceLock<Regex> = OnceLock::new();
@@ -666,24 +661,29 @@ fn instrument_contents_anchors(text: &str) -> Vec<usize> {
             .expect("valid bare instrument contents anchor grammar")
     });
     let mut anchors = Vec::with_capacity(CONTENTS_MAX_ANCHORS);
+    let mut tables = table
+        .find_iter(text)
+        .filter_map(|found| {
+            let before = text[..found.start()].chars().next_back();
+            let after = text[found.end()..].chars().next();
+            (before.is_none_or(|character| matches!(character, '\r' | '\n' | '\t' | ' '))
+                && after.is_none_or(|character| matches!(character, '\r' | '\n' | '\t' | ' ')))
+            .then_some((found.start(), found.end()))
+        })
+        .peekable();
     let mut start = 0;
     loop {
         let end = text[start..]
             .find(['\r', '\n'])
             .map_or(text.len(), |length| start + length);
         let line = &text[start..end];
-        for found in table.find_iter(line) {
-            let found_start = start + found.start();
-            let found_end = start + found.end();
-            let before = text[..found_start].chars().next_back();
-            let after = text[found_end..].chars().next();
-            if before.is_none_or(|character| matches!(character, '\r' | '\n' | '\t' | ' '))
-                && after.is_none_or(|character| matches!(character, '\r' | '\n' | '\t' | ' '))
-            {
-                anchors.push((found_start, found_end));
-                if anchors.len() == CONTENTS_MAX_ANCHORS {
-                    break;
-                }
+        while tables
+            .peek()
+            .is_some_and(|(found_start, _)| *found_start < end)
+        {
+            anchors.push(tables.next().unwrap());
+            if anchors.len() == CONTENTS_MAX_ANCHORS {
+                break;
             }
         }
         if anchors.len() == CONTENTS_MAX_ANCHORS {
@@ -1809,25 +1809,7 @@ fn derive_instrument_structure(
             id: "provider-adapter".to_owned(),
         }],
         native_claims: Vec::new(),
-        coverage: [
-            EvidenceKind::Paragraph,
-            EvidenceKind::Prose,
-            EvidenceKind::Page,
-            EvidenceKind::Section,
-            EvidenceKind::Heading,
-            EvidenceKind::Footnote,
-            EvidenceKind::Endnote,
-        ]
-        .into_iter()
-        .map(|kind| Coverage {
-            kind,
-            range: ScalarRange {
-                start: 0,
-                end: scalar_end,
-            },
-            state: CoverageState::Absent,
-        })
-        .collect(),
+        coverage: crate::whole_document_coverage(scalar_end, |_| CoverageState::Absent),
         exclusions: Vec::new(),
         paragraph_breaks: Vec::<ParagraphBreak>::new(),
     };
