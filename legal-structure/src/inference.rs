@@ -2299,6 +2299,13 @@ struct InstrumentLine<'a> {
 }
 
 fn any_instrument_marker(value: &str) -> Option<(&str, usize, InstrumentMarkerKind)> {
+    if !value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'(' || byte.is_ascii_lowercase())
+    {
+        return None;
+    }
     let valid_letters = |token: &str, upper: bool| {
         let bytes = token.as_bytes();
         let case = |byte: &u8| {
@@ -2369,22 +2376,17 @@ fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)
     })
 }
 
-fn instrument_lines<'a>(source: &[Line<'a>]) -> Vec<InstrumentLine<'a>> {
-    source
-        .iter()
-        .copied()
-        .filter_map(|line| {
-            let trimmed = line.text.trim_start_matches(instrument_space);
-            let value = trimmed.trim_end_matches(instrument_space);
-            (!value.is_empty()).then(|| InstrumentLine {
-                line,
-                value,
-                start: line.scalar_start
-                    + line.text[..line.text.len() - trimmed.len()].chars().count(),
-                marker: any_instrument_marker(value),
-            })
+fn instrument_lines<'a>(source: &'a [Line<'a>]) -> impl Iterator<Item = InstrumentLine<'a>> + 'a {
+    source.iter().copied().filter_map(|line| {
+        let trimmed = line.text.trim_start_matches(instrument_space);
+        let value = trimmed.trim_end_matches(instrument_space);
+        (!value.is_empty()).then(|| InstrumentLine {
+            line,
+            value,
+            start: line.scalar_start + line.text[..line.text.len() - trimmed.len()].chars().count(),
+            marker: any_instrument_marker(value),
         })
-        .collect()
+    })
 }
 
 fn instrument_space(character: char) -> bool {
@@ -2439,7 +2441,7 @@ fn compare_child_values(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-fn admitted_dialects(source: &[InstrumentLine<'_>]) -> (bool, bool) {
+fn admitted_dialects<'a>(source: impl Iterator<Item = InstrumentLine<'a>>) -> (bool, bool) {
     let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
     let mut best = [0, 0];
     for line in source {
@@ -2765,10 +2767,17 @@ fn direct_section(value: &str) -> Option<(String, usize)> {
 }
 
 fn instrument_top(value: &str, direct: bool) -> Option<(String, usize, bool)> {
-    let possible_top = value
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| matches!(byte, b'A' | b'P' | b'D' | b'S' | b'E'));
+    let possible_top = [
+        "ARTICLE", "Article", "PART", "Part", "DIVISION", "Division", "SCHEDULE", "Schedule",
+        "EXHIBIT", "Exhibit", "ANNEX", "Annex", "APPENDIX", "Appendix",
+    ]
+    .into_iter()
+    .any(|word| {
+        value
+            .strip_prefix(word)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(char::is_whitespace)
+    });
     if possible_top {
         if let Some(found) = cached_regex!(TOP,
         r"^(?:(ARTICLE|Article|PART|Part|DIVISION|Division)\s+([IVXLCDM]+|\d{1,3})\b\s*[—–\-.:]?\s*(.*)|(SCHEDULE|Schedule|EXHIBIT|Exhibit|ANNEX|Annex|APPENDIX|Appendix)\s+([A-Z0-9][\w.\-]*)\s*[—–\-.:]?\s*(.*))$"
@@ -2814,10 +2823,9 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
         .into_iter()
         .peekable();
     let direct = spine.peek().is_none();
-    let source = instrument_lines(&lines);
-    let dialects = admitted_dialects(&source);
+    let dialects = admitted_dialects(instrument_lines(&lines));
     let mut state = StructureState::default();
-    for source in source {
+    for source in instrument_lines(&lines) {
         let (line, value, start) = (source.line, source.value, source.start);
         let selected = spine
             .next_if(|mark| mark.start == start)
