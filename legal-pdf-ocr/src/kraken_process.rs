@@ -28,8 +28,26 @@ pub(crate) struct BllaRuntime {
     stderr: Arc<Mutex<String>>,
     timeout: Duration,
     request_id: u64,
+}
+
+pub(crate) struct PreparedBllaRuntime {
+    blla: VerifiedPack,
+    recognizer: VerifiedPack,
+    python: PathBuf,
+    python_path: OsString,
+    device: String,
     identity: String,
     name: String,
+}
+
+impl PreparedBllaRuntime {
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 enum ProcessLine {
@@ -94,7 +112,7 @@ struct RuntimeRegion {
 }
 
 impl BllaRuntime {
-    pub(crate) fn new(options: &KrakenOptions) -> Result<Self> {
+    pub(crate) fn prepare(options: &KrakenOptions) -> Result<PreparedBllaRuntime> {
         let wheel = required_file(
             &options.runtime_wheel,
             "LEGALPDF_KRAKEN_RUNTIME_WHEEL",
@@ -140,19 +158,38 @@ impl BllaRuntime {
             )));
         }
 
-        let mut command = Command::new(&python);
+        Ok(PreparedBllaRuntime {
+            blla,
+            recognizer,
+            python,
+            python_path,
+            device,
+            name: format!(
+                "{identity}:layout=blla:batch={}:threads={}",
+                options.runtime_batch_size,
+                options.threads.max(1),
+            ),
+            identity,
+        })
+    }
+
+    pub(crate) fn from_prepared(
+        options: &KrakenOptions,
+        prepared: PreparedBllaRuntime,
+    ) -> Result<Self> {
+        let mut command = Command::new(&prepared.python);
         command
             .args(["-m", "kraken_lite.cli", "serve", "--blla"])
-            .arg(&blla.root)
+            .arg(&prepared.blla.root)
             .arg("--recognizer")
-            .arg(&recognizer.root)
+            .arg(&prepared.recognizer.root)
             .arg("--device")
-            .arg(&device)
+            .arg(&prepared.device)
             .arg("--threads")
             .arg(options.threads.max(1).to_string())
             .arg("--batch-size")
             .arg(options.runtime_batch_size.to_string())
-            .env("PYTHONPATH", python_path)
+            .env("PYTHONPATH", prepared.python_path)
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1")
             .stdin(Stdio::piped())
@@ -167,7 +204,7 @@ impl BllaRuntime {
         hide_window(&mut command);
         let mut child = command
             .spawn()
-            .map_err(|source| Error::io(&python, source))?;
+            .map_err(|source| Error::io(&prepared.python, source))?;
         let input = child
             .stdin
             .take()
@@ -211,11 +248,6 @@ impl BllaRuntime {
                 }
             }
         });
-        let name = format!(
-            "{identity}:layout=blla:batch={}:threads={}",
-            options.runtime_batch_size,
-            options.threads.max(1),
-        );
         let mut runtime = Self {
             child,
             input,
@@ -225,8 +257,6 @@ impl BllaRuntime {
             stderr,
             timeout: Duration::from_secs(options.timeout_seconds),
             request_id: 0,
-            identity,
-            name,
         };
         let startup = runtime.request(json!({"op": "ocr_batch", "images": []}))?;
         if !startup.as_array().is_some_and(Vec::is_empty) {
@@ -235,14 +265,6 @@ impl BllaRuntime {
             ));
         }
         Ok(runtime)
-    }
-
-    pub(crate) fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    pub(crate) fn name(&self) -> &str {
-        &self.name
     }
 
     pub(crate) fn recognize(

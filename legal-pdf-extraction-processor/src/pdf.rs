@@ -1723,6 +1723,14 @@ pub fn load_extraction_document(path: &Path) -> Result<Document> {
     .map_err(Into::into)
 }
 
+pub fn pdf_page_count(path: &Path) -> Result<u32> {
+    let count = Document::load_metadata(path)?.page_count;
+    if count == 0 {
+        return Err(Error::Message("PDF contains no pages".to_owned()));
+    }
+    Ok(count)
+}
+
 pub fn page_dimensions(document: &Document) -> Vec<(u32, f64, f64)> {
     document
         .get_pages()

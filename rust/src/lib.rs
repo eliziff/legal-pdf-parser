@@ -21,6 +21,8 @@ pub use engine::{corpus_check_cached_extraction, digest_cached_extraction};
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::{Error, Result};
+#[cfg(feature = "pdf")]
+pub use legal_pdf_extraction::pdf_page_count;
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
     analyze_docx_bytes, apply_docx_links, assess_docx_route, compile_table_entry,
@@ -44,7 +46,7 @@ pub use legal_pdf_ocr::{
 };
 #[cfg(feature = "pdf")]
 pub use legal_pdf_support::{
-    lookup_footnote, source_doc, structure_lookup, to_alr_payload, to_toa_text_units,
+    lookup_footnote, project_structure, structure_lookup, to_alr_payload, to_toa_text_units,
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};

@@ -1,4 +1,4 @@
-use crate::kraken_process::BllaRuntime;
+use crate::kraken_process::{BllaRuntime, PreparedBllaRuntime};
 use crate::tesseract_layout::TesseractLayout;
 #[cfg(feature = "ocr")]
 use hayro::hayro_interpret::InterpreterSettings;
@@ -407,26 +407,52 @@ pub struct KrakenOcr {
     name: String,
 }
 
+pub(crate) enum PreparedKraken {
+    Blla(PreparedBllaRuntime),
+    Native(PreparedNativeKraken),
+}
+
+pub(crate) struct PreparedNativeKraken {
+    model: PathBuf,
+    codec: PathBuf,
+    runtime: PathBuf,
+    tesseract_library: PathBuf,
+    device: String,
+    workers: usize,
+    threads: usize,
+    layout_workers: usize,
+    batch_size: usize,
+    width_bucket: usize,
+    width_scale: f32,
+    identity: String,
+    name: String,
+}
+
+impl PreparedKraken {
+    pub(crate) fn identity(&self) -> &str {
+        match self {
+            Self::Blla(prepared) => prepared.identity(),
+            Self::Native(prepared) => &prepared.identity,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Blla(prepared) => prepared.name(),
+            Self::Native(prepared) => &prepared.name,
+        }
+    }
+}
+
 impl KrakenOcr {
     pub fn new(options: &KrakenOptions) -> Result<Self> {
+        Self::from_prepared(options, Self::prepare(options)?)
+    }
+
+    pub(crate) fn prepare(options: &KrakenOptions) -> Result<PreparedKraken> {
         validate_options(options)?;
         if options.layout == KrakenLayout::Blla {
-            let blla = BllaRuntime::new(options)?;
-            let identity = blla.identity().to_owned();
-            let name = blla.name().to_owned();
-            return Ok(Self {
-                sessions: vec![],
-                codec: None,
-                dpi: options.dpi,
-                batch_size: options.batch_size,
-                width_bucket: options.width_bucket,
-                input_height: options.input_height,
-                width_scale: 1.0,
-                tesseract_layouts: vec![],
-                blla: Some(blla),
-                identity,
-                name,
-            });
+            return BllaRuntime::prepare(options).map(PreparedKraken::Blla);
         }
         let device = options
             .backend
@@ -456,18 +482,6 @@ impl KrakenOcr {
         .and_then(|path| canonical_file(&path, "Tesseract layout library"))?;
         let (workers, threads) =
             recognition_schedule(options.workers, options.threads, options.backend);
-        let automatic_cpu =
-            options.backend == KrakenBackend::Cpu && options.workers == 0 && options.threads == 0;
-        let requested_global_threads = automatic_cpu.then_some(workers);
-        let environment_global_threads =
-            legal_pdf_core::init_ort_runtime(&runtime, requested_global_threads)?;
-        let independent_pool = environment_global_threads.is_some() && !uses_global_pool(options);
-        let session_global_threads = (!independent_pool)
-            .then_some(environment_global_threads)
-            .flatten();
-        let tesseract_layouts = (0..layout_workers)
-            .map(|_| TesseractLayout::new(&tesseract_library, options.dpi))
-            .collect::<Result<Vec<_>>>()?;
         let layout_identity = sha256_file(&tesseract_library)?;
         let identity = format!(
             "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}",
@@ -487,21 +501,6 @@ impl KrakenOcr {
                 options.expected_identity.as_deref().unwrap_or_default()
             )));
         }
-        let prepacked_weights = PrepackedWeights::new();
-        let sessions = (0..workers)
-            .map(|_| {
-                open_session(
-                    &model,
-                    threads,
-                    options.backend,
-                    &device,
-                    options.cpu_arena,
-                    &prepacked_weights,
-                    independent_pool,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let codec = Codec::load(&codec_path)?;
         let width_scale = options
             .width_scale
             .unwrap_or_else(|| options.tier.width_scale());
@@ -514,21 +513,85 @@ impl KrakenOcr {
             options.layout.name(),
             threads,
             layout_workers,
-            session_global_threads.unwrap_or(0),
+            if uses_global_pool(options) { workers } else { 0 },
             options.cpu_arena,
         );
+        Ok(PreparedKraken::Native(PreparedNativeKraken {
+            model,
+            codec: codec_path,
+            runtime,
+            tesseract_library,
+            device,
+            workers,
+            threads,
+            layout_workers,
+            batch_size,
+            width_bucket,
+            width_scale,
+            identity,
+            name,
+        }))
+    }
+
+    pub(crate) fn from_prepared(options: &KrakenOptions, prepared: PreparedKraken) -> Result<Self> {
+        let prepared = match prepared {
+            PreparedKraken::Blla(prepared) => {
+                let identity = prepared.identity().to_owned();
+                let name = prepared.name().to_owned();
+                let blla = BllaRuntime::from_prepared(options, prepared)?;
+                return Ok(Self {
+                    sessions: vec![],
+                    codec: None,
+                    dpi: options.dpi,
+                    batch_size: options.batch_size,
+                    width_bucket: options.width_bucket,
+                    input_height: options.input_height,
+                    width_scale: 1.0,
+                    tesseract_layouts: vec![],
+                    blla: Some(blla),
+                    identity,
+                    name,
+                });
+            }
+            PreparedKraken::Native(prepared) => prepared,
+        };
+        let automatic_cpu =
+            options.backend == KrakenBackend::Cpu && options.workers == 0 && options.threads == 0;
+        let environment_global_threads = legal_pdf_core::init_ort_runtime(
+            &prepared.runtime,
+            automatic_cpu.then_some(prepared.workers),
+        )?;
+        let independent_pool = environment_global_threads.is_some() && !uses_global_pool(options);
+        let tesseract_layouts = (0..prepared.layout_workers)
+            .map(|_| TesseractLayout::new(&prepared.tesseract_library, options.dpi))
+            .collect::<Result<Vec<_>>>()?;
+        let prepacked_weights = PrepackedWeights::new();
+        let sessions = (0..prepared.workers)
+            .map(|_| {
+                open_session(
+                    &prepared.model,
+                    prepared.threads,
+                    options.backend,
+                    &prepared.device,
+                    options.cpu_arena,
+                    &prepacked_weights,
+                    independent_pool,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let codec = Codec::load(&prepared.codec)?;
         Ok(Self {
             sessions,
             codec: Some(codec),
             dpi: options.dpi,
-            batch_size,
-            width_bucket,
+            batch_size: prepared.batch_size,
+            width_bucket: prepared.width_bucket,
             input_height: options.input_height,
-            width_scale,
+            width_scale: prepared.width_scale,
             tesseract_layouts,
             blla: None,
-            identity,
-            name,
+            identity: prepared.identity,
+            name: prepared.name,
         })
     }
 

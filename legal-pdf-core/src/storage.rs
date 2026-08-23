@@ -138,7 +138,8 @@ pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 pub fn read_gzip_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = io(path, File::open(path))?;
-    serde_json::from_reader(GzDecoder::new(BufReader::new(file))).map_err(Error::from)
+    serde_json::from_reader(BufReader::new(GzDecoder::new(BufReader::new(file))))
+        .map_err(Error::from)
 }
 
 #[cfg(test)]

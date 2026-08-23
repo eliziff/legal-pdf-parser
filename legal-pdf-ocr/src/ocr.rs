@@ -36,12 +36,52 @@ pub enum OcrProvider {
     Kraken(crate::kraken::KrakenOcr),
 }
 
+pub struct PreparedOcrProvider {
+    provider: PreparedProvider,
+}
+
+enum PreparedProvider {
+    Tesseract(PreparedTesseract),
+    #[cfg(feature = "kraken")]
+    Kraken(crate::kraken::PreparedKraken),
+}
+
 impl OcrProvider {
     pub fn new(options: &OcrOptions) -> Result<Self> {
+        Self::from_prepared(options, Self::prepare(options)?)
+    }
+
+    pub fn prepare(options: &OcrOptions) -> Result<PreparedOcrProvider> {
         match options {
-            OcrOptions::Tesseract(options) => TesseractOcr::new(options).map(Self::Tesseract),
+            OcrOptions::Tesseract(options) => {
+                let provider = TesseractOcr::prepare(options)?;
+                Ok(PreparedOcrProvider {
+                    provider: PreparedProvider::Tesseract(provider),
+                })
+            }
             #[cfg(feature = "kraken")]
-            OcrOptions::Kraken(options) => crate::kraken::KrakenOcr::new(options).map(Self::Kraken),
+            OcrOptions::Kraken(options) => {
+                let provider = crate::kraken::KrakenOcr::prepare(options)?;
+                Ok(PreparedOcrProvider {
+                    provider: PreparedProvider::Kraken(provider),
+                })
+            }
+        }
+    }
+
+    pub fn from_prepared(options: &OcrOptions, prepared: PreparedOcrProvider) -> Result<Self> {
+        match (options, prepared.provider) {
+            (OcrOptions::Tesseract(options), PreparedProvider::Tesseract(prepared)) => Ok(
+                Self::Tesseract(TesseractOcr::from_prepared(options, prepared)),
+            ),
+            #[cfg(feature = "kraken")]
+            (OcrOptions::Kraken(options), PreparedProvider::Kraken(prepared)) => {
+                crate::kraken::KrakenOcr::from_prepared(options, prepared).map(Self::Kraken)
+            }
+            #[cfg(feature = "kraken")]
+            _ => Err(Error::Message(
+                "OCR options changed after identity preparation".to_owned(),
+            )),
         }
     }
 
@@ -70,6 +110,24 @@ impl OcrProvider {
             Self::Tesseract(provider) => provider.extract_pages(pdf_path, requests),
             #[cfg(feature = "kraken")]
             Self::Kraken(provider) => provider.extract_pages(pdf_path, requests),
+        }
+    }
+}
+
+impl PreparedOcrProvider {
+    pub fn identity(&self) -> &str {
+        match &self.provider {
+            PreparedProvider::Tesseract(provider) => &provider.identity,
+            #[cfg(feature = "kraken")]
+            PreparedProvider::Kraken(provider) => provider.identity(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match &self.provider {
+            PreparedProvider::Tesseract(provider) => &provider.name,
+            #[cfg(feature = "kraken")]
+            PreparedProvider::Kraken(provider) => provider.name(),
         }
     }
 }
@@ -124,8 +182,19 @@ pub struct TesseractOcr {
     name: String,
 }
 
+struct PreparedTesseract {
+    command: PathBuf,
+    identity: String,
+    name: String,
+}
+
 impl TesseractOcr {
     pub fn new(options: &TesseractOptions) -> Result<Self> {
+        let prepared = Self::prepare(options)?;
+        Ok(Self::from_prepared(options, prepared))
+    }
+
+    fn prepare(options: &TesseractOptions) -> Result<PreparedTesseract> {
         validate_options(options)?;
         let command = options
             .command
@@ -153,15 +222,23 @@ impl TesseractOcr {
             "{identity}:lang={}:dpi={}:psm={}",
             options.language, options.dpi, options.psm
         );
-        Ok(Self {
+        Ok(PreparedTesseract {
             command,
+            identity,
+            name,
+        })
+    }
+
+    fn from_prepared(options: &TesseractOptions, prepared: PreparedTesseract) -> Self {
+        Self {
+            command: prepared.command,
             language: options.language.clone(),
             dpi: options.dpi,
             psm: options.psm,
             timeout: Duration::from_secs(options.timeout_seconds),
-            identity,
-            name,
-        })
+            identity: prepared.identity,
+            name: prepared.name,
+        }
     }
 
     pub fn identity(&self) -> &str {
@@ -170,70 +247,6 @@ impl TesseractOcr {
 
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    #[cfg(feature = "ocr")]
-    pub(crate) fn render_pages(
-        pdf_path: &Path,
-        page_indexes: &[usize],
-        output_dir: &Path,
-    ) -> Result<Vec<PathBuf>> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::vello_cpu::color::palette::css::WHITE;
-        use hayro::{render, RenderCache, RenderSettings};
-        use std::fs;
-        use std::io::Write;
-
-        fs::create_dir_all(output_dir).map_err(|source| Error::io(output_dir, source))?;
-        let bytes = fs::read(pdf_path).map_err(|source| Error::io(pdf_path, source))?;
-        let pdf = Pdf::new(bytes).map_err(|error| {
-            Error::Message(format!("repair renderer could not open PDF: {error:?}"))
-        })?;
-        let cache = RenderCache::new();
-        let interpreter = InterpreterSettings::default();
-        let scale = 1.5_f32;
-        let settings = RenderSettings {
-            x_scale: scale,
-            y_scale: scale,
-            bg_color: WHITE,
-            ..Default::default()
-        };
-        let mut paths = Vec::with_capacity(page_indexes.len());
-        for &page_index in page_indexes {
-            let output = output_dir.join(format!("p{:04}.png", page_index + 1));
-            if !output.is_file() {
-                let page = pdf.pages().iter().nth(page_index).ok_or_else(|| {
-                    Error::Message(format!("PDF page index is out of range: {page_index}"))
-                })?;
-                let png = render(page, &cache, &interpreter, &settings)
-                    .into_png()
-                    .map_err(|error| {
-                        Error::Message(format!("repair renderer could not encode PNG: {error}"))
-                    })?;
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output)
-                    .map_err(|source| Error::io(&output, source))?;
-                file.write_all(&png)
-                    .map_err(|source| Error::io(&output, source))?;
-            }
-            paths.push(output);
-        }
-        Ok(paths)
-    }
-
-    #[cfg(not(feature = "ocr"))]
-    pub(crate) fn render_pages(
-        _pdf_path: &Path,
-        _page_indexes: &[usize],
-        _output_dir: &Path,
-    ) -> Result<Vec<PathBuf>> {
-        Err(Error::Message(
-            "selective model repair requires a legalpdf binary built with `--features ocr`"
-                .to_owned(),
-        ))
     }
 
     #[cfg(feature = "ocr")]

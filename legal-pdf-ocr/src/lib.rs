@@ -13,4 +13,4 @@ pub use kraken::{
     KrakenLayout, KrakenOcr, KrakenOptions, KrakenTier,
 };
 pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
-pub use ocr::{OcrOptions, OcrProvider, TesseractOcr, TesseractOptions};
+pub use ocr::{OcrOptions, OcrProvider, PreparedOcrProvider, TesseractOcr, TesseractOptions};

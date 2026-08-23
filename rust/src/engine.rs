@@ -8,6 +8,7 @@ use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction::{extract_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider};
+use legal_pdf_support::{profile, project_structure};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
@@ -565,6 +566,7 @@ fn prune_parse_cache(root: &Path) {
 }
 
 pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<LegalDocument> {
+    let _profile = profile::scope();
     let path = path.as_ref();
     if !path.is_file() {
         return Err(Error::Message(format!(
@@ -575,9 +577,7 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     if path
         .extension()
         .and_then(|value| value.to_str())
-        .map(str::to_lowercase)
-        .as_deref()
-        != Some("pdf")
+        .is_none_or(|value| !value.eq_ignore_ascii_case("pdf"))
     {
         return Err(Error::Message(format!(
             "input must be a PDF: {}",
@@ -585,26 +585,30 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         )));
     }
     let path = fs::canonicalize(path).map_err(|source| Error::io(path, source))?;
-    let source_hash = sha256_file(&path)?;
+    let source_hash = profile::measure("source_sha256", || sha256_file(&path))?;
     let identity = engine_identity();
     #[cfg(feature = "ocr")]
-    let mut ocr_provider = options.ocr.as_ref().map(OcrProvider::new).transpose()?;
+    let mut ocr_prepared = profile::measure("provider_identity_ocr", || {
+        options.ocr.as_ref().map(OcrProvider::prepare).transpose()
+    })?;
     #[cfg(feature = "ocr")]
-    let ocr_identity = ocr_provider
+    let ocr_identity = ocr_prepared
         .as_ref()
         .map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
     #[cfg(not(feature = "ocr"))]
     let ocr_identity: Option<(String, String)> = None;
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-    let mut ppdoc = options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?;
+    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || {
+        options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()
+    })?;
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-    let ppdoc_identity = ppdoc
+    let ppdoc_identity = ppdoc_prepared
         .as_ref()
         .map(|provider| provider.identity().to_owned());
     #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
     let ppdoc_identity: Option<String> = None;
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-    let ppdoc_variant = ppdoc
+    let ppdoc_variant = ppdoc_prepared
         .as_ref()
         .map(|provider| provider.variant_id().to_owned());
     #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
@@ -626,16 +630,18 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         ppdoc_identity.as_deref(),
         options.ocr_pages.as_deref(),
     )?;
-    let selected_cache_root = options.cache_dir.clone().unwrap_or_else(default_cache_dir);
-    let cache_root = options.use_cache.then(|| selected_cache_root.clone());
+    let cache_root = options
+        .use_cache
+        .then(|| options.cache_dir.clone().unwrap_or_else(default_cache_dir));
     let mut document = None;
     if let Some(root) = &cache_root {
         let path = parse_cache_root(root)
             .join("documents")
             .join(format!("{key}.json.gz"));
         if path.is_file() {
-            if let Ok(mut cached) = read_gzip_json::<LegalDocument>(&path) {
-                let valid = cached.source_sha256 == source_hash
+            let cached = profile::measure("document_cache_read_validate", || {
+                let cached = read_gzip_json::<LegalDocument>(&path).ok()?;
+                (cached.source_sha256 == source_hash
                     && cached.schema_version == SCHEMA_VERSION
                     && cached.parser_version == PARSER_VERSION
                     && cached
@@ -643,17 +649,21 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                         .get("deterministic_cache_key")
                         .and_then(Value::as_str)
                         == Some(key.as_str())
-                    && validate_document(&cached).is_ok();
-                if valid {
-                    cached
-                        .provenance
-                        .insert("cache_hit".to_owned(), Value::Bool(true));
-                    cached
-                        .provenance
-                        .insert("cache_enabled".to_owned(), Value::Bool(true));
-                    touch_cache(&path);
-                    document = Some(cached);
+                    && validate_document(&cached).is_ok())
+                .then_some(cached)
+            });
+            if let Some(mut cached) = cached {
+                if cached.structure_graph.rendered_text.is_none() {
+                    profile::measure("project_structure", || project_structure(&mut cached));
                 }
+                cached
+                    .provenance
+                    .insert("cache_hit".to_owned(), Value::Bool(true));
+                cached
+                    .provenance
+                    .insert("cache_enabled".to_owned(), Value::Bool(true));
+                touch_cache(&path);
+                document = Some(cached);
             }
             if document.is_none() {
                 let _ = fs::remove_file(path);
@@ -668,7 +678,9 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
             if !path.is_file() {
                 return None;
             }
-            match read_gzip_json::<CachedExtraction>(&path) {
+            match profile::measure("extraction_cache_read", || {
+                read_gzip_json::<CachedExtraction>(&path)
+            }) {
                 Ok(cached)
                     if cached.schema_version == EXTRACTION_CACHE_SCHEMA
                         && cached.source_sha256 == source_hash
@@ -686,17 +698,39 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         });
         if extracted.is_none() {
             #[cfg(feature = "ocr")]
+            let mut ocr_provider = profile::measure("provider_runtime_ocr", || {
+                options
+                    .ocr
+                    .as_ref()
+                    .zip(ocr_prepared.take())
+                    .map(|(options, prepared)| OcrProvider::from_prepared(options, prepared))
+                    .transpose()
+            })?;
+            #[cfg(feature = "ocr")]
             let selected_ocr = ocr_provider
                 .as_mut()
                 .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
             #[cfg(not(feature = "ocr"))]
             let selected_ocr = None;
-            let mut fresh = extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())?;
+            let mut fresh = profile::measure("extract_pdf", || {
+                extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())
+            })?;
+            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+            let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
+                options
+                    .ppdoc
+                    .as_ref()
+                    .zip(ppdoc_prepared.take())
+                    .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
+                    .transpose()
+            })?;
             #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
             if let Some(provider) = ppdoc.as_mut() {
                 fresh
                     .diagnostics
-                    .extend(provider.annotate_pdf(&path, &mut fresh.pages)?);
+                    .extend(profile::measure("ppdoc_annotate", || {
+                        provider.annotate_pdf(&path, &mut fresh.pages)
+                    })?);
             }
             if let Some(root) = &cache_root {
                 let cached = CachedExtraction {
@@ -708,33 +742,40 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                 let cache_path = parse_cache_root(root)
                     .join("extractions")
                     .join(format!("{extraction_key}.json.gz"));
-                let _ = write_gzip_json(&cache_path, &cached);
+                let _ = profile::measure("extraction_cache_write", || {
+                    write_gzip_json(&cache_path, &cached)
+                });
                 fresh = cached.extraction;
             }
             extracted = Some(fresh);
         }
-        let mut parsed = build_document(
-            &path,
-            &source_hash,
-            &key,
-            &identity,
-            (
-                ocr_identity
-                    .as_ref()
-                    .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-                ppdoc_variant.as_deref(),
-                ppdoc_identity.as_deref(),
-            ),
-            extracted.expect("cache or parse produced an extraction"),
-        )?;
+        let mut parsed = profile::measure("build_document", || {
+            build_document(
+                &path,
+                &source_hash,
+                &key,
+                &identity,
+                (
+                    ocr_identity
+                        .as_ref()
+                        .map(|provider| (provider.0.as_str(), provider.1.as_str())),
+                    ppdoc_variant.as_deref(),
+                    ppdoc_identity.as_deref(),
+                ),
+                extracted.expect("cache or parse produced an extraction"),
+            )
+        })?;
         parsed
             .provenance
             .insert("cache_enabled".to_owned(), Value::Bool(options.use_cache));
+        profile::measure("project_structure", || project_structure(&mut parsed));
         if let Some(root) = &cache_root {
             let cache_path = parse_cache_root(root)
                 .join("documents")
                 .join(format!("{key}.json.gz"));
-            let _ = write_gzip_json(&cache_path, &parsed);
+            let _ = profile::measure("document_cache_write", || {
+                write_gzip_json(&cache_path, &parsed)
+            });
             prune_parse_cache(root);
         }
         document = Some(parsed);

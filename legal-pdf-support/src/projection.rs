@@ -1,11 +1,11 @@
 use legal_pdf_core::model::{
-    Derivation, LegalDocument, NodeKind, Page, SourceDoc, SourceDocBlock, SourceDocKind,
-    SourceDocOrigin, SourceDocProvider, StructureNode,
+    Derivation, LegalDocument, NodeKind, Page, ScalarRange, StructureNode,
 };
 use legal_pdf_core::Result;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
@@ -198,29 +198,19 @@ fn normal_pages(document: &LegalDocument) -> Vec<(u32, String)> {
     pages
 }
 
-fn graph_text(document: &LegalDocument) -> String {
-    let mut pages = document.pages.iter().collect::<Vec<_>>();
-    pages.sort_by_key(|page| page.index);
-    pages
-        .into_iter()
-        .flat_map(|page| {
-            let mut lines = page.lines.iter().collect::<Vec<_>>();
-            lines.sort_by_key(|line| (line.reading_order, line.id.as_str()));
-            lines
-                .into_iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn scalar_slice(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+fn rendered_slice(document: &LegalDocument, node: &StructureNode) -> String {
+    let Some(range) = node.rendered_range else {
+        return String::new();
+    };
+    String::from_utf16_lossy(
+        &document
+            .structure_graph
+            .query_text()
+            .encode_utf16()
+            .skip(range.start)
+            .take(range.end.saturating_sub(range.start))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn section_nodes(document: &LegalDocument) -> Vec<&StructureNode> {
@@ -245,7 +235,6 @@ fn source_extent<'a>(
 
 struct SourceParagraph<'a> {
     number: usize,
-    order_on_page: usize,
     paragraph: &'a legal_pdf_core::model::Paragraph,
     text: String,
 }
@@ -262,17 +251,11 @@ fn source_paragraphs(document: &LegalDocument) -> Vec<SourceParagraph<'_>> {
     pages.sort_by_key(|page| page.index);
     let mut output = Vec::new();
     for page in pages {
-        for (order_on_page, paragraph) in paragraphs_by_page
-            .get(&page.index)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+        for paragraph in paragraphs_by_page.get(&page.index).into_iter().flatten() {
             let text = clean_text(&paragraph.text);
             if !text.is_empty() {
                 output.push(SourceParagraph {
                     number: output.len() + 1,
-                    order_on_page,
                     paragraph,
                     text,
                 });
@@ -293,6 +276,11 @@ fn paragraph_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .map(|item| {
             let paragraph = item.paragraph;
             let page = pages.get(&paragraph.page_index);
+            let node = document
+                .structure_graph
+                .nodes
+                .iter()
+                .find(|node| node.id == paragraph.id);
             LookupUnit {
                 id: if paragraph.id.is_empty() {
                     format!("paragraph-{}", item.number)
@@ -301,7 +289,9 @@ fn paragraph_units(document: &LegalDocument) -> Vec<LookupUnit> {
                 },
                 kind: "paragraph".to_owned(),
                 locator: format!("paragraph {}", item.number),
-                text: item.text,
+                text: node
+                    .map(|node| rendered_slice(document, node))
+                    .unwrap_or_default(),
                 page_numbers: page.map_or_else(Vec::new, |item| vec![item.number]),
                 confidence: page.map(|item| item.text_quality.clamp(0.0, 1.0)),
                 confidence_basis: if page.is_some() {
@@ -330,7 +320,13 @@ fn page_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .pages
         .iter()
         .map(|page| {
-            let body = join_page_lines(page);
+            let text = document
+                .structure_graph
+                .nodes
+                .iter()
+                .find(|node| node.id == page.id)
+                .map(|node| rendered_slice(document, node))
+                .unwrap_or_default();
             LookupUnit {
                 id: if page.id.is_empty() {
                     format!("page-{}", page.number)
@@ -339,11 +335,7 @@ fn page_units(document: &LegalDocument) -> Vec<LookupUnit> {
                 },
                 kind: "page".to_owned(),
                 locator: format!("[page {}]", page.number),
-                text: if body.is_empty() {
-                    String::new()
-                } else {
-                    format!("[page {}]\n{body}", page.number)
-                },
+                text,
                 page_numbers: vec![page.number],
                 confidence: Some(page.text_quality.clamp(0.0, 1.0)),
                 confidence_basis: "page_text_quality".to_owned(),
@@ -409,7 +401,6 @@ fn section_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .iter()
         .map(|page| (page.index, page))
         .collect();
-    let text = graph_text(document);
     section_nodes(document)
         .into_iter()
         .enumerate()
@@ -441,9 +432,7 @@ fn section_units(document: &LegalDocument) -> Vec<LookupUnit> {
                     .unwrap_or(&section.id)
                     .trim()
                     .to_owned(),
-                text: scalar_slice(&text, section.range.start, section.range.end)
-                    .trim()
-                    .to_owned(),
+                text: rendered_slice(document, section).trim().to_owned(),
                 page_numbers,
                 confidence,
                 confidence_basis: if confidence.is_some() {
@@ -801,226 +790,201 @@ pub fn structure_lookup(document: &LegalDocument, request: &Value) -> Result<Val
     ))
 }
 
-fn normalized_locator(kind: &str, value: &str) -> Option<String> {
-    if kind == "section" {
-        return normalized_section(value);
-    }
-    static FOOTNOTE: OnceLock<Regex> = OnceLock::new();
-    let number = if kind == "footnote" {
-        let normalized: String = value.nfkc().collect();
-        FOOTNOTE
-            .get_or_init(|| Regex::new(r"(?i)^(?:fn|footnotes?|notes?)?[\s#.]*(\d{1,5})$").unwrap())
-            .captures(normalized.trim())?
-            .get(1)?
-            .as_str()
-            .parse()
-            .ok()?
-    } else {
-        parse_ordinal(kind, value)?
-    };
-    Some(match kind {
-        "page" => format!("page{number}"),
-        "paragraph" => format!("par{number}"),
-        _ => format!("fn{number}"),
-    })
-}
-
 fn append(text: &mut String, position: &mut usize, value: &str) {
     text.push_str(value);
     *position += utf16_len(value);
 }
 
-pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>) -> SourceDoc {
+pub fn project_structure(document: &mut LegalDocument) {
+    let paragraphs = source_paragraphs(document)
+        .into_iter()
+        .map(|item| {
+            (
+                item.paragraph.page_index,
+                item.paragraph.id.clone(),
+                item.paragraph.line_ids.clone(),
+                item.text,
+            )
+        })
+        .collect::<Vec<_>>();
     let mut text = String::new();
-    let mut blocks = Vec::new();
-    let mut line_offsets = HashMap::new();
+    let mut id_ranges = HashMap::new();
+    let mut line_ranges = HashMap::new();
+    let mut page_ranges = HashMap::new();
     let mut position = 0;
-    let paragraphs = source_paragraphs(document);
     let mut pages: Vec<_> = document.pages.iter().collect();
     pages.sort_by_key(|page| page.index);
     for page in pages {
-        if !text.is_empty() {
-            append(&mut text, &mut position, "\n\n");
-        }
-        let printed = page
-            .printed_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let display = printed.map_or_else(|| page.number.to_string(), str::to_owned);
-        let page_start = position;
-        append(&mut text, &mut position, &format!("[page {display}]\n"));
-        for item in paragraphs
-            .iter()
-            .filter(|item| item.paragraph.page_index == page.index)
+        let mut page_range: Option<ScalarRange> = None;
+        for (_, id, line_ids, paragraph_text) in
+            paragraphs.iter().filter(|item| item.0 == page.index)
         {
-            let paragraph = item.paragraph;
-            if item.order_on_page > 0 {
+            if !text.is_empty() {
                 append(&mut text, &mut position, "\n\n");
             }
             let start = position;
-            append(&mut text, &mut position, &item.text);
+            append(&mut text, &mut position, paragraph_text);
             let end = position;
-            let anchor = if paragraph.id.is_empty() {
-                format!("page-{}-paragraph-{}", page.number, item.order_on_page + 1)
-            } else {
-                paragraph.id.clone()
-            };
-            for line_id in &paragraph.line_ids {
-                line_offsets.insert(line_id.clone(), (start, end));
+            let range = ScalarRange { start, end };
+            if !id.is_empty() {
+                id_ranges.insert(id.clone(), range);
             }
-            let mut block = SourceDocBlock::new(
-                SourceDocKind::Paragraph,
-                format!("par{}", item.number),
-                start,
-                end,
-                SourceDocOrigin::Heuristic,
-            );
-            block.anchor = Some(anchor);
-            blocks.push(block);
+            for line_id in line_ids {
+                line_ranges.insert(line_id.clone(), range);
+            }
+            page_range = Some(page_range.map_or(range, |current| ScalarRange {
+                start: current.start.min(start),
+                end: current.end.max(end),
+            }));
         }
-        let label =
-            normalized_locator("page", &display).unwrap_or_else(|| format!("page{}", page.number));
-        let distinct_label = display != page.number.to_string();
-        let mut aliases = vec![page.number.to_string()];
-        if distinct_label {
-            aliases.push(display);
+        if let Some(range) = page_range {
+            page_ranges.insert(page.index, range);
+            if !page.id.is_empty() {
+                id_ranges.insert(page.id.clone(), range);
+            }
         }
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Page,
-            label,
-            page_start,
-            position,
-            if printed.is_some() {
-                SourceDocOrigin::Heuristic
-            } else {
-                SourceDocOrigin::Native
-            },
-        );
-        block.anchor = Some(format!("page={}", page.number));
-        block.aliases = aliases;
-        blocks.push(block);
     }
-    for section in section_nodes(document) {
-        let positions = source_extent(document, &section.id)
+
+    for note in &document.footnotes {
+        let positions = note
+            .body_line_ids
+            .iter()
+            .filter_map(|id| line_ranges.get(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let range = if positions.is_empty() {
+            let body = clean_text(&note.body);
+            if body.is_empty() {
+                None
+            } else if let Some(start_byte) = text.find(&body) {
+                let start = utf16_len(&text[..start_byte]);
+                Some(ScalarRange {
+                    start,
+                    end: start + utf16_len(&body),
+                })
+            } else {
+                if !text.is_empty() {
+                    append(&mut text, &mut position, "\n\n");
+                }
+                let start = position;
+                append(&mut text, &mut position, &body);
+                Some(ScalarRange {
+                    start,
+                    end: position,
+                })
+            }
+        } else {
+            Some(ScalarRange {
+                start: positions.iter().map(|range| range.start).min().unwrap(),
+                end: positions.iter().map(|range| range.end).max().unwrap(),
+            })
+        };
+        if let Some(range) = range {
+            id_ranges.insert(note.pair_id.clone(), range);
+            for line_id in &note.body_line_ids {
+                line_ranges.entry(line_id.clone()).or_insert(range);
+            }
+        }
+    }
+
+    let extents = document
+        .pdf_source_map
+        .nodes
+        .iter()
+        .map(|extent| (extent.id.as_str(), extent))
+        .collect::<HashMap<_, _>>();
+    let note_ranges = document
+        .structure_graph
+        .notes
+        .iter()
+        .filter_map(|note| {
+            id_ranges
+                .get(&note.id)
+                .copied()
+                .map(|range| (note.node_id.as_str(), range))
+        })
+        .collect::<HashMap<_, _>>();
+    for node in &mut document.structure_graph.nodes {
+        let positions = extents
+            .get(node.id.as_str())
             .into_iter()
             .flat_map(|extent| &extent.line_ids)
-            .filter_map(|id| line_offsets.get(id))
+            .filter_map(|id| line_ranges.get(id))
+            .copied()
             .collect::<Vec<_>>();
-        let Some(start) = positions.iter().map(|position| position.0).min() else {
-            continue;
-        };
-        let Some(end) = positions.iter().map(|position| position.1).max() else {
-            continue;
-        };
-        if start >= end || end - start > MAX_RETURN_CHARS {
-            continue;
-        }
-        let id = section.id.clone();
-        let locator = section.label.as_deref().unwrap_or(&id);
-        let label = normalized_locator("section", locator.trim())
-            .unwrap_or_else(|| format!("section:{id}"));
-        let mut seen = HashSet::new();
-        let aliases = std::iter::once(locator)
-            .chain(section.aliases.iter().flatten().map(String::as_str))
-            .filter(|value| !value.is_empty() && seen.insert((*value).to_owned()))
-            .map(str::to_owned)
-            .collect();
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Section,
-            label,
-            start,
-            end,
-            if section.source == Derivation::Native {
-                SourceDocOrigin::Native
-            } else {
-                SourceDocOrigin::Heuristic
-            },
-        );
-        block.anchor = Some(id);
-        block.aliases = aliases;
-        blocks.push(block);
+        node.rendered_range = note_ranges
+            .get(node.id.as_str())
+            .copied()
+            .or_else(|| id_ranges.get(&node.id).copied())
+            .or_else(|| {
+                (!positions.is_empty()).then(|| ScalarRange {
+                    start: positions.iter().map(|range| range.start).min().unwrap(),
+                    end: positions.iter().map(|range| range.end).max().unwrap(),
+                })
+            })
+            .or_else(|| {
+                extents
+                    .get(node.id.as_str())
+                    .and_then(|extent| extent.page_indexes.first())
+                    .and_then(|page| page_ranges.get(page))
+                    .copied()
+            });
     }
-    for (order, note) in document.footnotes.iter().enumerate() {
-        let body = clean_text(&note.body);
-        if body.is_empty() {
-            continue;
-        }
-        append(
-            &mut text,
-            &mut position,
-            &format!(
-                "\n\n[footnote {}]\n",
-                if note.label.trim().is_empty() {
-                    (order + 1).to_string()
-                } else {
-                    note.label.trim().to_owned()
-                }
-            ),
-        );
-        let start = position;
-        append(&mut text, &mut position, &body);
-        let end = position;
-        let label = normalized_locator("footnote", note.label.trim())
-            .unwrap_or_else(|| format!("fn{}", order + 1));
-        let aliases = [&note.label, &note.pair_id]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .collect();
-        let mut block = SourceDocBlock::new(
-            SourceDocKind::Footnote,
-            label,
-            start,
-            end,
-            SourceDocOrigin::Heuristic,
-        );
-        block.aliases = aliases;
-        if !note.pair_id.is_empty() {
-            block.anchor = Some(note.pair_id.clone());
-        }
-        blocks.push(block);
-    }
-    blocks.sort_by(|left, right| {
-        left.start
-            .cmp(&right.start)
-            .then_with(|| left.end.cmp(&right.end))
-            .then_with(|| left.label.cmp(&right.label))
-    });
-    SourceDoc::new(
-        Some(SourceDocProvider::LocalPdf),
-        id.unwrap_or(&document.document_id).to_owned(),
-        url.map(str::to_owned),
-        None,
-        text,
-        blocks,
-    )
+    document.structure_graph.revision = format!("{:x}", Sha256::digest(text.as_bytes()));
+    document.structure_graph.rendered_text = Some(text);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        DocumentStructure, GraphStatus, Paragraph, ScalarRange, PARSER_VERSION, SCHEMA_VERSION,
+        DocumentStructure, Paragraph, ScalarRange, PARSER_VERSION, SCHEMA_VERSION,
     };
     use serde_json::Map;
 
-    fn structure_graph() -> DocumentStructure {
-        DocumentStructure::from_parts(
-            "doc".to_owned(),
-            "",
-            Some("00".repeat(32)),
-            GraphStatus::Complete,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        )
+    fn structure_graph(nodes: Vec<StructureNode>) -> DocumentStructure {
+        serde_json::from_value(json!({
+            "schema_version": "legalpdf.document-structure.v1",
+            "document_id": "doc",
+            "offset_unit": "utf16",
+            "provider": "local-pdf",
+            "revision": "00",
+            "text": "",
+            "text_sha256": "00",
+            "source_sha256": "00",
+            "scope": {"kind": "complete"},
+            "origins": [],
+            "nodes": nodes,
+            "diagnostics": []
+        }))
+        .unwrap()
+    }
+
+    fn node(id: &str, kind: NodeKind) -> StructureNode {
+        StructureNode {
+            id: id.to_owned(),
+            kind,
+            range: ScalarRange { start: 0, end: 0 },
+            rendered_range: None,
+            origin_id: "test".to_owned(),
+            source: Derivation::Native,
+            label: None,
+            locator_kind: None,
+            aliases: None,
+            parent_id: None,
+            anchor: None,
+            content_start: None,
+            marker_range: None,
+            page_indexes: Vec::new(),
+            line_ids: Vec::new(),
+            grammar: None,
+            proof: None,
+        }
     }
 
     #[test]
     fn invalid_lookup_is_bounded_without_guessing() {
-        let document = LegalDocument {
+        let mut document = LegalDocument {
             document_id: "doc".to_owned(),
             source_name: "x.pdf".to_owned(),
             source_sha256: "00".repeat(32),
@@ -1061,7 +1025,10 @@ mod tests {
             footnotes: vec![],
             tables: vec![],
             images: vec![],
-            structure_graph: structure_graph(),
+            structure_graph: structure_graph(vec![
+                node("page-1", NodeKind::Page),
+                node("p", NodeKind::Prose),
+            ]),
             pdf_source_map: Default::default(),
             pairing_audit: None,
             diagnostics: vec![],
@@ -1076,15 +1043,16 @@ mod tests {
                 ["status"],
             "invalid"
         );
-        assert_eq!(source_doc(&document, Some("id"), None).id, "id");
-        let source = source_doc(&document, Some("id"), None);
-        let paragraph = source
-            .blocks
-            .iter()
-            .find(|block| block.kind == SourceDocKind::Paragraph)
-            .unwrap();
-        assert_eq!(paragraph.label, "par1");
-        assert_eq!(paragraph.anchor.as_deref(), Some("p"));
+        project_structure(&mut document);
+        assert_eq!(document.structure_graph.query_text(), "text");
+        assert_eq!(
+            document.structure_graph.revision,
+            format!("{:x}", Sha256::digest(b"text"))
+        );
+        assert_eq!(
+            document.structure_graph.nodes[1].rendered_range,
+            Some(ScalarRange { start: 0, end: 4 })
+        );
         let lookup = structure_lookup(
             &document,
             &json!({"locator_kind":"paragraph","locator":"par1"}),
@@ -1093,14 +1061,19 @@ mod tests {
         assert_eq!(lookup["status"], "found");
         assert_eq!(lookup["units"][0]["id"], "p");
         assert_eq!(lookup["units"][0]["text"], "text");
+        let page =
+            structure_lookup(&document, &json!({"locator_kind":"page","locator":"1"})).unwrap();
+        assert_eq!(page["status"], "found");
+        assert_eq!(page["units"][0]["text"], "text");
     }
 
     #[test]
-    fn source_doc_section_ids_are_exact_lookup_locators() {
+    fn section_ids_are_exact_lookup_locators() {
         let section = StructureNode {
             id: "section-000001".to_owned(),
             kind: NodeKind::Section,
             range: ScalarRange { start: 0, end: 18 },
+            rendered_range: None,
             origin_id: "test".to_owned(),
             source: Derivation::Heuristic,
             label: Some("A heading too long to use as a trusted locator".to_owned()),
@@ -1112,7 +1085,6 @@ mod tests {
             marker_range: None,
             page_indexes: Vec::new(),
             line_ids: Vec::new(),
-            level: Some(0),
             grammar: Some("hierarchy".to_owned()),
             proof: None,
         };
@@ -1124,9 +1096,9 @@ mod tests {
     }
 
     #[test]
-    fn source_doc_does_not_publish_a_heading_as_a_section() {
+    fn projection_does_not_invent_section_nodes() {
         let text = "😀".repeat(MAX_RETURN_CHARS / 2 + 1);
-        let document = LegalDocument {
+        let mut document = LegalDocument {
             document_id: "doc".to_owned(),
             source_name: "x.pdf".to_owned(),
             source_sha256: "00".repeat(32),
@@ -1157,7 +1129,7 @@ mod tests {
             footnotes: vec![],
             tables: vec![],
             images: vec![],
-            structure_graph: structure_graph(),
+            structure_graph: structure_graph(vec![node("heading", NodeKind::Heading)]),
             pdf_source_map: Default::default(),
             pairing_audit: None,
             diagnostics: vec![],
@@ -1168,24 +1140,16 @@ mod tests {
             parser_version: PARSER_VERSION.to_owned(),
         };
 
-        let source = source_doc(&document, None, None);
+        project_structure(&mut document);
+        assert_eq!(document.structure_graph.query_text(), text);
+        assert_eq!(document.structure_graph.nodes[0].kind, NodeKind::Heading);
         assert_eq!(
-            source
-                .blocks
-                .iter()
-                .filter(|block| block.kind == SourceDocKind::Section)
-                .count(),
-            0
+            document.structure_graph.nodes[0].rendered_range,
+            Some(ScalarRange {
+                start: 0,
+                end: utf16_len(&text),
+            })
         );
-        assert_eq!(
-            source
-                .blocks
-                .iter()
-                .filter(|block| block.kind == SourceDocKind::Paragraph)
-                .count(),
-            1
-        );
-        assert!(source.text.ends_with(&text));
         let lookup = structure_lookup(
             &document,
             &json!({"locator_kind":"section","locator":"section:section-000001"}),

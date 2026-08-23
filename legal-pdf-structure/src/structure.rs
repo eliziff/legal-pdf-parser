@@ -4797,6 +4797,7 @@ fn native_graph_parts(
             id: page.id.clone(),
             kind: NodeKind::Page,
             range,
+            rendered_range: None,
             origin_id: ORIGIN.to_owned(),
             source: Derivation::Native,
             label: page.printed_label.clone(),
@@ -4832,6 +4833,7 @@ fn native_graph_parts(
                 NodeKind::Prose
             },
             range,
+            rendered_range: None,
             origin_id: ORIGIN.to_owned(),
             source: if heading {
                 Derivation::Heuristic
@@ -4997,13 +4999,19 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
                 "document contains duplicate line IDs".to_owned(),
             ));
         }
-        let region_ids: Vec<&str> = page
-            .regions
-            .iter()
-            .flat_map(|region| region.line_ids.iter().map(String::as_str))
-            .collect();
-        let region_set: HashSet<&str> = region_ids.iter().copied().collect();
-        if region_set.len() != region_ids.len() || region_set != page_ids {
+        let mut regions_by_line = HashMap::new();
+        let duplicate_region_line = page.regions.iter().any(|region| {
+            region
+                .line_ids
+                .iter()
+                .any(|line| regions_by_line.insert(line.as_str(), region).is_some())
+        });
+        if duplicate_region_line
+            || regions_by_line.len() != page_ids.len()
+            || page_ids
+                .iter()
+                .any(|line| !regions_by_line.contains_key(line))
+        {
             return Err(Error::Message(format!(
                 "page {} region coverage is incomplete",
                 page.number
@@ -5028,10 +5036,9 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
                     "document contains duplicate word IDs".to_owned(),
                 ));
             }
-            let region = page
-                .regions
-                .iter()
-                .find(|region| region.line_ids.contains(&line.id))
+            let region = regions_by_line
+                .get(line.id.as_str())
+                .copied()
                 .ok_or_else(|| {
                     Error::Message(format!("line {} has no containing region", line.id))
                 })?;
@@ -5042,11 +5049,30 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<String>> {
                 )));
             }
             let mut prior_end = 0;
+            let scalar_boundaries = (!line.text.is_ascii()).then(|| {
+                line.text
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .chain(std::iter::once(line.text.len()))
+                    .collect::<Vec<_>>()
+            });
+            let scalar_len = scalar_boundaries
+                .as_ref()
+                .map_or(line.text.len(), |boundaries| boundaries.len() - 1);
             for word in &line.words {
+                let text = scalar_boundaries.as_ref().map_or_else(
+                    || line.text.get(word.start..word.end),
+                    |boundaries| {
+                        boundaries
+                            .get(word.start)
+                            .zip(boundaries.get(word.end))
+                            .and_then(|(&start, &end)| line.text.get(start..end))
+                    },
+                );
                 if word.start < prior_end
                     || word.end <= word.start
-                    || word.end > line.text.chars().count()
-                    || char_slice(&line.text, word.start, word.end) != word.text
+                    || word.end > scalar_len
+                    || text != Some(word.text.as_str())
                 {
                     return Err(Error::Message(format!(
                         "line {} contains invalid word geometry",
@@ -5168,7 +5194,7 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
         .map(|page| {
             page.lines
                 .iter()
-                .map(|line| line.text.chars().count())
+                .map(|line| line.text.encode_utf16().count())
                 .sum::<usize>()
         })
         .sum::<usize>()

@@ -375,8 +375,31 @@ pub struct PPDocLayout {
     identity: String,
 }
 
+pub struct PreparedPPDoc {
+    pack: ModelPack,
+    runtime: PathBuf,
+    cache_dir: Option<PathBuf>,
+    device: String,
+    threshold: f32,
+    identity: String,
+}
+
+impl PreparedPPDoc {
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn variant_id(&self) -> &str {
+        &self.pack.manifest.variant_id
+    }
+}
+
 impl PPDocLayout {
     pub fn new(options: &PPDocOptions) -> Result<Self> {
+        Self::from_prepared(options, Self::prepare(options)?)
+    }
+
+    pub fn prepare(options: &PPDocOptions) -> Result<PreparedPPDoc> {
         if !(0.0..=1.0).contains(&options.threshold) || !options.threshold.is_finite() {
             return Err(Error::Message(
                 "PPdoc threshold must be between zero and one".to_owned(),
@@ -489,6 +512,26 @@ impl PPDocLayout {
                 options.expected_identity.as_deref().unwrap_or_default()
             )));
         }
+        Ok(PreparedPPDoc {
+            pack,
+            runtime,
+            cache_dir,
+            device,
+            threshold,
+            identity,
+        })
+    }
+
+    pub fn from_prepared(options: &PPDocOptions, prepared: PreparedPPDoc) -> Result<Self> {
+        let PreparedPPDoc {
+            pack,
+            runtime,
+            cache_dir,
+            device,
+            threshold,
+            identity,
+        } = prepared;
+        let native_openvino = options.backend == PPDocBackend::OpenVino;
         #[cfg(feature = "ppdoc")]
         let backend = if pack.manifest.model.backend == "paddle" {
             Backend::Paddle(PaddleSession::new(

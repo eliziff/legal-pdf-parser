@@ -3,7 +3,7 @@ use crate::engine::{parse_pdf, ParseOptions};
 use crate::KrakenOptions;
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use crate::PPDocOptions;
-use crate::{source_doc, structure_lookup, Error, Result, SourceDoc};
+use crate::{structure_lookup, Error, Result};
 #[cfg(feature = "ocr")]
 use crate::{OcrOptions, TesseractOptions};
 use legal_structure::{InstrumentCrossReferenceGraph, NodeKind};
@@ -17,6 +17,10 @@ pub struct PdfDocumentResult {
 }
 
 impl PdfDocumentResult {
+    pub fn structure(&self) -> &legal_structure::DocumentStructure {
+        &self.document.structure_graph
+    }
+
     pub fn cross_references(&self) -> Option<&InstrumentCrossReferenceGraph> {
         self.document.structure_graph.cross_references.as_ref()
     }
@@ -242,20 +246,19 @@ fn validate_selected_pages(selected: Option<&[usize]>, count: usize) -> Result<(
 pub fn derive_pdf_document(
     value: &Value,
     include_pairing_audit: bool,
-) -> Result<(PdfDocumentResult, SourceDoc)> {
+) -> Result<PdfDocumentResult> {
     let options = parse_options(value)?;
     let selected = options.ocr_pages.clone();
     let mut document = parse_pdf(string(value, "source_pdf")?, &options)?;
     validate_selected_pages(selected.as_deref(), document.page_count)?;
-    let source_doc = source_doc(
-        &document,
-        value.get("id").and_then(Value::as_str),
-        value.get("url").and_then(Value::as_str),
-    );
+    if let Some(id) = value.get("id").and_then(Value::as_str) {
+        document.structure_graph.document_id = id.to_owned();
+    }
+    document.structure_graph.url = value.get("url").and_then(Value::as_str).map(str::to_owned);
     if !include_pairing_audit {
         document.pairing_audit = None;
     }
-    Ok((PdfDocumentResult { document }, source_doc))
+    Ok(PdfDocumentResult { document })
 }
 
 pub fn query_pdf_document(document: &PdfDocumentResult, query: &Value) -> Result<Value> {

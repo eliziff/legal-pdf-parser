@@ -18,5 +18,5 @@ pub use pairing_support::{
     protected_citation_spans,
 };
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
-pub use projection::{numeric_range, parse_ordinal, source_doc, structure_lookup};
+pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions, PreparedPPDoc};
+pub use projection::{numeric_range, parse_ordinal, project_structure, structure_lookup};

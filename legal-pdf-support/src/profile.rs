@@ -92,6 +92,19 @@ pub fn end() {
     enabled::end();
 }
 
+pub struct Scope;
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        end();
+    }
+}
+
+pub fn scope() -> Scope {
+    begin();
+    Scope
+}
+
 #[inline(always)]
 pub fn measure<T>(name: &str, operation: impl FnOnce() -> T) -> T {
     #[cfg(feature = "profiling")]

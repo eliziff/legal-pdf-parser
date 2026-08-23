@@ -34,7 +34,7 @@ legal PDF at **70.8 pages/second**.
 ## Use
 
 ```powershell
-cargo build --release --locked --package legal-structure-node
+cargo build --release --locked --manifest-path ../native/legal-structure-node/Cargo.toml
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
 legalpdf --version
 ```
