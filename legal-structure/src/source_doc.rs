@@ -300,18 +300,41 @@ fn range(kind: SourceDocKind, blocks: &[&SourceDocBlock]) -> SourceDocRange {
         .iter()
         .map(|block| block.label.to_lowercase())
         .collect::<HashSet<_>>();
-    let aliases = blocks
+    let count = blocks.len()
+        + blocks
+            .iter()
+            .flat_map(|block| block.aliases.iter().map(|label| label.to_lowercase()))
+            .filter(|label| !physical.contains(label))
+            .collect::<HashSet<_>>()
+            .len();
+    let (mut first, mut last) = (None, None);
+    let (mut lowest, mut highest) = (None, None);
+    let (mut seen, mut present) = (HashSet::new(), HashSet::new());
+    let mut all_numbered = true;
+    for block in blocks
         .iter()
-        .flat_map(|block| block.aliases.iter().map(|label| label.to_lowercase()))
-        .filter(|label| !physical.contains(label))
-        .collect::<HashSet<_>>();
-    let count = blocks.len() + aliases.len();
-    let spine = blocks
-        .iter()
-        .copied()
         .filter(|block| kind != SourceDocKind::Section || !block.label.contains('('))
-        .collect::<Vec<_>>();
-    if spine.is_empty() {
+    {
+        first.get_or_insert(block.label.as_str());
+        last = Some(block.label.as_str());
+        for label in std::iter::once(&block.label).chain(&block.aliases) {
+            if !seen.insert(label.as_str()) {
+                continue;
+            }
+            let Some(value) = number(kind, label) else {
+                all_numbered = false;
+                continue;
+            };
+            if lowest.is_none_or(|(_, current)| value < current) {
+                lowest = Some((label.as_str(), value));
+            }
+            if highest.is_none_or(|(_, current)| value > current) {
+                highest = Some((label.as_str(), value));
+            }
+            present.insert(value);
+        }
+    }
+    let Some(first) = first else {
         return SourceDocRange {
             kind,
             count,
@@ -320,43 +343,19 @@ fn range(kind: SourceDocKind, blocks: &[&SourceDocBlock]) -> SourceDocRange {
             missing: Vec::new(),
             missing_truncated: false,
         };
-    }
-    let mut seen = HashSet::new();
-    let labels = spine
-        .iter()
-        .flat_map(|block| std::iter::once(&block.label).chain(block.aliases.iter()))
-        .filter(|label| seen.insert(label.as_str()))
-        .collect::<Vec<_>>();
-    let numbered = labels
-        .iter()
-        .filter_map(|label| number(kind, label).map(|value| (*label, value)))
-        .collect::<Vec<_>>();
-    if numbered.len() != labels.len() {
+    };
+    if !all_numbered {
         return SourceDocRange {
             kind,
             count,
-            first: Some(spine[0].label.clone()),
-            last: Some(spine.last().unwrap().label.clone()),
+            first: Some(first.to_owned()),
+            last: Some(last.unwrap().to_owned()),
             missing: Vec::new(),
             missing_truncated: false,
         };
     }
-    let mut lowest = &numbered[0];
-    let mut highest = &numbered[0];
-    for entry in &numbered[1..] {
-        if entry.1 < lowest.1 {
-            lowest = entry;
-        }
-        if entry.1 > highest.1 {
-            highest = entry;
-        }
-    }
-    let present = numbered
-        .iter()
-        .map(|(_, value)| *value)
-        .collect::<HashSet<_>>();
-    let mut missing = Vec::new();
-    let mut missing_truncated = false;
+    let (lowest, highest) = (lowest.unwrap(), highest.unwrap());
+    let (mut missing, mut missing_truncated) = (Vec::new(), false);
     for value in lowest.1 + 1..highest.1 {
         if present.contains(&value) {
             continue;
@@ -379,8 +378,8 @@ fn range(kind: SourceDocKind, blocks: &[&SourceDocBlock]) -> SourceDocRange {
     SourceDocRange {
         kind,
         count,
-        first: Some(lowest.0.clone()),
-        last: Some(highest.0.clone()),
+        first: Some(lowest.0.to_owned()),
+        last: Some(highest.0.to_owned()),
         missing,
         missing_truncated,
     }
