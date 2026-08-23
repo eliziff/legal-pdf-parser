@@ -23,7 +23,11 @@ fn regex_parts(parts: &[&str], cell: &'static OnceLock<Regex>) -> &'static Regex
 }
 
 fn equal_fold(left: &str, right: &str) -> bool {
-    left.to_lowercase() == right.to_lowercase()
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left.to_lowercase() == right.to_lowercase()
+    }
 }
 
 fn block_matches(block: &SourceDocBlock, label: &str) -> bool {

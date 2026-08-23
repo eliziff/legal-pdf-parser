@@ -110,7 +110,9 @@ fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = Stri
             if hypothesis == text || seen.contains(&hypothesis) {
                 return None;
             }
-            seen.push(hypothesis.clone());
+            if stage < 3 {
+                seen.push(hypothesis.clone());
+            }
         }
         Some(hypothesis)
     })
@@ -326,7 +328,7 @@ fn push_provision_reference(
 
 #[cfg(feature = "structure-inference")]
 fn find_provision_references(
-    text: &str,
+    coordinates: &ScalarText<'_>,
     options: FindProvisionReferencesOptions<'_>,
 ) -> Vec<ProvisionReference> {
     static TRAILING_SUBDIVISIONS: OnceLock<Regex> = OnceLock::new();
@@ -335,6 +337,7 @@ fn find_provision_references(
     let allowed = options
         .words
         .map(|words| words.iter().copied().collect::<HashSet<_>>());
+    let text = coordinates.value;
     let mut found = BTreeMap::new();
 
     for captures in grammars.numeric.captures_iter(text) {
@@ -458,23 +461,24 @@ fn find_provision_references(
             None,
         );
     }
-    let mut byte = 0;
-    let mut utf16 = 0;
     let mut head = (0, 0);
     found
         .into_values()
         .map(|mut reference| {
             let start_byte = reference.start;
-            utf16 += text[byte..start_byte].encode_utf16().count();
-            byte = start_byte;
+            let start = coordinates
+                .utf16_at_byte(start_byte)
+                .expect("reference boundary");
             if let Some(head_byte) = reference.continuation_of {
                 assert_eq!(head_byte, head.0, "coordinated-list head precedes member");
                 reference.continuation_of = Some(head.1);
             } else {
-                head = (start_byte, utf16);
+                head = (start_byte, start);
             }
-            reference.start = utf16;
-            reference.end = utf16 + reference.raw.encode_utf16().count();
+            reference.start = start;
+            reference.end = coordinates
+                .utf16_at_byte(reference.end)
+                .expect("reference boundary");
             reference
         })
         .collect()
@@ -1281,15 +1285,6 @@ fn node_ambiguity_keys(node: &ReferenceNode) -> Vec<String> {
 }
 
 #[cfg(feature = "structure-inference")]
-fn node_lookup_keys(node: &ReferenceNode) -> Vec<String> {
-    let mut keys = node_ambiguity_keys(node);
-    keys.extend(node.anchor.iter().map(|key| key.to_lowercase()));
-    keys.sort();
-    keys.dedup();
-    keys
-}
-
-#[cfg(feature = "structure-inference")]
 fn label_parent(locator: &str) -> String {
     let Some(body) = locator.strip_prefix("sec") else {
         return String::new();
@@ -1382,10 +1377,14 @@ fn resolve_instrument_references(
     let mut key_counts = HashMap::<String, usize>::new();
     let mut index = HashMap::<String, Option<usize>>::new();
     for (node_index, node) in nodes.iter().enumerate() {
-        for key in node_ambiguity_keys(node) {
+        let mut keys = node_ambiguity_keys(node);
+        for key in &keys {
             *key_counts.entry(key.clone()).or_default() += 1;
         }
-        for key in node_lookup_keys(node) {
+        keys.extend(node.anchor.iter().map(|key| key.to_lowercase()));
+        keys.sort();
+        keys.dedup();
+        for key in keys {
             index
                 .entry(key)
                 .and_modify(|value| *value = None)
@@ -1463,31 +1462,29 @@ fn resolve_instrument_references(
             counts.abstained += 1;
             edge.status = InstrumentCrossReferenceStatus::Abstained;
             edge.reason = Some(InstrumentCrossReferenceReason::NoContainingSection);
-        } else if let Some(target) = index.get(&locator.to_lowercase()).and_then(|value| *value) {
-            counts.resolved += 1;
-            edge.status = InstrumentCrossReferenceStatus::Resolved;
-            edge.target_label = Some(nodes[target].label.clone());
-            edge.target_start = Some(nodes[target].start);
-            edge.target_end = Some(nodes[target].end);
-            edge.self_loop = source.is_some_and(|source| source.label == nodes[target].label);
-            counts.self_loops += usize::from(edge.self_loop);
-        } else if key_counts
-            .get(&locator.to_lowercase())
-            .copied()
-            .unwrap_or(0)
-            > 1
-        {
-            counts.abstained += 1;
-            edge.status = InstrumentCrossReferenceStatus::Abstained;
-            edge.reason = Some(InstrumentCrossReferenceReason::AmbiguousLabel);
-        } else if !numbers_here(&locator.to_lowercase()) {
-            counts.abstained += 1;
-            edge.status = InstrumentCrossReferenceStatus::Abstained;
-            edge.reason = Some(InstrumentCrossReferenceReason::DepthNotNumbered);
         } else {
-            counts.unresolved += 1;
-            edge.status = InstrumentCrossReferenceStatus::Unresolved;
-            edge.reason = Some(InstrumentCrossReferenceReason::NoSuchProvision);
+            let locator_key = locator.to_lowercase();
+            if let Some(target) = index.get(&locator_key).and_then(|value| *value) {
+                counts.resolved += 1;
+                edge.status = InstrumentCrossReferenceStatus::Resolved;
+                edge.target_label = Some(nodes[target].label.clone());
+                edge.target_start = Some(nodes[target].start);
+                edge.target_end = Some(nodes[target].end);
+                edge.self_loop = source.is_some_and(|source| source.label == nodes[target].label);
+                counts.self_loops += usize::from(edge.self_loop);
+            } else if key_counts.get(&locator_key).copied().unwrap_or(0) > 1 {
+                counts.abstained += 1;
+                edge.status = InstrumentCrossReferenceStatus::Abstained;
+                edge.reason = Some(InstrumentCrossReferenceReason::AmbiguousLabel);
+            } else if !numbers_here(&locator_key) {
+                counts.abstained += 1;
+                edge.status = InstrumentCrossReferenceStatus::Abstained;
+                edge.reason = Some(InstrumentCrossReferenceReason::DepthNotNumbered);
+            } else {
+                counts.unresolved += 1;
+                edge.status = InstrumentCrossReferenceStatus::Unresolved;
+                edge.reason = Some(InstrumentCrossReferenceReason::NoSuchProvision);
+            }
         }
         edges.push(edge);
     }
@@ -1569,8 +1566,7 @@ pub(crate) fn cross_reference_graph(
     structure: &DocumentStructure,
 ) -> Result<InstrumentCrossReferenceGraph, EngineError> {
     let text = ScalarText::new(&structure.text);
-    let references =
-        find_provision_references(text.value, FindProvisionReferencesOptions::default());
+    let references = find_provision_references(&text, FindProvisionReferencesOptions::default());
     resolve_instrument_references(&text, structure, references)
 }
 
@@ -1698,8 +1694,7 @@ fn derive_instrument_structure(
     mut hypotheses: impl Iterator<Item = String>,
 ) -> Result<(DocumentStructure, bool), EngineError> {
     let text = ScalarText::new(text);
-    let references =
-        find_provision_references(text.value, FindProvisionReferencesOptions::default());
+    let references = find_provision_references(&text, FindProvisionReferencesOptions::default());
     let endorsed = endorsed_references(&references);
     let first = hypotheses
         .next()
@@ -1747,7 +1742,7 @@ fn derive_instrument_structure(
         }
     }
     let selected_original = selected == 0 && first_is_original;
-    let scalar_end = selected_text.chars().count();
+    let scalar_end = text.len();
     let input = DocumentInput {
         schema_version: EVIDENCE_SCHEMA.to_owned(),
         document_id,
@@ -1860,16 +1855,18 @@ pub fn analyze_instrument(
     let original_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     let (mut structure, selected_original) =
         derive_instrument_structure(text, document_id, &original_sha256, &tables, hypotheses)?;
-    structure
-        .nodes
-        .extend(tables.nodes(&structure.nodes, "provider-adapter"));
-    let depths = node_depths(&structure.nodes)
-        .into_iter()
-        .map(|(id, depth)| (id.to_owned(), depth))
-        .collect::<HashMap<_, _>>();
-    structure
-        .nodes
-        .sort_by_key(|node| (node.range.start, depths[node.id.as_str()]));
+    if !tables.is_empty() {
+        structure
+            .nodes
+            .extend(tables.nodes(&structure.nodes, "provider-adapter"));
+        let depths = node_depths(&structure.nodes)
+            .into_iter()
+            .map(|(id, depth)| (id.to_owned(), depth))
+            .collect::<HashMap<_, _>>();
+        structure
+            .nodes
+            .sort_by_key(|node| (node.range.start, depths[node.id.as_str()]));
+    }
     if !selected_original {
         structure.text = text.to_owned();
         structure.text_sha256.clone_from(&original_sha256);
@@ -2022,7 +2019,10 @@ mod provision_reference_tests {
         "B. Pursuant to Section 7.4 of the Original Agreement, Parent, Sub and the Company";
 
     fn find(text: &str) -> Vec<ProvisionReference> {
-        find_provision_references(text, FindProvisionReferencesOptions::default())
+        find_provision_references(
+            &ScalarText::new(text),
+            FindProvisionReferencesOptions::default(),
+        )
     }
 
     #[test]
@@ -2135,7 +2135,7 @@ mod provision_reference_tests {
     fn restricts_the_vocabulary_on_request() {
         let text = "Section 5.3 and Schedule 2.1 and paragraph (b)";
         let found = find_provision_references(
-            text,
+            &ScalarText::new(text),
             FindProvisionReferencesOptions {
                 words: Some(&["section"]),
                 window: None,
@@ -2153,7 +2153,7 @@ mod provision_reference_tests {
     #[test]
     fn accepts_an_empty_lookaround_window() {
         let found = find_provision_references(
-            "Act Section 5 thereof",
+            &ScalarText::new("Act Section 5 thereof"),
             FindProvisionReferencesOptions {
                 words: None,
                 window: Some(0),
