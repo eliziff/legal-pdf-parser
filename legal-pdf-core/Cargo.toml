@@ -7,6 +7,8 @@ license = "MIT"
 [features]
 default = []
 ort-runtime = ["dep:ort"]
+profiling = []
+allocation-profiling = ["profiling"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
@@ -14,4 +16,5 @@ legal-structure = { path = "../../legal-structure", features = ["document-query"
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"

@@ -6,12 +6,14 @@ license = "MIT"
 
 [features]
 default = []
-profiling = []
+profiling = ["legal-pdf-core/profiling"]
+allocation-profiling = ["profiling", "legal-pdf-core/allocation-profiling"]
 ppdoc-openvino = ["dep:hayro", "dep:image", "dep:libloading"]
 ppdoc = ["ppdoc-openvino", "dep:ort", "legal-pdf-core/ort-runtime"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
+legal-structure = { path = "../../legal-structure" }
 hayro = { version = "0.7.0", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libloading = { version = "0.8", optional = true }

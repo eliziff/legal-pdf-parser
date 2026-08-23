@@ -1590,11 +1590,7 @@ fn extract_text_from_operand_impl(
 
             // Fallback: try UTF-16BE then Latin-1
             if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-                let utf16: Vec<u16> = bytes[2..]
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                    .collect();
-                let text = String::from_utf16_lossy(&utf16);
+                let text = decode_utf16be_lossy(&bytes[2..]);
                 if text.contains('\u{FFFD}') {
                     debug!(
                         "utf16 loss produced replacement for font={} bytes_len={}",
@@ -1609,11 +1605,7 @@ fn extract_text_from_operand_impl(
             if bytes.len() >= 4 && bytes.len() % 2 == 0 {
                 let nulls = bytes.iter().filter(|&&b| b == 0).count();
                 if nulls * 4 > bytes.len() {
-                    let utf16: Vec<u16> = bytes
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                        .collect();
-                    let text = String::from_utf16_lossy(&utf16);
+                    let text = decode_utf16be_lossy(bytes);
                     if score_text(&text) > 0 {
                         return Some(text);
                     }
@@ -1686,6 +1678,16 @@ fn extract_text_from_operand_impl(
         };
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
+}
+
+fn decode_utf16be_lossy(bytes: &[u8]) -> String {
+    char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+    )
+    .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect()
 }
 
 /// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen

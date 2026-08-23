@@ -21,16 +21,16 @@ use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
+use pdf_inspector_detector::detector::PageDetectionEvidence;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::{extract_page_text_items, FontProductCache};
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
-pub(crate) use fonts::FontStyleCache;
 #[cfg(test)]
 use layout::filter_markdown_page_numbers;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
@@ -42,10 +42,11 @@ pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 /// Extract fidelity text and vector geometry from a PDF the caller already loaded.
 pub fn extract_fidelity_from_doc(
     doc: &Document,
-) -> Result<(Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>), PdfError> {
+) -> Result<(PageExtraction, Vec<PageDetectionEvidence>), PdfError> {
     let font_cmaps = FontCMaps::from_doc(doc);
-    let (extraction, _, _) = extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
-    Ok(extraction)
+    let (extraction, _, _, evidence) =
+        extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
+    Ok((extraction, evidence))
 }
 
 /// Merge source-adjacent text runs for layout consumers such as table detectors.
@@ -97,7 +98,7 @@ pub fn extract_text_with_positions_preserving_scripts<P: AsRef<Path>>(
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+    let ((items, _rects, _lines, _rules), _thresholds, _gid_pages, _) =
         extract_positioned_text_from_doc_preserving_scripts(&doc, &font_cmaps, None)?;
     Ok(items)
 }
@@ -108,7 +109,7 @@ pub fn extract_text_with_positions_raw<P: AsRef<Path>>(path: P) -> Result<Vec<Te
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+    let ((items, _rects, _lines, _rules), _thresholds, _gid_pages, _) =
         extract_positioned_text_from_doc_raw(&doc, &font_cmaps, None)?;
     Ok(items)
 }
@@ -121,7 +122,7 @@ pub fn extract_text_with_positions_fidelity<P: AsRef<Path>>(
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+    let ((items, _rects, _lines, _rules), _thresholds, _gid_pages, _) =
         extract_positioned_text_from_doc_fidelity(&doc, &font_cmaps, None)?;
     Ok(items)
 }
@@ -134,7 +135,7 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines) =
+    let (items, _rects, _lines, _rules) =
         extract_text_with_positions_and_rects_with_password(path, page_filter, None)?;
     Ok(items)
 }
@@ -149,7 +150,7 @@ pub fn extract_text_with_positions_pages_with_password<P: AsRef<Path>>(
     page_filter: Option<&HashSet<u32>>,
     password: Option<&str>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines) =
+    let (items, _rects, _lines, _rules) =
         extract_text_with_positions_and_rects_with_password(path, page_filter, password)?;
     Ok(items)
 }
@@ -162,7 +163,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -177,7 +178,8 @@ pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines) = extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
+    let (items, _rects, _lines, _rules) =
+        extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
     Ok(items)
 }
 
@@ -189,7 +191,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _) =
         extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -200,6 +202,12 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
 
 /// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
 pub(crate) type PageThresholds = HashMap<u32, f32>;
+type PositionedExtraction = (
+    PageExtraction,
+    PageThresholds,
+    HashSet<u32>,
+    Vec<PageDetectionEvidence>,
+);
 
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
@@ -208,21 +216,20 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None, true, true, false)
+) -> Result<PositionedExtraction, PdfError> {
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, true, true, false)
 }
 
 fn extract_positioned_text_from_doc_preserving_scripts(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         page_filter,
         false,
-        None,
         true,
         false,
         false,
@@ -233,13 +240,12 @@ fn extract_positioned_text_from_doc_raw(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         page_filter,
         false,
-        None,
         false,
         false,
         false,
@@ -250,13 +256,12 @@ fn extract_positioned_text_from_doc_fidelity(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         page_filter,
         false,
-        None,
         false,
         false,
         true,
@@ -268,11 +273,10 @@ fn extract_positioned_text_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-    required_pages: Option<&HashSet<u32>>,
     merge_text: bool,
     merge_scripts: bool,
     fidelity: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<PositionedExtraction, PdfError> {
     let pages = doc.get_pages();
     // Decode the largest content streams before accumulated page results can
     // inflate their peak. Results are restored to page order below.
@@ -293,13 +297,18 @@ fn extract_positioned_text_impl(
     let mut extracted_pages = Vec::with_capacity(pages.len());
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
-    // Embedded-font style flags are document-scoped: the same font program
-    // is shared across pages, so parse it once, not once per page.
-    let mut style_cache = FontStyleCache::new();
+    // Font products are document-scoped: pages commonly reuse the same set.
+    let mut font_cache = FontProductCache::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
         pages.iter().map(|(num, &id)| (id, *num)).collect();
+    let mut form_items = HashMap::<u32, Vec<TextItem>>::new();
+    for item in extract_form_fields(doc, &page_id_to_num) {
+        if page_filter.is_none_or(|filter| filter.contains(&item.page)) {
+            form_items.entry(item.page).or_default().push(item);
+        }
+    }
 
     for (page_num, page_id, _) in extraction_pages {
         if let Some(filter) = page_filter {
@@ -314,7 +323,7 @@ fn extract_positioned_text_impl(
                 *page_num,
                 font_cmaps,
                 include_invisible,
-                &mut style_cache,
+                &mut font_cache,
             )
         } else if !merge_text {
             content_stream::extract_page_text_items_raw(
@@ -323,7 +332,7 @@ fn extract_positioned_text_impl(
                 *page_num,
                 font_cmaps,
                 include_invisible,
-                &mut style_cache,
+                &mut font_cache,
             )
         } else if merge_scripts {
             extract_page_text_items(
@@ -332,7 +341,7 @@ fn extract_positioned_text_impl(
                 *page_num,
                 font_cmaps,
                 include_invisible,
-                &mut style_cache,
+                &mut font_cache,
             )
         } else {
             content_stream::extract_page_text_items_preserving_scripts(
@@ -341,18 +350,16 @@ fn extract_positioned_text_impl(
                 *page_num,
                 font_cmaps,
                 include_invisible,
-                &mut style_cache,
+                &mut font_cache,
             )
         };
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) = match page_result {
+        let (
+            (mut items, mut rects, mut lines, mut rules),
+            has_gid_fonts,
+            coords_rotated,
+            detection,
+        ) = match page_result {
             Ok(extraction) => extraction,
-            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
-                debug!(
-                    "page {}: skipping context-only extraction error: {}",
-                    page_num, error
-                );
-                continue;
-            }
             Err(error) => return Err(error),
         };
         // Clip to the visible page box: single-page extracts and imposed
@@ -417,14 +424,16 @@ fn extract_positioned_text_impl(
                         };
                         rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
                         clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
+                        let on_page = |l: &PdfLine| {
                             overlaps(
                                 l.x1.min(l.x2),
                                 l.y1.min(l.y2),
                                 (l.x2 - l.x1).abs(),
                                 (l.y2 - l.y1).abs(),
                             )
-                        });
+                        };
+                        lines.retain(on_page);
+                        rules.retain(on_page);
                     }
                 }
             }
@@ -477,29 +486,31 @@ fn extract_positioned_text_impl(
             });
         }
         items.extend(links);
-        extracted_pages.push((*page_num, (items, rects, lines)));
+        items.extend(form_items.remove(page_num).unwrap_or_default());
+        extracted_pages.push((*page_num, (items, rects, lines, rules), detection));
     }
 
-    extracted_pages.sort_by_key(|(page, _)| *page);
+    extracted_pages.sort_by_key(|(page, _, _)| *page);
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
-    for (_, (items, rects, lines)) in extracted_pages {
+    let mut all_rules = Vec::new();
+    let mut detection = Vec::with_capacity(if fidelity { extracted_pages.len() } else { 0 });
+    for (_, (items, rects, lines, rules), page_detection) in extracted_pages {
         all_items.extend(items);
         all_rects.extend(rects);
         all_lines.extend(lines);
+        all_rules.extend(rules);
+        if fidelity {
+            detection.push(page_detection);
+        }
     }
 
-    // Extract AcroForm field values
-    let form_items = extract_form_fields(doc, &page_id_to_num)
-        .into_iter()
-        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
-    all_items.extend(form_items);
-
     Ok((
-        (all_items, all_rects, all_lines),
+        (all_items, all_rects, all_lines, all_rules),
         page_thresholds,
         gid_encoded_pages,
+        detection,
     ))
 }
 

@@ -6,7 +6,7 @@ mod engine;
 pub mod structure;
 mod structure_engine;
 
-#[cfg(all(feature = "profiling", feature = "fast-allocator"))]
+#[cfg(all(feature = "allocation-profiling", feature = "fast-allocator"))]
 compile_error!("profiling and fast-allocator cannot select two global allocators");
 
 #[cfg(feature = "pdf")]

@@ -9,7 +9,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 #[cfg(feature = "ocr")]
 use hayro::{render, RenderCache, RenderSettings};
 use image::{imageops, GrayImage, ImageReader, RgbaImage};
-use legal_pdf_core::{Error, Result};
+use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult};
 use ort::{
     execution_providers::CPUExecutionProvider,
@@ -17,10 +17,9 @@ use ort::{
     value::TensorRef,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -482,13 +481,13 @@ impl KrakenOcr {
         .and_then(|path| canonical_file(&path, "Tesseract layout library"))?;
         let (workers, threads) =
             recognition_schedule(options.workers, options.threads, options.backend);
-        let layout_identity = sha256_file(&tesseract_library)?;
+        let layout_identity = provider_asset_sha256(&tesseract_library)?;
         let identity = format!(
             "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}",
             options.backend.name(),
-            sha256_file(&model)?,
-            sha256_file(&codec_path)?,
-            sha256_file(&runtime)?,
+            provider_asset_sha256(&model)?,
+            provider_asset_sha256(&codec_path)?,
+            provider_asset_sha256(&runtime)?,
             options.input_height,
         );
         if options
@@ -2079,22 +2078,6 @@ pub(crate) fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
 
 fn ort_error(error: ort::Error) -> Error {
     Error::Message(format!("Kraken ONNX inference failed: {error}"))
-}
-
-pub(crate) fn sha256_file(path: &Path) -> Result<String> {
-    let mut reader = BufReader::new(File::open(path).map_err(|source| Error::io(path, source))?);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|source| Error::io(path, source))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn prepare_line(

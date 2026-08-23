@@ -188,6 +188,40 @@ pub fn detect_from_document(
 ) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
+    let title = get_document_title(doc);
+
+    Ok(classify_page_evidence(
+        page_count,
+        total_pages,
+        title,
+        config,
+        |page_num| {
+            pages
+                .get(&page_num)
+                .map(|&page_id| analyze_page_content(doc, page_id))
+        },
+    ))
+}
+
+/// Classify a document from one evidence record per page, in page order.
+pub fn detect_from_page_evidence(
+    pages: &[PageDetectionEvidence],
+    title: Option<String>,
+    config: &DetectionConfig,
+) -> PdfTypeResult {
+    let page_count = pages.len() as u32;
+    classify_page_evidence(page_count, page_count, title, config, |page_num| {
+        pages.get((page_num - 1) as usize).cloned()
+    })
+}
+
+fn classify_page_evidence(
+    page_count: u32,
+    total_pages: u32,
+    title: Option<String>,
+    config: &DetectionConfig,
+    mut page_evidence: impl FnMut(u32) -> Option<PageDetectionEvidence>,
+) -> PdfTypeResult {
 
     // Select pages to scan based on strategy
     let (sample_indices, allow_early_exit) = match &config.strategy {
@@ -215,20 +249,18 @@ pub fn detect_from_document(
     let mut pages_with_vector_text = 0u32;
     let mut total_text_ops = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
-    let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
+    let mut analysis_cache: HashMap<u32, PageDetectionEvidence> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
 
     for page_num in &sample_indices {
-        if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+        if let Some(analysis) = page_evidence(*page_num) {
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
+                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} vector_text={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
                 page_num, analysis.text_operator_count, analysis.has_images,
                 analysis.image_count, analysis.has_template_image,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
-                analysis.path_op_count, analysis.has_vector_text,
-                analysis.total_image_area, analysis.has_identity_h_no_tounicode,
+                analysis.has_vector_text, analysis.has_identity_h_no_tounicode,
                 analysis.has_only_type3_fonts, analysis.font_change_count,
                 analysis.has_decodable_text_fonts
             );
@@ -385,11 +417,10 @@ pub fn detect_from_document(
             for page_num in 1..=total_pages {
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
                     cached.clone()
-                } else if let Some(&page_id) = pages.get(&page_num) {
+                } else if let Some(a) = page_evidence(page_num) {
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -434,8 +465,7 @@ pub fn detect_from_document(
             if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
                 continue;
             }
-            if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+            if let Some(analysis) = page_evidence(page_num) {
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -461,10 +491,7 @@ pub fn detect_from_document(
         ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
     }
 
-    // Try to get title from metadata
-    let title = get_document_title(doc);
-
-    Ok(PdfTypeResult {
+    PdfTypeResult {
         pdf_type,
         page_count,
         pages_sampled,
@@ -474,7 +501,7 @@ pub fn detect_from_document(
         ocr_recommended,
         pages_needing_ocr,
         ocr_reasons_by_page,
-    })
+    }
 }
 
 /// Distribute `n` page indices evenly across `total` pages (1-indexed).
@@ -512,25 +539,21 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
     indices
 }
 
-/// Page content analysis result
-#[derive(Clone, Default)]
-struct PageAnalysis {
+/// Page signals consumed by PDF type and OCR classification.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageDetectionEvidence {
+    /// Number of text-show operators on the page.
     text_operator_count: u32,
+    /// Whether the page references any image content.
     has_images: bool,
     /// Whether page has a large background/template image (>50% coverage)
     has_template_image: bool,
-    /// Total image area in pixels (reserved for future use)
-    #[allow(dead_code)]
-    total_image_area: u64,
     /// Number of Do (XObject invocation) operators in content streams
     image_count: u32,
     /// Number of unique non-whitespace text characters found in string operands
     unique_text_chars: u32,
     /// Number of unique ASCII alphanumeric bytes (letters + digits) in string operands
     unique_alphanum_chars: u32,
-    /// Number of path construction/painting ops (m, l, c, h, f, re, etc.)
-    #[allow(dead_code)]
-    path_op_count: u32,
     /// Whether the page has vector-outlined text (massive path ops, minimal text ops)
     has_vector_text: bool,
     /// Whether the page has Type0 fonts with Identity-H/V encoding but no ToUnicode CMap.
@@ -554,7 +577,7 @@ struct PageAnalysis {
 /// (`vector_text`) come first because they persist even when a text layer is
 /// present; otherwise a page with no extractable text is `scanned` when an
 /// image backs it or `no_text` when nothing does.
-fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
+fn page_ocr_reasons(a: &PageDetectionEvidence) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if a.has_identity_h_no_tounicode || a.has_only_type3_fonts {
         reasons.push(crate::OCR_REASON_SUSPECTED_GARBLED_TEXT);
@@ -655,7 +678,7 @@ fn collect_fonts_from_resource_dict(
 fn resolve_font_names_to_ids(
     doc: &Document,
     resources: &lopdf::Dictionary,
-    font_names: &HashSet<Vec<u8>>,
+    font_names: &HashSet<&[u8]>,
     used_font_ids: &mut HashSet<ObjectId>,
 ) {
     let font_obj = match resources.get(b"Font").ok() {
@@ -708,7 +731,7 @@ fn resolve_with_shadowing(
     doc: &Document,
     own_resources: Option<&lopdf::Dictionary>,
     ancestor_resource_ids: &[ObjectId],
-    names: &HashSet<Vec<u8>>,
+    names: &HashSet<&[u8]>,
     used_font_ids: &mut HashSet<ObjectId>,
 ) {
     'name: for name in names {
@@ -732,13 +755,35 @@ fn resolve_with_shadowing(
 }
 
 /// Analyze a page's content stream for text operators and images
-fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
+fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageDetectionEvidence {
+    let contents = doc
+        .get_page_contents(page_id)
+        .into_iter()
+        .filter_map(|content_id| match doc.get_object(content_id) {
+            Ok(Object::Stream(stream)) => Some(
+                stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone()),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    analyze_page_content_streams(doc, page_id, contents.iter().map(Vec::as_slice))
+}
+
+/// Build classification evidence while reusing page streams already
+/// decompressed by the text extractor.
+pub fn analyze_page_content_streams<'a>(
+    doc: &Document,
+    page_id: ObjectId,
+    contents: impl IntoIterator<Item = &'a [u8]>,
+) -> PageDetectionEvidence {
     let mut text_ops = 0u32;
     let mut has_images = false;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
-    let mut all_unique_chars: HashSet<u8> = HashSet::new();
+    let mut all_unique_chars = [false; 256];
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
     // dictionary, producing the correct underlying font ObjectId.
@@ -749,45 +794,33 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
 
     // Get content streams for this page — these use the page's resource dict
-    let content_streams = doc.get_page_contents(page_id);
-
     // We need the page's resource dict to resolve font names from page content.
     // get_page_resources returns (Option<&Dictionary>, Vec<ObjectId>) for
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
-    for content_id in content_streams {
-        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+    for content in contents {
+        // Scan for text operators, collecting raw font names.
+        let mut page_font_names = HashSet::new();
+        let (ops, imgs, paths, fonts) =
+            scan_content_for_text_operators(content, &mut all_unique_chars, &mut page_font_names);
+        text_ops += ops;
+        image_count += imgs;
+        path_ops += paths;
+        font_changes += fonts;
+        has_images = has_images || imgs > 0;
 
-            // Scan for text operators, collecting raw font names
-            let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
-                &content,
-                &mut all_unique_chars,
-                &mut page_font_names,
+        // Resolve font names against the page's resource dictionaries,
+        // respecting PDF resource inheritance shadowing: the most-specific
+        // scope (page's own /Resources) wins over inherited ancestors.
+        if let Some((ref resource_dict, ref resource_ids)) = page_resources {
+            resolve_with_shadowing(
+                doc,
+                *resource_dict,
+                resource_ids,
+                &page_font_names,
+                &mut used_font_ids,
             );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
-
-            // Resolve font names against the page's resource dictionaries,
-            // respecting PDF resource inheritance shadowing: the most-specific
-            // scope (page's own /Resources) wins over inherited ancestors.
-            if let Some((ref resource_dict, ref resource_ids)) = page_resources {
-                resolve_with_shadowing(
-                    doc,
-                    *resource_dict,
-                    resource_ids,
-                    &page_font_names,
-                    &mut used_font_ids,
-                );
-            }
         }
     }
 
@@ -832,7 +865,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     }
 
     // Check for XObject images and calculate coverage
-    let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
+    let (found_images, _total_image_area, has_template_image) = analyze_page_images(doc, page_id);
 
     if found_images {
         has_images = true;
@@ -840,7 +873,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
-        .filter(|b| b.is_ascii_alphanumeric())
+        .enumerate()
+        .filter(|(byte, present)| **present && (*byte as u8).is_ascii_alphanumeric())
         .count() as u32;
 
     // Vector-outlined text: massive path ops with minimal text ops.
@@ -871,15 +905,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let has_decodable_text_fonts =
         text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
 
-    PageAnalysis {
+    PageDetectionEvidence {
         text_operator_count: text_ops,
         has_images,
         has_template_image,
-        total_image_area,
         image_count,
-        unique_text_chars: all_unique_chars.len() as u32,
+        unique_text_chars: all_unique_chars.iter().filter(|present| **present).count() as u32,
         unique_alphanum_chars,
-        path_op_count: path_ops,
         has_vector_text,
         has_identity_h_no_tounicode,
         has_only_type3_fonts,
@@ -1263,7 +1295,7 @@ fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
-    unique_chars: &mut HashSet<u8>,
+    unique_chars: &mut [bool; 256],
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
 ) -> (u32, u32, u32, u32) {
@@ -1300,7 +1332,7 @@ fn scan_xobjects_in_resources(
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
-                    let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    let mut xobj_font_names = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
                         &content,
                         unique_chars,
@@ -1366,10 +1398,10 @@ fn scan_xobjects_in_resources(
 ///
 /// Returns (text_op_count, image_count, path_op_count, font_change_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
-fn scan_content_for_text_operators(
-    content: &[u8],
-    unique_chars: &mut HashSet<u8>,
-    used_font_names: &mut HashSet<Vec<u8>>,
+fn scan_content_for_text_operators<'a>(
+    content: &'a [u8],
+    unique_chars: &mut [bool; 256],
+    used_font_names: &mut HashSet<&'a [u8]>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let image_count = 0u32;
@@ -1473,7 +1505,7 @@ fn scan_content_for_text_operators(
 /// whitespace to find the `/Name` token.
 ///
 /// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
-fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>> {
+fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<&[u8]> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
     while j > 0 && content[j - 1].is_ascii_whitespace() {
@@ -1504,7 +1536,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
     }
     // j-1 is the '/', font name is content[j..name_end]
     if j < name_end {
-        Some(content[j..name_end].to_vec())
+        Some(&content[j..name_end])
     } else {
         None
     }
@@ -1514,7 +1546,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize) -> Option<Vec<u8>>
 /// and collect unique non-whitespace bytes from it.
 ///
 /// Handles both literal strings `(...)` and hex strings `<...>`.
-fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut HashSet<u8>) {
+fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut [bool; 256]) {
     // Walk backward past whitespace to find the closing delimiter
     let mut j = op_pos;
     while j > 0 {
@@ -1545,7 +1577,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
         if depth == 0 && k + 1 < j {
             for &ch in &content[k + 1..j] {
                 if !ch.is_ascii_whitespace() {
-                    unique_chars.insert(ch);
+                    unique_chars[ch as usize] = true;
                 }
             }
         }
@@ -1559,25 +1591,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
             }
         }
         if content[k] == b'<' && k + 1 < j {
-            // Decode hex pairs and collect unique non-whitespace bytes
-            let hex_slice = &content[k + 1..j];
-            let hex_clean: Vec<u8> = hex_slice
-                .iter()
-                .copied()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect();
-            for pair in hex_clean.chunks(2) {
-                if pair.len() == 2 {
-                    let high = hex_val(pair[0]);
-                    let low = hex_val(pair[1]);
-                    if let (Some(h), Some(l)) = (high, low) {
-                        let byte = (h << 4) | l;
-                        if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
-                            unique_chars.insert(byte);
-                        }
-                    }
-                }
-            }
+            collect_hex_chars(&content[k + 1..j], unique_chars);
         }
     } else if closing == b']' {
         // TJ array: scan backward for '[' and collect from all strings inside
@@ -1609,7 +1623,7 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
                     // collect bytes from start..m
                     for &ch in &content[start..m] {
                         if !ch.is_ascii_whitespace() {
-                            unique_chars.insert(ch);
+                            unique_chars[ch as usize] = true;
                         }
                     }
                 } else if content[m] == b'<' {
@@ -1618,26 +1632,21 @@ fn collect_text_chars_before(content: &[u8], op_pos: usize, unique_chars: &mut H
                     while m < j && content[m] != b'>' {
                         m += 1;
                     }
-                    let hex_slice = &content[hex_start..m];
-                    let hex_clean: Vec<u8> = hex_slice
-                        .iter()
-                        .copied()
-                        .filter(|b| !b.is_ascii_whitespace())
-                        .collect();
-                    for pair in hex_clean.chunks(2) {
-                        if pair.len() == 2 {
-                            let high = hex_val(pair[0]);
-                            let low = hex_val(pair[1]);
-                            if let (Some(h), Some(l)) = (high, low) {
-                                let byte = (h << 4) | l;
-                                if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
-                                    unique_chars.insert(byte);
-                                }
-                            }
-                        }
-                    }
+                    collect_hex_chars(&content[hex_start..m], unique_chars);
                 }
                 m += 1;
+            }
+        }
+    }
+}
+
+fn collect_hex_chars(bytes: &[u8], unique_chars: &mut [bool; 256]) {
+    let mut hex = bytes.iter().copied().filter(|byte| !byte.is_ascii_whitespace());
+    while let (Some(high), Some(low)) = (hex.next(), hex.next()) {
+        if let (Some(high), Some(low)) = (hex_val(high), hex_val(low)) {
+            let byte = (high << 4) | low;
+            if !matches!(byte, 0 | b' ' | b'\t' | b'\n') {
+                unique_chars[byte as usize] = true;
             }
         }
     }
@@ -1842,7 +1851,7 @@ fn collect_images_from_resources(
 }
 
 /// Get document title from Info dictionary
-fn get_document_title(doc: &Document) -> Option<String> {
+pub fn get_document_title(doc: &Document) -> Option<String> {
     let info_ref = doc.trailer.get(b"Info").ok()?.as_reference().ok()?;
     let info = doc.get_dictionary(info_ref).ok()?;
     let title_obj = info.get(b"Title").ok()?;
@@ -1871,14 +1880,14 @@ mod tests {
     #[test]
     fn page_ocr_reasons_classify() {
         // Scanned: no text, full-page image.
-        let scanned = PageAnalysis {
+        let scanned = PageDetectionEvidence {
             has_template_image: true,
             ..Default::default()
         };
         assert_eq!(page_ocr_reasons(&scanned), vec![crate::OCR_REASON_SCANNED]);
 
         // Image-only page (no template flag, but has an image).
-        let image_only = PageAnalysis {
+        let image_only = PageDetectionEvidence {
             has_images: true,
             ..Default::default()
         };
@@ -1888,11 +1897,11 @@ mod tests {
         );
 
         // No text, no image → no_text.
-        let blank = PageAnalysis::default();
+        let blank = PageDetectionEvidence::default();
         assert_eq!(page_ocr_reasons(&blank), vec![crate::OCR_REASON_NO_TEXT]);
 
         // Vector-outlined text.
-        let vector = PageAnalysis {
+        let vector = PageDetectionEvidence {
             has_vector_text: true,
             ..Default::default()
         };
@@ -1902,7 +1911,7 @@ mod tests {
         );
 
         // Undecodable fonts → garbled, and it wins over the fall-through.
-        let garbled = PageAnalysis {
+        let garbled = PageDetectionEvidence {
             has_identity_h_no_tounicode: true,
             has_images: true,
             ..Default::default()
@@ -1914,7 +1923,7 @@ mod tests {
 
         // A page with real extractable text and an image is not flagged here
         // as scanned/no_text (only reached for pages already needing OCR).
-        let text_with_image = PageAnalysis {
+        let text_with_image = PageDetectionEvidence {
             text_operator_count: 40,
             unique_text_chars: 120,
             has_images: true,
@@ -1928,7 +1937,7 @@ mod tests {
 
     #[test]
     fn test_scan_content_operators() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
@@ -1937,20 +1946,20 @@ mod tests {
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
-        assert!(uchars.len() >= 7);
+        assert!(uchars.iter().filter(|value| **value).count() >= 7);
 
         // Content with TJ array
-        uchars.clear();
+        uchars.fill(false);
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
         let (ops2, _, _, _) =
             scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
-        assert!(uchars.len() >= 4);
+        assert!(uchars.iter().filter(|value| **value).count() >= 4);
 
         // Content with Do (XObject invocation — not counted as image here;
         // actual image detection is handled by scan_xobjects_in_resources)
-        uchars.clear();
+        uchars.fill(false);
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
         let (ops3, imgs3, _, _) =
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
@@ -1971,25 +1980,25 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, imgs, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
         assert_eq!(imgs, 0); // Do operators are not counted here
-        assert_eq!(uchars.len(), 1);
+        assert_eq!(uchars.iter().filter(|value| **value).count(), 1);
     }
 
     #[test]
     fn test_normal_text_not_image_dominated() {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, imgs, _, _) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0); // Do operators not counted here
                              // Many unique chars from the sentence
-        assert!(uchars.len() >= 5);
+        assert!(uchars.iter().filter(|value| **value).count() >= 5);
     }
 
     #[test]
@@ -2004,7 +2013,7 @@ mod tests {
         }
         content.extend_from_slice(b"f\n");
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (text, imgs, paths, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 1);
@@ -2030,7 +2039,7 @@ mod tests {
             content.extend_from_slice(b"100 200 m 150 250 l 200 200 c h f\n");
         }
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (text, _, paths, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 20);
@@ -2274,7 +2283,7 @@ mod tests {
 
     #[test]
     fn test_scan_content_counts_tf_operators() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         let (ops, _, _, fonts) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
@@ -2286,7 +2295,7 @@ mod tests {
     fn test_tf_without_trailing_whitespace() {
         // Some PDFs concatenate Tf directly with the next operator's operand,
         // e.g. "25 Tf[<01>..." or "25 Tf(<text>..."
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
 
         // Tf followed by '[' (TJ array start)
         let content = b"BT /F1 25 Tf[<01>1<02>-1] TJ ET";
@@ -2296,7 +2305,7 @@ mod tests {
         assert_eq!(ops, 1);
 
         // Tf followed by '(' (literal string)
-        uchars.clear();
+        uchars.fill(false);
         let content2 = b"BT /F1 12 Tf(Hello) Tj ET";
         let (ops2, _, _, fonts2) =
             scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
@@ -2304,7 +2313,7 @@ mod tests {
         assert_eq!(ops2, 1);
 
         // Tf followed by '<' (hex string)
-        uchars.clear();
+        uchars.fill(false);
         let content3 = b"BT /F1 12 Tf<0102> Tj ET";
         let (ops3, _, _, fonts3) =
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
@@ -2312,7 +2321,7 @@ mod tests {
         assert_eq!(ops3, 1);
 
         // Tf followed by '/' (next font name)
-        uchars.clear();
+        uchars.fill(false);
         let content4 = b"BT /F1 12 Tf/F2 10 Tf (x) Tj ET";
         let (_, _, _, fonts4) =
             scan_content_for_text_operators(content4, &mut uchars, &mut HashSet::new());
@@ -2716,24 +2725,24 @@ mod tests {
         // Standard pattern: /F1 12 Tf
         let content = b"/F1 12 Tf";
         let name = extract_font_name_before_tf(content, 6); // 'T' is at index 6
-        assert_eq!(name, Some(b"F1".to_vec()));
+        assert_eq!(name, Some(b"F1".as_slice()));
     }
 
     #[test]
     fn test_extract_font_name_long_name() {
         let content = b"/ArialMT-Bold 9.5 Tf";
         let name = extract_font_name_before_tf(content, 18);
-        assert_eq!(name, Some(b"ArialMT-Bold".to_vec()));
+        assert_eq!(name, Some(b"ArialMT-Bold".as_slice()));
     }
 
     #[test]
     fn test_scan_content_collects_used_font_names() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let mut fonts = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         scan_content_for_text_operators(content, &mut uchars, &mut fonts);
-        assert!(fonts.contains(&b"F1".to_vec()), "should collect F1");
-        assert!(fonts.contains(&b"F2".to_vec()), "should collect F2");
+        assert!(fonts.contains(b"F1".as_slice()), "should collect F1");
+        assert!(fonts.contains(b"F2".as_slice()), "should collect F2");
         assert_eq!(fonts.len(), 2);
     }
 

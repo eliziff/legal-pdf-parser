@@ -1,23 +1,35 @@
 use legal_pdf_core::model::{Footnote, FootnoteLookup, LegalDocument};
 use legal_pdf_core::{Error, Result};
 
+pub fn normalize_decimal_digit(character: char) -> Option<char> {
+    Some(match character {
+        '⁰' => '0',
+        '¹' => '1',
+        '²' => '2',
+        '³' => '3',
+        '⁴' => '4',
+        '⁵' => '5',
+        '⁶' => '6',
+        '⁷' => '7',
+        '⁸' => '8',
+        '⁹' => '9',
+        value if value.is_ascii_digit() => value,
+        _ => return None,
+    })
+}
+
+pub fn normalize_note_symbol(character: char) -> char {
+    match character {
+        '∗' | '\u{f02a}' => '*',
+        other => other,
+    }
+}
+
 pub(crate) fn normal_label(value: &str) -> String {
     let translated: String = value
         .trim()
         .chars()
-        .map(|character| match character {
-            '⁰' => '0',
-            '¹' => '1',
-            '²' => '2',
-            '³' => '3',
-            '⁴' => '4',
-            '⁵' => '5',
-            '⁶' => '6',
-            '⁷' => '7',
-            '⁸' => '8',
-            '⁹' => '9',
-            other => other,
-        })
+        .map(|character| normalize_decimal_digit(character).unwrap_or(character))
         .collect();
     if !translated.is_empty()
         && translated

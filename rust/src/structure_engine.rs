@@ -6,6 +6,8 @@ use legal_pdf_core::model::{
 };
 #[cfg(feature = "pdf")]
 use serde_json::{Map, Value};
+#[cfg(feature = "pdf")]
+use std::collections::HashMap;
 
 pub use legal_structure::{DocumentInput, DocumentStructure, EngineError as EvidenceError};
 
@@ -76,14 +78,15 @@ pub(crate) fn derive_pdf_pages(
         code: "invalid_evidence",
         message: error.to_string(),
     })?;
+    let extents_by_id = document
+        .pdf_source_map
+        .nodes
+        .iter()
+        .map(|extent| (extent.id.as_str(), extent))
+        .collect::<HashMap<_, _>>();
     let mut structure_graph = document.structure_graph;
     for node in &mut structure_graph.nodes {
-        if let Some(extent) = document
-            .pdf_source_map
-            .nodes
-            .iter()
-            .find(|extent| extent.id == node.id)
-        {
+        if let Some(extent) = extents_by_id.get(node.id.as_str()) {
             node.page_indexes.clone_from(&extent.page_indexes);
             node.line_ids.clone_from(&extent.line_ids);
         }

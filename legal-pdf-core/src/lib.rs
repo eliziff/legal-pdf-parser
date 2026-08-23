@@ -1,10 +1,13 @@
+mod asset;
 mod error;
 pub mod model;
+pub mod profile;
 mod ocr_contract;
 mod ort_backend;
 #[cfg(feature = "ort-runtime")]
 mod ort_runtime;
 mod storage;
+pub use asset::provider_asset_sha256;
 pub use error::{Error, Result};
 pub use model::*;
 pub use ocr_contract::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
@@ -12,7 +15,9 @@ pub use ort_backend::OrtBackend;
 #[cfg(feature = "ort-runtime")]
 #[doc(hidden)]
 pub use ort_runtime::init as init_ort_runtime;
-pub use storage::{atomic_write_with, python_json, read_gzip_json, write_gzip_json, write_json};
+pub use storage::{
+    atomic_write_with, python_json, read_gzip_json, write_gzip_bytes, write_gzip_json, write_json,
+};
 
 pub fn line_font_size(line: &model::Line) -> f64 {
     const INLINE_SPANS: usize = 32;

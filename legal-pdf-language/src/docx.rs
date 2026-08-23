@@ -1416,15 +1416,18 @@ fn normalized_docx_paragraph(paragraph: &XmlElement) -> Result<String> {
 }
 
 fn tolerant_docx_paragraphs(xml: &str) -> Result<Vec<String>> {
-    let paragraphs = Regex::new(r"(?s)<w:p\b[^>]*>.*?</w:p>").expect("literal DOCX regex");
-    let deletions = Regex::new(r"(?s)<w:del\b[^>]*>.*?</w:del>").expect("literal DOCX regex");
-    let text = Regex::new(r"(?s)<w:t\b[^>]*>(.*?)</w:t>").expect("literal DOCX regex");
-    paragraphs
+    static PARAGRAPHS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<w:p\b[^>]*>.*?</w:p>").expect("literal DOCX regex"));
+    static DELETIONS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<w:del\b[^>]*>.*?</w:del>").expect("literal DOCX regex"));
+    static TEXTS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<w:t\b[^>]*>(.*?)</w:t>").expect("literal DOCX regex"));
+    PARAGRAPHS
         .find_iter(xml)
         .map(|paragraph| {
-            let accepted = deletions.replace_all(paragraph.as_str(), "");
+            let accepted = DELETIONS.replace_all(paragraph.as_str(), "");
             let mut value = String::new();
-            for captures in text.captures_iter(&accepted) {
+            for captures in TEXTS.captures_iter(&accepted) {
                 value.push_str(
                     &quick_xml::escape::unescape(captures.get(1).unwrap().as_str())
                         .map_err(|error| Error::Message(error.to_string()))?,
@@ -1436,13 +1439,16 @@ fn tolerant_docx_paragraphs(xml: &str) -> Result<Vec<String>> {
 }
 
 static SUPRA: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r"(?i)supra,?[\x09-\x0D\x20\u{A0}\u{1680}\u{2000}-\u{200A}",
-        r"\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]{1,4}",
-        r"(?:note|nn?\.?)[\x09-\x0D\x20\u{A0}\u{1680}\u{2000}-\u{200A}",
-        r"\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]{1,4}",
-        r"([0-9]+)"
-    ))
+    Regex::new(
+        &[
+            r"(?i)supra,?",
+            legal_structure::JS_WHITESPACE_CLASS,
+            r"{1,4}(?:note|nn?\.?)",
+            legal_structure::JS_WHITESPACE_CLASS,
+            r"{1,4}([0-9]+)",
+        ]
+        .concat(),
+    )
     .expect("literal DOCX supra regex")
 });
 static NUMBERED_SUPRA: LazyLock<Regex> = LazyLock::new(|| {
@@ -2145,10 +2151,7 @@ fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
 pub fn analyze_docx_bytes(
     bytes: &[u8],
     document_id: String,
-) -> Result<(
-    legal_structure::DocumentStructure,
-    Vec<legal_structure::AuthoritativeTableCell>,
-)> {
+) -> Result<legal_structure::DocumentStructure> {
     let xml = docx_document_xml(bytes)?;
     let document = match parse_xml(&xml) {
         Ok(document) => document,
@@ -2158,7 +2161,7 @@ pub fn analyze_docx_bytes(
             let paragraphs = tolerant_docx_paragraphs(xml)?;
             let structure = legal_structure::analyze_docx(document_id, paragraphs, &[])
                 .map_err(|error| Error::Message(error.to_string()))?;
-            return Ok((structure, Vec::new()));
+            return Ok(structure);
         }
     };
     let root = document.root()?;
@@ -2268,9 +2271,8 @@ pub fn analyze_docx_bytes(
             }
         }
     }
-    let structure = legal_structure::analyze_docx(document_id, paragraphs, &table_cells)
-        .map_err(|error| Error::Message(error.to_string()))?;
-    Ok((structure, table_cells))
+    legal_structure::analyze_docx(document_id, paragraphs, &table_cells)
+        .map_err(|error| Error::Message(error.to_string()))
 }
 
 fn marker_re() -> &'static Regex {

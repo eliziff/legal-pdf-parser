@@ -199,6 +199,7 @@ fn anchors(text: &str) -> Result<Vec<(usize, usize, String)>> {
 }
 
 fn one_anchor_cluster(text: &str, anchors: &[(usize, usize, String)]) -> Result<bool> {
+    static COMMA: OnceLock<Regex> = OnceLock::new();
     if anchors.is_empty() {
         return Ok(false);
     }
@@ -206,8 +207,8 @@ fn one_anchor_cluster(text: &str, anchors: &[(usize, usize, String)]) -> Result<
         let previous = &pair[0];
         let current = &pair[1];
         let gap = &text[previous.1..current.0];
-        if Regex::new(r"^\s*,\s*$")
-            .expect("literal regex")
+        if COMMA
+            .get_or_init(|| Regex::new(r"^\s*,\s*$").expect("literal regex"))
             .is_match(gap)
             .map_err(|error| Error::Message(error.to_string()))?
         {
@@ -743,14 +744,21 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
         }
     }
 
+    static SIGNAL: OnceLock<Regex> = OnceLock::new();
     if anchors(text)?.is_empty()
-        && regex::Regex::new(r"(?i)^\s*(?:see|compare|cf\.?|contra)\b")
-            .unwrap()
+        && SIGNAL
+            .get_or_init(|| Regex::new(r"(?i)^\s*(?:see|compare|cf\.?|contra)\b").unwrap())
             .is_match(text)
+            .map_err(|error| Error::Message(error.to_string()))?
     {
-        let bare =
-            regex::Regex::new(r"(?i)\band\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]{2,50}\s*\.\s*$").unwrap();
-        if let Some(matched) = bare.find(text) {
+        static BARE: OnceLock<Regex> = OnceLock::new();
+        let bare = BARE.get_or_init(|| {
+            Regex::new(r"(?i)\band\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’.-]{2,50}\s*\.\s*$").unwrap()
+        });
+        if let Some(matched) = bare
+            .find(text)
+            .map_err(|error| Error::Message(error.to_string()))?
+        {
             boundaries.push((
                 matched.start(),
                 matched.start(),

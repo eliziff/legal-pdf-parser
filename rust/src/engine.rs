@@ -4,10 +4,10 @@ use legal_pdf_core::model::{
     Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Span, Word, PARSER_VERSION,
     SCHEMA_VERSION,
 };
-use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
+use legal_pdf_core::{read_gzip_json, write_gzip_bytes, Error, Result};
 use legal_pdf_extraction::{extract_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
-use legal_pdf_ocr::{OcrOptions, OcrProvider};
+use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 use legal_pdf_support::{profile, project_structure};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
@@ -18,11 +18,47 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    OnceLock,
+};
 use std::time::SystemTime;
 
 const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v1";
 const PARSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[cfg(feature = "ocr")]
+struct DeferredOcrProvider<'a> {
+    options: &'a OcrOptions,
+    prepared: Option<PreparedOcrProvider>,
+    runtime: Option<OcrProvider>,
+}
+
+#[cfg(feature = "ocr")]
+impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
+    fn extract_pages(
+        &mut self,
+        pdf_path: &Path,
+        requests: &[legal_pdf_core::OcrPageRequest],
+    ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.runtime.is_none() {
+            let prepared = self.prepared.take().ok_or_else(|| {
+                Error::Message("OCR runtime preparation was already consumed".to_owned())
+            })?;
+            self.runtime = Some(profile::measure("provider_runtime_ocr", || {
+                OcrProvider::from_prepared(self.options, prepared)
+            })?);
+        }
+        legal_pdf_core::PdfOcrProvider::extract_pages(
+            self.runtime.as_mut().expect("OCR runtime initialized"),
+            pdf_path,
+            requests,
+        )
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct CachedExtraction {
@@ -36,6 +72,7 @@ struct CachedExtraction {
 pub(crate) struct ParseOptions {
     pub cache_dir: Option<PathBuf>,
     pub use_cache: bool,
+    pub verified_source_sha256: Option<String>,
     #[cfg(feature = "ocr")]
     pub ocr: Option<OcrOptions>,
     /// Zero-based pages eligible for OCR. Native extraction still inspects the
@@ -50,6 +87,7 @@ impl Default for ParseOptions {
         Self {
             cache_dir: None,
             use_cache: true,
+            verified_source_sha256: None,
             #[cfg(feature = "ocr")]
             ocr: None,
             ocr_pages: None,
@@ -99,280 +137,198 @@ fn insert_digests(identity: &mut BTreeMap<String, Value>, digests: &[(&str, &str
     }
 }
 
-fn engine_identity() -> Value {
+fn engine_identity() -> &'static Value {
     static IDENTITY: OnceLock<Value> = OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let mut identity = BTreeMap::from([
+    IDENTITY.get_or_init(|| {
+        let mut identity = BTreeMap::from([
+            (
+                "engine".to_owned(),
+                Value::String("legal-pdf-parser-rust".to_owned()),
+            ),
+            (
+                "engine_version".to_owned(),
+                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+            ),
+            (
+                "parser_version".to_owned(),
+                Value::String(PARSER_VERSION.to_owned()),
+            ),
+            (
+                "native_extractor".to_owned(),
+                Value::String("pdf-inspector 1.14.0".to_owned()),
+            ),
+            (
+                "ocr_renderer".to_owned(),
+                Value::String(if cfg!(feature = "ocr") {
+                    "hayro 0.7.1".to_owned()
+                } else {
+                    "disabled".to_owned()
+                }),
+            ),
+        ]);
+        insert_digests(
+            &mut identity,
+            &[
                 (
-                    "engine".to_owned(),
-                    Value::String("legal-pdf-parser-rust".to_owned()),
+                    "engine.rs",
+                    "a464a8b25a5a9eaa1e58ee4682a7ce993ecbce589fbafcb7c7fff3a205e24362",
                 ),
                 (
-                    "engine_version".to_owned(),
-                    Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+                    "model.rs",
+                    "b3c02c1c938601f2a277a5a54022fdd79b939c7f8d9cbb43361600da9f5f2b09",
                 ),
                 (
-                    "parser_version".to_owned(),
-                    Value::String(PARSER_VERSION.to_owned()),
+                    "pairing.rs",
+                    "bb0bf8def5fbb3f9a12a1ebe4a8a44c3aff9fa397f14f3efa382b5a28f69ab71",
                 ),
                 (
-                    "native_extractor".to_owned(),
-                    Value::String("pdf-inspector 1.14.0".to_owned()),
+                    "pairing_support.rs",
+                    "45cb53bd9daae49ab58c0614cb61077695751318acc22bb9ae1d20c8ed3c5d80",
                 ),
                 (
-                    "ocr_renderer".to_owned(),
-                    Value::String(if cfg!(feature = "ocr") {
-                        "hayro 0.7.1".to_owned()
-                    } else {
-                        "disabled".to_owned()
-                    }),
-                ),
-            ]);
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "engine.rs",
-                        "a464a8b25a5a9eaa1e58ee4682a7ce993ecbce589fbafcb7c7fff3a205e24362",
-                    ),
-                    (
-                        "model.rs",
-                        "b3c02c1c938601f2a277a5a54022fdd79b939c7f8d9cbb43361600da9f5f2b09",
-                    ),
-                    (
-                        "pairing.rs",
-                        "bb0bf8def5fbb3f9a12a1ebe4a8a44c3aff9fa397f14f3efa382b5a28f69ab71",
-                    ),
-                    (
-                        "pairing_support.rs",
-                        "45cb53bd9daae49ab58c0614cb61077695751318acc22bb9ae1d20c8ed3c5d80",
-                    ),
-                    (
-                        "legal-pdf-pairing/lib.rs",
-                        "cec953dcd716b02b956637a6eb0c512719387af48ac42f465608ade3ac08965e",
-                    ),
-                    (
-                        "legal-pdf-core/lib.rs",
-                        "73beb349a58ff8ee1727e42978cbd3d2f260f8275506058285ae5eefe67911b8",
-                    ),
-                    (
-                        "legal-pdf-extraction/lib.rs",
-                        "fb0c3551d6041667b17d5aadd04f65ca21df98b2258330fdc612087f90501712",
-                    ),
-                    (
-                        "legal-pdf-support/lib.rs",
-                        "741860d3c2ad26f4fea0daf2876949d8b4e6aeea2f94e67a131405d3b45439db",
-                    ),
-                    (
-                        "legal-pdf-structure/lib.rs",
-                        "48b7f3234b5de89eba0f22160cb7829417accc2f8cdc539df433562926f6fe04",
-                    ),
-                    (
-                        "legal-structure/lib.rs",
-                        "4cab0f76821275e5457bcf0aa9cb2c24aafc3e320b6d05f1a8b70e85599b7b22",
-                    ),
-                    (
-                        "pdf.rs",
-                        "5df9f637cfe2426c752389a6d13163c360b92b08d00e1d608cadd08956a8298e",
-                    ),
-                    (
-                        "storage.rs",
-                        "3da41897710cdaf1992703a20a08ca5466fbe385c183d15a3b372b8bff0a76e6",
-                    ),
-                    (
-                        "structure.rs",
-                        "0d190979fee784669e5061c404ae0ed4bc9d7aaa4470cc0fbd04445c163ef914",
-                    ),
-                    (
-                        "structure-adapter.rs",
-                        "cbe430bd0e0f577a32b99e715164f447348760def362ecfb51426adb5c8cea4a",
-                    ),
-                    (
-                        "data/mcgill_reporters.json",
-                        "946e7554e8e9134d9b148d244d825e999080dd900c666cc4cf43235fa5ec9e2f",
-                    ),
-                    (
-                        "pdf-inspector/.cargo_vcs_info.json",
-                        "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
-                    ),
-                ],
-            );
-            #[cfg(feature = "language")]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "grammar_tables.rs",
-                        "089893ecc62a1965d9729ff67e85c632efb44944e2dd4dc1826c57d4f83506b7",
-                    ),
-                    (
-                        "grammar_word.rs",
-                        "e26a45bc99bcb6c7829338fd16d63ebebee29e09b11e8d0d0a1b38054c486e39",
-                    ),
-                    (
-                        "legal-pdf-language/lib.rs",
-                        "34d868a69379e6be5dd65331b4f8398c0821df48ca06a4c2bcb45118dcbc56e2",
-                    ),
-                    (
-                        "data/legal-grammar-tables/grammar-corpus.json",
-                        "8e6da9011c1cf78c609d54d53abb67b7a3e50f9a67cbf48cd72ab8136b16606f",
-                    ),
-                ],
-            );
-            #[cfg(feature = "ocr")]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "ocr.rs",
-                        "077f42d364cd18fe3e401b4deb933493e69fcbaaf060e58036c6863564a97dcc",
-                    ),
-                    (
-                        "legal-pdf-ocr/lib.rs",
-                        "92e732ac7c66484793b62c0a2c808072a26c7892afd91043daff7a455fcf52a6",
-                    ),
-                    (
-                        "separator.rs",
-                        "600736a243d5ba7c22c1f5b7ef9f2dd40e871047d3f417acac293f414a1440e8",
-                    ),
-                ],
-            );
-            #[cfg(feature = "kraken")]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "kraken.rs",
-                        "86b253e9680652c7e8abfd8bb28520a6abae80fa22c4b80cde1a12516752f718",
-                    ),
-                    (
-                        "ort_runtime.rs",
-                        "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
-                    ),
-                    (
-                        "tesseract_layout.rs",
-                        "6706a12f83cb56740028ee02f99fb37d370c992fb93b3e051b7d923c480618e6",
-                    ),
-                ],
-            );
-            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "ppdoc.rs",
-                        "412e8dec23c786fed282d536013180a9c757e5b6d46501e2bd9635e0ee38e480",
-                    ),
-                    (
-                        "ppdoc_postprocess.rs",
-                        "89c4a0f0a5d2a53532668fded947553dbac3bc79d5a7ffaf20a5718fbaf25a27",
-                    ),
-                    (
-                        "ppdoc_openvino.rs",
-                        "dc8de55bc05c4b859de273a71db061f1baf972d6325bd2dc5ce8dd89091d317c",
-                    ),
-                ],
-            );
-            #[cfg(feature = "ppdoc-full")]
-            insert_digests(
-                &mut identity,
-                &[(
-                    "ort_runtime.rs",
-                    "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
-                )],
-            );
-            #[cfg(feature = "full")]
-            insert_digests(
-                &mut identity,
-                &[(
-                    "Cargo.lock",
-                    "90b3561eeeaad70e651c0a91ec5f5e5932c406660ca52319516c24899bedfba5",
-                )],
-            );
-            json!(identity)
-        })
-        .clone()
-}
-
-fn extraction_identity() -> Value {
-    static IDENTITY: OnceLock<Value> = OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let mut identity = BTreeMap::from([
-                (
-                    "schema".to_owned(),
-                    Value::String(EXTRACTION_CACHE_SCHEMA.to_owned()),
+                    "legal-pdf-pairing/lib.rs",
+                    "cec953dcd716b02b956637a6eb0c512719387af48ac42f465608ade3ac08965e",
                 ),
                 (
-                    "native_extractor".to_owned(),
-                    Value::String("pdf-inspector 1.14.0; lopdf 0.42.0".to_owned()),
+                    "legal-pdf-core/lib.rs",
+                    "73beb349a58ff8ee1727e42978cbd3d2f260f8275506058285ae5eefe67911b8",
                 ),
-            ]);
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "model.rs",
-                        "b3c02c1c938601f2a277a5a54022fdd79b939c7f8d9cbb43361600da9f5f2b09",
-                    ),
-                    (
-                        "pdf.rs",
-                        "5df9f637cfe2426c752389a6d13163c360b92b08d00e1d608cadd08956a8298e",
-                    ),
-                    (
-                        "pdf-inspector/.cargo_vcs_info.json",
-                        "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
-                    ),
-                ],
-            );
-            #[cfg(feature = "ocr")]
-            insert_digests(
-                &mut identity,
-                &[(
+                (
+                    "legal-pdf-extraction/lib.rs",
+                    "fb0c3551d6041667b17d5aadd04f65ca21df98b2258330fdc612087f90501712",
+                ),
+                (
+                    "legal-pdf-support/lib.rs",
+                    "741860d3c2ad26f4fea0daf2876949d8b4e6aeea2f94e67a131405d3b45439db",
+                ),
+                (
+                    "legal-pdf-structure/lib.rs",
+                    "48b7f3234b5de89eba0f22160cb7829417accc2f8cdc539df433562926f6fe04",
+                ),
+                (
+                    "legal-structure/lib.rs",
+                    "4cab0f76821275e5457bcf0aa9cb2c24aafc3e320b6d05f1a8b70e85599b7b22",
+                ),
+                (
+                    "pdf.rs",
+                    "5df9f637cfe2426c752389a6d13163c360b92b08d00e1d608cadd08956a8298e",
+                ),
+                (
+                    "storage.rs",
+                    "3da41897710cdaf1992703a20a08ca5466fbe385c183d15a3b372b8bff0a76e6",
+                ),
+                (
+                    "structure.rs",
+                    "0d190979fee784669e5061c404ae0ed4bc9d7aaa4470cc0fbd04445c163ef914",
+                ),
+                (
+                    "structure-adapter.rs",
+                    "cbe430bd0e0f577a32b99e715164f447348760def362ecfb51426adb5c8cea4a",
+                ),
+                (
+                    "data/mcgill_reporters.json",
+                    "946e7554e8e9134d9b148d244d825e999080dd900c666cc4cf43235fa5ec9e2f",
+                ),
+                (
+                    "pdf-inspector/.cargo_vcs_info.json",
+                    "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
+                ),
+            ],
+        );
+        #[cfg(feature = "language")]
+        insert_digests(
+            &mut identity,
+            &[
+                (
+                    "grammar_tables.rs",
+                    "089893ecc62a1965d9729ff67e85c632efb44944e2dd4dc1826c57d4f83506b7",
+                ),
+                (
+                    "grammar_word.rs",
+                    "e26a45bc99bcb6c7829338fd16d63ebebee29e09b11e8d0d0a1b38054c486e39",
+                ),
+                (
+                    "legal-pdf-language/lib.rs",
+                    "34d868a69379e6be5dd65331b4f8398c0821df48ca06a4c2bcb45118dcbc56e2",
+                ),
+                (
+                    "data/legal-grammar-tables/grammar-corpus.json",
+                    "8e6da9011c1cf78c609d54d53abb67b7a3e50f9a67cbf48cd72ab8136b16606f",
+                ),
+            ],
+        );
+        #[cfg(feature = "ocr")]
+        insert_digests(
+            &mut identity,
+            &[
+                (
                     "ocr.rs",
                     "077f42d364cd18fe3e401b4deb933493e69fcbaaf060e58036c6863564a97dcc",
-                )],
-            );
-            #[cfg(feature = "kraken")]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "kraken.rs",
-                        "86b253e9680652c7e8abfd8bb28520a6abae80fa22c4b80cde1a12516752f718",
-                    ),
-                    (
-                        "kraken_process.rs",
-                        "c8e666d197a136a6b694ace1651d734a1ef43146c2645a10f97b01fdf372294c",
-                    ),
-                    (
-                        "tesseract_layout.rs",
-                        "6706a12f83cb56740028ee02f99fb37d370c992fb93b3e051b7d923c480618e6",
-                    ),
-                ],
-            );
-            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-            insert_digests(
-                &mut identity,
-                &[
-                    (
-                        "ppdoc.rs",
-                        "412e8dec23c786fed282d536013180a9c757e5b6d46501e2bd9635e0ee38e480",
-                    ),
-                    (
-                        "ppdoc_postprocess.rs",
-                        "89c4a0f0a5d2a53532668fded947553dbac3bc79d5a7ffaf20a5718fbaf25a27",
-                    ),
-                    (
-                        "ppdoc_openvino.rs",
-                        "dc8de55bc05c4b859de273a71db061f1baf972d6325bd2dc5ce8dd89091d317c",
-                    ),
-                ],
-            );
-            json!(identity)
-        })
-        .clone()
+                ),
+                (
+                    "legal-pdf-ocr/lib.rs",
+                    "92e732ac7c66484793b62c0a2c808072a26c7892afd91043daff7a455fcf52a6",
+                ),
+                (
+                    "separator.rs",
+                    "600736a243d5ba7c22c1f5b7ef9f2dd40e871047d3f417acac293f414a1440e8",
+                ),
+            ],
+        );
+        #[cfg(feature = "kraken")]
+        insert_digests(
+            &mut identity,
+            &[
+                (
+                    "kraken.rs",
+                    "86b253e9680652c7e8abfd8bb28520a6abae80fa22c4b80cde1a12516752f718",
+                ),
+                (
+                    "ort_runtime.rs",
+                    "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
+                ),
+                (
+                    "tesseract_layout.rs",
+                    "6706a12f83cb56740028ee02f99fb37d370c992fb93b3e051b7d923c480618e6",
+                ),
+            ],
+        );
+        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+        insert_digests(
+            &mut identity,
+            &[
+                (
+                    "ppdoc.rs",
+                    "412e8dec23c786fed282d536013180a9c757e5b6d46501e2bd9635e0ee38e480",
+                ),
+                (
+                    "ppdoc_postprocess.rs",
+                    "89c4a0f0a5d2a53532668fded947553dbac3bc79d5a7ffaf20a5718fbaf25a27",
+                ),
+                (
+                    "ppdoc_openvino.rs",
+                    "dc8de55bc05c4b859de273a71db061f1baf972d6325bd2dc5ce8dd89091d317c",
+                ),
+            ],
+        );
+        #[cfg(feature = "ppdoc-full")]
+        insert_digests(
+            &mut identity,
+            &[(
+                "ort_runtime.rs",
+                "4939b2199a0b67cba01c5a80b8a906b83ac67e48181a7665f18248b4cf3a1784",
+            )],
+        );
+        #[cfg(feature = "full")]
+        insert_digests(
+            &mut identity,
+            &[(
+                "Cargo.lock",
+                "90b3561eeeaad70e651c0a91ec5f5e5932c406660ca52319516c24899bedfba5",
+            )],
+        );
+        json!(identity)
+    })
 }
 
 fn cache_key(
@@ -395,24 +351,6 @@ fn cache_key(
     });
     let bytes = serde_json::to_vec(&value)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn extraction_cache_key(
-    source_hash: &str,
-    ocr_provider: Option<(&str, &str)>,
-    ppdoc_identity: Option<&str>,
-    ocr_pages: Option<&[usize]>,
-) -> Result<String> {
-    let value = json!({
-        "source_sha256": source_hash,
-        "extractor": extraction_identity(),
-        "ocr_provider": ocr_provider.map(|provider| provider.0),
-        "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
-        "layout_provider": ppdoc_identity.map(|_| "ppdoc-lite"),
-        "layout_provider_identity": ppdoc_identity,
-        "ocr_pages": ocr_pages,
-    });
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
 }
 
 fn build_document(
@@ -507,7 +445,7 @@ fn build_document(
         schema_version: SCHEMA_VERSION.to_owned(),
         parser_version: PARSER_VERSION.to_owned(),
     };
-    validate_document(&document)?;
+    profile::measure("build.validate_document", || validate_document(&document))?;
     Ok(document)
 }
 
@@ -528,16 +466,11 @@ fn touch_cache(path: &Path) {
     }
 }
 
-fn prune_parse_cache(root: &Path) {
-    let root = parse_cache_root(root);
-    let mut files = ["extractions", "documents"]
+fn prune_document_cache(root: &Path) {
+    let mut files = fs::read_dir(parse_cache_root(root).join("documents"))
         .into_iter()
-        .flat_map(|directory| {
-            fs::read_dir(root.join(directory))
-                .into_iter()
-                .flatten()
-                .flatten()
-        })
+        .flatten()
+        .flatten()
         .filter_map(|entry| {
             let metadata = entry.metadata().ok()?;
             metadata.is_file().then(|| {
@@ -565,8 +498,16 @@ fn prune_parse_cache(root: &Path) {
     }
 }
 
+fn maybe_prune_document_cache(root: &Path) {
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    // ponytail: amortized maintenance; rescan sooner if cache overshoot becomes material.
+    if WRITES.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
+        prune_document_cache(root);
+    }
+}
+
 pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<LegalDocument> {
-    let _profile = profile::scope();
+    let _profile = profile::scope("parse_pdf");
     let path = path.as_ref();
     if !path.is_file() {
         return Err(Error::Message(format!(
@@ -577,7 +518,8 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     if path
         .extension()
         .and_then(|value| value.to_str())
-        .is_none_or(|value| !value.eq_ignore_ascii_case("pdf"))
+        .map(|value| value.eq_ignore_ascii_case("pdf"))
+        != Some(true)
     {
         return Err(Error::Message(format!(
             "input must be a PDF: {}",
@@ -585,7 +527,10 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         )));
     }
     let path = fs::canonicalize(path).map_err(|source| Error::io(path, source))?;
-    let source_hash = profile::measure("source_sha256", || sha256_file(&path))?;
+    let source_hash = match &options.verified_source_sha256 {
+        Some(value) => value.clone(),
+        None => profile::measure("source_sha256", || sha256_file(&path))?,
+    };
     let identity = engine_identity();
     #[cfg(feature = "ocr")]
     let mut ocr_prepared = profile::measure("provider_identity_ocr", || {
@@ -615,15 +560,7 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     let ppdoc_variant: Option<String> = None;
     let key = cache_key(
         &source_hash,
-        &identity,
-        ocr_identity
-            .as_ref()
-            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-        ppdoc_identity.as_deref(),
-        options.ocr_pages.as_deref(),
-    )?;
-    let extraction_key = extraction_cache_key(
-        &source_hash,
+        identity,
         ocr_identity
             .as_ref()
             .map(|provider| (provider.0.as_str(), provider.1.as_str())),
@@ -633,15 +570,16 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     let cache_root = options
         .use_cache
         .then(|| options.cache_dir.clone().unwrap_or_else(default_cache_dir));
-    let mut document = None;
     if let Some(root) = &cache_root {
         let path = parse_cache_root(root)
             .join("documents")
             .join(format!("{key}.json.gz"));
         if path.is_file() {
-            let cached = profile::measure("document_cache_read_validate", || {
-                let cached = read_gzip_json::<LegalDocument>(&path).ok()?;
-                (cached.source_sha256 == source_hash
+            let cached = profile::measure("document_cache_read_decode", || {
+                read_gzip_json::<LegalDocument>(&path).ok()
+            });
+            let cached = cached.filter(|cached| {
+                cached.source_sha256 == source_hash
                     && cached.schema_version == SCHEMA_VERSION
                     && cached.parser_version == PARSER_VERSION
                     && cached
@@ -649,13 +587,12 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                         .get("deterministic_cache_key")
                         .and_then(Value::as_str)
                         == Some(key.as_str())
-                    && validate_document(&cached).is_ok())
-                .then_some(cached)
+                    && profile::measure("document_cache_validate", || {
+                        validate_document(cached).is_ok()
+                    })
             });
             if let Some(mut cached) = cached {
-                if cached.structure_graph.rendered_text.is_none() {
-                    profile::measure("project_structure", || project_structure(&mut cached));
-                }
+                profile::measure("project_structure", || project_structure(&mut cached));
                 cached
                     .provenance
                     .insert("cache_hit".to_owned(), Value::Bool(true));
@@ -663,124 +600,85 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                     .provenance
                     .insert("cache_enabled".to_owned(), Value::Bool(true));
                 touch_cache(&path);
-                document = Some(cached);
+                return Ok(cached);
             }
-            if document.is_none() {
-                let _ = fs::remove_file(path);
-            }
+            let _ = fs::remove_file(path);
         }
     }
-    if document.is_none() {
-        let mut extracted = cache_root.as_ref().and_then(|root| {
-            let path = parse_cache_root(root)
-                .join("extractions")
-                .join(format!("{extraction_key}.json.gz"));
-            if !path.is_file() {
-                return None;
-            }
-            match profile::measure("extraction_cache_read", || {
-                read_gzip_json::<CachedExtraction>(&path)
-            }) {
-                Ok(cached)
-                    if cached.schema_version == EXTRACTION_CACHE_SCHEMA
-                        && cached.source_sha256 == source_hash
-                        && cached.cache_key == extraction_key
-                        && cached.extraction.pages.len() == cached.extraction.separators.len() =>
-                {
-                    touch_cache(&path);
-                    Some(cached.extraction)
-                }
-                _ => {
-                    let _ = fs::remove_file(path);
-                    None
-                }
-            }
+    #[cfg(feature = "ocr")]
+    let mut ocr_provider = options
+        .ocr
+        .as_ref()
+        .zip(ocr_prepared.take())
+        .map(|(options, prepared)| DeferredOcrProvider {
+            options,
+            prepared: Some(prepared),
+            runtime: None,
         });
-        if extracted.is_none() {
-            #[cfg(feature = "ocr")]
-            let mut ocr_provider = profile::measure("provider_runtime_ocr", || {
-                options
-                    .ocr
-                    .as_ref()
-                    .zip(ocr_prepared.take())
-                    .map(|(options, prepared)| OcrProvider::from_prepared(options, prepared))
-                    .transpose()
-            })?;
-            #[cfg(feature = "ocr")]
-            let selected_ocr = ocr_provider
-                .as_mut()
-                .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
-            #[cfg(not(feature = "ocr"))]
-            let selected_ocr = None;
-            let mut fresh = profile::measure("extract_pdf", || {
-                extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())
-            })?;
-            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-            let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
-                options
-                    .ppdoc
-                    .as_ref()
-                    .zip(ppdoc_prepared.take())
-                    .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
-                    .transpose()
-            })?;
-            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-            if let Some(provider) = ppdoc.as_mut() {
-                fresh
-                    .diagnostics
-                    .extend(profile::measure("ppdoc_annotate", || {
-                        provider.annotate_pdf(&path, &mut fresh.pages)
-                    })?);
-            }
-            if let Some(root) = &cache_root {
-                let cached = CachedExtraction {
-                    schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(),
-                    source_sha256: source_hash.clone(),
-                    cache_key: extraction_key.clone(),
-                    extraction: fresh,
-                };
-                let cache_path = parse_cache_root(root)
-                    .join("extractions")
-                    .join(format!("{extraction_key}.json.gz"));
-                let _ = profile::measure("extraction_cache_write", || {
-                    write_gzip_json(&cache_path, &cached)
-                });
-                fresh = cached.extraction;
-            }
-            extracted = Some(fresh);
-        }
-        let mut parsed = profile::measure("build_document", || {
-            build_document(
-                &path,
-                &source_hash,
-                &key,
-                &identity,
-                (
-                    ocr_identity
-                        .as_ref()
-                        .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-                    ppdoc_variant.as_deref(),
-                    ppdoc_identity.as_deref(),
-                ),
-                extracted.expect("cache or parse produced an extraction"),
-            )
-        })?;
-        parsed
-            .provenance
-            .insert("cache_enabled".to_owned(), Value::Bool(options.use_cache));
-        profile::measure("project_structure", || project_structure(&mut parsed));
-        if let Some(root) = &cache_root {
-            let cache_path = parse_cache_root(root)
-                .join("documents")
-                .join(format!("{key}.json.gz"));
-            let _ = profile::measure("document_cache_write", || {
-                write_gzip_json(&cache_path, &parsed)
-            });
-            prune_parse_cache(root);
-        }
-        document = Some(parsed);
+    #[cfg(feature = "ocr")]
+    let selected_ocr = ocr_provider
+        .as_mut()
+        .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
+    #[cfg(not(feature = "ocr"))]
+    let selected_ocr = None;
+    let mut extracted = profile::measure("extract_pdf", || {
+        extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())
+    })?;
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
+        options
+            .ppdoc
+            .as_ref()
+            .zip(ppdoc_prepared.take())
+            .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
+            .transpose()
+    })?;
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    if let Some(provider) = ppdoc.as_mut() {
+        extracted
+            .diagnostics
+            .extend(profile::measure("ppdoc_annotate", || {
+                provider.annotate_pdf(&path, &mut extracted.pages)
+            })?);
     }
-    Ok(document.expect("cache or parse produced a document"))
+    let mut parsed = profile::measure("build_document", || {
+        build_document(
+            &path,
+            &source_hash,
+            &key,
+            identity,
+            (
+                ocr_identity
+                    .as_ref()
+                    .map(|provider| (provider.0.as_str(), provider.1.as_str())),
+                ppdoc_variant.as_deref(),
+                ppdoc_identity.as_deref(),
+            ),
+            extracted,
+        )
+    })?;
+    parsed
+        .provenance
+        .insert("cache_enabled".to_owned(), Value::Bool(options.use_cache));
+    profile::measure("project_structure", || project_structure(&mut parsed));
+    if let Some(root) = &cache_root {
+        let cache_path = parse_cache_root(root)
+            .join("documents")
+            .join(format!("{key}.json.gz"));
+        if let Ok(bytes) = profile::measure("document_cache_serialize", || {
+            serde_json::to_vec(&parsed)
+        }) {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let _profile = profile::scope("document_cache_background_write");
+                let _ = profile::measure("document_cache_compress_write", || {
+                    write_gzip_bytes(&cache_path, &bytes)
+                });
+                maybe_prune_document_cache(&root);
+            });
+        }
+    }
+    Ok(parsed)
 }
 
 trait FrozenOrder {
@@ -978,7 +876,7 @@ pub fn corpus_check_cached_extraction(
         Path::new(&source_name),
         &source_sha256,
         &cache_key,
-        &engine_identity(),
+        engine_identity(),
         (None, None, None),
         cached.extraction,
     )?;
@@ -1118,8 +1016,8 @@ mod tests {
     fn cache_identity_is_stable() {
         let identity = engine_identity();
         assert_eq!(
-            cache_key(&"00".repeat(32), &identity, None, None, None).unwrap(),
-            cache_key(&"00".repeat(32), &identity, None, None, None).unwrap()
+            cache_key(&"00".repeat(32), identity, None, None, None).unwrap(),
+            cache_key(&"00".repeat(32), identity, None, None, None).unwrap()
         );
     }
 }
