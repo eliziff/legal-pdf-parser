@@ -2299,25 +2299,65 @@ struct InstrumentLine<'a> {
 }
 
 fn any_instrument_marker(value: &str) -> Option<(&str, usize, InstrumentMarkerKind)> {
-    if !value
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| *byte == b'(' || byte.is_ascii_lowercase())
-    {
+    let valid_letters = |token: &str, upper: bool| {
+        let bytes = token.as_bytes();
+        let case = |byte: &u8| {
+            if upper {
+                byte.is_ascii_uppercase()
+            } else {
+                byte.is_ascii_lowercase()
+            }
+        };
+        (1..=2).contains(&bytes.len()) && bytes.iter().all(case)
+            || (1..=6).contains(&bytes.len())
+                && bytes.iter().all(|byte| {
+                    matches!(
+                        byte.to_ascii_lowercase(),
+                        b'i' | b'v' | b'x' | b'l' | b'c' | b'd' | b'm'
+                    )
+                })
+                && bytes.iter().all(case)
+    };
+    let valid_numeric = |token: &str| {
+        let mut parts = token.split('.');
+        let valid = |part: &str| {
+            (1..=3).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
+        };
+        parts.next().is_some_and(valid) && parts.next().is_none_or(valid) && parts.next().is_none()
+    };
+    if let Some(rest) = value.strip_prefix('(') {
+        let close = rest.find(')')?;
+        let token = &rest[..close];
+        if !valid_numeric(token) && !valid_letters(token, false) && !valid_letters(token, true) {
+            return None;
+        }
+        let after = &rest[close + 1..];
+        return Some((
+            token,
+            close + 2 + leading_ascii_space(after),
+            InstrumentMarkerKind::Parenthesized,
+        ));
+    }
+    let delimiter = value.find([')', '.'])?;
+    let token = &value[..delimiter];
+    if !valid_letters(token, false) {
         return None;
     }
-    let found = cached_regex!(MARKER,
-        r"^(?:\((\d{1,3}(?:\.\d{1,3})?|[a-z]{1,2}|[ivxlcdm]{1,6}|[A-Z]{1,2}|[IVXLCDM]{1,6})\)[ \t]*(.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\)[ \t]+(\S.*)|([a-z]{1,2}|[ivxlcdm]{1,6})\.[ \t]+(\S.*))$"
-    ).captures(value)?;
-    [
-        (1, 2, InstrumentMarkerKind::Parenthesized),
-        (3, 4, InstrumentMarkerKind::Tail),
-        (5, 6, InstrumentMarkerKind::Dot),
-    ]
-    .into_iter()
-    .find_map(|(token, rest, kind)| {
-        Some((found.get(token)?.as_str(), found.get(rest)?.start(), kind))
-    })
+    let after = &value[delimiter + 1..];
+    let gap = leading_ascii_space(after);
+    let content = &after[gap..];
+    if gap == 0 || content.chars().next().is_none_or(char::is_whitespace) {
+        return None;
+    }
+    Some((
+        token,
+        delimiter + 1 + gap,
+        if value.as_bytes()[delimiter] == b')' {
+            InstrumentMarkerKind::Tail
+        } else {
+            InstrumentMarkerKind::Dot
+        },
+    ))
 }
 
 fn instrument_marker(value: &str, tail: bool, dot: bool) -> Option<(&str, usize)> {
