@@ -1,7 +1,6 @@
 use crate::{
-    Coverage, CoverageState, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
-    EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
-    EVIDENCE_SCHEMA,
+    CoverageState, DetectionProfile, DocumentInput, DocumentStructure, EngineError, EvidenceKind,
+    NativeClaim, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope, EVIDENCE_SCHEMA,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -160,22 +159,7 @@ fn structure(
         claim.id = format!("native-{:06}", index + 1);
     }
     let end = text.chars().count();
-    let coverage = [
-        EvidenceKind::Paragraph,
-        EvidenceKind::Prose,
-        EvidenceKind::Page,
-        EvidenceKind::Section,
-        EvidenceKind::Heading,
-        EvidenceKind::Footnote,
-        EvidenceKind::Endnote,
-    ]
-    .into_iter()
-    .map(|kind| Coverage {
-        kind,
-        range: ScalarRange { start: 0, end },
-        state: CoverageState::Complete,
-    })
-    .collect();
+    let coverage = crate::whole_document_coverage(end, |_| CoverageState::Complete);
     let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     crate::derive_native_structure_evidence(DocumentInput {
         schema_version: EVIDENCE_SCHEMA.to_owned(),

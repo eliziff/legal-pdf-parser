@@ -50,12 +50,42 @@ pub use source_doc_query::*;
 pub use tables::AuthoritativeTableCell;
 pub(crate) use tables::AuthoritativeTables;
 pub(crate) use text::javascript_whitespace;
-pub(crate) use text::ScalarText;
-pub use text::{normalize_javascript_whitespace, utf16_len};
+pub use text::{normalize_javascript_whitespace, utf16_len, ScalarText};
 
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const DOCUMENT_STRUCTURE_SCHEMA: &str = "legalpdf.document-structure.v1";
 const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
+
+#[cfg(feature = "structure-inference")]
+fn canadian_report_start(value: &str) -> Option<u32> {
+    static REPORT: OnceLock<Regex> = OnceLock::new();
+    REPORT
+        .get_or_init(|| Regex::new(r"(?iu)\b(?:S\.?C\.?R\.?|R\.?C\.?S\.?)\s+(\d{1,4})\b").unwrap())
+        .captures(value)
+        .and_then(|capture| capture[1].parse().ok())
+}
+
+fn whole_document_coverage(
+    end: usize,
+    state: impl Fn(EvidenceKind) -> CoverageState,
+) -> Vec<Coverage> {
+    [
+        EvidenceKind::Paragraph,
+        EvidenceKind::Prose,
+        EvidenceKind::Page,
+        EvidenceKind::Section,
+        EvidenceKind::Heading,
+        EvidenceKind::Footnote,
+        EvidenceKind::Endnote,
+    ]
+    .into_iter()
+    .map(|kind| Coverage {
+        kind,
+        range: ScalarRange { start: 0, end },
+        state: state(kind),
+    })
+    .collect()
+}
 
 #[derive(Debug)]
 pub struct EngineError {

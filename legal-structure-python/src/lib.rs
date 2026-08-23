@@ -1,70 +1,18 @@
 use legal_structure_core::{
-    a2aj_document_structure, project_document_structure, A2ajInput, A2ajSourceKind, SourceDoc,
-    SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    a2aj_document_structure, project_document_structure, A2ajInput, A2ajSourceKind, ScalarText,
+    SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::types::PyAny;
 use pyo3::IntoPyObjectExt;
-use std::time::Instant;
-
-const COMPILER: &str = "legal-structure";
-
-fn required_string(payload: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
-    payload
-        .get_item(key)?
-        .ok_or_else(|| PyValueError::new_err(format!("{key} is required")))?
-        .extract()
-        .map_err(|_| PyValueError::new_err(format!("{key} must be a string")))
-}
-
-fn optional_string(payload: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
-    let Some(value) = payload.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        Ok(None)
-    } else {
-        value
-            .extract()
-            .map(Some)
-            .map_err(|_| PyValueError::new_err(format!("{key} must be a string or None")))
-    }
-}
-
-fn section_map(payload: &Bound<'_, PyDict>) -> PyResult<Option<Vec<(String, String)>>> {
-    let Some(value) = payload.get_item("sectionMap")? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    let map = value
-        .cast::<PyDict>()
-        .map_err(|_| PyValueError::new_err("sectionMap must map labels to strings"))?;
-    map.iter()
-        .map(|(label, text)| {
-            Ok((
-                label
-                    .extract()
-                    .map_err(|_| PyValueError::new_err("sectionMap must map labels to strings"))?,
-                text.extract()
-                    .map_err(|_| PyValueError::new_err("sectionMap must map labels to strings"))?,
-            ))
-        })
-        .collect::<PyResult<Vec<_>>>()
-        .map(Some)
-}
 
 fn kind_name(kind: SourceDocKind) -> &'static str {
     match kind {
         SourceDocKind::Paragraph => "paragraph",
         SourceDocKind::Page => "page",
         SourceDocKind::Section => "section",
-        SourceDocKind::Footnote => "footnote",
-        SourceDocKind::Table => "table",
-        SourceDocKind::Row => "row",
-        SourceDocKind::Cell => "cell",
+        _ => unreachable!("primary blocks are paragraphs, pages, or sections"),
     }
 }
 
@@ -75,27 +23,15 @@ fn origin_name(origin: SourceDocOrigin) -> &'static str {
     }
 }
 
-fn list<'py, T>(py: Python<'py>, values: T) -> PyResult<Bound<'py, PyList>>
-where
-    T: IntoIterator,
-    T::Item: IntoPyObject<'py>,
-    T::IntoIter: ExactSizeIterator,
-{
-    PyList::new(py, values)
-}
-
-fn block_dict<'py>(py: Python<'py>, block: &SourceDocBlock) -> PyResult<Bound<'py, PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("kind", kind_name(block.kind))?;
-    value.set_item("label", &block.label)?;
-    value.set_item(
-        "aliases",
-        list(py, block.aliases.iter().map(String::as_str))?,
-    )?;
-    value.set_item("start", block.start)?;
-    value.set_item("end", block.end)?;
-    value.set_item("origin", origin_name(block.origin))?;
-    Ok(value)
+fn parse_kind(value: &str) -> PyResult<SourceDocKind> {
+    match value {
+        "paragraph" => Ok(SourceDocKind::Paragraph),
+        "page" => Ok(SourceDocKind::Page),
+        "section" => Ok(SourceDocKind::Section),
+        _ => Err(PyValueError::new_err(
+            "kind must be paragraph, page, or section",
+        )),
+    }
 }
 
 fn text_slice(text: &[u16], start: usize, end: usize) -> PyResult<String> {
@@ -106,7 +42,10 @@ fn text_slice(text: &[u16], start: usize, end: usize) -> PyResult<String> {
         .map_err(|_| PyRuntimeError::new_err("SourceDoc block splits a Unicode character"))
 }
 
-fn numbered<'py>(py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
+fn numbered<'py>(py: Python<'py>, label: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
+    let Some(label) = label else {
+        return Ok(py.None().into_bound(py));
+    };
     let value = label
         .strip_prefix("par")
         .or_else(|| label.strip_prefix("page"))
@@ -124,151 +63,189 @@ fn numbered<'py>(py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
     }
 }
 
-fn rendition<'py>(
-    py: Python<'py>,
-    document: &SourceDoc,
-    selected: &[&SourceDocBlock],
-    kind: &str,
-) -> PyResult<Bound<'py, PyDict>> {
-    let text = document.text.encode_utf16().collect::<Vec<_>>();
-    let mut ordered = selected.to_vec();
-    ordered.sort_by_key(|block| block.start);
-    let segments = PyList::empty(py);
-    let mut cursor = 0;
-    for block in ordered {
-        if block.start > cursor {
-            let segment = PyDict::new(py);
-            segment.set_item("kind", "text")?;
-            segment.set_item("text", text_slice(&text, cursor, block.start)?)?;
-            segments.append(segment)?;
-        }
-        let segment = PyDict::new(py);
-        segment.set_item("kind", kind_name(block.kind))?;
-        segment.set_item("label", &block.label)?;
-        segment.set_item(
-            "aliases",
-            list(py, block.aliases.iter().map(String::as_str))?,
-        )?;
-        segment.set_item("origin", origin_name(block.origin))?;
-        segment.set_item("text", text_slice(&text, block.start, block.end)?)?;
-        segments.append(segment)?;
-        cursor = cursor.max(block.end);
-    }
-    if cursor < text.len() || segments.is_empty() {
-        let segment = PyDict::new(py);
-        segment.set_item("kind", "text")?;
-        segment.set_item("text", text_slice(&text, cursor, text.len())?)?;
-        segments.append(segment)?;
-    }
-    let value = PyDict::new(py);
-    value.set_item("kind", kind)?;
-    value.set_item("segments", segments)?;
-    Ok(value)
+#[pyclass(frozen)]
+struct Document {
+    source: SourceDoc,
 }
 
-fn receipt<'py>(py: Python<'py>, document: &SourceDoc) -> PyResult<Bound<'py, PyDict>> {
-    let top = |kind| {
-        document
+impl Document {
+    fn primary(&self) -> Option<(&'static str, SourceDocKind)> {
+        [
+            ("paragraphs", SourceDocKind::Paragraph),
+            ("pages", SourceDocKind::Page),
+            ("sections", SourceDocKind::Section),
+        ]
+        .into_iter()
+        .find(|(_, kind)| {
+            self.source
+                .blocks
+                .iter()
+                .any(|block| block.kind == *kind && block.parent_label.is_none())
+        })
+    }
+
+    fn top_blocks(&self, kind: SourceDocKind) -> impl Iterator<Item = &SourceDocBlock> {
+        self.source
             .blocks
             .iter()
             .filter(move |block| block.kind == kind && block.parent_label.is_none())
-            .collect::<Vec<_>>()
-    };
-    let paragraphs = top(SourceDocKind::Paragraph);
-    let pages = top(SourceDocKind::Page);
-    let sections = top(SourceDocKind::Section);
-    let (selected, kind) = if !paragraphs.is_empty() {
-        (&paragraphs, "paragraphs")
-    } else if !pages.is_empty() {
-        (&pages, "pages")
-    } else if !sections.is_empty() {
-        (&sections, "sections")
-    } else {
-        (&sections, "none")
-    };
-
-    let blocks = PyDict::new(py);
-    for (name, source) in [
-        ("paragraph", &paragraphs),
-        ("page", &pages),
-        ("section", &sections),
-    ] {
-        let values = PyList::empty(py);
-        for block in source {
-            values.append(block_dict(py, block)?)?;
-        }
-        blocks.set_item(name, values)?;
     }
-
-    let summary = PyDict::new(py);
-    summary.set_item("kind", kind)?;
-    summary.set_item("count", selected.len())?;
-    let first = match selected.first() {
-        Some(block) => numbered(py, &block.label)?,
-        None => py.None().into_bound(py),
-    };
-    let last = match selected.last() {
-        Some(block) => numbered(py, &block.label)?,
-        None => py.None().into_bound(py),
-    };
-    summary.set_item("first", first)?;
-    summary.set_item("last", last)?;
-    let span = if selected.len() > 1 {
-        let value = (selected.last().unwrap().start - selected[0].start) as f64
-            / document.text.encode_utf16().count().max(1) as f64;
-        (value * 10_000.0).round() / 10_000.0
-    } else if selected.is_empty() {
-        0.0
-    } else {
-        1.0
-    };
-    summary.set_item("span", span)?;
-
-    let value = PyDict::new(py);
-    value.set_item("compiler", COMPILER)?;
-    value.set_item("summary", summary)?;
-    value.set_item("rendition", rendition(py, document, selected, kind)?)?;
-    value.set_item("blocks", blocks)?;
-    Ok(value)
 }
 
-#[pyfunction]
-fn compile_document<'py>(py: Python<'py>, payload: &Bound<'py, PyDict>) -> PyResult<Py<PyDict>> {
-    let started = Instant::now();
-    let doc_type = match required_string(payload, "docType")?.as_str() {
-        "cases" => A2ajSourceKind::Cases,
-        "laws" => A2ajSourceKind::Laws,
-        _ => return Err(PyValueError::new_err("docType must be cases or laws")),
-    };
-    let citation = required_string(payload, "citation")?;
-    let text = required_string(payload, "text")?;
-    let sections = section_map(payload)?;
-    let input = A2ajInput {
+#[pymethods]
+impl Document {
+    #[new]
+    #[pyo3(signature = (
+        doc_type,
         citation,
-        source_kind: doc_type,
-        text: if sections.is_some() {
-            String::new()
-        } else {
-            text
-        },
-        id: None,
-        url: None,
-        dataset: optional_string(payload, "dataset")?,
-        name: optional_string(payload, "name")?,
-        alternate_citation: optional_string(payload, "alternateCitation")?,
-        section_map: sections,
-        excerpt_of: None,
-    };
-    let document = py
-        .detach(|| a2aj_document_structure(input).map(project_document_structure))
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    let value = receipt(py, &document)?;
-    let elapsed_ms = (started.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0;
-    value.set_item("elapsedMs", elapsed_ms)?;
-    Ok(value.unbind())
+        text,
+        *,
+        alternate_citation=None,
+        dataset=None,
+        name=None,
+        section_map=None
+    ))]
+    fn new(
+        py: Python<'_>,
+        doc_type: &str,
+        citation: String,
+        text: String,
+        alternate_citation: Option<String>,
+        dataset: Option<String>,
+        name: Option<String>,
+        section_map: Option<Vec<(String, String)>>,
+    ) -> PyResult<Self> {
+        let source_kind = match doc_type {
+            "cases" => A2ajSourceKind::Cases,
+            "laws" => A2ajSourceKind::Laws,
+            _ => return Err(PyValueError::new_err("doc_type must be cases or laws")),
+        };
+        let mut input = A2ajInput::new(
+            citation,
+            source_kind,
+            if section_map.is_some() {
+                String::new()
+            } else {
+                text
+            },
+        );
+        input.dataset = dataset;
+        input.name = name;
+        input.alternate_citation = alternate_citation;
+        input.section_map = section_map;
+        let source = py
+            .detach(|| a2aj_document_structure(input).map(project_document_structure))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { source })
+    }
+
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.primary().map_or("none", |(name, _)| name)
+    }
+
+    #[getter]
+    fn count(&self) -> usize {
+        self.primary()
+            .map(|(_, kind)| self.top_blocks(kind).count())
+            .unwrap_or_default()
+    }
+
+    #[getter]
+    fn first<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        numbered(
+            py,
+            self.primary()
+                .and_then(|(_, kind)| self.top_blocks(kind).next())
+                .map(|block| block.label.as_str()),
+        )
+    }
+
+    #[getter]
+    fn last<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        numbered(
+            py,
+            self.primary()
+                .and_then(|(_, kind)| self.top_blocks(kind).last())
+                .map(|block| block.label.as_str()),
+        )
+    }
+
+    #[getter]
+    fn span(&self) -> f64 {
+        let Some((_, kind)) = self.primary() else {
+            return 0.0;
+        };
+        let mut blocks = self.top_blocks(kind);
+        let Some(first) = blocks.next() else {
+            return 0.0;
+        };
+        let Some(last) = blocks.last() else {
+            return 1.0;
+        };
+        let value = (last.start - first.start) as f64
+            / self.source.text.encode_utf16().count().max(1) as f64;
+        (value * 10_000.0).round() / 10_000.0
+    }
+
+    fn blocks(&self, kind: &str) -> PyResult<Vec<(String, Vec<String>, usize, usize)>> {
+        let kind = parse_kind(kind)?;
+        let coordinates = ScalarText::new(&self.source.text);
+        self.top_blocks(kind)
+            .map(|block| {
+                Ok((
+                    block.label.clone(),
+                    block.aliases.clone(),
+                    coordinates.scalar_at_utf16(block.start).ok_or_else(|| {
+                        PyRuntimeError::new_err("SourceDoc block starts inside a Unicode character")
+                    })?,
+                    coordinates.scalar_at_utf16(block.end).ok_or_else(|| {
+                        PyRuntimeError::new_err("SourceDoc block ends inside a Unicode character")
+                    })?,
+                ))
+            })
+            .collect()
+    }
+
+    fn segments(&self) -> PyResult<Vec<(String, Option<String>, Option<String>, String)>> {
+        let text = self.source.text.encode_utf16().collect::<Vec<_>>();
+        let mut blocks = self
+            .primary()
+            .map(|(_, kind)| self.top_blocks(kind).collect::<Vec<_>>())
+            .unwrap_or_default();
+        blocks.sort_by_key(|block| block.start);
+        let mut segments = Vec::with_capacity(blocks.len() * 2 + 1);
+        let mut cursor = 0;
+        for block in blocks {
+            if block.start > cursor {
+                segments.push((
+                    "text".to_owned(),
+                    None,
+                    None,
+                    text_slice(&text, cursor, block.start)?,
+                ));
+            }
+            segments.push((
+                kind_name(block.kind).to_owned(),
+                Some(block.label.clone()),
+                Some(origin_name(block.origin).to_owned()),
+                text_slice(&text, block.start, block.end)?,
+            ));
+            cursor = cursor.max(block.end);
+        }
+        if cursor < text.len() || segments.is_empty() {
+            segments.push((
+                "text".to_owned(),
+                None,
+                None,
+                text_slice(&text, cursor, text.len())?,
+            ));
+        }
+        Ok(segments)
+    }
 }
 
 #[pymodule]
 fn legal_structure(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(compile_document, module)?)
+    module.add_class::<Document>()
 }

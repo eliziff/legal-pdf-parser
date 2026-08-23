@@ -790,5 +790,3 @@ mod tests {
         assert!(anchored >= 10);
     }
 }
-
-

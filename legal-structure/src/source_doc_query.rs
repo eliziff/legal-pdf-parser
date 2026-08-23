@@ -1,6 +1,7 @@
 use crate::{
-    javascript_whitespace, InstrumentCrossReferenceGraph, InstrumentCrossReferenceStatus,
-    ScalarText, SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    javascript_whitespace, text::trim_javascript_whitespace as js_trim,
+    InstrumentCrossReferenceGraph, InstrumentCrossReferenceStatus, ScalarText, SourceDoc,
+    SourceDocBlock, SourceDocKind, SourceDocOrigin,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -18,10 +19,6 @@ fn regex(pattern: &'static str, cell: &'static OnceLock<Regex>) -> &'static Rege
 
 fn regex_parts(parts: &[&str], cell: &'static OnceLock<Regex>) -> &'static Regex {
     cell.get_or_init(|| Regex::new(&parts.concat()).expect("query regex must compile"))
-}
-
-fn js_trim(value: &str) -> &str {
-    value.trim_matches(javascript_whitespace)
 }
 
 fn equal_fold(left: &str, right: &str) -> bool {

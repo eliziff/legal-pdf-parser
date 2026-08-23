@@ -1,6 +1,8 @@
-use crate::text::{javascript_whitespace, normalize_javascript_whitespace};
+use crate::text::{
+    javascript_whitespace, normalize_javascript_whitespace, trim_javascript_whitespace as trim_js,
+};
 use crate::{
-    derive::derive_trusted, utf16_len, CitedAuthority, Coverage, CoverageState, DetectionProfile,
+    derive::derive_trusted, utf16_len, CitedAuthority, CoverageState, DetectionProfile,
     DocumentInput, DocumentStructure, EngineError, EvidenceKind, Exclusion, NativeClaim, Origin,
     ParagraphBreak, ScalarRange, ScalarText, Scope, ScopeKind, SourceDocProvider, SourceDocType,
     EVIDENCE_SCHEMA,
@@ -118,10 +120,6 @@ struct RenderedMarkup {
     cited_authorities: Vec<CitedAuthority>,
     source_hash: String,
     harvard_casebody: bool,
-}
-
-fn trim_js(value: &str) -> &str {
-    value.trim_matches(javascript_whitespace)
 }
 
 fn contains_ascii_word(value: &str, word: &str, insensitive: bool) -> bool {
@@ -1247,11 +1245,7 @@ fn render_markup(
 }
 
 fn report_start(citation: Option<&str>) -> Option<u32> {
-    static REPORT: OnceLock<Regex> = OnceLock::new();
-    REPORT
-        .get_or_init(|| Regex::new(r"(?i)\b(?:S\.?C\.?R\.?|R\.?C\.?S\.?)\s+(\d{1,4})\b").unwrap())
-        .captures(citation.unwrap_or_default())
-        .and_then(|capture| capture[1].parse().ok())
+    citation.and_then(crate::canadian_report_start)
 }
 
 #[derive(Serialize)]
@@ -1380,29 +1374,13 @@ fn native_markup_evidence(
         .map(|block| block.kind.evidence())
         .collect::<HashSet<_>>();
     let scalar_end = coordinates.len();
-    let coverage = [
-        EvidenceKind::Paragraph,
-        EvidenceKind::Prose,
-        EvidenceKind::Page,
-        EvidenceKind::Section,
-        EvidenceKind::Heading,
-        EvidenceKind::Footnote,
-        EvidenceKind::Endnote,
-    ]
-    .into_iter()
-    .map(|kind| Coverage {
-        kind,
-        range: ScalarRange {
-            start: 0,
-            end: scalar_end,
-        },
-        state: if native_kinds.contains(&kind) {
+    let coverage = crate::whole_document_coverage(scalar_end, |kind| {
+        if native_kinds.contains(&kind) {
             CoverageState::Augment
         } else {
             CoverageState::Absent
-        },
-    })
-    .collect();
+        }
+    });
     let exclusions = rendered_exclusions
         .iter()
         .map(|range| {

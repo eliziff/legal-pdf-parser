@@ -2449,11 +2449,13 @@ fn compare_child_values(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-fn admitted_dialects<'a>(source: impl Iterator<Item = InstrumentLine<'a>>) -> (bool, bool) {
+fn admitted_dialects(source: &[Line<'_>]) -> (bool, bool) {
     let mut live = [HashMap::<u8, (String, usize)>::new(), HashMap::new()];
     let mut best = [0, 0];
     for line in source {
-        let Some((token, _, kind)) = line.marker else {
+        let Some((token, _, kind)) =
+            any_instrument_marker(line.text.trim_matches(instrument_space))
+        else {
             continue;
         };
         let index = match kind {
@@ -2835,7 +2837,7 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
         .into_iter()
         .peekable();
     let direct = spine.peek().is_none();
-    let dialects = admitted_dialects(instrument_lines(&lines));
+    let dialects = admitted_dialects(&lines);
     let mut state = StructureState::default();
     for source in instrument_lines(&lines) {
         let (line, value, start) = (source.line, source.value, source.start);

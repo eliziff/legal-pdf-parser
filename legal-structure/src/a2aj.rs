@@ -1,5 +1,5 @@
 use crate::{
-    utf16_len, Block, Coverage, CoverageState, Derivation, DetectionProfile, DocumentInput,
+    utf16_len, Block, CoverageState, Derivation, DetectionProfile, DocumentInput,
     DocumentStructure, EngineError, EvidenceKind, NativeClaim, NodeKind, Origin, ParagraphBreak,
     ScalarRange, ScalarText, Scope, ScopeKind, SourceDocType, EVIDENCE_SCHEMA,
 };
@@ -211,29 +211,13 @@ fn evidence(
 ) -> Result<DocumentInput, EngineError> {
     let coordinates = ScalarText::new(&text);
     let scalar_end = coordinates.len();
-    let coverage = [
-        EvidenceKind::Paragraph,
-        EvidenceKind::Prose,
-        EvidenceKind::Page,
-        EvidenceKind::Section,
-        EvidenceKind::Heading,
-        EvidenceKind::Footnote,
-        EvidenceKind::Endnote,
-    ]
-    .into_iter()
-    .map(|kind| Coverage {
-        kind,
-        range: crate::ScalarRange {
-            start: 0,
-            end: scalar_end,
-        },
-        state: if kind == EvidenceKind::Section && !claims.is_empty() {
+    let coverage = crate::whole_document_coverage(scalar_end, |kind| {
+        if kind == EvidenceKind::Section && !claims.is_empty() {
             CoverageState::Augment
         } else {
             CoverageState::Absent
-        },
-    })
-    .collect();
+        }
+    });
     let source_kind = input.source_kind;
     let profile = if source_kind == A2ajSourceKind::Cases {
         DetectionProfile::CaseRootedComplete
@@ -293,15 +277,9 @@ fn evidence(
 }
 
 fn report_start(input: &A2ajInput) -> Option<u32> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE
-        .get_or_init(|| Regex::new(r"(?iu)\b(?:S\.?C\.?R\.?|R\.?C\.?S\.?)\s+(\d{1,4})\b").unwrap());
     std::iter::once(input.citation.as_str())
         .chain(input.alternate_citation.as_deref())
-        .find_map(|value| {
-            re.captures(value)
-                .and_then(|capture| capture[1].parse().ok())
-        })
+        .find_map(crate::canadian_report_start)
 }
 
 fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {

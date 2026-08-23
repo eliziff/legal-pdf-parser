@@ -6,7 +6,7 @@
 
 use std::{ops::Range, sync::OnceLock};
 
-pub(crate) struct ScalarText<'a> {
+pub struct ScalarText<'a> {
     pub(crate) value: &'a str,
     /// Sparse `[scalar, byte, utf16]` checkpoints; ASCII is identity.
     offsets: Vec<[usize; 3]>,
@@ -16,7 +16,7 @@ pub(crate) struct ScalarText<'a> {
 }
 
 impl<'a> ScalarText<'a> {
-    pub(crate) fn new(value: &'a str) -> Self {
+    pub fn new(value: &'a str) -> Self {
         if value.is_ascii() {
             return Self {
                 value,
@@ -149,7 +149,7 @@ impl<'a> ScalarText<'a> {
             .expect("scalar offset must be in bounds")
     }
 
-    pub(crate) fn scalar_at_utf16(&self, utf16: usize) -> Option<usize> {
+    pub fn scalar_at_utf16(&self, utf16: usize) -> Option<usize> {
         self.byte_at_utf16(utf16)
             .and_then(|byte| self.scalar_at_byte(byte))
     }
@@ -219,6 +219,14 @@ pub fn utf16_len(value: &str) -> usize {
 /// terminators and BOM, deliberately excluding U+0085.
 pub(crate) fn javascript_whitespace(character: char) -> bool {
     character == '\u{feff}' || (character != '\u{0085}' && character.is_whitespace())
+}
+
+pub(crate) fn trim_javascript_whitespace(value: &str) -> &str {
+    value.trim_matches(javascript_whitespace)
+}
+
+pub(crate) fn trim_javascript_start(value: &str) -> &str {
+    value.trim_start_matches(javascript_whitespace)
 }
 
 /// Collapse ECMAScript whitespace runs to one ASCII space and trim runs at
