@@ -1,11 +1,12 @@
-use crate::{derive_docx_numbering, javascript_whitespace, DocxNumberAnchor};
+use crate::{
+    derive_docx_numbering, javascript_whitespace, text::JS_WHITESPACE_CLASS, DocxNumberAnchor,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const LABELS: [&str; 5] = ["Schedule", "Exhibit", "Appendix", "Annex", "Annexure"];
-const JS_WS: &str = r"\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
 const MAX_FINDINGS: usize = 200;
 const EXCERPT_LENGTH: usize = 160;
 
@@ -120,7 +121,7 @@ pub struct DocxStructureFacts {
 fn reference_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| Regex::new(&format!(
-        r"(?-u:\b)(Section|Sections|Clause|Clauses|Article|Articles|Paragraph|Paragraphs)[{JS_WS}]+(\d{{1,3}}(?:\.\d{{1,3}})*|[IVXLCDM]+)(?-u:\b)"
+        r"(?-u:\b)(Section|Sections|Clause|Clauses|Article|Articles|Paragraph|Paragraphs){JS_WHITESPACE_CLASS}+(\d{{1,3}}(?:\.\d{{1,3}})*|[IVXLCDM]+)(?-u:\b)"
     )).unwrap())
 }
 
@@ -128,7 +129,7 @@ fn external_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(&format!(
-            r"(?i)^[{JS_WS}]*(?:\([a-z0-9]{{1,4}}\)[{JS_WS}]*)?(?:of|to|under)[{JS_WS}]+((?-u:\w+))"
+            r"(?i)^{JS_WHITESPACE_CLASS}*(?:\([a-z0-9]{{1,4}}\){JS_WHITESPACE_CLASS}*)?(?:of|to|under){JS_WHITESPACE_CLASS}+((?-u:\w+))"
         ))
         .unwrap()
     })
@@ -215,7 +216,7 @@ fn attachment_pattern(label: &str, anchor: bool) -> Regex {
     let prefix = if anchor { "(?i)^" } else { r"(?-u:\b)" };
     let plural = if anchor { "" } else { "s?" };
     Regex::new(&format!(
-        r"{prefix}{label}{plural}[{JS_WS}]+(\d{{1,3}}|[A-Z]{{1,3}})(?-u:\b)"
+        r"{prefix}{label}{plural}{JS_WHITESPACE_CLASS}+(\d{{1,3}}|[A-Z]{{1,3}})(?-u:\b)"
     ))
     .unwrap()
 }

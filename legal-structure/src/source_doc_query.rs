@@ -1,8 +1,9 @@
 use crate::{
-    javascript_whitespace, locator::normalize_numbered_section_locator,
-    text::trim_javascript_whitespace as js_trim, InstrumentCrossReferenceGraph,
-    InstrumentCrossReferenceStatus, ScalarText, SourceDoc, SourceDocBlock, SourceDocKind,
-    SourceDocOrigin,
+    javascript_whitespace,
+    locator::normalize_numbered_section_locator,
+    text::{trim_javascript_whitespace as js_trim, JS_WHITESPACE_CLASS as JS_WS},
+    InstrumentCrossReferenceGraph, InstrumentCrossReferenceStatus, ScalarText, SourceDoc,
+    SourceDocBlock, SourceDocKind, SourceDocOrigin,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,6 @@ use std::sync::{
 
 mod text_fragment;
 pub use text_fragment::text_fragment_directives;
-
-const JS_WS: &str = r"[\u{0009}-\u{000d}\u{0020}\u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}]";
 
 fn regex(pattern: &'static str, cell: &'static OnceLock<Regex>) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pattern).expect("query regex must compile"))
