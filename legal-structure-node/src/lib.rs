@@ -4,10 +4,10 @@ use legal_structure::{
     derive_document_structure, docx_structure_lint, grounded_prose_errors, has_citation_in_text,
     journal_document_structure, journal_text_document_structure, marked_quote_spans,
     normalize_source_doc_locator, parse_address, phrase_spans, project_document_structure_view,
-    quote_repair_suggestion, quote_words, text_fragment_directives, tokenize_source_text,
-    A2ajInput, AuthoritativeTableCell, DocumentInput, DocumentStructure, FollowDirection,
-    InstrumentCrossReferenceGraph, JournalPageLabel, NativeMarkupInput, PhraseOptions, SourceDoc,
-    SourceDocKind, SourceDocOrigin, SourceDocQuery, VisibleEvidenceText,
+    provider_citations_in_text, quote_repair_suggestion, quote_words, text_fragment_directives,
+    tokenize_source_text, A2ajInput, AuthoritativeTableCell, DocumentInput, DocumentStructure,
+    FollowDirection, InstrumentCrossReferenceGraph, JournalPageLabel, NativeMarkupInput,
+    PhraseOptions, SourceDoc, SourceDocKind, SourceDocOrigin, SourceDocQuery, VisibleEvidenceText,
 };
 use napi::{
     bindgen_prelude::{AsyncTask, Buffer, External, ExternalRef},
@@ -528,6 +528,11 @@ pub fn citations_in_text_node(
     extended_us_fallback: bool,
 ) -> napi::Result<Unknown<'static>> {
     js_value(env, &citations_in_text(&text, extended_us_fallback))
+}
+
+#[napi(js_name = "providerCitationsInText")]
+pub fn provider_citations_in_text_node(env: Env, text: String) -> napi::Result<Unknown<'static>> {
+    js_value(env, &provider_citations_in_text(&text))
 }
 
 #[napi(js_name = "caselawCitationLookupKey")]

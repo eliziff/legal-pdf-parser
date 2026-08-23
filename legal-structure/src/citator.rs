@@ -36,6 +36,28 @@ pub struct CitationMatch<'a> {
     pub end: usize,
 }
 
+#[derive(Serialize)]
+pub struct ProviderCitationMatch<'a> {
+    pub text: &'a str,
+    pub start: usize,
+    pub end: usize,
+    pub family: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jurisdiction: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub court: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<&'a str>,
+}
+
 fn ecmascript(pattern: &str, flags: &str) -> CompiledEcmascriptGrammar {
     legal_grammar_tables::compile_ecmascript_pattern("citator", pattern, flags)
         .expect("frozen citator regex")
@@ -43,6 +65,9 @@ fn ecmascript(pattern: &str, flags: &str) -> CompiledEcmascriptGrammar {
 
 static CITATION_PATTERN: LazyLock<CompiledEcmascriptGrammar> =
     LazyLock::new(|| legal_grammar_tables::compile_ecmascript_table_entry("cite.in-text").unwrap());
+static ROUTING_PATTERN: LazyLock<CompiledEcmascriptGrammar> = LazyLock::new(|| {
+    legal_grammar_tables::compile_ecmascript_table_entry("cite.provider-routing").unwrap()
+});
 static RESIDUAL_CUE: LazyLock<CompiledEcmascriptGrammar> = LazyLock::new(|| {
     legal_grammar_tables::compile_ecmascript_table_entry("cite.us.fallback-cue").unwrap()
 });
@@ -200,6 +225,50 @@ fn citation_hits(value: &str, extended_us_fallback: bool) -> Vec<Hit> {
         resolved.push(hit);
     }
     resolved
+}
+
+pub fn provider_citations_in_text(text: &str) -> Vec<ProviderCitationMatch<'_>> {
+    let document = ScalarText::new(text);
+    ROUTING_PATTERN
+        .captures_iter(text)
+        .map(|captures| {
+            let matched = captures.get(0).unwrap();
+            let has = |name| captures.name(name).is_some();
+            let (family, jurisdiction) = if has("uk_neutral") {
+                ("neutral", Some("uk"))
+            } else if has("ca_statute") {
+                ("statute", Some("ca"))
+            } else if has("ca_reporter") {
+                ("reporter", Some("ca"))
+            } else if has("ca_neutral") {
+                ("neutral", Some("ca"))
+            } else if has("us_reporter") {
+                ("reporter", Some("us"))
+            } else if has("neutral") {
+                ("neutral", None)
+            } else {
+                ("reporter", None)
+            };
+            let group = |names: &[&str]| {
+                names
+                    .iter()
+                    .find_map(|name| captures.name(name).map(|capture| capture.as_str()))
+            };
+            ProviderCitationMatch {
+                text: matched.as_str(),
+                start: document.utf16_at_byte(matched.start()).unwrap(),
+                end: document.utf16_at_byte(matched.end()).unwrap(),
+                family,
+                jurisdiction,
+                year: group(&["uk_year", "ca_year", "year"]),
+                court: group(&["uk_court", "ca_court", "court"]),
+                number: group(&["uk_num", "ca_num", "num"]),
+                volume: group(&["us_volume", "volume"]),
+                reporter: group(&["us_reporter_name", "reporter"]),
+                page: group(&["us_page", "page"]),
+            }
+        })
+        .collect()
 }
 
 pub fn citations_in_text(text: &str, extended_us_fallback: bool) -> Vec<CitationMatch<'_>> {
