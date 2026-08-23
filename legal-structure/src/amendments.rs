@@ -1373,8 +1373,7 @@ fn reference_text(raw: &str, raw_label: &str, locator: &str) -> String {
     let full = locator.strip_prefix("sec").unwrap_or(locator);
     let label = if raw_label.starts_with('(') {
         let depth = raw_label.matches('(').count();
-        let subs = Regex::new(r"\([^()]+\)")
-            .unwrap()
+        let subs = cached!(SUBPROVISIONS, r"\([^()]+\)", "")
             .find_iter(full)
             .map(|item| item.as_str())
             .collect::<Vec<_>>();
@@ -1385,10 +1384,10 @@ fn reference_text(raw: &str, raw_label: &str, locator: &str) -> String {
     if label == raw_label {
         return raw.to_owned();
     }
-    Regex::new(r"[\d(]").unwrap().find(raw).map_or_else(
-        || raw.to_owned(),
-        |at| format!("{}{}", &raw[..at.start()], label),
-    )
+    match cached!(REFERENCE_START, r"[\d(]", "").find(raw) {
+        Some(at) => format!("{}{}", &raw[..at.start()], label),
+        None => raw.to_owned(),
+    }
 }
 
 fn delete_failure(code: &str, detail: String, range: Option<(usize, usize)>) -> Value {
