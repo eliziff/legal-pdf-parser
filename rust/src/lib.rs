@@ -24,8 +24,9 @@ pub use legal_pdf_core::{Error, Result};
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
     analyze_docx_bytes, apply_docx_links, assess_docx_route, compile_table_entry,
-    deterministic_docx_intents, extract_docx_gold, load_tables, plan_docx_links, plan_footnotes,
-    run_grammar_vectors, validate_docx_response, DocxPlanOptions,
+    deterministic_docx_intents, extract_docx_gold, fix_docx_supra_cross_references,
+    has_docx_supra_references, load_tables, plan_docx_links, plan_footnotes, run_grammar_vectors,
+    validate_docx_response, DocxPlanOptions, DocxSupraCleanup, MAX_DOCX_SUPRA_BYTES,
 };
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{

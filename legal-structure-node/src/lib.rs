@@ -2,14 +2,14 @@ use legal_structure::{
     a2aj_document_structure, analyze_instrument, analyze_native_markup, derive_document_structure,
     docx_structure_lint, journal_document_structure, journal_text_document_structure,
     normalize_source_doc_locator, parse_address, phrase_spans, project_document_structure_view,
-    quote_text, quote_words, tokenize_source_text, A2ajInput, AuthoritativeTableCell,
+    quote_words, text_fragment_directives, tokenize_source_text, A2ajInput, AuthoritativeTableCell,
     DocumentInput, DocumentStructure, FollowDirection, InstrumentCrossReferenceGraph,
     JournalPageLabel, NativeMarkupInput, PhraseOptions, SourceDoc, SourceDocKind, SourceDocOrigin,
     SourceDocQuery,
 };
 use napi::{
     bindgen_prelude::{AsyncTask, Buffer, External, ExternalRef},
-    Env, Error, Task,
+    Env, Error, Task, Unknown,
 };
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
@@ -123,10 +123,8 @@ struct SourceDocAnchor<'a> {
     parent_label: Option<&'a str>,
 }
 
-fn json_buffer(value: &impl Serialize) -> napi::Result<Buffer> {
-    serde_json::to_vec(value)
-        .map(Buffer::from)
-        .map_err(|error| Error::from_reason(error.to_string()))
+fn js_value(env: Env, value: &impl Serialize) -> napi::Result<Unknown<'static>> {
+    env.to_js_value(value)
 }
 
 fn source_doc_kind(value: &str) -> napi::Result<SourceDocKind> {
@@ -225,6 +223,106 @@ pub struct DeriveDocxDocumentTask {
     id: String,
 }
 
+#[napi(object)]
+pub struct DocxSupraReasonsNode {
+    #[napi(js_name = "restarted_numbering")]
+    pub restarted_numbering: bool,
+    #[napi(js_name = "unsafe_or_split_fields")]
+    pub unsafe_or_split_fields: u32,
+}
+
+#[napi(object)]
+pub struct DocxSupraCleanupNode {
+    pub bytes: Buffer,
+    pub detected: u32,
+    pub converted: u32,
+    #[napi(js_name = "already_linked")]
+    pub already_linked: u32,
+    #[napi(js_name = "review_required")]
+    pub review_required: u32,
+    #[napi(js_name = "bookmarks_added")]
+    pub bookmarks_added: u32,
+    pub reasons: DocxSupraReasonsNode,
+}
+
+impl From<legalpdf::DocxSupraCleanup> for DocxSupraCleanupNode {
+    fn from(result: legalpdf::DocxSupraCleanup) -> Self {
+        Self {
+            bytes: result.bytes.into(),
+            detected: result.detected as u32,
+            converted: result.converted as u32,
+            already_linked: result.already_linked as u32,
+            review_required: result.review_required as u32,
+            bookmarks_added: result.bookmarks_added as u32,
+            reasons: DocxSupraReasonsNode {
+                restarted_numbering: result.restarted_numbering,
+                unsafe_or_split_fields: result.unsafe_or_split_fields as u32,
+            },
+        }
+    }
+}
+
+pub struct FixDocxSuprasTask {
+    bytes: Vec<u8>,
+}
+
+fn docx_supra_bytes(bytes: Buffer) -> napi::Result<Vec<u8>> {
+    if bytes.is_empty() || bytes.len() > legalpdf::MAX_DOCX_SUPRA_BYTES {
+        return Err(Error::from_reason(
+            "DOCX is empty or exceeds the read limit",
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+impl Task for FixDocxSuprasTask {
+    type Output = legalpdf::DocxSupraCleanup;
+    type JsValue = DocxSupraCleanupNode;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        legalpdf::fix_docx_supra_cross_references(&self.bytes)
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output.into())
+    }
+}
+
+#[napi(js_name = "fixDocxSupraCrossReferences")]
+pub fn fix_docx_supra_cross_references_node(
+    bytes: Buffer,
+) -> napi::Result<AsyncTask<FixDocxSuprasTask>> {
+    Ok(AsyncTask::new(FixDocxSuprasTask {
+        bytes: docx_supra_bytes(bytes)?,
+    }))
+}
+
+pub struct HasDocxSuprasTask {
+    bytes: Vec<u8>,
+}
+
+impl Task for HasDocxSuprasTask {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        legalpdf::has_docx_supra_references(&self.bytes)
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(js_name = "hasDocxSupraReferences")]
+pub fn has_docx_supra_references_node(bytes: Buffer) -> napi::Result<AsyncTask<HasDocxSuprasTask>> {
+    Ok(AsyncTask::new(HasDocxSuprasTask {
+        bytes: docx_supra_bytes(bytes)?,
+    }))
+}
+
 impl Task for DeriveDocxDocumentTask {
     type Output = NativeDocument;
     type JsValue = ExternalRef<NativeDocument>;
@@ -293,56 +391,72 @@ pub fn derive_pdf_document_node(request: serde_json::Value) -> AsyncTask<DeriveP
 }
 
 #[napi(js_name = "documentSnapshot")]
-pub fn document_snapshot_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
+pub fn document_snapshot_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
     match &document.product {
-        NativeProduct::Structure(structure) => json_buffer(&StructureSnapshot { structure }),
-        NativeProduct::Docx { structure, .. } => json_buffer(&StructureSnapshot { structure }),
-        NativeProduct::Pdf(document) => json_buffer(&legalpdf::pdf_document_snapshot(document)),
+        NativeProduct::Structure(structure) => js_value(env, &StructureSnapshot { structure }),
+        NativeProduct::Docx { structure, .. } => js_value(env, &StructureSnapshot { structure }),
+        NativeProduct::Pdf(document) => js_value(env, &legalpdf::pdf_document_snapshot(document)),
     }
 }
 
 #[napi(js_name = "pdfDocumentSummary")]
-pub fn pdf_document_summary_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
+pub fn pdf_document_summary_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
     let NativeProduct::Pdf(document) = &document.product else {
         return Err(Error::from_reason("PDF summary requires a PDF document"));
     };
-    json_buffer(&legalpdf::pdf_document_summary(document))
+    js_value(env, &legalpdf::pdf_document_summary(document))
 }
 
 #[napi(js_name = "documentCitedAuthorities")]
 pub fn document_cited_authorities_node(
+    env: Env,
     document: &External<NativeDocument>,
-) -> napi::Result<Buffer> {
+) -> napi::Result<Unknown<'static>> {
     match &document.product {
-        NativeProduct::Structure(structure) => json_buffer(&structure.cited_authorities),
-        NativeProduct::Docx { structure, .. } => json_buffer(&structure.cited_authorities),
-        NativeProduct::Pdf(_) => json_buffer(&Vec::<serde_json::Value>::new()),
+        NativeProduct::Structure(structure) => js_value(env, &structure.cited_authorities),
+        NativeProduct::Docx { structure, .. } => js_value(env, &structure.cited_authorities),
+        NativeProduct::Pdf(_) => js_value(env, &Vec::<serde_json::Value>::new()),
     }
 }
 
 #[napi(js_name = "docxStructureLint")]
-pub fn docx_structure_lint_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
+pub fn docx_structure_lint_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
     let Some(structure) = document.structure() else {
         return Err(Error::from_reason(
             "DOCX lint requires a structured document",
         ));
     };
-    json_buffer(&docx_structure_lint(structure).map_err(native_error)?)
+    js_value(env, &docx_structure_lint(structure).map_err(native_error)?)
 }
 
 #[napi(js_name = "docxTableCells")]
-pub fn docx_table_cells_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
+pub fn docx_table_cells_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
     let NativeProduct::Docx { table_cells, .. } = &document.product else {
         return Err(Error::from_reason(
             "DOCX table cells require a DOCX document",
         ));
     };
-    json_buffer(table_cells)
+    js_value(env, table_cells)
 }
 
 #[napi(js_name = "sourceDocSnapshot")]
-pub fn source_doc_snapshot_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
-    json_buffer(document.source_doc())
+pub fn source_doc_snapshot_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
+    js_value(env, document.source_doc())
 }
 
 #[napi(js_name = "sourceDocText")]
@@ -361,8 +475,12 @@ pub fn source_doc_revision_node(document: &External<NativeDocument>) -> String {
 }
 
 #[napi(js_name = "sourceDocAnchors")]
-pub fn source_doc_anchors_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
-    json_buffer(
+pub fn source_doc_anchors_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
         &document
             .source_doc()
             .blocks
@@ -387,13 +505,8 @@ pub fn normalize_source_doc_locator_node(kind: String, locator: String) -> napi:
 }
 
 #[napi(js_name = "tokenizeSourceText")]
-pub fn tokenize_source_text_node(text: String) -> napi::Result<Buffer> {
-    json_buffer(&tokenize_source_text(&text))
-}
-
-#[napi(js_name = "sourceDocQuoteText")]
-pub fn source_doc_quote_text_node(text: String) -> String {
-    quote_text(&text)
+pub fn tokenize_source_text_node(env: Env, text: String) -> napi::Result<Unknown<'static>> {
+    js_value(env, &tokenize_source_text(&text))
 }
 
 #[napi(js_name = "sourceDocQuoteWords")]
@@ -401,129 +514,139 @@ pub fn source_doc_quote_words_node(text: String) -> Vec<String> {
     quote_words(&text)
 }
 
-#[napi(js_name = "sourceDocTokens")]
-pub fn source_doc_tokens_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().tokens())
-}
-
 #[napi(js_name = "lookupSourceDoc")]
 pub fn lookup_source_doc_node(
+    env: Env,
     document: &External<NativeDocument>,
     kind: String,
     locator: String,
     context_blocks: u32,
-) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().lookup(
-        source_doc_kind(&kind)?,
-        &locator,
-        context_blocks as usize,
-    ))
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
+        &document.source_doc_query().lookup(
+            source_doc_kind(&kind)?,
+            &locator,
+            context_blocks as usize,
+        ),
+    )
 }
 
 #[napi(js_name = "readSourceDocRange")]
 pub fn read_source_doc_range_node(
+    env: Env,
     document: &External<NativeDocument>,
     kind: String,
     from: String,
     to: String,
     context_blocks: u32,
-) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().read_range(
-        source_doc_kind(&kind)?,
-        &from,
-        &to,
-        context_blocks as usize,
-    ))
-}
-
-#[napi(js_name = "sourceDocContainedLeafUnits")]
-pub fn source_doc_contained_leaf_units_node(
-    document: &External<NativeDocument>,
-    kind: String,
-    start: u32,
-    end: u32,
-) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().contained_leaf_units(
-        source_doc_kind(&kind)?,
-        start as usize,
-        end as usize,
-    ))
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
+        &document.source_doc_query().read_range(
+            source_doc_kind(&kind)?,
+            &from,
+            &to,
+            context_blocks as usize,
+        ),
+    )
 }
 
 #[napi(js_name = "sourceDocSmallestContainingBlock")]
 pub fn source_doc_smallest_containing_block_node(
+    env: Env,
     document: &External<NativeDocument>,
     start: u32,
     end: u32,
-) -> napi::Result<Buffer> {
-    json_buffer(
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
         &document
             .source_doc_query()
             .smallest_containing_block(start as usize, end as usize),
     )
 }
 
-#[napi(js_name = "sourceDocPhraseSpans")]
-pub fn source_doc_phrase_spans_node(
-    document: &External<NativeDocument>,
-    words: Vec<String>,
-    start: Option<u32>,
-    end: Option<u32>,
-    same_line: Option<bool>,
-    limit: Option<u32>,
-) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().phrase_spans(
-        &words,
-        PhraseOptions {
-            start: start.map(|value| value as usize),
-            end: end.map(|value| value as usize),
-            same_line: same_line.unwrap_or(false),
-            limit: limit.map(|value| value as usize),
-        },
-    ))
-}
-
 #[napi(js_name = "textPhraseSpans")]
 pub fn text_phrase_spans_node(
+    env: Env,
     text: String,
     words: Vec<String>,
     start: Option<u32>,
     end: Option<u32>,
     same_line: Option<bool>,
     limit: Option<u32>,
-) -> napi::Result<Buffer> {
-    json_buffer(&phrase_spans(
-        &text,
-        &words,
-        PhraseOptions {
-            start: start.map(|value| value as usize),
-            end: end.map(|value| value as usize),
-            same_line: same_line.unwrap_or(false),
-            limit: limit.map(|value| value as usize),
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
+        &phrase_spans(
+            &text,
+            &words,
+            PhraseOptions {
+                start: start.map(|value| value as usize),
+                end: end.map(|value| value as usize),
+                same_line: same_line.unwrap_or(false),
+                limit: limit.map(|value| value as usize),
+            },
+        ),
+    )
+}
+
+#[napi(js_name = "textFragmentDirectives")]
+pub fn text_fragment_directives_node(
+    block_text: String,
+    quotes: Vec<String>,
+    page_scoped: bool,
+    document_text: Option<String>,
+    document: Option<&External<NativeDocument>>,
+) -> Vec<String> {
+    document.map_or_else(
+        || text_fragment_directives(&block_text, document_text.as_deref(), &quotes, page_scoped),
+        |document| {
+            document
+                .source_doc_query()
+                .text_fragment_directives(&block_text, &quotes, page_scoped)
         },
-    ))
+    )
+}
+
+#[napi(js_name = "sourceDocParagraphRangeDirective")]
+pub fn source_doc_paragraph_range_directive_node(
+    document: &External<NativeDocument>,
+    start: String,
+    end: String,
+) -> Option<String> {
+    document
+        .source_doc_query()
+        .paragraph_range_directive(&start, &end)
 }
 
 #[napi(js_name = "sourceDocPageMap")]
-pub fn source_doc_page_map_node(document: &External<NativeDocument>) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().page_map())
+pub fn source_doc_page_map_node(
+    env: Env,
+    document: &External<NativeDocument>,
+) -> napi::Result<Unknown<'static>> {
+    js_value(env, &document.source_doc_query().page_map())
 }
 
 #[napi(js_name = "resolveSourceDocPage")]
 pub fn resolve_source_doc_page_node(
+    env: Env,
     document: &External<NativeDocument>,
     requested: String,
-) -> napi::Result<Buffer> {
-    json_buffer(&document.source_doc_query().resolve_page(&requested))
+) -> napi::Result<Unknown<'static>> {
+    js_value(env, &document.source_doc_query().resolve_page(&requested))
 }
 
 #[napi(js_name = "lookupStructureBlock")]
 pub fn lookup_structure_block_node(
+    env: Env,
     document: &External<NativeDocument>,
     locator: String,
     context_blocks: u32,
-) -> napi::Result<Buffer> {
-    json_buffer(
+) -> napi::Result<Unknown<'static>> {
+    js_value(
+        env,
         &document
             .source_doc_query()
             .structure_block(&locator, context_blocks as usize),
@@ -531,20 +654,23 @@ pub fn lookup_structure_block_node(
 }
 
 #[napi(js_name = "parseDocumentAddress")]
-pub fn parse_document_address_node(spec: String) -> napi::Result<Buffer> {
-    json_buffer(&parse_address(&spec))
+pub fn parse_document_address_node(env: Env, spec: String) -> napi::Result<Unknown<'static>> {
+    js_value(env, &parse_address(&spec))
 }
 
 #[napi(js_name = "graphScope")]
 pub fn graph_scope_node(
+    env: Env,
     document: &External<NativeDocument>,
     seed_label: String,
     follow: String,
     depth: u32,
     include_descendants: bool,
-) -> napi::Result<Buffer> {
+    include_units: bool,
+) -> napi::Result<Unknown<'static>> {
     let follow = follow_direction(&follow)?;
-    json_buffer(
+    js_value(
+        env,
         &document
             .cross_references()
             .filter(|graph| !graph.document_abstained)
@@ -555,6 +681,7 @@ pub fn graph_scope_node(
                     follow,
                     depth as usize,
                     include_descendants,
+                    include_units,
                 )
             }),
     )
@@ -579,50 +706,33 @@ pub fn source_doc_has_origin_node(
 
 #[napi(js_name = "queryPdfDocument")]
 pub fn query_pdf_document_node(
+    env: Env,
     document: &External<NativeDocument>,
     query: serde_json::Value,
-) -> napi::Result<Buffer> {
+) -> napi::Result<Unknown<'static>> {
     let NativeProduct::Pdf(pdf) = &document.product else {
         return Err(Error::from_reason("PDF query requires a PDF document"));
     };
     let result = legalpdf::query_pdf_document(pdf, &query)
         .map_err(|error| Error::from_reason(error.to_string()))?;
-    json_buffer(&result)
+    js_value(env, &result)
 }
 
-macro_rules! json_task {
+macro_rules! js_task {
     ($name:ident { $($field:ident: $ty:ty),+ $(,)? }, $compute:expr) => {
         pub struct $name { $($field: $ty),+ }
         impl Task for $name {
             type Output = serde_json::Value;
-            type JsValue = Buffer;
+            type JsValue = Unknown<'static>;
             fn compute(&mut self) -> napi::Result<Self::Output> { $compute(self).map_err(native_error) }
-            fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Buffer> { json_buffer(&output) }
+            fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+                js_value(env, &output)
+            }
         }
     };
 }
 
-json_task!(ApplyAmendTask { source: String, ops: Vec<serde_json::Value>, reconstruct_lineation: bool }, |task: &mut ApplyAmendTask| {
-    legal_structure::apply_amend_ops(&task.source, std::mem::take(&mut task.ops), task.reconstruct_lineation)
-});
-
-#[napi(js_name = "applyAmendOps")]
-pub fn apply_amend_ops_node(
-    source: String,
-    ops: serde_json::Value,
-    reconstruct_lineation: Option<bool>,
-) -> napi::Result<AsyncTask<ApplyAmendTask>> {
-    let Some(ops) = ops.as_array().cloned() else {
-        return Err(Error::from_reason("amendment operations must be an array"));
-    };
-    Ok(AsyncTask::new(ApplyAmendTask {
-        source,
-        ops,
-        reconstruct_lineation: reconstruct_lineation.unwrap_or(true),
-    }))
-}
-
-json_task!(
+js_task!(
     DeleteAndRenumberTask {
         source: String,
         target: String,
@@ -650,7 +760,7 @@ pub fn delete_provision_and_renumber_siblings_node(
     })
 }
 
-json_task!(
+js_task!(
     ConsolidateAmendmentTask {
         source: String,
         amendment: String,

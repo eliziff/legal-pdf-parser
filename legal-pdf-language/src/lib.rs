@@ -11,7 +11,9 @@ pub use deterministic_citations::{
 };
 pub use docx::{
     analyze_docx_bytes, apply_docx_links, assess_docx_route, deterministic_docx_intents,
-    extract_docx_gold, plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
+    extract_docx_gold, fix_docx_supra_cross_references, has_docx_supra_references, plan_docx_links,
+    plan_footnotes, validate_docx_response, DocxPlanOptions, DocxSupraCleanup,
+    MAX_DOCX_SUPRA_BYTES,
 };
 pub use error::{Error, Result};
 pub use grammar_tables::{compile_table_entry, load_tables, run_vectors as run_grammar_vectors};

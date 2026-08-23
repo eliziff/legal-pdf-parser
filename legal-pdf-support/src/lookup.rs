@@ -136,7 +136,7 @@ pub fn lookup_footnote(
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        GraphStatus, Paragraph, DocumentStructure, PARSER_VERSION, SCHEMA_VERSION,
+        DocumentStructure, GraphStatus, Paragraph, PARSER_VERSION, SCHEMA_VERSION,
     };
     use serde_json::Map;
 

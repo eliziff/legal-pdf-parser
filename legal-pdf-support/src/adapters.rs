@@ -172,7 +172,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        Footnote, GraphStatus, Paragraph, DocumentStructure, PARSER_VERSION, SCHEMA_VERSION,
+        DocumentStructure, Footnote, GraphStatus, Paragraph, PARSER_VERSION, SCHEMA_VERSION,
     };
 
     fn note(pair_id: &str, body: &str, usable: bool) -> Footnote {
