@@ -194,7 +194,7 @@ fn projection(profile: Option<DetectionProfile>) -> (ProjectionOrder, Option<Sou
         Some(DetectionProfile::Legislation) => {
             (ProjectionOrder::Legislation, Some(SourceDocType::Laws))
         }
-        Some(DetectionProfile::Instrument) => (ProjectionOrder::Legislation, None),
+        Some(DetectionProfile::Instrument) => (ProjectionOrder::Native, None),
         Some(DetectionProfile::Journal) => (ProjectionOrder::StablePosition, None),
         None => (ProjectionOrder::Position, None),
     }

@@ -10,8 +10,8 @@ pub use deterministic_citations::{
     DeterministicPart, DeterministicSplit,
 };
 pub use docx::{
-    apply_docx_links, assess_docx_route, deterministic_docx_intents, extract_docx_gold,
-    plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
+    analyze_docx_bytes, apply_docx_links, assess_docx_route, deterministic_docx_intents,
+    extract_docx_gold, plan_docx_links, plan_footnotes, validate_docx_response, DocxPlanOptions,
 };
 pub use error::{Error, Result};
 pub use grammar_tables::{compile_table_entry, load_tables, run_vectors as run_grammar_vectors};

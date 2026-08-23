@@ -1476,84 +1476,94 @@ fn previous_nonblank<'a>(source: &'a [Line<'a>], index: usize) -> Option<&'a str
         .find(|value| !value.trim().is_empty())
 }
 
-fn collect_sections(text: &ScalarText<'_>, family: SectionFamily) -> Vec<SectionMark> {
-    let source = lines(text).collect::<Vec<_>>();
-    let mut result = Vec::new();
-    for (index, line) in source.iter().enumerate() {
-        let lead = leading_ascii_space(line.text);
-        let mut value = &line.text[lead..];
-        if family == SectionFamily::Markdown {
-            let hashes = value.bytes().take_while(|byte| *byte == b'#').count();
-            if !(1..=6).contains(&hashes) || !value[hashes..].starts_with([' ', '\t']) {
-                continue;
-            }
-            value = value[hashes..].trim_start_matches([' ', '\t']);
+fn section_mark(
+    text: &ScalarText<'_>,
+    source: &[Line<'_>],
+    index: usize,
+    family: SectionFamily,
+) -> Option<SectionMark> {
+    let line = &source[index];
+    let lead = leading_ascii_space(line.text);
+    let mut value = &line.text[lead..];
+    if family == SectionFamily::Markdown {
+        let hashes = value.bytes().take_while(|byte| *byte == b'#').count();
+        if !(1..=6).contains(&hashes) || !value[hashes..].starts_with([' ', '\t']) {
+            return None;
         }
-        let bold = value.starts_with("**");
-        if bold {
-            value = &value[2..];
+        value = value[hashes..].trim_start_matches([' ', '\t']);
+    }
+    let bold = value.starts_with("**");
+    if bold {
+        value = &value[2..];
+    }
+    let (label, length) = numeric_label(value, family == SectionFamily::Markdown)?;
+    let mut after = length;
+    if bold {
+        if !value[after..].starts_with("**") {
+            return None;
         }
-        let Some((label, length)) = numeric_label(value, family == SectionFamily::Markdown) else {
-            continue;
-        };
-        let mut after = length;
-        if bold {
-            if !value[after..].starts_with("**") {
-                continue;
-            }
-            after += 2;
+        after += 2;
+    }
+    let mut trailing = false;
+    if family == SectionFamily::DotTerm {
+        let punctuation = value[after..]
+            .chars()
+            .next()
+            .filter(|value| matches!(value, '.' | ')'))?;
+        after += punctuation.len_utf8();
+        trailing = true;
+    } else if family == SectionFamily::Markdown && value[after..].starts_with('.') {
+        after += 1;
+        trailing = true;
+    }
+    let rest = &value[after..];
+    let spaces = leading_ascii_space(rest);
+    let content = &rest[spaces..];
+    let accepted = match family {
+        SectionFamily::Bare => {
+            content.is_empty()
+                || (spaces > 0 && bare_content_starts(content))
+                || (spaces == 0 && content.starts_with('('))
         }
-        let mut trailing = false;
-        if family == SectionFamily::DotTerm {
-            let Some(punctuation) = value[after..]
-                .chars()
-                .next()
-                .filter(|value| matches!(value, '.' | ')'))
-            else {
-                continue;
-            };
-            after += punctuation.len_utf8();
-            trailing = true;
-        } else if family == SectionFamily::Markdown && value[after..].starts_with('.') {
-            after += 1;
-            trailing = true;
+        SectionFamily::DotTerm => {
+            !content.is_empty()
+                && dotterm_content_starts(content)
+                && (spaces > 0 || content.starts_with('('))
         }
-        let rest = &value[after..];
-        let spaces = leading_ascii_space(rest);
-        let content = &rest[spaces..];
-        let accepted = match family {
-            SectionFamily::Bare => {
-                content.is_empty()
-                    || (spaces > 0 && bare_content_starts(content))
-                    || (spaces == 0 && content.starts_with('('))
-            }
-            SectionFamily::DotTerm => {
-                !content.is_empty()
-                    && dotterm_content_starts(content)
-                    && (spaces > 0 || content.starts_with('('))
-            }
-            SectionFamily::Markdown => content.is_empty() || (spaces > 0 && !content.is_empty()),
-            _ => false,
-        };
-        if !accepted {
-            continue;
-        }
-        let start_byte = line.byte_start + lead;
-        let content_byte = line.byte_end - content.len();
-        if family == SectionFamily::Bare
+        SectionFamily::Markdown => content.is_empty() || (spaces > 0 && !content.is_empty()),
+        _ => false,
+    };
+    if !accepted
+        || family == SectionFamily::Bare
             && content.is_empty()
-            && previous_nonblank(&source, index).is_some_and(markdown_range_continuation)
-        {
-            continue;
+            && previous_nonblank(source, index).is_some_and(markdown_range_continuation)
+    {
+        return None;
+    }
+    Some(SectionMark {
+        label: label.to_owned(),
+        start: text.scalar(line.byte_start + lead),
+        content_start: text.scalar(line.byte_end - content.len()),
+        style: section_style(label, trailing),
+        family,
+        aliases: Vec::new(),
+    })
+}
+
+fn collect_section_families(text: &ScalarText<'_>) -> [Vec<SectionMark>; 3] {
+    const FAMILIES: [SectionFamily; 3] = [
+        SectionFamily::Bare,
+        SectionFamily::DotTerm,
+        SectionFamily::Markdown,
+    ];
+    let source = lines(text).collect::<Vec<_>>();
+    let mut result = std::array::from_fn(|_| Vec::new());
+    for index in 0..source.len() {
+        for (family, marks) in FAMILIES.into_iter().zip(&mut result) {
+            if let Some(mark) = section_mark(text, &source, index, family) {
+                marks.push(mark);
+            }
         }
-        result.push(SectionMark {
-            label: label.to_owned(),
-            start: text.scalar(start_byte),
-            content_start: text.scalar(content_byte),
-            style: section_style(label, trailing),
-            family,
-            aliases: Vec::new(),
-        });
     }
     result
 }
@@ -1782,16 +1792,14 @@ fn next_nonblank<'a>(source: &'a [Line<'a>], start: usize) -> Option<&'a Line<'a
         .find(|line| line.scalar_start > start && !line.text.trim().is_empty())
 }
 
-fn short_root(text: &ScalarText<'_>) -> Vec<SectionMark> {
+fn short_root(text: &ScalarText<'_>, families: &[Vec<SectionMark>; 3]) -> Vec<SectionMark> {
     let status = cached_regex!(
         STATUS,
         r"(?iu)^(?:\[\s*)?(?:repealed|revoked|abrog(?:ated|é|ée|és|ées)|renumbered|spent|not (?:yet )?in force|omitted)\b"
     );
     let heading = cached_regex!(HEADING, r#"^(?:(?:["'“«]\s*)?\p{Lu}|\(\d+\))"#);
     let source = lines(text).collect::<Vec<_>>();
-    let mut candidates = collect_sections(text, SectionFamily::Bare);
-    candidates.extend(collect_sections(text, SectionFamily::DotTerm));
-    candidates.extend(collect_sections(text, SectionFamily::Markdown));
+    let mut candidates = families.iter().flatten().cloned().collect::<Vec<_>>();
     for line in &source {
         let value = line.text.trim_matches([' ', '\t']);
         if matches!(value, "1" | "2") {
@@ -1872,14 +1880,10 @@ fn statute_spine_over(
     text: &ScalarText<'_>,
     allow_hyphen: bool,
     inline_only: bool,
+    all_families: &[Vec<SectionMark>; 3],
 ) -> Vec<SectionMark> {
-    let families = [
-        SectionFamily::Bare,
-        SectionFamily::DotTerm,
-        SectionFamily::Markdown,
-    ]
-    .map(|family| {
-        collect_sections(text, family)
+    let families = all_families.clone().map(|marks| {
+        marks
             .into_iter()
             .filter(|mark| !inline_only || inline_section(text, mark))
             .collect::<Vec<_>>()
@@ -1890,7 +1894,7 @@ fn statute_spine_over(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|value| value[0].start);
     if candidates.is_empty() {
-        return short_root(text);
+        return short_root(text, all_families);
     }
     let mut best = candidates[0].clone();
     let first_start = best[0].start;
@@ -1914,11 +1918,12 @@ fn statute_spine_over(
 }
 
 pub(super) fn statute_spine(text: &ScalarText<'_>, allow_hyphen: bool) -> Vec<SectionMark> {
-    let result = statute_spine_over(text, allow_hyphen, false);
+    let families = collect_section_families(text);
+    let result = statute_spine_over(text, allow_hyphen, false, &families);
     if result.is_empty() || result.iter().any(|value| inline_section(text, value)) {
         result
     } else {
-        statute_spine_over(text, allow_hyphen, true)
+        statute_spine_over(text, allow_hyphen, true, &families)
     }
 }
 
@@ -2698,15 +2703,19 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
             state.child(token, start, start + value[..at].chars().count());
         }
     }
+    let mut open = Vec::<usize>::new();
     for index in 0..state.nodes.len() {
-        let depth = state.nodes[index].1;
-        let end = state
-            .nodes
-            .iter()
-            .skip(index + 1)
-            .find(|(_, candidate)| *candidate <= depth)
-            .map_or(text.len(), |(block, _)| block.range.start);
-        state.nodes[index].0.range.end = end;
+        let (start, depth) = (state.nodes[index].0.range.start, state.nodes[index].1);
+        while open
+            .last()
+            .is_some_and(|prior| state.nodes[*prior].1 >= depth)
+        {
+            state.nodes[open.pop().expect("open node")].0.range.end = start;
+        }
+        open.push(index);
+    }
+    for index in open {
+        state.nodes[index].0.range.end = text.len();
     }
     state.nodes.into_iter().map(|(point, _)| point).collect()
 }

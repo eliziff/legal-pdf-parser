@@ -200,21 +200,21 @@ pub struct SourceDocRanges {
 }
 
 #[derive(Default)]
-pub struct SourceDocIndex(HashMap<String, usize>);
+pub struct SourceDocIndex {
+    positions: HashMap<String, usize>,
+    order: Vec<String>,
+}
 
 impl SourceDocIndex {
     pub fn get(&self, label: &str) -> Option<usize> {
-        self.0.get(&label.to_lowercase()).copied()
+        self.positions.get(&label.to_lowercase()).copied()
     }
 
     pub fn entries(&self) -> Vec<(String, usize)> {
-        let mut entries = self
-            .0
+        self.order
             .iter()
-            .map(|(label, position)| (label.clone(), *position))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        entries
+            .map(|label| (label.clone(), self.positions[label]))
+            .collect()
     }
 }
 
@@ -414,7 +414,8 @@ fn source_doc_navigation(
         section: range(SourceDocKind::Section, &blocks),
         footnote: range(SourceDocKind::Footnote, &blocks),
     };
-    let mut index = HashMap::new();
+    let mut positions = HashMap::new();
+    let mut order = Vec::new();
     let mut duplicates = HashSet::new();
     for (position, block) in blocks.iter().enumerate() {
         let mut labels = HashSet::new();
@@ -424,19 +425,23 @@ fn source_doc_navigation(
             .filter(|label| labels.insert((*label).clone()))
         {
             let key = label.to_lowercase();
-            if index.insert(key.clone(), position).is_some() {
+            if positions.contains_key(&key) {
                 duplicates.insert(key);
+            } else {
+                positions.insert(key.clone(), position);
+                order.push(key);
             }
         }
     }
-    index.retain(|label, _| !duplicates.contains(label));
+    positions.retain(|label, _| !duplicates.contains(label));
+    order.retain(|label| !duplicates.contains(label));
     (
         if blocks.is_empty() {
             SourceDocStatus::Unavailable
         } else {
             SourceDocStatus::Usable
         },
-        SourceDocIndex(index),
+        SourceDocIndex { positions, order },
         ranges,
     )
 }

@@ -3,15 +3,19 @@ use crate::text::ScalarText;
 
 const MAX_SAFE_INTEGER: usize = 9_007_199_254_740_991;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthoritativeTableCell {
     pub table: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
     pub row: usize,
     pub column: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub row_span: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub column_span: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     pub start: usize,
     pub end: usize,

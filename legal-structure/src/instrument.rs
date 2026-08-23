@@ -1,10 +1,10 @@
 #[cfg(feature = "structure-inference")]
 use crate::{
-    derive_definitions, derive_structure_evidence, javascript_whitespace, node_depths,
-    text::normalize_javascript_whitespace, AuthoritativeTableCell, AuthoritativeTables, Coverage,
-    CoverageState, DefinitionParagraph, DetectionProfile, DocumentInput, DocumentStructure,
-    EngineError, EvidenceKind, NodeKind, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
-    EVIDENCE_SCHEMA,
+    definitions::derive_definitions_indexed, derive_structure_evidence, javascript_whitespace,
+    node_depths, text::normalize_javascript_whitespace, AuthoritativeTableCell,
+    AuthoritativeTables, Coverage, CoverageState, DefinitionParagraph, DetectionProfile,
+    DocumentInput, DocumentStructure, EngineError, EvidenceKind, NodeKind, Origin, ParagraphBreak,
+    ScalarRange, ScalarText, Scope, EVIDENCE_SCHEMA,
 };
 #[cfg(feature = "structure-inference")]
 use legal_grammar_tables::{
@@ -90,21 +90,32 @@ fn split_instrument_sentence_joins(text: &str) -> String {
 /// Offset-preserving lineation hypotheses used by the instrument structure profile.
 /// The source lineation is first, so downstream selection keeps it on a tie.
 #[cfg(feature = "structure-inference")]
-pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
-    let joined = split_instrument_sentence_joins(text);
-    let hypotheses = [
-        text.to_owned(),
-        split_instrument_space_runs(text),
-        joined.clone(),
-        split_instrument_space_runs(&joined),
-    ];
-    let mut unique = Vec::with_capacity(hypotheses.len());
-    for hypothesis in hypotheses {
-        if !unique.contains(&hypothesis) {
-            unique.push(hypothesis);
+fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = String> + '_ {
+    let mut joined = None;
+    let mut seen = Vec::<String>::with_capacity(3);
+    (0..4).filter_map(move |stage| {
+        let hypothesis = match stage {
+            0 => text.to_owned(),
+            1 => split_instrument_space_runs(text),
+            2 => joined
+                .get_or_insert_with(|| split_instrument_sentence_joins(text))
+                .clone(),
+            3 => split_instrument_space_runs(joined.as_deref().unwrap()),
+            _ => unreachable!(),
+        };
+        if stage > 0 {
+            if hypothesis == text || seen.contains(&hypothesis) {
+                return None;
+            }
+            seen.push(hypothesis.clone());
         }
-    }
-    unique
+        Some(hypothesis)
+    })
+}
+
+#[cfg(feature = "structure-inference")]
+pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
+    instrument_lineation_hypotheses_iter(text).collect()
 }
 
 #[cfg(feature = "structure-inference")]
@@ -1133,15 +1144,80 @@ fn reference_node_kind(label: &str) -> &'static str {
 
 #[cfg(feature = "structure-inference")]
 fn populate_instrument_node_metadata(structure: &mut DocumentStructure) {
+    let text = ScalarText::new(&structure.text);
     for node in structure
         .nodes
         .iter_mut()
         .filter(|node| node.kind == NodeKind::Section)
     {
-        let Some(label) = node.label.as_deref().map(crate::public_structure_label) else {
+        let Some(label) = node.label.as_deref() else {
             continue;
         };
-        node.locator_kind = Some(reference_node_kind(&label).to_owned());
+        let kind = reference_node_kind(&label);
+        node.locator_kind = Some(kind.to_owned());
+        let body = match kind {
+            "article" => label.strip_prefix("art"),
+            "part" => label.strip_prefix("part"),
+            "division" => label.strip_prefix("div"),
+            "schedule" if label.starts_with("sched") => label.strip_prefix("sched"),
+            "schedule" if label.starts_with("exh") => label.strip_prefix("exh"),
+            "schedule" if label.starts_with("annex") => label.strip_prefix("annex"),
+            "schedule" => label.strip_prefix("app"),
+            _ => label.strip_prefix("sec"),
+        }
+        .unwrap_or(label);
+        let word = match kind {
+            "article" => "article",
+            "part" => "part",
+            "division" => "division",
+            "schedule" if label.starts_with("exh") => "exhibit",
+            "schedule" if label.starts_with("annex") => "annex",
+            "schedule" if label.starts_with("app") => "appendix",
+            "schedule" => "schedule",
+            _ => "section",
+        };
+        let raw_head = node
+            .content_start
+            .and_then(|end| {
+                Some((
+                    text.byte_at_utf16(node.range.start)?,
+                    text.byte_at_utf16(end)?,
+                ))
+            })
+            .and_then(|(start, end)| text.value.get(start..end))
+            .map(|value| value.trim_matches(javascript_whitespace).to_lowercase())
+            .unwrap_or_default();
+        let display = if matches!(kind, "section" | "subsection") {
+            format!("section {body}").to_lowercase()
+        } else if kind == "schedule" {
+            let mut words = raw_head.split_ascii_whitespace();
+            let schedule_word = words.next().unwrap_or(word);
+            let raw_value = words.next().unwrap_or(body).trim_end_matches(':');
+            let value = raw_value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+                .then_some(raw_value)
+                .unwrap_or(body);
+            format!("{schedule_word} {value}")
+        } else if raw_head.is_empty() {
+            format!("{word} {body}")
+        } else {
+            raw_head
+                .trim_end_matches(|character: char| {
+                    matches!(character, '\u{2013}' | '\u{2014}' | '-' | '.' | ':')
+                })
+                .trim_matches(javascript_whitespace)
+                .to_owned()
+        };
+        let mut aliases = vec![display];
+        if matches!(kind, "article" | "part") {
+            if let Ok(value) = body.parse::<usize>() {
+                aliases.push(format!("{word} {}", instrument_roman(value)).to_lowercase());
+            }
+        }
+        aliases.retain(|alias| alias != &label.to_lowercase());
+        aliases.dedup();
+        node.aliases = (!aliases.is_empty()).then_some(aliases);
         node.marker_range = node.content_start.map(|end| ScalarRange {
             start: node.range.start,
             end,
@@ -1173,7 +1249,7 @@ fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, Engi
         .iter()
         .filter(|node| node.kind == NodeKind::Section && node.label.is_some())
         .map(|node| {
-            let label = crate::public_structure_label(node.label.as_deref().unwrap());
+            let label = node.label.as_deref().unwrap().to_owned();
             let kind = reference_node_kind(&label);
             let mut depth = 0;
             let mut parent = node
@@ -1192,7 +1268,7 @@ fn reference_nodes(graph: &DocumentStructure) -> Result<Vec<ReferenceNode>, Engi
                 .as_deref()
                 .and_then(|id| by_id.get(id))
                 .and_then(|parent| parent.label.as_deref())
-                .map(crate::public_structure_label);
+                .map(str::to_owned);
             Ok(ReferenceNode {
                 label,
                 aliases: node.aliases.clone().unwrap_or_default(),
@@ -1748,7 +1824,7 @@ fn derive_instrument_structure(
             }
         })
         .collect::<Vec<_>>();
-    structure.definitions = derive_definitions(text.value, &paragraphs).terms;
+    structure.definitions = derive_definitions_indexed(&text, &paragraphs).terms;
     Ok(structure)
 }
 
@@ -1759,11 +1835,11 @@ pub fn analyze_instrument(
     table_cells: &[AuthoritativeTableCell],
     reconstruct_lineation: bool,
 ) -> Result<DocumentStructure, EngineError> {
-    let hypotheses = if reconstruct_lineation {
-        instrument_lineation_hypotheses(text)
-    } else {
-        vec![text.to_owned()]
-    };
+    let hypotheses = reconstruct_lineation
+        .then(|| instrument_lineation_hypotheses_iter(text))
+        .into_iter()
+        .flatten()
+        .chain((!reconstruct_lineation).then(|| text.to_owned()));
     let tables = AuthoritativeTables::new(text, table_cells)?;
     let documents = hypotheses.into_iter().map(|hypothesis| {
         let masked = tables.masked_text(hypothesis);

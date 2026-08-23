@@ -6,6 +6,75 @@ use std::sync::OnceLock;
 
 const LABELS: [&str; 5] = ["Schedule", "Exhibit", "Appendix", "Annex", "Annexure"];
 const JS_WS: &str = r"\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+const MAX_FINDINGS: usize = 200;
+const EXCERPT_LENGTH: usize = 160;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocxLintCode {
+    CrossReferenceMissing,
+    AttachmentReferenceMissing,
+    NumberingGap,
+    NumberingDuplicate,
+    DefinedTermDuplicate,
+    DefinedTermUnused,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocxLintSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintFinding {
+    pub code: DocxLintCode,
+    pub severity: DocxLintSeverity,
+    pub subject: String,
+    pub message: String,
+    pub paragraph_index: usize,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintReferenceChecks {
+    pub references: usize,
+    pub resolved: usize,
+    pub skipped_external: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintAttachmentChecks {
+    pub references: usize,
+    pub resolved: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintCount {
+    pub anchors: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintDefinitionCount {
+    pub definitions: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintChecks {
+    pub cross_references: DocxLintReferenceChecks,
+    pub attachments: DocxLintAttachmentChecks,
+    pub numbering: DocxLintCount,
+    pub defined_terms: DocxLintDefinitionCount,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocxLintReport {
+    pub paragraphs: usize,
+    pub checks: DocxLintChecks,
+    pub findings: Vec<DocxLintFinding>,
+    pub notes: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DocxCrossReferenceStatus {
@@ -244,6 +313,247 @@ pub fn derive_docx_lint_facts(paragraphs: &[String]) -> DocxStructureFacts {
         attachments: attachments(paragraphs),
         numbering,
     }
+}
+
+fn excerpt_around(text: &str, subject: &str) -> String {
+    let text = crate::text::ScalarText::new(text);
+    let subject_len = subject.encode_utf16().count();
+    let Some(index) = text
+        .value
+        .find(subject)
+        .and_then(|byte| text.utf16_at_byte(byte))
+    else {
+        let end = text.utf16_len().min(EXCERPT_LENGTH);
+        return text.value[..text.byte_at_utf16_floor(end).unwrap()].to_owned();
+    };
+    let start = index.saturating_sub(EXCERPT_LENGTH.saturating_sub(subject_len) / 2);
+    let end = (start + EXCERPT_LENGTH).min(text.utf16_len());
+    let slice = &text.value
+        [text.byte_at_utf16_floor(start).unwrap()..text.byte_at_utf16_floor(end).unwrap()];
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        slice,
+        if end < text.utf16_len() { "…" } else { "" }
+    )
+}
+
+pub fn docx_structure_lint(
+    structure: &crate::DocumentStructure,
+) -> Result<DocxLintReport, crate::EngineError> {
+    let facts = structure
+        .docx
+        .as_ref()
+        .ok_or_else(|| crate::EngineError::invalid("DOCX structure facts are missing"))?;
+    let paragraphs = structure.text.split('\n').collect::<Vec<_>>();
+    let excerpt = |paragraph: usize, subject: &str| {
+        excerpt_around(paragraphs.get(paragraph).copied().unwrap_or(""), subject)
+    };
+    let mut findings = Vec::new();
+    let mut notes = Vec::new();
+
+    for reference in &facts.cross_references {
+        let message = match &reference.status {
+            DocxCrossReferenceStatus::MissingRomanArticle => Some(format!(
+                "{} is referenced but no Article {} heading exists in this document.",
+                reference.subject, reference.value
+            )),
+            DocxCrossReferenceStatus::MissingTopLevel => Some(format!(
+                "{} is referenced but no provision {} exists in this document.",
+                reference.subject, reference.value
+            )),
+            DocxCrossReferenceStatus::MissingSibling { parent } => Some(format!(
+                "{} is referenced but does not exist; sibling provisions under {} are numbered without it.",
+                reference.subject, parent
+            )),
+            _ => None,
+        };
+        if let Some(message) = message {
+            findings.push(DocxLintFinding {
+                code: DocxLintCode::CrossReferenceMissing,
+                severity: DocxLintSeverity::Error,
+                subject: reference.subject.clone(),
+                message,
+                paragraph_index: reference.paragraph_index,
+                excerpt: excerpt(reference.paragraph_index, &reference.subject),
+            });
+        }
+    }
+
+    let skipped_external = facts
+        .cross_references
+        .iter()
+        .filter(|reference| reference.status == DocxCrossReferenceStatus::SkippedExternal)
+        .count();
+    let abstained = facts
+        .cross_references
+        .iter()
+        .filter(|reference| reference.status == DocxCrossReferenceStatus::Abstained)
+        .count();
+    if facts.numbering.number_anchors.is_empty()
+        && facts.numbering.roman_article_anchors.is_empty()
+        && facts.cross_references.len() > skipped_external
+    {
+        notes.push("Internal cross-references were found but the document has no literal clause numbering to check them against (Word field numbering is not resolved by this lint); cross-reference checks abstained.".into());
+    } else if abstained > 0 {
+        notes.push(format!(
+            "{abstained} cross-reference(s) could not be checked against the document's numbering scheme and were not flagged."
+        ));
+    }
+
+    let mut attachment_labels = HashMap::<&str, usize>::new();
+    for attachment in &facts.attachments {
+        match &attachment.status {
+            DocxAttachmentReferenceStatus::AbstainedNoAnchor => {
+                *attachment_labels.entry(&attachment.label).or_default() += 1;
+            }
+            DocxAttachmentReferenceStatus::Missing { included } => {
+                findings.push(DocxLintFinding {
+                    code: DocxLintCode::AttachmentReferenceMissing,
+                    severity: DocxLintSeverity::Error,
+                    subject: attachment.subject.clone(),
+                    message: format!(
+                        "{} is referenced but only {} {} {} included in this document.",
+                        attachment.subject,
+                        attachment.label,
+                        included.join(", "),
+                        if included.len() == 1 { "is" } else { "are" }
+                    ),
+                    paragraph_index: attachment.paragraph_index,
+                    excerpt: excerpt(attachment.paragraph_index, &attachment.subject),
+                });
+            }
+            DocxAttachmentReferenceStatus::Resolved => {}
+        }
+    }
+    for (label, count) in attachment_labels {
+        notes.push(format!(
+            "{count} {label} reference(s) found but no {label} is included in this document (attachments may be separate files); not checked."
+        ));
+    }
+
+    let mut numbering_findings = facts
+        .numbering
+        .duplicates
+        .iter()
+        .map(|duplicate| DocxLintFinding {
+            code: DocxLintCode::NumberingDuplicate,
+            severity: DocxLintSeverity::Warning,
+            subject: duplicate.number.clone(),
+            message: format!(
+                "Provision number {} appears more than once.",
+                duplicate.number
+            ),
+            paragraph_index: duplicate.paragraph_index,
+            excerpt: excerpt(duplicate.paragraph_index, &duplicate.number),
+        })
+        .chain(facts.numbering.gaps.iter().map(|gap| DocxLintFinding {
+            code: DocxLintCode::NumberingGap,
+            severity: DocxLintSeverity::Warning,
+            subject: gap.number.clone(),
+            message: format!(
+                "Numbering jumps from {} to {}; {}.",
+                gap.previous_number,
+                gap.number,
+                if gap.missing.len() == 1 {
+                    format!("{} is missing", gap.missing[0])
+                } else {
+                    format!("{} provisions are missing in between", gap.missing.len())
+                }
+            ),
+            paragraph_index: gap.paragraph_index,
+            excerpt: excerpt(gap.paragraph_index, &gap.number),
+        }))
+        .collect::<Vec<_>>();
+    numbering_findings.sort_by_key(|finding| finding.paragraph_index);
+    findings.extend(numbering_findings);
+
+    if structure.definitions.is_empty() {
+        notes.push("No quoted defined terms were detected; defined-term checks abstained.".into());
+    }
+    for term in &structure.definitions {
+        let defined_in = term
+            .definitions
+            .iter()
+            .filter_map(|definition| definition.source_paragraph_id.parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        if defined_in.len() > 1 {
+            let paragraph = *defined_in.last().unwrap();
+            findings.push(DocxLintFinding {
+                code: DocxLintCode::DefinedTermDuplicate,
+                severity: DocxLintSeverity::Warning,
+                subject: term.term.clone(),
+                message: format!(
+                    "\"{}\" is defined {} times (paragraphs {}).",
+                    term.term,
+                    defined_in.len(),
+                    defined_in
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                paragraph_index: paragraph,
+                excerpt: excerpt(paragraph, &term.term),
+            });
+        }
+        if term.uses.is_empty() {
+            if let Some(&paragraph) = defined_in.first() {
+                findings.push(DocxLintFinding {
+                    code: DocxLintCode::DefinedTermUnused,
+                    severity: DocxLintSeverity::Warning,
+                    subject: term.term.clone(),
+                    message: format!(
+                        "\"{}\" is defined but never used elsewhere in this document.",
+                        term.term
+                    ),
+                    paragraph_index: paragraph,
+                    excerpt: excerpt(paragraph, &term.term),
+                });
+            }
+        }
+    }
+
+    if findings.len() > MAX_FINDINGS {
+        notes.push(format!(
+            "Findings truncated to {MAX_FINDINGS} of {}.",
+            findings.len()
+        ));
+    }
+    findings.truncate(MAX_FINDINGS);
+    Ok(DocxLintReport {
+        paragraphs: paragraphs.len(),
+        checks: DocxLintChecks {
+            cross_references: DocxLintReferenceChecks {
+                references: facts.cross_references.len(),
+                resolved: facts
+                    .cross_references
+                    .iter()
+                    .filter(|reference| reference.status == DocxCrossReferenceStatus::Resolved)
+                    .count(),
+                skipped_external,
+            },
+            attachments: DocxLintAttachmentChecks {
+                references: facts.attachments.len(),
+                resolved: facts
+                    .attachments
+                    .iter()
+                    .filter(|attachment| {
+                        attachment.status == DocxAttachmentReferenceStatus::Resolved
+                    })
+                    .count(),
+            },
+            numbering: DocxLintCount {
+                anchors: facts.numbering.number_anchors.len()
+                    + facts.numbering.roman_article_anchors.len(),
+            },
+            defined_terms: DocxLintDefinitionCount {
+                definitions: structure.definitions.len(),
+            },
+        },
+        findings,
+        notes,
+    })
 }
 
 #[cfg(feature = "structure-inference")]
