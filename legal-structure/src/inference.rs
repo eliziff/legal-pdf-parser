@@ -1467,7 +1467,7 @@ fn numeric_label(value: &str, markdown: bool) -> Option<(&str, usize)> {
     (!markdown || label.contains(['.', '-'])).then_some((label, end))
 }
 
-fn provision_label(value: &str) -> Option<(&str, usize)> {
+pub(crate) fn provision_label(value: &str) -> Option<(&str, usize)> {
     let matched = cached_regex!(VALUE,
     r"^(?:\d{1,8}[A-Za-z]{0,3}(?:[.-]\d{1,8}[A-Za-z]{0,3}){0,3}|[A-Za-z]{1,3}(?:[.-][0-9A-Za-z]{1,8}){1,3})"
 ).find(value)?;
@@ -1592,16 +1592,26 @@ fn section_mark(
 }
 
 fn collect_section_families(text: &ScalarText<'_>, source: &[Line<'_>]) -> [Vec<SectionMark>; 3] {
-    const FAMILIES: [SectionFamily; 3] = [
-        SectionFamily::Bare,
-        SectionFamily::DotTerm,
-        SectionFamily::Markdown,
-    ];
     let mut result = std::array::from_fn(|_| Vec::new());
     for index in 0..source.len() {
-        for (family, marks) in FAMILIES.into_iter().zip(&mut result) {
-            if let Some(mark) = section_mark(text, source, index, family) {
-                marks.push(mark);
+        let line = source[index].text.trim_start_matches([' ', '\t']);
+        let numeric = line.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || line
+                .strip_prefix("**")
+                .and_then(|value| value.as_bytes().first())
+                .is_some_and(u8::is_ascii_digit);
+        if numeric {
+            for (family, marks) in [SectionFamily::Bare, SectionFamily::DotTerm]
+                .into_iter()
+                .zip(&mut result[..2])
+            {
+                if let Some(mark) = section_mark(text, source, index, family) {
+                    marks.push(mark);
+                }
+            }
+        } else if line.starts_with('#') {
+            if let Some(mark) = section_mark(text, source, index, SectionFamily::Markdown) {
+                result[2].push(mark);
             }
         }
     }
@@ -1991,10 +2001,8 @@ pub(super) fn statute_spine(text: &ScalarText<'_>, allow_hyphen: bool) -> Vec<Se
     statute_spine_from_lines(text, allow_hyphen, &lines(text).collect::<Vec<_>>())
 }
 
-fn dotted_order(marks: &[SectionMark]) -> Option<bool> {
-    let dotted = marks
-        .iter()
-        .map(|value| &value.label)
+pub(crate) fn dotted_order<'a>(labels: impl Iterator<Item = &'a str>) -> Option<bool> {
+    let dotted = labels
         .filter(|value| value.contains('.') && !value.contains('-'))
         .collect::<Vec<_>>();
     let inversions = |fraction| {
@@ -2064,7 +2072,7 @@ fn emphasis_sections(text: &ScalarText<'_>) -> Vec<SectionMark> {
             .starts_with(|character: char| character.is_ascii_digit())
             == numeric
     });
-    let Some(fraction) = dotted_order(&candidates) else {
+    let Some(fraction) = dotted_order(candidates.iter().map(|mark| mark.label.as_str())) else {
         return Vec::new();
     };
     let mut result = Vec::<SectionMark>::new();
@@ -2118,7 +2126,7 @@ fn status_sections(text: &ScalarText<'_>, allow_hyphen: bool) -> Vec<SectionMark
 }
 
 fn coherent_sections(marks: &[SectionMark]) -> bool {
-    let Some(fraction) = dotted_order(marks) else {
+    let Some(fraction) = dotted_order(marks.iter().map(|mark| mark.label.as_str())) else {
         return false;
     };
     marks
@@ -2767,17 +2775,21 @@ fn direct_section(value: &str) -> Option<(String, usize)> {
 }
 
 fn instrument_top(value: &str, direct: bool) -> Option<(String, usize, bool)> {
-    let possible_top = [
-        "ARTICLE", "Article", "PART", "Part", "DIVISION", "Division", "SCHEDULE", "Schedule",
-        "EXHIBIT", "Exhibit", "ANNEX", "Annex", "APPENDIX", "Appendix",
-    ]
-    .into_iter()
-    .any(|word| {
-        value
-            .strip_prefix(word)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_whitespace)
-    });
+    let possible_top = value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'A' | b'P' | b'D' | b'S' | b'E'))
+        && [
+            "ARTICLE", "Article", "PART", "Part", "DIVISION", "Division", "SCHEDULE", "Schedule",
+            "EXHIBIT", "Exhibit", "ANNEX", "Annex", "APPENDIX", "Appendix",
+        ]
+        .into_iter()
+        .any(|word| {
+            value
+                .strip_prefix(word)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(char::is_whitespace)
+        });
     if possible_top {
         if let Some(found) = cached_regex!(TOP,
         r"^(?:(ARTICLE|Article|PART|Part|DIVISION|Division)\s+([IVXLCDM]+|\d{1,3})\b\s*[—–\-.:]?\s*(.*)|(SCHEDULE|Schedule|EXHIBIT|Exhibit|ANNEX|Annex|APPENDIX|Appendix)\s+([A-Z0-9][\w.\-]*)\s*[—–\-.:]?\s*(.*))$"

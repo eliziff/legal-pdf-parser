@@ -57,36 +57,6 @@ impl A2ajInput {
     }
 }
 
-fn provision_label(value: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(?:\d{1,8}[A-Za-z]{0,3}(?:[.-]\d{1,8}[A-Za-z]{0,3}){0,3}|[A-Za-z]{1,3}(?:[.-][0-9A-Za-z]{1,8}){1,3})$").unwrap())
-        .is_match(value)
-}
-
-fn dotted_order(source: &[(usize, &str, &str)]) -> Option<bool> {
-    let labels = || {
-        source
-            .iter()
-            .map(|(_, label, _)| label)
-            .filter(|label| label.contains('.') && !label.contains('-'))
-    };
-    let pairs = || labels().zip(labels().skip(1));
-    let inversions = |order| {
-        pairs()
-            .filter(|(left, right)| crate::inference::compare_labels(left, right, order).is_gt())
-            .count()
-    };
-    let (component, fraction) = (inversions(false), inversions(true));
-    if component != fraction {
-        return Some(fraction < component);
-    }
-    (!pairs().any(|(left, right)| {
-        crate::inference::compare_labels(left, right, false)
-            != crate::inference::compare_labels(left, right, true)
-    }))
-    .then_some(false)
-}
-
 fn validate_section_map(map: &A2ajSectionMap) -> Result<(), EngineError> {
     let mut seen = HashSet::new();
     if map.iter().any(|(key, _)| !seen.insert(key)) {
@@ -114,12 +84,15 @@ fn object_entries(map: &A2ajSectionMap) -> Result<Vec<(usize, &str, &str)>, Engi
 
 fn ordered_sections(map: &A2ajSectionMap) -> Result<Vec<(&str, &str)>, EngineError> {
     let mut entries = object_entries(map)?;
-    let order = dotted_order(&entries);
+    let order = crate::inference::dotted_order(entries.iter().map(|(_, label, _)| *label));
     entries.sort_by(|left, right| {
         let (a, b) = (left.1.trim(), right.1.trim());
         let preamble =
             |value: &str| matches!(value.to_lowercase().as_str(), "preamble" | "préambule");
-        let provisions = (provision_label(a), provision_label(b));
+        let provisions = (
+            crate::inference::provision_label(a).is_some_and(|(_, end)| end == a.len()),
+            crate::inference::provision_label(b).is_some_and(|(_, end)| end == b.len()),
+        );
         preamble(b)
             .cmp(&preamble(a))
             .then_with(|| provisions.1.cmp(&provisions.0))

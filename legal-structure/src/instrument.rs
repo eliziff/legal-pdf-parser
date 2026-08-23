@@ -116,11 +116,6 @@ fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = Stri
 }
 
 #[cfg(feature = "structure-inference")]
-pub fn instrument_lineation_hypotheses(text: &str) -> Vec<String> {
-    instrument_lineation_hypotheses_iter(text).collect()
-}
-
-#[cfg(feature = "structure-inference")]
 struct ProvisionGrammars {
     numeric: CompiledEcmascriptGrammar,
     roman: CompiledEcmascriptGrammar,
@@ -1041,7 +1036,8 @@ fn instrument_contents_region(
 /// Read a document's own table of contents as a page-addressed outline. The
 /// outline never claims provision spans; ambiguous inputs receive a typed refusal.
 #[cfg(feature = "structure-inference")]
-pub fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
+#[cfg(test)]
+fn instrument_contents_outline(text: &str) -> InstrumentContentsReading {
     let anchors = instrument_contents_anchors(text);
     if anchors.is_empty() {
         return InstrumentContentsReading {
@@ -1648,51 +1644,6 @@ fn instrument_reference_index<'a>(
     index
 }
 
-/// Select the instrument graph whose provision inventory is best endorsed by
-/// typed references from the source text. Candidate zero wins every tie.
-#[cfg(feature = "structure-inference")]
-pub fn select_instrument_lineation(
-    text: &str,
-    graphs: &[DocumentStructure],
-) -> Result<usize, EngineError> {
-    let indexed = ScalarText::new(text);
-    let references = find_provision_references(text, FindProvisionReferencesOptions::default());
-    select_instrument_lineation_indexed(&indexed, graphs, &references)
-}
-
-#[cfg(feature = "structure-inference")]
-fn select_instrument_lineation_indexed(
-    text: &ScalarText<'_>,
-    graphs: &[DocumentStructure],
-    references: &[ProvisionReference],
-) -> Result<usize, EngineError> {
-    if graphs.is_empty() {
-        return Err(EngineError::invalid(
-            "instrument lineation selection requires a graph",
-        ));
-    }
-    let endorsed = endorsed_references(references);
-    if endorsed.is_empty() {
-        return Ok(0);
-    }
-    let mut selected = 0;
-    let mut best = instrument_lineation_score(&graphs[0], &endorsed);
-    for (index, graph) in graphs.iter().enumerate().skip(1) {
-        if instrument_head_span(graph, text.utf16_len()) < 0.05 {
-            continue;
-        }
-        let candidate = instrument_lineation_score(graph, &endorsed);
-        if candidate > best {
-            selected = index;
-            best = candidate;
-        }
-        if best == endorsed.len() {
-            break;
-        }
-    }
-    Ok(selected)
-}
-
 #[cfg(feature = "structure-inference")]
 fn endorsed_references(references: &[ProvisionReference]) -> Vec<(String, usize, usize)> {
     references
@@ -1707,22 +1658,6 @@ fn endorsed_references(references: &[ProvisionReference]) -> Vec<(String, usize,
             (!key.is_empty()).then_some((key, reference.start, reference.end))
         })
         .collect()
-}
-
-#[cfg(feature = "structure-inference")]
-fn instrument_lineation_score(
-    graph: &DocumentStructure,
-    endorsed: &[(String, usize, usize)],
-) -> usize {
-    instrument_lineation_score_sections(
-        graph.nodes.iter().filter_map(|node| {
-            (node.kind == NodeKind::Section)
-                .then_some(node.label.as_deref())
-                .flatten()
-                .map(|label| (label, node.range.start))
-        }),
-        endorsed,
-    )
 }
 
 #[cfg(feature = "structure-inference")]
@@ -1755,17 +1690,6 @@ fn instrument_lineation_score_sections<'a>(
                 .is_some_and(|target| *target < *start || *target >= *end)
         })
         .count()
-}
-
-#[cfg(feature = "structure-inference")]
-fn instrument_head_span(graph: &DocumentStructure, text_length: usize) -> f64 {
-    instrument_head_span_sections(
-        graph.nodes.iter().filter_map(|node| {
-            let label = node.label.as_deref()?;
-            (node.kind == NodeKind::Section).then_some((label, node.range.start))
-        }),
-        text_length,
-    )
 }
 
 #[cfg(feature = "structure-inference")]
@@ -1817,13 +1741,18 @@ fn derive_instrument_structure(
     let first = hypotheses
         .next()
         .ok_or_else(|| EngineError::invalid("instrument lineation selection requires a graph"))?;
+    let first_is_original = tables.is_empty() && first == text.value;
     let mut selected_text = tables.masked_text(first);
-    let selected_view = if selected_text.len() == text.value.len() {
-        text.with_same_coordinates(&selected_text)
+    let mut selected_blocks = if first_is_original {
+        crate::inference::detect_instrument(&text)
     } else {
-        ScalarText::new(&selected_text)
+        let selected_view = if selected_text.len() == text.value.len() {
+            text.with_same_coordinates(&selected_text)
+        } else {
+            ScalarText::new(&selected_text)
+        };
+        crate::inference::detect_instrument(&selected_view)
     };
-    let mut selected_blocks = crate::inference::detect_instrument(&selected_view);
     let mut selected = 0;
     let mut best = if endorsed.is_empty() {
         0
@@ -1854,7 +1783,7 @@ fn derive_instrument_structure(
             }
         }
     }
-    let selected_original = selected == 0 && tables.is_empty();
+    let selected_original = selected == 0 && first_is_original;
     let scalar_end = selected_text.chars().count();
     let input = DocumentInput {
         schema_version: EVIDENCE_SCHEMA.to_owned(),

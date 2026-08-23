@@ -751,11 +751,12 @@ impl SourceDocQuery {
         rest.sort_by_key(|block| block.start);
         let text = ScalarText::new(&self.document.text);
         let seed = self.materialize(seed, &text);
-        let mut nodes = vec![seed.clone()];
-        nodes.extend(rest.into_iter().map(|block| self.materialize(block, &text)));
         Some(GraphScope {
             seed,
-            nodes,
+            nodes: rest
+                .into_iter()
+                .map(|block| self.materialize(block, &text))
+                .collect(),
             depth: hops.min(limit),
         })
     }

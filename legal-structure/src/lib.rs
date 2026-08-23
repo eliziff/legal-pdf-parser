@@ -42,19 +42,19 @@ pub use native_markup::{analyze_native_markup, NativeMarkupInput};
 pub use numeric_sequence::*;
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
-    ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind, SourceDocOrigin,
-    SourceDocProvider, SourceDocType,
+    SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind, SourceDocOrigin, SourceDocProvider,
+    SourceDocType,
 };
 #[cfg(feature = "source-doc")]
 pub use source_doc_query::*;
-pub use tables::{AuthoritativeTableCell, AuthoritativeTables};
+pub use tables::AuthoritativeTableCell;
+pub(crate) use tables::AuthoritativeTables;
 pub(crate) use text::javascript_whitespace;
 pub(crate) use text::ScalarText;
 pub use text::{normalize_javascript_whitespace, utf16_len};
 
 pub const EVIDENCE_SCHEMA: &str = "legalpdf.structure-evidence.v1";
 pub const DOCUMENT_STRUCTURE_SCHEMA: &str = "legalpdf.document-structure.v1";
-pub const SOURCE_DOC_VERSION: u32 = 1;
 const ENGINE_ORIGIN: &str = "legalpdf.structure-engine";
 
 #[derive(Debug)]
@@ -899,15 +899,15 @@ mod inference;
 mod candidates;
 mod derive;
 
+#[cfg(all(feature = "structure-inference", test))]
+pub(crate) use candidates::resolve_structure_candidates;
 #[cfg(feature = "structure-inference")]
-pub use candidates::{
-    detect_structure_candidate_runs, resolve_structure_candidates, resolve_structure_graph,
-};
+pub use candidates::{detect_structure_candidate_runs, resolve_structure_graph};
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use derive::derive_document_structure;
-pub use derive::derive_native_structure_evidence;
-#[cfg(feature = "structure-inference")]
-pub use derive::derive_structure_evidence;
+pub(crate) use derive::derive_native_structure_evidence;
+#[cfg(all(feature = "structure-inference", test))]
+pub(crate) use derive::derive_structure_evidence;
 #[cfg(feature = "source-doc")]
 pub use derive::project_document_structure;
 #[cfg(feature = "source-doc")]

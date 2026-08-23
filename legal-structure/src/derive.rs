@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "source-doc")]
+use crate::source_doc::ProjectionOrder;
 
 fn native_kind(kind: EvidenceKind) -> NodeKind {
     match kind {
@@ -163,8 +165,8 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
     structure
 }
 
-#[cfg(feature = "structure-inference")]
-pub fn derive_structure_evidence(
+#[cfg(all(feature = "structure-inference", test))]
+pub(crate) fn derive_structure_evidence(
     evidence: DocumentInput,
 ) -> Result<DocumentStructure, EngineError> {
     let inferred = if evidence.needs_inference() {
@@ -176,7 +178,7 @@ pub fn derive_structure_evidence(
     Ok(infer_graph(evidence, inferred))
 }
 
-pub fn derive_native_structure_evidence(
+pub(crate) fn derive_native_structure_evidence(
     evidence: DocumentInput,
 ) -> Result<DocumentStructure, EngineError> {
     Ok(infer_graph(evidence, Vec::new()))

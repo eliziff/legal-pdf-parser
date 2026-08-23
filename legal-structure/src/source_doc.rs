@@ -452,7 +452,7 @@ fn source_doc_navigation(
 }
 
 #[derive(Clone, Copy)]
-pub enum ProjectionOrder {
+pub(crate) enum ProjectionOrder {
     Case,
     Legislation,
     Position,

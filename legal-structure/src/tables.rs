@@ -27,7 +27,7 @@ struct Cell<'a> {
     bytes: std::ops::Range<usize>,
 }
 
-pub struct AuthoritativeTables<'a> {
+pub(crate) struct AuthoritativeTables<'a> {
     cells: Vec<Cell<'a>>,
 }
 

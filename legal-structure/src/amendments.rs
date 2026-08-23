@@ -1,8 +1,7 @@
 use crate::{
     analyze_instrument, javascript_whitespace, normalize_source_doc_locator,
-    project_document_structure_view, AuthoritativeTableCell, DocumentStructure,
-    InstrumentCrossReferenceReason, InstrumentCrossReferenceStatus, ScalarText, SourceDoc,
-    SourceDocKind, StructureNode,
+    AuthoritativeTableCell, DocumentStructure, InstrumentCrossReferenceReason,
+    InstrumentCrossReferenceStatus, NodeKind, ScalarText, SourceDocKind, StructureNode,
 };
 use legal_grammar_tables::{
     compile_ecmascript_pattern, compile_table_entry, expand_pattern, load_tables, CompiledGrammar,
@@ -749,7 +748,6 @@ pub fn parse_amendment_instructions(text: &str) -> Value {
 
 struct Analyzed {
     structure: DocumentStructure,
-    source_doc: SourceDoc,
 }
 
 fn analyze(text: &str, reconstruct_lineation: bool) -> Result<Analyzed, crate::EngineError> {
@@ -759,11 +757,7 @@ fn analyze(text: &str, reconstruct_lineation: bool) -> Result<Analyzed, crate::E
         &[] as &[AuthoritativeTableCell],
         reconstruct_lineation,
     )?;
-    let source_doc = project_document_structure_view(&structure);
-    Ok(Analyzed {
-        structure,
-        source_doc,
-    })
+    Ok(Analyzed { structure })
 }
 
 fn utf16_slice_at<'a>(
@@ -829,14 +823,14 @@ fn find_in_span(
 
 struct Target {
     span: (usize, usize),
-    node: Option<usize>,
+    node: bool,
 }
 
-fn resolve_target(doc: &SourceDoc, target: &str, length: usize) -> Option<Target> {
+fn resolve_target(structure: &DocumentStructure, target: &str, length: usize) -> Option<Target> {
     if target.is_empty() {
         return Some(Target {
             span: (0, length),
-            node: None,
+            node: false,
         });
     }
     let normalized = normalize_source_doc_locator(SourceDocKind::Section, target);
@@ -844,11 +838,45 @@ fn resolve_target(doc: &SourceDoc, target: &str, length: usize) -> Option<Target
         if key.is_empty() {
             continue;
         }
-        if let Some(position) = doc.index.get(&key) {
-            let block = &doc.blocks[position];
+        let mut found = None;
+        let mut prose = 0;
+        for node in &structure.nodes {
+            if !matches!(
+                node.kind,
+                NodeKind::Paragraph
+                    | NodeKind::Prose
+                    | NodeKind::Page
+                    | NodeKind::Section
+                    | NodeKind::Footnote
+                    | NodeKind::Table
+                    | NodeKind::Row
+                    | NodeKind::Cell
+            ) {
+                continue;
+            }
+            let primary = if node.kind == NodeKind::Prose {
+                prose += 1;
+                format!("par{prose}")
+            } else {
+                let Some(label) = &node.label else { continue };
+                label.clone()
+            };
+            let matched = primary.to_lowercase() == key
+                || node
+                    .aliases
+                    .iter()
+                    .flatten()
+                    .chain(node.anchor.iter())
+                    .any(|label| label.to_lowercase() == key);
+            if matched && found.replace(node).is_some() {
+                found = None;
+                break;
+            }
+        }
+        if let Some(node) = found {
             return Some(Target {
-                span: (block.start, block.end),
-                node: Some(position),
+                span: (node.range.start, node.range.end),
+                node: true,
             });
         }
     }
@@ -918,7 +946,7 @@ pub fn apply_amend_ops(
             }};
         }
         let target_name = field(op, "target").unwrap_or("");
-        let Some(target) = resolve_target(&before.source_doc, target_name, length) else {
+        let Some(target) = resolve_target(&before.structure, target_name, length) else {
             reject!("target_not_found", target_name.to_owned());
         };
         let fail = |code, detail: String| amend_failure(op, code, detail);
@@ -1024,7 +1052,7 @@ pub fn apply_amend_ops(
                 None => failures.push(fail("missing_new_text", target_name.to_owned())),
             },
             "strike_provision" | "repeal_provision" => {
-                if target.node.is_none() {
+                if !target.node {
                     failures.push(fail(
                         "target_not_found",
                         "cannot repeal whole document".to_owned(),
@@ -1072,8 +1100,7 @@ pub fn apply_amend_ops(
                 };
                 let child_name = field(op, "afterChild");
                 let child = child_name.and_then(|label| {
-                    resolve_target(&before.source_doc, label, length)
-                        .filter(|target| target.node.is_some())
+                    resolve_target(&before.structure, label, length).filter(|target| target.node)
                 });
                 if child_name.is_some() && child.is_none() {
                     reject!("target_not_found", child_name.unwrap().to_owned());
@@ -1088,7 +1115,7 @@ pub fn apply_amend_ops(
                 push(op, at, at, format!("\n{}", ensure_block(value)));
             }
             "redesignate" => {
-                let Some(label) = field(op, "newLabel").filter(|_| target.node.is_some()) else {
+                let Some(label) = field(op, "newLabel").filter(|_| target.node) else {
                     reject!(
                         "unsupported_apply",
                         "redesignation needs a labelled node".to_owned(),
@@ -1184,7 +1211,7 @@ pub fn apply_amend_ops(
             && has_text(field(op, "oldText"))
         {
             let lingering = resolve_target(
-                &after.source_doc,
+                &after.structure,
                 field(op, "target").unwrap_or(""),
                 after_length,
             )
