@@ -126,7 +126,7 @@ pub fn detect_structure_candidate_runs(value: &str) -> Vec<StructureCandidateRun
     runs
 }
 #[cfg(feature = "structure-inference")]
-pub fn resolve_structure_candidates(
+pub(crate) fn resolve_structure_candidates(
     runs: &[StructureCandidateRun],
     evidence: &[CandidateEvidenceV2],
 ) -> Result<Vec<ResolvedCandidate>, EngineError> {

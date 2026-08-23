@@ -187,7 +187,7 @@ fn sequence_findings(
 
 /// Port of Beaver's literal DOCX numbering detector over its normalized
 /// paragraph-text plane. It does not resolve Word field numbering.
-pub fn derive_docx_numbering(paragraphs: &[String]) -> DocxNumberingResult {
+pub(crate) fn derive_docx_numbering(paragraphs: &[String]) -> DocxNumberingResult {
     let number_anchors = collect_number_anchors(paragraphs);
     let roman_article_anchors = collect_roman_article_anchors(paragraphs);
     let (duplicates, gaps) = sequence_findings(&number_anchors);

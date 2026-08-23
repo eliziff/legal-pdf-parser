@@ -302,7 +302,7 @@ fn attachments(paragraphs: &[String]) -> Vec<DocxAttachmentReference> {
     found
 }
 
-pub fn derive_docx_lint_facts(paragraphs: &[String]) -> DocxStructureFacts {
+fn derive_docx_lint_facts(paragraphs: &[String]) -> DocxStructureFacts {
     let numbering = derive_docx_numbering(paragraphs);
     DocxStructureFacts {
         cross_references: cross_references(
