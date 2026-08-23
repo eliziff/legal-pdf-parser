@@ -6,13 +6,13 @@ license = "MIT"
 
 [features]
 default = []
-structure-inference = ["dep:regex"]
+structure-inference = []
 source-doc = []
 a2aj = ["structure-inference", "source-doc"]
 journal = ["source-doc"]
 
 [dependencies]
-regex = { version = "1.11", optional = true }
+regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
