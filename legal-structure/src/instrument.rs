@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "structure-inference")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "structure-inference")]
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 #[cfg(feature = "structure-inference")]
 use std::sync::OnceLock;
 
@@ -273,7 +273,7 @@ fn provision_flanks<'a>(
 #[cfg(feature = "structure-inference")]
 #[allow(clippy::too_many_arguments)]
 fn push_provision_reference(
-    found: &mut BTreeMap<usize, ProvisionReference>,
+    found: &mut Vec<ProvisionReference>,
     text: &str,
     allowed: Option<&HashSet<&str>>,
     window: usize,
@@ -286,7 +286,10 @@ fn push_provision_reference(
     external_override: Option<bool>,
     continuation_of: Option<usize>,
 ) {
-    if found.contains_key(&start_byte) {
+    if found
+        .last()
+        .is_some_and(|reference| reference.start == start_byte)
+    {
         return;
     }
     let lower = word.to_lowercase();
@@ -306,22 +309,19 @@ fn push_provision_reference(
         normalize_numbered_section_locator(&label)
     };
     let alias_key = format!("{singular} {label}").to_lowercase();
-    found.insert(
-        start_byte,
-        ProvisionReference {
-            start: start_byte,
-            end: end_byte,
-            raw: raw.to_owned(),
-            word: singular,
-            plural,
-            label,
-            shape,
-            locator,
-            alias_key,
-            external,
-            continuation_of,
-        },
-    );
+    found.push(ProvisionReference {
+        start: start_byte,
+        end: end_byte,
+        raw: raw.to_owned(),
+        word: singular,
+        plural,
+        label,
+        shape,
+        locator,
+        alias_key,
+        external,
+        continuation_of,
+    });
 }
 
 #[cfg(feature = "structure-inference")]
@@ -336,12 +336,22 @@ fn find_provision_references(
         .words
         .map(|words| words.iter().copied().collect::<HashSet<_>>());
     let text = coordinates.value;
-    let mut found = BTreeMap::new();
+    let mut found = Vec::new();
+    let reference_grammar = &grammars.reference;
+    let mut capture_locations = reference_grammar.capture_locations();
+    let mut search_start = 0;
 
-    for captures in grammars.reference.captures_iter(text) {
-        if captures.get(1).is_none() {
-            let whole = captures.get(0).expect("roman provision match");
-            let word = captures.get(5).expect("roman provision word").as_str();
+    while let Some(whole) =
+        reference_grammar.captures_read_at(&mut capture_locations, text, search_start)
+    {
+        search_start = whole.end();
+        let capture = |index| {
+            capture_locations
+                .get(index)
+                .map(|(start, end)| &text[start..end])
+        };
+        if capture(1).is_none() {
+            let word = capture(5).expect("roman provision word");
             push_provision_reference(
                 &mut found,
                 text,
@@ -351,23 +361,19 @@ fn find_provision_references(
                 whole.as_str(),
                 word,
                 word.to_lowercase().ends_with('s'),
-                captures.get(6).expect("roman provision label").as_str(),
+                capture(6).expect("roman provision label"),
                 ProvisionReferenceShape::Roman,
                 None,
                 None,
             );
             continue;
         }
-        let whole = captures.get(0).expect("numeric provision match");
-        let raw_label = captures
-            .get(3)
-            .or_else(|| captures.get(4))
-            .map_or("", |value| value.as_str());
+        let raw_label = capture(3).or_else(|| capture(4)).unwrap_or("");
         let start_byte = whole.start();
         let end_byte = whole.end();
         let (before, after) = provision_flanks(text, start_byte, end_byte, window);
         let external = is_external_reference_in_context(before, after);
-        let word = captures.get(1).expect("provision word").as_str();
+        let word = capture(1).expect("provision word");
         push_provision_reference(
             &mut found,
             text,
@@ -376,9 +382,9 @@ fn find_provision_references(
             start_byte,
             whole.as_str(),
             word,
-            captures.get(2).is_some(),
+            capture(2).is_some(),
             raw_label,
-            if captures.get(3).is_some() {
+            if capture(3).is_some() {
                 ProvisionReferenceShape::Numeric
             } else {
                 ProvisionReferenceShape::SubOnly
@@ -419,7 +425,7 @@ fn find_provision_references(
             });
             cursor += whole.end();
         }
-        let safe_to_expand = captures.get(2).is_some()
+        let safe_to_expand = capture(2).is_some()
             || continuations.len() > 1
             || continuations.iter().any(|item| {
                 item.connector != "," || item.shape == ProvisionReferenceShape::SubOnly
@@ -461,7 +467,7 @@ fn find_provision_references(
     }
     let mut head = (0, 0);
     found
-        .into_values()
+        .into_iter()
         .map(|mut reference| {
             let start_byte = reference.start;
             let start = coordinates
@@ -1246,8 +1252,8 @@ fn reference_nodes(graph: &DocumentStructure) -> Vec<ReferenceNode<'_>> {
 }
 
 #[cfg(feature = "structure-inference")]
-fn node_keys(node: &ReferenceNode) -> Vec<String> {
-    let mut keys = vec![node.label.to_lowercase()];
+fn node_keys(node: &ReferenceNode, label: String) -> Vec<String> {
+    let mut keys = vec![label];
     let roman = match node.kind {
         "article" => node
             .label
@@ -1273,18 +1279,12 @@ fn node_keys(node: &ReferenceNode) -> Vec<String> {
 }
 
 #[cfg(feature = "structure-inference")]
-fn label_parent(locator: &str) -> String {
-    let Some(body) = locator.strip_prefix("sec") else {
-        return String::new();
-    };
+fn label_parent(locator: &str) -> Option<&str> {
+    let body = locator.strip_prefix("sec")?;
     let body = body.split('@').next().unwrap_or(body);
-    if !body.ends_with(')') {
-        return String::new();
-    }
-    let Some(open) = body.rfind('(') else {
-        return String::new();
-    };
-    format!("sec{}", &body[..open])
+    body.ends_with(')').then_some(())?;
+    let open = body.rfind('(')?;
+    Some(&locator[..3 + open])
 }
 
 #[cfg(feature = "structure-inference")]
@@ -1355,15 +1355,33 @@ fn resolve_instrument_references(
     const INTEGRITY_GATE: f64 = 0.5;
 
     let nodes = reference_nodes(graph);
-    let mut by_label = HashMap::new();
+    let mut by_label = HashMap::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
         by_label.entry(node.label).or_insert(index);
     }
     let mut ordered = (0..nodes.len()).collect::<Vec<_>>();
     ordered.sort_by_key(|index| (nodes[*index].start, nodes[*index].depth));
 
-    let mut targets = HashMap::<String, (Option<usize>, usize)>::new();
+    let mut targets =
+        HashMap::<String, (Option<usize>, usize)>::with_capacity(nodes.len().saturating_mul(2));
+    let mut child_depths = HashSet::with_capacity(nodes.len());
+    let mut top_level_numeric = 0;
+    let mut containers = 0;
+    static TOP_LEVEL: OnceLock<Regex> = OnceLock::new();
+    let top_level = TOP_LEVEL.get_or_init(|| {
+        Regex::new(r"(?i)^sec\d{1,8}[a-z]{0,3}(?:[.-]\d{1,8}[a-z]{0,3}){0,3}$")
+            .expect("valid top-level provision grammar")
+    });
     for (node_index, node) in nodes.iter().enumerate() {
+        let label = node.label.to_lowercase();
+        if let Some(parent) = label_parent(&label) {
+            child_depths.insert(format!("{parent}:{}", label_depth(&label)));
+        } else if top_level.is_match(&label) {
+            top_level_numeric += 1;
+        }
+        if matches!(node.kind, "article" | "part" | "division") {
+            containers += 1;
+        }
         let mut add = |key, ambiguity| {
             let target = targets.entry(key).or_insert((Some(node_index), 0));
             target.1 += usize::from(ambiguity);
@@ -1371,7 +1389,7 @@ fn resolve_instrument_references(
                 target.0 = None;
             }
         };
-        let mut keys = node_keys(node);
+        let mut keys = node_keys(node, label);
         keys.extend(node.aliases.iter().map(|key| key.to_lowercase()));
         keys.sort();
         keys.dedup();
@@ -1382,29 +1400,8 @@ fn resolve_instrument_references(
             add(anchor.to_lowercase(), false);
         }
     }
-    let mut child_depths = HashSet::new();
-    let mut top_level_numeric = 0;
-    let mut containers = 0;
-    static TOP_LEVEL: OnceLock<Regex> = OnceLock::new();
-    let top_level = TOP_LEVEL.get_or_init(|| {
-        Regex::new(r"(?i)^sec\d{1,8}[a-z]{0,3}(?:[.-]\d{1,8}[a-z]{0,3}){0,3}$")
-            .expect("valid top-level provision grammar")
-    });
-    for node in &nodes {
-        let label = node.label.to_lowercase();
-        let parent = label_parent(&label);
-        if !parent.is_empty() {
-            child_depths.insert(format!("{parent}:{}", label_depth(&label)));
-        } else if top_level.is_match(&label) {
-            top_level_numeric += 1;
-        }
-        if matches!(node.kind, "article" | "part" | "division") {
-            containers += 1;
-        }
-    }
     let numbers_here = |locator: &str| {
-        let parent = label_parent(locator);
-        if !parent.is_empty() {
+        if let Some(parent) = label_parent(locator) {
             child_depths.contains(&format!("{parent}:{}", label_depth(locator)))
         } else if !locator.starts_with("sec") {
             containers >= MIN_ADDRESSABLE_NODES
@@ -1498,17 +1495,19 @@ fn resolve_instrument_references(
             counts,
         });
     }
-    let targets = edges
+    let (target_count, furthest_target) = edges
         .iter()
         .filter(|edge| edge.status == InstrumentCrossReferenceStatus::Resolved)
         .filter_map(|edge| edge.target_start)
-        .collect::<Vec<_>>();
+        .fold((0, 0), |(count, furthest), target| {
+            (count + 1, furthest.max(target))
+        });
     let reach = if text.utf16_len() == 0 {
         1.0
     } else {
-        targets.iter().copied().max().unwrap_or(0) as f64 / text.utf16_len() as f64
+        furthest_target as f64 / text.utf16_len() as f64
     };
-    let contents_only = targets.len() >= MIN_TARGETS_FOR_REACH && reach < MIN_TARGET_REACH;
+    let contents_only = target_count >= MIN_TARGETS_FOR_REACH && reach < MIN_TARGET_REACH;
     if contents_only || (accepted > 0 && counts.integrity < INTEGRITY_GATE) {
         for edge in &mut edges {
             if edge.status != InstrumentCrossReferenceStatus::External {
@@ -1523,7 +1522,7 @@ fn resolve_instrument_references(
         let note = if contents_only {
             format!(
                 "Cross-reference resolution abstained: every one of {} resolved targets lands in the first {}% of the document, so the only numbering the compiler can see is a table of contents, not the provisions.",
-                targets.len(),
+                target_count,
                 js_percent(reach * 100.0)
             )
         } else {
