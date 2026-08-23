@@ -211,8 +211,7 @@ fn evidence(
     text: String,
     claims: Vec<NativeClaim>,
 ) -> Result<DocumentInput, EngineError> {
-    let coordinates = ScalarText::new(&text);
-    let scalar_end = coordinates.len();
+    let scalar_end = text.chars().count();
     let coverage = crate::whole_document_coverage(scalar_end, |kind| {
         if kind == EvidenceKind::Section && !claims.is_empty() {
             CoverageState::Augment
@@ -308,13 +307,36 @@ fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
 }
 
 fn apply_provider_section_evidence(
-    text: &str,
+    coordinates: &ScalarText<'_>,
     blocks: &mut Vec<Block>,
     native_claims: &[NativeClaim],
     map: &A2ajSectionMap,
 ) {
-    let tokens = words(text);
-    let coordinates = ScalarText::new(text);
+    let text = coordinates.value;
+    let mut counts = HashMap::new();
+    for (label, _) in map {
+        *counts.entry(label.trim().to_lowercase()).or_insert(0) += 1;
+    }
+    let native_top_sections = native_claims
+        .iter()
+        .filter(|claim| claim.kind == EvidenceKind::Section && claim.parent_label.is_none())
+        .flat_map(|claim| claim.label.iter().chain(&claim.aliases))
+        .map(|label| label.to_lowercase())
+        .collect::<HashSet<_>>();
+    let selected_sections = map
+        .iter()
+        .filter(|(label, provider_text)| {
+            let label = label.trim();
+            !label.is_empty()
+                && counts.get(&label.to_lowercase()) == Some(&1)
+                && !provider_text.trim().is_empty()
+                && !provider_text.trim().eq_ignore_ascii_case("[blank]")
+                && !native_top_sections.contains(&format!("sec{label}").to_lowercase())
+        })
+        .collect::<Vec<_>>();
+    let tokens = (!selected_sections.is_empty())
+        .then(|| words(text))
+        .unwrap_or_default();
     let mut postings = HashMap::<&str, Vec<usize>>::new();
     for (index, (word, ..)) in tokens.iter().enumerate() {
         postings.entry(word).or_default().push(index);
@@ -332,25 +354,8 @@ fn apply_provider_section_evidence(
             }
         }
     }
-    let mut counts = HashMap::new();
-    for (label, _) in map {
-        *counts.entry(label.trim().to_lowercase()).or_insert(0) += 1;
-    }
-    let native_top_sections = native_claims
-        .iter()
-        .filter(|claim| claim.kind == EvidenceKind::Section && claim.parent_label.is_none())
-        .flat_map(|claim| claim.label.iter().chain(&claim.aliases))
-        .map(|label| label.to_lowercase())
-        .collect::<HashSet<_>>();
-    for (label, provider_text) in map {
+    for (label, provider_text) in selected_sections {
         let label = label.trim();
-        if label.is_empty()
-            || counts.get(&label.to_lowercase()) != Some(&1)
-            || provider_text.trim().is_empty()
-            || provider_text.trim().eq_ignore_ascii_case("[blank]")
-        {
-            continue;
-        }
         let phrase = words(provider_text);
         if phrase.is_empty() {
             continue;
@@ -398,9 +403,6 @@ fn apply_provider_section_evidence(
             });
         let provider_label = format!("sec{label}");
         let key = provider_label.to_lowercase();
-        if native_top_sections.contains(&key) {
-            continue;
-        }
         let candidates = top_sections.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         if candidates.len() == 1 {
             let index = candidates[0];
@@ -464,14 +466,9 @@ pub fn a2aj_document_structure(mut input: A2ajInput) -> Result<DocumentStructure
     let mut structure = if let (A2ajSourceKind::Laws, true, Some(map)) =
         (input.source_kind, has_text, input.section_map.as_ref())
     {
-        let mut inferred =
-            crate::inference::inferred_blocks(&evidence, &ScalarText::new(&evidence.text));
-        apply_provider_section_evidence(
-            &evidence.text,
-            &mut inferred,
-            &evidence.native_claims,
-            map,
-        );
+        let coordinates = ScalarText::new(&evidence.text);
+        let mut inferred = crate::inference::inferred_blocks(&evidence, &coordinates);
+        apply_provider_section_evidence(&coordinates, &mut inferred, &evidence.native_claims, map);
         crate::derive::derive_trusted_inferred(evidence, inferred)?
     } else {
         crate::derive::derive_trusted(evidence)?
