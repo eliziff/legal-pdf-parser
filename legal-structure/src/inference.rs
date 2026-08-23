@@ -1509,21 +1509,12 @@ fn markdown_range_continuation(value: &str) -> bool {
     .is_match(value)
 }
 
-fn previous_nonblank<'a>(source: &'a [Line<'a>], index: usize) -> Option<&'a str> {
-    source[..index]
-        .iter()
-        .rev()
-        .map(|line| line.text)
-        .find(|value| !value.trim().is_empty())
-}
-
 fn section_mark(
     text: &ScalarText<'_>,
-    source: &[Line<'_>],
-    index: usize,
+    line: &Line<'_>,
     family: SectionFamily,
+    previous_nonblank: Option<&str>,
 ) -> Option<SectionMark> {
-    let line = &source[index];
     let lead = leading_ascii_space(line.text);
     let mut value = &line.text[lead..];
     if family == SectionFamily::Markdown {
@@ -1577,7 +1568,7 @@ fn section_mark(
     if !accepted
         || family == SectionFamily::Bare
             && content.is_empty()
-            && previous_nonblank(source, index).is_some_and(markdown_range_continuation)
+            && previous_nonblank.is_some_and(markdown_range_continuation)
     {
         return None;
     }
@@ -1593,8 +1584,9 @@ fn section_mark(
 
 fn collect_section_families(text: &ScalarText<'_>, source: &[Line<'_>]) -> [Vec<SectionMark>; 3] {
     let mut result = std::array::from_fn(|_| Vec::new());
-    for index in 0..source.len() {
-        let line = source[index].text.trim_start_matches([' ', '\t']);
+    let mut previous_nonblank = None;
+    for source_line in source {
+        let line = source_line.text.trim_start_matches([' ', '\t']);
         let numeric = line.as_bytes().first().is_some_and(u8::is_ascii_digit)
             || line
                 .strip_prefix("**")
@@ -1605,14 +1597,22 @@ fn collect_section_families(text: &ScalarText<'_>, source: &[Line<'_>]) -> [Vec<
                 .into_iter()
                 .zip(&mut result[..2])
             {
-                if let Some(mark) = section_mark(text, source, index, family) {
+                if let Some(mark) = section_mark(text, source_line, family, previous_nonblank) {
                     marks.push(mark);
                 }
             }
         } else if line.starts_with('#') {
-            if let Some(mark) = section_mark(text, source, index, SectionFamily::Markdown) {
+            if let Some(mark) = section_mark(
+                text,
+                source_line,
+                SectionFamily::Markdown,
+                previous_nonblank,
+            ) {
                 result[2].push(mark);
             }
+        }
+        if !source_line.text.trim().is_empty() {
+            previous_nonblank = Some(source_line.text);
         }
     }
     result
@@ -1840,9 +1840,9 @@ fn inline_section(text: &ScalarText<'_>, mark: &SectionMark) -> bool {
 }
 
 fn next_nonblank<'a>(source: &'a [Line<'a>], start: usize) -> Option<&'a Line<'a>> {
-    source
+    source[source.partition_point(|line| line.scalar_start <= start)..]
         .iter()
-        .find(|line| line.scalar_start > start && !line.text.trim().is_empty())
+        .find(|line| !line.text.trim().is_empty())
 }
 
 fn short_root(
@@ -2712,13 +2712,11 @@ fn enumerated_children(
             });
         }
     }
+    let seeded_start = markers.first().map(|marker| marker.start);
     for line in lines(&text) {
         let value = line.text.trim_start_matches(instrument_space);
         if let Some((token, at, _)) = legislation_marker(value, line.byte_end < text.value.len()) {
-            if !markers
-                .iter()
-                .any(|marker| marker.start == line.scalar_start)
-            {
+            if seeded_start != Some(line.scalar_start) {
                 markers.push(ChildMark {
                     token,
                     start: line.scalar_start,
@@ -2739,17 +2737,21 @@ fn enumerated_children(
             marker.content_start,
         );
     }
-    for index in 0..state.nodes.len() {
-        let start = state.nodes[index].0.range.start;
-        let end = markers
-            .iter()
-            .find(|marker| marker.start > start)
+    let mut next_marker = 0;
+    for (node, _) in &mut state.nodes {
+        while markers
+            .get(next_marker)
+            .is_some_and(|marker| marker.start <= node.range.start)
+        {
+            next_marker += 1;
+        }
+        node.range.end = markers
+            .get(next_marker)
             .map_or(text.len(), |marker| marker.start);
-        state.nodes[index].0.range.end = end;
-        state.nodes[index].0.range.start += offset;
-        state.nodes[index].0.range.end += offset;
-        state.nodes[index].0.content_start += offset;
-        state.nodes[index].0.parent_label = Some(public_parent.clone());
+        node.range.start += offset;
+        node.range.end += offset;
+        node.content_start += offset;
+        node.parent_label = Some(public_parent.clone());
     }
     state
         .nodes
@@ -2925,12 +2927,13 @@ fn detect_legislation(
 ) -> Vec<Block> {
     let sections = selected_sections(text, allow_hyphenated_sections);
     let mut result = Vec::new();
+    let mut parent_blocks = HashMap::<String, Vec<usize>>::new();
     for (index, section) in sections.iter().enumerate() {
         let end = sections
             .get(index + 1)
             .map_or(text.len(), |value| value.start);
-        let label = format!("sec{}", section.label);
-        let mut top = Block::labelled(NodeKind::Section, label, section.start, end);
+        let parent = format!("sec{}", section.label);
+        let mut top = Block::labelled(NodeKind::Section, parent.clone(), section.start, end);
         top.aliases = section
             .aliases
             .iter()
@@ -2941,16 +2944,22 @@ fn detect_legislation(
         let value = text
             .slice(section.start..end)
             .expect("instrument section range is bounded");
-        result.extend(enumerated_children(
+        let children = enumerated_children(
             value,
             section.start,
-            format!("sec{}", section.label),
+            parent.clone(),
             0,
             section.content_start - section.start,
             matches!(section.family, SectionFamily::Bare | SectionFamily::DotTerm),
             None,
-        ));
+        );
+        parent_blocks
+            .entry(parent.to_ascii_lowercase())
+            .or_default()
+            .extend(result.len()..result.len() + children.len());
+        result.extend(children);
     }
+    let mut retained = vec![true; result.len()];
     for claim in native_claims
         .iter()
         .filter(|claim| claim.kind == EvidenceKind::Section && claim.parent_label.is_none())
@@ -2975,25 +2984,34 @@ fn detect_legislation(
             .map_or(claim.range.start, |_| {
                 claim.range.start + value[..lead].chars().count() + label.chars().count()
             });
+        let parent = format!("sec{label}");
         let children = enumerated_children(
             value,
             claim.range.start,
-            format!("sec{label}"),
+            parent.clone(),
             0,
             content_start - claim.range.start,
             false,
             Some(label),
         );
-        result.retain(|block| {
-            !block
-                .parent_label
-                .as_deref()
-                .is_some_and(|parent| parent.eq_ignore_ascii_case(&format!("sec{label}")))
-                || block.range.start < claim.range.start
-                || block.range.end > claim.range.end
-        });
+        let positions = parent_blocks
+            .entry(parent.to_ascii_lowercase())
+            .or_default();
+        for &index in positions.iter() {
+            let block = &result[index];
+            if retained[index]
+                && block.range.start >= claim.range.start
+                && block.range.end <= claim.range.end
+            {
+                retained[index] = false;
+            }
+        }
+        positions.extend(result.len()..result.len() + children.len());
+        retained.resize(result.len() + children.len(), true);
         result.extend(children);
     }
+    let mut retained = retained.into_iter();
+    result.retain(|_| retained.next().unwrap());
     result
 }
 

@@ -25,12 +25,14 @@ use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 #[cfg(feature = "structure-inference")]
-fn split_instrument_space_runs(text: &str) -> String {
-    let mut recovered = String::with_capacity(text.len());
+fn split_instrument_space_runs(text: &str) -> Option<String> {
+    let mut recovered: Option<String> = None;
     let mut characters = text.char_indices().peekable();
     while let Some((start, character)) = characters.next() {
         if !matches!(character, ' ' | '\t') {
-            recovered.push(character);
+            if let Some(recovered) = &mut recovered {
+                recovered.push(character);
+            }
             continue;
         }
         let mut count = 1;
@@ -47,9 +49,10 @@ fn split_instrument_space_runs(text: &str) -> String {
             && !javascript_whitespace(text[..start].chars().next_back().unwrap())
             && !javascript_whitespace(text[end..].chars().next().unwrap());
         if internal_run {
+            let recovered = recovered.get_or_insert_with(|| text[..start].to_owned());
             recovered.push('\n');
             recovered.push_str(&text[start + 1..end]);
-        } else {
+        } else if let Some(recovered) = &mut recovered {
             recovered.push_str(&text[start..end]);
         }
     }
@@ -57,7 +60,7 @@ fn split_instrument_space_runs(text: &str) -> String {
 }
 
 #[cfg(feature = "structure-inference")]
-fn split_instrument_sentence_joins(text: &str) -> String {
+fn split_instrument_sentence_joins(text: &str) -> Option<String> {
     static HEAD: OnceLock<Regex> = OnceLock::new();
     let head = HEAD.get_or_init(|| {
         Regex::new(
@@ -65,7 +68,7 @@ fn split_instrument_sentence_joins(text: &str) -> String {
         )
         .expect("valid instrument sentence-join grammar")
     });
-    let mut recovered = String::with_capacity(text.len());
+    let mut recovered: Option<String> = None;
     let mut previous = None;
     let mut previous_previous = None;
     for (byte, character) in text.char_indices() {
@@ -80,8 +83,9 @@ fn split_instrument_sentence_joins(text: &str) -> String {
             && preceded_by_terminator
             && head.is_match(&text[after..])
         {
+            let recovered = recovered.get_or_insert_with(|| text[..byte].to_owned());
             recovered.push('\n');
-        } else {
+        } else if let Some(recovered) = &mut recovered {
             recovered.push(character);
         }
         previous_previous = previous;
@@ -94,28 +98,16 @@ fn split_instrument_sentence_joins(text: &str) -> String {
 /// The source lineation is first, so downstream selection keeps it on a tie.
 #[cfg(feature = "structure-inference")]
 fn instrument_lineation_hypotheses_iter(text: &str) -> impl Iterator<Item = String> + '_ {
-    let mut joined = None;
-    let mut seen = Vec::<String>::with_capacity(3);
-    (0..4).filter_map(move |stage| {
-        let hypothesis = match stage {
-            0 => text.to_owned(),
-            1 => split_instrument_space_runs(text),
-            2 => joined
-                .get_or_insert_with(|| split_instrument_sentence_joins(text))
-                .clone(),
-            3 => split_instrument_space_runs(joined.as_deref().unwrap()),
-            _ => unreachable!(),
-        };
-        if stage > 0 {
-            if hypothesis == text || seen.contains(&hypothesis) {
-                return None;
-            }
-            if stage < 3 {
-                seen.push(hypothesis.clone());
-            }
-        }
-        Some(hypothesis)
-    })
+    let spaced = split_instrument_space_runs(text);
+    let joined = split_instrument_sentence_joins(text);
+    let combined = spaced
+        .is_some()
+        .then(|| joined.as_deref().and_then(split_instrument_space_runs))
+        .flatten();
+    std::iter::once(text.to_owned())
+        .chain(spaced)
+        .chain(joined)
+        .chain(combined)
 }
 
 #[cfg(feature = "structure-inference")]
