@@ -249,7 +249,7 @@ pub(crate) fn derive_trusted(input: DocumentInput) -> Result<DocumentStructure, 
 }
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub(super) fn derive_trusted_inferred(
+pub(crate) fn derive_trusted_inferred(
     input: DocumentInput,
     inferred: Vec<Block>,
 ) -> Result<DocumentStructure, EngineError> {

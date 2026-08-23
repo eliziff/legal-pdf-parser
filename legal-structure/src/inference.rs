@@ -1568,18 +1568,15 @@ fn collect_section_families(text: &ScalarText<'_>) -> [Vec<SectionMark>; 3] {
     result
 }
 
-fn section_key(label: &str) -> Vec<u64> {
-    label
-        .split(['.', '-'])
-        .filter_map(|value| {
-            value
-                .bytes()
-                .take_while(u8::is_ascii_digit)
-                .fold(None, |total, digit| {
-                    Some(total.unwrap_or(0) * 10 + u64::from(digit - b'0'))
-                })
-        })
-        .collect()
+fn section_key(label: &str) -> impl Iterator<Item = u64> + '_ {
+    label.split(['.', '-']).filter_map(|value| {
+        value
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .fold(None, |total, digit| {
+                Some(total.unwrap_or(0) * 10 + u64::from(digit - b'0'))
+            })
+    })
 }
 
 fn section_scopes(
@@ -1628,8 +1625,7 @@ fn section_scopes(
     scopes
         .into_iter()
         .filter(|scope| {
-            scope.len() >= 3
-                && (!root || section_key(&scope[0].label).iter().all(|value| *value == 1))
+            scope.len() >= 3 && (!root || section_key(&scope[0].label).all(|value| value == 1))
         })
         .collect()
 }
@@ -1641,36 +1637,42 @@ fn expand_descendants(
 ) -> Vec<SectionMark> {
     if scope
         .first()
-        .is_none_or(|value| section_key(&value.label).len() != 1)
+        .is_none_or(|value| section_key(&value.label).count() != 1)
     {
         return scope;
     }
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(scope.len());
+    let mut cursor = 0;
     for (index, parent) in scope.iter().enumerate() {
         let end = scope.get(index + 1).map_or(length, |value| value.start);
-        let descendants = marks
-            .iter()
-            .filter(|mark| {
-                mark.start > parent.start
-                    && mark.start < end
-                    && matches!(mark.style, SectionStyle::Dot | SectionStyle::DotTerm)
-                    && mark.label.contains('.')
-                    && section_key(&mark.label).first() == section_key(&parent.label).first()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let counts =
-            descendants
-                .iter()
-                .fold(HashMap::<String, usize>::new(), |mut counts, value| {
-                    *counts.entry(value.label.clone()).or_default() += 1;
-                    counts
-                });
+        while marks
+            .get(cursor)
+            .is_some_and(|mark| mark.start <= parent.start)
+        {
+            cursor += 1;
+        }
+        let begin = cursor;
+        while marks.get(cursor).is_some_and(|mark| mark.start < end) {
+            cursor += 1;
+        }
+        let root = section_key(&parent.label).next();
+        let mut descendants = Vec::new();
+        let mut counts = HashMap::<&str, usize>::new();
+        for mark in &marks[begin..cursor] {
+            if matches!(mark.style, SectionStyle::Dot | SectionStyle::DotTerm)
+                && mark.label.contains('.')
+                && section_key(&mark.label).next() == root
+            {
+                descendants.push(mark);
+                *counts.entry(mark.label.as_str()).or_default() += 1;
+            }
+        }
         result.push(parent.clone());
         result.extend(
             descendants
                 .into_iter()
-                .filter(|value| counts.get(value.label.as_str()) == Some(&1)),
+                .filter(|value| counts.get(value.label.as_str()) == Some(&1))
+                .cloned(),
         );
     }
     result
@@ -1724,7 +1726,7 @@ fn scope_winner(
         .into_iter()
         .map(|scope| {
             if scope.first().is_some_and(|value| {
-                value.style != SectionStyle::DotTerm && section_key(&value.label).len() == 1
+                value.style != SectionStyle::DotTerm && section_key(&value.label).count() == 1
             }) {
                 expand_descendants(scope, marks, text.len())
             } else {
@@ -2720,7 +2722,7 @@ pub(super) fn detect_instrument_grammar(text: &ScalarText<'_>) -> Vec<GrammarPoi
     state.nodes.into_iter().map(|(point, _)| point).collect()
 }
 
-pub(super) fn detect_instrument(text: &ScalarText<'_>) -> Vec<Block> {
+pub(crate) fn detect_instrument(text: &ScalarText<'_>) -> Vec<Block> {
     detect_instrument_grammar(text)
         .into_iter()
         .map(GrammarPoint::into_section)

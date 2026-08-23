@@ -1,10 +1,12 @@
 #[cfg(feature = "structure-inference")]
 use crate::{
-    definitions::derive_definitions_indexed, derive_structure_evidence, javascript_whitespace,
-    node_depths, text::normalize_javascript_whitespace, AuthoritativeTableCell,
-    AuthoritativeTables, Coverage, CoverageState, DefinitionParagraph, DetectionProfile,
-    DocumentInput, DocumentStructure, EngineError, EvidenceKind, NodeKind, Origin, ParagraphBreak,
-    ScalarRange, ScalarText, Scope, EVIDENCE_SCHEMA,
+    definitions::{derive_definitions_bytes, DefinitionHit},
+    javascript_whitespace, node_depths,
+    text::normalize_javascript_whitespace,
+    AuthoritativeTableCell, AuthoritativeTables, Block, Coverage, CoverageState, DefinedTerm,
+    DefinitionOccurrence, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
+    EvidenceKind, NodeKind, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
+    EVIDENCE_SCHEMA,
 };
 #[cfg(feature = "structure-inference")]
 use legal_grammar_tables::{
@@ -1628,18 +1630,12 @@ fn instrument_label_keys(label: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "structure-inference")]
-fn instrument_reference_index(graph: &DocumentStructure) -> HashMap<String, usize> {
+fn instrument_reference_index<'a>(
+    sections: impl Iterator<Item = (&'a str, usize)>,
+) -> HashMap<String, usize> {
     let mut index = HashMap::new();
     let mut duplicates = HashSet::new();
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == NodeKind::Section)
-    {
-        let Some(label) = node.label.as_deref() else {
-            continue;
-        };
-        let start = node.range.start;
+    for (label, start) in sections {
         for key in instrument_label_keys(label) {
             if index.insert(key.clone(), start).is_some() {
                 duplicates.insert(key);
@@ -1715,7 +1711,39 @@ fn instrument_lineation_score(
     graph: &DocumentStructure,
     endorsed: &[(String, usize, usize)],
 ) -> usize {
-    let index = instrument_reference_index(graph);
+    instrument_lineation_score_sections(
+        graph.nodes.iter().filter_map(|node| {
+            (node.kind == NodeKind::Section)
+                .then_some(node.label.as_deref())
+                .flatten()
+                .map(|label| (label, node.range.start))
+        }),
+        endorsed,
+    )
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_lineation_score_blocks(
+    blocks: &[Block],
+    endorsed: &[(String, usize, usize)],
+) -> usize {
+    instrument_lineation_score_sections(
+        blocks.iter().filter_map(|block| {
+            (block.kind == NodeKind::Section)
+                .then_some(block.label.as_deref())
+                .flatten()
+                .map(|label| (label, block.range.start))
+        }),
+        endorsed,
+    )
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_lineation_score_sections<'a>(
+    sections: impl Iterator<Item = (&'a str, usize)>,
+    endorsed: &[(String, usize, usize)],
+) -> usize {
+    let index = instrument_reference_index(sections);
     endorsed
         .iter()
         .filter(|(key, start, end)| {
@@ -1728,10 +1756,33 @@ fn instrument_lineation_score(
 
 #[cfg(feature = "structure-inference")]
 fn instrument_head_span(graph: &DocumentStructure, text_length: usize) -> f64 {
-    let mut starts = graph.nodes.iter().filter_map(|node| {
-        let label = node.label.as_deref()?;
-        (node.kind == NodeKind::Section && label.starts_with("sec") && !label.contains('('))
-            .then_some(node.range.start)
+    instrument_head_span_sections(
+        graph.nodes.iter().filter_map(|node| {
+            let label = node.label.as_deref()?;
+            (node.kind == NodeKind::Section).then_some((label, node.range.start))
+        }),
+        text_length,
+    )
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_block_head_span(blocks: &[Block], text_length: usize) -> f64 {
+    instrument_head_span_sections(
+        blocks.iter().filter_map(|block| {
+            let label = block.label.as_deref()?;
+            (block.kind == NodeKind::Section).then_some((label, block.range.start))
+        }),
+        text_length,
+    )
+}
+
+#[cfg(feature = "structure-inference")]
+fn instrument_head_span_sections<'a>(
+    sections: impl Iterator<Item = (&'a str, usize)>,
+    text_length: usize,
+) -> f64 {
+    let mut starts = sections.filter_map(|(label, start)| {
+        (label.starts_with("sec") && !label.contains('(')).then_some(start)
     });
     let Some(first) = starts.next() else {
         return 0.0;
@@ -1751,35 +1802,87 @@ fn instrument_head_span(graph: &DocumentStructure, text_length: usize) -> f64 {
 #[cfg(feature = "structure-inference")]
 fn derive_instrument_structure(
     text: &str,
-    mut documents: impl Iterator<Item = DocumentInput>,
+    document_id: String,
+    tables: &AuthoritativeTables,
+    mut hypotheses: impl Iterator<Item = String>,
 ) -> Result<DocumentStructure, EngineError> {
     let text = ScalarText::new(text);
     let references =
         find_provision_references(text.value, FindProvisionReferencesOptions::default());
     let endorsed = endorsed_references(&references);
-    let mut structure =
-        derive_structure_evidence(documents.next().ok_or_else(|| {
-            EngineError::invalid("instrument lineation selection requires a graph")
-        })?)?;
+    let first = hypotheses
+        .next()
+        .ok_or_else(|| EngineError::invalid("instrument lineation selection requires a graph"))?;
+    let mut selected_text = tables.masked_text(first);
+    let mut selected_blocks = crate::inference::detect_instrument(&ScalarText::new(&selected_text));
     let mut selected = 0;
-    let mut best = instrument_lineation_score(&structure, &endorsed);
+    let mut best = instrument_lineation_score_blocks(&selected_blocks, &endorsed);
     if best < endorsed.len() {
-        for (index, document) in documents.enumerate() {
-            let candidate = derive_structure_evidence(document)?;
-            if instrument_head_span(&candidate, text.utf16_len()) < 0.05 {
+        for (index, hypothesis) in hypotheses.enumerate() {
+            let candidate_text = tables.masked_text(hypothesis);
+            let candidate = crate::inference::detect_instrument(&ScalarText::new(&candidate_text));
+            if instrument_block_head_span(&candidate, text.utf16_len()) < 0.05 {
                 continue;
             }
-            let score = instrument_lineation_score(&candidate, &endorsed);
+            let score = instrument_lineation_score_blocks(&candidate, &endorsed);
             if score > best {
                 selected = index + 1;
                 best = score;
-                structure = candidate;
+                selected_text = candidate_text;
+                selected_blocks = candidate;
             }
             if best == endorsed.len() {
                 break;
             }
         }
     }
+    let scalar_end = selected_text.chars().count();
+    let text_sha256 = format!("{:x}", Sha256::digest(selected_text.as_bytes()));
+    let input = DocumentInput {
+        schema_version: EVIDENCE_SCHEMA.to_owned(),
+        document_id,
+        provider: "internal".to_owned(),
+        #[cfg(feature = "source-doc")]
+        url: None,
+        #[cfg(feature = "source-doc")]
+        doc_type: None,
+        provider_revision: "legal-text-skeleton-v5".to_owned(),
+        profile: DetectionProfile::Instrument,
+        report_start_page: None,
+        require_report_start: false,
+        allow_hyphenated_sections: false,
+        text: selected_text,
+        text_sha256,
+        source_sha256: None,
+        offset_unit: "unicode-scalar".to_owned(),
+        scope: Scope::complete(),
+        origins: vec![Origin {
+            id: "provider-adapter".to_owned(),
+        }],
+        native_claims: Vec::new(),
+        coverage: [
+            EvidenceKind::Paragraph,
+            EvidenceKind::Prose,
+            EvidenceKind::Page,
+            EvidenceKind::Section,
+            EvidenceKind::Heading,
+            EvidenceKind::Footnote,
+            EvidenceKind::Endnote,
+        ]
+        .into_iter()
+        .map(|kind| Coverage {
+            kind,
+            range: ScalarRange {
+                start: 0,
+                end: scalar_end,
+            },
+            state: CoverageState::Absent,
+        })
+        .collect(),
+        exclusions: Vec::new(),
+        paragraph_breaks: Vec::<ParagraphBreak>::new(),
+    };
+    let mut structure = crate::derive::derive_trusted_inferred(input, selected_blocks)?;
     structure.selected_hypothesis = Some(selected);
     populate_instrument_node_metadata(&mut structure);
     structure.contents = Some(instrument_contents_outline_indexed(&text));
@@ -1794,37 +1897,52 @@ fn derive_instrument_structure(
         .filter(|(_, node)| node.kind == NodeKind::Section)
         .collect::<Vec<_>>();
     sections.sort_by_key(|(index, node)| (node.range.start, *index));
+    let lines = text.lines();
+    let raw = derive_definitions_bytes(&text, lines.len(), |index| {
+        (lines[index][0], lines[index][1])
+    });
+    let mut paragraphs = raw
+        .iter()
+        .flat_map(|term| term.definitions.iter().chain(&term.uses))
+        .map(|hit| hit.paragraph)
+        .collect::<Vec<_>>();
+    paragraphs.sort_unstable();
+    paragraphs.dedup();
     let mut next_section = 0;
     let mut active_sections = Vec::new();
-    let paragraphs = text
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(index, [start, end, _])| {
-            let range = ScalarRange {
-                start: text.utf16_at_byte(*start).unwrap(),
-                end: text.utf16_at_byte(*end).unwrap(),
-            };
-            while next_section < sections.len()
-                && sections[next_section].1.range.start <= range.start
-            {
-                active_sections.push(sections[next_section]);
-                next_section += 1;
-            }
-            active_sections.retain(|(_, node)| range.start < node.range.end);
-            let node_id = active_sections
+    let mut owners = Vec::with_capacity(paragraphs.len());
+    for &paragraph in &paragraphs {
+        let start = text.utf16_at_byte(lines[paragraph][0]).unwrap();
+        while next_section < sections.len() && sections[next_section].1.range.start <= start {
+            active_sections.push(sections[next_section]);
+            next_section += 1;
+        }
+        active_sections.retain(|(_, node)| start < node.range.end);
+        owners.push(
+            active_sections
                 .iter()
                 .max_by_key(|(index, node)| (depths[node.id.as_str()], *index))
-                .map(|(_, node)| node.id.clone());
-            DefinitionParagraph {
-                range,
-                node_id,
-                source_paragraph_id: index.to_string(),
-                source_artifact_id: Some(structure.document_id.clone()),
-            }
+                .map(|(_, node)| node.id.as_str()),
+        );
+    }
+    let occurrence = |hit: DefinitionHit| DefinitionOccurrence {
+        range: ScalarRange {
+            start: text.utf16_at_byte(hit.start).unwrap(),
+            end: text.utf16_at_byte(hit.end).unwrap(),
+        },
+        node_id: owners[paragraphs.binary_search(&hit.paragraph).unwrap()].map(str::to_owned),
+        source_paragraph_id: hit.paragraph.to_string(),
+        source_artifact_id: Some(structure.document_id.clone()),
+    };
+    let definitions = raw
+        .into_iter()
+        .map(|term| DefinedTerm {
+            term: term.term,
+            definitions: term.definitions.into_iter().map(&occurrence).collect(),
+            uses: term.uses.into_iter().map(&occurrence).collect(),
         })
-        .collect::<Vec<_>>();
-    structure.definitions = derive_definitions_indexed(&text, &paragraphs).terms;
+        .collect();
+    structure.definitions = definitions;
     Ok(structure)
 }
 
@@ -1841,55 +1959,7 @@ pub fn analyze_instrument(
         .flatten()
         .chain((!reconstruct_lineation).then(|| text.to_owned()));
     let tables = AuthoritativeTables::new(text, table_cells)?;
-    let documents = hypotheses.into_iter().map(|hypothesis| {
-        let masked = tables.masked_text(hypothesis);
-        let scalar_end = masked.chars().count();
-        DocumentInput {
-            schema_version: EVIDENCE_SCHEMA.to_owned(),
-            document_id: document_id.clone(),
-            provider: "internal".to_owned(),
-            #[cfg(feature = "source-doc")]
-            url: None,
-            #[cfg(feature = "source-doc")]
-            doc_type: None,
-            provider_revision: "legal-text-skeleton-v5".to_owned(),
-            profile: DetectionProfile::Instrument,
-            report_start_page: None,
-            require_report_start: false,
-            allow_hyphenated_sections: false,
-            text_sha256: format!("{:x}", Sha256::digest(masked.as_bytes())),
-            text: masked,
-            source_sha256: None,
-            offset_unit: "unicode-scalar".to_owned(),
-            scope: Scope::complete(),
-            origins: vec![Origin {
-                id: "provider-adapter".to_owned(),
-            }],
-            native_claims: Vec::new(),
-            coverage: [
-                EvidenceKind::Paragraph,
-                EvidenceKind::Prose,
-                EvidenceKind::Page,
-                EvidenceKind::Section,
-                EvidenceKind::Heading,
-                EvidenceKind::Footnote,
-                EvidenceKind::Endnote,
-            ]
-            .into_iter()
-            .map(|kind| Coverage {
-                kind,
-                range: ScalarRange {
-                    start: 0,
-                    end: scalar_end,
-                },
-                state: CoverageState::Absent,
-            })
-            .collect(),
-            exclusions: Vec::new(),
-            paragraph_breaks: Vec::<ParagraphBreak>::new(),
-        }
-    });
-    let mut structure = derive_instrument_structure(text, documents)?;
+    let mut structure = derive_instrument_structure(text, document_id, &tables, hypotheses)?;
     structure
         .nodes
         .extend(tables.nodes(&structure.nodes, "provider-adapter"));

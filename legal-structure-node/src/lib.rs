@@ -15,6 +15,7 @@ use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::OnceLock;
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -72,7 +73,7 @@ enum NativeProduct {
 
 pub struct NativeDocument {
     product: NativeProduct,
-    source_doc: SourceDocQuery,
+    source_doc: OnceLock<SourceDocQuery>,
 }
 
 impl NativeDocument {
@@ -81,7 +82,12 @@ impl NativeDocument {
     }
 
     fn source_doc_query(&self) -> &SourceDocQuery {
-        &self.source_doc
+        self.source_doc.get_or_init(|| {
+            SourceDocQuery::new(project_document_structure_view(
+                self.structure()
+                    .expect("PDF documents initialize their SourceDoc"),
+            ))
+        })
     }
 
     fn cross_references(&self) -> Option<&InstrumentCrossReferenceGraph> {
@@ -186,10 +192,9 @@ fn analyze_request(request: serde_json::Value) -> napi::Result<NativeDocument> {
             .map_err(native_error)?
         }
     };
-    let source_doc = SourceDocQuery::new(project_document_structure_view(&structure));
     Ok(NativeDocument {
         product: NativeProduct::Structure(structure),
-        source_doc,
+        source_doc: OnceLock::new(),
     })
 }
 
@@ -228,13 +233,12 @@ impl Task for DeriveDocxDocumentTask {
         let (structure, table_cells) =
             legalpdf::analyze_docx_bytes(&self.bytes, std::mem::take(&mut self.id))
                 .map_err(|error| Error::from_reason(error.to_string()))?;
-        let source_doc = SourceDocQuery::new(project_document_structure_view(&structure));
         Ok(NativeDocument {
             product: NativeProduct::Docx {
                 structure,
                 table_cells,
             },
-            source_doc,
+            source_doc: OnceLock::new(),
         })
     }
 
@@ -273,7 +277,7 @@ impl Task for DerivePdfDocumentTask {
         legalpdf::derive_pdf_document(&self.request, pairing_audit)
             .map(|(document, source_doc)| NativeDocument {
                 product: NativeProduct::Pdf(document),
-                source_doc: SourceDocQuery::new(source_doc),
+                source_doc: OnceLock::from(SourceDocQuery::new(source_doc)),
             })
             .map_err(|error| Error::from_reason(error.to_string()))
     }
