@@ -7,6 +7,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -291,7 +292,7 @@ fn report_start(input: &A2ajInput) -> Option<u32> {
         .find_map(crate::canadian_report_start)
 }
 
-fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
+fn words(text: &str) -> Vec<(Cow<'_, str>, usize, usize, usize, usize)> {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Keep these running totals local: tokenization already walks provider text
     // once and needs byte and UTF-16 spans for every match.
@@ -304,13 +305,13 @@ fn words(text: &str) -> Vec<(String, usize, usize, usize, usize)> {
             let start = utf16;
             utf16 += item.as_str().encode_utf16().count();
             previous = item.end();
-            (
-                item.as_str().to_lowercase(),
-                start,
-                utf16,
-                item.start(),
-                item.end(),
-            )
+            let word = item.as_str();
+            let word = if word.is_ascii() && !word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                Cow::Borrowed(word)
+            } else {
+                Cow::Owned(word.to_lowercase())
+            };
+            (word, start, utf16, item.start(), item.end())
         })
         .collect()
 }
@@ -348,7 +349,7 @@ fn apply_provider_section_evidence(
         .unwrap_or_default();
     let mut postings = HashMap::<&str, Vec<usize>>::new();
     for (index, (word, ..)) in tokens.iter().enumerate() {
-        postings.entry(word).or_default().push(index);
+        postings.entry(word.as_ref()).or_default().push(index);
     }
     let mut top_sections = HashMap::<String, Vec<usize>>::new();
     for (index, block) in blocks
@@ -372,10 +373,10 @@ fn apply_provider_section_evidence(
         let (anchor_offset, anchor_word) = phrase
             .iter()
             .enumerate()
-            .min_by_key(|(_, word)| postings.get(word.0.as_str()).map_or(0, Vec::len))
+            .min_by_key(|(_, word)| postings.get(word.0.as_ref()).map_or(0, Vec::len))
             .unwrap();
         let mut spans = Vec::new();
-        for &position in postings.get(anchor_word.0.as_str()).into_iter().flatten() {
+        for &position in postings.get(anchor_word.0.as_ref()).into_iter().flatten() {
             let Some(start) = position.checked_sub(anchor_offset) else {
                 continue;
             };
