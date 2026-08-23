@@ -1,7 +1,7 @@
 use crate::{
     utf16_len, Block, Coverage, CoverageState, Derivation, DetectionProfile, DocumentInput,
     DocumentStructure, EngineError, EvidenceKind, NativeClaim, NodeKind, Origin, ParagraphBreak,
-    ScalarRange, ScalarText, Scope, ScopeKind, SourceDoc, SourceDocType, EVIDENCE_SCHEMA,
+    ScalarRange, ScalarText, Scope, ScopeKind, SourceDocType, EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -536,14 +536,14 @@ pub fn a2aj_document_structure(mut input: A2ajInput) -> Result<DocumentStructure
     Ok(structure)
 }
 
-pub fn a2aj_source_doc(input: A2ajInput) -> Result<SourceDoc, EngineError> {
-    a2aj_document_structure(input).map(crate::project_document_structure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SourceDocKind, SourceDocOrigin};
+    use crate::{SourceDoc, SourceDocKind, SourceDocOrigin};
+
+    fn source_doc(input: A2ajInput) -> SourceDoc {
+        crate::project_document_structure(a2aj_document_structure(input).unwrap())
+    }
 
     #[test]
     fn map_rendering_and_provider_evidence_match_a2aj() {
@@ -554,7 +554,7 @@ mod tests {
                 .map(|label| (label.into(), format!("Provision {label}.")))
                 .collect(),
         );
-        let mapped = a2aj_source_doc(mapped).unwrap();
+        let mapped = source_doc(mapped);
         assert_eq!(
             mapped
                 .blocks
@@ -577,7 +577,7 @@ mod tests {
         let text = "1 First full-text provision.\n2 Second full-text provision.\n3 Third full-text provision.";
         let mut promoted = A2ajInput::new("fixture", A2ajSourceKind::Laws, text);
         promoted.section_map = Some(vec![("2".into(), "Second full-text provision.".into())]);
-        let promoted = a2aj_source_doc(promoted).unwrap();
+        let promoted = source_doc(promoted);
         assert_eq!(
             promoted
                 .blocks
@@ -604,7 +604,7 @@ mod tests {
         let text = "Preamble.\n99 Provider-only provision.";
         let mut missing = A2ajInput::new("fixture", A2ajSourceKind::Laws, text);
         missing.section_map = Some(vec![("99".into(), "Provider-only provision.".into())]);
-        let missing = a2aj_source_doc(missing).unwrap();
+        let missing = source_doc(missing);
         let added = missing
             .blocks
             .iter()
@@ -618,7 +618,7 @@ mod tests {
 
         let mut sole = A2ajInput::new("fixture", A2ajSourceKind::Laws, "1 Sole provision.");
         sole.section_map = Some(vec![("1".into(), "Sole provision.".into())]);
-        let sole = a2aj_source_doc(sole).unwrap();
+        let sole = source_doc(sole);
         assert_eq!(
             sole.blocks
                 .iter()
@@ -633,7 +633,7 @@ mod tests {
             "34".into(),
             "34(1) Parent provision.\n(a) Child paragraph.".into(),
         )]);
-        let printed = a2aj_source_doc(printed).unwrap();
+        let printed = source_doc(printed);
         let subsection = printed
             .blocks
             .iter()
@@ -657,7 +657,7 @@ mod tests {
             "1".into(),
             "(1) Parent provision.\n(a) Child.".into(),
         )]);
-        let bounded = a2aj_source_doc(bounded).unwrap();
+        let bounded = source_doc(bounded);
         let child = bounded
             .blocks
             .iter()

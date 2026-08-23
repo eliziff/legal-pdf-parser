@@ -721,6 +721,7 @@ pub fn resolve_structure_graph(
     Ok(DocumentStructure::from_scalar_parts(
         document_id,
         text.to_owned(),
+        format!("{:x}", Sha256::digest(text.as_bytes())),
         source_sha256,
         Scope::complete(),
         origins,

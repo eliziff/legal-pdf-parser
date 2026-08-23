@@ -24,25 +24,20 @@ mod source_doc;
 mod tables;
 mod text;
 #[cfg(feature = "a2aj")]
-pub use a2aj::{
-    a2aj_document_structure, a2aj_source_doc, A2ajInput, A2ajSectionMap, A2ajSourceKind,
-};
+pub use a2aj::{a2aj_document_structure, A2ajInput, A2ajSectionMap, A2ajSourceKind};
 pub use definitions::*;
 pub use docx_lint::*;
 pub use docx_numbering::*;
 pub use instrument::*;
 #[cfg(feature = "journal")]
-pub use journal::{
-    journal_document_structure, journal_source_doc, journal_text_document_structure,
-    journal_text_source_doc, JournalPageLabel,
-};
+pub use journal::{journal_document_structure, journal_text_document_structure, JournalPageLabel};
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub use native_markup::{analyze_native_markup, native_markup_source_doc, NativeMarkupInput};
+pub use native_markup::{analyze_native_markup, NativeMarkupInput};
 pub use numeric_sequence::*;
 #[cfg(feature = "source-doc")]
 pub use source_doc::{
-    create_source_doc, ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind,
-    SourceDocOrigin, SourceDocProvider, SourceDocType,
+    ProjectionOrder, SourceDoc, SourceDocBlock, SourceDocIndex, SourceDocKind, SourceDocOrigin,
+    SourceDocProvider, SourceDocType,
 };
 pub use tables::{AuthoritativeTableCell, AuthoritativeTables};
 pub(crate) use text::javascript_whitespace;
@@ -669,6 +664,7 @@ impl DocumentStructure {
     pub(crate) fn from_scalar_parts(
         document_id: String,
         text: String,
+        text_sha256: String,
         source_sha256: Option<String>,
         scope: Scope,
         origins: Vec<Origin>,
@@ -705,7 +701,6 @@ impl DocumentStructure {
                 utf16_range(range);
             }
         }
-        let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
         Self {
             schema_version: DOCUMENT_STRUCTURE_SCHEMA.to_owned(),
             document_id,
@@ -901,10 +896,6 @@ mod derive;
 pub use candidates::{
     detect_structure_candidate_runs, resolve_structure_candidates, resolve_structure_graph,
 };
-#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub use derive::compose;
-#[cfg(feature = "source-doc")]
-pub use derive::compose_native;
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub use derive::derive_document_structure;
 pub use derive::derive_native_structure_evidence;

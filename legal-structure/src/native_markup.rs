@@ -2,8 +2,8 @@ use crate::text::{javascript_whitespace, normalize_javascript_whitespace};
 use crate::{
     derive::derive_trusted, utf16_len, CitedAuthority, Coverage, CoverageState, DetectionProfile,
     DocumentInput, DocumentStructure, EngineError, EvidenceKind, Exclusion, NativeClaim, Origin,
-    ParagraphBreak, ScalarRange, ScalarText, Scope, ScopeKind, SourceDoc, SourceDocProvider,
-    SourceDocType, EVIDENCE_SCHEMA,
+    ParagraphBreak, ScalarRange, ScalarText, Scope, ScopeKind, SourceDocProvider, SourceDocType,
+    EVIDENCE_SCHEMA,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -125,21 +125,25 @@ fn trim_js(value: &str) -> &str {
 }
 
 fn contains_ascii_word(value: &str, word: &str, insensitive: bool) -> bool {
-    let owned;
-    let (value, word) = if insensitive {
-        owned = (value.to_ascii_lowercase(), word.to_ascii_lowercase());
-        (owned.0.as_str(), owned.1.as_str())
-    } else {
-        (value, word)
-    };
-    value.match_indices(word).any(|(start, found)| {
+    let value = value.as_bytes();
+    let word = word.as_bytes();
+    if word.len() > value.len() {
+        return false;
+    }
+    (0..=value.len().saturating_sub(word.len())).any(|start| {
+        let found = &value[start..start + word.len()];
+        if !(if insensitive {
+            found.eq_ignore_ascii_case(word)
+        } else {
+            found == word
+        }) {
+            return false;
+        }
         let ascii_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
         value
-            .as_bytes()
             .get(start.wrapping_sub(1))
             .is_none_or(|byte| !ascii_word(*byte))
             && value
-                .as_bytes()
                 .get(start + found.len())
                 .is_none_or(|byte| !ascii_word(*byte))
     })
@@ -266,11 +270,8 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
     attributes
 }
 
-fn attribute(attributes: &HashMap<String, String>, name: &str) -> String {
-    attributes
-        .get(&name.to_ascii_lowercase())
-        .cloned()
-        .unwrap_or_default()
+fn attribute<'a>(attributes: &'a HashMap<String, String>, name: &str) -> &'a str {
+    attributes.get(name).map(String::as_str).unwrap_or_default()
 }
 
 fn clean_section_id(raw: &str) -> String {
@@ -372,7 +373,7 @@ fn page_identity(
         page_label: Some(page_label),
         citation_index,
         page_scheme: (!attribute(attributes, "pagescheme").is_empty())
-            .then(|| attribute(attributes, "pagescheme")),
+            .then(|| attribute(attributes, "pagescheme").to_owned()),
     })
 }
 
@@ -474,10 +475,10 @@ fn courtlistener_footnote_body(
     static ID: OnceLock<Regex> = OnceLock::new();
     matches!(tag, "footnote" | "footnote_body")
         || (matches!(tag, "aside" | "div" | "li" | "section")
-            && (contains_ascii_word(&attribute(attributes, "class"), "footnote", true)
+            && (contains_ascii_word(attribute(attributes, "class"), "footnote", true)
                 || ID
                     .get_or_init(|| Regex::new(r"(?i)^(?:(?:fn|footnote)[_-]|fn\d|ftn\d)").unwrap())
-                    .is_match(&attribute(attributes, "id"))))
+                    .is_match(attribute(attributes, "id"))))
 }
 
 fn native_identity(
@@ -490,15 +491,15 @@ fn native_identity(
         .map(|name| attribute(attributes, name))
         .find(|value| !value.is_empty())
         .unwrap_or_default();
-    let anchor = (!id.is_empty()).then(|| id.clone());
+    let anchor = (!id.is_empty()).then(|| id.to_owned());
     if tag == "a" && matches!(provider, SourceDocProvider::CourtListener) {
-        if contains_ascii_word(&attribute(attributes, "class"), "page-label", false) {
+        if contains_ascii_word(attribute(attributes, "class"), "page-label", false) {
             static PAGE_ID: OnceLock<Regex> = OnceLock::new();
             let label = [
-                attribute(attributes, "data-label"),
+                attribute(attributes, "data-label").to_owned(),
                 PAGE_ID
                     .get_or_init(|| Regex::new(r"(?i)^p(\d{1,5})$").unwrap())
-                    .captures(&id)
+                    .captures(id)
                     .map(|capture| capture[1].to_owned())
                     .unwrap_or_default(),
             ]
@@ -511,11 +512,11 @@ fn native_identity(
     }
     if matches!(provider, SourceDocProvider::CourtListener) {
         if tag == "span"
-            && contains_ascii_word(&attribute(attributes, "class"), "star-pagination", false)
+            && contains_ascii_word(attribute(attributes, "class"), "star-pagination", false)
         {
             let raw = ["label", "data-label"]
                 .into_iter()
-                .map(|name| attribute(attributes, name))
+                .map(|name| attribute(attributes, name).to_owned())
                 .find(|value| !value.is_empty())
                 .unwrap_or_default();
             return page_identity(&raw, attributes, anchor, true);
@@ -523,7 +524,7 @@ fn native_identity(
         if courtlistener_footnote_body(provider, tag, attributes) {
             let raw = ["data-label", "label", "n"]
                 .into_iter()
-                .map(|name| attribute(attributes, name))
+                .map(|name| attribute(attributes, name).to_owned())
                 .find(|value| !value.is_empty())
                 .unwrap_or_default();
             return footnote_identity(&raw, &id, anchor);
@@ -532,11 +533,11 @@ fn native_identity(
     if tag == "page-number" {
         static PAGE_ID: OnceLock<Regex> = OnceLock::new();
         let raw = [
-            attribute(attributes, "label"),
-            attribute(attributes, "page"),
+            attribute(attributes, "label").to_owned(),
+            attribute(attributes, "page").to_owned(),
             PAGE_ID
                 .get_or_init(|| Regex::new(r"(?i)(?:page|p)[_-]?(\d{1,5})$").unwrap())
-                .captures(&id)
+                .captures(id)
                 .map(|capture| capture[1].to_owned())
                 .unwrap_or_default(),
         ]
@@ -549,16 +550,16 @@ fn native_identity(
     static DIV_PARAGRAPH: OnceLock<Regex> = OnceLock::new();
     let paragraph = PARAGRAPH
         .get_or_init(|| Regex::new(r"(?i)^(?:para(?:graph)?)[_-]?(\d{1,5})$").unwrap())
-        .captures(&id)
+        .captures(id)
         .map(|capture| capture[1].to_owned())
         .or_else(|| {
             (matches!(provider, SourceDocProvider::CourtListener)
                 && tag == "div"
-                && contains_ascii_word(&attribute(attributes, "class"), "num", false))
+                && contains_ascii_word(attribute(attributes, "class"), "num", false))
             .then(|| {
                 DIV_PARAGRAPH
                     .get_or_init(|| Regex::new(r"(?i)^p(\d{1,5})$").unwrap())
-                    .captures(&id)
+                    .captures(id)
                     .map(|capture| capture[1].to_owned())
             })
             .flatten()
@@ -589,7 +590,7 @@ fn native_identity(
     ) && !id.is_empty()
     {
         static SECTION: OnceLock<Regex> = OnceLock::new();
-        let section = clean_section_id(&id);
+        let section = clean_section_id(id);
         if SECTION
             .get_or_init(|| Regex::new(r"^\d{1,8}(?:[.-]\d{1,8}){0,3}(?:\([^)]+\))*$").unwrap())
             .is_match(&section)
@@ -614,7 +615,7 @@ fn native_identity(
         .get_or_init(|| {
             Regex::new(r"(?i)^sec(\d{1,8}(?:[.-]\d{1,8}){0,3}(?:\([^)]+\))*)$").unwrap()
         })
-        .captures(&id)
+        .captures(id)
         .map(|capture| PendingBlock {
             tag: String::new(),
             kind: Kind::Section,
@@ -638,10 +639,10 @@ fn courtlistener_footnote_container(
     static ID: OnceLock<Regex> = OnceLock::new();
     matches!(provider, SourceDocProvider::CourtListener)
         && (courtlistener_footnote_body(provider, tag, attributes)
-            || contains_ascii_word(&attribute(attributes, "class"), "footnotes", true)
+            || contains_ascii_word(attribute(attributes, "class"), "footnotes", true)
             || ID
                 .get_or_init(|| Regex::new(r"(?i)^(?:fn|footnote)[_-]").unwrap())
-                .is_match(&attribute(attributes, "id")))
+                .is_match(attribute(attributes, "id")))
 }
 
 fn citation_page_alias(citation: &str, label: &str) -> String {
@@ -771,7 +772,7 @@ fn void_tag(tag: &str) -> bool {
     )
 }
 
-fn parse_tag(raw: &str, closing: bool) -> Option<(String, String)> {
+fn parse_tag(raw: &str, closing: bool) -> Option<(String, &str)> {
     let mut value = raw.strip_prefix('<')?;
     value = value.trim_start_matches(javascript_whitespace);
     if closing {
@@ -794,7 +795,7 @@ fn parse_tag(raw: &str, closing: bool) -> Option<(String, String)> {
         .map(|(at, character)| at + character.len_utf8())?;
     let qualified = &value[..end];
     let tag = qualified.rsplit(':').next()?.to_ascii_lowercase();
-    let attrs = value[end..].strip_suffix('>')?.to_owned();
+    let attrs = value[end..].strip_suffix('>')?;
     Some((tag, attrs))
 }
 
@@ -1022,9 +1023,9 @@ fn render_markup(
             attrs
                 .trim_end_matches(javascript_whitespace)
                 .strip_suffix('/')
-                .unwrap_or(&attrs)
+                .unwrap_or(attrs)
         } else {
-            &attrs
+            attrs
         };
         let attributes = parse_attributes(attrs);
         if !harvard_casebody
@@ -1042,8 +1043,8 @@ fn render_markup(
                 depth,
                 CitedAuthority {
                     citation: String::new(),
-                    canonical: (!canonical.is_empty()).then_some(canonical),
-                    kind: (!kind.is_empty()).then_some(kind),
+                    canonical: (!canonical.is_empty()).then(|| canonical.to_owned()),
+                    kind: (!kind.is_empty()).then(|| kind.to_owned()),
                 },
             ));
         }
@@ -1071,7 +1072,7 @@ fn render_markup(
         if matches!(provider, SourceDocProvider::CourtListener)
             && !self_closing
             && tag == "span"
-            && contains_ascii_word(&attribute(&attributes, "class"), "star-pagination", false)
+            && contains_ascii_word(attribute(&attributes, "class"), "star-pagination", false)
             && identity
                 .as_ref()
                 .is_none_or(|value| value.kind != Kind::Page)
@@ -1080,13 +1081,13 @@ fn render_markup(
             text_page = Some(TextPage {
                 start: position,
                 anchor: (!attribute(&attributes, "id").is_empty())
-                    .then(|| attribute(&attributes, "id")),
+                    .then(|| attribute(&attributes, "id").to_owned()),
                 citation_index: ["citation-index", "data-citation-index"]
                     .into_iter()
                     .find_map(|name| attribute(&attributes, name).parse::<usize>().ok())
                     .filter(|value| *value != 0),
                 page_scheme: (!attribute(&attributes, "pagescheme").is_empty())
-                    .then(|| attribute(&attributes, "pagescheme")),
+                    .then(|| attribute(&attributes, "pagescheme").to_owned()),
             });
         }
         if identity
@@ -1459,10 +1460,6 @@ pub fn analyze_native_markup(input: NativeMarkupInput) -> Result<DocumentStructu
     Ok(structure)
 }
 
-pub fn native_markup_source_doc(input: NativeMarkupInput) -> Result<SourceDoc, EngineError> {
-    analyze_native_markup(input).map(crate::project_document_structure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,19 +1510,19 @@ mod tests {
 
     #[test]
     fn provider_blocks_keep_rendered_utf16_offsets_across_astral_text() {
-        let document = analyze_native_markup(NativeMarkupInput {
-            provider: "courtlistener".to_owned(),
-            id: "astral".to_owned(),
-            url: None,
-            text: String::new(),
-            markup: Some("<p id=\"paragraph-1\">\u{1f9ab}e\u{301}</p>".to_owned()),
-            citation: None,
-            page_citations: Vec::new(),
-            scope: default_scope(),
-        })
-        .unwrap()
-        .source_doc
-        .unwrap();
+        let document = crate::project_document_structure(
+            analyze_native_markup(NativeMarkupInput {
+                provider: "courtlistener".to_owned(),
+                id: "astral".to_owned(),
+                url: None,
+                text: String::new(),
+                markup: Some("<p id=\"paragraph-1\">\u{1f9ab}e\u{301}</p>".to_owned()),
+                citation: None,
+                page_citations: Vec::new(),
+                scope: default_scope(),
+            })
+            .unwrap(),
+        );
         assert_eq!(document.text, "\u{1f9ab}e\u{301}");
         let paragraph = document
             .blocks
