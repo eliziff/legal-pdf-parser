@@ -50,8 +50,24 @@ fn evidence(text: &str, profile: DetectionProfile) -> DocumentInput {
         .collect(),
         exclusions: Vec::new(),
         paragraph_breaks: Vec::new(),
-        #[cfg(feature = "source-doc")]
-        original_claims: HashMap::new(),
+    }
+}
+
+#[cfg(feature = "source-doc")]
+#[test]
+fn section_locator_prefixes_are_delimited() {
+    for (input, expected) in [
+        ("section 34", "sec34"),
+        ("s. 34(1)(a)", "sec34(1)(a)"),
+        ("sec34", "sec34"),
+        ("section sec34", "sec34"),
+        ("Savings", "sectitle:savings"),
+        ("Schedule 1", "sectitle:schedule 1"),
+    ] {
+        assert_eq!(
+            normalize_source_doc_locator(SourceDocKind::Section, input),
+            expected
+        );
     }
 }
 

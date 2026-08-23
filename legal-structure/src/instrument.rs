@@ -1,7 +1,9 @@
 #[cfg(feature = "structure-inference")]
 use crate::{
     definitions::{derive_definitions_bytes, DefinitionHit},
-    javascript_whitespace, node_depths,
+    javascript_whitespace,
+    locator::{compact_provision_label, normalize_numbered_section_locator},
+    node_depths,
     text::{normalize_javascript_whitespace, trim_javascript_start},
     AuthoritativeTableCell, AuthoritativeTables, Block, CoverageState, DefinedTerm,
     DefinitionOccurrence, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
@@ -198,42 +200,6 @@ struct FindProvisionReferencesOptions<'a> {
 }
 
 #[cfg(feature = "structure-inference")]
-fn compact_provision_label(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !javascript_whitespace(*character))
-        .collect()
-}
-
-#[cfg(feature = "structure-inference")]
-fn normalize_section_locator(locator: &str) -> String {
-    static PREFIX: OnceLock<Regex> = OnceLock::new();
-    static NUMERIC: OnceLock<Regex> = OnceLock::new();
-    static ALPHANUMERIC: OnceLock<Regex> = OnceLock::new();
-    let value = locator.trim_matches(javascript_whitespace);
-    let prefix = PREFIX.get_or_init(|| {
-        Regex::new(r"(?i)^(?:ss?\.?|sections?)").expect("valid section locator prefix")
-    });
-    let value = prefix.find(value).map_or(value, |matched| {
-        trim_javascript_start(&value[matched.end()..])
-    });
-    let compact = compact_provision_label(value);
-    let numeric = NUMERIC.get_or_init(|| {
-        Regex::new(r"^\d{1,8}[A-Za-z]{0,3}(?:[.-]\d{1,8}[A-Za-z]{0,3}){0,3}(?:\([^)]+\))*$")
-            .expect("valid numeric section locator grammar")
-    });
-    let alphanumeric = ALPHANUMERIC.get_or_init(|| {
-        Regex::new(r"^[A-Za-z]{1,3}(?:[.-][0-9A-Za-z]{1,8}){1,3}(?:\([^)]+\))*$")
-            .expect("valid alphanumeric section locator grammar")
-    });
-    if numeric.is_match(&compact) || alphanumeric.is_match(&compact) {
-        format!("sec{compact}")
-    } else {
-        String::new()
-    }
-}
-
-#[cfg(feature = "structure-inference")]
 fn replace_first_match<'a>(regex: &CompiledEcmascriptGrammar, value: &'a str) -> &'a str {
     regex
         .find(value)
@@ -337,7 +303,7 @@ fn push_provision_reference(
     let locator = if shape == ProvisionReferenceShape::Roman {
         String::new()
     } else {
-        normalize_section_locator(&label)
+        normalize_numbered_section_locator(&label)
     };
     let alias_key = format!("{singular} {label}").to_lowercase();
     found.insert(
@@ -1385,7 +1351,7 @@ fn reference_locator(reference: &ProvisionReference, source: Option<&ReferenceNo
     };
     let head = body.split(['(', '@']).next().unwrap_or("");
     (!head.is_empty())
-        .then(|| normalize_section_locator(&format!("{head}{}", reference.label)))
+        .then(|| normalize_numbered_section_locator(&format!("{head}{}", reference.label)))
         .unwrap_or_default()
 }
 
@@ -2162,7 +2128,7 @@ mod provision_reference_tests {
         assert_eq!(reference.shape, ProvisionReferenceShape::SubOnly);
         assert_eq!(reference.label, "(b)");
         assert_eq!(reference.locator, "");
-        assert_eq!(normalize_section_locator("8.01(b)"), "sec8.01(b)");
+        assert_eq!(normalize_numbered_section_locator("8.01(b)"), "sec8.01(b)");
     }
 
     #[test]
