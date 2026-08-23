@@ -1,10 +1,11 @@
 use legal_structure_core::{
-    a2aj_document_structure, project_document_structure, A2ajInput, A2ajSourceKind, ScalarText,
-    SourceDoc, SourceDocBlock, SourceDocKind, SourceDocOrigin,
+    a2aj_document_structure, pair_journal_footnotes as pair_journal, project_document_structure,
+    A2ajInput, A2ajSourceKind, ScalarText, SourceDoc, SourceDocBlock, SourceDocKind,
+    SourceDocOrigin,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::IntoPyObjectExt;
 
 fn kind_name(kind: SourceDocKind) -> &'static str {
@@ -14,6 +15,44 @@ fn kind_name(kind: SourceDocKind) -> &'static str {
         SourceDocKind::Section => "section",
         _ => unreachable!("primary blocks are paragraphs, pages, or sections"),
     }
+}
+
+#[pyfunction]
+fn pair_journal_footnotes<'py>(
+    py: Python<'py>,
+    text: &str,
+    page_labels: Vec<String>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = py.detach(|| pair_journal(text, &page_labels));
+    let notes = PyList::empty(py);
+    for note in result.notes {
+        let item = PyDict::new(py);
+        item.set_item("label", note.label)?;
+        item.set_item("restart_sequence", note.restart_sequence)?;
+        item.set_item("note_page_index", note.note_page_index)?;
+        item.set_item("ref_page_index", note.ref_page_index)?;
+        item.set_item("body", note.body)?;
+        item.set_item("truncated", note.truncated)?;
+        item.set_item("proposition", note.proposition)?;
+        item.set_item("passage", note.passage)?;
+        notes.append(item)?;
+    }
+    let output = PyDict::new(py);
+    output.set_item("notes", notes)?;
+    for (name, value) in [
+        ("symbol_labels_dropped", result.symbol_labels_dropped),
+        ("labels_candidates", result.labels_candidates),
+        ("labels_selected", result.labels_selected),
+        ("refs_assigned", result.refs_assigned),
+        ("ambiguous_sites", result.ambiguous_sites),
+        ("crossrefs", result.crossrefs),
+        ("crossrefs_unresolved", result.crossrefs_unresolved),
+        ("pages", result.pages),
+    ] {
+        output.set_item(name, value)?;
+    }
+    output.set_item("footnote_mode", result.footnote_mode)?;
+    Ok(output)
 }
 
 fn origin_name(origin: SourceDocOrigin) -> &'static str {
@@ -247,5 +286,6 @@ impl Document {
 
 #[pymodule]
 fn legal_structure(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Document>()
+    module.add_class::<Document>()?;
+    module.add_function(wrap_pyfunction!(pair_journal_footnotes, module)?)
 }
