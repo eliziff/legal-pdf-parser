@@ -1,10 +1,7 @@
 use crate::{text::ScalarText, ScalarRange};
-use regex::Regex;
+use regex::Regex as R;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::LazyLock,
-};
+use std::{collections::HashSet, sync::LazyLock};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DefinitionOccurrence {
@@ -30,31 +27,25 @@ pub struct DefinitionsResult {
     pub terms: Vec<DefinedTerm>,
 }
 
-static PAREN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(([^()]*)\)").unwrap());
-static QUOTED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""([A-Z][A-Za-z0-9&'\- ]{0,79})""#).unwrap());
-static LIST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-    r#"^"([A-Z][A-Za-z0-9&'\- ]{0,79})""#,
-    r"[\u{0009}-\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]+",
-    r"(?:means|shall mean|has the meaning|shall have the meaning)")).unwrap()
+static PAREN: LazyLock<R> = LazyLock::new(|| R::new(r"\(([^()]*)\)").unwrap());
+static QUOTED: LazyLock<R> = LazyLock::new(|| R::new(r#""([A-Z][A-Za-z0-9&' -]{0,79})""#).unwrap());
+static LIST: LazyLock<R> = LazyLock::new(|| {
+    R::new(r#"^"([A-Z][A-Za-z0-9&'\- ]{0,79})"[\u{0009}-\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]+(?:means|shall mean|has the meaning|shall have the meaning)"#).unwrap()
 });
 
-fn occurrence(
-    document: &ScalarText<'_>,
-    paragraph: &DefinitionParagraph,
-    start: usize,
-    end: usize,
-) -> DefinitionOccurrence {
-    DefinitionOccurrence {
-        range: ScalarRange {
-            start: document.scalar(start),
-            end: document.scalar(end),
-        },
-        node_id: paragraph.node_id.clone(),
-        source_paragraph_id: paragraph.source_paragraph_id.clone(),
-        source_artifact_id: paragraph.source_artifact_id.clone(),
+impl DefinitionOccurrence {
+    fn at(&self, document: &ScalarText<'_>, start: usize, end: usize) -> Self {
+        let mut hit = self.clone();
+        (hit.range.start, hit.range.end) = (document.scalar(start), document.scalar(end));
+        hit
     }
+}
+
+fn bounded(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let left = bytes.get(start.wrapping_sub(1)).copied().unwrap_or(b' ');
+    let right = bytes.get(end).copied().unwrap_or(b' ');
+    !left.is_ascii_alphanumeric() && !right.is_ascii_lowercase() && !right.is_ascii_digit()
 }
 
 pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> DefinitionsResult {
@@ -67,132 +58,66 @@ pub fn derive_definitions(text: &str, paragraphs: &[DefinitionParagraph]) -> Def
         })
         .collect::<Vec<_>>();
     let mut terms = Vec::<(String, Vec<(usize, DefinitionOccurrence)>)>::new();
-    let mut indexes = HashMap::<String, usize>::new();
-    for (paragraph_index, ((base, value), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
-        let mut detected = Vec::new();
-        for content in PAREN
-            .captures_iter(value)
-            .filter_map(|c| c.get(1))
-            .filter(|m| (1..=200).contains(&m.as_str().encode_utf16().count()))
-        {
-            detected.extend(
-                QUOTED
-                    .captures_iter(content.as_str())
-                    .filter_map(|c| c.get(1))
-                    .map(|m| {
-                        (
-                            m.as_str().to_owned(),
-                            content.start() + m.start(),
-                            content.start() + m.end(),
-                        )
-                    }),
-            );
+    for (paragraph_index, ((base, text), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
+        let mut found = Vec::new();
+        for content in PAREN.captures_iter(text).filter_map(|c| c.get(1)) {
+            if !(1..=200).contains(&content.as_str().encode_utf16().count()) {
+                continue;
+            }
+            found.extend(QUOTED.captures_iter(content.as_str()).map(|c| {
+                let term = c.get(1).unwrap();
+                (
+                    term.as_str(),
+                    content.start() + term.start(),
+                    content.start() + term.end(),
+                )
+            }));
         }
-        if let Some(captures) = LIST.captures(value).filter(|c| {
-            !value[c.get(0).unwrap().end()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        }) {
-            let term = captures.get(1).unwrap();
-            detected.push((term.as_str().to_owned(), term.start(), term.end()));
+        if let Some(c) = LIST.captures(text).filter(|c| bounded(text, 0, c[0].len())) {
+            let term = c.get(1).unwrap();
+            found.push((term.as_str(), term.start(), term.end()));
         }
         let mut seen = HashSet::new();
-        for (term, start, end) in detected
-            .into_iter()
-            .filter(|(term, _, _)| seen.insert(term.clone()))
-        {
-            let next = terms.len();
-            let index = *indexes.entry(term.clone()).or_insert(next);
-            if index == next {
-                terms.push((term, Vec::new()));
-            }
-            terms[index].1.push((
-                paragraph_index,
-                occurrence(&document, paragraph, base + start, base + end),
-            ));
-        }
-    }
-    if terms.is_empty() {
-        return DefinitionsResult { terms: Vec::new() };
-    }
-    let (mut variants, mut defined_in) = (HashMap::<String, Vec<usize>>::new(), HashSet::new());
-    for (index, (term, definitions)) in terms.iter().enumerate() {
-        for variant in [
-            term.clone(),
-            term.strip_suffix('s')
-                .map_or_else(|| format!("{term}s"), str::to_owned),
-        ] {
-            variants.entry(variant).or_default().push(index);
-        }
-        defined_in.extend(definitions.iter().map(|(paragraph, _)| (index, *paragraph)));
-    }
-    let mut alternatives = variants.keys().map(String::as_str).collect::<Vec<_>>();
-    alternatives.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-    let pattern = Regex::new(
-        &alternatives
-            .into_iter()
-            .map(regex::escape)
-            .collect::<Vec<_>>()
-            .join("|"),
-    )
-    .unwrap();
-    let mut uses = vec![Vec::new(); terms.len()];
-    for (paragraph_index, ((base, value), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
-        let (mut cursor, mut consumed) = (0, HashMap::<&str, usize>::new());
-        while let Some(found) = pattern.find_at(value, cursor) {
-            let start = found.start();
-            cursor = start + value[start..].chars().next().unwrap().len_utf8();
-            let left = !value[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric());
-            for end in found
-                .as_str()
-                .char_indices()
-                .map(|(at, c)| at + c.len_utf8())
-            {
-                let variant = &found.as_str()[..end];
-                let Some(owners) = variants.get(variant) else {
-                    continue;
-                };
-                if consumed.get(variant).is_some_and(|prior| start < *prior) {
-                    continue;
-                }
-                consumed.insert(variant, start + end);
-                if !left
-                    || value[start + end..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                {
-                    continue;
-                }
-                for &index in owners {
-                    if !defined_in.contains(&(index, paragraph_index)) {
-                        uses[index].push(occurrence(
-                            &document,
-                            paragraph,
-                            base + start,
-                            base + start + end,
-                        ));
-                    }
-                }
+        for (term, start, end) in found.into_iter().filter(|(term, _, _)| seen.insert(*term)) {
+            let hit = paragraph.at(&document, base + start, base + end);
+            if let Some((_, definitions)) = terms.iter_mut().find(|(known, _)| known == term) {
+                definitions.push((paragraph_index, hit));
+            } else {
+                terms.push((term.to_owned(), vec![(paragraph_index, hit)]));
             }
         }
     }
-    DefinitionsResult {
-        terms: terms
-            .into_iter()
-            .zip(uses)
-            .map(|((term, definitions), uses)| DefinedTerm {
+    let terms = terms
+        .into_iter()
+        .map(|(term, definitions)| {
+            let variants = [
+                term.clone(),
+                term.strip_suffix('s')
+                    .map_or_else(|| format!("{term}s"), str::to_owned),
+            ];
+            let mut uses = Vec::new();
+            for (index, ((base, text), paragraph)) in slices.iter().zip(paragraphs).enumerate() {
+                if definitions.iter().any(|(defined, _)| *defined == index) {
+                    continue;
+                }
+                let mut hits = variants
+                    .iter()
+                    .flat_map(|variant| text.match_indices(variant))
+                    .map(|(start, found)| (start, start + found.len()))
+                    .filter(|(start, end)| bounded(text, *start, *end))
+                    .collect::<Vec<_>>();
+                hits.sort_unstable();
+                uses.extend(
+                    hits.into_iter()
+                        .map(|(start, end)| paragraph.at(&document, base + start, base + end)),
+                );
+            }
+            DefinedTerm {
                 term,
-                definitions: definitions
-                    .into_iter()
-                    .map(|(_, occurrence)| occurrence)
-                    .collect(),
+                definitions: definitions.into_iter().map(|(_, hit)| hit).collect(),
                 uses,
-            })
-            .collect(),
-    }
+            }
+        })
+        .collect();
+    DefinitionsResult { terms }
 }
