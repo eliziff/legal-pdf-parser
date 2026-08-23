@@ -497,10 +497,11 @@ impl SourceDocQuery {
             let tokens = tokenize_source_text(&self.document.text);
             let mut postings = HashMap::<String, Vec<usize>>::new();
             for (position, token) in tokens.iter().enumerate() {
-                postings
-                    .entry(token.word.clone())
-                    .or_default()
-                    .push(position);
+                if let Some(posting) = postings.get_mut(&token.word) {
+                    posting.push(position);
+                } else {
+                    postings.insert(token.word.clone(), vec![position]);
+                }
             }
             SearchIndex { tokens, postings }
         })
