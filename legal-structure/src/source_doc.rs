@@ -200,32 +200,17 @@ pub struct SourceDocRanges {
 }
 
 #[derive(Default)]
-pub struct SourceDocIndex {
-    positions: HashMap<String, usize>,
-    order: Vec<String>,
-}
+pub struct SourceDocIndex(HashMap<String, usize>);
 
 impl SourceDocIndex {
     pub fn get(&self, label: &str) -> Option<usize> {
-        self.positions.get(&label.to_lowercase()).copied()
-    }
-
-    pub fn entries(&self) -> Vec<(String, usize)> {
-        self.order
-            .iter()
-            .map(|label| (label.clone(), self.positions[label]))
-            .collect()
+        self.0.get(&label.to_lowercase()).copied()
     }
 }
 
 impl Serialize for SourceDocIndex {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let entries = self.entries();
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (label, position) in entries {
-            map.serialize_entry(&label, &position)?;
-        }
-        map.end()
+        serializer.serialize_map(Some(0))?.end()
     }
 }
 
@@ -407,7 +392,6 @@ fn source_doc_navigation(
     let (mut paragraphs, mut pages, mut sections, mut footnotes) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut positions = HashMap::new();
-    let mut order = Vec::new();
     let mut duplicates = HashSet::new();
     for (position, block) in blocks.iter().enumerate() {
         match block.kind {
@@ -424,11 +408,8 @@ fn source_doc_navigation(
             .filter(|label| labels.insert(label.as_str()))
         {
             let key = label.to_lowercase();
-            if positions.contains_key(&key) {
+            if positions.insert(key.clone(), position).is_some() {
                 duplicates.insert(key);
-            } else {
-                positions.insert(key.clone(), position);
-                order.push(key);
             }
         }
     }
@@ -439,14 +420,13 @@ fn source_doc_navigation(
         footnote: range(SourceDocKind::Footnote, &footnotes),
     };
     positions.retain(|label, _| !duplicates.contains(label));
-    order.retain(|label| !duplicates.contains(label));
     (
         if blocks.is_empty() {
             SourceDocStatus::Unavailable
         } else {
             SourceDocStatus::Usable
         },
-        SourceDocIndex { positions, order },
+        SourceDocIndex(positions),
         ranges,
     )
 }
