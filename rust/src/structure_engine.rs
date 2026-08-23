@@ -98,7 +98,7 @@ pub(crate) fn derive_pdf_pages(
         footnotes: document.footnotes,
         diagnostics: document.diagnostics,
         markers: structure.derived.pairing_audit.markers,
-        marker_summary: structure.derived.pairing_audit.marker_summary,
+        marker_summary: structure.derived.pairing_audit.pairing_summary.clone(),
         pairing_summary: structure.derived.pairing_audit.pairing_summary,
         structure_graph,
     })

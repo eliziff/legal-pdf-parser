@@ -229,6 +229,17 @@ fn section_nodes(document: &LegalDocument) -> Vec<&StructureNode> {
         .collect()
 }
 
+fn source_extent<'a>(
+    document: &'a LegalDocument,
+    id: &str,
+) -> Option<&'a legal_pdf_core::model::PdfSourceExtent> {
+    document
+        .pdf_source_map
+        .nodes
+        .iter()
+        .find(|extent| extent.id == id)
+}
+
 struct SourceParagraph<'a> {
     number: usize,
     order_on_page: usize,
@@ -402,11 +413,7 @@ fn section_units(document: &LegalDocument) -> Vec<LookupUnit> {
         .map(|(index, section)| {
             let mut page_numbers = Vec::new();
             let mut qualities = Vec::new();
-            let page_indexes = document
-                .pdf_source_map
-                .nodes
-                .iter()
-                .find(|extent| extent.id == section.id)
+            let page_indexes = source_extent(document, &section.id)
                 .map(|extent| extent.page_indexes.as_slice())
                 .unwrap_or_default();
             for page_index in page_indexes {
@@ -873,9 +880,9 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
         blocks.push(json!({"kind":"page","label":label,"start":page_start,"end":position,"origin":if printed.is_some(){"heuristic"}else{"native"},"anchor":format!("page={}",page.number),"aliases":aliases}));
     }
     for section in section_nodes(document) {
-        let positions = section
-            .line_ids
-            .iter()
+        let positions = source_extent(document, &section.id)
+            .into_iter()
+            .flat_map(|extent| &extent.line_ids)
             .filter_map(|id| line_offsets.get(id))
             .collect::<Vec<_>>();
         let Some(start) = positions.iter().map(|position| position.0).min() else {
@@ -955,7 +962,7 @@ pub fn source_doc(document: &LegalDocument, id: Option<&str>, url: Option<&str>)
 mod tests {
     use super::*;
     use legal_pdf_core::model::{
-        GraphStatus, Paragraph, ScalarRange, DocumentStructure, PARSER_VERSION, SCHEMA_VERSION,
+        DocumentStructure, GraphStatus, Paragraph, ScalarRange, PARSER_VERSION, SCHEMA_VERSION,
     };
     use serde_json::Map;
 

@@ -4434,7 +4434,9 @@ impl PdfResolutionInput {
         }
         let citation_spans = by_line
             .iter()
-            .map(|(line_id, (_, line))| ((*line_id).to_owned(), protected_citation_spans(&line.text)))
+            .map(|(line_id, (_, line))| {
+                ((*line_id).to_owned(), protected_citation_spans(&line.text))
+            })
             .collect::<HashMap<_, _>>();
         let mut evidence = Vec::new();
         for run in &runs {
@@ -4616,8 +4618,15 @@ impl PdfResolutionInput {
             evidence,
             citation_spans: citation_spans
                 .into_iter()
-                .map(|(line_id, spans)| (line_id, spans.into_iter()
-                    .map(|(start, end)| PdfSourceSpan { start, end }).collect()))
+                .map(|(line_id, spans)| {
+                    (
+                        line_id,
+                        spans
+                            .into_iter()
+                            .map(|(start, end)| PdfSourceSpan { start, end })
+                            .collect(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -4650,13 +4659,16 @@ fn pdf_source_map(
         note_references: structure
             .notes
             .iter()
-            .flat_map(|note| note.references.iter().enumerate().map(move |(reference, value)| {
-                PdfSourceExtent {
-                    id: format!("{}:reference:{reference}", note.id),
-                    page_indexes: index.page_indexes(value.range),
-                    line_ids: index.line_ids(value.range),
-                }
-            }))
+            .flat_map(|note| {
+                note.references
+                    .iter()
+                    .enumerate()
+                    .map(move |(reference, value)| PdfSourceExtent {
+                        id: format!("{}:reference:{reference}", note.id),
+                        page_indexes: index.page_indexes(value.range),
+                        line_ids: index.line_ids(value.range),
+                    })
+            })
             .collect(),
         protected_citation_spans,
         table_ids: Vec::new(),
@@ -4892,7 +4904,6 @@ pub fn finish_derivation(
         Error::Message("PDF structure candidates were not prepared before pairing".to_owned())
     })?;
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
-    let marker_summary = pairing.summary.clone();
     let pairing_summary = pairing.summary;
     let markers = pairing.markers;
     let anchors = pairing.anchors;
@@ -4938,7 +4949,6 @@ pub fn finish_derivation(
         diagnostics,
         pairing_audit: PdfPairingAudit {
             markers,
-            marker_summary,
             pairing_summary,
         },
         pdf_source_map,

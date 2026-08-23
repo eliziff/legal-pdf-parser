@@ -254,7 +254,6 @@ pub struct PdfSourceMap {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PdfPairingAudit {
     pub markers: Vec<Value>,
-    pub marker_summary: Value,
     pub pairing_summary: Value,
 }
 
