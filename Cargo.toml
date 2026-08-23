@@ -10,6 +10,7 @@ members = [
     "legal-grammar-tables",
     "legal-structure",
     "legal-structure-node",
+    "legal-structure-python",
 ]
 exclude = [
     "legal-pdf-core",
