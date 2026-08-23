@@ -1,8 +1,9 @@
 use crate::{
     utf16_len, Block, CoverageState, Derivation, DetectionProfile, DocumentInput,
-    DocumentStructure, EngineError, EvidenceKind, NativeClaim, NodeKind, Origin, ParagraphBreak,
-    ScalarRange, ScalarText, Scope, ScopeKind, SourceDocType, EVIDENCE_SCHEMA,
+    DocumentStructure, EngineError, EvidenceKind, NativeClaim, NodeKind, Origin, ScalarRange,
+    ScalarText, Scope, ScopeKind, SourceDocType, EVIDENCE_SCHEMA,
 };
+use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -156,52 +157,53 @@ fn provider_source(mut text: String, entries: &[(&str, &str)]) -> (String, Vec<N
 
 fn provider_claims(text: &str, map: &A2ajSectionMap) -> Vec<NativeClaim> {
     static PRINTED: OnceLock<Regex> = OnceLock::new();
-    // Unique byte matches are in final provider-rendered text.
-    let coordinates = ScalarText::new(text);
-    map.iter()
+    let candidates = map
+        .iter()
         .filter_map(|(raw_label, value)| {
             let label = raw_label.trim();
-            if label.is_empty()
-                || value.trim().is_empty()
-                || value.trim().eq_ignore_ascii_case("[blank]")
-            {
-                return None;
-            }
-            let mut matches = text.match_indices(value).map(|(start, _)| start);
-            let start = matches.next()?;
-            if matches.next().is_some() {
-                return None;
-            }
-            let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
-            let prefix = text[line_start..start].trim();
-            let printed = PRINTED
+            (!label.is_empty()
+                && !value.trim().is_empty()
+                && !value.trim().eq_ignore_ascii_case("[blank]"))
+            .then_some((label, value.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let matcher = AhoCorasick::new(candidates.iter().map(|(_, value)| value)).unwrap();
+    let mut matches = vec![(0, 0, 0); candidates.len()];
+    for found in matcher.find_overlapping_iter(text) {
+        let matched = &mut matches[found.pattern().as_usize()];
+        if matched.2 < 2 && found.start() >= matched.1 {
+            *matched = (found.start(), found.end(), matched.2 + 1);
+        }
+    }
+    let coordinates = ScalarText::new(text);
+    let mut claims = Vec::new();
+    for ((label, value), (start, _, count)) in candidates.into_iter().zip(matches) {
+        let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+        if count != 1
+            || PRINTED
                 .get_or_init(|| Regex::new(r"^([^\s.)]+)[.)]?$").unwrap())
-                .captures(prefix)
-                .map(|capture| capture[1].to_owned());
-            if printed.is_some() {
-                return None;
-            }
-            let end = start + value.len();
-            Some(NativeClaim {
-                id: String::new(),
-                kind: EvidenceKind::Section,
-                label: Some(format!("sec{label}")),
-                aliases: Vec::new(),
-                range: ScalarRange {
-                    start: coordinates.scalar(start),
-                    end: coordinates.scalar(end),
-                },
-                origin_id: ORIGIN.to_owned(),
-                parent_label: None,
-                anchor: None,
-            })
-        })
-        .enumerate()
-        .map(|(index, mut claim)| {
-            claim.id = format!("native-{:06}", index + 1);
-            claim
-        })
-        .collect()
+                .is_match(text[line_start..start].trim())
+        {
+            continue;
+        }
+        claims.push(NativeClaim {
+            id: format!("native-{:06}", claims.len() + 1),
+            kind: EvidenceKind::Section,
+            label: Some(format!("sec{label}")),
+            aliases: Vec::new(),
+            range: ScalarRange {
+                start: coordinates.scalar(start),
+                end: coordinates.scalar(start + value.len()),
+            },
+            origin_id: ORIGIN.to_owned(),
+            parent_label: None,
+            anchor: None,
+        });
+    }
+    claims
 }
 
 fn evidence(
@@ -218,19 +220,18 @@ fn evidence(
             CoverageState::Absent
         }
     });
-    let source_kind = input.source_kind;
-    let profile = if source_kind == A2ajSourceKind::Cases {
+    let profile = if input.source_kind == A2ajSourceKind::Cases {
         DetectionProfile::CaseRootedComplete
     } else {
         DetectionProfile::Legislation
     };
     let report_start_page = report_start(input);
-    let require_report_start = source_kind == A2ajSourceKind::Cases
+    let require_report_start = input.source_kind == A2ajSourceKind::Cases
         && input
             .dataset
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case("SCC"));
-    let allow_hyphenated_sections = source_kind == A2ajSourceKind::Laws
+    let allow_hyphenated_sections = input.source_kind == A2ajSourceKind::Laws
         && input.name.as_deref().is_some_and(|value| {
             static RE: OnceLock<Regex> = OnceLock::new();
             RE.get_or_init(|| {
@@ -244,7 +245,7 @@ fn evidence(
         document_id: input.id.clone().unwrap_or_else(|| input.citation.clone()),
         provider: "a2aj".to_owned(),
         url: input.url.clone(),
-        doc_type: Some(if source_kind == A2ajSourceKind::Cases {
+        doc_type: Some(if input.source_kind == A2ajSourceKind::Cases {
             SourceDocType::Cases
         } else {
             SourceDocType::Laws
@@ -272,7 +273,7 @@ fn evidence(
         native_claims: claims,
         coverage,
         exclusions: Vec::new(),
-        paragraph_breaks: Vec::<ParagraphBreak>::new(),
+        paragraph_breaks: Vec::new(),
     })
 }
 
@@ -354,13 +355,11 @@ fn apply_provider_section_evidence(
         if phrase.is_empty() {
             continue;
         }
-        let Some((anchor_offset, anchor_word)) = phrase
+        let (anchor_offset, anchor_word) = phrase
             .iter()
             .enumerate()
             .min_by_key(|(_, word)| postings.get(word.0.as_str()).map_or(0, Vec::len))
-        else {
-            continue;
-        };
+            .unwrap();
         let mut spans = Vec::new();
         for &position in postings.get(anchor_word.0.as_str()).into_iter().flatten() {
             let Some(start) = position.checked_sub(anchor_offset) else {
@@ -458,10 +457,8 @@ pub fn a2aj_document_structure(mut input: A2ajInput) -> Result<DocumentStructure
         (None, _) => Vec::new(),
     };
     let (text, mut claims) = provider_source(std::mem::take(&mut input.text), &ordered);
-    if has_text {
-        if let Some(map) = &input.section_map {
-            claims = provider_claims(&text, map);
-        }
+    if let (true, Some(map)) = (has_text, &input.section_map) {
+        claims = provider_claims(&text, map);
     }
     let evidence = evidence(&input, text, claims)?;
     let mut structure = if let (A2ajSourceKind::Laws, true, Some(map)) =
