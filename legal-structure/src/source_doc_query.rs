@@ -12,6 +12,9 @@ use std::sync::{
     OnceLock,
 };
 
+mod text_fragment;
+pub use text_fragment::text_fragment_directives;
+
 const JS_WS: &str = r"[\u{0009}-\u{000d}\u{0020}\u{00a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}]";
 
 fn regex(pattern: &'static str, cell: &'static OnceLock<Regex>) -> &'static Regex {
@@ -20,6 +23,12 @@ fn regex(pattern: &'static str, cell: &'static OnceLock<Regex>) -> &'static Rege
 
 fn regex_parts(parts: &[&str], cell: &'static OnceLock<Regex>) -> &'static Regex {
     cell.get_or_init(|| Regex::new(&parts.concat()).expect("query regex must compile"))
+}
+
+fn js_regex(pattern: &'static str, cell: &'static OnceLock<Regex>) -> &'static Regex {
+    cell.get_or_init(|| {
+        Regex::new(&pattern.replace(r"\s", JS_WS)).expect("query regex must compile")
+    })
 }
 
 fn equal_fold(left: &str, right: &str) -> bool {
@@ -38,7 +47,7 @@ fn context(value: usize) -> usize {
     value.min(2)
 }
 
-fn slice_utf16<'a>(text: &'a ScalarText<'a>, start: usize, end: usize) -> &'a str {
+fn slice_utf16<'a>(text: &ScalarText<'a>, start: usize, end: usize) -> &'a str {
     let Some(start) = text.byte_at_utf16(start) else {
         return "";
     };
@@ -94,6 +103,28 @@ struct SearchIndex {
     postings: HashMap<String, Vec<usize>>,
 }
 
+impl SearchIndex {
+    fn new(text: &str) -> Self {
+        Self::with_tokens(tokenize_source_text(text))
+    }
+
+    fn with_scalar(text: &str, scalar: &ScalarText<'_>) -> Self {
+        Self::with_tokens(tokenize_with_scalar(text, scalar))
+    }
+
+    fn with_tokens(tokens: Vec<SourceDocWordSpan>) -> Self {
+        let mut postings = HashMap::<String, Vec<usize>>::new();
+        for (position, token) in tokens.iter().enumerate() {
+            if let Some(posting) = postings.get_mut(&token.word) {
+                posting.push(position);
+            } else {
+                postings.insert(token.word.clone(), vec![position]);
+            }
+        }
+        Self { tokens, postings }
+    }
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhraseOptions {
@@ -104,7 +135,7 @@ pub struct PhraseOptions {
     pub limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhraseSpan {
     pub start: usize,
@@ -184,8 +215,16 @@ pub enum FollowDirection {
 #[derive(Serialize)]
 pub struct GraphScope {
     pub seed: MaterializedSourceDocBlock,
-    pub nodes: Vec<MaterializedSourceDocBlock>,
+    pub nodes: Vec<GraphScopeNode>,
     pub depth: usize,
+}
+
+#[derive(Serialize)]
+pub struct GraphScopeNode {
+    #[serde(flatten)]
+    pub block: MaterializedSourceDocBlock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<Vec<MaterializedSourceDocBlock>>,
 }
 
 pub struct SourceDocQuery {
@@ -296,6 +335,21 @@ impl SourceDocQuery {
         locator: &str,
         context_blocks: usize,
     ) -> SourceDocLookup {
+        self.lookup_with_text(kind, locator, context_blocks, None)
+    }
+
+    fn lookup_with_text(
+        &self,
+        kind: SourceDocKind,
+        locator: &str,
+        context_blocks: usize,
+        text: Option<&ScalarText<'_>>,
+    ) -> SourceDocLookup {
+        let requested = self.requested_label(kind, locator);
+        self.lookup_label_with_text(kind, &requested, context_blocks, text)
+    }
+
+    fn requested_label(&self, kind: SourceDocKind, locator: &str) -> String {
         let exact = js_trim(locator);
         let exact_label = self
             .document
@@ -322,7 +376,7 @@ impl SourceDocQuery {
                 String::new()
             }
         };
-        self.lookup_label(kind, &requested, context_blocks)
+        requested
     }
 
     pub fn lookup_label(
@@ -330,6 +384,16 @@ impl SourceDocQuery {
         kind: SourceDocKind,
         requested_label: &str,
         context_blocks: usize,
+    ) -> SourceDocLookup {
+        self.lookup_label_with_text(kind, requested_label, context_blocks, None)
+    }
+
+    fn lookup_label_with_text(
+        &self,
+        kind: SourceDocKind,
+        requested_label: &str,
+        context_blocks: usize,
+        text: Option<&ScalarText<'_>>,
     ) -> SourceDocLookup {
         let available = self.blocks(kind);
         let empty = |status| SourceDocLookup {
@@ -370,7 +434,13 @@ impl SourceDocQuery {
             .position(|block| std::ptr::eq(*block, selected))
             .unwrap_or(0);
         let context = context(context_blocks);
-        let text = ScalarText::new(&self.document.text);
+        let owned_text;
+        let text = if let Some(text) = text {
+            text
+        } else {
+            owned_text = ScalarText::new(&self.document.text);
+            &owned_text
+        };
         SourceDocLookup {
             status: SourceDocLookupStatus::Found,
             requested_label: requested_label.to_owned(),
@@ -387,29 +457,6 @@ impl SourceDocQuery {
         }
     }
 
-    fn range_blocks(&self, kind: SourceDocKind, from: &str, to: &str) -> Vec<&SourceDocBlock> {
-        let available = self.blocks(kind);
-        let find = |locator: &str| {
-            let label = normalize_source_doc_locator(kind, locator);
-            (!label.is_empty())
-                .then(|| {
-                    available
-                        .iter()
-                        .position(|block| block_matches(block, &label))
-                })
-                .flatten()
-        };
-        let (Some(first), Some(last)) = (find(from), find(to)) else {
-            return Vec::new();
-        };
-        let (low, high) = if first <= last {
-            (first, last)
-        } else {
-            (last, first)
-        };
-        available[low..=high].to_vec()
-    }
-
     pub fn read_range(
         &self,
         kind: SourceDocKind,
@@ -417,108 +464,146 @@ impl SourceDocQuery {
         to: &str,
         context_blocks: usize,
     ) -> Option<SourceDocRangeLookup> {
-        let selected = self.range_blocks(kind, from, to);
-        let (Some(first), Some(last)) = (selected.first(), selected.last()) else {
-            return None;
-        };
-        let available = self.blocks(kind);
-        let first_index = available
-            .iter()
-            .position(|block| std::ptr::eq(*block, *first))?;
-        let last_index = available
-            .iter()
-            .position(|block| std::ptr::eq(*block, *last))?;
-        let context = context(context_blocks);
         let text = ScalarText::new(&self.document.text);
+        let available = self.blocks(kind);
+        let resolve = |locator: &str| {
+            let label = self.requested_label(kind, locator);
+            let block = self
+                .document
+                .index
+                .get(&label)
+                .and_then(|position| self.document.blocks.get(position))
+                .filter(|block| block.kind == kind)?;
+            available
+                .iter()
+                .position(|candidate| std::ptr::eq(*candidate, block))
+        };
+        let first_index = resolve(from)?;
+        let last_index = resolve(to)?;
+        let (low, high) = if first_index <= last_index {
+            (first_index, last_index)
+        } else {
+            (last_index, first_index)
+        };
+        let context = context(context_blocks);
         Some(SourceDocRangeLookup {
-            selected: selected
-                .iter()
-                .map(|block| self.materialize(block, &text))
-                .collect(),
-            before: available[first_index.saturating_sub(context)..first_index]
-                .iter()
-                .map(|block| self.materialize(block, &text))
-                .collect(),
-            after: available[last_index + 1..(last_index + 1 + context).min(available.len())]
-                .iter()
-                .map(|block| self.materialize(block, &text))
-                .collect(),
+            selected: self.materialize_leaf_blocks(&available[low..=high], &text),
+            before: self
+                .materialize_leaf_blocks(&available[low.saturating_sub(context)..low], &text),
+            after: self.materialize_leaf_blocks(
+                &available[high + 1..(high + 1 + context).min(available.len())],
+                &text,
+            ),
         })
     }
 
-    pub fn contained_leaf_units(
-        &self,
-        kind: SourceDocKind,
-        start: usize,
-        end: usize,
-    ) -> Vec<MaterializedSourceDocBlock> {
+    fn contained_leaf_blocks<'a>(&'a self, blocks: &[&SourceDocBlock]) -> Vec<&'a SourceDocBlock> {
+        let Some(kind) = blocks.first().map(|block| block.kind) else {
+            return Vec::new();
+        };
+        let mut ranges = blocks
+            .iter()
+            .map(|block| (block.start, block.end))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        let mut maximum_ends = Vec::<usize>::with_capacity(ranges.len());
+        for &(_, end) in &ranges {
+            maximum_ends.push(maximum_ends.last().copied().unwrap_or(0).max(end));
+        }
         let contained = self
             .document
             .blocks
             .iter()
-            .filter(|block| block.kind == kind && block.start >= start && block.end <= end)
+            .filter(|block| {
+                if block.kind != kind {
+                    return false;
+                }
+                let count = ranges.partition_point(|(start, _)| *start <= block.start);
+                count > 0 && maximum_ends[count - 1] >= block.end
+            })
             .collect::<Vec<_>>();
-        let units = if kind == SourceDocKind::Section && contained.len() > 1 {
-            contained
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    !contained.iter().any(|child| {
-                        !std::ptr::eq(*child, *candidate)
-                            && child.start >= candidate.start
-                            && child.end <= candidate.end
-                            && (child.start > candidate.start || child.end < candidate.end)
-                    })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            contained
-        };
-        let text = ScalarText::new(&self.document.text);
-        units
+        if kind != SourceDocKind::Section || contained.len() <= 1 {
+            return contained;
+        }
+        let mut ordered = (0..contained.len()).collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|&index| {
+            (
+                contained[index].start,
+                std::cmp::Reverse(contained[index].end),
+            )
+        });
+        let mut stack = Vec::<usize>::new();
+        let mut parents = HashSet::new();
+        for index in ordered {
+            let candidate = contained[index];
+            while stack
+                .last()
+                .is_some_and(|&parent| contained[parent].end < candidate.end)
+            {
+                stack.pop();
+            }
+            for &parent in &stack {
+                let parent = contained[parent];
+                if parent.end >= candidate.end
+                    && (parent.start < candidate.start || parent.end > candidate.end)
+                {
+                    parents.insert(parent as *const SourceDocBlock);
+                }
+            }
+            stack.push(index);
+        }
+        contained
             .into_iter()
-            .filter(|unit| unit.kind != SourceDocKind::Footnote)
-            .map(|unit| self.materialize(unit, &text))
-            .filter(|unit| !unit.text.trim().is_empty())
+            .filter(|candidate| !parents.contains(&(*candidate as *const SourceDocBlock)))
             .collect()
     }
 
-    pub fn smallest_containing_block(&self, start: usize, end: usize) -> Option<SourceDocBlock> {
-        self.document
+    fn materialize_leaf_blocks(
+        &self,
+        blocks: &[&SourceDocBlock],
+        text: &ScalarText<'_>,
+    ) -> Vec<MaterializedSourceDocBlock> {
+        self.contained_leaf_blocks(blocks)
+            .into_iter()
+            .map(|unit| self.materialize(unit, text))
+            .filter(|unit| !unit.text.is_empty())
+            .collect()
+    }
+
+    pub fn smallest_containing_block(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<MaterializedSourceDocBlock> {
+        let block = self
+            .document
             .blocks
             .iter()
             .filter(|block| block.start <= start && block.end >= end)
-            .min_by_key(|block| block.end - block.start)
-            .cloned()
+            .min_by_key(|block| block.end - block.start)?;
+        Some(self.materialize(block, &ScalarText::new(&self.document.text)))
     }
 
     fn index(&self) -> &SearchIndex {
-        self.search.get_or_init(|| {
-            let tokens = tokenize_source_text(&self.document.text);
-            let mut postings = HashMap::<String, Vec<usize>>::new();
-            for (position, token) in tokens.iter().enumerate() {
-                if let Some(posting) = postings.get_mut(&token.word) {
-                    posting.push(position);
-                } else {
-                    postings.insert(token.word.clone(), vec![position]);
-                }
-            }
-            SearchIndex { tokens, postings }
-        })
+        self.search
+            .get_or_init(|| SearchIndex::new(&self.document.text))
+    }
+
+    fn index_with_text(&self, text: &ScalarText<'_>) -> &SearchIndex {
+        self.search
+            .get_or_init(|| SearchIndex::with_scalar(&self.document.text, text))
     }
 
     fn line_breaks(&self) -> &[usize] {
         self.line_breaks.get_or_init(|| {
             let text = ScalarText::new(&self.document.text);
-            self.document
-                .text
-                .match_indices('\n')
-                .map(|(byte, _)| {
-                    text.utf16_at_byte(byte)
-                        .expect("line break is a scalar boundary")
-                })
-                .collect()
+            collect_line_breaks(&self.document.text, &text)
         })
+    }
+
+    fn line_breaks_with_text(&self, text: &ScalarText<'_>) -> &[usize] {
+        self.line_breaks
+            .get_or_init(|| collect_line_breaks(&self.document.text, text))
     }
 
     pub fn phrase_spans(&self, words: &[String], options: PhraseOptions) -> Vec<PhraseSpan> {
@@ -533,60 +618,32 @@ impl SourceDocQuery {
         {
             return scan_phrase_spans(&self.document.text, words, options);
         }
-        let index = self.index();
-        let from = options
-            .start
-            .map_or(0, |offset| token_index_at_or_after(&index.tokens, offset));
-        let until = options.end.map_or(index.tokens.len(), |offset| {
-            token_index_at_or_after(&index.tokens, offset)
-        });
-        let limit = options.limit.unwrap_or(usize::MAX);
-        let mut anchor = 0;
-        let mut rarest = usize::MAX;
-        for (offset, word) in words.iter().enumerate() {
-            let size = index.postings.get(word).map_or(0, Vec::len);
-            if size == 0 {
-                return Vec::new();
-            }
-            if size < rarest {
-                rarest = size;
-                anchor = offset;
-            }
+        indexed_phrase_spans(self.index(), self.line_breaks(), words, options)
+    }
+
+    fn phrase_spans_with_text(
+        &self,
+        words: &[String],
+        options: PhraseOptions,
+        text: &ScalarText<'_>,
+    ) -> Vec<PhraseSpan> {
+        if words.is_empty() {
+            return Vec::new();
         }
-        let mut spans = Vec::new();
-        for &position in &index.postings[&words[anchor]] {
-            let Some(start) = position.checked_sub(anchor) else {
-                continue;
-            };
-            if start < from {
-                continue;
-            }
-            if start + words.len() > until {
-                break;
-            }
-            if index.tokens[start..start + words.len()]
-                .iter()
-                .zip(words)
-                .any(|(token, word)| token.word != *word)
-            {
-                continue;
-            }
-            let first = &index.tokens[start];
-            let last = &index.tokens[start + words.len() - 1];
-            if options.same_line && crosses_line_break(self.line_breaks(), first.start, last.end) {
-                continue;
-            }
-            spans.push(PhraseSpan {
-                start: first.start,
-                end: last.end,
-                first_word: start,
-                last_word: start + words.len() - 1,
-            });
-            if spans.len() >= limit {
-                break;
-            }
+        let query = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
+        if query == 1
+            && self.search.get().is_none()
+            && options.start.is_none()
+            && options.end.is_none()
+        {
+            return scan_phrase_spans_with_text(&self.document.text, text, words, options);
         }
-        spans
+        indexed_phrase_spans(
+            self.index_with_text(text),
+            self.line_breaks_with_text(text),
+            words,
+            options,
+        )
     }
 
     pub fn contains_quote(&self, quote: &str, start: Option<usize>, end: Option<usize>) -> bool {
@@ -685,6 +742,7 @@ impl SourceDocQuery {
         follow: FollowDirection,
         depth: usize,
         include_descendants: bool,
+        include_units: bool,
     ) -> Option<GraphScope> {
         let wanted = js_trim(seed_label).to_lowercase();
         let seed = self
@@ -758,7 +816,20 @@ impl SourceDocQuery {
             seed,
             nodes: rest
                 .into_iter()
-                .map(|block| self.materialize(block, &text))
+                .map(|block| {
+                    let materialized = self.materialize(block, &text);
+                    let units =
+                        include_units.then(|| self.materialize_leaf_blocks(&[block], &text));
+                    let units = units.filter(|units| {
+                        units.len() != 1
+                            || units[0].block.start != block.start
+                            || units[0].block.end != block.end
+                    });
+                    GraphScopeNode {
+                        block: materialized,
+                        units,
+                    }
+                })
                 .collect(),
             depth: hops.min(limit),
         })
@@ -837,9 +908,8 @@ pub fn normalize_source_doc_locator(kind: SourceDocKind, locator: &str) -> Strin
     }
 }
 
-pub fn tokenize_source_text(text: &str) -> Vec<SourceDocWordSpan> {
+fn tokenize_with_scalar(text: &str, scalar: &ScalarText<'_>) -> Vec<SourceDocWordSpan> {
     static WORD: OnceLock<Regex> = OnceLock::new();
-    let scalar = ScalarText::new(text);
     regex(r"[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*", &WORD)
         .find_iter(text)
         .map(|found| SourceDocWordSpan {
@@ -848,6 +918,10 @@ pub fn tokenize_source_text(text: &str) -> Vec<SourceDocWordSpan> {
             end: scalar.utf16_at_byte(found.end()).expect("token boundary"),
         })
         .collect()
+}
+
+pub fn tokenize_source_text(text: &str) -> Vec<SourceDocWordSpan> {
+    tokenize_with_scalar(text, &ScalarText::new(text))
 }
 
 pub fn quote_text(value: &str) -> String {
@@ -889,14 +963,89 @@ fn token_index_at_or_after(tokens: &[SourceDocWordSpan], offset: usize) -> usize
     tokens.partition_point(|token| token.start < offset)
 }
 
+fn collect_line_breaks(text: &str, scalar: &ScalarText<'_>) -> Vec<usize> {
+    text.match_indices('\n')
+        .map(|(byte, _)| {
+            scalar
+                .utf16_at_byte(byte)
+                .expect("line break is a scalar boundary")
+        })
+        .collect()
+}
+
 fn crosses_line_break(line_breaks: &[usize], start: usize, end: usize) -> bool {
     let at = line_breaks.partition_point(|offset| *offset < start);
     at < line_breaks.len() && line_breaks[at] < end
 }
 
-fn scan_phrase_spans(text: &str, words: &[String], options: PhraseOptions) -> Vec<PhraseSpan> {
+fn indexed_phrase_spans(
+    index: &SearchIndex,
+    line_breaks: &[usize],
+    words: &[String],
+    options: PhraseOptions,
+) -> Vec<PhraseSpan> {
+    let from = options
+        .start
+        .map_or(0, |offset| token_index_at_or_after(&index.tokens, offset));
+    let until = options.end.map_or(index.tokens.len(), |offset| {
+        token_index_at_or_after(&index.tokens, offset)
+    });
+    let limit = options.limit.unwrap_or(usize::MAX);
+    let Some((anchor, _)) = words
+        .iter()
+        .enumerate()
+        .map(|(offset, word)| (offset, index.postings.get(word).map_or(0, Vec::len)))
+        .filter(|(_, size)| *size > 0)
+        .min_by_key(|(_, size)| *size)
+    else {
+        return Vec::new();
+    };
+    if words.iter().any(|word| !index.postings.contains_key(word)) {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    for &position in &index.postings[&words[anchor]] {
+        let Some(start) = position.checked_sub(anchor) else {
+            continue;
+        };
+        if start < from {
+            continue;
+        }
+        if start + words.len() > until {
+            break;
+        }
+        if index.tokens[start..start + words.len()]
+            .iter()
+            .zip(words)
+            .any(|(token, word)| token.word != *word)
+        {
+            continue;
+        }
+        let first = &index.tokens[start];
+        let last = &index.tokens[start + words.len() - 1];
+        if options.same_line && crosses_line_break(line_breaks, first.start, last.end) {
+            continue;
+        }
+        spans.push(PhraseSpan {
+            start: first.start,
+            end: last.end,
+            first_word: start,
+            last_word: start + words.len() - 1,
+        });
+        if spans.len() >= limit {
+            break;
+        }
+    }
+    spans
+}
+
+fn scan_phrase_spans_with_text(
+    text: &str,
+    scalar: &ScalarText<'_>,
+    words: &[String],
+    options: PhraseOptions,
+) -> Vec<PhraseSpan> {
     static WORD: OnceLock<Regex> = OnceLock::new();
-    let scalar = ScalarText::new(text);
     let size = words.len();
     let limit = options.limit.unwrap_or(usize::MAX);
     let mut ring = vec![
@@ -945,6 +1094,10 @@ fn scan_phrase_spans(text: &str, words: &[String], options: PhraseOptions) -> Ve
         }
     }
     spans
+}
+
+fn scan_phrase_spans(text: &str, words: &[String], options: PhraseOptions) -> Vec<PhraseSpan> {
+    scan_phrase_spans_with_text(text, &ScalarText::new(text), words, options)
 }
 
 pub fn phrase_spans(text: &str, words: &[String], options: PhraseOptions) -> Vec<PhraseSpan> {

@@ -15,7 +15,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -24,6 +24,7 @@ pub const DOCX_PROMPT_VERSION: &str = "legalpdf.docx.citation-intents.v1";
 pub const DEFAULT_DOCX_MODEL: &str = "gpt-5.6-sol";
 pub const DEFAULT_DOCX_EFFORT: &str = "none";
 pub const MAX_FOOTNOTES: usize = 400;
+pub const MAX_DOCX_SUPRA_BYTES: usize = 25 * 1024 * 1024;
 const MAX_BATCH_FOOTNOTES: usize = 32;
 const MAX_BATCH_CHARS: usize = 45_000;
 const MAX_BATCHES: usize = 13;
@@ -1432,6 +1433,644 @@ fn tolerant_docx_paragraphs(xml: &str) -> Result<Vec<String>> {
             Ok(normalize_docx_text(&value))
         })
         .collect()
+}
+
+static SUPRA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)supra,?[\x09-\x0D\x20\u{A0}\u{1680}\u{2000}-\u{200A}",
+        r"\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]{1,4}",
+        r"(?:note|nn?\.?)[\x09-\x0D\x20\u{A0}\u{1680}\u{2000}-\u{200A}",
+        r"\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]{1,4}",
+        r"([0-9]+)"
+    ))
+    .expect("literal DOCX supra regex")
+});
+static NUMBERED_SUPRA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(supra)[^\n\r\u{2028}\u{2029}]{0,40}?[0-9]+")
+        .expect("literal numbered supra regex")
+});
+static NUMBERING_RESTART: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<w:numRestart\b").expect("literal DOCX numbering regex"));
+static PARAGRAPH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<w:p\b.*?</w:p>").expect("literal DOCX paragraph regex"));
+static RUN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<w:r\b([^>]*)>(.*?)</w:r>").expect("literal DOCX run regex"));
+static TEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<w:t\b[^>]*>(.*?)</w:t>").expect("literal DOCX text regex"));
+static FIELD_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<w:fldChar\b[^>]*\bw:fldCharType=(?:"(begin|end)"|'(begin|end)')[^>]*/?>"#)
+        .expect("literal DOCX field regex")
+});
+static NOTEREF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)NOTEREF").expect("literal NOTEREF regex"));
+static RUN_PROPERTIES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<w:rPr\b.*?</w:rPr>").expect("literal run properties regex"));
+static FOOTNOTE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<w:footnoteReference\b[^>]*\bw:id=(?:"(-?[0-9]+)"|'(-?[0-9]+)')[^>]*/?>"#)
+        .expect("literal DOCX footnote reference regex")
+});
+static CUSTOM_MARK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?-u:\b)w:customMarkFollows=").expect("literal custom mark regex")
+});
+static BOOKMARK_ID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<w:bookmark(?:Start|End)\b[^>]*\bw:id=(?:"([0-9]+)"|'([0-9]+)')"#)
+        .expect("literal DOCX bookmark regex")
+});
+static BOOKMARK_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<w:bookmarkStart\b[^>]*\bw:name=(?:"([^"]*)"|'([^']*)')"#)
+        .expect("literal DOCX bookmark name regex")
+});
+
+#[derive(Debug)]
+pub struct DocxSupraCleanup {
+    pub bytes: Vec<u8>,
+    pub detected: usize,
+    pub converted: usize,
+    pub already_linked: usize,
+    pub review_required: usize,
+    pub bookmarks_added: usize,
+    pub restarted_numbering: bool,
+    pub unsafe_or_split_fields: usize,
+}
+
+struct SupraAnalysis {
+    detected: usize,
+    already_linked: usize,
+    ordinals: BTreeSet<usize>,
+}
+
+#[derive(Debug)]
+struct ParagraphTextNode {
+    text: String,
+    visible_start: usize,
+    visible_end: usize,
+    xml_start: usize,
+    run_start: usize,
+    run_end: usize,
+    run_attributes: String,
+    run_properties: String,
+    safe_to_replace: bool,
+}
+
+fn xml_text(value: &str) -> Result<String> {
+    quick_xml::escape::unescape(value)
+        .map(|value| value.into_owned())
+        .map_err(|error| Error::Message(format!("XML text unescaping failed: {error}")))
+}
+
+fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn element_is_open(xml: &str, offset: usize, tag: &str) -> bool {
+    let prior = &xml[..offset];
+    let open = prior
+        .rfind(&format!("<{tag} "))
+        .max(prior.rfind(&format!("<{tag}>")));
+    open.is_some_and(|open| {
+        prior
+            .rfind(&format!("</{tag}>"))
+            .is_none_or(|close| open > close)
+    })
+}
+
+fn javascript_iu_word(character: Option<char>) -> bool {
+    character.is_some_and(|character| {
+        character.is_ascii_alphanumeric()
+            || character == '_'
+            || matches!(character, '\u{017f}' | '\u{212a}')
+    })
+}
+
+fn javascript_iu_word_bounded(text: &str, start: usize, end: usize) -> bool {
+    javascript_iu_word(text[..start].chars().next_back())
+        != javascript_iu_word(text[start..].chars().next())
+        && javascript_iu_word(text[..end].chars().next_back())
+            != javascript_iu_word(text[end..].chars().next())
+}
+
+fn field_spans(paragraph: &str) -> Vec<(usize, usize)> {
+    let mut stack = Vec::new();
+    let mut spans = Vec::new();
+    for marker in FIELD_MARKER.captures_iter(paragraph) {
+        let whole = marker.get(0).unwrap();
+        if marker.get(1).or_else(|| marker.get(2)).unwrap().as_str() == "begin" {
+            stack.push(whole.start());
+        } else if let Some(start) = stack.pop() {
+            let field = &paragraph[start..whole.start()];
+            if NOTEREF
+                .find_iter(field)
+                .any(|value| javascript_iu_word_bounded(field, value.start(), value.end()))
+            {
+                spans.push((start, whole.end()));
+            }
+        }
+    }
+    spans
+}
+
+fn paragraph_text_nodes(
+    xml: &str,
+    paragraph: &str,
+    paragraph_offset: usize,
+) -> Result<Vec<ParagraphTextNode>> {
+    let mut nodes = Vec::new();
+    let mut visible = 0;
+    for run in RUN.captures_iter(paragraph) {
+        let whole = run.get(0).unwrap();
+        let body = run.get(2).unwrap();
+        let texts = TEXT.captures_iter(body.as_str()).collect::<Vec<_>>();
+        let properties = RUN_PROPERTIES
+            .find(body.as_str())
+            .map_or("", |value| value.as_str());
+        let only_text = texts.len() == 1
+            && legal_structure::normalize_javascript_whitespace(
+                &body.as_str().replacen(properties, "", 1).replacen(
+                    texts[0].get(0).unwrap().as_str(),
+                    "",
+                    1,
+                ),
+            )
+            .is_empty();
+        let safe = only_text
+            && ["w:hyperlink", "w:fldSimple", "w:ins", "w:del"]
+                .iter()
+                .all(|tag| !element_is_open(xml, paragraph_offset + whole.start(), tag));
+        for text in texts {
+            let value = xml_text(text.get(1).unwrap().as_str())?;
+            nodes.push(ParagraphTextNode {
+                visible_start: visible,
+                visible_end: visible + value.len(),
+                xml_start: whole.start()
+                    + (body.start() - whole.start())
+                    + text.get(0).unwrap().start(),
+                run_start: whole.start(),
+                run_end: whole.end(),
+                run_attributes: run.get(1).unwrap().as_str().to_owned(),
+                run_properties: properties.to_owned(),
+                text: value,
+                safe_to_replace: safe,
+            });
+            visible = nodes.last().unwrap().visible_end;
+        }
+    }
+    Ok(nodes)
+}
+
+fn analyze_supras(xml: &str) -> Result<SupraAnalysis> {
+    let mut analysis = SupraAnalysis {
+        detected: 0,
+        already_linked: 0,
+        ordinals: BTreeSet::new(),
+    };
+    for paragraph in PARAGRAPH.find_iter(xml) {
+        let nodes = paragraph_text_nodes(xml, paragraph.as_str(), paragraph.start())?;
+        let visible = nodes
+            .iter()
+            .map(|node| node.text.as_str())
+            .collect::<String>();
+        let fields = field_spans(paragraph.as_str());
+        for matched in SUPRA.captures_iter(&visible) {
+            let whole = matched.get(0).unwrap();
+            if !javascript_iu_word_bounded(&visible, whole.start(), whole.end()) {
+                continue;
+            }
+            analysis.detected += 1;
+            let number = matched.get(1).unwrap();
+            let node = nodes.iter().find(|node| {
+                node.visible_start <= number.start() && node.visible_end >= number.end()
+            });
+            if node.is_some_and(|node| {
+                fields
+                    .iter()
+                    .any(|&(start, end)| start <= node.xml_start && node.xml_start < end)
+            }) {
+                analysis.already_linked += 1;
+            } else if let Ok(ordinal) = number.as_str().parse::<usize>() {
+                if ordinal > 0 {
+                    analysis.ordinals.insert(ordinal);
+                }
+            }
+        }
+    }
+    Ok(analysis)
+}
+
+fn contains_numbered_supra(xml: &str) -> Result<bool> {
+    for paragraph in PARAGRAPH.find_iter(xml) {
+        let mut visible = String::new();
+        for text in TEXT.captures_iter(paragraph.as_str()) {
+            visible.push_str(&xml_text(text.get(1).unwrap().as_str())?);
+        }
+        if NUMBERED_SUPRA.captures_iter(&visible).any(|capture| {
+            let whole = capture.get(0).unwrap();
+            let word = capture.get(1).unwrap();
+            javascript_iu_word_bounded(&visible, word.start(), word.end())
+                && javascript_iu_word_bounded(&visible, word.start(), whole.end())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String, Vec<u8>)>> {
+    const MAX_EXPANDED_BYTES: u64 = 96 * 1024 * 1024;
+    const MAX_XML_PART_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_XML_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+    if bytes.is_empty() || bytes.len() > MAX_DOCX_SUPRA_BYTES {
+        return Err(Error::Message(
+            "DOCX is empty or exceeds the read limit".to_owned(),
+        ));
+    }
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut files = Vec::with_capacity(wanted.map_or(archive.len(), |names| names.len()));
+    let mut seen = HashSet::with_capacity(archive.len());
+    let mut expanded = 0_u64;
+    let mut xml_expanded = 0_u64;
+    let mut declared_expanded = 0_u64;
+    let mut declared_xml_expanded = 0_u64;
+    let mut file_count = 0;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let name = entry.name().replace('\\', "/");
+        if name.contains('\0')
+            || name.starts_with('/')
+            || name.as_bytes().get(1) == Some(&b':')
+            || name.split('/').any(|component| component == "..")
+        {
+            return Err(Error::Message(
+                "DOCX contains an unsafe package path".to_owned(),
+            ));
+        }
+        let lower_name = name.to_ascii_lowercase();
+        let xml = lower_name.ends_with(".xml") || lower_name.ends_with(".xml.rels");
+        if !entry.is_dir() {
+            file_count += 1;
+            if file_count > 2_048 {
+                return Err(Error::Message(
+                    "DOCX has too many package entries".to_owned(),
+                ));
+            }
+            declared_expanded = declared_expanded
+                .checked_add(entry.size())
+                .filter(|&size| size <= MAX_EXPANDED_BYTES)
+                .ok_or_else(|| Error::Message("DOCX exceeds the expanded read limit".to_owned()))?;
+            if xml {
+                if entry.size() > MAX_XML_PART_BYTES {
+                    return Err(Error::Message(
+                        "DOCX XML part exceeds the read limit".to_owned(),
+                    ));
+                }
+                declared_xml_expanded = declared_xml_expanded
+                    .checked_add(entry.size())
+                    .filter(|&size| size <= MAX_XML_TOTAL_BYTES)
+                    .ok_or_else(|| {
+                        Error::Message("DOCX XML parts exceed the read limit".to_owned())
+                    })?;
+            }
+        }
+        if !seen.insert(name.clone()) {
+            return Err(Error::Message(format!(
+                "DOCX contains duplicate package part {name}"
+            )));
+        }
+        if wanted.is_some_and(|wanted| !wanted.contains(&name.as_str())) {
+            continue;
+        }
+        let remaining = MAX_EXPANDED_BYTES.saturating_sub(expanded);
+        let limit = if xml {
+            remaining
+                .min(MAX_XML_PART_BYTES)
+                .min(MAX_XML_TOTAL_BYTES.saturating_sub(xml_expanded))
+        } else {
+            remaining
+        };
+        let mut value = Vec::with_capacity(entry.size().min(limit).min(1024 * 1024) as usize);
+        entry
+            .by_ref()
+            .take(limit + 1)
+            .read_to_end(&mut value)
+            .map_err(|error| Error::io(&name, error))?;
+        if value.len() as u64 > limit {
+            let message = if xml {
+                "DOCX XML part exceeds the read limit"
+            } else {
+                "DOCX exceeds the expanded read limit"
+            };
+            return Err(Error::Message(message.to_owned()));
+        }
+        expanded += value.len() as u64;
+        if xml {
+            xml_expanded += value.len() as u64;
+        }
+        files.push((name, value));
+    }
+    Ok(files)
+}
+
+fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
+    file_bytes(files, name).map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn footnote_reference_ids(document: &str) -> Vec<usize> {
+    FOOTNOTE_REFERENCE
+        .captures_iter(document)
+        .filter(|matched| !CUSTOM_MARK.is_match(matched.get(0).unwrap().as_str()))
+        .filter_map(|matched| {
+            matched
+                .get(1)
+                .or_else(|| matched.get(2))?
+                .as_str()
+                .parse()
+                .ok()
+        })
+        .filter(|id| *id > 0)
+        .collect()
+}
+
+fn add_target_bookmarks(
+    mut xml: String,
+    reference_ids: &[usize],
+    ordinals: &BTreeSet<usize>,
+) -> (String, HashMap<usize, String>, usize) {
+    let mut bookmark_id = BOOKMARK_ID
+        .captures_iter(&xml)
+        .filter_map(|matched| {
+            matched
+                .get(1)
+                .or_else(|| matched.get(2))?
+                .as_str()
+                .parse()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let existing = BOOKMARK_NAME
+        .captures_iter(&xml)
+        .filter_map(|matched| matched.get(1).or_else(|| matched.get(2)))
+        .map(|name| name.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    let mut targets = HashMap::<usize, (usize, usize)>::new();
+    for run in RUN.find_iter(&xml) {
+        for matched in FOOTNOTE_REFERENCE.captures_iter(run.as_str()) {
+            let Some(reference_id) = matched
+                .get(1)
+                .or_else(|| matched.get(2))
+                .and_then(|id| id.as_str().parse().ok())
+            else {
+                continue;
+            };
+            targets
+                .entry(reference_id)
+                .or_insert((run.start(), run.end()));
+        }
+    }
+    let mut names = HashMap::new();
+    let mut edits = BTreeMap::<(usize, usize), Vec<(usize, String)>>::new();
+    let mut added = 0;
+    for &ordinal in ordinals {
+        let Some(&reference_id) = ordinal
+            .checked_sub(1)
+            .and_then(|index| reference_ids.get(index))
+        else {
+            continue;
+        };
+        let name = format!("MikeSupraNote{ordinal}");
+        names.insert(ordinal, name.clone());
+        if existing.contains(&name) {
+            continue;
+        }
+        let Some(&target) = targets.get(&reference_id) else {
+            names.remove(&ordinal);
+            continue;
+        };
+        edits.entry(target).or_default().push((bookmark_id, name));
+        bookmark_id += 1;
+        added += 1;
+    }
+    for ((start, end), bookmarks) in edits.into_iter().rev() {
+        let mut replacement = String::new();
+        for (id, name) in &bookmarks {
+            replacement.push_str(&format!(
+                r#"<w:bookmarkStart w:id="{id}" w:name="{name}"/>"#
+            ));
+        }
+        replacement.push_str(&xml[start..end]);
+        for (id, _) in bookmarks.iter().rev() {
+            replacement.push_str(&format!(r#"<w:bookmarkEnd w:id="{id}"/>"#));
+        }
+        xml.replace_range(start..end, &replacement);
+    }
+    (xml, names, added)
+}
+
+fn plain_run(attributes: &str, properties: &str, text: &str) -> String {
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<w:r{attributes}>{properties}<w:t xml:space="preserve">{}</w:t></w:r>"#,
+            escape_xml_text(text)
+        )
+    }
+}
+
+fn noteref_field(attributes: &str, properties: &str, name: &str, number: &str) -> String {
+    format!(
+        concat!(
+            r#"<w:r{attributes}>{properties}<w:fldChar w:fldCharType="begin"/></w:r>"#,
+            r#"<w:r{attributes}>{properties}<w:instrText xml:space="preserve"> NOTEREF {name} \h </w:instrText></w:r>"#,
+            r#"<w:r{attributes}>{properties}<w:fldChar w:fldCharType="separate"/></w:r>"#,
+            r#"{number_run}<w:r{attributes}>{properties}<w:fldChar w:fldCharType="end"/></w:r>"#
+        ),
+        attributes = attributes,
+        properties = properties,
+        name = name,
+        number_run = plain_run(attributes, properties, number)
+    )
+}
+
+fn convert_safe_paragraphs(xml: &str, names: &HashMap<usize, String>) -> Result<(String, usize)> {
+    let mut output = String::with_capacity(xml.len());
+    let mut cursor = 0;
+    let mut converted = 0;
+    for paragraph in PARAGRAPH.find_iter(xml) {
+        output.push_str(&xml[cursor..paragraph.start()]);
+        let nodes = paragraph_text_nodes(xml, paragraph.as_str(), paragraph.start())?;
+        let visible = nodes
+            .iter()
+            .map(|node| node.text.as_str())
+            .collect::<String>();
+        let fields = field_spans(paragraph.as_str());
+        let mut candidates = BTreeMap::<usize, Vec<(&ParagraphTextNode, usize, &str, &str)>>::new();
+        for matched in SUPRA.captures_iter(&visible) {
+            let whole = matched.get(0).unwrap();
+            if !javascript_iu_word_bounded(&visible, whole.start(), whole.end()) {
+                continue;
+            }
+            let number = matched.get(1).unwrap();
+            let Ok(ordinal) = number.as_str().parse::<usize>() else {
+                continue;
+            };
+            let Some(name) = names.get(&ordinal) else {
+                continue;
+            };
+            let Some(node) = nodes.iter().find(|node| {
+                node.visible_start <= number.start() && node.visible_end >= number.end()
+            }) else {
+                continue;
+            };
+            if !node.safe_to_replace
+                || fields
+                    .iter()
+                    .any(|&(start, end)| start <= node.xml_start && node.xml_start < end)
+            {
+                continue;
+            }
+            candidates.entry(node.run_start).or_default().push((
+                node,
+                number.start(),
+                number.as_str(),
+                name,
+            ));
+        }
+        let mut edits = Vec::new();
+        for rows in candidates.values_mut() {
+            rows.sort_by_key(|row| row.1);
+            let node = rows[0].0;
+            let mut replacement = String::new();
+            let mut text_cursor = 0;
+            for (_, start, number, name) in rows {
+                let local = *start - node.visible_start;
+                replacement.push_str(&plain_run(
+                    &node.run_attributes,
+                    &node.run_properties,
+                    &node.text[text_cursor..local],
+                ));
+                replacement.push_str(&noteref_field(
+                    &node.run_attributes,
+                    &node.run_properties,
+                    name,
+                    number,
+                ));
+                text_cursor = local + number.len();
+                converted += 1;
+            }
+            replacement.push_str(&plain_run(
+                &node.run_attributes,
+                &node.run_properties,
+                &node.text[text_cursor..],
+            ));
+            edits.push((node.run_start, node.run_end, replacement));
+        }
+        let mut next = paragraph.as_str().to_owned();
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.0));
+        for (start, end, replacement) in edits {
+            next.replace_range(start..end, &replacement);
+        }
+        output.push_str(&next);
+        cursor = paragraph.end();
+    }
+    output.push_str(&xml[cursor..]);
+    Ok((output, converted))
+}
+
+pub fn has_docx_supra_references(bytes: &[u8]) -> Result<bool> {
+    let files = read_docx_files(bytes, Some(&["word/footnotes.xml"]))?;
+    if let Some(xml) = docx_part(&files, "word/footnotes.xml") {
+        if contains_numbered_supra(&xml)? {
+            return Ok(true);
+        }
+    }
+    let files = read_docx_files(bytes, Some(&["word/document.xml"]))?;
+    docx_part(&files, "word/document.xml").map_or(Ok(false), |xml| contains_numbered_supra(&xml))
+}
+
+pub fn fix_docx_supra_cross_references(bytes: &[u8]) -> Result<DocxSupraCleanup> {
+    let files = read_docx_files(
+        bytes,
+        Some(&[
+            "word/document.xml",
+            "word/footnotes.xml",
+            "word/settings.xml",
+        ]),
+    )?;
+    let document = docx_part(&files, "word/document.xml").ok_or_else(|| {
+        Error::Message("DOCX does not contain ordinary Word footnotes".to_owned())
+    })?;
+    let footnotes = docx_part(&files, "word/footnotes.xml").ok_or_else(|| {
+        Error::Message("DOCX does not contain ordinary Word footnotes".to_owned())
+    })?;
+    let body = analyze_supras(&document)?;
+    let notes = analyze_supras(&footnotes)?;
+    let detected = body.detected + notes.detected;
+    let already_linked = body.already_linked + notes.already_linked;
+    let restarted = NUMBERING_RESTART.is_match(&document)
+        || docx_part(&files, "word/settings.xml")
+            .is_some_and(|settings| NUMBERING_RESTART.is_match(&settings));
+    let unchanged = |review_required, restarted_numbering| DocxSupraCleanup {
+        bytes: bytes.to_vec(),
+        detected,
+        converted: 0,
+        already_linked,
+        review_required,
+        bookmarks_added: 0,
+        restarted_numbering,
+        unsafe_or_split_fields: review_required,
+    };
+    if detected == 0 || restarted {
+        return Ok(unchanged(
+            detected.saturating_sub(already_linked),
+            restarted,
+        ));
+    }
+    let ordinals = body.ordinals.union(&notes.ordinals).copied().collect();
+    let reference_ids = footnote_reference_ids(&document);
+    let (bookmarked, names, bookmarks_added) =
+        add_target_bookmarks(document, &reference_ids, &ordinals);
+    let (next_document, body_converted) = convert_safe_paragraphs(&bookmarked, &names)?;
+    let (next_footnotes, note_converted) = convert_safe_paragraphs(&footnotes, &names)?;
+    let converted = body_converted + note_converted;
+    let review_required = detected.saturating_sub(converted + already_linked);
+    if converted == 0 {
+        return Ok(unchanged(review_required, false));
+    }
+    let mut files = read_docx_files(bytes, None)?;
+    replace_file(&mut files, "word/document.xml", next_document.into_bytes());
+    replace_file(
+        &mut files,
+        "word/footnotes.xml",
+        next_footnotes.into_bytes(),
+    );
+    let writer = Cursor::new(Vec::new());
+    let mut archive = ZipWriter::new(writer);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, value) in files {
+        if name.ends_with('/') {
+            archive.add_directory(name, options)?;
+        } else {
+            archive.start_file(name, options)?;
+            archive
+                .write_all(&value)
+                .map_err(|error| Error::io("DOCX output", error))?;
+        }
+    }
+    let output = archive.finish()?.into_inner();
+    Ok(DocxSupraCleanup {
+        bytes: output,
+        detected,
+        converted,
+        already_linked,
+        review_required,
+        bookmarks_added,
+        restarted_numbering: false,
+        unsafe_or_split_fields: review_required,
+    })
 }
 
 fn nested_word_elements<'a>(element: &'a XmlElement, wanted: &str) -> Vec<&'a XmlElement> {

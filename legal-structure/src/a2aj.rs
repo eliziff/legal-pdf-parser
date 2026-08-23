@@ -171,21 +171,37 @@ fn provider_claims(coordinates: &ScalarText<'_>, map: &A2ajSectionMap) -> Vec<Na
     if candidates.is_empty() {
         return Vec::new();
     }
-    let matcher = AhoCorasick::new(candidates.iter().map(|(_, value)| value)).unwrap();
-    let mut matches = vec![(0, 0, 0); candidates.len()];
-    for found in matcher.find_overlapping_iter(text) {
-        let matched = &mut matches[found.pattern().as_usize()];
-        if matched.2 < 2 && found.start() >= matched.1 {
-            *matched = (found.start(), found.end(), matched.2 + 1);
+    let mut patterns = Vec::new();
+    let mut pattern_ids = Vec::with_capacity(candidates.len());
+    let mut by_value = HashMap::new();
+    for (_, value) in &candidates {
+        pattern_ids.push((value.len() <= text.len()).then(|| {
+            *by_value.entry(*value).or_insert_with(|| {
+                patterns.push(*value);
+                patterns.len() - 1
+            })
+        }));
+    }
+    let mut matches = vec![(0, 0, 0); patterns.len()];
+    if !patterns.is_empty() {
+        let matcher = AhoCorasick::new(patterns).unwrap();
+        for found in matcher.find_overlapping_iter(text) {
+            let matched = &mut matches[found.pattern().as_usize()];
+            if matched.2 < 2 && found.start() >= matched.1 {
+                *matched = (found.start(), found.end(), matched.2 + 1);
+            }
         }
     }
     let mut claims = Vec::new();
-    for ((label, value), (start, _, count)) in candidates.into_iter().zip(matches) {
+    for ((label, value), pattern) in candidates.into_iter().zip(pattern_ids) {
+        let (start, _, count) = pattern.map(|index| matches[index]).unwrap_or_default();
+        if count != 1 {
+            continue;
+        }
         let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
-        if count != 1
-            || PRINTED
-                .get_or_init(|| Regex::new(r"^([^\s.)]+)[.)]?$").unwrap())
-                .is_match(text[line_start..start].trim())
+        if PRINTED
+            .get_or_init(|| Regex::new(r"^([^\s.)]+)[.)]?$").unwrap())
+            .is_match(text[line_start..start].trim())
         {
             continue;
         }
@@ -483,6 +499,21 @@ mod tests {
 
     fn source_doc(input: A2ajInput) -> SourceDoc {
         crate::project_document_structure(a2aj_document_structure(input).unwrap())
+    }
+
+    #[test]
+    fn duplicate_provider_bodies_keep_per_label_matches() {
+        let map = vec![
+            ("1".to_owned(), "Shared body.".to_owned()),
+            ("2".to_owned(), "Shared body.".to_owned()),
+            ("3".to_owned(), "Shared body. Too long.".to_owned()),
+        ];
+        let labels = provider_claims(&ScalarText::new("Shared body."), &map)
+            .into_iter()
+            .filter_map(|claim| claim.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["sec1", "sec2"]);
+        assert!(provider_claims(&ScalarText::new("Shared body.\nShared body."), &map).is_empty());
     }
 
     #[test]
