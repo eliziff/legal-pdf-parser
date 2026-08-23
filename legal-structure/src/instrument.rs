@@ -23,31 +23,32 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "structure-inference")]
 fn split_instrument_space_runs(text: &str) -> String {
-    let characters = text.chars().collect::<Vec<_>>();
     let mut recovered = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < characters.len() {
-        if matches!(characters[index], ' ' | '\t') {
-            let start = index;
-            while index < characters.len() && matches!(characters[index], ' ' | '\t') {
-                index += 1;
-            }
-            let internal_run = index - start >= 2
-                && start > 0
-                && index < characters.len()
-                && !javascript_whitespace(characters[start - 1])
-                && !javascript_whitespace(characters[index]);
-            for (offset, character) in characters[start..index].iter().enumerate() {
-                recovered.push(if internal_run && offset == 0 {
-                    '\n'
-                } else {
-                    *character
-                });
-            }
+    let mut characters = text.char_indices().peekable();
+    while let Some((start, character)) = characters.next() {
+        if !matches!(character, ' ' | '\t') {
+            recovered.push(character);
             continue;
         }
-        recovered.push(characters[index]);
-        index += 1;
+        let mut count = 1;
+        while characters
+            .next_if(|(_, character)| matches!(character, ' ' | '\t'))
+            .is_some()
+        {
+            count += 1;
+        }
+        let end = characters.peek().map_or(text.len(), |(byte, _)| *byte);
+        let internal_run = count >= 2
+            && start > 0
+            && end < text.len()
+            && !javascript_whitespace(text[..start].chars().next_back().unwrap())
+            && !javascript_whitespace(text[end..].chars().next().unwrap());
+        if internal_run {
+            recovered.push('\n');
+            recovered.push_str(&text[start + 1..end]);
+        } else {
+            recovered.push_str(&text[start..end]);
+        }
     }
     recovered
 }
@@ -61,20 +62,16 @@ fn split_instrument_sentence_joins(text: &str) -> String {
         )
         .expect("valid instrument sentence-join grammar")
     });
-    let positions = text.char_indices().collect::<Vec<_>>();
-    let characters = positions
-        .iter()
-        .map(|(_, character)| *character)
-        .collect::<Vec<_>>();
     let mut recovered = String::with_capacity(text.len());
-    for (index, (byte, character)) in positions.iter().copied().enumerate() {
-        let preceded_by_terminator = index > 0
-            && (matches!(characters[index - 1], '.' | ';' | ':')
+    let mut previous = None;
+    let mut previous_previous = None;
+    for (byte, character) in text.char_indices() {
+        let preceded_by_terminator = previous.is_some()
+            && (matches!(previous, Some('.' | ';' | ':'))
                 || (matches!(
-                    characters[index - 1],
-                    ')' | ']' | '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}'
-                ) && index > 1
-                    && matches!(characters[index - 2], '.' | ';' | ':')));
+                    previous,
+                    Some(')' | ']' | '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}')
+                ) && matches!(previous_previous, Some('.' | ';' | ':'))));
         let after = byte + character.len_utf8();
         if matches!(character, ' ' | '\t')
             && preceded_by_terminator
@@ -84,6 +81,8 @@ fn split_instrument_sentence_joins(text: &str) -> String {
         } else {
             recovered.push(character);
         }
+        previous_previous = previous;
+        previous = Some(character);
     }
     recovered
 }
@@ -1721,6 +1720,15 @@ pub fn derive_instrument_structure(
         &text, &structure, references,
     )?);
     let depths = node_depths(&structure.nodes);
+    let mut sections = structure
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NodeKind::Section)
+        .collect::<Vec<_>>();
+    sections.sort_by_key(|(index, node)| (node.range.start, *index));
+    let mut next_section = 0;
+    let mut active_sections = Vec::new();
     let paragraphs = text
         .lines()
         .iter()
@@ -1730,16 +1738,17 @@ pub fn derive_instrument_structure(
                 start: text.utf16_at_byte(*start).unwrap(),
                 end: text.utf16_at_byte(*end).unwrap(),
             };
-            let node_id = structure
-                .nodes
+            while next_section < sections.len()
+                && sections[next_section].1.range.start <= range.start
+            {
+                active_sections.push(sections[next_section]);
+                next_section += 1;
+            }
+            active_sections.retain(|(_, node)| range.start < node.range.end);
+            let node_id = active_sections
                 .iter()
-                .filter(|node| {
-                    node.kind == NodeKind::Section
-                        && node.range.start <= range.start
-                        && range.start < node.range.end
-                })
-                .max_by_key(|node| depths[node.id.as_str()])
-                .map(|node| node.id.clone());
+                .max_by_key(|(index, node)| (depths[node.id.as_str()], *index))
+                .map(|(_, node)| node.id.clone());
             DefinitionParagraph {
                 range,
                 node_id,

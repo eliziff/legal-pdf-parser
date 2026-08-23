@@ -1,7 +1,6 @@
 use crate::{public_structure_label, DocumentStructure, NodeKind};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const MAX_MISSING: usize = 64;
@@ -98,9 +97,6 @@ pub enum SourceDocOrigin {
 pub(crate) enum BlockFieldOrder {
     #[default]
     Projected,
-    Native,
-    AliasesBeforeOrigin,
-    AliasesAnchorBeforeOrigin,
     EndLast,
 }
 
@@ -141,37 +137,6 @@ impl SourceDocBlock {
         }
     }
 
-    pub(crate) fn with_field_order(mut self, field_order: BlockFieldOrder) -> Self {
-        self.field_order = field_order;
-        self
-    }
-
-    pub fn preserve_field_order(&mut self, fields: &[String]) {
-        let position = |name: &str| fields.iter().position(|field| field == name);
-        self.field_order = match (
-            position("end"),
-            position("origin"),
-            position("aliases"),
-            position("anchor"),
-        ) {
-            (Some(_), Some(origin), Some(aliases), Some(anchor))
-                if anchor < aliases && aliases < origin =>
-            {
-                BlockFieldOrder::Native
-            }
-            (Some(_), Some(origin), Some(aliases), Some(anchor))
-                if aliases < anchor && anchor < origin =>
-            {
-                BlockFieldOrder::AliasesAnchorBeforeOrigin
-            }
-            (Some(end), Some(origin), Some(aliases), _) if aliases < origin && end < aliases => {
-                BlockFieldOrder::AliasesBeforeOrigin
-            }
-            (Some(end), Some(origin), _, _) if origin < end => BlockFieldOrder::EndLast,
-            _ => BlockFieldOrder::Projected,
-        };
-    }
-
     fn fields(&self) -> usize {
         5 + usize::from(self.anchor.is_some())
             + usize::from(!self.aliases.is_empty())
@@ -195,36 +160,6 @@ impl Serialize for SourceDocBlock {
                 if let Some(anchor) = &self.anchor {
                     row.serialize_field("anchor", anchor)?;
                 }
-            }
-            BlockFieldOrder::Native => {
-                row.serialize_field("end", &self.end)?;
-                if let Some(anchor) = &self.anchor {
-                    row.serialize_field("anchor", anchor)?;
-                }
-                if !self.aliases.is_empty() {
-                    row.serialize_field("aliases", &self.aliases)?;
-                }
-                row.serialize_field("origin", &self.origin)?;
-            }
-            BlockFieldOrder::AliasesBeforeOrigin => {
-                row.serialize_field("end", &self.end)?;
-                if !self.aliases.is_empty() {
-                    row.serialize_field("aliases", &self.aliases)?;
-                }
-                row.serialize_field("origin", &self.origin)?;
-                if let Some(anchor) = &self.anchor {
-                    row.serialize_field("anchor", anchor)?;
-                }
-            }
-            BlockFieldOrder::AliasesAnchorBeforeOrigin => {
-                row.serialize_field("end", &self.end)?;
-                if !self.aliases.is_empty() {
-                    row.serialize_field("aliases", &self.aliases)?;
-                }
-                if let Some(anchor) = &self.anchor {
-                    row.serialize_field("anchor", anchor)?;
-                }
-                row.serialize_field("origin", &self.origin)?;
             }
             BlockFieldOrder::EndLast => {
                 if let Some(anchor) = &self.anchor {
@@ -314,47 +249,6 @@ pub struct SourceDoc {
     pub blocks: Vec<SourceDocBlock>,
     pub index: SourceDocIndex,
     pub ranges: SourceDocRanges,
-}
-
-#[derive(Serialize)]
-struct StoredSourceDoc<'a> {
-    provider: Option<SourceDocProvider>,
-    id: &'a str,
-    url: &'a Option<String>,
-    revision: &'a str,
-    #[serde(rename = "docType")]
-    doc_type: Option<SourceDocType>,
-    status: &'a SourceDocStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-    blocks: &'a [SourceDocBlock],
-    index: &'a SourceDocIndex,
-    ranges: &'a SourceDocRanges,
-}
-
-impl SourceDoc {
-    fn stored(&self, include_text: bool) -> StoredSourceDoc<'_> {
-        StoredSourceDoc {
-            provider: self.provider,
-            id: &self.id,
-            url: &self.url,
-            revision: &self.revision,
-            doc_type: self.doc_type,
-            status: &self.status,
-            text: include_text.then_some(&self.text),
-            blocks: &self.blocks,
-            index: &self.index,
-            ranges: &self.ranges,
-        }
-    }
-
-    pub fn json_value(&self, include_text: bool) -> serde_json::Result<serde_json::Value> {
-        serde_json::to_value(self.stored(include_text))
-    }
-
-    pub fn json_bytes(&self, include_text: bool) -> serde_json::Result<Vec<u8>> {
-        serde_json::to_vec(&self.stored(include_text))
-    }
 }
 
 fn number(kind: SourceDocKind, label: &str) -> Option<usize> {
@@ -469,42 +363,6 @@ fn range(kind: SourceDocKind, all: &[SourceDocBlock]) -> SourceDocRange {
         last: Some(highest.0.clone()),
         missing,
         missing_truncated,
-    }
-}
-
-pub fn create_source_doc(
-    provider: Option<SourceDocProvider>,
-    id: String,
-    url: Option<String>,
-    doc_type: Option<SourceDocType>,
-    text: String,
-    blocks: Vec<SourceDocBlock>,
-) -> SourceDoc {
-    let revision = format!("{:x}", Sha256::digest(text.as_bytes()));
-    create_source_doc_with_revision(provider, id, url, doc_type, text, revision, blocks)
-}
-
-fn create_source_doc_with_revision(
-    provider: Option<SourceDocProvider>,
-    id: String,
-    url: Option<String>,
-    doc_type: Option<SourceDocType>,
-    text: String,
-    revision: String,
-    blocks: Vec<SourceDocBlock>,
-) -> SourceDoc {
-    let (status, index, ranges) = source_doc_navigation(&blocks);
-    SourceDoc {
-        provider,
-        id,
-        url,
-        revision,
-        doc_type,
-        status,
-        text,
-        blocks,
-        index,
-        ranges,
     }
 }
 
@@ -690,64 +548,5 @@ fn project_graph_with_text(
         blocks,
         index,
         ranges,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_doc_bytes_and_lookup_match_the_javascript_contract() {
-        let text = "1 First\n3 Third".to_owned();
-        let blocks = vec![
-            SourceDocBlock::new(
-                SourceDocKind::Section,
-                "sec1",
-                0,
-                7,
-                SourceDocOrigin::Native,
-            ),
-            SourceDocBlock::new(
-                SourceDocKind::Section,
-                "sec3",
-                8,
-                15,
-                SourceDocOrigin::Heuristic,
-            ),
-        ];
-        let doc = create_source_doc(
-            Some(SourceDocProvider::A2aj),
-            "fixture".into(),
-            None,
-            Some(SourceDocType::Laws),
-            text,
-            blocks,
-        );
-        assert_eq!(doc.index.get("SEC1"), Some(0));
-        assert_eq!(
-            serde_json::to_string(&doc).unwrap(),
-            concat!(
-                r#"{"provider":"a2aj","id":"fixture","url":null,"revision":"4963dc1b70ed75305b19feedabe3e6e7a8f5fcd639a2dedf2905dcc44e7fb54b","docType":"laws","status":"usable","text":"1 First\n3 Third","blocks":[{"kind":"section","label":"sec1","start":0,"end":7,"origin":"native"},{"kind":"section","label":"sec3","start":8,"end":15,"origin":"heuristic"}],"index":{},"ranges":{"paragraph":{"kind":"paragraph","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false},"page":{"kind":"page","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false},"section":{"kind":"section","count":2,"first":"sec1","last":"sec3","missing":["sec2"],"missingTruncated":false},"footnote":{"kind":"footnote","count":0,"first":null,"last":null,"missing":[],"missingTruncated":false}}}"#
-            )
-        );
-    }
-
-    #[test]
-    fn native_claim_scalars_project_onto_final_text_utf16_offsets() {
-        let claim = NativeClaim {
-            id: "native".to_owned(),
-            kind: EvidenceKind::Section,
-            label: Some("sec\u{6587}".to_owned()),
-            aliases: Vec::new(),
-            range: crate::ScalarRange { start: 1, end: 3 },
-            origin_id: "provider".to_owned(),
-            parent_label: None,
-            anchor: None,
-        };
-        let blocks = native_blocks("\u{1f9ab}e\u{301}", &[claim], HashMap::new());
-        let block = blocks.get("native").expect("projected native block");
-        assert_eq!((block.start, block.end), (2, 4));
-        assert_eq!(block.label, "sec\u{6587}");
     }
 }

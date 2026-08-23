@@ -1,8 +1,7 @@
-use crate::source_doc::BlockFieldOrder;
 use crate::{
     Coverage, CoverageState, DetectionProfile, DocumentInput, DocumentStructure, EngineError,
-    EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope, SourceDoc,
-    SourceDocKind, EVIDENCE_SCHEMA,
+    EvidenceKind, NativeClaim, Origin, ParagraphBreak, ScalarRange, ScalarText, Scope,
+    EVIDENCE_SCHEMA,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -246,16 +245,6 @@ pub fn journal_text_document_structure(
     structure(article_id, url, clean, claims)
 }
 
-pub fn journal_text_source_doc(
-    article_id: usize,
-    url: Option<String>,
-    text: String,
-    page_labels: &[JournalPageLabel],
-) -> Result<SourceDoc, EngineError> {
-    journal_text_document_structure(article_id, url, text, page_labels)
-        .map(crate::project_document_structure)
-}
-
 pub fn journal_document_structure(
     article_id: usize,
     url: Option<String>,
@@ -448,38 +437,33 @@ pub fn journal_document_structure(
     structure(article_id, url, text, claims)
 }
 
-pub fn journal_source_doc(
-    article_id: usize,
-    url: Option<String>,
-    reader: impl BufRead,
-    page_labels: &[JournalPageLabel],
-) -> Result<SourceDoc, EngineError> {
-    let mut document = crate::project_document_structure(journal_document_structure(
-        article_id,
-        url,
-        reader,
-        page_labels,
-    )?);
-    for block in &mut document.blocks {
-        let order = match block.kind {
-            SourceDocKind::Page => BlockFieldOrder::Native,
-            SourceDocKind::Section => BlockFieldOrder::AliasesBeforeOrigin,
-            SourceDocKind::Footnote => BlockFieldOrder::AliasesAnchorBeforeOrigin,
-            SourceDocKind::Paragraph => BlockFieldOrder::Projected,
-            SourceDocKind::Table | SourceDocKind::Row | SourceDocKind::Cell => {
-                BlockFieldOrder::Projected
-            }
-        };
-        *block = block.clone().with_field_order(order);
-    }
-    Ok(document)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SourceDocOrigin;
+    use crate::{SourceDoc, SourceDocKind, SourceDocOrigin};
     use std::io::Cursor;
+
+    fn project_json(
+        article_id: usize,
+        url: Option<String>,
+        reader: impl BufRead,
+        page_labels: &[JournalPageLabel],
+    ) -> SourceDoc {
+        crate::project_document_structure(
+            journal_document_structure(article_id, url, reader, page_labels).unwrap(),
+        )
+    }
+
+    fn project_text(
+        article_id: usize,
+        url: Option<String>,
+        text: String,
+        page_labels: &[JournalPageLabel],
+    ) -> SourceDoc {
+        crate::project_document_structure(
+            journal_text_document_structure(article_id, url, text, page_labels).unwrap(),
+        )
+    }
 
     #[test]
     fn authoritative_pages_preserve_every_native_region() {
@@ -487,7 +471,7 @@ mod tests {
             r#"{"article_id":"1","text":"TITLE\nBody\n7\n1 Note","pdf_page":1,"regions":[{"order":0,"type":"paragraph_title","text":"TITLE"},{"order":1,"type":"text","lines":[{"text":"Body"}]},{"order":2,"type":"number","text":"7"},{"order":3,"type":"footnote","text":"1 Note","lines":[{"codex_text_order":7}]}],"annotations":[{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_ref"},{"pair_id":"p","pair_status":"paired","taxonomy_name":"fn_label","note_id":"1","start_line_order":7}]}"#,
             "\n",
         );
-        let doc = journal_source_doc(
+        let doc = project_json(
             1,
             None,
             Cursor::new(pages),
@@ -495,8 +479,7 @@ mod tests {
                 label: "7".into(),
                 pdf_page: 1,
             }],
-        )
-        .unwrap();
+        );
         assert_eq!(doc.text, "TITLE\nBody\n7\n1 Note");
         assert_eq!(
             doc.blocks
@@ -514,7 +497,7 @@ mod tests {
     #[test]
     fn plain_text_uses_only_page_markers() {
         let text = "[page 9]\nFirst page.\n\n[page x]\nSecond page.";
-        let doc = journal_text_source_doc(
+        let doc = project_text(
             3,
             Some("https://example.test/article".into()),
             text.into(),
@@ -528,8 +511,7 @@ mod tests {
                     pdf_page: 5,
                 },
             ],
-        )
-        .unwrap();
+        );
         assert_eq!(doc.url.as_deref(), Some("https://example.test/article"));
         assert_eq!(doc.text, "First page.\n\nSecond page.");
         assert_eq!(
@@ -568,7 +550,7 @@ mod tests {
 
     #[test]
     fn plain_text_page_offsets_use_clean_text_utf16_coordinates() {
-        let doc = journal_text_source_doc(
+        let doc = project_text(
             4,
             None,
             "[page 1]\r\n\u{1f9ab}e\u{301}\r\n[page 2]\nZ".to_owned(),
@@ -582,8 +564,7 @@ mod tests {
                     pdf_page: 2,
                 },
             ],
-        )
-        .unwrap();
+        );
         assert_eq!(doc.text, "\u{1f9ab}e\u{301}\r\nZ");
         assert_eq!(
             doc.blocks
@@ -600,7 +581,7 @@ mod tests {
             r#"{"article_id":"5","text":"\ud83e\uddab\nBody","pdf_page":1,"regions":[{"order":0,"type":"text","text":"Body"}]}"#,
             "\n",
         );
-        let doc = journal_source_doc(
+        let doc = project_json(
             5,
             None,
             Cursor::new(pages),
@@ -608,8 +589,7 @@ mod tests {
                 label: "1".to_owned(),
                 pdf_page: 1,
             }],
-        )
-        .unwrap();
+        );
         let paragraph = doc
             .blocks
             .iter()

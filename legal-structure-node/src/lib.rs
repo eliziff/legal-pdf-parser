@@ -143,11 +143,7 @@ fn analyze_request(request: serde_json::Value) -> napi::Result<serde_json::Value
             source_doc,
         ),
     };
-    let source_doc = source_doc.then(|| {
-        let mut document = project_document_structure_view(&structure);
-        document.text.clear();
-        document
-    });
+    let source_doc = source_doc.then(|| project_document_structure_view(&structure));
     serde_json::to_value(StructureResponse {
         structure,
         source_doc,
@@ -174,9 +170,7 @@ impl Task for DeriveDocumentTask {
 }
 
 #[napi(js_name = "deriveDocumentStructure")]
-pub fn derive_document_structure_node(
-    request: serde_json::Value,
-) -> AsyncTask<DeriveDocumentTask> {
+pub fn derive_document_structure_node(request: serde_json::Value) -> AsyncTask<DeriveDocumentTask> {
     AsyncTask::new(DeriveDocumentTask { request })
 }
 
@@ -190,7 +184,9 @@ impl Task for DerivePdfDocumentTask {
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
         if self.request.get("kind").and_then(serde_json::Value::as_str) != Some("pdf") {
-            return Err(Error::from_reason("PDF document request has an invalid kind"));
+            return Err(Error::from_reason(
+                "PDF document request has an invalid kind",
+            ));
         }
         let source_doc = self
             .request
@@ -212,9 +208,7 @@ impl Task for DerivePdfDocumentTask {
 }
 
 #[napi(js_name = "derivePdfDocument")]
-pub fn derive_pdf_document_node(
-    request: serde_json::Value,
-) -> AsyncTask<DerivePdfDocumentTask> {
+pub fn derive_pdf_document_node(request: serde_json::Value) -> AsyncTask<DerivePdfDocumentTask> {
     AsyncTask::new(DerivePdfDocumentTask { request })
 }
 

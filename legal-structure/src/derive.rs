@@ -16,6 +16,17 @@ fn native_kind(kind: EvidenceKind) -> NodeKind {
     }
 }
 fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStructure {
+    let native_labels = evidence
+        .native_claims
+        .iter()
+        .flat_map(|claim| {
+            claim
+                .label
+                .iter()
+                .chain(&claim.aliases)
+                .map(|label| (claim.kind, label.to_ascii_lowercase()))
+        })
+        .collect::<HashSet<_>>();
     let mut nodes = evidence
         .native_claims
         .iter()
@@ -44,18 +55,8 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
             }) {
                 return None;
             }
-            (!evidence.native_claims.iter().any(|claim| {
-                claim.kind == block.kind.evidence()
-                    && block.label.as_deref().is_some_and(|candidate| {
-                        claim
-                            .label
-                            .as_deref()
-                            .is_some_and(|value| value.eq_ignore_ascii_case(candidate))
-                            || claim
-                                .aliases
-                                .iter()
-                                .any(|value| value.eq_ignore_ascii_case(candidate))
-                    })
+            (!block.label.as_ref().is_some_and(|label| {
+                native_labels.contains(&(block.kind.evidence(), label.to_ascii_lowercase()))
             }))
             .then_some(block)
         })
@@ -132,7 +133,7 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
     let document_id = std::mem::take(&mut evidence.document_id);
     let provider = std::mem::take(&mut evidence.provider);
     let profile = evidence.profile;
-    let revision = evidence.text_sha256.clone();
+    let text_sha256 = std::mem::take(&mut evidence.text_sha256);
     #[cfg(feature = "source-doc")]
     let url = evidence.url.take();
     #[cfg(feature = "source-doc")]
@@ -144,6 +145,7 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
     let mut structure = DocumentStructure::from_scalar_parts(
         document_id,
         text,
+        text_sha256,
         source_sha256,
         scope,
         origins,
@@ -153,7 +155,6 @@ fn infer_graph(mut evidence: DocumentInput, inferred: Vec<Block>) -> DocumentStr
     );
     structure.provider = provider;
     structure.profile = Some(profile);
-    structure.revision = revision;
     #[cfg(feature = "source-doc")]
     {
         structure.url = url;
@@ -202,7 +203,6 @@ fn projection(profile: Option<DetectionProfile>) -> (ProjectionOrder, Option<Sou
 #[cfg(feature = "source-doc")]
 fn compose_with(
     input: DocumentInput,
-    inference_enabled: bool,
     validate: bool,
     precomputed: Option<Vec<Block>>,
 ) -> Result<DocumentStructure, EngineError> {
@@ -211,7 +211,7 @@ fn compose_with(
     }
     #[cfg(feature = "structure-inference")]
     let inferred = precomputed.unwrap_or_else(|| {
-        if inference_enabled && input.needs_inference() {
+        if input.needs_inference() {
             let text = ScalarText::new(&input.text);
             inference::inferred_blocks(&input, &text)
         } else {
@@ -224,17 +224,6 @@ fn compose_with(
         Vec::new()
     };
     Ok(infer_graph(input, inferred))
-}
-
-#[cfg(feature = "source-doc")]
-fn project_with(
-    input: DocumentInput,
-    inference_enabled: bool,
-    validate: bool,
-    precomputed: Option<Vec<Block>>,
-) -> Result<SourceDoc, EngineError> {
-    let structure = compose_with(input, inference_enabled, validate, precomputed)?;
-    Ok(project_document_structure(structure))
 }
 
 #[cfg(feature = "source-doc")]
@@ -251,22 +240,12 @@ pub fn project_document_structure_view(structure: &DocumentStructure) -> SourceD
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub fn derive_document_structure(input: DocumentInput) -> Result<DocumentStructure, EngineError> {
-    compose_with(input, true, true, None)
-}
-
-#[cfg(feature = "source-doc")]
-pub fn compose_native(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    project_with(input, false, true, None)
-}
-
-#[cfg(all(feature = "structure-inference", feature = "source-doc"))]
-pub fn compose(input: DocumentInput) -> Result<SourceDoc, EngineError> {
-    project_with(input, true, true, None)
+    compose_with(input, true, None)
 }
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
 pub(crate) fn derive_trusted(input: DocumentInput) -> Result<DocumentStructure, EngineError> {
-    compose_with(input, true, false, None)
+    compose_with(input, false, None)
 }
 
 #[cfg(all(feature = "structure-inference", feature = "source-doc"))]
@@ -274,5 +253,5 @@ pub(super) fn derive_trusted_inferred(
     input: DocumentInput,
     inferred: Vec<Block>,
 ) -> Result<DocumentStructure, EngineError> {
-    compose_with(input, true, false, Some(inferred))
+    compose_with(input, false, Some(inferred))
 }
