@@ -5,7 +5,7 @@ pub enum Error {
     #[error("{0}")]
     Message(String),
     #[error("PDF extraction failed: {0}")]
-    Pdf(#[from] pdf_inspector_loader::PdfError),
+    Pdf(#[from] pdf_inspector::PdfError),
     #[error("PDF parsing failed: {0}")]
     Lopdf(#[from] lopdf::Error),
 }

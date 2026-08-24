@@ -2,8 +2,8 @@ use crate::{Error, Result};
 use legal_pdf_core::model::{Diagnostic, ImageBlock, Line, Page, Span, TableBlock, Word};
 use legal_pdf_core::{profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
 use lopdf::{Document, Object, ObjectId};
-use pdf_inspector_core::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
-use pdf_inspector_detector::PdfTypeResult;
+use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
+use pdf_inspector::{PdfType, PdfTypeResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1193,7 +1193,7 @@ fn shares_source_line(line: &TextLine, item: &TextItem) -> bool {
     if (item_baseline(prior) - item_baseline(item)).abs() > line_em * BASE_MAX_DIST {
         return false;
     }
-    let rtl = pdf_inspector_core::text_utils::is_rtl_text(
+    let rtl = pdf_inspector::text_utils::is_rtl_text(
         line.items
             .iter()
             .map(|value| value.text.as_str())
@@ -1328,12 +1328,12 @@ fn text_quality(lines: &[Line]) -> f64 {
         / 10_000.0
 }
 
-fn pdf_type_name(value: pdf_inspector_detector::PdfType) -> &'static str {
+fn pdf_type_name(value: PdfType) -> &'static str {
     match value {
-        pdf_inspector_detector::PdfType::TextBased => "TextBased",
-        pdf_inspector_detector::PdfType::Scanned => "Scanned",
-        pdf_inspector_detector::PdfType::ImageBased => "ImageBased",
-        pdf_inspector_detector::PdfType::Mixed => "Mixed",
+        PdfType::TextBased => "TextBased",
+        PdfType::Scanned => "Scanned",
+        PdfType::ImageBased => "ImageBased",
+        PdfType::Mixed => "Mixed",
     }
 }
 
@@ -1427,7 +1427,7 @@ pub struct ExtractedPdf {
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
     if let Some(mut document) = Document::load_mem(bytes)
         .ok()
-        .filter(|document| !document.is_encrypted())
+        .filter(|document| !document.is_encrypted() && !document.get_pages().is_empty())
     {
         document
             .objects
@@ -1435,7 +1435,7 @@ pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
             .for_each(prune_extraction_object);
         return Ok(document);
     }
-    pdf_inspector_loader::load_document_from_mem(bytes)
+    pdf_inspector::load_document_from_mem(bytes)
         .map(|value| value.0)
         .map_err(Into::into)
 }
@@ -1714,6 +1714,7 @@ mod tests {
             height: size,
             font_size: size,
             font: String::new(),
+            font_tag: String::new(),
             page: 1,
             is_bold: false,
             is_italic: false,
@@ -1736,7 +1737,7 @@ mod tests {
 
     fn fidelity_item(text: &str, glyphs: &[(&str, f32, f32)]) -> TextItem {
         let mut item = text_item(text, 10.0, 80.0, 75.0, 10.0);
-        item.fidelity = Some(Box::new(pdf_inspector_core::types::FidelityTextInfo {
+        item.fidelity = Some(Box::new(pdf_inspector::types::FidelityTextInfo {
             text: text.to_owned(),
             font: "Test".to_owned(),
             resource: "F1".to_owned(),
