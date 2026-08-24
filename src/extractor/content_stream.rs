@@ -214,6 +214,27 @@ fn fidelity_info(
     }))
 }
 
+fn positioned_fidelity_glyphs(
+    glyphs: Vec<(String, f32)>,
+    horizontal_scaling: f32,
+) -> Vec<FidelityGlyph> {
+    let mut cursor = 0.0;
+    glyphs
+        .into_iter()
+        .map(|(text, advance)| {
+            let advance = advance * horizontal_scaling;
+            let glyph = FidelityGlyph {
+                text,
+                x0: cursor,
+                x1: cursor + advance,
+                bbox: [0.0; 4],
+            };
+            cursor += advance;
+            glyph
+        })
+        .collect()
+}
+
 pub(super) fn append_tj_text(current: &mut String, pending_space: &mut bool, text: &str) {
     let Some(first) = text.chars().next() else {
         return;
@@ -938,9 +959,8 @@ fn extract_page_text_items_impl(
                         }
                         continue;
                     }
-                    let mut glyph_cursor = 0.0f32;
-                    let fidelity_glyphs: Vec<_> = if fidelity {
-                        extract_fidelity_glyphs(
+                    let (decoded_text, fidelity_glyphs): (Option<String>, Vec<_>) = if fidelity {
+                        let (text, glyphs) = extract_fidelity_glyphs(
                             &op.operands[0],
                             &current_font,
                             font_base_names.get(&current_font).map(String::as_str),
@@ -954,22 +974,10 @@ fn extract_page_text_items_impl(
                             current_font_size,
                             char_spacing,
                             word_spacing,
-                        )
-                        .into_iter()
-                        .map(|(text, advance)| {
-                            let advance = advance * horizontal_scaling;
-                            let glyph = FidelityGlyph {
-                                text,
-                                x0: glyph_cursor,
-                                x1: glyph_cursor + advance,
-                                bbox: [0.0; 4],
-                            };
-                            glyph_cursor += advance;
-                            glyph
-                        })
-                        .collect()
+                        );
+                        (text, positioned_fidelity_glyphs(glyphs, horizontal_scaling))
                     } else {
-                        Vec::new()
+                        (None, Vec::new())
                     };
                     let fidelity_text = (!fidelity_glyphs.is_empty()).then(|| {
                         fidelity_glyphs
@@ -977,7 +985,7 @@ fn extract_page_text_items_impl(
                             .map(|glyph| glyph.text.as_str())
                             .collect()
                     });
-                    if let Some(text) = extract_text_from_operand(
+                    if let Some(text) = decoded_text.or_else(|| extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -988,7 +996,7 @@ fn extract_page_text_items_impl(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
-                    ) {
+                    )) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
@@ -1220,8 +1228,9 @@ fn extract_page_text_items_impl(
                                 }
                             }
                             if !is_invisible {
+                                let mut decoded_text = None;
                                 if fidelity {
-                                    let glyphs = extract_fidelity_glyphs(
+                                    let (text, glyphs) = extract_fidelity_glyphs(
                                         element,
                                         &current_font,
                                         font_base_names.get(&current_font).map(String::as_str),
@@ -1236,6 +1245,7 @@ fn extract_page_text_items_impl(
                                         char_spacing,
                                         word_spacing,
                                     );
+                                    decoded_text = text;
                                     if !glyphs.is_empty() {
                                         if pending_space
                                             && !current_fidelity_text.ends_with(char::is_whitespace)
@@ -1277,7 +1287,7 @@ fn extract_page_text_items_impl(
                                         current_fidelity_text.push_str(&text);
                                     }
                                 }
-                                if let Some(text) = extract_text_from_operand(
+                                if let Some(text) = decoded_text.or_else(|| extract_text_from_operand(
                                     element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -1288,7 +1298,7 @@ fn extract_page_text_items_impl(
                                     &encoding_cache,
                                     &mut cmap_decisions,
                                     &font_widths,
-                                ) {
+                                )) {
                                     append_tj_text(&mut current_text, &mut pending_space, &text);
                                 }
                             }
@@ -1456,9 +1466,8 @@ fn extract_page_text_items_impl(
                     || suppress_glyph_extraction
                     || shown.is_none())
                 {
-                    let mut glyph_cursor = 0.0f32;
-                    let fidelity_glyphs: Vec<_> = if fidelity {
-                        extract_fidelity_glyphs(
+                    let (decoded_text, fidelity_glyphs): (Option<String>, Vec<_>) = if fidelity {
+                        let (text, glyphs) = extract_fidelity_glyphs(
                             shown.expect("show operand exists"),
                             &current_font,
                             font_base_names.get(&current_font).map(String::as_str),
@@ -1472,22 +1481,10 @@ fn extract_page_text_items_impl(
                             current_font_size,
                             char_spacing,
                             word_spacing,
-                        )
-                        .into_iter()
-                        .map(|(text, advance)| {
-                            let advance = advance * horizontal_scaling;
-                            let glyph = FidelityGlyph {
-                                text,
-                                x0: glyph_cursor,
-                                x1: glyph_cursor + advance,
-                                bbox: [0.0; 4],
-                            };
-                            glyph_cursor += advance;
-                            glyph
-                        })
-                        .collect()
+                        );
+                        (text, positioned_fidelity_glyphs(glyphs, horizontal_scaling))
                     } else {
-                        Vec::new()
+                        (None, Vec::new())
                     };
                     let fidelity_text = fidelity.then(|| {
                         if fidelity_glyphs.is_empty() {
@@ -1512,7 +1509,7 @@ fn extract_page_text_items_impl(
                             )
                         }
                     });
-                    if let Some(text) = extract_text_from_operand(
+                    if let Some(text) = decoded_text.or_else(|| extract_text_from_operand(
                         shown.expect("show operand exists"),
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -1523,7 +1520,7 @@ fn extract_page_text_items_impl(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
-                    ) {
+                    )) {
                         if fidelity || !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);

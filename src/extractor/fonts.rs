@@ -717,9 +717,9 @@ pub(crate) fn extract_fidelity_glyphs(
     font_size: f32,
     char_spacing: f32,
     word_spacing: f32,
-) -> Vec<(String, f32)> {
+) -> (Option<String>, Vec<(String, f32)>) {
     let Some(bytes) = get_operand_bytes(obj) else {
-        return Vec::new();
+        return (None, Vec::new());
     };
     let code_len = inline_cmaps
         .get(current_font)
@@ -742,9 +742,9 @@ pub(crate) fn extract_fidelity_glyphs(
         })
         .max(1);
     let Some(widths) = font_widths.get(current_font) else {
-        return Vec::new();
+        return (None, Vec::new());
     };
-    bytes
+    let glyphs: Vec<_> = bytes
         .chunks(code_len)
         .filter_map(|code| {
             let operand = Object::String(code.to_vec(), lopdf::StringFormat::Hexadecimal);
@@ -764,7 +764,20 @@ pub(crate) fn extract_fidelity_glyphs(
                 compute_string_width_ts(code, widths, font_size, char_spacing, word_spacing);
             Some((text, advance))
         })
-        .collect()
+        .collect();
+    let has_remapped_cmap = inline_cmaps
+        .get(current_font)
+        .or_else(|| {
+            font_tounicode_refs
+                .get(current_font)
+                .and_then(|id| font_cmaps.get_by_obj(*id))
+        })
+        .is_some_and(|entry| entry.remapped.is_some());
+    let text = (!glyphs.is_empty() && !has_remapped_cmap).then(|| {
+        let text = glyphs.iter().map(|(text, _)| text.as_str()).collect();
+        presentation_text_from_fidelity(text, base_font_name, widths.is_cid)
+    });
+    (text, glyphs)
 }
 
 /// Extract raw bytes from a PDF operand (String object)
@@ -1748,6 +1761,17 @@ fn extract_text_from_operand_impl(
         };
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
+}
+
+fn presentation_text_from_fidelity(
+    text: String,
+    base_font_name: Option<&str>,
+    is_type0_cid_font: bool,
+) -> String {
+    normalize_cp1252_controls(
+        remap_texcm_math_symbols(clean_symbol_pua(text), base_font_name),
+        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font),
+    )
 }
 
 /// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen

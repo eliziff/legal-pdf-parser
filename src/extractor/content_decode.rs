@@ -20,7 +20,9 @@ pub(crate) fn decode_content_bounded(
     data: &[u8],
     max_operations: usize,
 ) -> Result<Option<Content>, PdfError> {
-    if content_exceeds_operation_limit(data, max_operations) {
+    if data.len() > max_operations.saturating_mul(2)
+        && content_exceeds_operation_limit(data, max_operations)
+    {
         return Ok(None);
     }
     Content::decode(data)
