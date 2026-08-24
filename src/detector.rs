@@ -689,7 +689,7 @@ fn collect_fonts_from_resource_dict(
 fn resolve_font_names_to_ids(
     doc: &Document,
     resources: &lopdf::Dictionary,
-    font_names: &HashSet<Vec<u8>>,
+    font_names: &HashSet<&[u8]>,
     used_font_ids: &mut HashSet<ObjectId>,
 ) {
     let font_obj = match resources.get(b"Font").ok() {
@@ -742,7 +742,7 @@ fn resolve_with_shadowing(
     doc: &Document,
     own_resources: Option<&lopdf::Dictionary>,
     ancestor_resource_ids: &[ObjectId],
-    names: &HashSet<Vec<u8>>,
+    names: &HashSet<&[u8]>,
     used_font_ids: &mut HashSet<ObjectId>,
 ) {
     'name: for name in names {
@@ -792,7 +792,7 @@ pub(crate) fn analyze_page_content_streams<'a>(
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
-    let mut all_unique_chars: HashSet<u8> = HashSet::new();
+    let mut all_unique_chars = [false; 256];
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
     // dictionary, producing the correct underlying font ObjectId.
@@ -809,7 +809,7 @@ pub(crate) fn analyze_page_content_streams<'a>(
 
     for content in contents {
             // Scan for text operators, collecting raw font names
-            let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
+            let mut page_font_names = HashSet::new();
             let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
                 content,
                 &mut all_unique_chars,
@@ -884,7 +884,8 @@ pub(crate) fn analyze_page_content_streams<'a>(
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
-        .filter(|b| b.is_ascii_alphanumeric())
+        .enumerate()
+        .filter(|(byte, present)| **present && (*byte as u8).is_ascii_alphanumeric())
         .count() as u32;
 
     // Vector-outlined text: massive path ops with minimal text ops.
@@ -921,7 +922,7 @@ pub(crate) fn analyze_page_content_streams<'a>(
         has_template_image,
         total_image_area,
         image_count,
-        unique_text_chars: all_unique_chars.len() as u32,
+        unique_text_chars: all_unique_chars.iter().filter(|present| **present).count() as u32,
         unique_alphanum_chars,
         path_op_count: path_ops,
         has_vector_text,
@@ -1307,7 +1308,7 @@ fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
     visited: &mut HashSet<ObjectId>,
-    unique_chars: &mut HashSet<u8>,
+    unique_chars: &mut [bool; 256],
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
 ) -> (u32, u32, u32, u32) {
@@ -1317,8 +1318,8 @@ fn scan_xobjects_in_resources(
     let mut font_changes = 0u32;
 
     let xobjects = match resources.get(b"XObject").ok() {
-        Some(Object::Dictionary(d)) => Some(d.clone()),
-        Some(Object::Reference(r)) => doc.get_dictionary(*r).ok().cloned(),
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Reference(r)) => doc.get_dictionary(*r).ok(),
         _ => None,
     };
 
@@ -1344,7 +1345,7 @@ fn scan_xobjects_in_resources(
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
-                    let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
+                    let mut xobj_font_names = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
                         &content,
                         unique_chars,
@@ -1410,10 +1411,10 @@ fn scan_xobjects_in_resources(
 ///
 /// Returns (text_op_count, image_count, path_op_count, font_change_count).
 /// Unique non-whitespace text characters are collected into `unique_chars`.
-fn scan_content_for_text_operators(
-    content: &[u8],
-    unique_chars: &mut HashSet<u8>,
-    used_font_names: &mut HashSet<Vec<u8>>,
+fn scan_content_for_text_operators<'a>(
+    content: &'a [u8],
+    unique_chars: &mut [bool; 256],
+    used_font_names: &mut HashSet<&'a [u8]>,
 ) -> (u32, u32, u32, u32) {
     let mut text_ops = 0u32;
     let image_count = 0u32;
@@ -1538,7 +1539,7 @@ fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool
 /// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
 /// `floor` is the start of the previous text/font operator (or 0); lookback
 /// must not cross it.
-fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<Vec<u8>> {
+fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<&[u8]> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
     while j > floor && content[j - 1].is_ascii_whitespace() {
@@ -1569,7 +1570,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
     }
     // j-1 is the '/', font name is content[j..name_end]
     if j < name_end {
-        Some(content[j..name_end].to_vec())
+        Some(&content[j..name_end])
     } else {
         None
     }
@@ -1584,7 +1585,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
 fn collect_text_chars_before(
     content: &[u8],
     op_pos: usize,
-    unique_chars: &mut HashSet<u8>,
+    unique_chars: &mut [bool; 256],
     floor: usize,
 ) {
     // Walk backward past whitespace to find the closing delimiter
@@ -1618,7 +1619,7 @@ fn collect_text_chars_before(
         if depth == 0 && k + 1 < j {
             for &ch in &content[k + 1..j] {
                 if !ch.is_ascii_whitespace() {
-                    unique_chars.insert(ch);
+                    unique_chars[ch as usize] = true;
                 }
             }
         }
@@ -1632,25 +1633,7 @@ fn collect_text_chars_before(
             }
         }
         if content[k] == b'<' && k + 1 < j {
-            // Decode hex pairs and collect unique non-whitespace bytes
-            let hex_slice = &content[k + 1..j];
-            let hex_clean: Vec<u8> = hex_slice
-                .iter()
-                .copied()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect();
-            for pair in hex_clean.chunks(2) {
-                if pair.len() == 2 {
-                    let high = hex_val(pair[0]);
-                    let low = hex_val(pair[1]);
-                    if let (Some(h), Some(l)) = (high, low) {
-                        let byte = (h << 4) | l;
-                        if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
-                            unique_chars.insert(byte);
-                        }
-                    }
-                }
-            }
+            collect_hex_chars(&content[k + 1..j], unique_chars);
         }
     } else if closing == b']' {
         // TJ array: scan backward for '[' and collect from all strings inside
@@ -1682,7 +1665,7 @@ fn collect_text_chars_before(
                     // collect bytes from start..m
                     for &ch in &content[start..m] {
                         if !ch.is_ascii_whitespace() {
-                            unique_chars.insert(ch);
+                            unique_chars[ch as usize] = true;
                         }
                     }
                 } else if content[m] == b'<' {
@@ -1691,26 +1674,21 @@ fn collect_text_chars_before(
                     while m < j && content[m] != b'>' {
                         m += 1;
                     }
-                    let hex_slice = &content[hex_start..m];
-                    let hex_clean: Vec<u8> = hex_slice
-                        .iter()
-                        .copied()
-                        .filter(|b| !b.is_ascii_whitespace())
-                        .collect();
-                    for pair in hex_clean.chunks(2) {
-                        if pair.len() == 2 {
-                            let high = hex_val(pair[0]);
-                            let low = hex_val(pair[1]);
-                            if let (Some(h), Some(l)) = (high, low) {
-                                let byte = (h << 4) | l;
-                                if byte != 0 && byte != b' ' && byte != b'\t' && byte != b'\n' {
-                                    unique_chars.insert(byte);
-                                }
-                            }
-                        }
-                    }
+                    collect_hex_chars(&content[hex_start..m], unique_chars);
                 }
                 m += 1;
+            }
+        }
+    }
+}
+
+fn collect_hex_chars(bytes: &[u8], unique_chars: &mut [bool; 256]) {
+    let mut hex = bytes.iter().copied().filter(|byte| !byte.is_ascii_whitespace());
+    while let (Some(high), Some(low)) = (hex.next(), hex.next()) {
+        if let (Some(high), Some(low)) = (hex_val(high), hex_val(low)) {
+            let byte = (high << 4) | low;
+            if !matches!(byte, 0 | b' ' | b'\t' | b'\n') {
+                unique_chars[byte as usize] = true;
             }
         }
     }
@@ -2066,7 +2044,7 @@ mod tests {
 
     #[test]
     fn test_scan_content_operators() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
 
         // Sample PDF content stream with text operators
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
@@ -2075,20 +2053,20 @@ mod tests {
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0);
         // "Hello World" without space: H, e, l, o, W, r, d = 7 unique
-        assert!(uchars.len() >= 7);
+        assert!(uchars.iter().filter(|&&seen| seen).count() >= 7);
 
         // Content with TJ array
-        uchars.clear();
+        uchars.fill(false);
         let content2 = b"BT /F1 12 Tf 100 700 Td [(H) 10 (ello)] TJ ET";
         let (ops2, _, _, _) =
             scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
         assert_eq!(ops2, 1);
         // H, e, l, o = 4 unique
-        assert!(uchars.len() >= 4);
+        assert!(uchars.iter().filter(|&&seen| seen).count() >= 4);
 
         // Content with Do (XObject invocation — not counted as image here;
         // actual image detection is handled by scan_xobjects_in_resources)
-        uchars.clear();
+        uchars.fill(false);
         let content3 = b"q 100 0 0 100 50 700 cm /Img1 Do Q";
         let (ops3, imgs3, _, _) =
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
@@ -2101,7 +2079,7 @@ mod tests {
         // Lookback is floored at the previous Tj/TJ/Tf so later operators must
         // still see their own operands.
         let content = b"[(Hello)] TJ [(World)] TJ (More) Tj";
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, _, _, _) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
@@ -2115,7 +2093,7 @@ mod tests {
         // `Tj` followed by space inside a literal must not count as an operator
         // or pin the lookback floor; the real `Tj` still collects the string.
         let content = b"BT (Hello Tj World) Tj ET";
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, _, _, _) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
@@ -2134,7 +2112,7 @@ mod tests {
         for _ in 0..n {
             content.extend_from_slice(b"] TJ\n");
         }
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, _, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, n as u32);
@@ -2154,25 +2132,25 @@ mod tests {
         content.extend_from_slice(b"BT (x) Tj ET\n");
         content.extend_from_slice(b"BT (x) Tj ET\n");
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, imgs, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
         assert_eq!(imgs, 0); // Do operators are not counted here
-        assert_eq!(uchars.len(), 1);
+        assert_eq!(uchars.iter().filter(|&&seen| seen).count(), 1);
     }
 
     #[test]
     fn test_normal_text_not_image_dominated() {
         let content = b"BT /F1 12 Tf (The quick brown fox jumps over the lazy dog) Tj ET\n\
                          /Img1 Do\n/Img2 Do\n";
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (ops, imgs, _, _) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         assert_eq!(imgs, 0); // Do operators not counted here
                              // Many unique chars from the sentence
-        assert!(uchars.len() >= 5);
+        assert!(uchars.iter().filter(|&&seen| seen).count() >= 5);
     }
 
     #[test]
@@ -2187,7 +2165,7 @@ mod tests {
         }
         content.extend_from_slice(b"f\n");
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (text, imgs, paths, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 1);
@@ -2213,7 +2191,7 @@ mod tests {
             content.extend_from_slice(b"100 200 m 150 250 l 200 200 c h f\n");
         }
 
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let (text, _, paths, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(text, 20);
@@ -2457,7 +2435,7 @@ mod tests {
 
     #[test]
     fn test_scan_content_counts_tf_operators() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         let (ops, _, _, fonts) =
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
@@ -2469,7 +2447,7 @@ mod tests {
     fn test_tf_without_trailing_whitespace() {
         // Some PDFs concatenate Tf directly with the next operator's operand,
         // e.g. "25 Tf[<01>..." or "25 Tf(<text>..."
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
 
         // Tf followed by '[' (TJ array start)
         let content = b"BT /F1 25 Tf[<01>1<02>-1] TJ ET";
@@ -2479,7 +2457,7 @@ mod tests {
         assert_eq!(ops, 1);
 
         // Tf followed by '(' (literal string)
-        uchars.clear();
+        uchars.fill(false);
         let content2 = b"BT /F1 12 Tf(Hello) Tj ET";
         let (ops2, _, _, fonts2) =
             scan_content_for_text_operators(content2, &mut uchars, &mut HashSet::new());
@@ -2487,7 +2465,7 @@ mod tests {
         assert_eq!(ops2, 1);
 
         // Tf followed by '<' (hex string)
-        uchars.clear();
+        uchars.fill(false);
         let content3 = b"BT /F1 12 Tf<0102> Tj ET";
         let (ops3, _, _, fonts3) =
             scan_content_for_text_operators(content3, &mut uchars, &mut HashSet::new());
@@ -2495,7 +2473,7 @@ mod tests {
         assert_eq!(ops3, 1);
 
         // Tf followed by '/' (next font name)
-        uchars.clear();
+        uchars.fill(false);
         let content4 = b"BT /F1 12 Tf/F2 10 Tf (x) Tj ET";
         let (_, _, _, fonts4) =
             scan_content_for_text_operators(content4, &mut uchars, &mut HashSet::new());
@@ -2912,7 +2890,7 @@ mod tests {
 
     #[test]
     fn test_scan_content_collects_used_font_names() {
-        let mut uchars = HashSet::new();
+        let mut uchars = [false; 256];
         let mut fonts = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         scan_content_for_text_operators(content, &mut uchars, &mut fonts);

@@ -452,12 +452,17 @@ pub fn detect_chart_regions(
 ) -> Vec<(f32, f32, f32, f32)> {
     // Match detect_tables_from_rects: image placeholders are not text and
     // would defeat the bar-content check.
-    let items_owned: Vec<TextItem> = items
-        .iter()
-        .filter(|i| crate::extractor::is_text_layout_item(i))
-        .cloned()
-        .collect();
-    let items = items_owned.as_slice();
+    let items_owned;
+    let items = if items.iter().all(crate::extractor::is_text_layout_item) {
+        items
+    } else {
+        items_owned = items
+            .iter()
+            .filter(|item| crate::extractor::is_text_layout_item(item))
+            .cloned()
+            .collect::<Vec<_>>();
+        &items_owned
+    };
     let page_rects: Vec<(f32, f32, f32, f32)> = rects
         .iter()
         .filter(|r| r.page == page)
@@ -520,12 +525,17 @@ pub fn detect_tables_from_rects(
 ) -> (Vec<Table>, Vec<RectHintRegion>) {
     // Strip Image placeholders before column/row clustering — an image's bbox
     // would otherwise show up as a spurious column edge. See `is_text_layout_item`.
-    let items_owned: Vec<TextItem> = items
-        .iter()
-        .filter(|i| crate::extractor::is_text_layout_item(i))
-        .cloned()
-        .collect();
-    let items = items_owned.as_slice();
+    let items_owned;
+    let items = if items.iter().all(crate::extractor::is_text_layout_item) {
+        items
+    } else {
+        items_owned = items
+            .iter()
+            .filter(|item| crate::extractor::is_text_layout_item(item))
+            .cloned()
+            .collect::<Vec<_>>();
+        &items_owned
+    };
 
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
@@ -547,6 +557,9 @@ pub fn detect_tables_from_rects(
             continue;
         }
         page_rects.push((x, y, w, h));
+    }
+    if page_rects.is_empty() {
+        return (Vec::new(), Vec::new());
     }
 
     // Some generators repeat a page-sized clipping/fill rectangle for nearly
@@ -643,6 +656,7 @@ pub fn detect_tables_from_rects(
     let mut tables = Vec::new();
     let mut hint_regions = Vec::new();
     let mut failed_clusters: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
+    let mut clustered_page_rects = None;
 
     // Full grid detection requires ≥ 6 rects
     if page_rects.len() >= 6 {
@@ -668,6 +682,7 @@ pub fn detect_tables_from_rects(
             }
             flags
         };
+        let has_page_backgrounds = is_page_bg.iter().any(|&value| value);
 
         // Build filtered rect list for clustering (excluding page backgrounds)
         let non_bg_indices: Vec<usize> =
@@ -868,6 +883,9 @@ pub fn detect_tables_from_rects(
                 }
             }
         }
+        if !has_page_backgrounds {
+            clustered_page_rects = Some(clusters);
+        }
     }
 
     // NOTE: 3-5 box stacks never reach detect_stacked_box_table — the main
@@ -885,7 +903,9 @@ pub fn detect_tables_from_rects(
         // and small cell-border clusters on rect-sparse pages.
         let mut has_failed_cluster_hints = false;
         if page_rects.len() >= 6 {
-            let clusters = cluster_rects(&page_rects, 3.0, 6);
+            let clusters = clustered_page_rects
+                .take()
+                .unwrap_or_else(|| cluster_rects(&page_rects, 3.0, 6));
 
             // Generate hints from large clusters (≥30 rects, decorative/calendar style)
             for cluster_indices in &clusters {

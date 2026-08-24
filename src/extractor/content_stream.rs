@@ -14,6 +14,7 @@ use crate::PdfError;
 use crate::detector::{analyze_page_content_streams, PageDetectionEvidence};
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::fonts::{
@@ -25,6 +26,107 @@ use super::fonts::{
 use super::underline::UnderlineLine;
 use super::xobjects::{expand_page_content, MAX_EXPANDED_OPERATIONS};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+
+struct FontProducts {
+    encodings: crate::types::PageFontEncodings,
+    has_gid_fonts: bool,
+    widths: crate::types::PageFontWidths,
+    type3_scales: HashMap<String, f32>,
+    base_names: HashMap<String, String>,
+    tounicode_refs: HashMap<String, u32>,
+    inline_cmaps: HashMap<String, crate::tounicode::CMapEntry>,
+    style_flags: HashMap<String, (bool, bool)>,
+    fidelity: Option<HashMap<String, FontFidelity>>,
+}
+
+pub(crate) struct FontProductCache {
+    style: FontStyleCache,
+    sets: HashMap<(bool, Vec<(Vec<u8>, usize)>), FontProducts>,
+}
+
+impl FontProductCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            style: FontStyleCache::new(),
+            sets: HashMap::new(),
+        }
+    }
+
+    fn get(
+        &mut self,
+        doc: &Document,
+        fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+        cmaps: &FontCMaps,
+        fidelity: bool,
+    ) -> &FontProducts {
+        let key = (
+            fidelity,
+            fonts
+                .iter()
+                .map(|(name, font)| (name.clone(), std::ptr::from_ref(*font) as usize))
+                .collect::<Vec<_>>(),
+        );
+        if self.sets.contains_key(&key) {
+            return &self.sets[&key];
+        }
+
+        let (encodings, has_gid_fonts) = build_font_encodings(doc, fonts, cmaps);
+        let widths = build_font_widths(doc, fonts);
+        let type3_scales = build_type3_scales(doc, fonts);
+        let mut base_names = HashMap::new();
+        let mut tounicode_refs = HashMap::new();
+        let mut inline_cmaps = HashMap::new();
+        let mut style_flags = HashMap::new();
+        for (font_name, font) in fonts {
+            let resource = String::from_utf8_lossy(font_name).into_owned();
+            if let Some(name) = font
+                .get(b"BaseFont")
+                .ok()
+                .and_then(|value| value.as_name().ok())
+            {
+                base_names.insert(resource.clone(), String::from_utf8_lossy(name).into_owned());
+            }
+            let style = descriptor_style_flags(doc, font, &mut self.style);
+            if style != (false, false) {
+                style_flags.insert(resource.clone(), style);
+            }
+            match font.get(b"ToUnicode") {
+                Ok(value) => {
+                    if let Ok(reference) = value.as_reference() {
+                        tounicode_refs.insert(resource, reference.0);
+                    } else if let Object::Stream(stream) = value {
+                        let data = stream
+                            .decompressed_content()
+                            .unwrap_or_else(|_| stream.content.clone());
+                        if let Some(entry) =
+                            crate::tounicode::build_cmap_entry_from_stream(&data, font, doc, 0)
+                        {
+                            inline_cmaps.insert(resource, entry);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Some(reference) = get_font_file2_obj_num(doc, font) {
+                        tounicode_refs.insert(resource, reference);
+                    }
+                }
+            }
+        }
+        let font_fidelity = fidelity.then(|| build_font_fidelity(doc, fonts, &mut self.style));
+        let products = FontProducts {
+            encodings,
+            has_gid_fonts,
+            widths,
+            type3_scales,
+            base_names,
+            tounicode_refs,
+            inline_cmaps,
+            style_flags,
+            fidelity: font_fidelity,
+        };
+        self.sets.entry(key).or_insert(products)
+    }
+}
 
 fn fidelity_info(
     fonts: Option<&HashMap<String, FontFidelity>>,
@@ -134,10 +236,10 @@ pub(super) fn append_tj_text(current: &mut String, pending_space: &mut bool, tex
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
-pub(super) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+pub(super) fn strip_pdf_comments(data: &[u8]) -> Cow<'_, [u8]> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
-        return data.to_vec();
+        return Cow::Borrowed(data);
     }
 
     let mut result = Vec::with_capacity(data.len());
@@ -191,7 +293,7 @@ pub(super) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
         i += 1;
     }
 
-    result
+    Cow::Owned(result)
 }
 
 fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
@@ -199,6 +301,88 @@ fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
         x * ctm[0] + y * ctm[2] + ctm[4],
         x * ctm[1] + y * ctm[3] + ctm[5],
     )
+}
+
+type RuleSegment = ((f32, f32), (f32, f32));
+type RuleRect = (f32, f32, f32, f32, [f32; 6]);
+
+fn push_rule(rules: &mut Vec<PdfLine>, page: u32, from: (f32, f32), to: (f32, f32)) {
+    if (to.1 - from.1).abs() <= 1.5 {
+        rules.push(PdfLine {
+            x1: from.0,
+            y1: (from.1 + to.1) / 2.0,
+            x2: to.0,
+            y2: (from.1 + to.1) / 2.0,
+            page,
+        });
+    }
+}
+
+fn paint_rule_strokes(
+    rules: &mut Vec<PdfLine>,
+    page: u32,
+    segments: &mut Vec<RuleSegment>,
+    rectangles: &mut Vec<RuleRect>,
+    ctm: &[f32; 6],
+) {
+    for (from, to) in segments.drain(..) {
+        push_rule(
+            rules,
+            page,
+            transform_path_point(from.0, from.1, ctm),
+            transform_path_point(to.0, to.1, ctm),
+        );
+    }
+    for (x, y, width, height, matrix) in rectangles.drain(..) {
+        push_rule(
+            rules,
+            page,
+            transform_path_point(x, y, &matrix),
+            transform_path_point(x + width, y + height, &matrix),
+        );
+    }
+}
+
+fn paint_rule_fills(
+    rules: &mut Vec<PdfLine>,
+    page: u32,
+    segments: &mut Vec<RuleSegment>,
+    rectangles: &mut Vec<RuleRect>,
+    ctm: &[f32; 6],
+) {
+    let mut first = 0;
+    for end in 1..=segments.len() {
+        let path_ends = end == segments.len() || segments[end - 1].1 != segments[end].0;
+        if !path_ends {
+            continue;
+        }
+        let mut x0 = f32::INFINITY;
+        let mut y0 = f32::INFINITY;
+        let mut x1 = f32::NEG_INFINITY;
+        let mut y1 = f32::NEG_INFINITY;
+        for &(from, to) in &segments[first..end] {
+            for (x, y) in [from, to] {
+                let (x, y) = transform_path_point(x, y, ctm);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        if end - first >= 2 {
+            push_rule(rules, page, (x0, y0), (x1, y1));
+        }
+        first = end;
+    }
+    segments.clear();
+    for (x, y, width, height, matrix) in rectangles.drain(..) {
+        push_rule(
+            rules,
+            page,
+            transform_path_point(x, y, &matrix),
+            transform_path_point(x + width, y + height, &matrix),
+        );
+    }
 }
 
 fn transformed_stroke_width(
@@ -255,7 +439,7 @@ pub(crate) fn extract_page_text_items(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-    style_cache: &mut FontStyleCache,
+    font_cache: &mut FontProductCache,
 ) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
     extract_page_text_items_impl(
         doc,
@@ -263,7 +447,7 @@ pub(crate) fn extract_page_text_items(
         page_num,
         font_cmaps,
         include_invisible,
-        style_cache,
+        font_cache,
         true,
         true,
         false,
@@ -276,7 +460,7 @@ pub(crate) fn extract_page_text_items_preserving_scripts(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-    style_cache: &mut FontStyleCache,
+    font_cache: &mut FontProductCache,
 ) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
     extract_page_text_items_impl(
         doc,
@@ -284,7 +468,7 @@ pub(crate) fn extract_page_text_items_preserving_scripts(
         page_num,
         font_cmaps,
         include_invisible,
-        style_cache,
+        font_cache,
         true,
         false,
         false,
@@ -297,7 +481,7 @@ pub(crate) fn extract_page_text_items_raw(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-    style_cache: &mut FontStyleCache,
+    font_cache: &mut FontProductCache,
 ) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
     extract_page_text_items_impl(
         doc,
@@ -305,7 +489,7 @@ pub(crate) fn extract_page_text_items_raw(
         page_num,
         font_cmaps,
         include_invisible,
-        style_cache,
+        font_cache,
         false,
         false,
         false,
@@ -318,7 +502,7 @@ pub(crate) fn extract_page_text_items_fidelity(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-    style_cache: &mut FontStyleCache,
+    font_cache: &mut FontProductCache,
 ) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
     extract_page_text_items_impl(
         doc,
@@ -326,7 +510,7 @@ pub(crate) fn extract_page_text_items_fidelity(
         page_num,
         font_cmaps,
         include_invisible,
-        style_cache,
+        font_cache,
         false,
         false,
         true,
@@ -339,7 +523,7 @@ fn extract_page_text_items_impl(
     page_num: u32,
     font_cmaps: &FontCMaps,
     include_invisible: bool,
-    style_cache: &mut FontStyleCache,
+    font_cache: &mut FontProductCache,
     merge_text: bool,
     merge_scripts: bool,
     fidelity: bool,
@@ -348,6 +532,7 @@ fn extract_page_text_items_impl(
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
+    let mut painted_rules: Vec<PdfLine> = Vec::new();
     let mut underline_lines: Vec<UnderlineLine> = Vec::new();
     // Indexes of items whose raw decoded text is a multi-character RTL run
     // that may be stored in visual order (see fix_visual_order_rtl), plus a
@@ -369,6 +554,12 @@ fn extract_page_text_items_impl(
     // merely sits near an invisible clip boundary.
     let mut pending_re_rects: Vec<PdfRect> = Vec::new();
     let mut painted_rects: Vec<PdfRect> = Vec::new();
+    // Separator detection consumes the same decoded/expanded operation stream.
+    // Keep its path semantics independent from the table/underline machinery.
+    let mut rule_current = None;
+    let mut rule_start = None;
+    let mut rule_segments: Vec<RuleSegment> = Vec::new();
+    let mut rule_rectangles: Vec<RuleRect> = Vec::new();
 
     // Decode page and nested Form content before building font state. Form
     // resources are qualified while their operations are inlined, so every
@@ -407,9 +598,17 @@ fn extract_page_text_items_impl(
             log::warn!(
                 "page {page_num}: skipping extraction because content exceeds the operation limit"
             );
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false, detection));
+            return Ok((
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                false,
+                false,
+                false,
+                detection,
+            ));
         }
     };
+    drop(content_data);
+    drop(raw_content);
     let expanded = expand_page_content(doc, page_id, content.operations, page_fonts);
     if expanded.exceeded_limit {
         log::warn!(
@@ -417,7 +616,13 @@ fn extract_page_text_items_impl(
             page_num,
             MAX_EXPANDED_OPERATIONS
         );
-        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false, detection));
+        return Ok((
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            false,
+            false,
+            false,
+            detection,
+        ));
     }
     if expanded.form_truncated {
         log::warn!("page {page_num}: Form XObject expansion was truncated");
@@ -427,61 +632,16 @@ fn extract_page_text_items_impl(
     let xobjects = expanded.images;
     let operations = expanded.operations;
 
-    // Build font encoding maps from Differences arrays
-    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
-
-    // Build font width info for accurate text positioning
-    let font_widths = build_font_widths(doc, &fonts);
-    let type3_scales = build_type3_scales(doc, &fonts);
-
-    // Build maps of font resource names to their base font names and ToUnicode object refs
-    let mut font_base_names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut font_tounicode_refs: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    let mut inline_cmaps: std::collections::HashMap<String, crate::tounicode::CMapEntry> =
-        std::collections::HashMap::new();
-    let mut font_style_flags: std::collections::HashMap<String, (bool, bool)> =
-        std::collections::HashMap::new();
-    for (font_name, font_dict) in &fonts {
-        let resource_name = String::from_utf8_lossy(font_name).to_string();
-        if let Ok(base_font) = font_dict.get(b"BaseFont") {
-            if let Ok(name) = base_font.as_name() {
-                let base_name = String::from_utf8_lossy(name).to_string();
-                font_base_names.insert(resource_name.clone(), base_name);
-            }
-        }
-        // Descriptor style flags rescue subset fonts whose BaseFont names
-        // are opaque tags the name heuristics can't read.
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
-        if style != (false, false) {
-            font_style_flags.insert(resource_name.clone(), style);
-        }
-        // Track ToUnicode object reference, with FontFile2 fallback for Identity-H/V.
-        // Also handle inline ToUnicode streams.
-        match font_dict.get(b"ToUnicode") {
-            Ok(tounicode) => {
-                if let Ok(obj_ref) = tounicode.as_reference() {
-                    font_tounicode_refs.insert(resource_name, obj_ref.0);
-                } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
-                    if let Some(entry) =
-                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                    {
-                        inline_cmaps.insert(resource_name, entry);
-                    }
-                }
-            }
-            Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
-                    font_tounicode_refs.insert(resource_name, ff2_obj_num);
-                }
-            }
-        }
-    }
-    let font_fidelity = fidelity.then(|| build_font_fidelity(doc, &fonts, style_cache));
+    let products = font_cache.get(doc, &fonts, font_cmaps, fidelity);
+    let font_encodings = &products.encodings;
+    let has_gid_fonts = products.has_gid_fonts;
+    let font_widths = &products.widths;
+    let type3_scales = &products.type3_scales;
+    let font_base_names = &products.base_names;
+    let font_tounicode_refs = &products.tounicode_refs;
+    let inline_cmaps = &products.inline_cmaps;
+    let font_style_flags = &products.style_flags;
+    let font_fidelity = &products.fidelity;
 
     // Cache font encodings from lopdf (once per font, not per text operand).
     // This avoids re-parsing ToUnicode CMap streams for every Tj/TJ operator.
@@ -1174,8 +1334,7 @@ fn extract_page_text_items_impl(
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
                             let advance_scale = scale_x.hypot(scale_y);
-                            for (text, fidelity_text, fidelity_glyphs, start_w, end_w) in &sub_items
-                            {
+                            for (text, fidelity_text, fidelity_glyphs, start_w, end_w) in sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -1193,7 +1352,7 @@ fn extract_page_text_items_impl(
                                     0.0
                                 };
                                 if horizontal_advance
-                                    && crate::text_utils::is_visual_rtl_candidate(text)
+                                    && crate::text_utils::is_visual_rtl_candidate(&text)
                                 {
                                     if scale_x < 0.0 {
                                         rtl_logical_ops += 1;
@@ -1207,7 +1366,7 @@ fn extract_page_text_items_impl(
                                     }
                                 }
                                 items.push(TextItem {
-                                    text: expand_ligatures(text),
+                                    text: expand_ligatures(&text),
                                     x,
                                     y,
                                     width,
@@ -1230,12 +1389,12 @@ fn extract_page_text_items_impl(
                                         if fidelity_text.is_empty() {
                                             text.clone()
                                         } else {
-                                            fidelity_text.clone()
+                                            fidelity_text
                                         },
                                         text_object_index,
                                         source_line_index,
                                         text_rise,
-                                        fidelity_glyphs.clone(),
+                                        fidelity_glyphs,
                                         combined,
                                         current_font_size,
                                         type3_scales.get(&current_font).copied().unwrap_or(1.0),
@@ -1611,6 +1770,7 @@ fn extract_page_text_items_impl(
                     let ry = get_number(&op.operands[1]).unwrap_or(0.0);
                     let rw = get_number(&op.operands[2]).unwrap_or(0.0);
                     let rh = get_number(&op.operands[3]).unwrap_or(0.0);
+                    rule_rectangles.push((rx, ry, rw, rh, ctm));
                     // Transform origin to device space
                     let x_dev = rx * ctm[0] + ry * ctm[2] + ctm[4];
                     let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
@@ -1637,6 +1797,8 @@ fn extract_page_text_items_impl(
                 if op.operands.len() >= 2 {
                     let px = get_number(&op.operands[0]).unwrap_or(0.0);
                     let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                    rule_current = Some((px, py));
+                    rule_start = Some((px, py));
                     path_subpath_start = Some((px, py));
                     path_current = Some((px, py));
                 }
@@ -1647,6 +1809,10 @@ fn extract_page_text_items_impl(
                     if let Some((cx, cy)) = path_current {
                         let px = get_number(&op.operands[0]).unwrap_or(0.0);
                         let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                        if let Some(from) = rule_current {
+                            rule_segments.push((from, (px, py)));
+                        }
+                        rule_current = Some((px, py));
                         pending_lines.push((cx, cy, px, py));
                         path_current = Some((px, py));
                     }
@@ -1654,6 +1820,10 @@ fn extract_page_text_items_impl(
             }
             "h" => {
                 // closepath: segment back to subpath start
+                if let (Some(from), Some(to)) = (rule_current, rule_start) {
+                    rule_segments.push((from, to));
+                    rule_current = Some(to);
+                }
                 if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
                     if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
                         pending_lines.push((cx, cy, sx, sy));
@@ -1668,6 +1838,15 @@ fn extract_page_text_items_impl(
             }
             // ── Path painting operators ──────────────────────────
             "S" | "s" => {
+                paint_rule_strokes(
+                    &mut painted_rules,
+                    page_num,
+                    &mut rule_segments,
+                    &mut rule_rectangles,
+                    &ctm,
+                );
+                rule_current = None;
+                rule_start = None;
                 // stroke / close-and-stroke: emit pending lines
                 if op.operator == "s" {
                     // close first
@@ -1702,6 +1881,15 @@ fn extract_page_text_items_impl(
                 path_current = None;
             }
             "B" | "B*" | "b" | "b*" => {
+                paint_rule_strokes(
+                    &mut painted_rules,
+                    page_num,
+                    &mut rule_segments,
+                    &mut rule_rectangles,
+                    &ctm,
+                );
+                rule_current = None;
+                rule_start = None;
                 // fill+stroke: emit lines AND clear state
                 if op.operator == "b" || op.operator == "b*" {
                     // close first
@@ -1736,6 +1924,15 @@ fn extract_page_text_items_impl(
                 path_current = None;
             }
             "f" | "F" | "f*" => {
+                paint_rule_fills(
+                    &mut painted_rules,
+                    page_num,
+                    &mut rule_segments,
+                    &mut rule_rectangles,
+                    &ctm,
+                );
+                rule_current = None;
+                rule_start = None;
                 // fill-only: extract axis-aligned rects from completed subpaths
                 // Also check any un-closed segments still in pending_lines
                 if !pending_lines.is_empty() {
@@ -1858,6 +2055,10 @@ fn extract_page_text_items_impl(
                 // were only ever part of a clip path (`re W n`), which draw
                 // no ink and must not feed underline detection.
                 pending_re_rects.clear();
+                rule_segments.clear();
+                rule_rectangles.clear();
+                rule_current = None;
+                rule_start = None;
                 pending_lines.clear();
                 pending_subpaths.clear();
                 path_subpath_start = None;
@@ -1919,7 +2120,7 @@ fn extract_page_text_items_impl(
     );
 
     let items = if merge_text {
-        super::merge_text_items(items)
+        super::merge_text_items_for_layout(&items)
     } else {
         items
     };
@@ -1929,7 +2130,7 @@ fn extract_page_text_items_impl(
         items
     };
     Ok((
-        (items, rects, lines),
+        (items, rects, lines, painted_rules),
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,
@@ -2205,13 +2406,13 @@ mod tests {
         page_id: lopdf::ObjectId,
     ) -> Vec<TextItem> {
         let font_cmaps = FontCMaps::from_doc(doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items_fidelity(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items_fidelity(
             doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         items
@@ -2222,13 +2423,13 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         items
@@ -2239,13 +2440,13 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items_raw(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items_raw(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         items
@@ -2256,13 +2457,13 @@ mod tests {
 
         let (doc, page_id) = simple_doc_with_content(content);
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items_fidelity(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items_fidelity(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         items
@@ -2687,10 +2888,11 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
-        let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
+        let ((items, rects, lines, _rules), _has_gid, _coords_rotated, _skipped_invisible, _) =
+            result;
         assert!(items.is_empty());
         assert!(rects.is_empty());
         assert!(lines.is_empty());
@@ -2771,13 +2973,13 @@ BT 30 700 Tm <41> Tj ET";
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         let text = items
@@ -2846,13 +3048,13 @@ end"#;
         doc.add_object(catalog);
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, _) = extract_page_text_items(
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items(
             &doc,
             page_id,
             1,
             &font_cmaps,
             false,
-            &mut FontStyleCache::new(),
+            &mut FontProductCache::new(),
         )
         .unwrap();
         items
