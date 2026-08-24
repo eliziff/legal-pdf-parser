@@ -131,6 +131,7 @@ fn merge_adjacent_items_preserving(
                 is_italic: first_item.is_italic,
                 is_underline: first_item.is_underline,
                 is_strikeout: first_item.is_strikeout,
+                fidelity: first_item.fidelity.clone(),
                 item_type: first_item.item_type.clone(),
                 mcid: first_item.mcid,
             });

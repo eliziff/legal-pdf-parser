@@ -300,6 +300,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            fidelity: item.fidelity.clone(),
             item_type: item.item_type.clone(),
             mcid: item.mcid,
         });
@@ -323,6 +324,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            fidelity: item.fidelity.clone(),
             item_type: item.item_type.clone(),
             mcid: item.mcid,
         });

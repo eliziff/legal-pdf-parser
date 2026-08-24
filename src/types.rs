@@ -10,7 +10,7 @@ use crate::text_utils::should_join_items;
 
 /// Result tuple returned by page-level text extraction: text items, rectangles, line segments,
 /// and whether fonts with unresolvable gid-encoded glyphs were encountered.
-pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
+pub type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 
 // ── Font types (crate-internal) ──────────────────────────────────────
 
@@ -137,11 +137,62 @@ pub struct TextItem {
     /// glyphs at mid x-height). Same geometric detection as underline,
     /// different vertical window; see `extractor::underline`.
     pub is_strikeout: bool,
+    /// Optional source-faithful facts for consumers that request the fidelity
+    /// extraction path. Ordinary extraction leaves this unset.
+    pub fidelity: Option<Box<FidelityTextInfo>>,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
     /// Marked Content ID from the content stream's BDC/BMC operator.
     /// Used to link this item to the PDF structure tree for tagged PDFs.
     pub mcid: Option<i64>,
+}
+
+/// Source-faithful information retained for consumers that must reproduce the
+/// PDF's extraction contract rather than its presentation-oriented Markdown.
+/// Kept separate from `TextItem` so the existing compact API and its many
+/// callers do not pay for provenance they do not use.
+#[derive(Debug, Clone, Default)]
+pub struct FidelityTextInfo {
+    /// Decoded source text before ligature/soft-hyphen/PUA cleanup.
+    pub text: String,
+    /// PostScript BaseFont name with a six-letter subset prefix removed.
+    pub font: String,
+    /// Resource-scoped font identity. Distinct PDF font objects can expose
+    /// the same PostScript name but still delimit renderer spans.
+    pub resource: String,
+    /// Font flags in PyMuPDF order: superscript=1, italic=2, serif=4,
+    /// monospaced=8, bold=16. Superscript is derived after line assembly.
+    pub flags: u32,
+    /// Ascender and descender measured in em units.
+    pub ascender: f32,
+    pub descender: f32,
+    /// Monotonic source text-object and text-line identities.
+    pub text_object: u32,
+    pub source_line: u32,
+    /// Renderer-compatible line and block identities assigned after page
+    /// coordinate normalization by fidelity consumers.
+    pub renderer_line: u32,
+    pub renderer_block: u32,
+    /// Text rendering rise (`Ts`) in text-space units.
+    pub text_rise: f32,
+    /// Baseline origin, full text advance, and one-em y-axis vector in the
+    /// extractor's page coordinate space. Keeping the vectors avoids losing
+    /// rotated and skewed geometry in an axis-aligned `TextItem`.
+    pub baseline: [f32; 2],
+    pub advance: [f32; 2],
+    pub em: [f32; 2],
+    /// Source glyph geometry.
+    pub glyphs: Vec<FidelityGlyph>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FidelityGlyph {
+    pub text: String,
+    /// Reading-axis distances from the item's baseline origin.
+    pub x0: f32,
+    pub x1: f32,
+    /// Absolute axis-aligned glyph bounds in page coordinates.
+    pub bbox: [f32; 4],
 }
 
 /// A line of text (grouped text items)
@@ -360,6 +411,7 @@ mod formatting_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: strikeout,
+            fidelity: None,
             item_type: ItemType::Text,
             mcid: None,
         }
