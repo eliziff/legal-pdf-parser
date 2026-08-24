@@ -49,9 +49,9 @@ ttf-parser = "0.25"
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-lopdf = { version = "0.42.0", features = ["rayon"] }
+lopdf = { version = "0.42.0", default-features = false, features = ["rayon"] }
 rayon = "1.10"
-env_logger = "0.11"
+env_logger = { version = "0.11", optional = true }
 # Optional native page rendering for OCR pipelines. PDFium is loaded at
 # runtime, so enabling this feature does not link or download a native library.
 firecrawl-pdfium = { version = "0.1.0", optional = true }
@@ -82,7 +82,8 @@ include_dir = "0.7"
 tempfile = "3.3"
 
 [features]
-default = []
+default = ["cli"]
+cli = ["dep:env_logger"]
 python = ["pyo3", "ocr"]
 vision = []
 model-cache = ["vision", "dep:dirs", "dep:fs2", "dep:sha2", "dep:windows-sys"]
@@ -96,10 +97,12 @@ ocr = ["render-pdfium", "ocr-oar", "model-download"]
 [[bin]]
 name = "pdf2md"
 path = "src/bin/pdf2md.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "detect-pdf"
 path = "src/bin/detect_pdf.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "dump_ops"
