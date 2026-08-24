@@ -479,7 +479,11 @@ pub(crate) fn parse_cid_w_array(
     widths: &mut HashMap<u16, u16>,
 ) {
     let mut i = 0;
+    let mut assigned = 0usize;
     while i < w_array.len() {
+        if assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return;
+        }
         let start_cid = match &w_array[i] {
             Object::Integer(n) => *n as u16,
             Object::Real(n) => *n as u16,
@@ -498,12 +502,14 @@ pub(crate) fn parse_cid_w_array(
             Object::Array(arr) => {
                 // [c [w1 w2 ...]] — consecutive widths starting at c
                 for (j, w_obj) in arr.iter().enumerate() {
-                    let w = match w_obj {
-                        Object::Integer(n) => *n as u16,
-                        Object::Real(n) => *n as u16,
-                        _ => continue,
-                    };
-                    widths.insert(start_cid + j as u16, w);
+                    if !assign_cid_width(
+                        widths,
+                        start_cid.wrapping_add(j as u16),
+                        w_obj,
+                        &mut assigned,
+                    ) {
+                        return;
+                    }
                 }
                 i += 1;
             }
@@ -511,12 +517,14 @@ pub(crate) fn parse_cid_w_array(
                 // Could be a reference to an array
                 if let Ok(Object::Array(arr)) = doc.get_object(*r) {
                     for (j, w_obj) in arr.iter().enumerate() {
-                        let w = match w_obj {
-                            Object::Integer(n) => *n as u16,
-                            Object::Real(n) => *n as u16,
-                            _ => continue,
-                        };
-                        widths.insert(start_cid + j as u16, w);
+                        if !assign_cid_width(
+                            widths,
+                            start_cid.wrapping_add(j as u16),
+                            w_obj,
+                            &mut assigned,
+                        ) {
+                            return;
+                        }
                     }
                     i += 1;
                 } else {
@@ -539,8 +547,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -558,8 +566,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -1678,6 +1686,45 @@ fn extract_text_from_operand_impl(
         };
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
+}
+
+fn assign_cid_width(
+    widths: &mut HashMap<u16, u16>,
+    cid: u16,
+    width: &Object,
+    assigned: &mut usize,
+) -> bool {
+    let width = match width {
+        Object::Integer(value) => *value as u16,
+        Object::Real(value) => *value as u16,
+        _ => return true,
+    };
+    if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+        return false;
+    }
+    widths.insert(cid, width);
+    *assigned += 1;
+    true
+}
+
+fn assign_cid_width_range(
+    widths: &mut HashMap<u16, u16>,
+    start: u16,
+    end: u16,
+    width: u16,
+    assigned: &mut usize,
+) -> bool {
+    if start > end {
+        return true;
+    }
+    for cid in start..=end {
+        if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return false;
+        }
+        widths.insert(cid, width);
+        *assigned += 1;
+    }
+    true
 }
 
 fn decode_utf16be_lossy(bytes: &[u8]) -> String {

@@ -695,16 +695,15 @@ impl KrakenOcr {
     #[cfg(feature = "ocr")]
     pub(crate) fn extract_pages(
         &mut self,
-        pdf_path: &Path,
+        bytes: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let bytes = fs::read(pdf_path).map_err(|source| Error::io(pdf_path, source))?;
         let blla = self.blla.is_some();
         if blla || requests.len() < 24 {
-            let pdf = Pdf::new(bytes).map_err(|error| {
+            let pdf = Pdf::new(bytes.to_vec()).map_err(|error| {
                 Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
             })?;
             let cache = RenderCache::new();
@@ -729,7 +728,7 @@ impl KrakenOcr {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let (metadata_sender, metadata_receiver) = std::sync::mpsc::channel();
             let producer = scope.spawn(move || {
-                let result = Pdf::new(bytes).map_err(|error| {
+                let result = Pdf::new(bytes.to_vec()).map_err(|error| {
                     Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
                 });
                 let pdf = match result {

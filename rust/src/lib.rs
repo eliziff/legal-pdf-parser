@@ -12,7 +12,7 @@ compile_error!("profiling and fast-allocator cannot select two global allocators
 #[cfg(feature = "pdf")]
 pub use contract::{
     derive_pdf_document, pdf_document_snapshot, pdf_document_summary, query_pdf_document,
-    PdfDocumentResult,
+    restore_pdf_document, PdfDocumentResult,
 };
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
@@ -21,8 +21,6 @@ pub use engine::{corpus_check_cached_extraction, digest_cached_extraction};
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::{Error, Result};
-#[cfg(feature = "pdf")]
-pub use legal_pdf_extraction::pdf_page_count;
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
     analyze_docx_bytes, apply_docx_links, assess_docx_route, compile_table_entry,

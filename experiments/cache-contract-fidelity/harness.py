@@ -16,7 +16,8 @@ from typing import Any
 
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[2]
+PARSER_ROOT = HERE.parents[1]
+DEFAULT_CORPUS_ROOT = PARSER_ROOT.parent
 REQUEST_SCHEMA = "legalpdf.document-request.v1"
 RESULT_SCHEMA = "legalpdf.document-result.v1"
 RECORD_SCHEMA = "legalpdf.cache-contract-record.v1"
@@ -61,7 +62,9 @@ def safe_token(value: str) -> str:
 
 
 class Gate:
-    def __init__(self, binary: Path, manifest: Path, raw: Path, selected: set[str]) -> None:
+    def __init__(
+        self, binary: Path, manifest: Path, raw: Path, corpus_root: Path, selected: set[str]
+    ) -> None:
         self.binary = binary.resolve()
         self.manifest_path = manifest.resolve()
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -74,6 +77,7 @@ class Gate:
             }
         )[:20]
         self.raw = raw.resolve() / self.run_id
+        self.corpus_root = corpus_root.resolve()
         self.records = self.raw / "records"
         self.selected = selected
         self.calls = 0
@@ -291,7 +295,7 @@ class Gate:
         relative = row["path"]
         if self.selected and relative not in self.selected and Path(relative).name not in self.selected:
             return {}
-        pdf = ROOT / relative
+        pdf = self.corpus_root / relative
         token = f"{position:02d}-{safe_token(Path(relative).stem)}"
         expected_sha = row["sha256"]
         pages = row["pages"]
@@ -381,6 +385,49 @@ class Gate:
         )
         return result
 
+    def source_docs(self) -> dict[str, Any]:
+        """Fast cold-extraction gate used for dependency update PRs."""
+        assert self.manifest["schema_version"] == "legalpdf.cache-contract-corpus.v1"
+        documents = [
+            row
+            for row in self.manifest["documents"]
+            if not self.selected
+            or row["path"] in self.selected
+            or Path(row["path"]).name in self.selected
+        ]
+        assert documents, "no documents selected"
+        self.raw.mkdir(parents=True, exist_ok=True)
+        reports = []
+        for position, row in enumerate(documents, 1):
+            relative = row["path"]
+            pdf = self.corpus_root / relative
+            expected_sha = row["sha256"]
+            assert pdf.is_file(), pdf
+            assert file_sha256(pdf) == expected_sha, relative
+            token = f"{position:02d}-{safe_token(Path(relative).stem)}"
+            print(f"DOCUMENT {position}/{len(documents)} {relative}", flush=True)
+            response = self.call(
+                f"{token}:source-doc",
+                self.request("source_doc", pdf, self.raw / "cache" / token),
+            )
+            self.assert_source(relative, response, expected_sha, row["pages"])
+            reports.append({
+                "path": relative,
+                "sha256": digest(response["result"]),
+            })
+        report = {
+            "schema_version": "legalpdf.source-doc-fidelity.v1",
+            "passed": True,
+            "binary_sha256": self.binary_sha256,
+            "documents": len(reports),
+            "pages": sum(row["pages"] for row in documents),
+            "source_docs_sha256": digest(reports),
+            "documents_detail": reports,
+        }
+        atomic_json(self.raw / "report.json", report)
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+        return report
+
     def run(self) -> dict[str, Any]:
         assert self.manifest["schema_version"] == "legalpdf.cache-contract-corpus.v1"
         documents = self.manifest["documents"]
@@ -399,7 +446,9 @@ class Gate:
         source_keys = {(row["sha256"], row["full_cache_key"]) for row in self.reports}
         assert len({item[0] for item in source_keys}) == len(source_keys)
         assert len({item[1] for item in source_keys}) == len(source_keys)
-        separation = self.source_separation(self.reports[0], ROOT / self.reports[0]["path"])
+        separation = self.source_separation(
+            self.reports[0], self.corpus_root / self.reports[0]["path"]
+        )
         report = {
             "schema_version": "legalpdf.cache-contract-fidelity.v1",
             "passed": True,
@@ -447,17 +496,29 @@ def main() -> int:
     parser.add_argument(
         "--binary",
         type=Path,
-        default=ROOT / "legal-pdf-parser" / "target" / "release" / "legalpdf.exe",
+        default=PARSER_ROOT / "target" / "release" / "legalpdf.exe",
     )
     parser.add_argument("--manifest", type=Path, default=HERE / "manifest.json")
     parser.add_argument("--raw", type=Path, default=HERE / "raw")
+    parser.add_argument("--corpus-root", type=Path, default=DEFAULT_CORPUS_ROOT)
     parser.add_argument("--document", action="append", default=[])
+    parser.add_argument("--source-doc-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     arguments = parser.parse_args()
     if arguments.self_test:
         self_test()
         return 0
-    Gate(arguments.binary, arguments.manifest, arguments.raw, set(arguments.document)).run()
+    gate = Gate(
+        arguments.binary,
+        arguments.manifest,
+        arguments.raw,
+        arguments.corpus_root,
+        set(arguments.document),
+    )
+    if arguments.source_doc_only:
+        gate.source_docs()
+    else:
+        gate.run()
     return 0
 
 

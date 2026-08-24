@@ -6,11 +6,13 @@
 //! operator. This keeps one text-state machine for pages and nested Forms.
 
 use super::content_stream::strip_pdf_comments;
-use lopdf::content::{Content, Operation};
+use lopdf::content::Operation;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 pub(super) const MAX_EXPANDED_OPERATIONS: usize = 1_000_000;
+const MAX_FORM_XOBJECT_INVOCATIONS: usize = 10_000;
 
 #[derive(Clone, Copy)]
 enum XObject<'a> {
@@ -34,6 +36,7 @@ pub(super) struct ExpandedContent<'a> {
     pub font_names: HashMap<String, String>,
     pub images: HashMap<String, String>,
     pub exceeded_limit: bool,
+    pub form_truncated: bool,
 }
 
 /// Inline every reachable Form XObject into one resource-qualified operation
@@ -80,9 +83,12 @@ struct Expander<'a> {
     fonts: BTreeMap<Vec<u8>, &'a Dictionary>,
     font_names: HashMap<String, String>,
     images: HashMap<String, String>,
+    form_operations: HashMap<ObjectId, Option<Rc<[Operation]>>>,
     active_forms: HashSet<ObjectId>,
     next_name: u64,
     exceeded_limit: bool,
+    form_invocations: usize,
+    form_truncated: bool,
 }
 
 impl<'a> Expander<'a> {
@@ -104,9 +110,12 @@ impl<'a> Expander<'a> {
             fonts,
             font_names: HashMap::new(),
             images,
+            form_operations: HashMap::new(),
             active_forms: HashSet::new(),
             next_name: 0,
             exceeded_limit: false,
+            form_invocations: 0,
+            form_truncated: false,
         }
     }
 
@@ -117,6 +126,7 @@ impl<'a> Expander<'a> {
             font_names: self.font_names,
             images: self.images,
             exceeded_limit: self.exceeded_limit,
+            form_truncated: self.form_truncated,
         }
     }
 
@@ -192,7 +202,7 @@ impl<'a> Expander<'a> {
 
     fn expand_stream(
         &mut self,
-        operations: Vec<Operation>,
+        operations: impl IntoIterator<Item = Operation>,
         resources: &Resources<'a>,
         qualify: bool,
     ) {
@@ -254,25 +264,48 @@ impl<'a> Expander<'a> {
         stream: &'a Stream,
         parent_resources: &Resources<'a>,
     ) {
+        // Depth/cycle checks do not bound an acyclic Form DAG: cap every
+        // invocation shared across this page's expansion.
+        if self.form_invocations >= MAX_FORM_XOBJECT_INVOCATIONS {
+            self.form_truncated = true;
+            return;
+        }
+        self.form_invocations += 1;
         if id.is_some_and(|id| !self.active_forms.insert(id)) {
             log::warn!("skipping recursive Form XObject {id:?}");
             return;
         }
 
-        let raw_data = stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone());
-        let data = strip_pdf_comments(&raw_data);
-        let content = Content::decode(&data);
-        drop(data);
-        drop(raw_data);
-        if let Ok(content) = content {
-            let resources = form_resources(self.doc, stream, parent_resources);
+        let operations = id
+            .and_then(|id| self.form_operations.get(&id).cloned())
+            .unwrap_or_else(|| {
+                let raw = stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                let decoded = super::content_decode::decode_content_bounded(
+                    &strip_pdf_comments(&raw),
+                    super::content_decode::MAX_PAGE_OPERATIONS,
+                )
+                .ok()
+                .flatten()
+                .map(|content| Rc::from(content.operations));
+                if let Some(id) = id {
+                    self.form_operations.insert(id, decoded.clone());
+                }
+                decoded
+            });
+        if let Some(operations) = operations {
+            let owned_resources = stream
+                .dict
+                .get(b"Resources")
+                .ok()
+                .map(|value| form_resources(self.doc, value));
+            let resources = owned_resources.as_ref().unwrap_or(parent_resources);
             self.push(Operation::new("q", Vec::new()));
             if let Some(matrix) = form_matrix(self.doc, stream) {
                 self.push(Operation::new("cm", matrix));
             }
-            self.expand_stream(content.operations, &resources, true);
+            self.expand_stream(operations.iter().cloned(), resources, true);
             self.push(Operation::new("Q", Vec::new()));
         } else {
             log::warn!("skipping undecodable Form XObject {id:?}");
@@ -308,12 +341,8 @@ fn page_resources<'a>(
 
 fn form_resources<'a>(
     doc: &'a Document,
-    stream: &'a Stream,
-    parent: &Resources<'a>,
+    value: &'a Object,
 ) -> Resources<'a> {
-    let Ok(value) = stream.dict.get(b"Resources") else {
-        return parent.clone();
-    };
     let Some(dictionary) = object_dictionary(doc, value) else {
         return Resources::default();
     };

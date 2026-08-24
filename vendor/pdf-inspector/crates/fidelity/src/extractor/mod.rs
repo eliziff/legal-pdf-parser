@@ -2,6 +2,7 @@
 //!
 //! This module extracts text with position information for structure detection.
 
+mod content_decode;
 pub(crate) mod content_stream;
 mod links;
 pub(crate) mod underline;
@@ -21,7 +22,10 @@ use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
-use pdf_inspector_detector::detector::PageDetectionEvidence;
+use pdf_inspector_detector::detector::{
+    detect_from_page_evidence, get_document_title, PageDetectionEvidence,
+};
+use pdf_inspector_detector::{DetectionConfig, PdfTypeResult};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -42,15 +46,22 @@ pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 /// Extract fidelity text and vector geometry from a PDF the caller already loaded.
 pub fn extract_fidelity_from_doc(
     doc: &Document,
-) -> Result<(PageExtraction, Vec<PageDetectionEvidence>), PdfError> {
+) -> Result<(PageExtraction, PdfTypeResult), PdfError> {
     let font_cmaps = FontCMaps::from_doc(doc);
     let (extraction, _, _, evidence) =
         extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
-    Ok((extraction, evidence))
+    let detection = detect_from_page_evidence(
+        &evidence,
+        get_document_title(doc),
+        &DetectionConfig::default(),
+    );
+    Ok((extraction, detection))
 }
 
 /// Merge source-adjacent text runs for layout consumers such as table detectors.
-pub fn merge_text_items_for_layout(items: Vec<TextItem>) -> Vec<TextItem> {
+pub fn merge_text_items_for_layout<'a>(
+    items: impl IntoIterator<Item = &'a TextItem>,
+) -> Vec<TextItem> {
     merge_text_items(items)
 }
 
@@ -542,18 +553,15 @@ fn suppress_table_underlines(
         // text) — suppressing there erased every legitimate underline on
         // the page. Real data-table cells are short values; a cell with
         // hundreds of characters means the grid captured flowing prose.
-        let lens: Vec<usize> = table
+        let (cells, long) = table
             .cells
             .iter()
             .flatten()
             .filter(|cell| !cell.trim().is_empty())
-            .map(|cell| cell.chars().count())
-            .collect();
-        if lens.is_empty() {
-            return false;
-        }
-        let long = lens.iter().filter(|&&n| n > 100).count();
-        (long as f32) < (lens.len() as f32) * 0.3
+            .fold((0, 0), |(cells, long), cell| {
+                (cells + 1, long + usize::from(cell.chars().count() > 100))
+            });
+        cells > 0 && long * 10 < cells * 3
     };
 
     if !rects.is_empty() {
@@ -894,9 +902,8 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     // shape — clearly wide, uniform, ALL-CAPS — because a genuine spaced
     // sequence of single letters ("x y z" variables) has the same gap
     // count; display tracking is a caps convention.
-    let mut sorted = gaps.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let median = sorted[sorted.len() / 2];
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    let median = gaps[gaps.len() / 2];
     // Typographic convention gate, both tiers: display tracking is an
     // all-caps convention, and Han/Kana never space between glyphs. Mixed-
     // or lowercase Latin runs keep their boundaries because geometry alone
@@ -919,7 +926,7 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
             return None;
         }
     } else {
-        let uniform = sorted[sorted.len() - 1] <= sorted[0].max(0.01) * 1.4;
+        let uniform = gaps[gaps.len() - 1] <= gaps[0].max(0.01) * 1.4;
         if median < 0.09 || !uniform {
             return None;
         }
@@ -936,7 +943,7 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     // cluster: split at the largest relative jump. Unimodal → one word.
     let mut best_jump = 1.0f32;
     let mut floor = f32::INFINITY;
-    for pair in sorted.windows(2) {
+    for pair in gaps.windows(2) {
         let (lo, hi) = (pair[0].max(0.01), pair[1].max(0.01));
         let jump = hi / lo;
         if jump > best_jump {
@@ -950,31 +957,37 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
-pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    if items.is_empty() {
-        return items;
-    }
-
+pub(crate) fn merge_text_items<'a>(
+    items: impl IntoIterator<Item = &'a TextItem>,
+) -> Vec<TextItem> {
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
     let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    let mut line_buckets: HashMap<(u32, i32), Vec<usize>> = HashMap::new();
 
-    for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
+    for item in items {
+        let bucket = (item.y / y_tolerance).floor() as i32;
+        let found = (bucket.saturating_sub(1)..=bucket.saturating_add(1))
+            .filter_map(|nearby| line_buckets.get(&(item.page, nearby)))
+            .flatten()
+            .copied()
+            .filter(|&index| (item.y - line_groups[index].1).abs() < y_tolerance)
+            .min();
+        if let Some(index) = found {
+            line_groups[index].2.push(item);
         } else {
+            line_buckets
+                .entry((item.page, bucket))
+                .or_default()
+                .push(line_groups.len());
             line_groups.push((item.page, item.y, vec![item]));
         }
     }
 
-    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool)> = Vec::new();
+    line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    let mut merged = Vec::new();
 
-    // Sort each group by X position (direction-aware), except for lines whose
-    // content stream intentionally backtracks to overlay ActualText fragments.
-    for (page, y, mut group) in line_groups {
+    for (_, _, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
@@ -982,15 +995,6 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
-        ordered_line_groups.push((page, y, group, preserve_stream_order));
-    }
-
-    // Sort groups by page then Y descending (top of page first)
-    ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
-
-    let mut merged = Vec::new();
-
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -999,10 +1003,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
-            let tracked = if *preserve_stream_order {
+            let tracked = if preserve_stream_order {
                 None
             } else {
-                tracked_run_space_floor(group, i)
+                tracked_run_space_floor(&group, i)
             };
 
             let mut j = i + 1;
@@ -1026,7 +1030,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     break;
                 }
                 let gap = next.x - end_x;
-                let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
+                let x_gap_max = if preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
                 } else {
                     first.font_size * 0.5
@@ -1056,7 +1060,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                         first.font_size * 0.08
                     }
                 };
-                let needs_bullet_space = *preserve_stream_order
+                let needs_bullet_space = preserve_stream_order
                     && is_standalone_bullet_text(&text)
                     && !next.text.trim().is_empty();
                 let effective_threshold = match tracked {
@@ -1068,7 +1072,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 }
                 text.push_str(&next.text);
                 let next_end = next.x + effective_merge_width(next);
-                end_x = if *preserve_stream_order {
+                end_x = if preserve_stream_order {
                     end_x.max(next_end)
                 } else {
                     next_end
@@ -1294,7 +1298,7 @@ mod tests {
         // Display tracking: every letter gap (0.19 em) clears the fixed
         // space threshold — without the run-local floor this reads "H O W".
         let items = glyph_run("HOW", 100.0, 10.0, 2.3);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "HOW");
     }
@@ -1311,7 +1315,7 @@ mod tests {
         for i in 4..6 {
             items[i].x += 2.8; // word gap at S|O
         }
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "IT IS OK");
     }
@@ -1321,7 +1325,7 @@ mod tests {
         // "x y z" variables: same gap shape but lowercase — the short-run
         // caps requirement keeps genuine spaced singles apart.
         let items = glyph_run("xyz", 100.0, 6.0, 2.3);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "x y z");
     }
@@ -1330,7 +1334,7 @@ mod tests {
     fn kerned_singles_unaffected() {
         // Tiny kerning gaps never triggered spaces before and still don't.
         let items = glyph_run("WORD", 100.0, 8.0, 0.3);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "WORD");
     }
@@ -1341,7 +1345,7 @@ mod tests {
         // shape at any length — the convention gate must protect it in
         // the >=4-gap tier too.
         let items = glyph_run("abcde", 100.0, 6.0, 2.3);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "a b c d e");
     }
@@ -1354,7 +1358,7 @@ mod tests {
         for item in items.iter_mut().skip(3) {
             item.x += 3.0; // wide gap after the third glyph
         }
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "北京时事快报");
     }
@@ -1364,7 +1368,7 @@ mod tests {
         // "A b c d e" is indistinguishable from a title-case tracked word
         // without reliable tracking metadata, so preserve its boundaries.
         let items = glyph_run("Abcde", 100.0, 7.0, 2.3);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "A b c d e");
     }
@@ -1374,7 +1378,7 @@ mod tests {
         // CJK sets one glyph per item with loose gaps; CJK uses no spaces,
         // and the non-alphabetic run passes the caps gate.
         let items = glyph_run("北京时事", 100.0, 12.0, 1.4);
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "北京时事");
     }
@@ -1439,7 +1443,7 @@ mod tests {
             underlined,
             make_merge_item("plain tail", 218.0, 45.0),
         ];
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 4);
         assert!(merged[1].is_italic && !merged[1].is_underline);
         assert!(merged[2].is_underline && !merged[2].is_italic);
@@ -1454,7 +1458,7 @@ mod tests {
             make_merge_item("date", 227.25, 89.25), // end = 316.50
             make_merge_item(".", 318.00, 3.0),      // gap = 1.50 (0.125 × fs)
         ];
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "date.");
     }
@@ -1467,7 +1471,7 @@ mod tests {
             make_merge_item("deve", 100.0, 30.0),    // end = 130.0
             make_merge_item("lopers", 131.44, 40.0), // gap = 1.44 (0.12 × 12)
         ];
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "developers");
     }
@@ -1479,7 +1483,7 @@ mod tests {
             make_merge_item("hello", 100.0, 30.0),
             make_merge_item("world", 132.0, 30.0), // gap = 2.0 (0.167 × 12)
         ];
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "hello world");
     }
@@ -1496,7 +1500,7 @@ mod tests {
         ];
         items[1].is_underline = true;
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].text, "pre");
@@ -1518,7 +1522,7 @@ mod tests {
             with_mcid(make_merge_item("ready content", 210.5, 60.8)),
         ];
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(
@@ -1535,7 +1539,7 @@ mod tests {
             with_mcid(make_merge_item("w fields created", 68.0, 82.0)),
         ];
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "New fields created");
@@ -1549,7 +1553,7 @@ mod tests {
             make_merge_item("w fields created", 68.2, 82.0),
         ];
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         let texts: Vec<_> = merged.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(texts, vec!["N", "w fields created", "e"]);
@@ -1563,7 +1567,7 @@ mod tests {
             with_mcid(make_merge_item("A LoS project", 84.4, 70.0)),
         ];
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "• The MSA LoS project");
@@ -1576,7 +1580,7 @@ mod tests {
             make_merge_item("Distant item", 91.0, 60.0),
         ];
 
-        let merged = merge_text_items(items);
+        let merged = merge_text_items(&items);
 
         let texts: Vec<_> = merged.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(texts, vec!["•", "Distant item"]);

@@ -4,6 +4,5 @@ mod pdf;
 pub use error::{Error, Result};
 pub use legal_pdf_core::union_bbox;
 pub use pdf::{
-    assemble_pdf, inspect_pdf, load_extraction_document, page_dimensions, pdf_page_count,
-    project_table, ExtractedPdf, PdfInspection,
+    assemble_pdf, load_extraction_document, page_dimensions, project_table, ExtractedPdf,
 };

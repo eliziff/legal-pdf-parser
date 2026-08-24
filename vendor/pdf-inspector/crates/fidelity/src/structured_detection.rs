@@ -77,12 +77,18 @@ fn item_bbox(table: &Table, items: &[TextItem]) -> Option<[f32; 4]> {
     ))
 }
 
+fn caption_remainder(text: &str) -> Option<&str> {
+    let text = text.trim();
+    text.get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("table "))
+        .map(|_| &text[6..])
+        .or_else(|| text.get(..8)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("tableau "))
+            .map(|_| &text[8..]))
+}
+
 fn is_caption(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    let Some(rest) = lower
-        .strip_prefix("table ")
-        .or_else(|| lower.strip_prefix("tableau "))
-    else {
+    let Some(rest) = caption_remainder(text) else {
         return false;
     };
     let token = rest.split_whitespace().next().unwrap_or("");
@@ -95,17 +101,14 @@ fn is_caption(text: &str) -> bool {
                 .starts_with([':', '.', '-', '–', '—']))
 }
 
-fn has_nearby_caption(table: &Table, items: &[TextItem]) -> bool {
-    let Some([left, _, right, top]) = item_bbox(table, items) else {
-        return false;
-    };
+fn has_nearby_caption(table: &Table, items: &[TextItem], [left, _, right, top]: [f32; 4]) -> bool {
     items.iter().enumerate().any(|(index, item)| {
-        !table.item_indices.contains(&index)
-            && is_caption(&item.text)
+        is_caption(&item.text)
             && item.y + item.height >= top - 5.0
             && item.y <= top + 60.0
             && item.x < right
             && item.x + item.width > left
+            && !table.item_indices.contains(&index)
     })
 }
 
@@ -167,9 +170,7 @@ pub fn detect_structured_tables(
         let page_items = merge_text_items_for_layout(
             page_values(items, page, |item| item.page)
                 .iter()
-                .filter(|item| matches!(item.item_type, ItemType::Text))
-                .cloned()
-                .collect(),
+                .filter(|item| matches!(item.item_type, ItemType::Text)),
         );
         if page_items.is_empty() {
             continue;
@@ -223,14 +224,16 @@ pub fn detect_structured_tables(
                     .into_iter()
                     .filter(|table| !is_table_of_contents(&table.cells))
                     .filter(|table| {
-                        has_nearby_caption(table, &page_items)
-                            || item_bbox(table, &page_items).is_some_and(|bbox| {
-                                let shape = Shape::of(table);
-                                f64::from((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
-                                    >= width * height * 0.15
-                                    && repeated_multi_cell_rows(table)
-                                    && shape.populated * 5 > shape.slots * 2
-                            })
+                        let Some(bbox) = item_bbox(table, &page_items) else {
+                            return false;
+                        };
+                        has_nearby_caption(table, &page_items, bbox) || {
+                            let shape = Shape::of(table);
+                            f64::from((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+                                >= width * height * 0.15
+                                && repeated_multi_cell_rows(table)
+                                && shape.populated * 5 > shape.slots * 2
+                        }
                     })
                     .collect();
                 if !tables.is_empty() {
@@ -261,10 +264,9 @@ pub fn detect_structured_tables(
         }
         if tables.is_empty() {
             (method, confidence) = ("text-geometry", 0.75);
-            let caption = page_items.iter().any(|item| {
-                let text = item.text.trim().to_ascii_lowercase();
-                text.starts_with("table ") || text.starts_with("tableau ")
-            });
+            let caption = page_items
+                .iter()
+                .any(|item| caption_remainder(&item.text).is_some());
             tables = text_tables()
                 .into_iter()
                 .filter(|table| {

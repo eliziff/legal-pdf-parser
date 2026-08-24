@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -38,7 +38,7 @@ struct DeferredOcrProvider<'a> {
 impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
     fn extract_pages(
         &mut self,
-        pdf_path: &Path,
+        pdf: &[u8],
         requests: &[legal_pdf_core::OcrPageRequest],
     ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
         if requests.is_empty() {
@@ -54,7 +54,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         }
         legal_pdf_core::PdfOcrProvider::extract_pages(
             self.runtime.as_mut().expect("OCR runtime initialized"),
-            pdf_path,
+            pdf,
             requests,
         )
     }
@@ -72,7 +72,8 @@ struct CachedExtraction {
 pub(crate) struct ParseOptions {
     pub cache_dir: Option<PathBuf>,
     pub use_cache: bool,
-    pub verified_source_sha256: Option<String>,
+    pub expected_source_sha256: Option<String>,
+    pub source_name: Option<String>,
     #[cfg(feature = "ocr")]
     pub ocr: Option<OcrOptions>,
     /// Zero-based pages eligible for OCR. Native extraction still inspects the
@@ -87,7 +88,8 @@ impl Default for ParseOptions {
         Self {
             cache_dir: None,
             use_cache: true,
-            verified_source_sha256: None,
+            expected_source_sha256: None,
+            source_name: None,
             #[cfg(feature = "ocr")]
             ocr: None,
             ocr_pages: None,
@@ -112,23 +114,6 @@ fn default_cache_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("OpenLegalData/legalpdf")
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let file = File::open(path).map_err(|source| Error::io(path, source))?;
-    let mut reader = BufReader::new(file);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|source| Error::io(path, source))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn insert_digests(identity: &mut BTreeMap<String, Value>, digests: &[(&str, &str)]) {
@@ -166,6 +151,13 @@ fn engine_identity() -> &'static Value {
                 }),
             ),
         ]);
+        identity.insert(
+            "Cargo.lock".to_owned(),
+            Value::String(format!(
+                "{:x}",
+                Sha256::digest(include_bytes!("../../Cargo.lock"))
+            )),
+        );
         insert_digests(
             &mut identity,
             &[
@@ -354,7 +346,7 @@ fn cache_key(
 }
 
 fn build_document(
-    path: &Path,
+    source_name: String,
     source_hash: &str,
     key: &str,
     identity: &Value,
@@ -410,9 +402,6 @@ fn build_document(
     );
     provenance.insert("engine_code".to_owned(), identity.clone());
     let status = status(&extracted.diagnostics, &extracted.pages);
-    let source_name = path
-        .file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
     let mut pdf_source_map = derived.pdf_source_map;
     pdf_source_map.table_ids = extracted
         .tables
@@ -506,30 +495,35 @@ fn maybe_prune_document_cache(root: &Path) {
     }
 }
 
-pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Result<LegalDocument> {
+pub(crate) fn parse_pdf(
+    bytes: Option<&[u8]>,
+    options: &ParseOptions,
+) -> Result<Option<LegalDocument>> {
     let _profile = profile::scope("parse_pdf");
-    let path = path.as_ref();
-    if !path.is_file() {
-        return Err(Error::Message(format!(
-            "PDF does not exist: {}",
-            path.display()
-        )));
-    }
-    if path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("pdf"))
-        != Some(true)
-    {
-        return Err(Error::Message(format!(
-            "input must be a PDF: {}",
-            path.display()
-        )));
-    }
-    let path = fs::canonicalize(path).map_err(|source| Error::io(path, source))?;
-    let source_hash = match &options.verified_source_sha256 {
-        Some(value) => value.clone(),
-        None => profile::measure("source_sha256", || sha256_file(&path))?,
+    let source_hash = if let Some(bytes) = bytes {
+        if bytes.is_empty()
+            || bytes.len() > 100 * 1024 * 1024
+            || !bytes[..bytes.len().min(1024)]
+                .windows(5)
+                .any(|window| window == b"%PDF-")
+        {
+            return Err(Error::Message("PDF source bytes are invalid".to_owned()));
+        }
+        let actual = profile::measure("source_sha256", || {
+            format!("{:x}", Sha256::digest(bytes))
+        });
+        if options
+            .expected_source_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != actual)
+        {
+            return Err(Error::Message("PDF source changed after preparation began".to_owned()));
+        }
+        actual
+    } else {
+        options.expected_source_sha256.clone().ok_or_else(|| {
+            Error::Message("PDF cache lookup requires expected_source_sha256".to_owned())
+        })?
     };
     let identity = engine_identity();
     #[cfg(feature = "ocr")]
@@ -592,6 +586,10 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                     })
             });
             if let Some(mut cached) = cached {
+                cached.source_name = options
+                    .source_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{source_hash}.pdf"));
                 profile::measure("project_structure", || project_structure(&mut cached));
                 cached
                     .provenance
@@ -600,11 +598,14 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
                     .provenance
                     .insert("cache_enabled".to_owned(), Value::Bool(true));
                 touch_cache(&path);
-                return Ok(cached);
+                return Ok(Some(cached));
             }
             let _ = fs::remove_file(path);
         }
     }
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
     #[cfg(feature = "ocr")]
     let mut ocr_provider = options
         .ocr
@@ -622,7 +623,7 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
     #[cfg(not(feature = "ocr"))]
     let selected_ocr = None;
     let mut extracted = profile::measure("extract_pdf", || {
-        extract_pdf(&path, selected_ocr, options.ocr_pages.as_deref())
+        extract_pdf(bytes, selected_ocr, options.ocr_pages.as_deref())
     })?;
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
@@ -638,12 +639,15 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
         extracted
             .diagnostics
             .extend(profile::measure("ppdoc_annotate", || {
-                provider.annotate_pdf(&path, &mut extracted.pages)
+                provider.annotate_pdf(bytes, &mut extracted.pages)
             })?);
     }
     let mut parsed = profile::measure("build_document", || {
         build_document(
-            &path,
+            options
+                .source_name
+                .clone()
+                .unwrap_or_else(|| format!("{source_hash}.pdf")),
             &source_hash,
             &key,
             identity,
@@ -678,7 +682,7 @@ pub(crate) fn parse_pdf(path: impl AsRef<Path>, options: &ParseOptions) -> Resul
             });
         }
     }
-    Ok(parsed)
+    Ok(Some(parsed))
 }
 
 trait FrozenOrder {
@@ -873,7 +877,7 @@ pub fn corpus_check_cached_extraction(
     let source_sha256 = cached.source_sha256.clone();
     let cache_key = cached.cache_key.clone();
     let document = build_document(
-        Path::new(&source_name),
+        source_name,
         &source_sha256,
         &cache_key,
         engine_identity(),

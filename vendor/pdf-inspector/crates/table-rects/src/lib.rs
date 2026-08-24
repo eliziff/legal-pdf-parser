@@ -13,7 +13,7 @@ pub mod tables {
 
     mod detect_rects;
 
-    pub use detect_rects::{detect_chart_regions, detect_tables_from_rects, RectHintRegion};
+    pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
 }
 
 pub use tables::*;
