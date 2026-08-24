@@ -1,5 +1,4 @@
 use regex::{Regex, RegexSet};
-use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -345,8 +344,7 @@ pub fn heading_text_plausible(value: &str) -> bool {
     static POSSESSIVE: OnceLock<Regex> = OnceLock::new();
     let citation_text = POSSESSIVE
         .get_or_init(|| Regex::new(r"(?i)([A-Za-z])['’]s\b").expect("possessive suffix regex"))
-        .replace_all(text, "$1")
-        .into_owned();
+        .replace_all(text, "$1");
     if has_legal_citation_cue(&citation_text) || has_citation_signal(&citation_text) {
         return false;
     }
@@ -399,7 +397,9 @@ fn roman_to_int(value: &str) -> Option<u32> {
     (total > 0 && total <= MAX_COUNTER_VALUE).then_some(total)
 }
 
-pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<Value> {
+pub type EnumeratorInterpretation = (String, u32, usize);
+
+pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<EnumeratorInterpretation> {
     static LEGAL_NUMERIC: OnceLock<Regex> = OnceLock::new();
     static ROMAN: OnceLock<Regex> = OnceLock::new();
     let mut result = Vec::new();
@@ -408,23 +408,22 @@ pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<Value> {
         .is_match(value)
     {
         let parts = value.split('.').collect::<Vec<_>>();
-        let tail = parts.last().and_then(|part| part.parse::<u32>().ok());
-        if tail.is_some_and(|number| (1..=MAX_COUNTER_VALUE).contains(&number)) {
-            result.push(json!([format!("legal_numeric_{punct}"), tail, parts.len()]));
+        if let Some(tail) = parts
+            .last()
+            .and_then(|part| part.parse::<u32>().ok())
+            .filter(|number| (1..=MAX_COUNTER_VALUE).contains(number))
+        {
+            result.push((format!("legal_numeric_{punct}"), tail, parts.len()));
         }
         return result;
     }
     if value.chars().all(|character| character.is_ascii_digit()) {
-        if value
+        if let Some(number) = value
             .parse::<u32>()
             .ok()
-            .is_some_and(|number| (1..=MAX_COUNTER_VALUE).contains(&number))
+            .filter(|number| (1..=MAX_COUNTER_VALUE).contains(number))
         {
-            result.push(json!([
-                format!("numeric_{punct}"),
-                value.parse::<u32>().unwrap(),
-                0
-            ]));
+            result.push((format!("numeric_{punct}"), number, 0));
         }
         return result;
     }
@@ -435,7 +434,7 @@ pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<Value> {
             .is_match(&upper)
     {
         if let Some(number) = roman_to_int(value) {
-            result.push(json!([format!("roman_{punct}"), number, 0]));
+            result.push((format!("roman_{punct}"), number, 0));
         }
         return result;
     }
@@ -447,130 +446,130 @@ pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<Value> {
         };
         if value == upper && "IVXLCDM".contains(&upper) {
             if let Some(number) = roman_to_int(value) {
-                result.push(json!([format!("roman_{punct}"), number, 0]));
+                result.push((format!("roman_{punct}"), number, 0));
             }
         }
         let character = upper.chars().next().unwrap();
         let number = u32::from(character).wrapping_sub(u32::from('A')) + 1;
-        result.push(json!([format!("{family}_{punct}"), number, 0]));
+        result.push((format!("{family}_{punct}"), number, 0));
     }
     result
 }
 
-#[derive(Clone)]
-struct Frame {
-    family: String,
+#[derive(Clone, Copy)]
+struct Frame<'a> {
+    family: &'a str,
     value: u32,
 }
 
-#[derive(Default)]
-struct FamilyStats {
-    count: usize,
-    max_value: u32,
-    level_votes: BTreeMap<usize, usize>,
-    violations: usize,
-    gaps: usize,
+#[derive(Debug, Default)]
+pub struct HeadingFamilyStats {
+    pub count: usize,
+    pub max_value: u32,
+    pub level_votes: BTreeMap<usize, usize>,
+    pub violations: usize,
+    pub gaps: usize,
+    pub footnote_suspect: bool,
 }
 
-fn interpretations(candidate: &Value) -> Vec<(String, u32, usize)> {
-    candidate
-        .get("interpretations")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let values = item.as_array()?;
-            Some((
-                values.first()?.as_str()?.to_owned(),
-                u32::try_from(values.get(1)?.as_u64()?).ok()?,
-                usize::try_from(values.get(2)?.as_u64()?).ok()?,
-            ))
-        })
-        .collect()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeadingAction {
+    Increment,
+    OpenLevel,
+    IllegalRestart,
+    JumpForward,
+    OpenMidcounter,
+    Violation,
 }
 
-fn assigned(candidate: &Value, family: &str, value: Value, level: Value, action: &str) -> Value {
-    let mut result = candidate.as_object().cloned().unwrap_or_default();
-    result.insert("family".to_owned(), Value::String(family.to_owned()));
-    result.insert("value".to_owned(), value);
-    result.insert("level".to_owned(), level);
-    result.insert("action".to_owned(), Value::String(action.to_owned()));
-    Value::Object(result)
+#[derive(Debug)]
+pub struct HeadingAssignment<'a> {
+    pub family: &'a str,
+    pub value: Option<u32>,
+    pub level: Option<usize>,
+    pub action: HeadingAction,
 }
 
-pub fn parse_heading_ladder(candidates: &[Value]) -> Value {
-    let mut stack: Vec<Frame> = Vec::new();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeadingLadderStatus {
+    NoEnumerators,
+    ParsedClean,
+    ParsedWithViolations,
+    Unparseable,
+}
+
+#[derive(Debug)]
+pub struct HeadingLadder<'a> {
+    pub assignments: Vec<HeadingAssignment<'a>>,
+    pub violations: usize,
+    pub gaps: usize,
+    pub families: BTreeMap<&'a str, HeadingFamilyStats>,
+    pub status: HeadingLadderStatus,
+}
+
+pub fn parse_heading_ladder<'a>(
+    candidates: impl IntoIterator<Item = &'a [EnumeratorInterpretation]>,
+) -> HeadingLadder<'a> {
+    let mut stack: Vec<Frame<'a>> = Vec::new();
     let mut assignments = Vec::new();
-    let mut stats: BTreeMap<String, FamilyStats> = BTreeMap::new();
+    let mut families: BTreeMap<&'a str, HeadingFamilyStats> = BTreeMap::new();
     let mut violations = 0_usize;
     let mut gaps = 0_usize;
+    let mut enumerator_count = 0_usize;
 
-    for candidate in candidates {
-        if candidate.get("kind").and_then(Value::as_str) != Some("enumerator") {
-            assignments.push(assigned(
-                candidate,
-                "",
-                Value::Null,
-                Value::Null,
-                "caps_observed",
-            ));
-            continue;
-        }
-        let choices = interpretations(candidate);
-        let mut chosen: Option<(String, u32, &'static str, usize)> = None;
-        for (family, value, _) in &choices {
-            if let Some(index) = stack.iter().rposition(|frame| &frame.family == family) {
+    for choices in candidates {
+        enumerator_count += 1;
+        let mut chosen: Option<(&'a str, u32, HeadingAction, usize)> = None;
+        for (family, value, _) in choices {
+            if let Some(index) = stack.iter().rposition(|frame| frame.family == family) {
                 if stack[index].value + 1 == *value {
                     stack.truncate(index + 1);
                     stack[index].value = *value;
-                    chosen = Some((family.clone(), *value, "increment", index + 1));
+                    chosen = Some((family, *value, HeadingAction::Increment, index + 1));
                     break;
                 }
             }
         }
         if chosen.is_none() {
-            for (family, value, _) in &choices {
+            for (family, value, _) in choices {
                 if *value == 1
-                    && !stack.iter().any(|frame| &frame.family == family)
+                    && !stack.iter().any(|frame| frame.family == family)
                     && stack.len() < MAX_OUTLINE_DEPTH
                 {
-                    stack.push(Frame {
-                        family: family.clone(),
-                        value: 1,
-                    });
-                    chosen = Some((family.clone(), *value, "open_level", stack.len()));
+                    stack.push(Frame { family, value: 1 });
+                    chosen = Some((family, *value, HeadingAction::OpenLevel, stack.len()));
                     break;
                 }
             }
         }
         if chosen.is_none() {
-            for (family, value, _) in &choices {
-                if let Some(index) = stack.iter().rposition(|frame| &frame.family == family) {
+            for (family, value, _) in choices {
+                if let Some(index) = stack.iter().rposition(|frame| frame.family == family) {
                     if *value == 1 {
                         stack.truncate(index + 1);
                         stack[index].value = 1;
-                        chosen = Some((family.clone(), *value, "illegal_restart", index + 1));
+                        chosen = Some((family, *value, HeadingAction::IllegalRestart, index + 1));
                         break;
                     }
                     if *value > stack[index].value + 1 {
                         stack.truncate(index + 1);
                         stack[index].value = *value;
-                        chosen = Some((family.clone(), *value, "jump_forward", index + 1));
+                        chosen = Some((family, *value, HeadingAction::JumpForward, index + 1));
                         break;
                     }
                 }
             }
         }
         if chosen.is_none() {
-            for (family, value, _) in &choices {
-                if !stack.iter().any(|frame| &frame.family == family)
+            for (family, value, _) in choices {
+                if !stack.iter().any(|frame| frame.family == family)
                     && stack.len() < MAX_OUTLINE_DEPTH
                 {
                     stack.push(Frame {
-                        family: family.clone(),
+                        family,
                         value: *value,
                     });
-                    chosen = Some((family.clone(), *value, "open_midcounter", stack.len()));
+                    chosen = Some((family, *value, HeadingAction::OpenMidcounter, stack.len()));
                     break;
                 }
             }
@@ -578,84 +577,62 @@ pub fn parse_heading_ladder(candidates: &[Value]) -> Value {
         let Some((family, value, action, level)) = chosen else {
             let (family, value) = choices
                 .first()
-                .map(|(family, value, _)| (family.clone(), Some(*value)))
-                .unwrap_or_else(|| ("unknown".to_owned(), None));
+                .map(|(family, value, _)| (family.as_str(), Some(*value)))
+                .unwrap_or(("unknown", None));
             violations += 1;
-            stats.entry(family.clone()).or_default().violations += 1;
-            assignments.push(assigned(
-                candidate,
-                &family,
-                value.map_or(Value::Null, |number| json!(number)),
-                Value::Null,
-                "violation",
-            ));
+            families.entry(family).or_default().violations += 1;
+            assignments.push(HeadingAssignment {
+                family,
+                value,
+                level: None,
+                action: HeadingAction::Violation,
+            });
             continue;
         };
-        let family_stats = stats.entry(family.clone()).or_default();
-        if action == "illegal_restart" {
+        let family_stats = families.entry(family).or_default();
+        if action == HeadingAction::IllegalRestart {
             violations += 1;
             family_stats.violations += 1;
-        } else if matches!(action, "jump_forward" | "open_midcounter") {
+        } else if matches!(
+            action,
+            HeadingAction::JumpForward | HeadingAction::OpenMidcounter
+        ) {
             gaps += 1;
             family_stats.gaps += 1;
         }
         family_stats.count += 1;
         family_stats.max_value = family_stats.max_value.max(value);
         *family_stats.level_votes.entry(level).or_default() += 1;
-        assignments.push(assigned(
-            candidate,
-            &family,
-            json!(value),
-            json!(level),
+        assignments.push(HeadingAssignment {
+            family,
+            value: Some(value),
+            level: Some(level),
             action,
-        ));
+        });
     }
 
-    let families = stats
-        .into_iter()
-        .map(|(family, stats)| {
-            let footnote_suspect = (family.starts_with("numeric_")
-                || family.starts_with("legal_numeric_"))
-                && stats.max_value >= FOOTNOTE_SUSPECT_MIN_VALUE
-                && stats.level_votes.len() == 1;
-            let level_votes = stats
-                .level_votes
-                .into_iter()
-                .map(|(level, count)| (level.to_string(), json!(count)))
-                .collect::<Map<_, _>>();
-            (
-                family,
-                json!({
-                    "count": stats.count,
-                    "max_value": stats.max_value,
-                    "violations": stats.violations,
-                    "gaps": stats.gaps,
-                    "level_votes": level_votes,
-                    "footnote_suspect": footnote_suspect,
-                }),
-            )
-        })
-        .collect::<Map<_, _>>();
-    let enumerator_count = assignments
-        .iter()
-        .filter(|row| row.get("action").and_then(Value::as_str) != Some("caps_observed"))
-        .count();
+    for (family, stats) in &mut families {
+        stats.footnote_suspect = (family.starts_with("numeric_")
+            || family.starts_with("legal_numeric_"))
+            && stats.max_value >= FOOTNOTE_SUSPECT_MIN_VALUE
+            && stats.level_votes.len() == 1;
+    }
     let status = if enumerator_count == 0 {
-        "no_enumerators"
+        HeadingLadderStatus::NoEnumerators
     } else if violations == 0 {
-        "parsed_clean"
+        HeadingLadderStatus::ParsedClean
     } else if violations <= (enumerator_count / 5).max(1) {
-        "parsed_with_violations"
+        HeadingLadderStatus::ParsedWithViolations
     } else {
-        "unparseable"
+        HeadingLadderStatus::Unparseable
     };
-    json!({
-        "assignments": assignments,
-        "violations": violations,
-        "gaps": gaps,
-        "families": families,
-        "status": status,
-    })
+    HeadingLadder {
+        assignments,
+        violations,
+        gaps,
+        families,
+        status,
+    }
 }
 
 #[cfg(test)]

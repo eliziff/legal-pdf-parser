@@ -7,4 +7,4 @@ license = "MIT"
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-pdf-extraction-processor = { path = "../legal-pdf-extraction-processor" }
-pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", branch = "pdf-inspector", default-features = false }
+pdf-inspector = { workspace = true }

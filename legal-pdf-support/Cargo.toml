@@ -13,7 +13,7 @@ ppdoc = ["ppdoc-openvino", "dep:ort", "legal-pdf-core/ort-runtime"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
-legal-structure = { path = "../../legal-structure" }
+legal-structure = { workspace = true }
 hayro = { version = "0.7.0", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libloading = { version = "0.8", optional = true }

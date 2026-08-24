@@ -1,9 +1,9 @@
 pub use legal_structure::{Derivation, DocumentStructure, NodeKind, ScalarRange, StructureNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-pub const SCHEMA_VERSION: &str = "legalpdf.document.v3";
+pub const SCHEMA_VERSION: &str = "legalpdf.document.v4";
 pub const PARSER_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +35,15 @@ pub struct Span {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetachedReference {
+    pub note_id: String,
+    pub selected_text: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub source_line_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     pub id: String,
     pub page_index: usize,
@@ -49,7 +58,7 @@ pub struct Line {
     #[serde(default)]
     pub words: Vec<Word>,
     #[serde(default)]
-    pub detached_references: Vec<Value>,
+    pub detached_references: Vec<DetachedReference>,
     #[serde(default)]
     pub exclude_from_body: bool,
     #[serde(default)]
@@ -84,29 +93,6 @@ pub struct Region {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TableBlock {
-    pub id: String,
-    pub page_index: usize,
-    pub page_number: u32,
-    pub bbox: [f64; 4],
-    pub cells: Vec<Vec<String>>,
-    pub provenance: String,
-    pub confidence: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImageBlock {
-    pub id: String,
-    pub page_index: usize,
-    pub page_number: u32,
-    pub bbox: [f64; 4],
-    pub source_name: String,
-    pub area_ratio: f64,
-    pub route: String,
-    pub route_reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     pub id: String,
     pub index: usize,
@@ -132,6 +118,13 @@ const fn one() -> f64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParagraphAnchor {
+    pub pair_id: String,
+    pub label: String,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paragraph {
     pub id: String,
     pub page_index: usize,
@@ -139,7 +132,20 @@ pub struct Paragraph {
     pub text: String,
     pub line_ids: Vec<String>,
     #[serde(default)]
-    pub anchors: Vec<Value>,
+    pub anchors: Vec<ParagraphAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FootnoteCrossref {
+    pub source_pair_id: String,
+    pub kind: String,
+    pub number: u32,
+    pub shortform: String,
+    pub start: usize,
+    pub end: usize,
+    pub resolved: bool,
+    pub target_pair_id: String,
+    pub target_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,7 +166,7 @@ pub struct Footnote {
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
-    pub crossrefs: Vec<Value>,
+    pub crossrefs: Vec<FootnoteCrossref>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,61 +206,22 @@ impl Diagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RepairRecord {
-    pub page_index: usize,
-    pub status: String,
-    pub model: String,
-    pub effort: String,
-    pub prompt_version: String,
-    pub cache_key: String,
-    pub attempts: usize,
-    pub elapsed_seconds: f64,
-    pub input_line_hash: String,
-    #[serde(default)]
-    pub output_hash: String,
-    #[serde(default)]
-    pub token_usage: Map<String, Value>,
-    #[serde(default)]
-    pub error: String,
-    #[serde(default)]
-    pub scope_pages: Vec<usize>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PdfSourceSpan {
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PdfSourceExtent {
-    pub id: String,
-    pub page_indexes: Vec<usize>,
-    pub line_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PdfPageIdentity {
-    pub physical_index: usize,
-    pub physical_number: u32,
-    pub printed_folio: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PdfSourceMap {
-    pub pages: Vec<PdfPageIdentity>,
-    pub nodes: Vec<PdfSourceExtent>,
-    pub note_references: Vec<PdfSourceExtent>,
-    pub protected_citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
-    pub table_ids: Vec<String>,
-    pub image_ids: Vec<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PdfPairingAudit {
     pub markers: Vec<Value>,
     pub pairing_summary: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PdfExtractionMetadata {
+    pub pages_needing_ocr: Vec<usize>,
+    pub ocr_routed_pages: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -267,14 +234,8 @@ pub struct LegalDocument {
     pub pages: Vec<Page>,
     pub paragraphs: Vec<Paragraph>,
     pub footnotes: Vec<Footnote>,
-    pub tables: Vec<TableBlock>,
-    pub images: Vec<ImageBlock>,
     pub structure_graph: DocumentStructure,
-    pub pdf_source_map: PdfSourceMap,
-    pub pairing_audit: Option<PdfPairingAudit>,
     pub diagnostics: Vec<Diagnostic>,
-    #[serde(default)]
-    pub repairs: Vec<RepairRecord>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
     #[serde(default)]
@@ -296,14 +257,6 @@ fn parser_version() -> String {
 impl LegalDocument {
     pub fn line_count(&self) -> usize {
         self.pages.iter().map(|page| page.lines.len()).sum()
-    }
-
-    pub fn text(&self) -> String {
-        self.paragraphs
-            .iter()
-            .map(|paragraph| paragraph.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
     }
 }
 
@@ -344,27 +297,7 @@ pub struct PairingOutput {
     pub diagnostics: Vec<Diagnostic>,
     pub anchors: HashMap<String, Vec<Anchor>>,
     pub pair_claims: Vec<NotePairClaim>,
-    pub markers: Vec<Value>,
-    pub summary: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FootnoteLookup {
-    pub status: String,
-    pub query: String,
-    pub matches: Vec<String>,
-    #[serde(default)]
-    pub footnote: Option<Footnote>,
-    #[serde(default = "sentence_mode")]
-    pub proposition_mode: String,
-    #[serde(default)]
-    pub proposition: String,
-    #[serde(default)]
-    pub context: String,
-}
-
-fn sentence_mode() -> String {
-    "sentence".to_owned()
+    pub pairing_audit: Option<PdfPairingAudit>,
 }
 
 #[cfg(test)]
@@ -384,6 +317,6 @@ mod tests {
         let value = serde_json::to_value(region).unwrap();
         assert_eq!(value["type"], "body");
         assert!(value.get("kind").is_none());
-        assert_eq!(SCHEMA_VERSION, "legalpdf.document.v3");
+        assert_eq!(SCHEMA_VERSION, "legalpdf.document.v4");
     }
 }

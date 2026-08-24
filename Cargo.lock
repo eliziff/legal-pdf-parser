@@ -608,7 +608,6 @@ dependencies = [
  "pdf-inspector",
  "regex",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -620,6 +619,7 @@ dependencies = [
  "legal-grammar-tables",
  "legal-pdf-core",
  "legal-structure",
+ "libc",
  "quick-xml",
  "regex",
  "serde",
@@ -663,7 +663,6 @@ dependencies = [
  "legal-pdf-extraction",
  "legal-pdf-language",
  "legal-pdf-ocr",
- "legal-pdf-pairing",
  "legal-pdf-structure",
  "legal-pdf-support",
  "legal-structure",
@@ -679,6 +678,7 @@ name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-pdf-pairing",
  "legal-pdf-support",
  "legal-structure",
  "regex",
@@ -917,7 +917,7 @@ dependencies = [
 [[package]]
 name = "pdf-inspector"
 version = "1.17.0"
-source = "git+https://github.com/eliziff/legal-pdf-parser.git?branch=pdf-inspector#a75db38787ca9428858dabf6a6125fb90e4beb82"
+source = "git+https://github.com/eliziff/legal-pdf-parser.git?branch=pdf-inspector#d659310c1015a84b92c72b0aff9bd5be5ce7ed05"
 dependencies = [
  "include_dir",
  "log",

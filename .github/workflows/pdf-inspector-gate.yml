@@ -8,77 +8,123 @@ on:
       - "legal-pdf-*/**"
       - "rust/src/**"
       - "experiments/cache-contract-fidelity/**"
+      - ".github/workflows/pdf-inspector-*.yml"
+  workflow_call:
+    inputs:
+      parser-ref:
+        required: true
+        type: string
+      candidate-artifact:
+        required: true
+        type: string
+      candidate-sha:
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
-  compile:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: Open-Legal-Products/mike
-          ref: 7411b1be11f9e15452fd3ab21d19354cc0a864a4
-          path: work
-          sparse-checkout: legal-structure
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: work/legal-pdf-parser
-          persist-credentials: false
-      - name: Check parser
-        working-directory: work/legal-pdf-parser
-        run: cargo check --locked --no-default-features --features pdf,language
-
   source-document-preflight:
+    if: >-
+      github.event_name == 'workflow_call' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64, legalpdf-corpus-ephemeral]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: Open-Legal-Products/mike
-          ref: 7411b1be11f9e15452fd3ab21d19354cc0a864a4
+          ref: 32a6cf57be442296edae072f91c75c7d059adc46
           path: shared
           sparse-checkout: legal-structure
           persist-credentials: false
+      - name: Install pinned legal-structure
+        shell: pwsh
+        run: Copy-Item shared/legal-structure legal-structure -Recurse
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name == 'pull_request'
         with:
-          path: base/legal-pdf-parser
+          path: base
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name == 'pull_request'
         with:
-          path: head/legal-pdf-parser
+          path: head
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Copy pinned legal-structure
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name == 'workflow_call'
+        with:
+          path: base
+          ref: ${{ inputs.parser-ref }}
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name == 'workflow_call'
+        with:
+          path: head
+          ref: ${{ inputs.parser-ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: github.event_name == 'workflow_call'
+        with:
+          name: ${{ inputs.candidate-artifact }}
+          path: candidate
+      - name: Use candidate PDF Inspector
+        if: github.event_name == 'workflow_call'
         shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate-sha }}
         run: |
-          Copy-Item shared/legal-structure base/legal-structure -Recurse
-          Copy-Item shared/legal-structure head/legal-structure -Recurse
-      - name: Build and compare source documents
+          git clone --no-checkout candidate/pdf-inspector.bundle inspector
+          git -C inspector checkout --detach $env:CANDIDATE_SHA
+          if ((git -C inspector rev-parse HEAD) -ne $env:CANDIDATE_SHA) {
+            throw "Candidate bundle does not contain $env:CANDIDATE_SHA"
+          }
+
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'head/Cargo.toml'
+          $source = [System.IO.File]::ReadAllText($manifest)
+          $dependency = 'pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", branch = "pdf-inspector", default-features = false }'
+          if (-not $source.Contains($dependency)) { throw "PDF Inspector dependency declaration changed" }
+          [System.IO.File]::WriteAllText(
+            $manifest,
+            $source.Replace($dependency, 'pdf-inspector = { path = "../inspector", default-features = false }')
+          )
+          cargo update --manifest-path $manifest -p pdf-inspector
+          if ($LASTEXITCODE -ne 0) { throw "Candidate lockfile update failed" }
+      - name: Build and compare raw-PDF products
         shell: pwsh
+        env:
+          LEGALPDF_CORPUS_ROOT: ${{ vars.LEGALPDF_CORPUS_ROOT }}
         run: |
-          $target = Join-Path $env:RUNNER_TEMP legalpdf-upstream-target
+          if (-not $env:LEGALPDF_CORPUS_ROOT) { throw "LEGALPDF_CORPUS_ROOT is not configured" }
+          $target = Join-Path $env:RUNNER_TEMP legalpdf-pdf-inspector-target
           $baseBinary = Join-Path $env:RUNNER_TEMP legalpdf-base.exe
           $headBinary = Join-Path $env:RUNNER_TEMP legalpdf-head.exe
+          $baseSnapshot = Join-Path $env:RUNNER_TEMP legalpdf-base-products.jsonl
+          $headSnapshot = Join-Path $env:RUNNER_TEMP legalpdf-head-products.jsonl
+          $baseManifest = Join-Path $env:GITHUB_WORKSPACE 'base/Cargo.toml'
+          $headManifest = Join-Path $env:GITHUB_WORKSPACE 'head/Cargo.toml'
+          $gateManifest = Join-Path $env:GITHUB_WORKSPACE 'head/experiments/cache-contract-fidelity/manifest.json'
           $env:CARGO_TARGET_DIR = $target
 
-          cargo build --manifest-path base/legal-pdf-parser/Cargo.toml --locked --no-default-features --features pdf,language --bin legalpdf
+          cargo build --manifest-path $baseManifest --locked --no-default-features --features pdf --bin legalpdf
+          if ($LASTEXITCODE -ne 0) { throw "Base legalpdf build failed" }
           Copy-Item (Join-Path $target debug/legalpdf.exe) $baseBinary
-          cargo build --manifest-path head/legal-pdf-parser/Cargo.toml --locked --no-default-features --features pdf,language --bin legalpdf
+          cargo build --manifest-path $headManifest --locked --no-default-features --features pdf --bin legalpdf
+          if ($LASTEXITCODE -ne 0) { throw "Head legalpdf build failed" }
           Copy-Item (Join-Path $target debug/legalpdf.exe) $headBinary
 
-          python base/legal-pdf-parser/experiments/cache-contract-fidelity/harness.py --source-doc-only --binary $baseBinary --corpus-root '${{ vars.LEGALPDF_CORPUS_ROOT }}' --raw (Join-Path $env:RUNNER_TEMP legalpdf-base-raw)
-          python base/legal-pdf-parser/experiments/cache-contract-fidelity/harness.py --source-doc-only --binary $headBinary --corpus-root '${{ vars.LEGALPDF_CORPUS_ROOT }}' --raw (Join-Path $env:RUNNER_TEMP legalpdf-head-raw)
+          & $baseBinary _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $baseSnapshot
+          if ($LASTEXITCODE -ne 0) { throw "Base PDF Inspector product gate failed" }
+          & $headBinary _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $headSnapshot
+          if ($LASTEXITCODE -ne 0) { throw "Head PDF Inspector product gate failed" }
 
-          $baseReports = @(Get-ChildItem (Join-Path $env:RUNNER_TEMP legalpdf-base-raw) -Filter report.json -Recurse)
-          $headReports = @(Get-ChildItem (Join-Path $env:RUNNER_TEMP legalpdf-head-raw) -Filter report.json -Recurse)
-          if ($baseReports.Count -ne 1) { throw "Expected exactly one base report, found $($baseReports.Count)" }
-          if ($headReports.Count -ne 1) { throw "Expected exactly one head report, found $($headReports.Count)" }
-          $base = $baseReports[0]
-          $head = $headReports[0]
-          $baseHash = (Get-Content -Raw $base.FullName | ConvertFrom-Json).source_docs_sha256
-          $headHash = (Get-Content -Raw $head.FullName | ConvertFrom-Json).source_docs_sha256
-          if ($baseHash -ne $headHash) { throw "SourceDoc parity failed: $baseHash != $headHash" }
-          "SourceDoc parity: $headHash"
+          $baseHash = (Get-FileHash -Algorithm SHA256 $baseSnapshot).Hash.ToLowerInvariant()
+          $headHash = (Get-FileHash -Algorithm SHA256 $headSnapshot).Hash.ToLowerInvariant()
+          if ($baseHash -ne $headHash) {
+            throw "PDF Inspector product parity failed: $baseHash != $headHash"
+          }
+          "PDF Inspector product parity: $headHash"

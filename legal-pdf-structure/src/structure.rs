@@ -1,22 +1,31 @@
 //! Shared structure derivation for aligned page and line evidence.
 
+mod graph;
+
+use crate::layout::*;
+pub use graph::PdfTextIndex;
+use graph::{contents_leader_re, map_note_pairs, native_graph_parts, PdfResolutionInput};
+#[cfg(test)]
+use graph::{contents_row, index_pages};
 use legal_pdf_core::model::{
-    Diagnostic, Footnote, LegalDocument, Line, NotePairClaim, NotePairKind, Page, Paragraph,
-    PdfPageIdentity, PdfPairingAudit, PdfSourceExtent, PdfSourceMap, PdfSourceSpan, Region, Span,
+    DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
+    Paragraph, ParagraphAnchor, PdfPairingAudit,
 };
-use legal_pdf_core::{line_font_size, union_bbox, Anchor, Error, PairingOutput, Result};
+#[cfg(test)]
+use legal_pdf_core::model::{NotePairClaim, NotePairKind, Span};
+use legal_pdf_core::{line_font_size, Anchor, Error, Result};
 use legal_pdf_support::{
-    enumerator_interpretations, has_citation_signal, heading_text_plausible,
-    normalize_decimal_digit, normalize_note_symbol, parse_heading_ladder, protected_citation_spans,
+    enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
+    EnumeratorInterpretation, HeadingAction, HeadingFamilyStats, HeadingLadderStatus,
 };
 use legal_structure::{
-    detect_structure_candidate_runs, resolve_structure_graph, utf16_len, CandidateEvidenceV2,
-    CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity, DocumentStructure,
-    NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ResolutionRuleV2, ScalarRange,
-    StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
+    last_scalars, normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph,
+    utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
+#[cfg(test)]
+use legal_structure::{CandidateGrammar, CandidateObservationV2};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -27,28 +36,28 @@ const HARD_DIAGNOSTICS: &[&str] = &[
     "FOOTNOTE_REGION_UNCERTAIN",
     "TEXT_QUALITY_LOW",
 ];
-const MAX_SYMBOL_LABEL_LEN: usize = 8;
+pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 
 #[derive(Debug, Clone)]
-struct LabelPrefix {
-    label: String,
+pub(super) struct LabelPrefix {
+    pub(super) label: String,
     start: usize,
-    end: usize,
+    pub(super) end: usize,
 }
 
 #[derive(Debug, Default)]
 struct PdfPrimitiveEvidence {
     source_regions: Option<HashMap<String, String>>,
+    contents_pages: HashSet<usize>,
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
 }
 
 #[derive(Debug)]
-pub struct PdfPreparation {
+struct PdfPreparation {
     diagnostics: Vec<Diagnostic>,
     primitives: PdfPrimitiveEvidence,
-    resolution: Option<PdfResolutionInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,185 +66,11 @@ pub struct StructureIdentity {
     pub source_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexedPdfLine {
-    pub page_id: String,
-    pub page_index: usize,
-    pub line_id: String,
-    pub range: ScalarRange,
-}
-
-#[derive(Debug, Clone)]
-pub struct PdfTextIndex {
-    text: String,
-    lines: Vec<IndexedPdfLine>,
-    line_slots: HashMap<String, usize>,
-    page_ranges: HashMap<usize, ScalarRange>,
-}
-
-#[derive(Debug)]
-struct PdfResolutionInput {
-    index: PdfTextIndex,
-    runs: Vec<StructureCandidateRun>,
-    evidence: Vec<CandidateEvidenceV2>,
-    citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
-}
-
-impl PdfTextIndex {
-    pub fn from_pages(pages: &[Page]) -> Self {
-        let mut ordered_pages = pages.iter().collect::<Vec<_>>();
-        ordered_pages.sort_by_key(|page| page.index);
-        let mut text = String::new();
-        let mut lines = Vec::new();
-        let mut line_slots = HashMap::new();
-        let mut page_ranges = HashMap::new();
-        let mut scalar_cursor = 0;
-        for page in ordered_pages {
-            let mut ordered_lines = page.lines.iter().collect::<Vec<_>>();
-            ordered_lines.sort_by(|left, right| {
-                left.reading_order
-                    .cmp(&right.reading_order)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            let mut page_start = None;
-            let mut page_end = scalar_cursor;
-            for line in ordered_lines {
-                if !lines.is_empty() {
-                    text.push('\n');
-                    scalar_cursor += 1;
-                }
-                let start = scalar_cursor;
-                text.push_str(&line.text);
-                scalar_cursor += line.text.chars().count();
-                let range = ScalarRange {
-                    start,
-                    end: scalar_cursor,
-                };
-                page_start.get_or_insert(start);
-                page_end = range.end;
-                let slot = lines.len();
-                line_slots.insert(line.id.clone(), slot);
-                lines.push(IndexedPdfLine {
-                    page_id: page.id.clone(),
-                    page_index: page.index,
-                    line_id: line.id.clone(),
-                    range,
-                });
-            }
-            page_ranges.insert(
-                page.index,
-                ScalarRange {
-                    start: page_start.unwrap_or(scalar_cursor),
-                    end: page_end,
-                },
-            );
-        }
-        Self {
-            text,
-            lines,
-            line_slots,
-            page_ranges,
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn line(&self, line_id: &str) -> Option<&IndexedPdfLine> {
-        self.line_slots
-            .get(line_id)
-            .and_then(|slot| self.lines.get(*slot))
-    }
-
-    fn line_at(&self, at: usize) -> Option<&IndexedPdfLine> {
-        let slot = self
-            .lines
-            .partition_point(|line| line.range.start <= at)
-            .checked_sub(1)?;
-        self.lines.get(slot).filter(|line| {
-            (line.range.start <= at && at < line.range.end)
-                || (line.range.start == line.range.end && line.range.start == at)
-        })
-    }
-
-    fn overlapping_lines(&self, range: ScalarRange) -> &[IndexedPdfLine] {
-        let start = self
-            .lines
-            .partition_point(|line| line.range.end <= range.start);
-        let end = self
-            .lines
-            .partition_point(|line| line.range.start < range.end);
-        &self.lines[start.min(end)..end]
-    }
-
-    pub fn page_range(&self, page_index: usize) -> Option<ScalarRange> {
-        self.page_ranges.get(&page_index).copied()
-    }
-
-    pub fn global_range(&self, line_id: &str, start: usize, end: usize) -> Option<ScalarRange> {
-        let line = self.line(line_id)?;
-        let length = line.range.end - line.range.start;
-        (start <= end && end <= length).then_some(ScalarRange {
-            start: line.range.start + start,
-            end: line.range.start + end,
-        })
-    }
-
-    pub fn line_ids(&self, range: ScalarRange) -> Vec<String> {
-        self.overlapping_lines(range)
-            .iter()
-            .map(|line| line.line_id.clone())
-            .collect()
-    }
-
-    pub fn page_indexes(&self, range: ScalarRange) -> Vec<usize> {
-        self.overlapping_lines(range)
-            .iter()
-            .fold(Vec::new(), |mut pages, line| {
-                if !pages.contains(&line.page_index) {
-                    pages.push(line.page_index);
-                }
-                pages
-            })
-    }
-
-    fn range_for_line_ids<'a>(
-        &self,
-        line_ids: impl IntoIterator<Item = &'a String>,
-    ) -> Option<ScalarRange> {
-        line_ids
-            .into_iter()
-            .filter_map(|line_id| self.line(line_id))
-            .fold(None, |range, line| {
-                Some(range.map_or(line.range, |range: ScalarRange| ScalarRange {
-                    start: range.start.min(line.range.start),
-                    end: range.end.max(line.range.end),
-                }))
-            })
-    }
-
-    fn page_indexes_for_line_ids<'a>(
-        &self,
-        line_ids: impl IntoIterator<Item = &'a String>,
-    ) -> Vec<usize> {
-        line_ids.into_iter().fold(Vec::new(), |mut pages, line_id| {
-            if let Some(page_index) = self.line(line_id).map(|line| line.page_index) {
-                if !pages.contains(&page_index) {
-                    pages.push(page_index);
-                }
-            }
-            pages
-        })
-    }
-}
-
 pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
-    pub pairing_audit: PdfPairingAudit,
-    pub pdf_source_map: PdfSourceMap,
+    pub pairing_audit: Option<PdfPairingAudit>,
     pub structure_graph: DocumentStructure,
 }
 
@@ -257,20 +92,24 @@ fn normalize_label(value: &str) -> String {
         .map_or(translated, |number| number.to_string())
 }
 
-fn char_to_byte(value: &str, character_offset: usize) -> usize {
-    value
-        .char_indices()
-        .nth(character_offset)
-        .map_or(value.len(), |(index, _)| index)
+pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
+    if value.is_ascii() {
+        return &value[start.min(value.len())..];
+    }
+    let end = value.len();
+    let byte = value.char_indices().nth(start).map_or(end, |at| at.0);
+    &value[byte..]
 }
 
-fn char_slice(value: &str, start: usize, end: usize) -> &str {
-    let start = char_to_byte(value, start.min(value.chars().count()));
-    let end = char_to_byte(value, end.min(value.chars().count()));
-    &value[start..end]
+#[cfg(test)]
+pub(super) fn char_slice(value: &str, start: usize, end: usize) -> &str {
+    let length = value.chars().count();
+    ScalarText::new(value)
+        .slice(start.min(length)..end.min(length))
+        .expect("valid scalar range")
 }
 
-fn is_note_symbol(character: char) -> bool {
+pub(super) fn is_note_symbol(character: char) -> bool {
     matches!(
         character,
         '*' | '∗' | '\u{f02a}' | '†' | '‡' | '§' | '¶' | '#'
@@ -301,12 +140,12 @@ fn line_start_label_prefix(text: &str) -> Option<LabelPrefix> {
         return None;
     }
     let token_chars = token.chars().count();
-    let remainder = char_slice(trimmed, token_chars, trimmed.chars().count());
+    let remainder = scalar_suffix(trimmed, token_chars);
     let embedded_endnote = format!("endnote {token}");
     let embedded_chars = embedded_endnote.chars().count();
     if remainder
-        .to_ascii_lowercase()
-        .starts_with(&embedded_endnote.to_ascii_lowercase())
+        .get(..embedded_endnote.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(&embedded_endnote))
     {
         return Some(LabelPrefix {
             label: normalize_label(&token),
@@ -333,7 +172,7 @@ fn line_start_label_prefix(text: &str) -> Option<LabelPrefix> {
     })
 }
 
-fn label_prefix(text: &str) -> Option<LabelPrefix> {
+pub(super) fn label_prefix(text: &str) -> Option<LabelPrefix> {
     if let Some(prefix) = line_start_label_prefix(text) {
         return Some(prefix);
     }
@@ -353,7 +192,7 @@ fn label_prefix(text: &str) -> Option<LabelPrefix> {
     })
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
+pub(super) fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -375,18 +214,17 @@ fn upper_quartile(mut values: Vec<f64>) -> f64 {
 }
 
 fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_size: f64) -> bool {
-    let spans: Vec<&Span> = line
-        .spans
-        .iter()
-        .filter(|span| span.start < prefix.end && span.end > prefix.start)
-        .collect();
-    let label_size = spans
-        .iter()
+    let spans = || {
+        line.spans
+            .iter()
+            .filter(|span| span.start < prefix.end && span.end > prefix.start)
+    };
+    let label_size = spans()
         .filter_map(|span| (span.size > 0.0).then_some(span.size))
         .min_by(f64::total_cmp)
         .unwrap_or(line_size);
     let height = line.bbox[3] - line.bbox[1];
-    spans.iter().any(|span| {
+    spans().any(|span| {
         span.superscript
             || (line_size > 0.0 && span.size > 0.0 && span.size <= line_size * 0.75)
             || (line_size > 0.0
@@ -399,6 +237,9 @@ fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_
 
 fn normalize_furniture(text: &str) -> String {
     static DIGITS: OnceLock<Regex> = OnceLock::new();
+    let text = DIGITS
+        .get_or_init(|| Regex::new(r"\d+").unwrap())
+        .replace_all(text, "#");
     let mut normalized = String::with_capacity(text.len());
     let mut pending_space = false;
     for character in text.chars().flat_map(char::to_lowercase) {
@@ -412,19 +253,14 @@ fn normalize_furniture(text: &str) -> String {
             normalized.push(character);
         }
     }
-    let digits = DIGITS.get_or_init(|| Regex::new(r"\d+").unwrap());
-    if digits.is_match(&normalized) {
-        digits.replace_all(&normalized, "#").into_owned()
-    } else {
-        normalized
-    }
+    normalized
 }
 
 fn compact_note_line(text: &str) -> bool {
     let Some(prefix) = line_start_label_prefix(text) else {
         return false;
     };
-    char_slice(text, prefix.end, text.chars().count())
+    scalar_suffix(text, prefix.end)
         .trim_start_matches(|character: char| {
             character.is_whitespace() || ".)],:;-".contains(character)
         })
@@ -435,13 +271,26 @@ fn compact_note_line(text: &str) -> bool {
         == 4
 }
 
-fn standalone_enumerator(text: &str) -> bool {
+fn standalone_enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:[IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})[.)]\s*$")
+        Regex::new(r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$")
             .unwrap()
     })
-    .is_match(text)
+}
+
+fn inline_enumerator_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
+        )
+        .unwrap()
+    })
+}
+
+fn standalone_enumerator(text: &str) -> bool {
+    standalone_enumerator_re().is_match(text)
 }
 
 const FOLIO_MIN_SEQUENCE_PAGES: usize = 4;
@@ -488,7 +337,7 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
         if page.width <= 0.0 || page.height <= 0.0 {
             continue;
         }
-        let candidates = page
+        let mut candidates = page
             .lines
             .iter()
             .enumerate()
@@ -512,10 +361,11 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
                     y_ratio: line.bbox[1] / page.height,
                     x_ratio,
                 })
-            })
-            .collect::<Vec<_>>();
-        if candidates.len() == 1 {
-            singletons.push(candidates[0]);
+            });
+        if let Some(candidate) = candidates.next() {
+            if candidates.next().is_none() {
+                singletons.push(candidate);
+            }
         }
     }
     singletons.sort_by_key(|candidate| candidate.page_number);
@@ -775,8 +625,7 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     line.region_type = "footer".to_owned();
                 } else if repeated.contains(&(page_slot, index))
                     && (at_top || at_bottom)
-                    && (line_size >= body_size * 0.75
-                        || normalize_furniture(&line.text) != "#")
+                    && (line_size >= body_size * 0.75 || normalize_furniture(&line.text) != "#")
                     && !compact_note
                     && !attached_labels.contains(&index)
                     && !attached_enumerators.contains(&index)
@@ -911,13 +760,15 @@ fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>])
             };
             let source_line_id = page.lines[marker_index].id.clone();
             let selected_text = page.lines[marker_index].text.trim().to_owned();
-            page.lines[host_index].detached_references.push(json!({
-                "note_id": label,
-                "selected_text": selected_text,
-                "start_offset": offset,
-                "end_offset": offset,
-                "source_line_id": source_line_id,
-            }));
+            page.lines[host_index]
+                .detached_references
+                .push(DetachedReference {
+                    note_id: label,
+                    selected_text,
+                    start_offset: offset,
+                    end_offset: offset,
+                    source_line_id,
+                });
             page.lines[marker_index].exclude_from_body = true;
         }
         associate_spliced_markers(page, note_cut);
@@ -1011,23 +862,24 @@ fn associate_spliced_markers(page: &mut Page, note_cut: f64) {
         let selected_text = page.lines[marker_index].text.trim().to_owned();
         let source_line_id = page.lines[marker_index].id.clone();
         let offset = page.lines[host_index].text.chars().count();
-        page.lines[host_index].detached_references.push(json!({
-            "note_id": value,
-            "selected_text": selected_text,
-            "start_offset": offset,
-            "end_offset": offset,
-            "source_line_id": source_line_id,
-        }));
+        page.lines[host_index]
+            .detached_references
+            .push(DetachedReference {
+                note_id: value,
+                selected_text,
+                start_offset: offset,
+                end_offset: offset,
+                source_line_id,
+            });
         page.lines[marker_index].exclude_from_body = true;
     }
 }
 
 fn all_caps(text: &str) -> bool {
-    let letters: Vec<char> = text
-        .chars()
-        .filter(|character| character.is_alphabetic())
-        .collect();
-    !letters.is_empty() && letters.iter().all(|character| character.is_uppercase())
+    let mut letters = text.chars().filter(|character| character.is_alphabetic());
+    letters.next().is_some_and(|first| {
+        first.is_uppercase() && letters.all(|character| character.is_uppercase())
+    })
 }
 
 fn has_word_character(text: &str) -> bool {
@@ -1093,22 +945,36 @@ fn heading_source_eligible(regions: &HashMap<String, String>, line: &Line) -> bo
     })
 }
 
-fn heading_candidates(pages: &[Page], regions: &HashMap<String, String>) -> Vec<Value> {
-    static INLINE: OnceLock<Regex> = OnceLock::new();
-    static STANDALONE: OnceLock<Regex> = OnceLock::new();
-    let inline = INLINE.get_or_init(|| {
-        Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
-        )
-        .unwrap()
-    });
-    let standalone = STANDALONE.get_or_init(|| {
-        Regex::new(r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$")
-            .unwrap()
-    });
+struct HeadingCandidate<'a> {
+    page_slot: usize,
+    line_slot: usize,
+    joined_line_slot: Option<usize>,
+    text: &'a str,
+    interpretations: Vec<EnumeratorInterpretation>,
+}
+
+#[derive(Clone, Copy)]
+struct HeadingDecision {
+    page_slot: usize,
+    line_slot: usize,
+    joined_line_slot: Option<usize>,
+    text_plausible: bool,
+    level: Option<usize>,
+    action: HeadingAction,
+    coherent_family: bool,
+    footnote_suspect: bool,
+}
+
+fn heading_candidates<'a>(
+    pages: &'a [Page],
+    primitives: &PdfPrimitiveEvidence,
+) -> Vec<HeadingCandidate<'a>> {
+    let regions = primitives.source_regions.as_ref().expect("source regions");
+    let inline = inline_enumerator_re();
+    let standalone = standalone_enumerator_re();
     let mut candidates = Vec::new();
     for (page_slot, page) in pages.iter().enumerate() {
-        if contents_grid(&page.lines, page.width) {
+        if primitives.contents_pages.contains(&page.index) {
             continue;
         }
         for (line_slot, line) in page.lines.iter().enumerate().filter(|(_, line)| {
@@ -1122,16 +988,13 @@ fn heading_candidates(pages: &[Page], regions: &HashMap<String, String>) -> Vec<
                 let text = capture.get(3).unwrap().as_str().trim();
                 let interpretations = enumerator_interpretations(value, punct);
                 if heading_text_plausible(text) && !interpretations.is_empty() {
-                    candidates.push(json!({
-                        "page_slot": page_slot,
-                        "line_slot": line_slot,
-                        "kind": "enumerator",
-                        "joined": false,
-                        "value_text": value,
-                        "punct": punct,
-                        "text": text,
-                        "interpretations": interpretations,
-                    }));
+                    candidates.push(HeadingCandidate {
+                        page_slot,
+                        line_slot,
+                        joined_line_slot: None,
+                        text,
+                        interpretations,
+                    });
                 }
                 continue;
             }
@@ -1153,17 +1016,13 @@ fn heading_candidates(pages: &[Page], regions: &HashMap<String, String>) -> Vec<
             let punct = capture.get(2).unwrap().as_str();
             let interpretations = enumerator_interpretations(value, punct);
             if heading_text_plausible(text) && !interpretations.is_empty() {
-                candidates.push(json!({
-                    "page_slot": page_slot,
-                    "line_slot": line_slot,
-                    "joined_line_slot": follower_slot,
-                    "kind": "enumerator",
-                    "joined": true,
-                    "value_text": value,
-                    "punct": punct,
-                    "text": text,
-                    "interpretations": interpretations,
-                }));
+                candidates.push(HeadingCandidate {
+                    page_slot,
+                    line_slot,
+                    joined_line_slot: Some(follower_slot),
+                    text,
+                    interpretations,
+                });
             }
         }
     }
@@ -1176,7 +1035,13 @@ fn bold_char_share(line: &Line) -> f64 {
     for span in &line.spans {
         let chars = span.text.chars().count();
         total += chars;
-        if span.flags & 16 != 0 || span.font.to_ascii_lowercase().contains("bold") {
+        if span.flags & 16 != 0
+            || span
+                .font
+                .as_bytes()
+                .windows(4)
+                .any(|value| value.eq_ignore_ascii_case(b"bold"))
+        {
             bold += chars;
         }
     }
@@ -1279,17 +1144,8 @@ fn has_body_flow(
     })
 }
 
-fn coherent_heading_family(family: &Value) -> bool {
-    family.get("count").and_then(Value::as_u64).unwrap_or(0) >= 2
-        && family
-            .get("violations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            == 0
-        && family
-            .get("level_votes")
-            .and_then(Value::as_object)
-            .is_some_and(|votes| votes.len() == 1)
+fn coherent_heading_family(family: &HeadingFamilyStats) -> bool {
+    family.count >= 2 && family.violations == 0 && family.level_votes.len() == 1
 }
 
 fn wrapped_heading_continuation(
@@ -1367,23 +1223,21 @@ fn wrapped_heading_continuation(
 }
 
 fn titlecase_ratio(text: &str) -> f64 {
-    let words = text
+    let mut words = 0;
+    let titlecase = text
         .split_whitespace()
         .filter(|word| word.chars().any(char::is_alphabetic))
-        .collect::<Vec<_>>();
-    if words.is_empty() {
+        .inspect(|_| words += 1)
+        .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+        .count();
+    if words == 0 {
         0.0
     } else {
-        words
-            .iter()
-            .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
-            .count() as f64
-            / words.len() as f64
+        titlecase as f64 / words as f64
     }
 }
 
 fn heading_style_corroborated(text: &str) -> bool {
-    static INLINE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
     if text.is_empty() || text.chars().count() > 120 || has_citation_signal(text) {
         return false;
@@ -1404,16 +1258,8 @@ fn heading_style_corroborated(text: &str) -> bool {
     {
         return true;
     }
-    if let Some(capture) = INLINE
-        .get_or_init(|| {
-            Regex::new(
-                r"^\s*(?:[IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})[.)]\s+(\S.*)$",
-            )
-            .unwrap()
-        })
-        .captures(text)
-    {
-        if heading_text_plausible(capture.get(1).unwrap().as_str()) && !text.ends_with('.') {
+    if let Some(capture) = inline_enumerator_re().captures(text) {
+        if heading_text_plausible(capture.get(3).unwrap().as_str()) && !text.ends_with('.') {
             return true;
         }
     }
@@ -1425,19 +1271,13 @@ fn heading_style_corroborated(text: &str) -> bool {
 }
 
 fn caps_warble(text: &str) -> bool {
-    let letters = text
-        .chars()
-        .filter(|character| character.is_alphabetic())
-        .collect::<Vec<_>>();
-    !letters.is_empty()
-        && letters.iter().any(|character| character.is_uppercase())
-        && letters.iter().any(|character| character.is_lowercase())
-        && letters
-            .iter()
-            .filter(|character| character.is_uppercase())
-            .count() as f64
-            / letters.len() as f64
-            >= 0.65
+    let (mut letters, mut uppercase, mut lowercase) = (0_usize, 0_usize, false);
+    for character in text.chars().filter(|character| character.is_alphabetic()) {
+        letters += 1;
+        uppercase += usize::from(character.is_uppercase());
+        lowercase |= character.is_lowercase();
+    }
+    uppercase > 0 && lowercase && uppercase as f64 / letters as f64 >= 0.65
 }
 
 fn bilateral_body_geometry(page: &Page, line_slot: usize) -> bool {
@@ -1469,24 +1309,14 @@ fn bilateral_body_geometry(page: &Page, line_slot: usize) -> bool {
 
 fn demote_false_headings(
     pages: &mut [Page],
-    parsed: &Value,
+    decisions: &[HeadingDecision],
     source_regions: &HashMap<String, String>,
 ) {
-    let assignments = parsed
-        .get("assignments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let families = parsed.get("families").and_then(Value::as_object);
-    let mut by_line = HashMap::<(usize, usize), Value>::new();
-    for assignment in assignments {
-        let Some(page) = assignment.get("page_slot").and_then(Value::as_u64) else {
-            continue;
-        };
-        for key in ["line_slot", "joined_line_slot"] {
-            if let Some(line) = assignment.get(key).and_then(Value::as_u64) {
-                by_line.insert((page as usize, line as usize), assignment.clone());
-            }
+    let mut by_line = HashMap::<(usize, usize), &HeadingDecision>::new();
+    for decision in decisions {
+        by_line.insert((decision.page_slot, decision.line_slot), decision);
+        if let Some(line) = decision.joined_line_slot {
+            by_line.insert((decision.page_slot, line), decision);
         }
     }
     for (page_slot, page) in pages.iter_mut().enumerate() {
@@ -1504,20 +1334,16 @@ fn demote_false_headings(
             if caps_warble(text) {
                 continue;
             }
-            let assignment = by_line.get(&(page_slot, line_slot));
-            let family = assignment
-                .and_then(|assignment| assignment.get("family"))
-                .and_then(Value::as_str)
-                .and_then(|family| families.and_then(|families| families.get(family)));
-            if family.is_some_and(coherent_heading_family) {
+            let decision = by_line.get(&(page_slot, line_slot));
+            if decision.is_some_and(|decision| decision.coherent_family) {
                 continue;
             }
             let style = heading_style_corroborated(text);
-            let grammar_negative = assignment.map_or(!style, |assignment| {
+            let grammar_negative = decision.map_or(!style, |decision| {
                 !style
                     || matches!(
-                        assignment.get("action").and_then(Value::as_str),
-                        Some("illegal_restart" | "violation")
+                        decision.action,
+                        HeadingAction::IllegalRestart | HeadingAction::Violation
                     )
             });
             if !grammar_negative {
@@ -1588,16 +1414,14 @@ fn demote_false_headings(
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
     body_size: f64,
-    source_regions: Option<&HashMap<String, String>>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
-    let Some(source_regions) = source_regions else {
+    let Some(source_regions) = primitives.source_regions.as_ref() else {
         return HashMap::new();
     };
-    static TOC_LEADER: OnceLock<Regex> = OnceLock::new();
-    let toc_leader =
-        TOC_LEADER.get_or_init(|| Regex::new(r"(?:\. ){3,}|\.{4,}").expect("TOC leader regex"));
+    let toc_leader = contents_leader_re();
     for page in pages.iter_mut() {
-        if contents_grid(&page.lines, page.width)
+        if primitives.contents_pages.contains(&page.index)
             || page
                 .lines
                 .iter()
@@ -1630,39 +1454,44 @@ fn apply_text_fidelity_headings(
         }
     }
 
-    let candidates = heading_candidates(pages, source_regions);
-    let parsed = parse_heading_ladder(&candidates);
-    demote_false_headings(pages, &parsed, source_regions);
-    let ladder_clean = parsed.get("status").and_then(Value::as_str) == Some("parsed_clean");
-    let families = parsed.get("families").and_then(Value::as_object);
-    let assignments = parsed
-        .get("assignments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut heading_levels = assignments
+    let (ladder_clean, decisions) = {
+        let candidates = heading_candidates(pages, primitives);
+        let parsed = parse_heading_ladder(
+            candidates
+                .iter()
+                .map(|candidate| candidate.interpretations.as_slice()),
+        );
+        let decisions = candidates
+            .iter()
+            .zip(&parsed.assignments)
+            .map(|(candidate, assignment)| {
+                let family = parsed.families.get(assignment.family);
+                HeadingDecision {
+                    page_slot: candidate.page_slot,
+                    line_slot: candidate.line_slot,
+                    joined_line_slot: candidate.joined_line_slot,
+                    text_plausible: heading_text_plausible(candidate.text),
+                    level: assignment.level,
+                    action: assignment.action,
+                    coherent_family: family.is_some_and(coherent_heading_family),
+                    footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
+                }
+            })
+            .collect::<Vec<_>>();
+        (parsed.status == HeadingLadderStatus::ParsedClean, decisions)
+    };
+    demote_false_headings(pages, &decisions, source_regions);
+    let mut heading_levels = decisions
         .iter()
-        .flat_map(|assignment| {
-            let page = assignment
-                .get("page_slot")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let marker = assignment
-                .get("line_slot")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let joined = assignment
-                .get("joined_line_slot")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let level = assignment
-                .get("level")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            [marker, joined]
+        .flat_map(|decision| {
+            [Some(decision.line_slot), decision.joined_line_slot]
                 .into_iter()
                 .flatten()
-                .filter_map(move |line| page.zip(level).map(|(page, level)| (page, line, level)))
+                .filter_map(move |line| {
+                    decision
+                        .level
+                        .map(|level| (decision.page_slot, line, level))
+                })
         })
         .filter_map(|(page, line, level)| {
             pages
@@ -1671,42 +1500,24 @@ fn apply_text_fidelity_headings(
                 .map(|line| (line.id.clone(), level))
         })
         .collect::<HashMap<_, _>>();
-    let structural: HashSet<(usize, usize)> = assignments
+    let structural: HashSet<(usize, usize)> = decisions
         .iter()
-        .flat_map(|assignment| {
-            let page = assignment.get("page_slot").and_then(Value::as_u64);
-            let line = assignment.get("line_slot").and_then(Value::as_u64);
-            let joined = assignment.get("joined_line_slot").and_then(Value::as_u64);
+        .flat_map(|decision| {
             [
-                page.zip(line)
-                    .map(|(page, line)| (page as usize, line as usize)),
-                page.zip(joined)
-                    .map(|(page, line)| (page as usize, line as usize)),
+                Some((decision.page_slot, decision.line_slot)),
+                decision
+                    .joined_line_slot
+                    .map(|line| (decision.page_slot, line)),
             ]
             .into_iter()
             .flatten()
         })
         .collect();
 
-    for assignment in assignments {
-        let Some(page_slot) = assignment
-            .get("page_slot")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-        else {
-            continue;
-        };
-        let Some(marker_slot) = assignment
-            .get("line_slot")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-        else {
-            continue;
-        };
-        let target_slot = assignment
-            .get("joined_line_slot")
-            .and_then(Value::as_u64)
-            .map_or(marker_slot, |value| value as usize);
+    for decision in &decisions {
+        let page_slot = decision.page_slot;
+        let marker_slot = decision.line_slot;
+        let target_slot = decision.joined_line_slot.unwrap_or(marker_slot);
         if page_slot >= pages.len() || target_slot >= pages[page_slot].lines.len() {
             continue;
         }
@@ -1721,26 +1532,15 @@ fn apply_text_fidelity_headings(
             continue;
         }
         if !ladder_clean
-            || !heading_text_plausible(assignment.get("text").and_then(Value::as_str).unwrap_or(""))
+            || !decision.text_plausible
             || matches!(
-                assignment.get("action").and_then(Value::as_str),
-                Some("illegal_restart" | "violation")
+                decision.action,
+                HeadingAction::IllegalRestart | HeadingAction::Violation
             )
         {
             continue;
         }
-        let family_name = assignment
-            .get("family")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let family = families.and_then(|families| families.get(family_name));
-        if family.is_some_and(|family| {
-            family
-                .get("footnote_suspect")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        }) || assignment.get("level").and_then(Value::as_u64).unwrap_or(0) == 0
-        {
+        if decision.footnote_suspect || decision.level.unwrap_or(0) == 0 {
             continue;
         }
         let page = &pages[page_slot];
@@ -1750,7 +1550,7 @@ fn apply_text_fidelity_headings(
         let target = &page.lines[target_slot];
         let visual = bold_char_share(target) >= 0.60
             || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
-        if !visual && !family.is_some_and(coherent_heading_family) {
+        if !visual && !decision.coherent_family {
             continue;
         }
         pages[page_slot].lines[target_slot].region_type = "heading".to_owned();
@@ -1769,11 +1569,8 @@ fn apply_text_fidelity_headings(
             let block = pages[page_slot].lines[target_slot].block_index;
             pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
             pages[page_slot].lines[continuation_slot].block_index = block;
-            if let Some(level) = assignment.get("level").and_then(Value::as_u64) {
-                heading_levels.insert(
-                    pages[page_slot].lines[continuation_slot].id.clone(),
-                    level as usize,
-                );
+            if let Some(level) = decision.level {
+                heading_levels.insert(pages[page_slot].lines[continuation_slot].id.clone(), level);
             }
         }
     }
@@ -1815,7 +1612,7 @@ fn structural_reset_heading(text: &str) -> bool {
 
 fn citation_shaped_candidate(page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
     let line = &page.lines[candidate.0];
-    let tail = char_slice(&line.text, candidate.1.end, line.text.chars().count());
+    let tail = scalar_suffix(&line.text, candidate.1.end);
     citation_shaped_tail(tail)
 }
 
@@ -1832,15 +1629,20 @@ fn longest_label_run(values: &[u32]) -> usize {
 }
 
 fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
+    let matches_label = |value: &str| {
+        let value = value.trim();
+        value == label || normalize_label(value) == label
+    };
     page.lines.iter().any(|line| {
         line.bbox[1] < label_y
             && (line
                 .spans
                 .iter()
-                .any(|span| span.superscript && normalize_label(span.text.trim()) == label)
-                || line.detached_references.iter().any(|reference| {
-                    normalize_label(reference["note_id"].as_str().unwrap_or_default()) == label
-                }))
+                .any(|span| span.superscript && matches_label(&span.text))
+                || line
+                    .detached_references
+                    .iter()
+                    .any(|reference| matches_label(&reference.note_id)))
     })
 }
 
@@ -1863,20 +1665,23 @@ fn classify_pages_with_source(
         .zip(separators.iter().copied())
         .map(|(page, separator)| {
             let continuation = continuing_table;
-            let evidence = table_evidence(&page.lines, page.width);
+            let table = table_evidence(&page.lines, page.width);
+            evidence
+                .contents_pages
+                .extend(table.contents.then_some(page.index));
             let caption = has_table_caption(&page.lines);
             let is_table = caption
-                || strong_table_evidence(&evidence, &page.lines)
-                || continuation && evidence.continuation_on_page(page.height);
+                || strong_table_evidence(&table, &page.lines)
+                || continuation && table.continuation_on_page(page.height);
             continuing_table = is_table
-                && evidence.reaches_page_bottom(page.height)
-                && (caption || evidence.continuation());
+                && table.reaches_page_bottom(page.height)
+                && (caption || table.continuation());
             let mut cells = if is_table {
-                evidence.expanded_lines(&page.lines, page.height, continuation, separator)
+                table.expanded_lines(&page.lines, page.height, continuation, separator)
             } else {
                 HashSet::new()
             };
-            let notes = evidence.table_note_lines(&page.lines, &cells);
+            let notes = table.table_note_lines(&page.lines, &cells);
             cells.retain(|index| !notes.contains(index));
             (is_table, cells, notes)
         })
@@ -1992,8 +1797,7 @@ fn classify_pages_with_source(
                 && line.bbox[1] >= page.height * 0.91
                 && line.bbox[0] >= page.width * 0.50
                 && !compact_note_line(&line.text);
-            let comma_tail =
-                char_slice(&line.text, prefix.end, prefix.end + 1) == "," && !typographic;
+            let comma_tail = line.text.chars().nth(prefix.end) == Some(',') && !typographic;
             let below_separator = separator.is_some_and(|cut| line.bbox[1] >= cut - tolerance);
             let suppressed = (line.bbox[1] >= page.height * 0.94
                 && !(below_separator && typographic))
@@ -2057,19 +1861,14 @@ fn classify_pages_with_source(
                 .unwrap_or(0)
         });
         let minimum_label_y = minimum_label_y.unwrap_or(page.height);
-        let content_before: Vec<usize> = page
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
+        let content_before = || {
+            page.lines.iter().enumerate().filter_map(|(index, line)| {
                 (!matches!(line.region_type.as_str(), "header" | "footer")
                     && line.bbox[1] < minimum_label_y)
                     .then_some(index)
             })
-            .collect();
-        let first_content = content_before
-            .iter()
-            .copied()
+        };
+        let first_content = content_before()
             .min_by(|left, right| page.lines[*left].bbox[1].total_cmp(&page.lines[*right].bbox[1]));
         let generic_heading_reset = candidates.is_empty()
             && first_content.is_some_and(|index| {
@@ -2086,8 +1885,8 @@ fn classify_pages_with_source(
                     && !continuing_note_heading(text)
             });
         let structural_reset = generic_heading_reset
-            || content_before.iter().any(|index| {
-                let line = &page.lines[*index];
+            || content_before().any(|index| {
+                let line = &page.lines[index];
                 (line.region_type == "heading" || line.bbox[1] >= page.height * 0.08)
                     && structural_reset_heading(&line.text)
             });
@@ -2096,6 +1895,7 @@ fn classify_pages_with_source(
             .map(|(index, _, _)| line_sizes[*index])
             .filter(|size| *size > 0.0)
             .collect();
+        let label_size = (!label_sizes.is_empty()).then(|| median(label_sizes));
         let early_labels = candidates.iter().any(|(index, _, typographic)| {
             page.lines[*index].bbox[1] < page.height * 0.48
                 && (*typographic || line_sizes[*index] <= body_size * 0.90)
@@ -2169,9 +1969,9 @@ fn classify_pages_with_source(
             .map(|(index, _)| line_sizes[index])
             .filter(|size| *size > 0.0)
             .collect();
-        let continuation_size_matches = continuing_size.is_none_or(|size| {
-            content_sizes.is_empty() || median(content_sizes.clone()) <= size * 1.15
-        });
+        let content_size = (!content_sizes.is_empty()).then(|| median(content_sizes));
+        let continuation_size_matches = continuing_size
+            .is_none_or(|size| content_size.is_none_or(|content| content <= size * 1.15));
         let label_free_continuation = expected_endnote.is_some()
             && candidates.is_empty()
             && !structural_reset
@@ -2193,14 +1993,6 @@ fn classify_pages_with_source(
             .filter(|(index, _, _)| margin_candidates.contains(index))
             .filter_map(|(_, prefix, _)| prefix.label.parse().ok())
             .collect();
-        let mut margin_runs = vec![1; margin_numeric.len()];
-        for index in 0..margin_numeric.len() {
-            for prior in 0..index {
-                if (1..=3).contains(&margin_numeric[index].saturating_sub(margin_numeric[prior])) {
-                    margin_runs[index] = margin_runs[index].max(margin_runs[prior] + 1);
-                }
-            }
-        }
         let supported_margin_candidates: Vec<_> = candidates
             .iter()
             .filter(|(index, prefix, _)| {
@@ -2209,7 +2001,7 @@ fn classify_pages_with_source(
             })
             .map(|(index, _, _)| *index)
             .collect();
-        let margin_labels = if margin_runs.into_iter().max().unwrap_or(1) >= 3 {
+        let margin_labels = if longest_label_run(&margin_numeric) >= 3 {
             &margin_candidates
         } else {
             &supported_margin_candidates
@@ -2238,8 +2030,7 @@ fn classify_pages_with_source(
                 && !candidates.is_empty()
                 && early_labels
                 && best_run >= 3
-                && !label_sizes.is_empty()
-                && median(label_sizes.clone()) <= body_size * 0.90);
+                && label_size.is_some_and(|size| size <= body_size * 0.90));
         let labels: Vec<usize> = candidates[selected_start..]
             .iter()
             .filter_map(|(index, prefix, typographic)| {
@@ -2310,26 +2101,26 @@ fn classify_pages_with_source(
             .map(|index| line_sizes[*index])
             .filter(|size| *size > 0.0)
             .collect();
+        let selected_size = (!selected_sizes.is_empty()).then(|| median(selected_sizes));
         let separator_starts_small_text = separator.is_some_and(|cut| {
-            if contents_grid(&page.lines, page.width) {
-                return false;
-            }
-            page.lines
-                .iter()
-                .enumerate()
-                .filter(|(index, line)| {
-                    !table_cells.contains(index)
-                        && !table_notes.contains(index)
-                        && !line.exclude_from_body
-                        && !matches!(line.region_type.as_str(), "header" | "footer")
-                        && line.bbox[1] >= cut - tolerance
-                })
-                .min_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]))
-                .is_some_and(|(index, line)| {
-                    line.bbox[1] - cut <= page.height * 0.06
-                        && line_sizes[index] > 0.0
-                        && line_sizes[index] <= body_size * 0.90
-                })
+            !evidence.contents_pages.contains(&page.index)
+                && page
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, line)| {
+                        !table_cells.contains(index)
+                            && !table_notes.contains(index)
+                            && !line.exclude_from_body
+                            && !matches!(line.region_type.as_str(), "header" | "footer")
+                            && line.bbox[1] >= cut - tolerance
+                    })
+                    .min_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]))
+                    .is_some_and(|(index, line)| {
+                        line.bbox[1] - cut <= page.height * 0.06
+                            && line_sizes[index] > 0.0
+                            && line_sizes[index] <= body_size * 0.90
+                    })
         });
         let note_cut = if label_free_continuation {
             eligible_top()
@@ -2347,14 +2138,12 @@ fn classify_pages_with_source(
                 0.0 <= first_label - cut
                     && (first_label - cut <= page.height * 0.15
                         || (separator_starts_small_text
-                            && !selected_sizes.is_empty()
-                            && median(selected_sizes.clone()) <= body_size * 0.90))
+                            && selected_size.is_some_and(|size| size <= body_size * 0.90)))
             }) {
                 separator
             } else {
                 let confident = (first_label >= page.height * 0.58 || endnote_page)
-                    && !selected_sizes.is_empty()
-                    && median(selected_sizes.clone()) <= body_size * 0.90;
+                    && selected_size.is_some_and(|size| size <= body_size * 0.90);
                 if !confident {
                     let mut diagnostic = Diagnostic::warning(
                         "FOOTNOTE_REGION_UNCERTAIN",
@@ -2455,19 +2244,21 @@ fn classify_pages_with_source(
                 line.region_type = "body".to_owned();
             }
         }
-        let endnote_lines: Vec<&Line> = page
+        if !page
             .lines
             .iter()
-            .filter(|line| line.note_region_mode == "endnote")
-            .collect();
-        if endnote_lines.is_empty() {
+            .any(|line| line.note_region_mode == "endnote")
+        {
             expected_endnote = None;
             continuing_size = None;
         } else {
-            if let Some(last) = endnote_lines
+            if let Some(last) = page
+                .lines
                 .iter()
+                .rev()
+                .filter(|line| line.note_region_mode == "endnote")
                 .filter_map(|line| label_prefix(&line.text)?.label.parse::<u32>().ok())
-                .next_back()
+                .next()
             {
                 expected_endnote = Some(last + 1);
             }
@@ -2487,8 +2278,8 @@ fn classify_pages_with_source(
         diagnostics.extend(order_page(page, table_page, &table_notes));
         build_regions(std::slice::from_mut(page));
     }
-    evidence.heading_levels =
-        apply_text_fidelity_headings(pages, article_body_size, evidence.source_regions.as_ref());
+    let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
+    evidence.heading_levels = heading_levels;
     build_regions(pages);
     diagnostics
 }
@@ -2500,1221 +2291,6 @@ fn classify_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnos
         ..PdfPrimitiveEvidence::default()
     };
     classify_pages_with_source(pages, separators, &mut evidence)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrderRepair {
-    None,
-    Column,
-    Geometry,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ColumnModel {
-    kind: &'static str,
-    split_x: f64,
-    left_count: usize,
-    right_count: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OrderDecision {
-    repair: OrderRepair,
-    source_switches: usize,
-    strategy: &'static str,
-    reason: &'static str,
-}
-
-impl OrderDecision {
-    const fn keep(reason: &'static str) -> Self {
-        Self {
-            repair: OrderRepair::None,
-            source_switches: 0,
-            strategy: "kraken-native",
-            reason,
-        }
-    }
-}
-
-fn line_width(line: &Line) -> f64 {
-    line.bbox[2] - line.bbox[0]
-}
-
-fn has_valid_bbox(line: &Line) -> bool {
-    line.bbox.iter().all(|value| value.is_finite())
-        && line.bbox[2] > line.bbox[0]
-        && line.bbox[3] > line.bbox[1]
-}
-
-fn line_center_x(line: &Line) -> f64 {
-    (line.bbox[0] + line.bbox[2]) / 2.0
-}
-
-fn line_center_y(line: &Line) -> f64 {
-    (line.bbox[1] + line.bbox[3]) / 2.0
-}
-
-fn p50(mut values: Vec<f64>) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
-}
-
-#[derive(Default)]
-struct TableEvidence {
-    lines: HashSet<usize>,
-    rows: usize,
-    columns: usize,
-    numeric_cells: usize,
-    cells: usize,
-    top: f64,
-    bottom: f64,
-    left: f64,
-    right: f64,
-    line_height: f64,
-}
-
-impl TableEvidence {
-    fn strong(&self) -> bool {
-        self.rows >= 6 && self.columns >= 3 && self.numeric_cells * 5 >= self.cells
-    }
-
-    fn continuation(&self) -> bool {
-        self.rows >= 6 && self.columns >= 2 && self.numeric_cells * 10 >= self.cells
-    }
-
-    fn reaches_page_bottom(&self, page_height: f64) -> bool {
-        page_height > 0.0 && self.bottom >= page_height * 0.70
-    }
-
-    fn continuation_on_page(&self, page_height: f64) -> bool {
-        page_height > 0.0 && self.top <= page_height * 0.30 && self.continuation()
-    }
-
-    fn expanded_lines(
-        &self,
-        lines: &[Line],
-        page_height: f64,
-        continuation: bool,
-        separator: Option<f64>,
-    ) -> HashSet<usize> {
-        if self.lines.is_empty() {
-            return HashSet::new();
-        }
-        let top = if continuation {
-            lines
-                .iter()
-                .filter(|line| {
-                    has_valid_bbox(line)
-                        && !line.exclude_from_body
-                        && line.bbox[1] >= page_height * 0.08
-                        && line.bbox[1] <= self.top
-                })
-                .map(|line| line.bbox[1])
-                .min_by(f64::total_cmp)
-                .unwrap_or(self.top)
-        } else {
-            self.top
-        };
-        let table_size = p50(self
-            .lines
-            .iter()
-            .map(|index| line_font_size(&lines[*index]))
-            .filter(|size| *size > 0.0)
-            .collect());
-        let bottom = separator
-            .filter(|cut| {
-                *cut > top
-                    && lines
-                        .iter()
-                        .filter(|line| has_valid_bbox(line) && line.bbox[1] >= *cut)
-                        .min_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]))
-                        .is_some_and(|next| {
-                            let gap = next.bbox[1] - cut;
-                            gap >= self.line_height * 1.5
-                                && (gap >= self.line_height * 4.0
-                                    || (table_size > 0.0
-                                        && line_font_size(next) <= table_size * 0.90))
-                        })
-            })
-            .unwrap_or(self.bottom);
-        lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                (has_valid_bbox(line)
-                    && !line.exclude_from_body
-                    && line.bbox[3] >= top - self.line_height
-                    && line.bbox[1] <= bottom
-                    && line.bbox[2] >= self.left
-                    && line.bbox[0] <= self.right)
-                    .then_some(index)
-            })
-            .collect()
-    }
-
-    fn table_note_lines(&self, lines: &[Line], cells: &HashSet<usize>) -> HashSet<usize> {
-        let anchors: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                let prefix = label_prefix(&line.text)?;
-                let symbolic = prefix
-                    .label
-                    .chars()
-                    .all(|character| !character.is_ascii_digit());
-                let tail = char_slice(&line.text, prefix.end, line.text.chars().count());
-                (symbolic
-                    && tail
-                        .chars()
-                        .filter(|character| character.is_alphabetic())
-                        .count()
-                        >= 4
-                    && ((!self.lines.contains(&index) && cells.contains(&index))
-                        || (line.bbox[1] > self.bottom
-                            && line.bbox[1] <= self.bottom + self.line_height * 3.0)))
-                    .then_some(index)
-            })
-            .collect();
-        let mut notes: HashSet<_> = anchors.iter().copied().collect();
-        for anchor in anchors {
-            let mut bottom = lines[anchor].bbox[3];
-            let mut following: Vec<_> = lines
-                .iter()
-                .enumerate()
-                .filter(|(index, line)| *index != anchor && line.bbox[1] >= lines[anchor].bbox[1])
-                .collect();
-            following.sort_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]));
-            for (index, line) in following {
-                if line.bbox[1] - bottom > self.line_height * 1.6
-                    || cells.contains(&index)
-                    || has_table_caption(std::slice::from_ref(line))
-                {
-                    break;
-                }
-                notes.insert(index);
-                bottom = bottom.max(line.bbox[3]);
-            }
-        }
-        notes
-    }
-}
-
-fn strong_table_evidence(evidence: &TableEvidence, lines: &[Line]) -> bool {
-    let mut prior = None;
-    let mut run = 0;
-    let mut longest = 0;
-    for line in lines {
-        let Some(prefix) = label_prefix(&line.text) else {
-            continue;
-        };
-        let Ok(label) = prefix.label.parse::<u32>() else {
-            continue;
-        };
-        if !char_slice(&line.text, prefix.end, line.text.chars().count())
-            .chars()
-            .any(char::is_alphabetic)
-        {
-            continue;
-        }
-        run = if prior.is_some_and(|value| (1..=3).contains(&label.saturating_sub(value))) {
-            run + 1
-        } else {
-            1
-        };
-        longest = longest.max(run);
-        prior = Some(label);
-    }
-    evidence.strong()
-        && longest < 3
-        && lines
-            .iter()
-            .enumerate()
-            .filter(|(index, line)| {
-                standalone_note_label(line) && aligned_note_body_index(lines, *index).is_some()
-            })
-            .take(3)
-            .count()
-            < 3
-}
-
-fn has_table_caption(lines: &[Line]) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let regex =
-        RE.get_or_init(|| Regex::new(r"(?i)^(?:table|tableau)\s+(?:\d+|[ivxlcdm]+)\b").unwrap());
-    lines.iter().any(|line| regex.is_match(line.text.trim()))
-}
-
-fn contents_grid(lines: &[Line], page_width: f64) -> bool {
-    if page_width <= 0.0 {
-        return false;
-    }
-    let mut locators: Vec<_> = lines
-        .iter()
-        .filter_map(|line| {
-            let value = line.text.trim().parse::<u32>().ok()?;
-            (has_valid_bbox(line) && line.bbox[0] >= page_width * 0.72).then_some((line, value))
-        })
-        .filter(|(locator, _)| {
-            lines.iter().any(|peer| {
-                let overlap = locator.bbox[3].min(peer.bbox[3]) - locator.bbox[1].max(peer.bbox[1]);
-                let height = (locator.bbox[3] - locator.bbox[1]).min(peer.bbox[3] - peer.bbox[1]);
-                peer.bbox[0] < page_width * 0.68
-                    && peer.text.chars().any(char::is_alphabetic)
-                    && height > 0.0
-                    && overlap / height >= 0.5
-            })
-        })
-        .collect();
-    if locators.len() < 6 {
-        return false;
-    }
-    locators.sort_by(|(left, _), (right, _)| band_geometry_order(left, right));
-    let monotone = locators
-        .windows(2)
-        .filter(|pair| pair[0].1 <= pair[1].1)
-        .count();
-    monotone * 5 >= (locators.len() - 1) * 4
-}
-
-fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
-    let height = p50(lines
-        .iter()
-        .filter(|line| has_valid_bbox(line))
-        .map(|line| line.bbox[3] - line.bbox[1])
-        .filter(|value| *value > 0.0)
-        .collect());
-    if height <= 0.0 {
-        return TableEvidence::default();
-    }
-    let caption = lines
-        .iter()
-        .filter(|line| has_table_caption(std::slice::from_ref(line)))
-        .min_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]));
-    let caption_bottom = caption.map(|line| line.bbox[3]);
-    let mut rows: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
-        has_valid_bbox(line)
-            && !line.exclude_from_body
-            && !matches!(line.region_type.as_str(), "header" | "footer")
-    }) {
-        rows.entry((line_center_y(line) / (height * 0.75)).round() as i64)
-            .or_default()
-            .push(index);
-    }
-    let mut dense_rows: Vec<_> = rows
-        .into_values()
-        .filter(|row| {
-            row.len() >= 2
-                && p50(row
-                    .iter()
-                    .map(|index| lines[*index].text.trim().chars().count() as f64)
-                    .collect())
-                    <= 24.0
-        })
-        .collect();
-    dense_rows.sort_by(|left, right| {
-        let center = |row: &[usize]| {
-            row.iter()
-                .map(|index| line_center_y(&lines[*index]))
-                .min_by(f64::total_cmp)
-                .unwrap_or(0.0)
-        };
-        center(left).total_cmp(&center(right))
-    });
-    if let Some(bottom) = caption_bottom {
-        dense_rows.retain(|row| {
-            row.iter()
-                .map(|index| line_center_y(&lines[*index]))
-                .min_by(f64::total_cmp)
-                .is_some_and(|center| center >= bottom - height)
-        });
-    }
-    if !contents_grid(lines, page_width) {
-        let mut prior = None;
-        dense_rows = dense_rows
-            .into_iter()
-            .take_while(|row| {
-                let center = row
-                    .iter()
-                    .map(|index| line_center_y(&lines[*index]))
-                    .min_by(f64::total_cmp)
-                    .unwrap_or(0.0);
-                let connected = prior.is_none_or(|value| center - value <= height * 6.0);
-                prior = Some(center);
-                connected
-            })
-            .collect();
-    }
-    if dense_rows.len() < 3 {
-        return TableEvidence::default();
-    }
-    let mut columns: HashMap<i64, usize> = HashMap::new();
-    for row in &dense_rows {
-        let mut seen = HashSet::new();
-        for index in row {
-            seen.insert((lines[*index].bbox[0] / (height * 2.0)).round() as i64);
-        }
-        for column in seen {
-            *columns.entry(column).or_default() += 1;
-        }
-    }
-    let row_count = dense_rows.len();
-    let column_count = columns.values().filter(|count| **count >= 3).count();
-    let compact: Vec<_> = dense_rows
-        .iter()
-        .flatten()
-        .map(|index| lines[*index].text.trim())
-        .collect();
-    let numeric_cells = compact
-        .iter()
-        .filter(|text| {
-            text.chars().any(|character| character.is_ascii_digit())
-                && text.chars().all(|character| {
-                    character.is_ascii_digit()
-                        || character.is_whitespace()
-                        || matches!(
-                            character,
-                            '.' | ',' | '%' | '(' | ')' | '/' | '$' | '-' | '\u{2013}' | '\u{2014}'
-                        )
-                })
-        })
-        .count();
-    let dense_lines: HashSet<_> = dense_rows.into_iter().flatten().collect();
-    TableEvidence {
-        top: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[1])
-            .min_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        bottom: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[3])
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        left: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[0])
-            .min_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        right: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[2])
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        line_height: height,
-        lines: dense_lines,
-        rows: row_count,
-        columns: column_count,
-        numeric_cells,
-        cells: compact.len(),
-    }
-}
-
-fn column_model(lines: &[Line], page_width: f64) -> ColumnModel {
-    column_model_with_furniture(lines, page_width, false)
-}
-
-fn margin_note_model(
-    lines: &[Line],
-    labels: &[usize],
-    page_width: f64,
-    body_size: f64,
-    minimum_labels: usize,
-) -> Option<ColumnModel> {
-    if labels.is_empty() || page_width <= 0.0 || body_size <= 0.0 {
-        return None;
-    }
-    [false, true]
-        .into_iter()
-        .filter_map(|right| {
-            let lane: Vec<_> = labels
-                .iter()
-                .copied()
-                .filter(|index| (line_center_x(&lines[*index]) >= page_width / 2.0) == right)
-                .collect();
-            if lane.len() < minimum_labels {
-                return None;
-            }
-            let label_set: HashSet<_> = lane.iter().copied().collect();
-            let mut note_left = page_width;
-            let mut note_right: f64 = 0.0;
-            let mut note_top = f64::INFINITY;
-            let mut note_bottom: f64 = 0.0;
-            for index in &lane {
-                let label = &lines[*index];
-                note_left = note_left.min(label.bbox[0]);
-                note_right = note_right.max(label.bbox[2]);
-                note_top = note_top.min(label.bbox[1]);
-                note_bottom = note_bottom.max(label.bbox[3]);
-                if standalone_note_label(label) {
-                    if let Some(body) = aligned_note_body_index(lines, *index) {
-                        note_left = note_left.min(lines[body].bbox[0]);
-                        note_right = note_right.max(lines[body].bbox[2]);
-                        note_top = note_top.min(lines[body].bbox[1]);
-                        note_bottom = note_bottom.max(lines[body].bbox[3]);
-                    }
-                }
-            }
-            let prose: Vec<_> = lines
-                .iter()
-                .enumerate()
-                .filter(|(index, line)| {
-                    !label_set.contains(index)
-                        && has_valid_bbox(line)
-                        && !line.exclude_from_body
-                        && !matches!(line.region_type.as_str(), "header" | "footer")
-                        && line_font_size(line) >= body_size * 0.90
-                        && line_width(line) >= page_width * 0.25
-                        && line.bbox[3] >= note_top
-                        && line.bbox[1] <= note_bottom
-                })
-                .map(|(_, line)| line)
-                .collect();
-            if prose.len() < 3 {
-                return None;
-            }
-            let body_left = prose
-                .iter()
-                .map(|line| line.bbox[0])
-                .min_by(f64::total_cmp)?;
-            let body_right = prose
-                .iter()
-                .map(|line| line.bbox[2])
-                .max_by(f64::total_cmp)?;
-            let gap = (body_size * 1.5).max(page_width * 0.02);
-            let split_x = if note_right + gap <= body_left {
-                (note_right + body_left) / 2.0
-            } else if body_right + gap <= note_left {
-                (body_right + note_left) / 2.0
-            } else {
-                return None;
-            };
-            Some((
-                lane.len(),
-                ColumnModel {
-                    kind: "margin_column",
-                    split_x,
-                    left_count: if right { prose.len() } else { lane.len() },
-                    right_count: if right { lane.len() } else { prose.len() },
-                },
-            ))
-        })
-        .max_by_key(|(count, _)| *count)
-        .map(|(_, model)| model)
-}
-
-fn column_model_with_furniture(
-    lines: &[Line],
-    page_width: f64,
-    ignore_centered_furniture: bool,
-) -> ColumnModel {
-    let single = ColumnModel {
-        kind: "single",
-        split_x: 0.0,
-        left_count: 0,
-        right_count: 0,
-    };
-    if page_width <= 0.0 || lines.is_empty() {
-        return single;
-    }
-    let boxed: Vec<&Line> = lines
-        .iter()
-        .filter(|line| {
-            has_valid_bbox(line)
-                && !line.exclude_from_body
-                && !matches!(line.region_type.as_str(), "header" | "footer")
-        })
-        .collect();
-    let centered_band = |line: &Line| {
-        let width_ratio = line_width(line) / page_width;
-        ignore_centered_furniture
-            && width_ratio <= 0.30
-            && (line_center_x(line) / page_width - 0.5).abs() <= 0.12
-    };
-    let inference_lines: Vec<&Line> = boxed
-        .iter()
-        .copied()
-        .filter(|line| !centered_band(line))
-        .collect();
-    let candidates: Vec<&Line> = inference_lines
-        .iter()
-        .copied()
-        .filter(|line| line_width(line) / page_width <= 0.55)
-        .collect();
-    if candidates.len() < 6
-        || (!inference_lines.is_empty()
-            && 1.0 - candidates.len() as f64 / inference_lines.len() as f64 > 0.40)
-    {
-        return single;
-    }
-    let mut centers: Vec<f64> = candidates.iter().map(|line| line_center_x(line)).collect();
-    centers.sort_by(f64::total_cmp);
-    centers
-        .windows(2)
-        .filter_map(|pair| {
-            let left = pair[0];
-            let right = pair[1];
-            let center_gap = pair[1] - pair[0];
-            let initial_split = (left + right) / 2.0;
-            if center_gap / page_width < 0.12
-                || !(0.25..=0.75).contains(&(initial_split / page_width))
-            {
-                return None;
-            }
-            let (left_lines, right_lines): (Vec<_>, Vec<_>) = candidates
-                .iter()
-                .copied()
-                .partition(|line| line_center_x(line) < initial_split);
-            if left_lines.len() < 3 || right_lines.len() < 3 {
-                return None;
-            }
-            let (split_x, gap, imbalance) = if ignore_centered_furniture {
-                let left_edge = left_lines
-                    .iter()
-                    .map(|line| line.bbox[2])
-                    .max_by(f64::total_cmp)
-                    .unwrap_or(initial_split);
-                let right_edge = right_lines
-                    .iter()
-                    .map(|line| line.bbox[0])
-                    .min_by(f64::total_cmp)
-                    .unwrap_or(initial_split);
-                if right_edge <= left_edge {
-                    return None;
-                }
-                (
-                    (left_edge + right_edge) / 2.0,
-                    right_edge - left_edge,
-                    left_lines.len().abs_diff(right_lines.len()),
-                )
-            } else {
-                (initial_split, center_gap, 0)
-            };
-            let split_ratio = (split_x / page_width * 10_000.0).round_ties_even() / 10_000.0;
-            let vertical_extent = |values: &[&Line]| {
-                (
-                    values
-                        .iter()
-                        .map(|line| line.bbox[1])
-                        .min_by(f64::total_cmp)
-                        .unwrap_or(0.0),
-                    values
-                        .iter()
-                        .map(|line| line.bbox[3])
-                        .max_by(f64::total_cmp)
-                        .unwrap_or(0.0),
-                )
-            };
-            let left_y = vertical_extent(&left_lines);
-            let right_y = vertical_extent(&right_lines);
-            let span = left_y.1.max(right_y.1) - left_y.0.min(right_y.0);
-            let overlap = left_y.1.min(right_y.1) - left_y.0.max(right_y.0);
-            if span <= 0.0 || overlap.max(0.0) / span < 0.30 {
-                return None;
-            }
-            let crossings = candidates
-                .iter()
-                .filter(|line| line.bbox[0] < split_x && line.bbox[2] > split_x)
-                .count();
-            let left_width = p50(left_lines
-                .iter()
-                .map(|line| line_width(line) / page_width)
-                .collect());
-            let right_width = p50(right_lines
-                .iter()
-                .map(|line| line_width(line) / page_width)
-                .collect());
-            let width_ratio = left_width.min(right_width) / left_width.max(right_width);
-            Some((
-                crossings,
-                imbalance,
-                gap,
-                ColumnModel {
-                    kind: if (crossings == 0 && (0.40..=0.60).contains(&split_ratio))
-                        || width_ratio >= 0.60
-                    {
-                        "two_column"
-                    } else {
-                        "margin_column"
-                    },
-                    split_x,
-                    left_count: left_lines.len(),
-                    right_count: right_lines.len(),
-                },
-            ))
-        })
-        .min_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then(left.1.cmp(&right.1))
-                .then_with(|| right.2.total_cmp(&left.2))
-        })
-        .map(|(_, _, _, model)| model)
-        .unwrap_or(single)
-}
-
-fn note_column_model(lines: &[Line], page_width: f64) -> ColumnModel {
-    let mut model = column_model(lines, page_width);
-    if model.kind != "two_column" {
-        return model;
-    }
-    let crossing_prose = lines
-        .iter()
-        .filter(|line| {
-            has_valid_bbox(line)
-                && line
-                    .text
-                    .chars()
-                    .filter(|character| !character.is_whitespace())
-                    .count()
-                    >= 8
-                && line.bbox[0] < model.split_x
-                && line.bbox[2] > model.split_x
-        })
-        .count();
-    if crossing_prose > 0 {
-        model.kind = "margin_column";
-    }
-    model
-}
-
-fn geometry_order(lines: &mut [Line]) {
-    lines.sort_by(|left, right| {
-        line_center_y(left)
-            .total_cmp(&line_center_y(right))
-            .then(line_center_x(left).total_cmp(&line_center_x(right)))
-            .then(left.bbox[0].total_cmp(&right.bbox[0]))
-            .then(left.id.cmp(&right.id))
-    });
-}
-
-fn column_order(lines: &mut [Line], split_x: f64) {
-    let spans = |line: &Line| {
-        let width = line_width(line);
-        width > 0.0
-            && line.bbox[0] <= split_x - width * 0.20
-            && line.bbox[2] >= split_x + width * 0.20
-    };
-    let bounds = |right: bool| {
-        let mut values = lines
-            .iter()
-            .filter(|line| {
-                has_valid_bbox(line) && !spans(line) && (line_center_x(line) >= split_x) == right
-            })
-            .map(line_center_y);
-        let first = values.next()?;
-        Some(values.fold((first, first), |(top, bottom), value| {
-            (top.min(value), bottom.max(value))
-        }))
-    };
-    let Some((left, right)) = bounds(false).zip(bounds(true)) else {
-        geometry_order(lines);
-        return;
-    };
-    let overlap = (left.0.max(right.0), left.1.min(right.1));
-    let mut anchors: Vec<_> = lines
-        .iter()
-        .filter(|line| spans(line) && (overlap.0..=overlap.1).contains(&line_center_y(line)))
-        .map(line_center_y)
-        .collect();
-    anchors.sort_by(f64::total_cmp);
-    lines.sort_by(|left, right| {
-        let left_y = line_center_y(left);
-        let right_y = line_center_y(right);
-        let band = |y: f64| usize::from(y >= overlap.0) + usize::from(y > overlap.1);
-        let left_band = band(left_y);
-        let right_band = band(right_y);
-        let band_order = left_band.cmp(&right_band);
-        if band_order != std::cmp::Ordering::Equal || left_band != 1 {
-            return band_order
-                .then(left_y.total_cmp(&right_y))
-                .then(left.bbox[0].total_cmp(&right.bbox[0]))
-                .then(left.id.cmp(&right.id));
-        }
-        let left_anchor = spans(left);
-        let right_anchor = spans(right);
-        let left_segment = anchors.partition_point(|anchor| *anchor < left_y);
-        let right_segment = anchors.partition_point(|anchor| *anchor < right_y);
-        let left_column = usize::from(line_center_x(left) >= split_x);
-        let right_column = usize::from(line_center_x(right) >= split_x);
-        left_segment
-            .cmp(&right_segment)
-            .then(left_anchor.cmp(&right_anchor))
-            .then_with(|| {
-                if left_anchor {
-                    std::cmp::Ordering::Equal
-                } else {
-                    left_column.cmp(&right_column)
-                }
-            })
-            .then(left_y.total_cmp(&right_y))
-            .then(line_center_x(left).total_cmp(&line_center_x(right)))
-            .then(left.bbox[0].total_cmp(&right.bbox[0]))
-            .then(left.id.cmp(&right.id))
-    });
-}
-
-fn column_switches(lines: &[Line], model: ColumnModel, page_width: f64) -> usize {
-    let mut previous = None;
-    let mut switches = 0;
-    for line in lines {
-        if !has_valid_bbox(line) || line_width(line) / page_width > 0.55 {
-            continue;
-        }
-        let column = line_center_x(line) >= model.split_x;
-        if previous.is_some_and(|prior| prior != column) {
-            switches += 1;
-        }
-        previous = Some(column);
-    }
-    switches
-}
-
-fn median_column_run(lines: &[Line], model: ColumnModel, page_width: f64) -> usize {
-    let mut previous = None;
-    let mut current = 0;
-    let mut runs = Vec::new();
-    for line in lines {
-        if !has_valid_bbox(line) || line_width(line) / page_width > 0.55 {
-            continue;
-        }
-        let column = line_center_x(line) >= model.split_x;
-        if previous.is_none_or(|prior| prior == column) {
-            current += 1;
-        } else {
-            runs.push(current);
-            current = 1;
-        }
-        previous = Some(column);
-    }
-    if current > 0 {
-        runs.push(current);
-    }
-    runs.sort_unstable();
-    runs.get(runs.len() / 2).copied().unwrap_or(0)
-}
-
-fn hyphen_join_score(lines: &[Line]) -> (usize, usize) {
-    let mut candidates = 0;
-    let mut satisfied = 0;
-    for (index, line) in lines.iter().enumerate() {
-        let text = line.text.trim_end();
-        let Some(last) = text
-            .chars()
-            .last()
-            .filter(|character| matches!(character, '-' | '\u{00ad}' | '\u{00ac}'))
-        else {
-            continue;
-        };
-        let prefix = &text[..text.len() - last.len_utf8()];
-        if prefix
-            .chars()
-            .rev()
-            .take_while(|character| character.is_ascii_alphabetic())
-            .count()
-            < 2
-        {
-            continue;
-        }
-        candidates += 1;
-        if lines.get(index + 1).is_some_and(|next| {
-            next.text
-                .trim_start()
-                .chars()
-                .take_while(|character| character.is_ascii_alphabetic())
-                .count()
-                >= 2
-        }) {
-            satisfied += 1;
-        }
-    }
-    (candidates, satisfied)
-}
-
-fn y_regressions(lines: &[Line]) -> usize {
-    let boxed: Vec<&Line> = lines.iter().filter(|line| has_valid_bbox(line)).collect();
-    let tolerance = p50(boxed
-        .iter()
-        .map(|line| (line.bbox[3] - line.bbox[1]).max(0.0))
-        .collect());
-    boxed
-        .windows(2)
-        .filter(|pair| line_center_y(pair[1]) < line_center_y(pair[0]) - tolerance)
-        .count()
-}
-
-fn arbitrate_body_order(lines: &mut [Line], page_width: f64, page_height: f64) -> OrderDecision {
-    let boxed = lines.iter().filter(|line| has_valid_bbox(line)).count();
-    if lines.len() < 8 || boxed * 5 < lines.len() * 4 || page_width <= 0.0 || page_height <= 0.0 {
-        return OrderDecision::keep("insufficient_geometry");
-    }
-    if has_table_caption(lines) {
-        return OrderDecision::keep("table_grid");
-    }
-    let mut model = column_model(lines, page_width);
-    if model.kind != "two_column" {
-        let alternative = column_model_with_furniture(lines, page_width, true);
-        if alternative.kind == "two_column" {
-            model = alternative;
-        }
-    }
-    if model.kind == "two_column" {
-        let source_switches = column_switches(lines, model, page_width);
-        let source_run = median_column_run(lines, model, page_width);
-        let source_hyphens = hyphen_join_score(lines);
-        let mut challenger = lines.to_vec();
-        column_order(&mut challenger, model.split_x);
-        let challenger_switches = column_switches(&challenger, model, page_width);
-        let challenger_hyphens = hyphen_join_score(&challenger);
-        let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }
-            .max(((model.left_count + model.right_count) as f64 * 0.10) as usize);
-        if source_switches >= minimum_switches
-            && source_run <= 6
-            && challenger_switches <= 2
-            && source_switches.saturating_sub(challenger_switches) >= 2
-            && challenger_hyphens.1 >= source_hyphens.1
-            && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
-                <= source_hyphens.0.saturating_sub(source_hyphens.1)
-        {
-            lines.clone_from_slice(&challenger);
-            return OrderDecision {
-                repair: OrderRepair::Column,
-                source_switches,
-                strategy: "column-geometry",
-                reason: "column_interleave_repair",
-            };
-        }
-        return OrderDecision {
-            repair: OrderRepair::None,
-            source_switches,
-            strategy: "kraken-native",
-            reason: "two_column_kraken_coherent",
-        };
-    }
-    if model.kind == "single" {
-        let source_regressions = y_regressions(lines);
-        let source_hyphens = hyphen_join_score(lines);
-        let mut challenger = lines.to_vec();
-        geometry_order(&mut challenger);
-        let challenger_regressions = y_regressions(&challenger);
-        let challenger_hyphens = hyphen_join_score(&challenger);
-        let threshold = 3.max((boxed as f64 * 0.08) as usize);
-        if source_regressions >= threshold
-            && challenger_regressions <= source_regressions / 3
-            && challenger_hyphens.1 > source_hyphens.1
-            && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
-                < source_hyphens.0.saturating_sub(source_hyphens.1)
-        {
-            lines.clone_from_slice(&challenger);
-            return OrderDecision {
-                repair: OrderRepair::Geometry,
-                source_switches: 0,
-                strategy: "geometry",
-                reason: "kraken_order_scrambled",
-            };
-        }
-    }
-    OrderDecision::keep(if model.kind == "single" {
-        "single_column_kraken_coherent"
-    } else {
-        "non_two_column"
-    })
-}
-
-fn repair_drop_caps(lines: &mut Vec<Line>) {
-    let body_size = p50(lines
-        .iter()
-        .map(line_font_size)
-        .filter(|size| (4.0..=24.0).contains(size))
-        .collect());
-    if body_size <= 0.0 {
-        return;
-    }
-    let mut moves = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let text = line.text.trim();
-        if text.chars().count() != 1
-            || !text.chars().all(char::is_alphabetic)
-            || line_font_size(line) < body_size * 1.8
-        {
-            continue;
-        }
-        let target = lines
-            .iter()
-            .enumerate()
-            .filter(|(other, candidate)| {
-                *other != index
-                    && line_font_size(candidate) <= body_size * 1.4
-                    && candidate.bbox[0] >= line.bbox[2] - body_size
-                    && candidate.bbox[0] - line.bbox[2] <= body_size * 3.0
-                    && candidate.bbox[1] < line.bbox[3]
-                    && candidate.bbox[3] > line.bbox[1]
-            })
-            .min_by(|(_, left), (_, right)| {
-                left.bbox[1]
-                    .total_cmp(&right.bbox[1])
-                    .then(left.bbox[0].total_cmp(&right.bbox[0]))
-            })
-            .map(|(target, _)| target);
-        if let Some(target) = target.filter(|target| *target < index) {
-            moves.push((index, target));
-        }
-    }
-    for (index, target) in moves.into_iter().rev() {
-        let line = lines.remove(index);
-        lines.insert(target, line);
-    }
-}
-
-fn band_geometry_top(line: &Line) -> f64 {
-    line.words
-        .iter()
-        .map(|word| word.bbox[1])
-        .min_by(f64::total_cmp)
-        .unwrap_or(line.bbox[1])
-}
-
-fn band_geometry_order(left: &Line, right: &Line) -> std::cmp::Ordering {
-    band_geometry_top(left)
-        .total_cmp(&band_geometry_top(right))
-        .then(left.bbox[0].total_cmp(&right.bbox[0]))
-}
-
-fn standalone_note_label(line: &Line) -> bool {
-    let text = line.text.trim();
-    let length = text.chars().count();
-    ((1..=MAX_SYMBOL_LABEL_LEN).contains(&length) && text.chars().all(is_note_symbol))
-        || ((1..=4).contains(&length) && text.chars().all(|character| character.is_ascii_digit()))
-}
-
-fn aligned_note_body(label: &Line, body: &Line) -> bool {
-    if standalone_note_label(body) || body.bbox[0] < label.bbox[0] {
-        return false;
-    }
-    let overlap = label.bbox[3].min(body.bbox[3]) - label.bbox[1].max(body.bbox[1]);
-    let minimum_height = (label.bbox[3] - label.bbox[1]).min(body.bbox[3] - body.bbox[1]);
-    overlap > 0.0 && minimum_height > 0.0 && overlap / minimum_height >= 0.5
-}
-
-fn aligned_note_body_index(lines: &[Line], label_index: usize) -> Option<usize> {
-    let label = &lines[label_index];
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, body)| aligned_note_body(label, body))
-        .min_by(|(_, left), (_, right)| {
-            (left.bbox[0] - label.bbox[2])
-                .max(0.0)
-                .total_cmp(&(right.bbox[0] - label.bbox[2]).max(0.0))
-                .then(
-                    (left.bbox[1] - label.bbox[1])
-                        .abs()
-                        .total_cmp(&(right.bbox[1] - label.bbox[1]).abs()),
-                )
-        })
-        .map(|(index, _)| index)
-}
-
-fn order_note_lines(lines: &mut Vec<Line>, page_width: f64) {
-    let mut tops: Vec<f64> = lines.iter().map(band_geometry_top).collect();
-    for (label_index, label) in lines.iter().enumerate() {
-        if !standalone_note_label(label) {
-            continue;
-        }
-        if let Some(body_index) = aligned_note_body_index(lines, label_index) {
-            tops[label_index] = tops[body_index];
-        }
-    }
-    let columns = note_column_model(lines, page_width);
-    let mut keyed: Vec<_> = std::mem::take(lines).into_iter().zip(tops).collect();
-    keyed.sort_by(|(left, left_top), (right, right_top)| {
-        let left_column =
-            usize::from(columns.kind == "two_column" && line_center_x(left) >= columns.split_x);
-        let right_column =
-            usize::from(columns.kind == "two_column" && line_center_x(right) >= columns.split_x);
-        left_column.cmp(&right_column).then(
-            left_top
-                .total_cmp(right_top)
-                .then(left.bbox[0].total_cmp(&right.bbox[0])),
-        )
-    });
-    lines.extend(keyed.into_iter().map(|(line, _)| line));
-}
-
-fn weave_note_columns(mut body: Vec<Line>, note: Vec<Line>, page_width: f64) -> Vec<Line> {
-    let note_columns = note_column_model(&note, page_width);
-    let body_model = column_model(&body, page_width);
-    let split_x = if note_columns.kind == "two_column" {
-        note_columns.split_x
-    } else if body_model.kind == "two_column" {
-        body_model.split_x
-    } else {
-        body.extend(note);
-        return body;
-    };
-    let note_sides = note
-        .iter()
-        .filter(|line| line_width(line) / page_width <= 0.55)
-        .fold([0_usize; 2], |mut counts, line| {
-            counts[usize::from(line_center_x(line) >= split_x)] += 1;
-            counts
-        });
-    if note_sides.contains(&0) {
-        body.extend(note);
-        return body;
-    }
-    let (left_notes, right_notes): (Vec<_>, Vec<_>) = note
-        .into_iter()
-        .partition(|line| line_center_x(line) < split_x);
-    let body_columns = body
-        .iter()
-        .filter(|line| line_width(line) / page_width <= 0.55)
-        .fold([0_usize; 2], |mut counts, line| {
-            counts[usize::from(line_center_x(line) >= split_x)] += 1;
-            counts
-        });
-    if left_notes.is_empty()
-        || right_notes.is_empty()
-        || body_columns.iter().any(|count| *count < 3)
-    {
-        body.extend(left_notes);
-        body.extend(right_notes);
-        return body;
-    }
-    let insert_at = body
-        .iter()
-        .rposition(|line| line_width(line) / page_width <= 0.55 && line_center_x(line) < split_x)
-        .map_or(0, |index| index + 1);
-    let right_body = body.split_off(insert_at);
-    body.extend(left_notes);
-    body.extend(right_body);
-    body.extend(right_notes);
-    body
-}
-
-fn order_page(page: &mut Page, table_page: bool, table_notes: &HashSet<usize>) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut header = Vec::new();
-    let mut body = Vec::new();
-    let mut note = Vec::new();
-    let mut footer = Vec::new();
-    for (index, line) in std::mem::take(&mut page.lines).into_iter().enumerate() {
-        match line.region_type.as_str() {
-            "header" => header.push(line),
-            "footnote" if table_notes.contains(&index) => body.push(line),
-            "footnote" => note.push(line),
-            "footer" => footer.push(line),
-            _ => body.push(line),
-        }
-    }
-    header.sort_by(band_geometry_order);
-    repair_drop_caps(&mut body);
-    let contents = table_page && !has_table_caption(&body) && contents_grid(&body, page.width);
-    let decision = if contents && y_regressions(&body) > 0 {
-        geometry_order(&mut body);
-        OrderDecision {
-            repair: OrderRepair::Geometry,
-            source_switches: 0,
-            strategy: "table-row-geometry",
-            reason: "table_source_order_scrambled",
-        }
-    } else if table_page {
-        OrderDecision::keep("table_grid")
-    } else {
-        arbitrate_body_order(&mut body, page.width, page.height)
-    };
-    if decision.repair != OrderRepair::None {
-        let mut diagnostic = Diagnostic::info(
-            "COLUMN_ORDER_REPAIRED",
-            format!(
-                "Extraction order replaced by {}: {}.",
-                decision.strategy, decision.reason
-            ),
-            Some(page.index),
-        );
-        diagnostic.line_ids = body.iter().take(20).map(|line| line.id.clone()).collect();
-        diagnostics.push(diagnostic);
-    } else if decision.source_switches > 2 {
-        let mut diagnostic = Diagnostic::warning(
-            "COLUMN_ORDER_UNCERTAIN",
-            format!(
-                "Two-column page keeps an order that crosses columns {} times ({}).",
-                decision.source_switches, decision.reason
-            ),
-            Some(page.index),
-        );
-        diagnostic.line_ids = body.iter().take(20).map(|line| line.id.clone()).collect();
-        diagnostics.push(diagnostic);
-    }
-    order_note_lines(&mut note, page.width);
-    footer.sort_by(band_geometry_order);
-    let mut ordered = header;
-    ordered.extend(weave_note_columns(body, note, page.width));
-    ordered.extend(footer);
-    for (index, line) in ordered.iter_mut().enumerate() {
-        line.reading_order = index + 1;
-    }
-    page.lines = ordered;
-    diagnostics
-}
-
-#[cfg(test)]
-fn order_pages(pages: &mut [Page]) -> Vec<Diagnostic> {
-    pages
-        .iter_mut()
-        .flat_map(|page| {
-            let evidence = table_evidence(&page.lines, page.width);
-            let table_page =
-                has_table_caption(&page.lines) || strong_table_evidence(&evidence, &page.lines);
-            order_page(page, table_page, &HashSet::new())
-        })
-        .collect()
-}
-
-fn build_regions(pages: &mut [Page]) {
-    for page in pages {
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for index in 0..page.lines.len() {
-            if groups.last().is_some_and(|group| {
-                let prior = &page.lines[*group.last().expect("non-empty group")];
-                prior.region_type == page.lines[index].region_type
-                    && prior.block_index == page.lines[index].block_index
-            }) {
-                groups.last_mut().expect("group exists").push(index);
-            } else {
-                groups.push(vec![index]);
-            }
-        }
-        page.regions.clear();
-        for (region_index, indexes) in groups.into_iter().enumerate() {
-            let id = format!("p{:04}-r{:04}", page.number, region_index + 1);
-            let kind = page.lines[indexes[0]].region_type.clone();
-            let line_ids = indexes
-                .iter()
-                .map(|&index| page.lines[index].id.clone())
-                .collect();
-            let bbox = union_bbox(indexes.iter().map(|&index| page.lines[index].bbox));
-            let reading_order = indexes
-                .iter()
-                .map(|&index| page.lines[index].reading_order)
-                .min()
-                .unwrap_or(0);
-            for &index in &indexes {
-                page.lines[index].region_id.clone_from(&id);
-            }
-            page.regions.push(Region {
-                id,
-                page_index: page.index,
-                kind,
-                line_ids,
-                bbox,
-                reading_order,
-            });
-        }
-    }
 }
 
 fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
@@ -3781,13 +2357,14 @@ fn citation_shaped_tail(text: &str) -> bool {
     .is_match(text)
 }
 
-fn join_lines(lines: &[&Line]) -> (String, HashMap<String, (usize, usize)>) {
+fn join_lines(lines: &[&Line]) -> (String, Vec<Option<(usize, usize)>>) {
     let mut text = String::new();
-    let mut offsets = HashMap::new();
+    let mut offsets = Vec::with_capacity(lines.len());
     let mut scalar_cursor = 0;
     for line in lines {
         let value = line.text.trim();
         if value.is_empty() {
+            offsets.push(None);
             continue;
         }
         if text
@@ -3805,7 +2382,7 @@ fn join_lines(lines: &[&Line]) -> (String, HashMap<String, (usize, usize)>) {
         let start = scalar_cursor;
         text.push_str(value);
         scalar_cursor += value.chars().count();
-        offsets.insert(line.id.clone(), (start, scalar_cursor));
+        offsets.push(Some((start, scalar_cursor)));
     }
     (text, offsets)
 }
@@ -3818,9 +2395,7 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
             .iter()
             .map(|line| (line.id.as_str(), line))
             .collect();
-        let mut regions: Vec<&Region> = page.regions.iter().collect();
-        regions.sort_by_key(|region| region.reading_order);
-        for region in regions {
+        for region in &page.regions {
             if !matches!(region.kind.as_str(), "body" | "heading") {
                 continue;
             }
@@ -3835,37 +2410,48 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
                 continue;
             }
             let mut events = Vec::new();
-            for line in &lines {
-                let Some((base, _)) = line_offsets.get(&line.id) else {
+            for (line, offset) in lines.iter().zip(&line_offsets) {
+                let Some((base, _)) = offset else {
                     continue;
                 };
                 for anchor in anchors.get(&line.id).into_iter().flatten() {
                     events.push((
-                        base + anchor.start,
-                        base + anchor.end,
-                        anchor.pair_id.clone(),
-                        anchor.label.clone(),
+                        *base + anchor.start,
+                        *base + anchor.end,
+                        anchor.pair_id.as_str(),
+                        anchor.label.as_str(),
                     ));
                 }
             }
             events.sort_by_key(|event| (event.0, event.1));
-            let mut rendered = String::new();
-            let mut output_anchors = Vec::new();
-            let mut cursor = 0;
-            for (start, end, pair_id, label) in events {
-                let start = start.max(cursor).min(text.chars().count());
-                let end = end.max(start).min(text.chars().count());
-                rendered.push_str(char_slice(&text, cursor, start));
-                let offset = rendered.chars().count();
-                rendered.push_str(&format!("⟦FN:{pair_id}⟧"));
-                output_anchors.push(json!({
-                    "pair_id": pair_id,
-                    "label": label,
-                    "offset": offset,
-                }));
-                cursor = end;
-            }
-            rendered.push_str(char_slice(&text, cursor, text.chars().count()));
+            let (rendered, output_anchors) = if events.is_empty() {
+                (text, Vec::new())
+            } else {
+                let coordinates = ScalarText::new(&text);
+                let text_len = coordinates.len();
+                let mut rendered = String::with_capacity(text.len());
+                let mut output_anchors = Vec::with_capacity(events.len());
+                let (mut cursor, mut rendered_len) = (0, 0);
+                for (start, end, pair_id, label) in events {
+                    let start = start.max(cursor).min(text_len);
+                    let end = end.max(start).min(text_len);
+                    rendered.push_str(coordinates.slice(cursor..start).unwrap());
+                    rendered_len += start - cursor;
+                    let offset = rendered_len;
+                    rendered.push_str("⟦FN:");
+                    rendered.push_str(&pair_id);
+                    rendered.push('⟧');
+                    rendered_len += 5 + pair_id.chars().count();
+                    output_anchors.push(ParagraphAnchor {
+                        pair_id: pair_id.to_owned(),
+                        label: label.to_owned(),
+                        offset,
+                    });
+                    cursor = end;
+                }
+                rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
+                (rendered, output_anchors)
+            };
             paragraphs.push(Paragraph {
                 id: format!("para-{:06}", paragraphs.len() + 1),
                 page_index: page.index,
@@ -3961,17 +2547,12 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
     for paragraph in paragraphs {
         let chars: Vec<char> = paragraph.text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
-        let mut anchors = paragraph.anchors.clone();
-        anchors.sort_by_key(|anchor| anchor.get("offset").and_then(Value::as_u64).unwrap_or(0));
         let mut previous_offset = 0;
-        for anchor in anchors {
-            let Some(pair_id) = anchor.get("pair_id").and_then(Value::as_str) else {
+        for anchor in &paragraph.anchors {
+            let Some(&index) = by_pair.get(&anchor.pair_id) else {
                 continue;
             };
-            let Some(&index) = by_pair.get(pair_id) else {
-                continue;
-            };
-            let offset = anchor.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let offset = anchor.offset;
             footnotes[index].sentence_proposition =
                 sentence_at_boundaries(&chars, &boundaries, offset);
             let passage_text: String = chars
@@ -3984,7 +2565,7 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
             } else {
                 passage
             };
-            previous_offset = offset + format!("⟦FN:{pair_id}⟧").chars().count();
+            previous_offset = offset + 5 + anchor.pair_id.chars().count();
         }
         previous_tail = chars[previous_offset.min(chars.len())..]
             .iter()
@@ -4061,10 +2642,7 @@ fn crossref_shortform(text: &str, byte_start: usize) -> String {
         )
         .unwrap()
     });
-    let prefix = &text[..byte_start];
-    let window_start = prefix.chars().count().saturating_sub(70);
-    let start = char_to_byte(prefix, window_start);
-    let Some(capture) = pattern.captures(&prefix[start..]) else {
+    let Some(capture) = pattern.captures(last_scalars(&text[..byte_start], 70)) else {
         return String::new();
     };
     let short = capture
@@ -4073,10 +2651,10 @@ fn crossref_shortform(text: &str, byte_start: usize) -> String {
         .trim()
         .trim_end_matches([',', '.', ';', ':'])
         .to_owned();
-    if matches!(
-        short.to_lowercase().as_str(),
-        "see" | "in" | "the" | "but" | "and" | "also" | "supra" | "infra" | "ibid" | "at"
-    ) {
+    if "see in the but and also supra infra ibid at"
+        .split(' ')
+        .any(|word| short.eq_ignore_ascii_case(word))
+    {
         String::new()
     } else {
         short
@@ -4106,21 +2684,16 @@ fn hyphen_continuation(text: &str) -> bool {
 fn text_flow_faults(pages: &[Page]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for page in pages {
-        let eligible: Vec<&Line> = page
-            .lines
-            .iter()
-            .filter(|line| {
-                !matches!(line.region_type.as_str(), "header" | "footer") && !line.exclude_from_body
-            })
-            .collect();
-        for pair in eligible.windows(2) {
-            let previous = pair[0];
-            let current = pair[1];
-            if !hyphen_fragment_tail(&previous.text) {
-                continue;
-            }
-            if hyphen_continuation(&current.text) {
-                if line_family(previous) != line_family(current) {
+        let mut eligible = page.lines.iter().filter(|line| {
+            !matches!(line.region_type.as_str(), "header" | "footer") && !line.exclude_from_body
+        });
+        let Some(mut previous) = eligible.next() else {
+            continue;
+        };
+        for current in eligible {
+            if hyphen_fragment_tail(&previous.text) {
+                let continues = hyphen_continuation(&current.text);
+                if continues && line_family(previous) != line_family(current) {
                     let mut diagnostic = Diagnostic::warning(
                         "REGION_BOUNDARY_FAULT",
                         format!(
@@ -4132,16 +2705,17 @@ fn text_flow_faults(pages: &[Page]) -> Vec<Diagnostic> {
                     );
                     diagnostic.line_ids = vec![previous.id.clone(), current.id.clone()];
                     diagnostics.push(diagnostic);
+                } else if !continues && line_family(previous) == line_family(current) {
+                    let mut diagnostic = Diagnostic::info(
+                        "DANGLING_SOFT_HYPHEN",
+                        "A line ends mid-word but the next eligible line does not continue it.",
+                        Some(page.index),
+                    );
+                    diagnostic.line_ids.push(previous.id.clone());
+                    diagnostics.push(diagnostic);
                 }
-            } else if line_family(previous) == line_family(current) {
-                let mut diagnostic = Diagnostic::info(
-                    "DANGLING_SOFT_HYPHEN",
-                    "A line ends mid-word but the next eligible line does not continue it.",
-                    Some(page.index),
-                );
-                diagnostic.line_ids.push(previous.id.clone());
-                diagnostics.push(diagnostic);
             }
+            previous = current;
         }
     }
     diagnostics
@@ -4152,7 +2726,7 @@ fn unmatched_reference_diagnostics(
     footnotes: &[Footnote],
     anchors: &HashMap<String, Vec<Anchor>>,
 ) -> Vec<Diagnostic> {
-    let labels: HashSet<String> = footnotes.iter().map(|note| note.label.clone()).collect();
+    let labels: HashSet<&str> = footnotes.iter().map(|note| note.label.as_str()).collect();
     let primary_lines: HashSet<&str> = footnotes
         .iter()
         .filter_map(|note| note.reference_line_id.as_deref())
@@ -4160,22 +2734,9 @@ fn unmatched_reference_diagnostics(
     let mut diagnostics = Vec::new();
     for line in pages.iter().flat_map(|page| page.lines.iter()) {
         for detached in &line.detached_references {
-            let label = normalize_label(
-                detached
-                    .get("note_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-            );
-            let start = detached
-                .get("start_offset")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0);
-            let end = detached
-                .get("end_offset")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(start);
+            let label = normalize_label(&detached.note_id);
+            let start = detached.start_offset;
+            let end = detached.end_offset;
             let paired = anchors.get(&line.id).is_some_and(|entries| {
                 entries.iter().any(|anchor| {
                     anchor.start == start && anchor.end == end && anchor.label == label
@@ -4188,10 +2749,8 @@ fn unmatched_reference_diagnostics(
                     Some(line.page_index),
                 );
                 diagnostic.line_ids.push(line.id.clone());
-                if let Some(source) = detached.get("source_line_id").and_then(Value::as_str) {
-                    if !source.is_empty() {
-                        diagnostic.line_ids.push(source.to_owned());
-                    }
+                if !detached.source_line_id.is_empty() {
+                    diagnostic.line_ids.push(detached.source_line_id.clone());
                 }
                 diagnostic.details.insert("label".to_owned(), json!(label));
                 diagnostics.push(diagnostic);
@@ -4203,11 +2762,9 @@ fn unmatched_reference_diagnostics(
         {
             continue;
         }
-        if line
-            .spans
-            .iter()
-            .any(|span| span.superscript && labels.contains(&normalize_label(span.text.trim())))
-        {
+        if line.spans.iter().any(|span| {
+            span.superscript && labels.contains(normalize_label(span.text.trim()).as_str())
+        }) {
             let mut diagnostic = Diagnostic::warning(
                 "FOOTNOTE_UNMATCHED_REFERENCE",
                 "A superscript resembling a known note label was not paired.",
@@ -4228,16 +2785,17 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
         )
         .unwrap()
     });
-    let mut by_number: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut by_number: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
     for footnote in footnotes.iter() {
         if let Ok(number) = footnote.label.parse::<u32>() {
             by_number
-                .entry(number.to_string())
+                .entry(number)
                 .or_default()
                 .push((footnote.restart_sequence, footnote.pair_id.clone()));
         }
     }
     for footnote in footnotes {
+        let (mut prior_byte, mut prior_scalar) = (0, 0);
         for capture in pattern.captures_iter(&footnote.body) {
             let Some(found) = capture.get(0) else {
                 continue;
@@ -4246,18 +2804,20 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
                 .get(4)
                 .and_then(|value| value.as_str().parse::<u32>().ok())
                 .unwrap_or(0);
-            let number_key = number.to_string();
-            let candidates = by_number.get(&number_key).cloned().unwrap_or_default();
-            let scoped: Vec<&(usize, String)> = candidates
-                .iter()
-                .filter(|(restart, _)| *restart == footnote.restart_sequence)
-                .collect();
+            let candidates = by_number
+                .get(&number)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let target_pair_id = if candidates.len() == 1 {
                 candidates[0].1.clone()
-            } else if scoped.len() == 1 {
-                scoped[0].1.clone()
             } else {
-                String::new()
+                let mut scoped = candidates
+                    .iter()
+                    .filter(|(restart, _)| *restart == footnote.restart_sequence);
+                match (scoped.next(), scoped.next()) {
+                    (Some((_, pair_id)), None) => pair_id.clone(),
+                    _ => String::new(),
+                }
             };
             let kind = if let Some(value) = capture.get(1) {
                 value.as_str().to_lowercase()
@@ -4266,580 +2826,45 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
             } else {
                 "see_footnote".to_owned()
             };
-            let record = json!({
-                "source_pair_id": footnote.pair_id,
-                "kind": kind,
-                "number": number,
-                "shortform": crossref_shortform(&footnote.body, found.start()),
-                "start": footnote.body[..found.start()].chars().count(),
-                "end": footnote.body[..found.end()].chars().count(),
-                "resolved": !candidates.is_empty(),
-                "target_pair_id": target_pair_id,
-                "target_count": candidates.len(),
-            });
-            footnote.crossrefs.push(record.clone());
+            let start = prior_scalar + footnote.body[prior_byte..found.start()].chars().count();
+            let end = start + found.as_str().chars().count();
+            (prior_byte, prior_scalar) = (found.end(), end);
+            let record = FootnoteCrossref {
+                source_pair_id: footnote.pair_id.clone(),
+                kind,
+                number,
+                shortform: crossref_shortform(&footnote.body, found.start()),
+                start,
+                end,
+                resolved: !candidates.is_empty(),
+                target_pair_id,
+                target_count: candidates.len(),
+            };
             if candidates.is_empty() {
                 let mut diagnostic = Diagnostic::info(
                     "NOTE_CROSSREF_UNRESOLVED",
                     format!(
                         "Note {} references {} note {}, which no paired note carries - a pairing-quality witness.",
-                        footnote.label, kind, number
+                        footnote.label, record.kind, number
                     ),
                     footnote.reference_page.map(|page| page as usize),
                 );
-                diagnostic.details.insert("crossref".to_owned(), record);
+                diagnostic
+                    .details
+                    .insert("crossref".to_owned(), json!(&record));
                 diagnostics.push(diagnostic);
             }
+            footnote.crossrefs.push(record);
         }
     }
 }
 
-fn add_observation(
-    observations: &mut Vec<CandidateObservationV2>,
-    observation: CandidateObservationV2,
-) {
-    if !observations.contains(&observation) {
-        observations.push(observation);
+fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Result<PdfPreparation> {
+    if separators.len() != pages.len() {
+        return Err(Error::Message(
+            "common input must contain one separator value per page".to_owned(),
+        ));
     }
-}
-
-fn visual_source_region(region: &str) -> bool {
-    matches!(
-        region,
-        "table"
-            | "table_cell"
-            | "form"
-            | "figure"
-            | "image"
-            | "chart"
-            | "formula"
-            | "separator"
-            | "visual"
-    )
-}
-
-fn contents_row(text: &str) -> bool {
-    static LEADER: OnceLock<Regex> = OnceLock::new();
-    LEADER
-        .get_or_init(|| Regex::new(r"(?:\. ){3,}|\.{4,}").expect("contents leader regex"))
-        .is_match(text)
-}
-
-fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
-    const MIN_LINE_NUMBERS: u32 = 15;
-    pages
-        .iter()
-        .filter_map(|page| {
-            if page.width <= 0.0 {
-                return None;
-            }
-            let mut candidates = page
-                .lines
-                .iter()
-                .filter_map(|line| {
-                    let number = arabic_page_number(&line.text)?;
-                    (number <= 40).then_some((line.bbox[0], number))
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-            let tolerance = page.width * 0.03;
-            let mut best = &candidates[0..0];
-            let mut start = 0;
-            for end in 0..candidates.len() {
-                while candidates[end].0 - candidates[start].0 > tolerance {
-                    start += 1;
-                }
-                if end + 1 - start > best.len() {
-                    best = &candidates[start..=end];
-                }
-            }
-            let values = best
-                .iter()
-                .map(|(_, number)| *number)
-                .collect::<HashSet<_>>();
-            (values.len() >= MIN_LINE_NUMBERS as usize
-                && (1..=MIN_LINE_NUMBERS).all(|number| values.contains(&number)))
-            .then_some(page.index)
-        })
-        .collect()
-}
-
-fn index_pages(pages: &[Page]) -> HashSet<usize> {
-    static ENTRY: OnceLock<Regex> = OnceLock::new();
-    let entry = ENTRY
-        .get_or_init(|| Regex::new(r"\[\d{1,3}\]\s+\d{1,3}:\d{1,3}").expect("index entry regex"));
-    pages
-        .iter()
-        .filter_map(|page| {
-            let text = page
-                .lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            (entry.find_iter(&text).take(5).count() >= 5).then_some(page.index)
-        })
-        .collect()
-}
-
-impl PdfResolutionInput {
-    fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
-        let index = PdfTextIndex::from_pages(pages);
-        let runs = detect_structure_candidate_runs(index.text());
-        let contents_pages = pages
-            .iter()
-            .filter(|page| contents_grid(&page.lines, page.width))
-            .map(|page| page.index)
-            .collect::<HashSet<_>>();
-        let transcript_line_number_pages = transcript_line_number_pages(pages);
-        let index_pages = index_pages(pages);
-        let by_line = pages
-            .iter()
-            .flat_map(|page| {
-                page.lines
-                    .iter()
-                    .map(move |line| (line.id.as_str(), (page, line)))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut flow_lines = HashSet::new();
-        for page in pages {
-            let mut lines = page.lines.iter().collect::<Vec<_>>();
-            lines.sort_by(|left, right| {
-                left.reading_order
-                    .cmp(&right.reading_order)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            for pair in lines.windows(2) {
-                if pair.iter().all(|line| {
-                    !line.exclude_from_body
-                        && line.note_region_mode.is_empty()
-                        && line.region_type == "body"
-                }) && body_flow_edge(pair[0], pair[1])
-                {
-                    flow_lines.insert(pair[0].id.as_str());
-                    flow_lines.insert(pair[1].id.as_str());
-                }
-            }
-        }
-        let citation_spans = by_line
-            .iter()
-            .map(|(line_id, (_, line))| {
-                ((*line_id).to_owned(), protected_citation_spans(&line.text))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut evidence = Vec::new();
-        for run in &runs {
-            let mut list_candidates = HashSet::new();
-            if !matches!(run.grammar, CandidateGrammar::Numeric) {
-                for candidate in &run.markers {
-                    let list_context = candidate.parent_candidate_id.is_some()
-                        || (run.grammar == CandidateGrammar::Enumerator
-                            && run.rooted
-                            && run.consecutive);
-                    if !list_context {
-                        continue;
-                    }
-                    let Some(indexed) = index.line_at(candidate.marker_range.start) else {
-                        continue;
-                    };
-                    let Some((page, line)) = by_line.get(indexed.line_id.as_str()) else {
-                        continue;
-                    };
-                    let aligned_sibling = run.markers.iter().any(|sibling| {
-                        if sibling.id == candidate.id || sibling.level != candidate.level {
-                            return false;
-                        }
-                        let Some(sibling_indexed) = index.line_at(sibling.marker_range.start)
-                        else {
-                            return false;
-                        };
-                        let Some((sibling_page, sibling_line)) =
-                            by_line.get(sibling_indexed.line_id.as_str())
-                        else {
-                            return false;
-                        };
-                        line.region_type == "body"
-                            && sibling_line.region_type == "body"
-                            && !line.exclude_from_body
-                            && !sibling_line.exclude_from_body
-                            && (line.bbox[0] - sibling_line.bbox[0]).abs()
-                                <= page.width.max(sibling_page.width).max(1.0) * 0.008
-                    });
-                    if aligned_sibling {
-                        list_candidates.insert(candidate.id.as_str());
-                    }
-                }
-            }
-            for candidate in &run.markers {
-                let line_ids = index.line_ids(candidate.range);
-                let page_indexes = index.page_indexes(candidate.range);
-                let marker_line_ids = index.line_ids(candidate.marker_range);
-                let mut observations = Vec::new();
-
-                let body_prose = line_ids.iter().take(3).any(|line_id| {
-                    let Some((_, line)) = by_line.get(line_id.as_str()) else {
-                        return false;
-                    };
-                    if line.exclude_from_body
-                        || !line.note_region_mode.is_empty()
-                        || line.region_type != "body"
-                    {
-                        return false;
-                    }
-                    let start = index.line(line_id).map_or(0, |indexed| {
-                        candidate
-                            .content_start
-                            .saturating_sub(indexed.range.start)
-                            .min(line.text.chars().count())
-                    });
-                    let tail = char_slice(&line.text, start, line.text.chars().count());
-                    tail.chars()
-                        .filter(|character| character.is_alphabetic())
-                        .count()
-                        >= 8
-                        && (flow_lines.contains(line.id.as_str())
-                            || tail.split_whitespace().take(3).count() == 3)
-                });
-                if body_prose {
-                    add_observation(&mut observations, CandidateObservationV2::BodyProseFlow);
-                }
-                if marker_line_ids.iter().any(|line_id| {
-                    by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
-                        line.region_type == "heading"
-                            || primitives
-                                .source_regions
-                                .as_ref()
-                                .and_then(|regions| regions.get(&line.id))
-                                .is_some_and(|region| {
-                                    matches!(region.as_str(), "heading" | "paragraph_title")
-                                })
-                    })
-                }) {
-                    add_observation(&mut observations, CandidateObservationV2::SectionHeading);
-                }
-                if list_candidates.contains(candidate.id.as_str()) && body_prose {
-                    add_observation(&mut observations, CandidateObservationV2::ListItemLayout);
-                }
-                let marker_is_cross_reference = marker_line_ids.iter().any(|line_id| {
-                    let Some(indexed) = index.line(line_id) else {
-                        return false;
-                    };
-                    let local = ScalarRange {
-                        start: candidate
-                            .marker_range
-                            .start
-                            .saturating_sub(indexed.range.start),
-                        end: candidate
-                            .marker_range
-                            .end
-                            .saturating_sub(indexed.range.start)
-                            .min(indexed.range.end - indexed.range.start),
-                    };
-                    citation_spans.get(line_id.as_str()).is_some_and(|spans| {
-                        spans
-                            .iter()
-                            .any(|(start, end)| *start < local.end && local.start < *end)
-                    })
-                });
-                if marker_is_cross_reference {
-                    add_observation(&mut observations, CandidateObservationV2::CrossReference);
-                }
-                let table_or_form = marker_line_ids.iter().any(|line_id| {
-                    primitives.table_cell_line_ids.contains(line_id)
-                        || by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
-                            primitives
-                                .source_regions
-                                .as_ref()
-                                .and_then(|regions| regions.get(&line.id))
-                                .is_some_and(|region| visual_source_region(region))
-                        })
-                });
-                if table_or_form {
-                    add_observation(&mut observations, CandidateObservationV2::TableOrForm);
-                }
-                let contents = line_ids.iter().take(3).any(|line_id| {
-                    by_line.get(line_id.as_str()).is_some_and(|(page, line)| {
-                        contents_pages.contains(&page.index) || contents_row(&line.text)
-                    })
-                });
-                if contents {
-                    add_observation(&mut observations, CandidateObservationV2::ContentsRow);
-                }
-                let marker_pages = marker_line_ids
-                    .iter()
-                    .filter_map(|line_id| by_line.get(line_id.as_str()).map(|(page, _)| page.index))
-                    .collect::<HashSet<_>>();
-                if marker_pages.iter().any(|page| index_pages.contains(page)) {
-                    add_observation(&mut observations, CandidateObservationV2::IndexRow);
-                }
-                if marker_pages
-                    .iter()
-                    .any(|page| transcript_line_number_pages.contains(page))
-                {
-                    add_observation(
-                        &mut observations,
-                        CandidateObservationV2::TranscriptLineNumber,
-                    );
-                }
-                let furniture = marker_line_ids.iter().any(|line_id| {
-                    by_line.get(line_id.as_str()).is_some_and(|(_, line)| {
-                        matches!(line.region_type.as_str(), "header" | "footer")
-                            || (line.exclude_from_body
-                                && !primitives.table_cell_line_ids.contains(&line.id)
-                                && !primitives.table_note_line_ids.contains(&line.id))
-                    })
-                });
-                if furniture {
-                    add_observation(&mut observations, CandidateObservationV2::Furniture);
-                }
-                evidence.push(CandidateEvidenceV2 {
-                    candidate_id: candidate.id.clone(),
-                    page_indexes,
-                    line_ids,
-                    observations,
-                });
-            }
-        }
-        Self {
-            index,
-            runs,
-            evidence,
-            citation_spans: citation_spans
-                .into_iter()
-                .map(|(line_id, spans)| {
-                    (
-                        line_id,
-                        spans
-                            .into_iter()
-                            .map(|(start, end)| PdfSourceSpan { start, end })
-                            .collect(),
-                    )
-                })
-                .collect(),
-        }
-    }
-}
-
-fn pdf_source_map(
-    index: &PdfTextIndex,
-    pages: &[Page],
-    structure: &mut DocumentStructure,
-    protected_citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
-) -> PdfSourceMap {
-    PdfSourceMap {
-        pages: pages
-            .iter()
-            .map(|page| PdfPageIdentity {
-                physical_index: page.index,
-                physical_number: page.number,
-                printed_folio: page.printed_label.clone(),
-            })
-            .collect(),
-        nodes: structure
-            .nodes
-            .iter_mut()
-            .map(|node| PdfSourceExtent {
-                id: node.id.clone(),
-                page_indexes: std::mem::take(&mut node.page_indexes),
-                line_ids: std::mem::take(&mut node.line_ids),
-            })
-            .collect(),
-        note_references: structure
-            .notes
-            .iter()
-            .flat_map(|note| {
-                note.references
-                    .iter()
-                    .enumerate()
-                    .map(move |(reference, value)| PdfSourceExtent {
-                        id: format!("{}:reference:{reference}", note.id),
-                        page_indexes: index.page_indexes(value.range),
-                        line_ids: index.line_ids(value.range),
-                    })
-            })
-            .collect(),
-        protected_citation_spans,
-        table_ids: Vec::new(),
-        image_ids: Vec::new(),
-    }
-}
-
-fn map_note_pairs(
-    index: &PdfTextIndex,
-    pairs: &[NotePairClaim],
-) -> Result<(Vec<NotePairClaimV2>, Vec<StructureDiagnostic>)> {
-    let mut claims = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut pair_ids = HashSet::new();
-    for pair in pairs {
-        if pair.pair_id.is_empty() || !pair_ids.insert(pair.pair_id.as_str()) {
-            return Err(Error::Message(format!(
-                "paired note '{}' has an empty or duplicate pair id",
-                pair.pair_id
-            )));
-        }
-        let label_line = index.line(&pair.label_anchor.line_id).ok_or_else(|| {
-            Error::Message(format!(
-                "paired note {} has an unknown label line",
-                pair.pair_id
-            ))
-        })?;
-        let label_range = index
-            .global_range(
-                &pair.label_anchor.line_id,
-                pair.label_anchor.start,
-                pair.label_anchor.end,
-            )
-            .ok_or_else(|| {
-                Error::Message(format!(
-                    "paired note {} has an invalid label range",
-                    pair.pair_id
-                ))
-            })?;
-        let references = pair
-            .reference_anchors
-            .iter()
-            .map(|anchor| {
-                let line = index.line(&anchor.line_id).ok_or_else(|| {
-                    Error::Message(format!(
-                        "paired note {} has an unknown reference line",
-                        pair.pair_id
-                    ))
-                })?;
-                let range = index
-                    .global_range(&anchor.line_id, anchor.start, anchor.end)
-                    .ok_or_else(|| {
-                        Error::Message(format!(
-                            "paired note {} has an invalid reference range",
-                            pair.pair_id
-                        ))
-                    })?;
-                Ok(TextAnchorV2 {
-                    range,
-                    page_index: line.page_index,
-                    line_id: anchor.line_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if pair
-            .body_line_ids
-            .iter()
-            .any(|line_id| index.line(line_id).is_none())
-        {
-            return Err(Error::Message(format!(
-                "paired note {} has an unknown body line",
-                pair.pair_id
-            )));
-        }
-        let body_range = index.range_for_line_ids(&pair.body_line_ids);
-        if pair.reference_anchors.is_empty()
-            || body_range.is_none()
-            || body_range.is_some_and(|range| range.start == range.end)
-            || label_range.start == label_range.end
-            || references
-                .iter()
-                .any(|anchor| anchor.range.start == anchor.range.end)
-        {
-            diagnostics.push(StructureDiagnostic {
-                code: "note_pair_unmaterialized".to_owned(),
-                severity: DiagnosticSeverity::Info,
-                ranges: Vec::new(),
-                node_ids: Vec::new(),
-            });
-            continue;
-        }
-        claims.push(NotePairClaimV2 {
-            pair_id: pair.pair_id.clone(),
-            kind: match pair.kind {
-                NotePairKind::Footnote => NoteKindV2::Footnote,
-                NotePairKind::Endnote => NoteKindV2::Endnote,
-            },
-            label: TextAnchorV2 {
-                range: label_range,
-                page_index: label_line.page_index,
-                line_id: pair.label_anchor.line_id.clone(),
-            },
-            body: NoteBodyV2 {
-                range: body_range.unwrap(),
-                page_indexes: index.page_indexes_for_line_ids(&pair.body_line_ids),
-                line_ids: pair.body_line_ids.clone(),
-            },
-            references,
-        });
-    }
-    Ok((claims, diagnostics))
-}
-
-fn native_graph_parts(
-    index: &PdfTextIndex,
-    pages: &[Page],
-    paragraphs: &[Paragraph],
-) -> Result<Vec<StructureNode>> {
-    const ORIGIN: &str = "legalpdf.pdf-structure.v2";
-    let mut nodes = Vec::new();
-    for page in pages {
-        let range = index.page_range(page.index).ok_or_else(|| {
-            Error::Message(format!("page {} is absent from the text index", page.index))
-        })?;
-        nodes.push(StructureNode {
-            id: page.id.clone(),
-            kind: NodeKind::Page,
-            range,
-            rendered_range: None,
-            origin_id: ORIGIN.to_owned(),
-            source: Derivation::Native,
-            label: page.printed_label.clone(),
-            locator_kind: None,
-            aliases: None,
-            parent_id: None,
-            anchor: page.printed_label_line_id.clone(),
-            content_start: None,
-            marker_range: None,
-            page_indexes: vec![page.index],
-            line_ids: index.line_ids(range),
-            grammar: None,
-            proof: None,
-        });
-    }
-    for paragraph in paragraphs {
-        let range = index
-            .range_for_line_ids(&paragraph.line_ids)
-            .ok_or_else(|| {
-                Error::Message(format!("paragraph {} has no indexed lines", paragraph.id))
-            })?;
-        let heading = paragraph.region_type == "heading";
-        nodes.push(StructureNode {
-            id: paragraph.id.clone(),
-            kind: if heading {
-                NodeKind::Heading
-            } else {
-                NodeKind::Prose
-            },
-            range,
-            rendered_range: None,
-            origin_id: ORIGIN.to_owned(),
-            source: if heading {
-                Derivation::Heuristic
-            } else {
-                Derivation::Native
-            },
-            label: heading.then(|| char_slice(index.text(), range.start, range.end).to_owned()),
-            locator_kind: None,
-            aliases: None,
-            parent_id: None,
-            anchor: None,
-            content_start: None,
-            marker_range: None,
-            page_indexes: index.page_indexes_for_line_ids(&paragraph.line_ids),
-            line_ids: paragraph.line_ids.clone(),
-            grammar: heading.then(|| "accepted_heading".to_owned()),
-            proof: None,
-        });
-    }
-    Ok(nodes)
-}
-
-pub fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> PdfPreparation {
     let mut primitives = PdfPrimitiveEvidence {
         source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
             source_region_contract(pages)
@@ -4857,14 +2882,18 @@ pub fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> PdfPrepa
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
     ));
-    PdfPreparation {
+    Ok(PdfPreparation {
         diagnostics,
         primitives,
-        resolution: None,
-    }
+    })
 }
 
-pub fn prepare_derivation(pages: &mut [Page], mut prepared: PdfPreparation) -> PdfPreparation {
+fn derive_prepared(
+    pages: &mut [Page],
+    mut prepared: PdfPreparation,
+    identity: StructureIdentity,
+    include_pairing_audit: bool,
+) -> Result<StructureOutput> {
     legal_pdf_support::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
     prepared
         .diagnostics
@@ -4872,25 +2901,13 @@ pub fn prepare_derivation(pages: &mut [Page], mut prepared: PdfPreparation) -> P
             "derive.text_flow",
             || text_flow_faults(pages),
         ));
-    prepared.resolution = Some(legal_pdf_support::profile::measure(
-        "derive.structure_candidates",
-        || PdfResolutionInput::from_pages(pages, &prepared.primitives),
-    ));
-    prepared
-}
-
-pub fn finish_derivation(
-    pages: &mut [Page],
-    mut prepared: PdfPreparation,
-    pairing: PairingOutput,
-    identity: StructureIdentity,
-) -> Result<StructureOutput> {
-    let resolution = prepared.resolution.take().ok_or_else(|| {
-        Error::Message("PDF structure candidates were not prepared before pairing".to_owned())
-    })?;
+    let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
+        PdfResolutionInput::from_pages(pages, &prepared.primitives)
+    });
+    let pairing =
+        legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, include_pairing_audit);
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
-    let pairing_summary = pairing.summary;
-    let markers = pairing.markers;
+    let pairing_audit = pairing.pairing_audit;
     let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
     let mut diagnostics = prepared.diagnostics;
@@ -4909,7 +2926,7 @@ pub fn finish_derivation(
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
     let nodes = native_graph_parts(&resolution.index, pages, &paragraphs)?;
-    let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
+    let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         resolve_structure_graph(
             identity.document_id,
             resolution.index.text(),
@@ -4922,31 +2939,37 @@ pub fn finish_derivation(
         )
     })
     .map_err(|error| Error::Message(error.to_string()))?;
-    let pdf_source_map = pdf_source_map(
-        &resolution.index,
-        pages,
-        &mut structure_graph,
-        resolution.citation_spans,
-    );
     Ok(StructureOutput {
         paragraphs,
         footnotes,
         diagnostics,
-        pairing_audit: PdfPairingAudit {
-            markers,
-            pairing_summary,
-        },
-        pdf_source_map,
+        pairing_audit,
         structure_graph,
     })
 }
 
-pub fn validate_input(pages: &[Page], separators: &[Option<f64>]) -> Result<()> {
-    (separators.len() == pages.len())
-        .then_some(())
-        .ok_or_else(|| {
-            Error::Message("common input must contain one separator value per page".to_owned())
-        })
+pub fn derive(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    identity: StructureIdentity,
+) -> Result<StructureOutput> {
+    let prepared = prepare_pages(pages, separators)?;
+    derive_prepared(pages, prepared, identity, false)
+}
+
+pub fn replay(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    identity: StructureIdentity,
+) -> Result<StructureReplay> {
+    let _profile = legal_pdf_support::profile::scope("structure_replay");
+    let prepared = prepare_pages(pages, separators)?;
+    let prepared_pages = pages.to_vec();
+    let derived = derive_prepared(pages, prepared, identity, true)?;
+    Ok(StructureReplay {
+        prepared_pages,
+        derived,
+    })
 }
 
 pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {
@@ -4974,10 +2997,7 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {
     let mut span_ids = HashSet::new();
     let mut word_ids = HashSet::new();
     for page in pages {
-        let page_ids: HashSet<&str> = page.lines.iter().map(|line| line.id.as_str()).collect();
-        if page_ids.len() != page.lines.len()
-            || page.lines.iter().any(|line| !ids.insert(line.id.as_str()))
-        {
+        if page.lines.iter().any(|line| !ids.insert(line.id.as_str())) {
             return Err(Error::Message(
                 "document contains duplicate line IDs".to_owned(),
             ));
@@ -4990,10 +3010,11 @@ fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {
                 .any(|line| regions_by_line.insert(line.as_str(), region).is_some())
         });
         if duplicate_region_line
-            || regions_by_line.len() != page_ids.len()
-            || page_ids
+            || regions_by_line.len() != page.lines.len()
+            || page
+                .lines
                 .iter()
-                .any(|line| !regions_by_line.contains_key(line))
+                .any(|line| !regions_by_line.contains_key(line.id.as_str()))
         {
             return Err(Error::Message(format!(
                 "page {} region coverage is incomplete",
@@ -5100,36 +3121,28 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             "document page_count does not match the page collection".to_owned(),
         ));
     }
-    let known_lines = validate_page_records(&document.pages)?;
-    let mut block_ids = HashSet::new();
-    for (id, page_index, page_number, bbox) in document
-        .tables
-        .iter()
-        .map(|table| (&table.id, table.page_index, table.page_number, table.bbox))
-        .chain(
-            document
-                .images
-                .iter()
-                .map(|image| (&image.id, image.page_index, image.page_number, image.bbox)),
-        )
-    {
-        let page = document.pages.get(page_index);
-        if !block_ids.insert(id)
-            || page.is_none_or(|page| page.number != page_number)
-            || bbox.iter().any(|value| !value.is_finite())
-            || bbox[0] < 0.0
-            || bbox[1] < 0.0
-            || bbox[2] < bbox[0]
-            || bbox[3] < bbox[1]
-            || page.is_some_and(|page| bbox[2] > page.width + 0.01 || bbox[3] > page.height + 0.01)
-        {
-            return Err(Error::Message(format!(
-                "document visual block {id} is invalid"
-            )));
-        }
-    }
+    validate_pdf_components(
+        &document.document_id,
+        &document.source_sha256,
+        &document.pages,
+        &document.paragraphs,
+        &document.footnotes,
+        &document.structure_graph,
+    )
+}
+
+pub fn validate_pdf_components(
+    document_id: &str,
+    source_sha256: &str,
+    pages: &[Page],
+    paragraphs: &[Paragraph],
+    footnotes: &[Footnote],
+    structure_graph: &DocumentStructure,
+) -> Result<()> {
+    let known_lines = validate_page_records(pages)?;
+    let known_pages = pages.iter().map(|page| page.index).collect::<HashSet<_>>();
     let mut pair_ids = HashSet::new();
-    for footnote in &document.footnotes {
+    for footnote in footnotes {
         if !pair_ids.insert(&footnote.pair_id) {
             return Err(Error::Message(
                 "document contains duplicate footnote pair IDs".to_owned(),
@@ -5151,7 +3164,7 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
         }
     }
     let mut paragraph_ids = HashSet::new();
-    for paragraph in &document.paragraphs {
+    for paragraph in paragraphs {
         if !paragraph_ids.insert(&paragraph.id)
             || paragraph
                 .line_ids
@@ -5164,30 +3177,30 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             )));
         }
     }
-    if document.structure_graph.document_id != document.document_id
-        || document.structure_graph.source_sha256.as_deref() != Some(&document.source_sha256)
+    if structure_graph.document_id != document_id
+        || structure_graph.source_sha256.as_deref() != Some(source_sha256)
     {
         return Err(Error::Message(
             "structure graph identity disagrees with the document".to_owned(),
         ));
     }
-    let text_length = document
-        .pages
+    let (text_length, line_count) = pages
         .iter()
-        .map(|page| {
-            page.lines
-                .iter()
-                .map(|line| utf16_len(&line.text))
-                .sum::<usize>()
-        })
-        .sum::<usize>()
-        + document.line_count().saturating_sub(1);
+        .flat_map(|page| &page.lines)
+        .fold((0, 0_usize), |(units, count), line| {
+            (units + utf16_len(&line.text), count + 1)
+        });
+    let text_length = text_length + line_count.saturating_sub(1);
     let mut node_ids = HashSet::new();
-    for node in &document.structure_graph.nodes {
+    for node in &structure_graph.nodes {
         if node.id.is_empty()
             || !node_ids.insert(node.id.as_str())
             || node.range.start > node.range.end
             || node.range.end > text_length
+            || node
+                .page_indexes
+                .iter()
+                .any(|page| !known_pages.contains(page))
             || node
                 .line_ids
                 .iter()
@@ -5205,7 +3218,7 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             )));
         }
     }
-    if document.structure_graph.nodes.iter().any(|node| {
+    if structure_graph.nodes.iter().any(|node| {
         node.parent_id
             .as_deref()
             .is_some_and(|parent| !node_ids.contains(parent))
@@ -5214,2600 +3227,34 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
             "structure graph contains an unknown parent".to_owned(),
         ));
     }
+    for note in &structure_graph.notes {
+        let valid_range = |range: ScalarRange| range.start <= range.end && range.end <= text_length;
+        if !node_ids.contains(note.node_id.as_str())
+            || !valid_range(note.label_range)
+            || !valid_range(note.body_range)
+            || note
+                .primary_reference
+                .is_some_and(|range| !valid_range(range))
+            || note.references.iter().any(|reference| {
+                !valid_range(reference.range)
+                    || reference
+                        .page_indexes
+                        .iter()
+                        .any(|page| !known_pages.contains(page))
+                    || reference
+                        .line_ids
+                        .iter()
+                        .any(|line| !known_lines.contains(line.as_str()))
+            })
+        {
+            return Err(Error::Message(format!(
+                "structure note {} is invalid",
+                note.id
+            )));
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use legal_pdf_core::model::Word;
-
-    #[test]
-    fn pdf_text_index_preserves_exact_lines_and_scalar_offsets() {
-        let pages: Vec<Page> = serde_json::from_value(json!([
-            {
-                "id": "p2",
-                "index": 1,
-                "number": 2,
-                "width": 100.0,
-                "height": 100.0,
-                "lines": [{
-                    "id": "excluded",
-                    "page_index": 1,
-                    "page_number": 2,
-                    "source_index": 0,
-                    "reading_order": 0,
-                    "block_index": 0,
-                    "text": "EXCLUDED",
-                    "bbox": [0.0, 0.0, 10.0, 10.0],
-                    "exclude_from_body": true
-                }],
-                "regions": []
-            },
-            {
-                "id": "p1",
-                "index": 0,
-                "number": 1,
-                "width": 100.0,
-                "height": 100.0,
-                "lines": [
-                    {
-                        "id": "unicode",
-                        "page_index": 0,
-                        "page_number": 1,
-                        "source_index": 1,
-                        "reading_order": 1,
-                        "block_index": 0,
-                        "text": "\u{1f600}e\u{301}",
-                        "bbox": [0.0, 10.0, 10.0, 20.0]
-                    },
-                    {
-                        "id": "alpha",
-                        "page_index": 0,
-                        "page_number": 1,
-                        "source_index": 0,
-                        "reading_order": 0,
-                        "block_index": 0,
-                        "text": "\u{3b1}",
-                        "bbox": [0.0, 0.0, 10.0, 10.0]
-                    }
-                ],
-                "regions": []
-            }
-        ]))
-        .unwrap();
-
-        let index = PdfTextIndex::from_pages(&pages);
-
-        assert_eq!(index.text(), "\u{3b1}\n\u{1f600}e\u{301}\nEXCLUDED");
-        assert_eq!(
-            index.line("alpha").unwrap().range,
-            ScalarRange { start: 0, end: 1 }
-        );
-        assert_eq!(
-            index.line("unicode").unwrap().range,
-            ScalarRange { start: 2, end: 5 }
-        );
-        assert_eq!(
-            index.global_range("unicode", 0, 1),
-            Some(ScalarRange { start: 2, end: 3 })
-        );
-        assert_eq!(
-            index.line_ids(ScalarRange { start: 0, end: 5 }),
-            ["alpha", "unicode"]
-        );
-        assert_eq!(index.page_range(0), Some(ScalarRange { start: 0, end: 5 }));
-        assert_eq!(index.page_range(1), Some(ScalarRange { start: 6, end: 14 }));
-    }
-
-    #[test]
-    fn pdf_adapter_maps_raw_numeric_candidates_to_exact_line_ids_once() {
-        let pages: Vec<Page> = serde_json::from_value(json!([{
-            "id": "page-1",
-            "index": 0,
-            "number": 1,
-            "width": 600.0,
-            "height": 800.0,
-            "lines": [
-                {
-                    "id": "line-1",
-                    "page_index": 0,
-                    "page_number": 1,
-                    "source_index": 0,
-                    "reading_order": 0,
-                    "block_index": 0,
-                    "text": "1. First paragraph has prose.",
-                    "bbox": [72.0, 100.0, 400.0, 112.0],
-                    "region_type": "body"
-                },
-                {
-                    "id": "line-2",
-                    "page_index": 0,
-                    "page_number": 1,
-                    "source_index": 1,
-                    "reading_order": 1,
-                    "block_index": 1,
-                    "text": "2. Second paragraph has prose.",
-                    "bbox": [72.0, 120.0, 410.0, 132.0],
-                    "region_type": "body"
-                }
-            ],
-            "regions": []
-        }]))
-        .unwrap();
-
-        let adapter = PdfResolutionInput::from_pages(&pages, &PdfPrimitiveEvidence::default());
-        let run = adapter
-            .runs
-            .iter()
-            .find(|run| run.grammar == CandidateGrammar::Numeric)
-            .expect("numeric candidate run");
-        let mapped = run
-            .markers
-            .iter()
-            .map(|candidate| {
-                adapter
-                    .evidence
-                    .iter()
-                    .find(|evidence| evidence.candidate_id == candidate.id)
-                    .expect("mapped candidate")
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(mapped[0].line_ids, ["line-1"]);
-        assert_eq!(mapped[1].line_ids, ["line-2"]);
-        assert!(mapped.iter().all(|evidence| evidence
-            .observations
-            .contains(&CandidateObservationV2::BodyProseFlow)));
-    }
-
-    #[test]
-    fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
-        assert!(contents_row("1.1 Background ........ 3"));
-        assert!(!contents_row("1.1 Background and application"));
-
-        let mut contents = test_page(
-            (1..=3)
-                .map(|number| {
-                    let mut line = test_line(
-                        &format!("{number}. Topic heading ........ {}", number + 4),
-                        [72.0, 80.0 + f64::from(number) * 20.0, 500.0, 94.0],
-                        vec![],
-                    );
-                    line.region_type = "body".to_owned();
-                    line
-                })
-                .collect(),
-        );
-        contents.index = 7;
-        contents.number = 8;
-        for line in &mut contents.lines {
-            line.page_index = 7;
-            line.page_number = 8;
-        }
-        let contents_adapter =
-            PdfResolutionInput::from_pages(&[contents], &PdfPrimitiveEvidence::default());
-        assert!(contents_adapter.evidence.iter().any(|item| item
-            .observations
-            .contains(&CandidateObservationV2::ContentsRow)));
-
-        let mut transcript = test_page(
-            (1..=25)
-                .map(|number| {
-                    test_line(
-                        &number.to_string(),
-                        [112.0, 60.0 + f64::from(number) * 20.0, 140.0, 74.0],
-                        vec![],
-                    )
-                })
-                .chain((1..=25).map(|number| {
-                    let mut line = test_line(
-                        &format!("Counsel continues speaking on transcript line {number}."),
-                        [154.0, 60.0 + f64::from(number) * 20.0, 500.0, 74.0],
-                        vec![],
-                    );
-                    line.region_type = "body".to_owned();
-                    line
-                }))
-                .collect(),
-        );
-        transcript.index = 3;
-        transcript.number = 4;
-        for line in &mut transcript.lines {
-            line.page_index = 3;
-            line.page_number = 4;
-        }
-        let transcript_adapter =
-            PdfResolutionInput::from_pages(&[transcript], &PdfPrimitiveEvidence::default());
-        assert!(!transcript_adapter.evidence.is_empty());
-        assert!(transcript_adapter.evidence.iter().all(|item| item
-            .observations
-            .contains(&CandidateObservationV2::TranscriptLineNumber)));
-
-        let index = test_page(
-            (1..=5)
-                .flat_map(|number| {
-                    [
-                        test_line(
-                            &format!("term-{number}"),
-                            [72.0, 80.0 + f64::from(number) * 20.0, 150.0, 94.0],
-                            vec![],
-                        ),
-                        test_line(
-                            &format!("[{number}] {}:{}", number + 20, number + 1),
-                            [180.0, 80.0 + f64::from(number) * 20.0, 300.0, 94.0],
-                            vec![],
-                        ),
-                    ]
-                })
-                .collect(),
-        );
-        assert!(index_pages(&[index]).contains(&0));
-    }
-
-    #[test]
-    fn typed_note_pairs_keep_every_exact_reference_anchor() {
-        let pages: Vec<Page> = serde_json::from_value(json!([{
-            "id": "page-1",
-            "index": 0,
-            "number": 1,
-            "width": 600.0,
-            "height": 800.0,
-            "lines": [
-                {
-                    "id": "reference",
-                    "page_index": 0,
-                    "page_number": 1,
-                    "source_index": 0,
-                    "reading_order": 0,
-                    "block_index": 0,
-                    "text": "x¹ y¹",
-                    "bbox": [72.0, 100.0, 200.0, 112.0]
-                },
-                {
-                    "id": "label",
-                    "page_index": 0,
-                    "page_number": 1,
-                    "source_index": 1,
-                    "reading_order": 1,
-                    "block_index": 1,
-                    "text": "1 Note body",
-                    "bbox": [72.0, 700.0, 300.0, 712.0]
-                }
-            ],
-            "regions": []
-        }]))
-        .unwrap();
-        let index = PdfTextIndex::from_pages(&pages);
-        let (pairs, diagnostics) = map_note_pairs(
-            &index,
-            &[NotePairClaim {
-                pair_id: "pair-1".to_owned(),
-                label: "1".to_owned(),
-                kind: NotePairKind::Footnote,
-                label_anchor: legal_pdf_core::SourceAnchor {
-                    line_id: "label".to_owned(),
-                    start: 0,
-                    end: 1,
-                },
-                reference_anchors: vec![
-                    legal_pdf_core::SourceAnchor {
-                        line_id: "reference".to_owned(),
-                        start: 1,
-                        end: 2,
-                    },
-                    legal_pdf_core::SourceAnchor {
-                        line_id: "reference".to_owned(),
-                        start: 4,
-                        end: 5,
-                    },
-                ],
-                body_line_ids: vec!["label".to_owned()],
-            }],
-        )
-        .unwrap();
-
-        assert!(diagnostics.is_empty());
-        assert_eq!(pairs[0].label.range, ScalarRange { start: 6, end: 7 });
-        assert_eq!(pairs[0].references.len(), 2);
-        assert_eq!(
-            pairs[0]
-                .references
-                .iter()
-                .map(|reference| reference.range)
-                .collect::<Vec<_>>(),
-            [
-                ScalarRange { start: 1, end: 2 },
-                ScalarRange { start: 4, end: 5 }
-            ]
-        );
-        assert_eq!(pairs[0].body.line_ids, ["label"]);
-    }
-
-    #[test]
-    fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
-        let pages: Vec<Page> = serde_json::from_value(json!([{
-            "id": "page-1", "index": 0, "number": 1, "width": 600.0, "height": 800.0,
-            "lines": [
-                {"id":"reference","page_index":0,"page_number":1,"source_index":0,"reading_order":0,"block_index":0,"text":"1","bbox":[0.0,0.0,1.0,1.0]},
-                {"id":"empty","page_index":0,"page_number":1,"source_index":1,"reading_order":1,"block_index":1,"text":"","bbox":[0.0,2.0,1.0,3.0]},
-                {"id":"body","page_index":0,"page_number":1,"source_index":2,"reading_order":2,"block_index":2,"text":"1 body","bbox":[0.0,4.0,10.0,5.0]}
-            ], "regions": []
-        }])).unwrap();
-        let index = PdfTextIndex::from_pages(&pages);
-        let mut pairs = (0..346)
-            .map(|number| NotePairClaim {
-                pair_id: format!("no-body-{number:03}"),
-                label: "1".to_owned(),
-                kind: NotePairKind::Footnote,
-                label_anchor: legal_pdf_core::SourceAnchor {
-                    line_id: "body".to_owned(),
-                    start: 0,
-                    end: 1,
-                },
-                reference_anchors: vec![legal_pdf_core::SourceAnchor {
-                    line_id: "reference".to_owned(),
-                    start: 0,
-                    end: 1,
-                }],
-                body_line_ids: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        pairs.push(NotePairClaim {
-            pair_id: "zero-label".to_owned(),
-            label: "1".to_owned(),
-            kind: NotePairKind::Footnote,
-            label_anchor: legal_pdf_core::SourceAnchor {
-                line_id: "empty".to_owned(),
-                start: 0,
-                end: 0,
-            },
-            reference_anchors: vec![legal_pdf_core::SourceAnchor {
-                line_id: "reference".to_owned(),
-                start: 0,
-                end: 1,
-            }],
-            body_line_ids: vec!["body".to_owned()],
-        });
-        pairs.push(NotePairClaim {
-            pair_id: "zero-reference".to_owned(),
-            label: "1".to_owned(),
-            kind: NotePairKind::Footnote,
-            label_anchor: legal_pdf_core::SourceAnchor {
-                line_id: "body".to_owned(),
-                start: 0,
-                end: 1,
-            },
-            reference_anchors: vec![legal_pdf_core::SourceAnchor {
-                line_id: "empty".to_owned(),
-                start: 0,
-                end: 0,
-            }],
-            body_line_ids: vec!["body".to_owned()],
-        });
-
-        let (claims, diagnostics) = map_note_pairs(&index, &pairs).unwrap();
-
-        assert!(claims.is_empty());
-        assert_eq!(diagnostics.len(), 348);
-        assert!(diagnostics
-            .iter()
-            .all(|item| item.code == "note_pair_unmaterialized"));
-        assert_eq!(diagnostics[346].candidate_ids, ["zero-label"]);
-        assert_eq!(diagnostics[347].candidate_ids, ["zero-reference"]);
-    }
-
-    fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
-        Line {
-            id: String::new(),
-            page_index: 0,
-            page_number: 1,
-            source_index: 0,
-            reading_order: 0,
-            block_index: 0,
-            text: text.to_owned(),
-            bbox,
-            spans,
-            words: vec![],
-            detached_references: vec![],
-            exclude_from_body: false,
-            suppress_footnote_label: false,
-            note_region_mode: String::new(),
-            region_id: String::new(),
-            region_type: "unknown".to_owned(),
-            source: "native".to_owned(),
-        }
-    }
-
-    fn sized_line(text: &str, bbox: [f64; 4], size: f64) -> Line {
-        test_line(
-            text,
-            bbox,
-            vec![Span {
-                id: String::new(),
-                text: text.to_owned(),
-                bbox,
-                font: String::new(),
-                size,
-                flags: 0,
-                superscript: false,
-                start: 0,
-                end: text.chars().count(),
-            }],
-        )
-    }
-
-    #[test]
-    fn paragraph_join_consumes_every_source_hyphen_marker() {
-        for marker in ['-', '\u{00ad}', '\u{00ac}'] {
-            let first = test_line(&format!("judg{marker}"), [0.0, 0.0, 10.0, 10.0], vec![]);
-            let second = test_line("ment", [0.0, 12.0, 10.0, 22.0], vec![]);
-            assert_eq!(join_lines(&[&first, &second]).0, "judgment");
-        }
-    }
-
-    fn test_page(mut lines: Vec<Line>) -> Page {
-        for (index, line) in lines.iter_mut().enumerate() {
-            line.id = format!("p0001-l{:04}", index + 1);
-            line.source_index = index + 1;
-            line.reading_order = index + 1;
-        }
-        Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }
-    }
-
-    fn mark_source_body(lines: &mut [Line]) {
-        for line in lines {
-            line.region_type = "body".to_owned();
-        }
-    }
-
-    #[test]
-    fn note_order_puts_a_raised_label_before_its_nearby_text() {
-        for marker in ["17", "**"] {
-            let mut label = test_line(marker, [39.8, 420.55, 49.8, 430.56], vec![]);
-            label.words.push(Word {
-                id: String::new(),
-                text: marker.to_owned(),
-                bbox: [39.8, 420.61, 49.8, 426.72],
-                start: 0,
-                end: marker.chars().count(),
-            });
-            let body = test_line(
-                "Dominique Moran, Carceral Geography",
-                [57.5, 420.50, 363.7, 430.56],
-                vec![],
-            );
-            let mut lines = vec![body, label];
-
-            order_note_lines(&mut lines, 612.0);
-
-            assert_eq!(lines[0].text, marker);
-        }
-    }
-
-    #[test]
-    fn note_order_puts_a_detached_label_before_a_distant_same_row_fragment() {
-        let mut label = test_line("68", [95.8, 554.3, 105.9, 566.1], vec![]);
-        label.words.push(Word {
-            id: String::new(),
-            text: "68".to_owned(),
-            bbox: [95.8, 555.3, 105.9, 562.0],
-            start: 0,
-            end: 2,
-        });
-        let body = test_line("of", [411.7, 554.3, 422.3, 566.1], vec![]);
-        let mut lines = vec![body, label];
-
-        order_note_lines(&mut lines, 612.0);
-
-        assert_eq!(lines[0].text, "68");
-    }
-
-    #[test]
-    fn note_order_reads_two_columns_column_by_column() {
-        let mut lines = Vec::new();
-        for row in 0..3 {
-            lines.push(test_line(
-                &format!("right {row}"),
-                [
-                    340.0,
-                    400.0 + row as f64 * 12.0,
-                    540.0,
-                    410.0 + row as f64 * 12.0,
-                ],
-                vec![],
-            ));
-            lines.push(test_line(
-                &format!("left {row}"),
-                [
-                    70.0,
-                    400.0 + row as f64 * 12.0,
-                    270.0,
-                    410.0 + row as f64 * 12.0,
-                ],
-                vec![],
-            ));
-        }
-
-        order_note_lines(&mut lines, 612.0);
-
-        assert_eq!(
-            lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            ["left 0", "left 1", "left 2", "right 0", "right 1", "right 2"]
-        );
-    }
-
-    #[test]
-    fn note_number_margin_is_not_a_text_column() {
-        let mut lines = Vec::new();
-        for row in 0..6 {
-            let y = 400.0 + row as f64 * 12.0;
-            lines.push(test_line(
-                "citation body",
-                [105.0, y, 405.0, y + 10.0],
-                vec![],
-            ));
-            lines.push(test_line(
-                &(row + 1).to_string(),
-                [50.0, y, 60.0, y + 8.0],
-                vec![],
-            ));
-        }
-        assert_eq!(column_model(&lines, 612.0).kind, "margin_column");
-
-        order_note_lines(&mut lines, 612.0);
-
-        for (row, pair) in lines.chunks_exact(2).enumerate() {
-            assert_eq!(pair[0].text, (row + 1).to_string());
-            assert_eq!(pair[1].text, "citation body");
-        }
-    }
-
-    #[test]
-    fn hanging_citation_fragments_are_not_a_second_note_column() {
-        let mut lines = vec![
-            test_line("43", [95.0, 100.0, 109.0, 110.0], vec![]),
-            test_line("Fashion ID GmbH", [275.0, 100.0, 422.0, 110.0], vec![]),
-            test_line(
-                "continuation across the row",
-                [95.0, 112.0, 422.0, 122.0],
-                vec![],
-            ),
-            test_line("See also", [95.0, 124.0, 132.0, 134.0], vec![]),
-            test_line("Wirtschaftsakademie", [249.0, 124.0, 422.0, 134.0], vec![]),
-            test_line("C-", [95.0, 136.0, 105.0, 146.0], vec![]),
-            test_line("Jehovan todistajat", [340.0, 136.0, 422.0, 146.0], vec![]),
-            test_line("C-25/17", [95.0, 148.0, 205.0, 158.0], vec![]),
-        ];
-
-        assert_ne!(
-            column_model_with_furniture(&lines, 600.0, false).kind,
-            "two_column"
-        );
-        order_note_lines(&mut lines, 600.0);
-
-        assert_eq!(
-            lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "43",
-                "Fashion ID GmbH",
-                "continuation across the row",
-                "See also",
-                "Wirtschaftsakademie",
-                "C-",
-                "Jehovan todistajat",
-                "C-25/17",
-            ]
-        );
-    }
-
-    #[test]
-    fn column_model_ignores_far_edge_furniture() {
-        let mut lines = Vec::new();
-        for row in 0..3 {
-            lines.push(test_line(
-                "left",
-                [
-                    70.0,
-                    100.0 + row as f64 * 12.0,
-                    270.0,
-                    110.0 + row as f64 * 12.0,
-                ],
-                vec![],
-            ));
-            lines.push(test_line(
-                "right",
-                [
-                    340.0,
-                    100.0 + row as f64 * 12.0,
-                    540.0,
-                    110.0 + row as f64 * 12.0,
-                ],
-                vec![],
-            ));
-        }
-        let mut page_number = test_line("27", [580.0, 760.0, 595.0, 770.0], vec![]);
-        page_number.region_type = "footer".to_owned();
-        lines.push(page_number);
-
-        assert_eq!(column_model(&lines, 612.0).kind, "two_column");
-    }
-
-    #[test]
-    fn column_model_prefers_a_clear_page_gutter_over_larger_internal_gaps() {
-        let mut lines = Vec::new();
-        for row in 0..8 {
-            let y = 100.0 + row as f64 * 12.0;
-            if row < 4 {
-                lines.push(test_line("left text", [54.0, y, 380.0, y + 10.0], vec![]));
-            }
-            lines.push(test_line("page", [408.0, y, 422.0, y + 10.0], vec![]));
-            lines.push(test_line("right text", [540.0, y, 900.0, y + 10.0], vec![]));
-            if row < 3 {
-                lines.push(test_line("short", [540.0, y, 560.0, y + 10.0], vec![]));
-            }
-        }
-
-        let model = column_model(&lines, 972.0);
-
-        assert_eq!(model.kind, "two_column");
-        assert!((450.0..520.0).contains(&model.split_x));
-    }
-
-    #[test]
-    fn centered_title_furniture_does_not_hide_the_page_gutter() {
-        let mut lines = vec![
-            test_line("volume and page", [265.0, 30.0, 342.0, 40.0], vec![]),
-            test_line("author", [275.0, 70.0, 335.0, 80.0], vec![]),
-        ];
-        for row in 0..5 {
-            let y = 100.0 + row as f64 * 12.0;
-            lines.push(test_line("left", [70.0, y, 290.0, y + 10.0], vec![]));
-            lines.push(test_line("right", [324.0, y, 542.0, y + 10.0], vec![]));
-        }
-
-        let model = column_model_with_furniture(&lines, 612.0, true);
-
-        assert_eq!(model.kind, "two_column");
-    }
-
-    #[test]
-    fn table_grid_is_not_rewritten_as_columns() {
-        let mut lines = vec![test_line(
-            "Table 2. Results",
-            [60.0, 70.0, 200.0, 80.0],
-            vec![],
-        )];
-        for row in 0..4 {
-            let y = 100.0 + row as f64 * 14.0;
-            for (column, x) in [60.0, 180.0, 300.0, 420.0].into_iter().enumerate() {
-                lines.push(test_line(
-                    &format!("r{row}c{column}"),
-                    [x, y, x + 50.0, y + 10.0],
-                    vec![],
-                ));
-            }
-        }
-
-        assert_eq!(table_evidence(&lines, 600.0).lines.len(), 16);
-        assert_eq!(
-            arbitrate_body_order(&mut lines, 600.0, 800.0).reason,
-            "table_grid"
-        );
-    }
-
-    #[test]
-    fn textual_table_caption_does_not_force_geometry_order() {
-        let mut lines = vec![test_line(
-            "Table 1. Contents",
-            [60.0, 70.0, 200.0, 80.0],
-            vec![],
-        )];
-        for row in 0..6 {
-            let y = 100.0 + row as f64 * 14.0;
-            lines.extend([
-                test_line("I", [60.0, y, 70.0, y + 10.0], vec![]),
-                test_line("Section title", [100.0, y, 280.0, y + 10.0], vec![]),
-                test_line("Appendix", [360.0, y, 430.0, y + 10.0], vec![]),
-            ]);
-        }
-
-        assert!(!contents_grid(&lines, 600.0));
-    }
-
-    #[test]
-    fn margin_notes_do_not_cut_off_the_main_text_column() {
-        let mut lines = Vec::new();
-        for row in 0..12 {
-            let y = 400.0 + row as f64 * 24.0;
-            lines.push(sized_line(
-                if row == 6 {
-                    "1988 to a pair of inventors in the main text"
-                } else {
-                    "Main-column prose continues below the adjacent notes"
-                },
-                [145.0, y, 425.0, y + 10.0],
-                9.0,
-            ));
-        }
-        for row in 0..6 {
-            let y = 500.0 + row as f64 * 24.0;
-            lines.push(sized_line(
-                &format!("{} Citation text", row + 1),
-                [37.0, y, 110.0, y + 8.0],
-                7.0,
-            ));
-        }
-        lines.push(sized_line(
-            "25 Margin citation",
-            [427.0, 730.0, 505.0, 738.0],
-            7.0,
-        ));
-        assert_eq!(column_model(&lines, 540.0).kind, "margin_column");
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 540.0,
-            height: 792.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("Main-column"))
-            .all(|line| line.region_type == "body"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text.starts_with("1988"))
-            .is_some_and(|line| line.region_type == "body"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.ends_with("Citation text"))
-            .all(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn an_early_right_margin_note_lane_is_not_body_prose() {
-        let mut lines = Vec::new();
-        for row in 0..8 {
-            let y = 250.0 + row as f64 * 32.0;
-            lines.push(sized_line(
-                "Main-column prose remains independent of its notes",
-                [70.0, y, 410.0, y + 10.0],
-                9.0,
-            ));
-        }
-        for row in 0..5 {
-            let y = 320.0 + row as f64 * 24.0;
-            lines.push(sized_line(
-                &format!("{} Margin citation", row + 20),
-                [427.0, y, 505.0, y + 8.0],
-                7.0,
-            ));
-        }
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 540.0,
-            height: 792.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("Main-column"))
-            .all(|line| line.region_type == "body"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.ends_with("Margin citation"))
-            .all(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn embedded_contents_locators_are_not_document_headings() {
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines: ["I", "II", "III", "A"]
-                .into_iter()
-                .enumerate()
-                .map(|(row, label)| {
-                    let y = 100.0 + row as f64 * 20.0;
-                    sized_line(
-                        &format!("{label}. Section title\u{2003}{}", row + 10),
-                        [60.0, y, 500.0, y + 12.0],
-                        10.0,
-                    )
-                })
-                .collect(),
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0].lines.iter().all(|line| line.region_type == "body"));
-    }
-
-    #[test]
-    fn contents_grid_does_not_scramble_prose_or_hide_an_author_note() {
-        let mut lines = vec![
-            sized_line("ARTICLE TITLE", [84.0, 30.0, 400.0, 44.0], 14.0),
-            sized_line("AUTHOR", [84.0, 70.0, 180.0, 81.0], 10.0),
-            sized_line("ABSTRACT", [84.0, 420.0, 140.0, 430.0], 8.0),
-        ];
-        for row in 0..4 {
-            let y = 445.0 + row as f64 * 14.0;
-            lines.push(sized_line(
-                "The abstract is ordinary prose, not a heading.",
-                [84.0, y, 420.0, y + 11.0],
-                10.0,
-            ));
-        }
-        for row in 0..6 {
-            let y = 110.0 + row as f64 * 35.0;
-            lines.extend([
-                sized_line("I", [84.0, y, 94.0, y + 9.0], 8.0),
-                sized_line("SECTION", [120.0, y, 220.0, y + 9.0], 8.0),
-                sized_line(&(168 + row).to_string(), [404.0, y, 420.0, y + 9.0], 8.0),
-            ]);
-        }
-        lines.extend([
-            sized_line("*", [84.0, 570.0, 90.0, 579.0], 8.0),
-            sized_line(
-                "Author affiliation and acknowledgments",
-                [102.0, 570.0, 400.0, 579.0],
-                8.0,
-            ),
-        ]);
-        assert!(contents_grid(&lines, 486.0));
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 486.0,
-            height: 702.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[Some(220.0)]);
-
-        let order = |text: &str| {
-            pages[0]
-                .lines
-                .iter()
-                .find(|line| line.text == text)
-                .map(|line| line.reading_order)
-                .unwrap()
-        };
-        assert!(order("SECTION") < order("ABSTRACT"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("The abstract"))
-            .all(|line| line.region_type == "body"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text == "*")
-            .is_some_and(|line| line.region_type == "footnote"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text.starts_with("Author affiliation"))
-            .is_some_and(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn two_column_note_prose_is_not_a_table_grid() {
-        let mut lines = Vec::new();
-        for row in 0..4 {
-            let y = 100.0 + row as f64 * 14.0;
-            lines.extend([
-                test_line(&(row + 1).to_string(), [50.0, y, 60.0, y + 10.0], vec![]),
-                test_line(
-                    "A full citation body with enough prose to be a note",
-                    [70.0, y, 280.0, y + 10.0],
-                    vec![],
-                ),
-                test_line(&(row + 5).to_string(), [330.0, y, 340.0, y + 10.0], vec![]),
-                test_line(
-                    "Another complete citation body in the right column",
-                    [350.0, y, 570.0, y + 10.0],
-                    vec![],
-                ),
-            ]);
-        }
-
-        let evidence = table_evidence(&lines, 600.0);
-        assert!(!evidence.strong());
-        assert!(!evidence.continuation());
-    }
-
-    #[test]
-    fn attached_note_sequence_is_not_a_table_grid() {
-        let mut lines = Vec::new();
-        for row in 0..8 {
-            let y = 500.0 + row as f64 * 12.0;
-            lines.extend([
-                test_line(
-                    &format!("{} Citation text", row + 91),
-                    [60.0, y, 260.0, y + 10.0],
-                    vec![],
-                ),
-                test_line("20", [330.0, y, 370.0, y + 10.0], vec![]),
-                test_line("40", [430.0, y, 470.0, y + 10.0], vec![]),
-            ]);
-        }
-
-        let evidence = table_evidence(&lines, 600.0);
-
-        assert!(!strong_table_evidence(&evidence, &lines));
-    }
-
-    #[test]
-    fn table_numbers_do_not_start_a_footnote_region() {
-        let mut lines = vec![sized_line(
-            "Table 2. Results",
-            [60.0, 70.0, 200.0, 80.0],
-            10.0,
-        )];
-        for row in 0..4 {
-            let y = 100.0 + row as f64 * 14.0;
-            let texts = [
-                "Income".to_owned(),
-                "Low".to_owned(),
-                (30 + row).to_string(),
-                (20 + row).to_string(),
-            ];
-            for (text, x) in texts.into_iter().zip([60.0, 160.0, 260.0, 360.0]) {
-                lines.push(sized_line(&text, [x, y, x + 50.0, y + 9.0], 8.0));
-            }
-        }
-        lines.push(sized_line(
-            "† Table-specific note",
-            [60.0, 160.0, 240.0, 169.0],
-            8.0,
-        ));
-        lines.push(sized_line(
-            "2004 study of the following issue",
-            [60.0, 190.0, 240.0, 200.0],
-            8.0,
-        ));
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[Some(130.0)]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text != "† Table-specific note")
-            .all(|line| line.region_type != "footnote"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text == "† Table-specific note")
-            .is_some_and(|line| line.region_type == "footnote" && !line.suppress_footnote_label));
-        let order = |text: &str| {
-            pages[0]
-                .lines
-                .iter()
-                .find(|line| line.text == text)
-                .map(|line| line.reading_order)
-                .unwrap()
-        };
-        assert!(order("† Table-specific note") < order("2004 study of the following issue"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text == "2004 study of the following issue")
-            .is_some_and(|line| line.region_type == "body"));
-    }
-
-    #[test]
-    fn separator_keeps_an_unlabelled_note_continuation_with_the_notes() {
-        let mut lines = (0..12)
-            .map(|row| {
-                sized_line(
-                    "Ordinary main text continues above the footnotes",
-                    [
-                        100.0,
-                        100.0 + row as f64 * 24.0,
-                        480.0,
-                        111.0 + row as f64 * 24.0,
-                    ],
-                    10.5,
-                )
-            })
-            .collect::<Vec<_>>();
-        lines.extend([
-            sized_line(
-                "Continuation of the preceding note below the separator",
-                [130.0, 462.0, 480.0, 472.0],
-                9.0,
-            ),
-            sized_line(
-                "2) for fraudulent and wrongful trading",
-                [130.0, 578.0, 390.0, 588.0],
-                9.0,
-            ),
-        ]);
-        for row in 0..4 {
-            let y = 590.0 + row as f64 * 12.0;
-            lines.push(sized_line(
-                &format!("{} Citation", row + 28),
-                [137.0, y, 300.0, y + 8.0],
-                6.0,
-            ));
-        }
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 612.0,
-            height: 792.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        let diagnostics = classify_pages(&mut pages, &[Some(451.0)]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text.starts_with("Continuation"))
-            .is_some_and(|line| line.region_type == "footnote"));
-        assert!(!diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "FOOTNOTE_REGION_UNCERTAIN"));
-    }
-
-    #[test]
-    fn captioned_tables_continue_across_pages_without_becoming_notes() {
-        let page = |index: usize, mut lines: Vec<Line>| {
-            for line in &mut lines {
-                line.page_index = index;
-                line.page_number = (index + 1) as u32;
-            }
-            Page {
-                id: format!("p{:04}", index + 1),
-                index,
-                number: (index + 1) as u32,
-                width: 600.0,
-                height: 800.0,
-                lines,
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            }
-        };
-        let mut continuation = Vec::new();
-        for row in 0..8 {
-            let y = 100.0 + row as f64 * 14.0;
-            continuation.extend([
-                sized_line("Province", [60.0, y, 120.0, y + 9.0], 8.0),
-                sized_line(&(20 + row).to_string(), [240.0, y, 280.0, y + 9.0], 8.0),
-                sized_line(&(40 + row).to_string(), [360.0, y, 400.0, y + 9.0], 8.0),
-            ]);
-        }
-        let mut sparse_cell = sized_line(
-            "continued text in a tall cell",
-            [360.0, 107.0, 500.0, 116.0],
-            8.0,
-        );
-        sparse_cell.region_type = "footer".to_owned();
-        continuation.push(sparse_cell);
-        for row in 0..6 {
-            let y = 600.0 + row as f64 * 12.0;
-            continuation.extend([
-                sized_line(&(row + 1).to_string(), [60.0, y, 70.0, y + 8.0], 7.0),
-                sized_line("Genuine footnote", [85.0, y, 260.0, y + 8.0], 7.0),
-            ]);
-        }
-        let mut pages = vec![
-            page(0, {
-                let mut first = vec![sized_line(
-                    "Table 1: Provincial results",
-                    [60.0, 580.0, 240.0, 590.0],
-                    10.0,
-                )];
-                for row in 0..6 {
-                    let y = 600.0 + row as f64 * 14.0;
-                    first.extend([
-                        sized_line("Province", [60.0, y, 120.0, y + 9.0], 8.0),
-                        sized_line(&(20 + row).to_string(), [240.0, y, 280.0, y + 9.0], 8.0),
-                        sized_line(&(40 + row).to_string(), [360.0, y, 400.0, y + 9.0], 8.0),
-                    ]);
-                }
-                first
-            }),
-            page(1, continuation),
-        ];
-
-        classify_pages(&mut pages, &[None, Some(580.0)]);
-
-        assert!(pages[1]
-            .lines
-            .iter()
-            .find(|line| line.text == "continued text in a tall cell")
-            .is_some_and(|line| line.region_type == "body" && line.note_region_mode.is_empty()));
-        assert!(pages[1]
-            .lines
-            .iter()
-            .filter(|line| line.text == "Genuine footnote")
-            .all(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn bottom_footnotes_do_not_extend_a_table_onto_the_next_page() {
-        let page = |index: usize, lines: Vec<Line>| Page {
-            id: format!("p{:04}", index + 1),
-            index,
-            number: (index + 1) as u32,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        };
-        let mut second = (0..8)
-            .map(|row| {
-                sized_line(
-                    "Ordinary prose on the page after a completed table",
-                    [
-                        60.0,
-                        100.0 + row as f64 * 16.0,
-                        500.0,
-                        111.0 + row as f64 * 16.0,
-                    ],
-                    10.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        for row in 0..6 {
-            let y = 600.0 + row as f64 * 12.0;
-            second.extend([
-                sized_line(&(row + 1).to_string(), [60.0, y, 70.0, y + 8.0], 7.0),
-                sized_line("Citation text", [85.0, y, 300.0, y + 8.0], 7.0),
-            ]);
-        }
-        let mut pages = vec![
-            page(
-                0,
-                vec![sized_line(
-                    "Table 1: Results",
-                    [60.0, 600.0, 240.0, 610.0],
-                    10.0,
-                )],
-            ),
-            page(1, second),
-        ];
-
-        classify_pages(&mut pages, &[None, Some(580.0)]);
-
-        assert!(pages[1]
-            .lines
-            .iter()
-            .filter(|line| line.text == "Citation text")
-            .all(|line| line.region_type == "footnote"));
-        assert!(pages[1]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("Ordinary prose"))
-            .all(|line| line.region_type == "body"));
-    }
-
-    #[test]
-    fn a_table_ending_midpage_does_not_mark_the_next_page_as_a_continuation() {
-        let page = |index: usize, lines: Vec<Line>| Page {
-            id: format!("p{:04}", index + 1),
-            index,
-            number: (index + 1) as u32,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        };
-        let mut first = vec![sized_line(
-            "Table 1: Results",
-            [60.0, 70.0, 240.0, 80.0],
-            10.0,
-        )];
-        for row in 0..6 {
-            let y = 100.0 + row as f64 * 14.0;
-            first.extend([
-                sized_line("Province", [60.0, y, 120.0, y + 9.0], 8.0),
-                sized_line(&(20 + row).to_string(), [240.0, y, 280.0, y + 9.0], 8.0),
-                sized_line(&(40 + row).to_string(), [360.0, y, 400.0, y + 9.0], 8.0),
-            ]);
-        }
-        let mut second = (0..8)
-            .map(|row| {
-                sized_line(
-                    "Ordinary prose on the following page",
-                    [
-                        60.0,
-                        100.0 + row as f64 * 16.0,
-                        500.0,
-                        111.0 + row as f64 * 16.0,
-                    ],
-                    10.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        for row in 0..6 {
-            let y = 600.0 + row as f64 * 12.0;
-            second.extend([
-                sized_line(&(row + 1).to_string(), [60.0, y, 70.0, y + 8.0], 7.0),
-                sized_line("Footnote text", [85.0, y, 300.0, y + 8.0], 7.0),
-            ]);
-        }
-        let mut pages = vec![page(0, first), page(1, second)];
-
-        classify_pages(&mut pages, &[None, Some(580.0)]);
-
-        assert!(pages[1]
-            .lines
-            .iter()
-            .filter(|line| line.text == "Footnote text")
-            .all(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn detached_drop_cap_moves_before_its_paragraph_line() {
-        let mut lines = vec![
-            sized_line("crucial opening line", [101.0, 360.0, 400.0, 372.0], 10.0),
-            sized_line("continuation", [68.0, 374.0, 400.0, 386.0], 10.0),
-            sized_line("A", [68.0, 350.0, 101.0, 407.0], 48.0),
-        ];
-
-        repair_drop_caps(&mut lines);
-
-        assert_eq!(lines[0].text, "A");
-        assert_eq!(lines[1].text, "crucial opening line");
-    }
-
-    #[test]
-    fn two_column_pages_keep_each_columns_notes_after_its_body() {
-        let lines = |prefix: &str, y: f64| {
-            (0..3)
-                .flat_map(|row| {
-                    [
-                        test_line(
-                            &format!("{prefix} left {row}"),
-                            [
-                                70.0,
-                                y + row as f64 * 12.0,
-                                270.0,
-                                y + 10.0 + row as f64 * 12.0,
-                            ],
-                            vec![],
-                        ),
-                        test_line(
-                            &format!("{prefix} right {row}"),
-                            [
-                                340.0,
-                                y + row as f64 * 12.0,
-                                540.0,
-                                y + 10.0 + row as f64 * 12.0,
-                            ],
-                            vec![],
-                        ),
-                    ]
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut body = lines("body", 100.0);
-        column_order(&mut body, 305.0);
-        let mut notes: Vec<_> = (0..3)
-            .flat_map(|row| {
-                [
-                    test_line(
-                        &format!("note left {row}"),
-                        [
-                            70.0,
-                            700.0 + row as f64 * 12.0,
-                            270.0,
-                            710.0 + row as f64 * 12.0,
-                        ],
-                        vec![],
-                    ),
-                    test_line(
-                        &format!("note right {row}"),
-                        [
-                            340.0,
-                            760.0 + row as f64 * 12.0,
-                            540.0,
-                            770.0 + row as f64 * 12.0,
-                        ],
-                        vec![],
-                    ),
-                ]
-            })
-            .collect();
-        column_order(&mut notes, 305.0);
-
-        let result = weave_note_columns(body, notes, 612.0);
-
-        assert_eq!(
-            result
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "body left 0",
-                "body left 1",
-                "body left 2",
-                "note left 0",
-                "note left 1",
-                "note left 2",
-                "body right 0",
-                "body right 1",
-                "body right 2",
-                "note right 0",
-                "note right 1",
-                "note right 2",
-            ]
-        );
-
-        let mut body = lines("body", 100.0);
-        column_order(&mut body, 305.0);
-        let result = weave_note_columns(
-            body,
-            vec![
-                test_line("*", [54.0, 700.0, 64.0, 710.0], vec![]),
-                test_line("full-width note", [72.0, 700.0, 540.0, 710.0], vec![]),
-            ],
-            612.0,
-        );
-        assert_eq!(result[result.len() - 2].text, "*");
-        assert_eq!(result[result.len() - 1].text, "full-width note");
-    }
-
-    #[test]
-    fn labels_normalize_unicode_superscripts() {
-        assert_eq!(normalize_label("⁰¹²"), "12");
-        assert_eq!(label_prefix("  12. Note").unwrap().label, "12");
-        assert_eq!(label_prefix("2024 decision").unwrap().label, "2024");
-        assert!(line_start_label_prefix("12").is_none());
-        assert_eq!(label_prefix("12").unwrap().label, "12");
-        assert_eq!(label_prefix("**** Note").unwrap().label, "****");
-        let embedded = line_start_label_prefix("2endnote 2This is a note").unwrap();
-        assert_eq!(embedded.label, "2");
-        assert_eq!(
-            char_slice("2endnote 2This is a note", embedded.end, 25),
-            "This is a note"
-        );
-        assert!(label_prefix("*Not a note").is_none());
-        assert!(line_start_label_prefix("3.2. Good neighbours").is_none());
-    }
-
-    #[test]
-    fn compact_note_bodies_are_not_repeated_footers() {
-        let page = |index: usize, label: usize| {
-            let mut body = test_line("Body prose", [72.0, 100.0, 300.0, 110.0], vec![]);
-            body.spans.push(Span {
-                id: String::new(),
-                text: body.text.clone(),
-                bbox: body.bbox,
-                font: String::new(),
-                size: 10.0,
-                flags: 0,
-                superscript: false,
-                start: 0,
-                end: body.text.chars().count(),
-            });
-            let text = format!("{label}. Ibid at {label}.");
-            let mut note = test_line(&text, [72.0, 730.0, 170.0, 737.0], vec![]);
-            note.spans.push(Span {
-                id: String::new(),
-                text: note.text.clone(),
-                bbox: note.bbox,
-                font: String::new(),
-                size: 7.0,
-                flags: 0,
-                superscript: false,
-                start: 0,
-                end: note.text.chars().count(),
-            });
-            Page {
-                id: format!("p{:04}", index + 1),
-                index,
-                number: u32::try_from(index + 1).unwrap(),
-                width: 612.0,
-                height: 792.0,
-                lines: vec![body, note],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            }
-        };
-        let mut pages = vec![page(0, 33), page(1, 46), page(2, 57)];
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[1].region_type == "unknown"));
-    }
-
-    #[test]
-    fn repeated_detached_citation_shortforms_remain_note_lines() {
-        let mut pages = (0..4)
-            .map(|index| {
-                let mut body = sized_line(
-                    "Ordinary article body establishes the document font.",
-                    [72.0, 300.0, 500.0, 312.0],
-                    10.0,
-                );
-                body.id = format!("body-{index}");
-                let mut label =
-                    sized_line(&(51 + index).to_string(), [50.0, 730.0, 56.0, 736.0], 5.0);
-                label.id = format!("label-{index}");
-                let mut note = sized_line("Ibid.", [72.0, 730.0, 92.0, 738.0], 8.0);
-                note.id = format!("note-{index}");
-                Page {
-                    id: format!("p{:04}", index + 1),
-                    index,
-                    number: u32::try_from(index + 1).unwrap(),
-                    width: 612.0,
-                    height: 792.0,
-                    lines: vec![body, label, note],
-                    regions: vec![],
-                    source: "native".to_owned(),
-                    text_quality: 1.0,
-                    printed_label: None,
-                    printed_label_source: None,
-                    printed_label_line_id: None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages.iter().all(|page| page.lines[1..]
-            .iter()
-            .all(|line| line.region_type == "unknown")));
-    }
-
-    #[test]
-    fn attached_top_note_labels_are_not_repeated_headers() {
-        let page = |index: usize, label: usize| {
-            let marker = test_line(&label.to_string(), [40.0, 70.0, 52.0, 80.0], vec![]);
-            let body = test_line(
-                if index == 0 {
-                    "First note"
-                } else {
-                    "Second note"
-                },
-                [60.0, 70.0, 180.0, 82.0],
-                vec![],
-            );
-            Page {
-                id: format!("p{:04}", index + 1),
-                index,
-                number: u32::try_from(index + 1).unwrap(),
-                width: 612.0,
-                height: 792.0,
-                lines: vec![marker, body],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            }
-        };
-        let mut pages = vec![page(0, 41), page(1, 42)];
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[0].region_type == "unknown"));
-    }
-
-    #[test]
-    fn repeated_top_paragraph_enumerators_are_not_headers() {
-        let mut pages = (0..5)
-            .map(|index| Page {
-                id: format!("p{:04}", index + 1),
-                index,
-                number: u32::try_from(index + 1).unwrap(),
-                width: 612.0,
-                height: 792.0,
-                lines: vec![
-                    sized_line(&format!("{}.", 18 + index), [40.0, 72.0, 52.0, 82.0], 10.0),
-                    sized_line(
-                        "Paragraph text begins on the same baseline.",
-                        [60.0, 72.0, 500.0, 84.0],
-                        10.0,
-                    ),
-                ],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            })
-            .collect::<Vec<_>>();
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[0].region_type == "unknown"));
-    }
-
-    #[test]
-    fn attached_page_numbers_remain_repeated_headers() {
-        let page = |index: usize, number: usize| {
-            let marker_text = number.to_string();
-            let marker = sized_line(&marker_text, [40.0, 40.0, 52.0, 50.0], 8.0);
-            let heading = sized_line("Journal title", [60.0, 40.0, 180.0, 52.0], 8.0);
-            Page {
-                id: format!("p{:04}", index + 1),
-                index,
-                number: u32::try_from(index + 1).unwrap(),
-                width: 612.0,
-                height: 792.0,
-                lines: vec![marker, heading],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            }
-        };
-        let mut pages = vec![page(0, 240), page(1, 242)];
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines.iter().all(|line| line.region_type == "header")));
-    }
-
-    #[test]
-    fn repeated_edge_text_does_not_sweep_in_a_geometry_outlier() {
-        let mut pages = (0..4)
-            .map(|index| {
-                let top = if index == 3 { 70.0 } else { 20.0 };
-                let mut header =
-                    sized_line("ALBERTA LAW REVIEW", [100.0, top, 400.0, top + 10.0], 8.0);
-                header.id = format!("header-{index}");
-                let mut body = sized_line(
-                    "Unique body prose remains body evidence.",
-                    [72.0, 300.0, 500.0, 312.0],
-                    10.0,
-                );
-                body.id = format!("body-{index}");
-                Page {
-                    id: format!("p{:04}", index + 1),
-                    index,
-                    number: u32::try_from(index + 1).unwrap(),
-                    width: 612.0,
-                    height: 792.0,
-                    lines: vec![header, body],
-                    regions: vec![],
-                    source: "native".to_owned(),
-                    text_quality: 1.0,
-                    printed_label: None,
-                    printed_label_source: None,
-                    printed_label_line_id: None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages[..3]
-            .iter()
-            .all(|page| page.lines[0].region_type == "header"));
-        assert_eq!(pages[3].lines[0].region_type, "unknown");
-    }
-
-    #[test]
-    fn repeated_edge_text_uses_the_stable_cluster_not_a_title_outlier() {
-        let mut pages = (0..5)
-            .map(|index| {
-                let mut header = sized_line("CIRCULAR PRIORITIES", [100.0, 30.0, 300.0, 40.0], 8.0);
-                header.id = format!("header-{index}");
-                let mut lines = vec![header];
-                if index == 0 {
-                    let mut title =
-                        sized_line("CIRCULAR PRIORITIES", [100.0, 70.0, 300.0, 84.0], 14.0);
-                    title.id = "article-title".to_owned();
-                    lines.push(title);
-                }
-                Page {
-                    id: format!("p{:04}", index + 1),
-                    index,
-                    number: u32::try_from(index + 1).unwrap(),
-                    width: 612.0,
-                    height: 792.0,
-                    lines,
-                    regions: vec![],
-                    source: "native".to_owned(),
-                    text_quality: 1.0,
-                    printed_label: None,
-                    printed_label_source: None,
-                    printed_label_line_id: None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[0].region_type == "header"));
-        assert_eq!(pages[0].lines[1].region_type, "unknown");
-    }
-
-    #[test]
-    fn alternating_sequential_bottom_folios_override_same_row_footer_text() {
-        let mut pages = (0..5)
-            .map(|index| {
-                let x = if index % 2 == 0 { 570.0 } else { 20.0 };
-                let mut folio =
-                    sized_line(&(51 + index).to_string(), [x, 730.0, x + 20.0, 740.0], 8.0);
-                folio.id = format!("folio-{index}");
-                let mut footer = sized_line(
-                    "Same-baseline journal footer",
-                    [80.0, 730.0, 430.0, 740.0],
-                    8.0,
-                );
-                footer.id = format!("footer-{index}");
-                let mut body = sized_line(
-                    "Body prose stays ordinary text.",
-                    [72.0, 300.0, 500.0, 312.0],
-                    10.0,
-                );
-                body.id = format!("body-{index}");
-                Page {
-                    id: format!("p{:04}", index + 1),
-                    index,
-                    number: u32::try_from(index + 1).unwrap(),
-                    width: 612.0,
-                    height: 792.0,
-                    lines: vec![body, footer, folio],
-                    regions: vec![],
-                    source: "native".to_owned(),
-                    text_quality: 1.0,
-                    printed_label: None,
-                    printed_label_source: None,
-                    printed_label_line_id: None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        mark_repeated_furniture(&mut pages);
-
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[2].region_type == "footer"));
-        assert!(pages
-            .iter()
-            .all(|page| page.lines[0].region_type == "unknown"));
-    }
-
-    #[test]
-    fn propositions_remove_durable_markers() {
-        let text = "First rule. Second rule⟦FN:pair⟧ continues.";
-        assert_eq!(sentence_at(text, 23), "Second rule continues.");
-        assert_eq!(
-            sentence_at("It was so held.” Next point.", 18),
-            "Next point."
-        );
-        assert_eq!(
-            sentence_at("The proceeding ended.⟦FN:12⟧", 21),
-            "The proceeding ended."
-        );
-        assert_eq!(sentence_at("R v X at para.20", 15), "R v X at para.20");
-    }
-
-    #[test]
-    fn interleaved_columns_are_repaired_to_column_order() {
-        let mut title = test_line("full-width title", [50.0, 20.0, 550.0, 30.0], vec![]);
-        title.id = "title".to_owned();
-        let mut author = test_line("author", [360.0, 50.0, 500.0, 60.0], vec![]);
-        author.id = "author".to_owned();
-        let mut lines = vec![title, author];
-        for row in 0..6 {
-            let y = 100.0 + row as f64 * 12.0;
-            let mut left = test_line("left column prose", [60.0, y, 240.0, y + 10.0], vec![]);
-            left.id = format!("left-{row}");
-            let mut right = test_line("right column prose", [360.0, y, 540.0, y + 10.0], vec![]);
-            right.id = format!("right-{row}");
-            lines.extend([left, right]);
-        }
-        let decision = arbitrate_body_order(&mut lines, 600.0, 800.0);
-        assert_eq!(decision.repair, OrderRepair::Column);
-        assert_eq!(lines[0].id, "title");
-        assert_eq!(lines[1].id, "author");
-        assert!(lines[2..8].iter().all(|line| line.bbox[0] < 300.0));
-        assert!(lines[8..].iter().all(|line| line.bbox[0] > 300.0));
-    }
-
-    #[test]
-    fn misplaced_preamble_alone_does_not_justify_a_column_repair() {
-        let mut lines = Vec::new();
-        for (x, name) in [(60.0, "left"), (360.0, "right")] {
-            for row in 0..3 {
-                let y = 100.0 + row as f64 * 12.0;
-                lines.push(test_line(name, [x, y, x + 180.0, y + 10.0], vec![]));
-            }
-        }
-        lines.push(test_line("title", [50.0, 20.0, 550.0, 30.0], vec![]));
-        lines.push(test_line("author", [360.0, 50.0, 500.0, 60.0], vec![]));
-
-        let decision = arbitrate_body_order(&mut lines, 600.0, 800.0);
-
-        assert_eq!(decision.repair, OrderRepair::None);
-        assert_eq!(lines[0].text, "left");
-    }
-
-    #[test]
-    fn endnotes_read_columns_in_sequence() {
-        let mut lines = Vec::new();
-        for row in 0..6 {
-            let y = 100.0 + row as f64 * 12.0;
-            let mut left = test_line(
-                &format!("{} left endnote prose", row + 1),
-                [60.0, y, 240.0, y + 10.0],
-                vec![],
-            );
-            left.id = format!("left-{row}");
-            left.region_type = "footnote".to_owned();
-            left.note_region_mode = "endnote".to_owned();
-            let mut right = test_line(
-                &format!("{} right endnote prose", row + 7),
-                [360.0, y, 540.0, y + 10.0],
-                vec![],
-            );
-            right.id = format!("right-{row}");
-            right.region_type = "footnote".to_owned();
-            right.note_region_mode = "endnote".to_owned();
-            lines.extend([left, right]);
-        }
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: Vec::new(),
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        let diagnostics = order_pages(&mut pages);
-
-        assert!(diagnostics.is_empty());
-        assert_eq!(pages[0].lines[0].id, "left-0");
-        assert_eq!(pages[0].lines[1].id, "left-1");
-        assert_eq!(pages[0].lines[6].id, "right-0");
-    }
-
-    #[test]
-    fn detached_reference_fits_the_word_gap_not_the_note_margin() {
-        let host = test_line(
-            "higher. They",
-            [335.0, 93.9, 396.0, 103.9],
-            vec![
-                Span {
-                    id: "left".to_owned(),
-                    text: "higher.".to_owned(),
-                    bbox: [335.0, 93.9, 366.6, 103.9],
-                    font: String::new(),
-                    size: 10.0,
-                    flags: 0,
-                    superscript: false,
-                    start: 0,
-                    end: 7,
-                },
-                Span {
-                    id: "right".to_owned(),
-                    text: "They".to_owned(),
-                    bbox: [377.8, 93.9, 396.0, 103.9],
-                    font: String::new(),
-                    size: 10.0,
-                    flags: 0,
-                    superscript: false,
-                    start: 8,
-                    end: 12,
-                },
-            ],
-        );
-        let inline_marker = test_line("40", [367.5, 94.2, 373.2, 100.0], vec![]);
-        let margin_label = test_line("40", [54.1, 94.2, 59.8, 100.0], vec![]);
-
-        assert_eq!(
-            detached_reference_target(0, &[inline_marker, host.clone()], 10.0),
-            Some((1, 7))
-        );
-        assert_eq!(
-            detached_reference_target(0, &[margin_label, host], 10.0),
-            None
-        );
-    }
-
-    #[test]
-    fn endnote_mode_carries_to_the_next_numbered_note_page() {
-        let mut first = test_line("1 First note", [60.0, 100.0, 300.0, 110.0], vec![]);
-        first.region_type = "footnote".to_owned();
-        first.note_region_mode = "endnote".to_owned();
-        let mut second = test_line("2 Second note", [60.0, 100.0, 300.0, 110.0], vec![]);
-        second.region_type = "footnote".to_owned();
-        second.page_index = 1;
-        second.page_number = 2;
-        let mut pages = vec![
-            Page {
-                id: "p0001".to_owned(),
-                index: 0,
-                number: 1,
-                width: 600.0,
-                height: 800.0,
-                lines: vec![first],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            },
-            Page {
-                id: "p0002".to_owned(),
-                index: 1,
-                number: 2,
-                width: 600.0,
-                height: 800.0,
-                lines: vec![second],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            },
-        ];
-
-        infer_note_region_modes(&mut pages);
-
-        assert_eq!(pages[1].lines[0].note_region_mode, "endnote");
-    }
-
-    #[test]
-    fn endnote_heading_uses_a_separate_cut_for_each_column() {
-        let mut body = test_line(
-            "Article body before the notes",
-            [60.0, 100.0, 280.0, 110.0],
-            vec![],
-        );
-        body.source_index = 1;
-        let mut notes = test_line("Notes", [60.0, 340.0, 120.0, 360.0], vec![]);
-        notes.source_index = 2;
-        let mut first = test_line("*", [60.0, 365.0, 70.0, 375.0], vec![]);
-        first.source_index = 3;
-        let first_body = test_line("First note", [80.0, 365.0, 280.0, 375.0], vec![]);
-        let continuation = test_line(
-            "Continuation from the prior note",
-            [350.0, 105.0, 570.0, 115.0],
-            vec![],
-        );
-        let eighth = test_line("8", [330.0, 130.0, 340.0, 140.0], vec![]);
-        let eighth_body = test_line("Eighth note", [350.0, 130.0, 570.0, 140.0], vec![]);
-        let right_tail = test_line("More note text", [350.0, 300.0, 570.0, 310.0], vec![]);
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 612.0,
-            height: 792.0,
-            lines: vec![
-                body,
-                notes,
-                first,
-                first_body,
-                continuation,
-                eighth,
-                eighth_body,
-                right_tail,
-            ],
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        let by_text: HashMap<_, _> = pages[0]
-            .lines
-            .iter()
-            .map(|line| (line.text.as_str(), line))
-            .collect();
-        assert_eq!(by_text["Article body before the notes"].region_type, "body");
-        assert!(by_text["Notes"].note_region_mode.is_empty());
-        assert_eq!(by_text["Notes"].region_type, "heading");
-        assert_eq!(
-            by_text["Continuation from the prior note"].note_region_mode,
-            "endnote"
-        );
-        assert_eq!(by_text["First note"].note_region_mode, "endnote");
-    }
-
-    #[test]
-    fn an_early_body_number_does_not_turn_bottom_footnotes_into_endnotes() {
-        let mut lines = vec![
-            sized_line(
-                "19. The ordinary paragraph continues",
-                [60.0, 180.0, 400.0, 192.0],
-                10.0,
-            ),
-            sized_line("More body prose", [60.0, 200.0, 400.0, 212.0], 10.0),
-        ];
-        for number in 13..=18 {
-            let y = 560.0 + f64::from(number - 13) * 20.0;
-            lines.push(sized_line(
-                &format!("{number} Citation text"),
-                [60.0, y, 400.0, y + 9.0],
-                7.0,
-            ));
-        }
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.region_type == "footnote")
-            .all(|line| line.note_region_mode == "footnote"));
-    }
-
-    #[test]
-    fn a_compact_lower_sequence_is_footnotes_without_a_drawn_rule() {
-        let mut lines: Vec<_> = (0..10)
-            .map(|row| {
-                let y = 120.0 + row as f64 * 20.0;
-                sized_line("Ordinary article body", [60.0, y, 500.0, y + 12.0], 10.0)
-            })
-            .collect();
-        for number in 91..=95 {
-            let y = 560.0 + f64::from(number - 91) * 20.0;
-            if number == 93 {
-                lines.push(sized_line(
-                    "2021) 35 at 41).",
-                    [60.0, y - 10.0, 180.0, y - 1.0],
-                    8.5,
-                ));
-            }
-            lines.push(sized_line(
-                &format!("{number} Citation text"),
-                [60.0, y, 500.0, y + 10.0],
-                8.5,
-            ));
-        }
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with('9'))
-            .all(|line| line.region_type == "footnote" && line.note_region_mode == "footnote"));
-    }
-
-    #[test]
-    fn a_single_lower_note_is_backed_by_its_superscript_reference() {
-        let mut body = sized_line(
-            "Ordinary article body with a reference",
-            [60.0, 120.0, 500.0, 132.0],
-            10.0,
-        );
-        body.spans.push(Span {
-            id: String::new(),
-            text: "21".to_owned(),
-            bbox: [400.0, 116.0, 410.0, 124.0],
-            font: String::new(),
-            size: 6.0,
-            flags: 0,
-            superscript: true,
-            start: body.text.chars().count(),
-            end: body.text.chars().count(),
-        });
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 600.0,
-            height: 800.0,
-            lines: vec![
-                body,
-                sized_line(
-                    "More ordinary article body",
-                    [60.0, 140.0, 500.0, 152.0],
-                    10.0,
-                ),
-                sized_line("Still more article body", [60.0, 160.0, 500.0, 172.0], 10.0),
-                sized_line("21 Citation text", [60.0, 400.0, 500.0, 410.0], 8.5),
-                sized_line("Citation continuation", [75.0, 412.0, 500.0, 422.0], 8.5),
-            ],
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0].lines[3..]
-            .iter()
-            .all(|line| line.region_type == "footnote" && line.note_region_mode == "footnote"));
-    }
-
-    #[test]
-    fn two_reference_backed_margin_notes_do_not_cut_through_main_prose() {
-        let mut lines: Vec<_> = (0..10)
-            .map(|row| {
-                let y = 380.0 + row as f64 * 24.0;
-                sized_line(
-                    "Main-column prose continues beside the margin notes",
-                    [145.0, y, 425.0, y + 10.0],
-                    9.0,
-                )
-            })
-            .collect();
-        for (line, label) in lines.iter_mut().take(2).zip(["39", "40"]) {
-            line.spans.push(Span {
-                id: String::new(),
-                text: label.to_owned(),
-                bbox: [400.0, line.bbox[1] - 4.0, 410.0, line.bbox[1] + 4.0],
-                font: String::new(),
-                size: 6.0,
-                flags: 0,
-                superscript: true,
-                start: line.text.chars().count(),
-                end: line.text.chars().count(),
-            });
-        }
-        lines.extend([
-            sized_line("39 First margin note", [37.0, 500.0, 110.0, 508.0], 7.0),
-            sized_line("40 Second margin note", [37.0, 550.0, 110.0, 558.0], 7.0),
-        ]);
-        let mut pages = vec![Page {
-            id: "p0001".to_owned(),
-            index: 0,
-            number: 1,
-            width: 540.0,
-            height: 792.0,
-            lines,
-            regions: vec![],
-            source: "native".to_owned(),
-            text_quality: 1.0,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
-        }];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("Main-column"))
-            .all(|line| line.region_type == "body"));
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("39 ") || line.text.starts_with("40 "))
-            .all(|line| line.region_type == "footnote"));
-    }
-
-    #[test]
-    fn smaller_quoted_text_does_not_make_normal_prose_a_heading() {
-        let mut lines = Vec::new();
-        for row in 0..20 {
-            let y = 100.0 + row as f64 * 12.0;
-            lines.push(sized_line(
-                "Indented quoted passage",
-                [90.0, y, 500.0, y + 10.0],
-                9.0,
-            ));
-        }
-        for row in 0..10 {
-            let y = 350.0 + row as f64 * 14.0;
-            lines.push(sized_line(
-                "Normal narrative prose continues here.",
-                [60.0, y, 520.0, y + 12.0],
-                11.0,
-            ));
-        }
-        lines.push(sized_line("IV. Rulings", [60.0, 510.0, 220.0, 526.0], 14.0));
-        for (index, line) in lines.iter_mut().enumerate() {
-            line.region_type = if index < 20 {
-                "block_quote"
-            } else if index < 30 {
-                "body"
-            } else {
-                "heading"
-            }
-            .to_owned();
-        }
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("Normal"))
-            .all(|line| line.region_type == "body"));
-        assert_eq!(pages[0].lines.last().unwrap().region_type, "heading");
-    }
-
-    #[test]
-    fn region_dependent_lanes_require_a_complete_source_contract() {
-        let mut pages = vec![test_page(vec![
-            sized_line("Known body", [60.0, 100.0, 300.0, 112.0], 11.0),
-            sized_line("Unknown peer", [60.0, 120.0, 300.0, 132.0], 11.0),
-        ])];
-        pages[0].lines[0].region_type = "body".to_owned();
-        assert!(!source_regions_available(&pages));
-
-        pages[0].lines[1].region_type = "text".to_owned();
-        assert!(source_regions_available(&pages));
-    }
-
-    #[test]
-    fn source_roles_admit_display_headings_without_promoting_authors() {
-        let mut pages = vec![test_page(vec![
-            sized_line(
-                "CONSTITUTIONAL PRINCIPLES",
-                [60.0, 100.0, 360.0, 112.0],
-                11.0,
-            ),
-            sized_line("JANE EXAMPLE", [60.0, 125.0, 240.0, 137.0], 11.0),
-            sized_line(
-                "Ordinary narrative text ends here.",
-                [60.0, 160.0, 520.0, 172.0],
-                11.0,
-            ),
-        ])];
-        pages[0].lines[0].region_type = "text".to_owned();
-        pages[0].lines[1].region_type = "author".to_owned();
-        pages[0].lines[2].region_type = "text".to_owned();
-
-        classify_pages(&mut pages, &[None]);
-
-        assert_eq!(pages[0].lines[0].region_type, "heading");
-        assert_eq!(pages[0].lines[1].region_type, "body");
-    }
-
-    #[test]
-    fn clean_repeated_heading_grammar_promotes_nested_ladders_without_visual_tuning() {
-        let mut lines = (0..12)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        for (row, text) in [
-            "I. First Part",
-            "A. First Issue",
-            "B. Second Issue",
-            "II. Second Part",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let y = 330.0 + row as f64 * 25.0;
-            lines.push(sized_line(text, [60.0, y, 280.0, y + 12.0], 11.0));
-        }
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.contains("Part") || line.text.contains("Issue"))
-            .all(|line| line.region_type == "heading"));
-    }
-
-    #[test]
-    fn source_regions_allow_same_style_wrapped_heading_continuations() {
-        let mut lines = (0..10)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut heading = sized_line(
-            "I. A Complete Account Of",
-            [60.0, 300.0, 340.0, 312.0],
-            12.0,
-        );
-        heading.spans[0].flags = 16;
-        let mut continuation =
-            sized_line("The Governing Framework", [80.0, 313.0, 360.0, 325.0], 12.0);
-        continuation.spans[0].flags = 16;
-        lines.extend([
-            heading,
-            continuation,
-            sized_line(
-                "Ordinary prose begins after the display heading.",
-                [60.0, 345.0, 520.0, 357.0],
-                11.0,
-            ),
-        ]);
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        let heading_lines = pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("I.") || line.text == "The Governing Framework")
-            .collect::<Vec<_>>();
-        assert_eq!(heading_lines.len(), 2);
-        assert!(heading_lines
-            .iter()
-            .all(|line| line.region_type == "heading"));
-        assert_eq!(heading_lines[0].region_id, heading_lines[1].region_id);
-    }
-
-    #[test]
-    fn dirty_heading_ladder_abstains_instead_of_promoting_examples() {
-        let mut lines = (0..10)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        lines.push(sized_line(
-            "I. First Part",
-            [60.0, 300.0, 280.0, 312.0],
-            11.0,
-        ));
-        lines.push(sized_line(
-            "I. Duplicate Part",
-            [60.0, 325.0, 300.0, 337.0],
-            11.0,
-        ));
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("I."))
-            .all(|line| line.region_type == "body"));
-    }
-
-    #[test]
-    fn long_numeric_ladder_is_not_promoted_as_document_headings() {
-        let mut lines = (0..10)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        lines.push(sized_line(
-            "15. Historical Note",
-            [60.0, 300.0, 280.0, 312.0],
-            11.0,
-        ));
-        lines.push(sized_line(
-            "16. Further Note",
-            [60.0, 325.0, 280.0, 337.0],
-            11.0,
-        ));
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("15.") || line.text.starts_with("16."))
-            .all(|line| line.region_type != "heading"));
-    }
-
-    #[test]
-    fn body_flow_vetoes_a_visually_bold_false_heading() {
-        let mut lines = (0..10)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut candidate = sized_line("I. This Is Actually", [60.0, 300.0, 280.0, 312.0], 11.0);
-        candidate.spans[0].flags = 16;
-        lines.push(candidate);
-        lines.push(sized_line(
-            "continued prose from the same sentence.",
-            [60.0, 314.0, 520.0, 326.0],
-            11.0,
-        ));
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert_eq!(
-            pages[0]
-                .lines
-                .iter()
-                .find(|line| line.text.starts_with("I."))
-                .unwrap()
-                .region_type,
-            "body"
-        );
-    }
-
-    #[test]
-    fn citation_and_destination_shapes_never_enter_the_heading_ladder() {
-        let mut lines = (0..10)
-            .map(|row| {
-                let y = 80.0 + row as f64 * 18.0;
-                sized_line(
-                    "Ordinary narrative text ends here.",
-                    [60.0, y, 520.0, y + 12.0],
-                    11.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        for (row, text) in ["I. Example v Sample 123", "II. Destination 42"]
-            .into_iter()
-            .enumerate()
-        {
-            let mut line = sized_line(
-                text,
-                [
-                    60.0,
-                    300.0 + row as f64 * 25.0,
-                    320.0,
-                    312.0 + row as f64 * 25.0,
-                ],
-                11.0,
-            );
-            line.spans[0].flags = 16;
-            lines.push(line);
-        }
-        mark_source_body(&mut lines);
-        let mut pages = vec![test_page(lines)];
-
-        classify_pages(&mut pages, &[None]);
-
-        assert!(pages[0]
-            .lines
-            .iter()
-            .filter(|line| line.text.starts_with("I.") || line.text.starts_with("II."))
-            .all(|line| line.region_type == "body"));
-    }
-
-    #[test]
-    fn endnote_sequence_includes_column_continuations_above_the_next_label() {
-        let mut first = test_line("1", [60.0, 100.0, 70.0, 110.0], vec![]);
-        first.source_index = 2;
-        let mut first_body = test_line("First note", [80.0, 100.0, 300.0, 110.0], vec![]);
-        first_body.source_index = 3;
-        let mut second_lines = Vec::new();
-        for (label, x, y) in [
-            (2, 60.0, 100.0),
-            (3, 60.0, 200.0),
-            (4, 60.0, 300.0),
-            (5, 330.0, 100.0),
-            (6, 330.0, 200.0),
-            (7, 330.0, 300.0),
-        ] {
-            let mut marker = test_line(&label.to_string(), [x, y, x + 10.0, y + 10.0], vec![]);
-            let mut body = test_line("Note body", [x + 20.0, y, x + 240.0, y + 10.0], vec![]);
-            marker.page_index = 1;
-            marker.page_number = 2;
-            body.page_index = 1;
-            body.page_number = 2;
-            second_lines.extend([marker, body]);
-        }
-        let mut continuation = test_line(
-            "Continuation from the prior column",
-            [350.0, 70.0, 570.0, 80.0],
-            vec![],
-        );
-        continuation.page_index = 1;
-        continuation.page_number = 2;
-        second_lines.insert(6, continuation);
-        let mut pages = vec![
-            Page {
-                id: "p0001".to_owned(),
-                index: 0,
-                number: 1,
-                width: 600.0,
-                height: 800.0,
-                lines: vec![
-                    test_line("Notes", [60.0, 70.0, 120.0, 85.0], vec![]),
-                    first,
-                    first_body,
-                ],
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            },
-            Page {
-                id: "p0002".to_owned(),
-                index: 1,
-                number: 2,
-                width: 600.0,
-                height: 800.0,
-                lines: second_lines,
-                regions: vec![],
-                source: "native".to_owned(),
-                text_quality: 1.0,
-                printed_label: None,
-                printed_label_source: None,
-                printed_label_line_id: None,
-            },
-        ];
-
-        classify_pages(&mut pages, &[None, Some(90.0)]);
-
-        assert!(pages[1]
-            .lines
-            .iter()
-            .all(|line| line.note_region_mode == "endnote"));
-    }
-
-    #[test]
-    fn crossref_shortform_uses_python_word_boundaries_at_join_controls() {
-        let text = "\u{200c}Quebec Water Policy, supra note 3";
-        let start = text.find("supra").unwrap();
-        assert_eq!(crossref_shortform(text, start), "Quebec Water Policy");
-
-        let text = "\u{200c}Godin, supra note 41";
-        let start = text.find("supra").unwrap();
-        assert_eq!(crossref_shortform(text, start), "Godin");
-    }
-}
+mod tests;
