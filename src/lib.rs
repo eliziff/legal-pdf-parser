@@ -517,7 +517,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines, _all_rules), page_thresholds, gid_pages) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -1048,7 +1048,7 @@ pub fn extract_text_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
-    let mut style_cache = extractor::FontStyleCache::new();
+    let mut font_cache = extractor::FontProductCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1059,14 +1059,20 @@ pub fn extract_text_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible, _) =
+        let (
+            (mut items, _rects, _lines, _rules),
+            mut has_gid,
+            mut coords_rotated,
+            skipped_invisible,
+            _,
+        ) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
                 *page_num,
                 &font_cmaps,
                 false,
-                &mut style_cache,
+                &mut font_cache,
             )?;
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
@@ -1087,14 +1093,14 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _, _)) =
+            if let Ok(((inv_items, _inv_rects, _inv_lines, _inv_rules), inv_gid, inv_rotated, _, _)) =
                 extractor::content_stream::extract_page_text_items(
                     &doc,
                     page_id,
                     *page_num,
                     &font_cmaps,
                     true,
-                    &mut style_cache,
+                    &mut font_cache,
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
@@ -1260,7 +1266,7 @@ pub fn extract_tables_in_regions_mem(
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
-    let mut style_cache = extractor::FontStyleCache::new();
+    let mut font_cache = extractor::FontProductCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1269,14 +1275,14 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible, _) =
+        let ((mut items, rects, lines, _rules), has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
                 *page_num,
                 &font_cmaps,
                 false,
-                &mut style_cache,
+                &mut font_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1580,14 +1586,14 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible, _) =
+    let ((mut items, rects, lines, _rules), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
             page_1idx,
             &font_cmaps,
             false,
-            &mut extractor::FontStyleCache::new(),
+            &mut extractor::FontProductCache::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1774,14 +1780,14 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+        let ((items, rects, _lines, _rules), _has_gid, _rotated, _skipped_invisible, _) =
             extract_page_text_items(
                 &doc,
                 page_id,
                 1,
                 &cmaps,
                 false,
-                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FontProductCache::new(),
             )
             .unwrap();
 
@@ -1817,14 +1823,14 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+        let ((items, rects, _lines, _rules), _has_gid, _rotated, _skipped_invisible, _) =
             extract_page_text_items(
                 &doc,
                 page_id,
                 page_num,
                 &cmaps,
                 false,
-                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FontProductCache::new(),
             )
             .unwrap();
 
@@ -2545,7 +2551,7 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashSet<u32> = HashSet::new();
-    let mut style_cache = extractor::FontStyleCache::new();
+    let mut font_cache = extractor::FontProductCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -2554,14 +2560,14 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
+        let ((mut items, _rects, _lines, _rules), _has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
                 *page_num,
                 &font_cmaps,
                 false,
-                &mut style_cache,
+                &mut font_cache,
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -3356,14 +3362,14 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
+    let ((mut items, _rects, _lines, _rules), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
             page_1idx,
             &font_cmaps,
             false,
-            &mut extractor::FontStyleCache::new(),
+            &mut extractor::FontProductCache::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3867,28 +3873,33 @@ pub(crate) fn load_document_from_mem_with_password(
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf, password) {
-        Ok(doc) => doc,
-        Err(first_err) => {
-            for repaired in repair_pdf_container_candidates(buf) {
-                match load_document_bytes(&repaired, password) {
-                    Ok(doc) => {
-                        log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
-                        return Ok((doc, page_count));
-                    }
-                    Err(e) => {
-                        if is_encrypted_lopdf_error(&e) {
-                            return Err(e.into());
-                        }
-                    }
-                }
+    let (empty_document, first_error) = match load_document_bytes(buf, password) {
+        Ok(doc) => {
+            let page_count = doc.get_pages().len() as u32;
+            if page_count > 0 {
+                return Ok((doc, page_count));
             }
-            return Err(first_err.into());
+            (Some(doc), None)
         }
+        Err(error) => (None, Some(error)),
     };
-    let page_count = doc.get_pages().len() as u32;
-    Ok((doc, page_count))
+    for repaired in repair_pdf_container_candidates(buf) {
+        match load_document_bytes(&repaired, password) {
+            Ok(doc) if !doc.get_pages().is_empty() => {
+                log::debug!("loaded PDF after repairing malformed container bytes");
+                let page_count = doc.get_pages().len() as u32;
+                return Ok((doc, page_count));
+            }
+            Ok(_) => {}
+            Err(error) if is_encrypted_lopdf_error(&error) => return Err(error.into()),
+            Err(_) => {}
+        }
+    }
+    match (empty_document, first_error) {
+        (Some(doc), _) => Ok((doc, 0)),
+        (_, Some(error)) => Err(error.into()),
+        _ => unreachable!("initial PDF load produced neither a document nor an error"),
+    }
 }
 
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
@@ -3924,6 +3935,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    add_repair_candidate(&mut candidates, strip_duplicated_pdf_prefix(buf), buf);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -4099,6 +4111,41 @@ fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Recover a PDF whose beginning was accidentally duplicated in front of the
+/// complete file. The final `startxref` offset is relative to the later PDF
+/// header, so only accept a suffix when that relative offset lands on a valid
+/// classic cross-reference table. This avoids mistaking an embedded PDF stream
+/// for the outer document.
+fn strip_duplicated_pdf_prefix(buf: &[u8]) -> Option<Vec<u8>> {
+    let marker = b"startxref";
+    let marker_pos = buf
+        .windows(marker.len())
+        .rposition(|window| window == marker)?;
+    let mut number_start = marker_pos + marker.len();
+    while buf.get(number_start).is_some_and(u8::is_ascii_whitespace) {
+        number_start += 1;
+    }
+    let number_end = (number_start..buf.len()).find(|&index| !buf[index].is_ascii_digit())?;
+    let xref_offset = std::str::from_utf8(&buf[number_start..number_end])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+
+    buf.windows(b"%PDF-".len())
+        .enumerate()
+        .skip(1)
+        .rev()
+        .find_map(|(header, window)| {
+            if window != b"%PDF-" {
+                return None;
+            }
+            let xref = header.checked_add(xref_offset)?;
+            (buf.get(xref..xref + 4) == Some(b"xref")
+                && looks_like_xref_subsection_header(buf, xref + 4))
+            .then(|| buf[header..].to_vec())
+        })
+}
+
 /// Core processing pipeline operating on a pre-loaded document.
 fn process_document(
     doc: Document,
@@ -4162,7 +4209,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            if let Ok((ref items, _, _, _)) = result.as_ref().map(|(e, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4230,7 +4277,7 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some(((items, rects, lines, _rules), page_thresholds, gid_encoded_pages)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or

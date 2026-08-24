@@ -8,9 +8,14 @@ use std::collections::HashMap;
 
 use crate::text_utils::should_join_items;
 
-/// Result tuple returned by page-level text extraction: text items, rectangles, line segments,
-/// and whether fonts with unresolvable gid-encoded glyphs were encountered.
-pub type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
+/// Result tuple returned by page-level extraction: text, table rectangles,
+/// painted line segments, and all thin painted rules.
+pub type PageExtraction = (
+    Vec<TextItem>,
+    Vec<PdfRect>,
+    Vec<PdfLine>,
+    Vec<PdfLine>,
+);
 
 // ── Font types (crate-internal) ──────────────────────────────────────
 
