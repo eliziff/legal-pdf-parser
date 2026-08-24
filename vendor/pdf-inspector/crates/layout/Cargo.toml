@@ -1,9 +1,0 @@
-[package]
-name = "pdf-inspector-layout"
-version = "1.14.0"
-edition = "2021"
-license = "MIT"
-
-[dependencies]
-log = "0.4"
-pdf-inspector-core = { path = "../core" }

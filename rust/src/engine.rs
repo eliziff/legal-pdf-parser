@@ -140,7 +140,7 @@ fn engine_identity() -> &'static Value {
             ),
             (
                 "native_extractor".to_owned(),
-                Value::String("pdf-inspector 1.14.0".to_owned()),
+                Value::String("pdf-inspector".to_owned()),
             ),
             (
                 "ocr_renderer".to_owned(),
@@ -220,10 +220,6 @@ fn engine_identity() -> &'static Value {
                 (
                     "data/mcgill_reporters.json",
                     "946e7554e8e9134d9b148d244d825e999080dd900c666cc4cf43235fa5ec9e2f",
-                ),
-                (
-                    "pdf-inspector/.cargo_vcs_info.json",
-                    "e3d92d9d90501ff4f7b0f83b20b537789163bc833b0ad96820ea9be7049ae8fa",
                 ),
             ],
         );
@@ -372,7 +368,7 @@ fn build_document(
     provenance.insert("engine".to_owned(), Value::String("legalpdf".to_owned()));
     provenance.insert(
         "native_extractor".to_owned(),
-        Value::String("pdf-inspector 1.14.0 (Rust)".to_owned()),
+        Value::String("pdf-inspector".to_owned()),
     );
     provenance.insert(
         "ocr_provider".to_owned(),

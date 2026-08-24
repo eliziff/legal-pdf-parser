@@ -16,7 +16,6 @@ exclude = [
     "legal-pdf-pairing",
     "legal-pdf-structure",
     "legal-pdf-support",
-    "vendor/pdf-inspector",
 ]
 resolver = "2"
 

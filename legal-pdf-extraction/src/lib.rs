@@ -1,6 +1,8 @@
 use legal_pdf_core::{model::TableBlock, profile, PdfOcrProvider};
 use legal_pdf_extraction_processor as processor;
 
+mod tables;
+
 pub use legal_pdf_extraction_processor::{union_bbox, Error, ExtractedPdf, Result};
 
 pub fn extract_pdf(
@@ -19,7 +21,7 @@ pub fn extract_pdf(
             pdf_inspector::extract_fidelity_from_doc(&document)
         })?;
     let tables: Vec<TableBlock> = profile::measure("extract.tables", || {
-        pdf_inspector::tables::detect_structured_tables(&items, &rects, &lines, &pages)
+        tables::detect_structured_tables(&items, &rects, &lines, &pages)
             .into_iter()
             .filter_map(|table| {
                 processor::project_table(
