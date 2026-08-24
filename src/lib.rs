@@ -3852,7 +3852,7 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
 }
 
 /// Load a PDF from a memory buffer.
-pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
+pub fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
     load_document_from_mem_with_password(buffer, None)
 }
 
