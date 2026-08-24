@@ -1,6 +1,5 @@
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OcrWord {
@@ -58,7 +57,7 @@ pub struct OcrPageResult {
 pub trait PdfOcrProvider {
     fn extract_pages(
         &mut self,
-        pdf_path: &Path,
+        pdf: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>>;
 }

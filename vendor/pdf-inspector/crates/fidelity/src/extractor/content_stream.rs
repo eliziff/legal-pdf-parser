@@ -525,8 +525,6 @@ fn extract_page_text_items_impl(
     merge_scripts: bool,
     fidelity: bool,
 ) -> Result<(PageExtraction, bool, bool, PageDetectionEvidence), PdfError> {
-    use lopdf::content::Content;
-
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -582,10 +580,33 @@ fn extract_page_text_items_impl(
         })
         .unwrap_or_default();
     let content_data = strip_pdf_comments(&raw_content);
-    let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
+    let content = match super::content_decode::decode_content_bounded(
+        &content_data,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    )? {
+        Some(content) => content,
+        None => {
+            log::warn!(
+                "page {}: skipping extraction — content stream exceeds {} operations",
+                page_num,
+                super::content_decode::MAX_PAGE_OPERATIONS
+            );
+            return Ok((
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                false,
+                false,
+                detection,
+            ));
+        }
+    };
     drop(content_data);
     drop(raw_content);
     let expanded = expand_page_content(doc, page_id, content.operations, page_fonts);
+    if expanded.form_truncated {
+        log::warn!(
+            "page {page_num}: Form XObject expansion truncated (invocation budget reached); nested form text may be incomplete"
+        );
+    }
     if expanded.exceeded_limit {
         log::warn!(
             "page {}: skipping extraction — expanded content exceeds {} operations",
@@ -1065,69 +1086,39 @@ fn extract_page_text_items_impl(
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         for element in array {
-                            match element {
-                                Object::Integer(n) => {
-                                    let n_val = *n as f32;
-                                    let displacement =
-                                        -n_val / 1000.0 * current_font_size * horizontal_scaling;
+                            let adjustment = match element {
+                                Object::Integer(value) => Some(*value as f32),
+                                Object::Real(value) => Some(*value),
+                                _ => None,
+                            };
+                            if let Some(value) = adjustment {
+                                let displacement =
+                                    -value / 1000.0 * current_font_size * horizontal_scaling;
+                                if !is_invisible
+                                    && value < -column_gap_threshold
+                                    && !current_text.is_empty()
+                                {
+                                    pending_space = false;
+                                    sub_items.push((
+                                        std::mem::take(&mut current_text),
+                                        std::mem::take(&mut current_fidelity_text),
+                                        std::mem::take(&mut current_fidelity_glyphs),
+                                        sub_start_width_ts,
+                                        total_width_ts,
+                                    ));
+                                    total_width_ts += displacement;
+                                    sub_start_width_ts = total_width_ts;
+                                } else {
+                                    total_width_ts += displacement;
                                     if !is_invisible
-                                        && n_val < -column_gap_threshold
+                                        && value < -space_threshold
                                         && !current_text.is_empty()
+                                        && !current_text.ends_with(' ')
                                     {
-                                        // Column gap: flush current segment
-                                        pending_space = false;
-                                        sub_items.push((
-                                            std::mem::take(&mut current_text),
-                                            std::mem::take(&mut current_fidelity_text),
-                                            std::mem::take(&mut current_fidelity_glyphs),
-                                            sub_start_width_ts,
-                                            total_width_ts,
-                                        ));
-                                        total_width_ts += displacement;
-                                        sub_start_width_ts = total_width_ts;
-                                    } else {
-                                        total_width_ts += displacement;
-                                        if !is_invisible
-                                            && n_val < -space_threshold
-                                            && !current_text.is_empty()
-                                            && !current_text.ends_with(' ')
-                                        {
-                                            pending_space = true;
-                                        }
+                                        pending_space = true;
                                     }
-                                    continue;
                                 }
-                                Object::Real(n) => {
-                                    let n_val = *n;
-                                    let displacement =
-                                        -n_val / 1000.0 * current_font_size * horizontal_scaling;
-                                    if !is_invisible
-                                        && n_val < -column_gap_threshold
-                                        && !current_text.is_empty()
-                                    {
-                                        pending_space = false;
-                                        sub_items.push((
-                                            std::mem::take(&mut current_text),
-                                            std::mem::take(&mut current_fidelity_text),
-                                            std::mem::take(&mut current_fidelity_glyphs),
-                                            sub_start_width_ts,
-                                            total_width_ts,
-                                        ));
-                                        total_width_ts += displacement;
-                                        sub_start_width_ts = total_width_ts;
-                                    } else {
-                                        total_width_ts += displacement;
-                                        if !is_invisible
-                                            && n_val < -space_threshold
-                                            && !current_text.is_empty()
-                                            && !current_text.ends_with(' ')
-                                        {
-                                            pending_space = true;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                _ => {}
+                                continue;
                             }
                             let element_start_width_ts = total_width_ts;
                             if let Some(fi) = font_info {
@@ -1249,7 +1240,7 @@ fn extract_page_text_items_impl(
                             let axis_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
                             let axis_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
                             let advance_scale = axis_x.hypot(axis_y);
-                            for (text, fidelity_text, fidelity_glyphs, start_w, end_w) in &sub_items
+                            for (text, fidelity_text, fidelity_glyphs, start_w, end_w) in sub_items
                             {
                                 let offset_tm = [
                                     text_matrix[0],
@@ -1268,7 +1259,7 @@ fn extract_page_text_items_impl(
                                     0.0
                                 };
                                 items.push(TextItem {
-                                    text: expand_ligatures(text),
+                                    text: expand_ligatures(&text),
                                     x,
                                     y,
                                     width,
@@ -1286,12 +1277,12 @@ fn extract_page_text_items_impl(
                                         if fidelity_text.is_empty() {
                                             text.clone()
                                         } else {
-                                            fidelity_text.clone()
+                                            fidelity_text
                                         },
                                         text_object_index,
                                         source_line_index,
                                         text_rise,
-                                        fidelity_glyphs.clone(),
+                                        fidelity_glyphs,
                                         combined,
                                         current_font_size,
                                         type3_scales.get(&current_font).copied().unwrap_or(1.0),
@@ -1983,7 +1974,7 @@ fn extract_page_text_items_impl(
     );
 
     let items = if merge_text {
-        super::merge_text_items(items)
+        super::merge_text_items(&items)
     } else {
         items
     };

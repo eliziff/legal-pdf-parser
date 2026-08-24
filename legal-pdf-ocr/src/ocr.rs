@@ -103,13 +103,13 @@ impl OcrProvider {
 
     fn extract_pages_inner(
         &mut self,
-        pdf_path: &Path,
+        pdf: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
         match self {
-            Self::Tesseract(provider) => provider.extract_pages(pdf_path, requests),
+            Self::Tesseract(provider) => provider.extract_pages(pdf, requests),
             #[cfg(feature = "kraken")]
-            Self::Kraken(provider) => provider.extract_pages(pdf_path, requests),
+            Self::Kraken(provider) => provider.extract_pages(pdf, requests),
         }
     }
 }
@@ -135,10 +135,10 @@ impl PreparedOcrProvider {
 impl PdfOcrProvider for OcrProvider {
     fn extract_pages(
         &mut self,
-        pdf_path: &Path,
+        pdf: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
-        self.extract_pages_inner(pdf_path, requests)
+        self.extract_pages_inner(pdf, requests)
     }
 }
 
@@ -252,7 +252,7 @@ impl TesseractOcr {
     #[cfg(feature = "ocr")]
     pub(crate) fn extract_pages(
         &self,
-        pdf_path: &Path,
+        bytes: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
         use hayro::hayro_interpret::InterpreterSettings;
@@ -265,8 +265,7 @@ impl TesseractOcr {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let bytes = fs::read(pdf_path).map_err(|source| Error::io(pdf_path, source))?;
-        let pdf = Pdf::new(bytes).map_err(|error| {
+        let pdf = Pdf::new(bytes.to_vec()).map_err(|error| {
             Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
         })?;
         let cache = RenderCache::new();
@@ -346,7 +345,7 @@ impl TesseractOcr {
     #[cfg(not(feature = "ocr"))]
     pub(crate) fn extract_pages(
         &self,
-        _pdf_path: &Path,
+        _pdf: &[u8],
         _requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
         Err(Error::Message(

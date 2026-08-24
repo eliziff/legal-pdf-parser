@@ -546,16 +546,7 @@ impl ToUnicodeCMap {
     /// Collects all source CIDs, sorts them, and reassigns to 1, 2, 3, ...
     pub fn remap_to_sequential(&self) -> ToUnicodeCMap {
         let mut cid_to_unicode: HashMap<u16, String> = HashMap::new();
-
-        // Expand ranges first
-        for &(start, end, base) in &self.ranges {
-            for cid in start..=end {
-                let unicode_cp = base + (cid - start) as u32;
-                if let Some(ch) = char::from_u32(unicode_cp) {
-                    cid_to_unicode.insert(cid, ch.to_string());
-                }
-            }
-        }
+        expand_bfranges_for_remap(&self.ranges, &mut cid_to_unicode, MAX_CID_W_EXPANSION);
 
         // char_map entries override range entries
         for (&cid, unicode) in &self.char_map {
@@ -578,6 +569,30 @@ impl ToUnicodeCMap {
 
         new_cmap
     }
+}
+
+/// Count overwrites so repeated full-width ranges cannot repeatedly expand.
+fn expand_bfranges_for_remap(
+    ranges: &[(u16, u16, u32)],
+    cid_to_unicode: &mut HashMap<u16, String>,
+    max_assignments: usize,
+) -> usize {
+    let mut assigned = 0usize;
+    'ranges: for &(start, end, base) in ranges {
+        if start > end {
+            continue;
+        }
+        for cid in start..=end {
+            if assigned >= max_assignments {
+                break 'ranges;
+            }
+            assigned += 1;
+            if let Some(ch) = char::from_u32(base + (cid - start) as u32) {
+                cid_to_unicode.insert(cid, ch.to_string());
+            }
+        }
+    }
+    assigned
 }
 
 /// Parse a hex string to u16
@@ -1568,23 +1583,31 @@ fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
     }
 
     let mut map = HashMap::new();
+    let mut assigned = 0usize;
     let mut pos = 0;
     while let Some(start) = text[pos..].find("begincidchar") {
         let section_start = pos + start + "begincidchar".len();
         if let Some(end) = text[section_start..].find("endcidchar") {
             let section = &text[section_start..section_start + end];
-            parse_cidchar_section(section, &mut map, &mut src_hex_lengths);
+            if !parse_cidchar_section(section, &mut map, &mut src_hex_lengths, &mut assigned) {
+                break;
+            }
             pos = section_start + end;
         } else {
             break;
         }
     }
     pos = 0;
-    while let Some(start) = text[pos..].find("begincidrange") {
+    while assigned < MAX_CID_W_EXPANSION {
+        let Some(start) = text[pos..].find("begincidrange") else {
+            break;
+        };
         let section_start = pos + start + "begincidrange".len();
         if let Some(end) = text[section_start..].find("endcidrange") {
             let section = &text[section_start..section_start + end];
-            parse_cidrange_section(section, &mut map, &mut src_hex_lengths);
+            if !parse_cidrange_section(section, &mut map, &mut src_hex_lengths, &mut assigned) {
+                break;
+            }
             pos = section_start + end;
         } else {
             break;
@@ -1619,7 +1642,8 @@ fn parse_cidchar_section(
     section: &str,
     map: &mut HashMap<u16, u16>,
     src_hex_lengths: &mut Vec<usize>,
-) {
+    assigned: &mut usize,
+) -> bool {
     let mut chars = section.chars().peekable();
     loop {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -1650,16 +1674,20 @@ fn parse_cidchar_section(
             }
         }
         if let (Some(code), Ok(cid)) = (parse_hex_u16(&src_hex), cid_str.parse::<u16>()) {
-            map.insert(code, cid);
+            if !assign_encoding_cid(map, code, cid, assigned) {
+                return false;
+            }
         }
     }
+    true
 }
 
 fn parse_cidrange_section(
     section: &str,
     map: &mut HashMap<u16, u16>,
     src_hex_lengths: &mut Vec<usize>,
-) {
+    assigned: &mut usize,
+) -> bool {
     let mut chars = section.chars().peekable();
     loop {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
@@ -1710,12 +1738,32 @@ fn parse_cidrange_section(
         ) else {
             continue;
         };
+        if start > end {
+            continue;
+        }
         let mut cid = start_cid;
         for code in start..=end {
-            map.insert(code, cid);
+            if !assign_encoding_cid(map, code, cid, assigned) {
+                return false;
+            }
             cid = cid.saturating_add(1);
         }
     }
+    true
+}
+
+fn assign_encoding_cid(
+    map: &mut HashMap<u16, u16>,
+    code: u16,
+    cid: u16,
+    assigned: &mut usize,
+) -> bool {
+    if *assigned >= MAX_CID_W_EXPANSION {
+        return false;
+    }
+    map.insert(code, cid);
+    *assigned += 1;
+    true
 }
 
 fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
@@ -1838,6 +1886,10 @@ fn merge_cmaps(mut base: ToUnicodeCMap, overlay: ToUnicodeCMap) -> ToUnicodeCMap
     base.code_byte_length = base.code_byte_length.max(overlay.code_byte_length);
     base
 }
+
+/// Shared cap for expansions over the 16-bit CID domain. Assignments count
+/// overwrites so repeated full-width ranges cannot repeat unbounded work.
+pub(crate) const MAX_CID_W_EXPANSION: usize = 65_536;
 
 pub use pdf_inspector_cid_signal::cid_values_look_like_unicode;
 

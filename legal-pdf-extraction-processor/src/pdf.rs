@@ -3,14 +3,12 @@ use legal_pdf_core::model::{Diagnostic, ImageBlock, Line, Page, Span, TableBlock
 use legal_pdf_core::{profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
 use lopdf::{Document, Object, ObjectId};
 use pdf_inspector_core::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
-use pdf_inspector_detector::detector::{
-    detect_from_page_evidence, get_document_title, PageDetectionEvidence,
-};
+use pdf_inspector_detector::PdfTypeResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::OnceLock;
 
 fn prune_extraction_object(object: &mut Object) {
@@ -206,18 +204,9 @@ fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool 
     fidelity.advance = transform_vector(geometry, fidelity.advance[0], fidelity.advance[1]);
     fidelity.em = transform_vector(geometry, fidelity.em[0], fidelity.em[1]);
     let source_glyph_count = fidelity.glyphs.len();
-    let visible_glyphs = fidelity
-        .glyphs
-        .iter()
-        .map(|glyph| bbox_intersects_page(geometry, glyph.bbox))
-        .collect::<Vec<_>>();
-    for glyph in &mut fidelity.glyphs {
+    fidelity.glyphs.retain_mut(|glyph| {
+        let visible = bbox_intersects_page(geometry, glyph.bbox);
         glyph.bbox = transform_bbox(geometry, glyph.bbox);
-    }
-    let mut index = 0;
-    fidelity.glyphs.retain(|_| {
-        let visible = visible_glyphs[index];
-        index += 1;
         visible
     });
     let clipped_glyph = fidelity.glyphs.len() != source_glyph_count;
@@ -289,6 +278,10 @@ fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool 
     item.width = bbox[2] - bbox[0];
     item.height = bbox[3] - bbox[1];
     item.font_size = fidelity.em[0].hypot(fidelity.em[1]);
+    item.text = std::mem::take(&mut fidelity.text);
+    item.font = std::mem::take(&mut fidelity.font);
+    item.is_italic = fidelity.flags & 2 != 0;
+    item.is_bold = fidelity.flags & 16 != 0;
     true
 }
 
@@ -398,16 +391,6 @@ fn detected_images(items: &[TextItem], geometries: &PageGeometryMap) -> Vec<Imag
             }
         })
         .collect()
-}
-
-fn apply_fidelity(item: &mut TextItem) {
-    let Some(fidelity) = item.fidelity.as_ref() else {
-        return;
-    };
-    item.text.clone_from(&fidelity.text);
-    item.font.clone_from(&fidelity.font);
-    item.is_italic = fidelity.flags & 2 != 0;
-    item.is_bold = fidelity.flags & 16 != 0;
 }
 
 fn same_painted_text(left: &TextItem, right: &TextItem) -> bool {
@@ -630,7 +613,10 @@ fn item_baseline(item: &TextItem) -> f64 {
         })
 }
 
-fn normalize_text(value: &str) -> String {
+fn normalize_text(value: &str) -> Cow<'_, str> {
+    if !value.contains('\u{feff}') && !value.contains('\u{200b}') {
+        return Cow::Borrowed(value);
+    }
     let mut result = String::with_capacity(value.len());
     let mut characters = value
         .chars()
@@ -650,7 +636,7 @@ fn normalize_text(value: &str) -> String {
             result.push(' ');
         }
     }
-    result
+    Cow::Owned(result)
 }
 
 #[derive(Debug)]
@@ -750,9 +736,10 @@ fn assemble_line(text_line: &TextLine) -> AssembledLine {
         }
         previous_content = Some(item_index);
         span_index += 1;
-        let boundary_text = item.text.replace('\u{feff}', "");
-        let leading_boundary = boundary_text.starts_with('\u{200b}');
-        let trailing_boundary = boundary_text.ends_with('\u{200b}');
+        let leading_boundary = item.text.chars().find(|&character| character != '\u{feff}')
+            == Some('\u{200b}');
+        let trailing_boundary = item.text.chars().rev()
+            .find(|&character| character != '\u{feff}') == Some('\u{200b}');
         let span_text = normalize_text(&item.text);
         if span_text.is_empty() {
             previous_trailing_boundary |= trailing_boundary;
@@ -823,19 +810,6 @@ fn median(mut values: Vec<f64>) -> f64 {
         return 0.0;
     }
     values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) / 2.0
-    } else {
-        values[middle]
-    }
-}
-
-fn median_f32(mut values: Vec<f32>) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f32::total_cmp);
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
@@ -957,7 +931,7 @@ fn line_glyphs(
         let start_byte = assembled.byte(source_span.start);
         let end_byte = assembled.byte(source_span.end);
         let target = &assembled.text[start_byte..end_byte];
-        let item_text = normalize_text(&fidelity.text);
+        let item_text = normalize_text(&item.text);
         let Some(target_byte) = item_text.find(target) else {
             continue;
         };
@@ -1254,9 +1228,6 @@ fn group_source_order_lines(items: Vec<TextItem>) -> Vec<TextLine> {
             });
         }
     }
-    for line in &mut lines {
-        line.y = median_f32(line.items.iter().map(|item| item.y).collect());
-    }
     lines
 }
 
@@ -1453,25 +1424,8 @@ pub struct ExtractedPdf {
     pub metadata: Map<String, Value>,
 }
 
-pub struct PdfInspection {
-    pub page_count: u32,
-    pub pdf_type: &'static str,
-    pub confidence: f32,
-    pub pages_needing_ocr: Vec<u32>,
-}
-
-pub fn inspect_pdf(path: &Path) -> Result<PdfInspection> {
-    let inspection = pdf_inspector_detector::detector::detect_pdf_type(path)?;
-    Ok(PdfInspection {
-        page_count: inspection.page_count,
-        pdf_type: pdf_type_name(inspection.pdf_type),
-        confidence: inspection.confidence,
-        pages_needing_ocr: inspection.pages_needing_ocr,
-    })
-}
-
-pub fn load_extraction_document(path: &Path) -> Result<Document> {
-    if let Some(mut document) = Document::load(path)
+pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
+    if let Some(mut document) = Document::load_mem(bytes)
         .ok()
         .filter(|document| !document.is_encrypted())
     {
@@ -1481,17 +1435,9 @@ pub fn load_extraction_document(path: &Path) -> Result<Document> {
             .for_each(prune_extraction_object);
         return Ok(document);
     }
-    pdf_inspector_loader::load_document_from_path(path)
+    pdf_inspector_loader::load_document_from_mem(bytes)
         .map(|value| value.0)
         .map_err(Into::into)
-}
-
-pub fn pdf_page_count(bytes: &[u8]) -> Result<u32> {
-    let count = Document::load_metadata_mem(bytes)?.page_count;
-    if count == 0 {
-        return Err(Error::Message("PDF contains no pages".to_owned()));
-    }
-    Ok(count)
 }
 
 pub fn page_dimensions(document: &Document) -> (Vec<(u32, f64, f64)>, PageGeometryMap) {
@@ -1529,12 +1475,12 @@ pub fn project_table(
 }
 
 pub fn assemble_pdf(
-    path: &Path,
+    pdf: &[u8],
     document: Document,
     geometries: &PageGeometryMap,
     mut items: Vec<TextItem>,
     painted_rules: Vec<PdfLine>,
-    detection_evidence: Vec<PageDetectionEvidence>,
+    detection: PdfTypeResult,
     tables: Vec<TableBlock>,
     ocr: Option<&mut dyn PdfOcrProvider>,
     ocr_pages: Option<&[usize]>,
@@ -1542,7 +1488,6 @@ pub fn assemble_pdf(
     if geometries.is_empty() {
         return Err(Error::Message("PDF has no pages".to_owned()));
     }
-    let title = get_document_title(&document);
     let mut metadata = source_metadata(&document);
     drop(document);
 
@@ -1550,7 +1495,6 @@ pub fn assemble_pdf(
     for item in &mut items {
         if let Some((_, geometry)) = geometries.get(&item.page) {
             transform_item(item, *geometry);
-            apply_fidelity(item);
         }
     }
     items.retain(has_extraction_evidence);
@@ -1619,13 +1563,6 @@ pub fn assemble_pdf(
             .collect::<Vec<_>>()
     });
 
-    let detection = legal_pdf_core::profile::measure("extract.classify_pdf", || {
-        detect_from_page_evidence(
-            &detection_evidence,
-            title,
-            &pdf_inspector_detector::DetectionConfig::default(),
-        )
-    });
     for page in &detection.pages_needing_ocr {
         if let Ok(index) = usize::try_from(page.saturating_sub(1)) {
             weak_pages.insert(index);
@@ -1653,7 +1590,7 @@ pub fn assemble_pdf(
             })
             .collect();
         let results = legal_pdf_core::profile::measure("extract.ocr", || {
-            provider.extract_pages(path, &requests)
+            provider.extract_pages(pdf, &requests)
         })?;
         for result in results {
             let Some(page) = pages.get_mut(result.page_index) else {
@@ -1976,7 +1913,6 @@ mod tests {
         };
 
         assert!(transform_fidelity_item(&mut item, geometry));
-        apply_fidelity(&mut item);
 
         assert_eq!(item.text, "o");
         assert_eq!((item.x, item.width), (4.0, 10.0));

@@ -64,6 +64,9 @@ sha2 = { version = "0.10", optional = true }
 [dev-dependencies]
 lopdf = { version = "0.42.0", default-features = false }
 
+[patch.crates-io]
+hayro-jpeg2000 = { git = "https://github.com/LaurenzV/hayro.git", rev = "ff7e2e407f6b9c429b44dc29a851180727892b6c" }
+
 [profile.dev]
 debug = 0
 incremental = true

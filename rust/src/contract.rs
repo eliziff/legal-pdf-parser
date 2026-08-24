@@ -26,14 +26,6 @@ impl PdfDocumentResult {
     }
 }
 
-fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::Message(format!("document request has no {key}")))
-}
-
 fn provider_spec(value: &Value, key: &str) -> Result<Option<(String, Value)>> {
     let Some(spec) = value.get(key) else {
         return Ok(None);
@@ -106,8 +98,8 @@ fn selected_pages(value: &Value) -> Result<Option<Vec<usize>>> {
 }
 
 fn parse_options(value: &Value) -> Result<ParseOptions> {
-    let verified_source_sha256 = value
-        .get("verified_source_sha256")
+    let expected_source_sha256 = value
+        .get("expected_source_sha256")
         .map(|value| {
             value
                 .as_str()
@@ -120,10 +112,26 @@ fn parse_options(value: &Value) -> Result<ParseOptions> {
                 .map(str::to_owned)
                 .ok_or_else(|| {
                     Error::Message(
-                        "document request verified_source_sha256 must be lowercase SHA-256"
+                        "document request expected_source_sha256 must be lowercase SHA-256"
                             .to_owned(),
                     )
                 })
+        })
+        .transpose()?;
+    let source_name = value
+        .get("source_name")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 260
+                        && !name.contains('/')
+                        && !name.contains('\\')
+                        && !name.chars().any(char::is_control)
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Message("document request source_name is invalid".to_owned()))
         })
         .transpose()?;
     let mut options = ParseOptions {
@@ -133,7 +141,8 @@ fn parse_options(value: &Value) -> Result<ParseOptions> {
             .map(PathBuf::from),
         ocr_pages: selected_pages(value)?,
         use_cache: true,
-        verified_source_sha256,
+        expected_source_sha256,
+        source_name,
         ..ParseOptions::default()
     };
 
@@ -265,11 +274,32 @@ fn validate_selected_pages(selected: Option<&[usize]>, count: usize) -> Result<(
 }
 
 pub fn derive_pdf_document(
+    bytes: &[u8],
     value: &Value,
     include_pairing_audit: bool,
 ) -> Result<PdfDocumentResult> {
     let options = parse_options(value)?;
-    let mut document = parse_pdf(string(value, "source_pdf")?, &options)?;
+    let document = parse_pdf(Some(bytes), &options)?
+        .ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
+    finish_pdf_document(document, value, include_pairing_audit, &options)
+}
+
+pub fn restore_pdf_document(
+    value: &Value,
+    include_pairing_audit: bool,
+) -> Result<Option<PdfDocumentResult>> {
+    let options = parse_options(value)?;
+    parse_pdf(None, &options)?
+        .map(|document| finish_pdf_document(document, value, include_pairing_audit, &options))
+        .transpose()
+}
+
+fn finish_pdf_document(
+    mut document: legal_pdf_core::model::LegalDocument,
+    value: &Value,
+    include_pairing_audit: bool,
+    options: &ParseOptions,
+) -> Result<PdfDocumentResult> {
     validate_selected_pages(options.ocr_pages.as_deref(), document.page_count)?;
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         document.structure_graph.document_id = id.to_owned();
