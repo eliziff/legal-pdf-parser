@@ -374,13 +374,30 @@ fn extract_page_text_items_impl(
     // resources are qualified while their operations are inlined, so every
     // text-show operation below travels through this one interpreter.
     let page_fonts = doc.get_page_fonts(page_id).unwrap_or_default();
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
-    let content_data = strip_pdf_comments(&content_data);
+    let mut raw_content = Vec::new();
+    let mut stream_ranges = Vec::new();
+    for content_id in doc.get_page_contents(page_id) {
+        let Ok(Object::Stream(stream)) = doc.get_object(content_id) else {
+            continue;
+        };
+        let content = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
+        let start = raw_content.len();
+        raw_content.extend_from_slice(&content);
+        stream_ranges.push(start..raw_content.len());
+        raw_content.push(b'\n');
+    }
     let detection = fidelity
-        .then(|| analyze_page_content_streams(doc, page_id, [content_data.as_slice()]))
+        .then(|| {
+            analyze_page_content_streams(
+                doc,
+                page_id,
+                stream_ranges.iter().map(|range| &raw_content[range.clone()]),
+            )
+        })
         .unwrap_or_default();
+    let content_data = strip_pdf_comments(&raw_content);
     let content = match super::content_decode::decode_content_bounded(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
