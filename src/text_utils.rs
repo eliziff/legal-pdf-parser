@@ -124,7 +124,7 @@ pub(crate) fn is_arabic_presentation_form(c: char) -> bool {
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
 }
 
-pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
+pub fn is_rtl_text<I, S>(texts: I) -> bool
 where
     I: Iterator<Item = S>,
     S: AsRef<str>,
