@@ -103,6 +103,21 @@ def create_kill_job(kernel32: ctypes.WinDLL, process_handle: int) -> int:
     return int(job)
 
 
+def job_peak_memory(kernel32: ctypes.WinDLL, job: int) -> tuple[int, int]:
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    limits = ExtendedLimitInformation()
+    if not kernel32.QueryInformationJobObject(
+        job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(limits), ctypes.sizeof(limits), None,
+    ):
+        raise OSError(ctypes.get_last_error(), "failed to query process job")
+    return int(limits.peak_process_memory), int(limits.peak_job_memory)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", required=True, type=Path)
@@ -144,15 +159,19 @@ def main() -> int:
     observed_priority = kernel32.GetPriorityClass(int(process._handle))  # type: ignore[attr-defined]
     timed_out = False
     tree_kill_exit: int | None = None
+    peak_process_memory = 0
+    peak_job_memory = 0
     try:
         stdout, stderr = process.communicate(timeout=args.timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+        peak_process_memory, peak_job_memory = job_peak_memory(kernel32, job)
         tree_kill_exit = 0 if kernel32.CloseHandle(job) else ctypes.get_last_error()
         job = 0
         stdout, stderr = process.communicate(timeout=5)
     finally:
         if job:
+            peak_process_memory, peak_job_memory = job_peak_memory(kernel32, job)
             kernel32.CloseHandle(job)
     elapsed = time.perf_counter() - started
     command_bytes = json.dumps(command, ensure_ascii=False, separators=(",", ":")).encode()
@@ -177,6 +196,8 @@ def main() -> int:
         "stdout_sha256": sha256_bytes(stdout),
         "stderr_bytes": len(stderr),
         "stderr_sha256": sha256_bytes(stderr),
+        "peak_process_memory_bytes": peak_process_memory,
+        "peak_job_memory_bytes": peak_job_memory,
     }
     write_receipt(args.receipt.resolve(), receipt)
     sys.stdout.buffer.write(stdout)

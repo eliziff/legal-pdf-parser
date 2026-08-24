@@ -14,12 +14,20 @@ reading order, and pinpoint locators. It runs locally and caches completed work.
 | Turbo | 2.50 pages/s | **6.59 pages/s** | 3.14% |
 | Native Tesseract 5.4 | **2.76 pages/s** | — | 3.83% |
 
-These are end-to-end results on the a sample of 153 scanned legal pages.
+These are end-to-end results on a sample of 153 scanned legal pages.
 The full reproducible receipt is in
 [`experiments/kraken-lite/cpu-benchmark/RESULTS.md`](experiments/kraken-lite/cpu-benchmark/RESULTS.md).
 
-Digital-born PDFs avoid OCR. The native path processed a separate 156-page
-legal PDF at **70.8 pages/second**.
+Digital-born PDFs avoid OCR:
+
+| Native benchmark | Documents | Pages | Throughput | Peak memory |
+| --- | ---: | ---: | ---: | ---: |
+| Legal PDFs, fresh cache | 8 | 425 | **134.0 pages/s** | **49.3 MiB** |
+
+This measures process launch, extraction, structure, page queries, and JSON
+serialization. Three isolated runs per document produced identical output.
+The fixed corpus and runner live in
+[`experiments/digitalborn-benchmark`](experiments/digitalborn-benchmark).
 
 ## Capabilities
 
@@ -34,21 +42,20 @@ legal PDF at **70.8 pages/second**.
 ## Use
 
 ```powershell
-cargo build --release --locked --manifest-path ../native/legal-structure-node/Cargo.toml
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
 legalpdf --version
 ```
 
-The Node binding exposes the provider-neutral structure detector and SourceDoc
-projection through one document operation.
+Provider-neutral detection and document queries live in the standalone
+[`legal-structure`](https://github.com/eliziff/legal-structure) crate.
 The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
 `ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
 separate runtime/model pack are required. The root package has no default
 features, so every shipped artifact declares its capabilities explicitly.
 
-The Node binding derives the canonical PDF structure, source map, optional
-SourceDoc, and pairing audit in one operation while retaining the native PDF
-artifacts for exact lookups.
+The Node binding returns one opaque native document that owns the canonical
+structure and only the extra PDF evidence required for exact lookups, without
+serializing an intermediary.
 
 ## Credits
 

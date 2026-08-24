@@ -5,11 +5,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
+
+const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn stable_hash(value: &Value) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
@@ -127,70 +127,28 @@ pub(crate) fn invoke(
     for image in image_paths {
         command.arg("--image").arg(image);
     }
-    command
-        .arg("-")
-        .current_dir(work_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|source| Error::io(&executable, source))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Message("codex stdout was not captured".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Message("codex stderr was not captured".to_owned()))?;
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut reader = BufReader::new(stdout);
-        reader.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut reader = BufReader::new(stderr);
-        reader.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .map_err(|source| Error::io(&executable, source))?;
+    command.arg("-").current_dir(work_dir);
+    let output = crate::process::run(
+        command,
+        prompt.as_bytes().to_vec(),
+        Duration::from_secs(timeout_seconds),
+        MAX_EVENT_BYTES,
+        8_192,
+    )
+    .map_err(|error| match error {
+        crate::process::RunError::Io(source) => Error::io(&executable, source),
+        crate::process::RunError::Timeout => Error::Message(format!(
+            "codex exec timed out after {timeout_seconds} seconds"
+        )),
+    })?;
+    if output.stdout_exceeded {
+        return Err(Error::Message(
+            "codex exec event output exceeded 16 MiB".to_owned(),
+        ));
     }
-    let timeout = Duration::from_secs(timeout_seconds);
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| Error::io(&executable, source))?
-        {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(Error::Message(format!(
-                "codex exec timed out after {timeout_seconds} seconds"
-            )));
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let elapsed = started.elapsed().as_secs_f64();
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| Error::Message("codex stdout reader failed".to_owned()))?
-        .map_err(|source| Error::io(&executable, source))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| Error::Message("codex stderr reader failed".to_owned()))?
-        .map_err(|source| Error::io(&executable, source))?;
-    let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if !status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
         let message = if stderr.trim().is_empty() {
             stdout.trim()
         } else {
@@ -206,7 +164,7 @@ pub(crate) fn invoke(
             .collect::<String>();
         return Err(Error::Message(format!(
             "codex exec exited with {}: {tail}",
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         )));
     }
     if !output_path.is_file() {
@@ -214,8 +172,21 @@ pub(crate) fn invoke(
             "codex exec did not write its final response".to_owned(),
         ));
     }
+    if fs::metadata(&output_path)
+        .map_err(|source| Error::io(&output_path, source))?
+        .len()
+        > MAX_EVENT_BYTES as u64
+    {
+        return Err(Error::Message(
+            "codex exec response exceeded 16 MiB".to_owned(),
+        ));
+    }
     let bytes = fs::read(&output_path).map_err(|source| Error::io(&output_path, source))?;
     let response = serde_json::from_slice(&bytes)
         .map_err(|error| Error::Message(format!("codex response is not valid JSON: {error}")))?;
-    Ok((response, usage_from_events(&stdout), elapsed))
+    Ok((
+        response,
+        usage_from_events(&stdout),
+        output.elapsed.as_secs_f64(),
+    ))
 }

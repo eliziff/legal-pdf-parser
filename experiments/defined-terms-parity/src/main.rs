@@ -1,4 +1,4 @@
-use legal_structure::{derive_definitions, DefinitionParagraph};
+use legal_structure::{derive_definitions, DefinitionOccurrence};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write};
 struct Input {
     id: String,
     text: String,
-    paragraphs: Vec<DefinitionParagraph>,
+    paragraphs: Vec<DefinitionOccurrence>,
 }
 
 #[derive(Serialize)]

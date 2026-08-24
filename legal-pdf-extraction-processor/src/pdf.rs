@@ -1,27 +1,27 @@
 use crate::{Error, Result};
-use legal_pdf_core::model::{Diagnostic, ImageBlock, Line, Page, Span, TableBlock, Word};
+use legal_pdf_core::model::{Diagnostic, Line, Page, PdfExtractionMetadata, Span, Word};
 use legal_pdf_core::{profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
 use lopdf::{Document, Object, ObjectId};
 use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
-use pdf_inspector::{PdfType, PdfTypeResult};
+use pdf_inspector::PdfTypeResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 fn prune_extraction_object(object: &mut Object) {
     if let Object::Array(values) = object {
-        let nulls = values
-            .iter()
-            .filter(|value| matches!(value, Object::Null))
-            .count();
-        if values.len() >= 4096
-            && nulls * 20 >= values.len() * 19
-            && values
-                .iter()
-                .all(|value| matches!(value, Object::Null | Object::Reference(_)))
+        let nulls = (values.len() >= 4096).then(|| {
+            values.iter().try_fold(0, |nulls, value| match value {
+                Object::Null => Some(nulls + 1),
+                Object::Reference(_) => Some(nulls),
+                _ => None,
+            })
+        });
+        if nulls
+            .flatten()
+            .is_some_and(|nulls| nulls * 20 >= values.len() * 19)
         {
             *object = Object::Null;
         }
@@ -49,11 +49,11 @@ fn number(value: &Object) -> Option<f64> {
     }
 }
 
-fn inherited_object(doc: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
+fn inherited_object<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a Object> {
     for _ in 0..32 {
         let dictionary = doc.get_dictionary(id).ok()?;
         if let Ok(value) = dictionary.get(key) {
-            return Some(value.clone());
+            return Some(value);
         }
         match dictionary.get(b"Parent") {
             Ok(Object::Reference(parent)) => id = *parent,
@@ -63,11 +63,11 @@ fn inherited_object(doc: &Document, mut id: ObjectId, key: &[u8]) -> Option<Obje
     None
 }
 
-fn resolve_array(doc: &Document, value: Object) -> Option<Vec<Object>> {
+fn resolve_array<'a>(doc: &'a Document, value: &'a Object) -> Option<&'a [Object]> {
     match value {
         Object::Array(values) => Some(values),
-        Object::Reference(id) => match doc.get_object(id).ok()? {
-            Object::Array(values) => Some(values.clone()),
+        Object::Reference(id) => match doc.get_object(*id).ok()? {
+            Object::Array(values) => Some(values),
             _ => None,
         },
         _ => None,
@@ -79,19 +79,17 @@ fn page_geometry(doc: &Document, id: ObjectId) -> PageGeometry {
         .or_else(|| inherited_object(doc, id, b"MediaBox"))
         .and_then(|value| resolve_array(doc, value))
         .and_then(|values| {
-            let numbers: Vec<f64> = values.iter().filter_map(number).collect();
-            (numbers.len() >= 4).then(|| {
-                [
-                    numbers[0].min(numbers[2]),
-                    numbers[1].min(numbers[3]),
-                    numbers[0].max(numbers[2]),
-                    numbers[1].max(numbers[3]),
-                ]
-            })
+            let mut numbers = values.iter().filter_map(number);
+            let (x0, y0, x1, y1) = (
+                numbers.next()?,
+                numbers.next()?,
+                numbers.next()?,
+                numbers.next()?,
+            );
+            Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
         })
         .unwrap_or([0.0, 0.0, 612.0, 792.0]);
     let rotation = inherited_object(doc, id, b"Rotate")
-        .as_ref()
         .and_then(number)
         .map_or(0, |value| value.round() as i32)
         .rem_euclid(360);
@@ -133,62 +131,27 @@ fn transform_vector(geometry: PageGeometry, x: f32, y: f32) -> [f32; 2] {
     }
 }
 
-fn transform_bbox(geometry: PageGeometry, bbox: [f32; 4]) -> [f32; 4] {
+fn transform_bbox(geometry: PageGeometry, bbox: [f32; 4]) -> ([f32; 4], bool) {
     let points = [
         transform_point(geometry, f64::from(bbox[0]), f64::from(bbox[1])),
         transform_point(geometry, f64::from(bbox[0]), f64::from(bbox[3])),
         transform_point(geometry, f64::from(bbox[2]), f64::from(bbox[1])),
         transform_point(geometry, f64::from(bbox[2]), f64::from(bbox[3])),
     ];
-    let x0 = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::INFINITY, f64::min)
-        .clamp(0.0, geometry.width);
-    let y0 = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::INFINITY, f64::min)
-        .clamp(0.0, geometry.height);
-    let x1 = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::NEG_INFINITY, f64::max)
-        .min(geometry.width)
-        .max(x0);
-    let y1 = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::NEG_INFINITY, f64::max)
-        .min(geometry.height)
-        .max(y0);
-    [x0 as f32, y0 as f32, x1 as f32, y1 as f32]
-}
-
-fn bbox_intersects_page(geometry: PageGeometry, bbox: [f32; 4]) -> bool {
-    let points = [
-        transform_point(geometry, f64::from(bbox[0]), f64::from(bbox[1])),
-        transform_point(geometry, f64::from(bbox[2]), f64::from(bbox[1])),
-        transform_point(geometry, f64::from(bbox[0]), f64::from(bbox[3])),
-        transform_point(geometry, f64::from(bbox[2]), f64::from(bbox[3])),
-    ];
-    let x0 = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::INFINITY, f64::min);
-    let y0 = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::INFINITY, f64::min);
-    let x1 = points
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let y1 = points
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::NEG_INFINITY, f64::max);
-    x1 >= 0.0 && x0 <= geometry.width && y1 >= 0.0 && y0 <= geometry.height
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in points {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let visible = x1 >= 0.0 && x0 <= geometry.width && y1 >= 0.0 && y0 <= geometry.height;
+    let x0 = x0.clamp(0.0, geometry.width);
+    let y0 = y0.clamp(0.0, geometry.height);
+    let x1 = x1.min(geometry.width).max(x0);
+    let y1 = y1.min(geometry.height).max(y0);
+    ([x0 as f32, y0 as f32, x1 as f32, y1 as f32], visible)
 }
 
 fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool {
@@ -205,8 +168,8 @@ fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool 
     fidelity.em = transform_vector(geometry, fidelity.em[0], fidelity.em[1]);
     let source_glyph_count = fidelity.glyphs.len();
     fidelity.glyphs.retain_mut(|glyph| {
-        let visible = bbox_intersects_page(geometry, glyph.bbox);
-        glyph.bbox = transform_bbox(geometry, glyph.bbox);
+        let (bbox, visible) = transform_bbox(geometry, glyph.bbox);
+        glyph.bbox = bbox;
         visible
     });
     let clipped_glyph = fidelity.glyphs.len() != source_glyph_count;
@@ -235,28 +198,18 @@ fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool 
             fidelity.baseline[1] + fidelity.advance[1] + fidelity.ascender * fidelity.em[1],
         ],
     ];
-    let x0 = points
-        .iter()
-        .map(|point| point[0])
-        .fold(f32::INFINITY, f32::min)
-        .clamp(0.0, geometry.width as f32);
-    let y0 = points
-        .iter()
-        .map(|point| point[1])
-        .fold(f32::INFINITY, f32::min)
-        .clamp(0.0, geometry.height as f32);
-    let x1 = points
-        .iter()
-        .map(|point| point[0])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .min(geometry.width as f32)
-        .max(x0);
-    let y1 = points
-        .iter()
-        .map(|point| point[1])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .min(geometry.height as f32)
-        .max(y0);
+    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for [x, y] in points {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let x0 = x0.clamp(0.0, geometry.width as f32);
+    let y0 = y0.clamp(0.0, geometry.height as f32);
+    let x1 = x1.min(geometry.width as f32).max(x0);
+    let y1 = y1.min(geometry.height as f32).max(y0);
     let visible_glyph_bbox = clipped_glyph.then(|| {
         let mut boxes = fidelity.glyphs.iter().filter(|glyph| {
             !glyph.text.chars().all(char::is_whitespace)
@@ -299,22 +252,14 @@ fn transform_item(item: &mut TextItem, geometry: PageGeometry) {
             f64::from(item.y + item.height),
         ),
     ];
-    let x0 = corners
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::INFINITY, f64::min);
-    let y0 = corners
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::INFINITY, f64::min);
-    let x1 = corners
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let y1 = corners
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
     item.x = x0.max(0.0) as f32;
     item.y = y0.max(0.0) as f32;
     item.width = (x1.min(geometry.width) - f64::from(item.x)).max(0.0) as f32;
@@ -336,61 +281,6 @@ fn item_bbox(item: &TextItem, page_height: f64) -> [f64; 4] {
         round3(x + width),
         round3(page_height - y),
     ]
-}
-
-fn source_bbox(geometry: PageGeometry, bbox: [f32; 4]) -> [f64; 4] {
-    let [x0, y0, x1, y1] = transform_bbox(geometry, bbox);
-    [
-        round3(f64::from(x0)),
-        round3(geometry.height - f64::from(y1)),
-        round3(f64::from(x1)),
-        round3(geometry.height - f64::from(y0)),
-    ]
-}
-
-fn detected_images(items: &[TextItem], geometries: &PageGeometryMap) -> Vec<ImageBlock> {
-    let mut page_counts = HashMap::<u32, usize>::new();
-    items
-        .iter()
-        .filter(|item| matches!(item.item_type, ItemType::Image))
-        .filter_map(|item| Some((item, &geometries.get(&item.page)?.1)))
-        .map(|(item, geometry)| {
-            let index = page_counts.entry(item.page).or_default();
-            *index += 1;
-            let mut bbox = item_bbox(item, geometry.height);
-            bbox[0] = bbox[0].clamp(0.0, geometry.width);
-            bbox[1] = bbox[1].clamp(0.0, geometry.height);
-            bbox[2] = bbox[2].clamp(bbox[0], geometry.width);
-            bbox[3] = bbox[3].clamp(bbox[1], geometry.height);
-            let area_ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                / (geometry.width * geometry.height).max(1.0))
-            .clamp(0.0, 1.0);
-            let (route, route_reason) = if area_ratio >= 0.75 {
-                ("ocr", "page_dominant_raster")
-            } else if area_ratio < 0.01 {
-                ("ignore", "tiny_raster")
-            } else if bbox[3] <= geometry.height * 0.12 || bbox[1] >= geometry.height * 0.88 {
-                ("ignore", "page_edge_decoration")
-            } else {
-                ("vision", "meaningful_embedded_raster")
-            };
-            ImageBlock {
-                id: format!("p{:04}-image-{index:03}", item.page),
-                page_index: usize::try_from(item.page.saturating_sub(1)).unwrap_or(usize::MAX),
-                page_number: item.page,
-                bbox,
-                source_name: item
-                    .text
-                    .strip_prefix("[Image: ")
-                    .and_then(|value| value.strip_suffix(']'))
-                    .unwrap_or(&item.text)
-                    .to_owned(),
-                area_ratio: round3(area_ratio),
-                route: route.to_owned(),
-                route_reason: route_reason.to_owned(),
-            }
-        })
-        .collect()
 }
 
 fn same_painted_text(left: &TextItem, right: &TextItem) -> bool {
@@ -464,30 +354,18 @@ fn painted_glyph_exists_in(previous: &TextItem, current: &TextItem, glyph: &Fide
 }
 
 fn deduplicate_painted_text(items: &mut Vec<TextItem>) {
-    let mut unique = Vec::with_capacity(items.len());
-    for item in items.drain(..) {
-        let duplicate = unique.last().is_some_and(|previous| {
-            same_painted_text(previous, &item)
-                || item.fidelity.as_ref().is_some_and(|fidelity| {
-                    let mut visible = fidelity
-                        .glyphs
-                        .iter()
-                        .filter(|glyph| !glyph.text.chars().all(char::is_whitespace));
-                    let first = visible.next();
-                    first.is_some_and(|glyph| painted_glyph_exists_in(previous, &item, glyph))
-                        && visible.all(|glyph| painted_glyph_exists_in(previous, &item, glyph))
-                })
-        });
-        if duplicate {
-            continue;
-        }
-        unique.push(item);
-    }
-    *items = unique;
-}
-
-fn has_extraction_evidence(item: &TextItem) -> bool {
-    !matches!(&item.item_type, ItemType::Text) || !item.text.is_empty()
+    items.dedup_by(|current, previous| {
+        same_painted_text(previous, current)
+            || current.fidelity.as_ref().is_some_and(|fidelity| {
+                let mut visible = fidelity
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| !glyph.text.chars().all(char::is_whitespace));
+                let first = visible.next();
+                first.is_some_and(|glyph| painted_glyph_exists_in(previous, current, glyph))
+                    && visible.all(|glyph| painted_glyph_exists_in(previous, current, glyph))
+            })
+    });
 }
 
 fn assign_renderer_layout(items: &mut [TextItem]) {
@@ -644,25 +522,16 @@ struct AssembledSpan {
     item_index: usize,
     bbox_start_item: usize,
     bbox_end_item: usize,
-    span_index: usize,
     start: usize,
     end: usize,
+    byte_start: usize,
+    byte_end: usize,
 }
 
 #[derive(Debug)]
 struct AssembledLine {
     text: String,
     spans: Vec<AssembledSpan>,
-    scalar_bytes: Vec<usize>,
-}
-
-impl AssembledLine {
-    fn byte(&self, scalar: usize) -> usize {
-        self.scalar_bytes
-            .get(scalar)
-            .copied()
-            .unwrap_or(self.text.len())
-    }
 }
 
 fn same_renderer_span(left: &TextItem, right: &TextItem) -> bool {
@@ -697,49 +566,52 @@ fn assemble_line(text_line: &TextLine) -> AssembledLine {
     let mut raw_text = String::new();
     let mut spans = Vec::<AssembledSpan>::new();
     let mut offset = 0;
-    let mut span_index = 0;
     let mut previous_x1 = None;
     let mut previous_trailing_boundary = false;
-    let mut pending_leading_whitespace = None::<(usize, usize)>;
-    let mut next_content = vec![None; text_line.items.len()];
-    let mut next = None;
-    for (index, item) in text_line.items.iter().enumerate().rev() {
-        next_content[index] = next;
-        if !item.text.trim().is_empty() {
-            next = Some(index);
-        }
-    }
+    let mut pending_leading_whitespace = None::<(usize, usize, usize)>;
+    let mut next_content = text_line
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !item.text.trim().is_empty())
+        .peekable();
     let mut previous_content = None;
 
     for (item_index, item) in text_line.items.iter().enumerate() {
         if item.text.trim().is_empty() {
             let previous = previous_content.map(|index| &text_line.items[index]);
-            let next = next_content[item_index].map(|index| &text_line.items[index]);
+            let next = next_content.peek().map(|(_, item)| *item);
             let extends_previous =
                 previous.is_some_and(|candidate| same_renderer_span(candidate, item));
             if extends_previous || next.is_some_and(|candidate| same_renderer_span(candidate, item))
             {
                 let start = offset;
+                let byte_start = raw_text.len();
                 let whitespace = normalize_text(&item.text);
                 raw_text.push_str(&whitespace);
                 offset += whitespace.chars().count();
                 if extends_previous {
                     if let Some(previous) = spans.last_mut() {
                         previous.end = offset;
+                        previous.byte_end = raw_text.len();
                         previous.bbox_end_item = item_index;
                     }
                 } else {
-                    pending_leading_whitespace.get_or_insert((start, item_index));
+                    pending_leading_whitespace.get_or_insert((start, byte_start, item_index));
                 }
             }
             continue;
         }
+        let _ = next_content.next();
         previous_content = Some(item_index);
-        span_index += 1;
-        let leading_boundary = item.text.chars().find(|&character| character != '\u{feff}')
+        let leading_boundary =
+            item.text.chars().find(|&character| character != '\u{feff}') == Some('\u{200b}');
+        let trailing_boundary = item
+            .text
+            .chars()
+            .rev()
+            .find(|&character| character != '\u{feff}')
             == Some('\u{200b}');
-        let trailing_boundary = item.text.chars().rev()
-            .find(|&character| character != '\u{feff}') == Some('\u{200b}');
         let span_text = normalize_text(&item.text);
         if span_text.is_empty() {
             previous_trailing_boundary |= trailing_boundary;
@@ -763,27 +635,29 @@ fn assemble_line(text_line: &TextLine) -> AssembledLine {
 
         previous_x1 = Some(x1);
         previous_trailing_boundary = trailing_boundary;
-        let (start, bbox_start_item) = pending_leading_whitespace
-            .take()
-            .unwrap_or((offset, item_index));
+        let (start, byte_start, bbox_start_item) =
+            pending_leading_whitespace
+                .take()
+                .unwrap_or((offset, raw_text.len(), item_index));
         raw_text.push_str(&span_text);
         offset += span_text.chars().count();
         spans.push(AssembledSpan {
             item_index,
             bbox_start_item,
             bbox_end_item: item_index,
-            span_index,
             start,
             end: offset,
+            byte_start,
+            byte_end: raw_text.len(),
         });
     }
 
-    let leading = raw_text
-        .chars()
-        .take_while(|character| character.is_whitespace())
-        .count();
-    let text = raw_text.trim().to_owned();
-    let text_len = text.chars().count();
+    let leading_bytes = raw_text.len() - raw_text.trim_start().len();
+    let leading = raw_text[..leading_bytes].chars().count();
+    let trimmed_end = raw_text.trim_end().len().max(leading_bytes);
+    raw_text.truncate(trimmed_end);
+    raw_text.replace_range(..leading_bytes, "");
+    let text_len = raw_text.chars().count();
     for span in &mut spans {
         span.start = span.start.saturating_sub(leading).min(text_len);
         span.end = span
@@ -791,17 +665,20 @@ fn assemble_line(text_line: &TextLine) -> AssembledLine {
             .saturating_sub(leading)
             .max(span.start)
             .min(text_len);
+        span.byte_start = span
+            .byte_start
+            .saturating_sub(leading_bytes)
+            .min(raw_text.len());
+        span.byte_end = span
+            .byte_end
+            .saturating_sub(leading_bytes)
+            .max(span.byte_start)
+            .min(raw_text.len());
     }
     spans.retain(|span| span.start < span.end);
-    let scalar_bytes = text
-        .char_indices()
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(text.len()))
-        .collect();
     AssembledLine {
-        text,
+        text: raw_text,
         spans,
-        scalar_bytes,
     }
 }
 
@@ -809,12 +686,18 @@ fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
+    let (_, right, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+    let right = *right;
     if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) / 2.0
+        let left = values[..middle]
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap();
+        (left + right) / 2.0
     } else {
-        values[middle]
+        right
     }
 }
 
@@ -857,21 +740,40 @@ fn line_spans(
             .map(item_baseline)
             .collect(),
     );
-    let mut spans = Vec::<(Span, usize)>::new();
+    let mut spans = Vec::<Span>::new();
+    let mut previous_item_index = None::<usize>;
+    let mut previous_byte_end = 0;
     for source_span in &assembled.spans {
         let item = &text_line.items[source_span.item_index];
-        let start_byte = assembled.byte(source_span.start);
-        let end_byte = assembled.byte(source_span.end);
-        let span_text = assembled.text[start_byte..end_byte].to_owned();
+        let start_byte = source_span.byte_start;
+        let end_byte = source_span.byte_end;
+        let bbox = union_bbox(
+            text_line.items[source_span.bbox_start_item..=source_span.bbox_end_item]
+                .iter()
+                .map(|item| item_bbox(item, page_height)),
+        );
+        if let (Some(previous), Some(prior_item_index)) = (spans.last_mut(), previous_item_index) {
+            let gap_start = previous_byte_end;
+            let gap_end = start_byte;
+            if same_renderer_span(&text_line.items[prior_item_index], item)
+                && same_source_text_object(&text_line.items[prior_item_index], item)
+                && assembled.text[gap_start..gap_end]
+                    .chars()
+                    .all(char::is_whitespace)
+            {
+                previous.text.push_str(&assembled.text[gap_start..end_byte]);
+                previous.end = source_span.end;
+                previous.bbox = union_bbox([previous.bbox, bbox]);
+                previous_item_index = Some(source_span.item_index);
+                previous_byte_end = end_byte;
+                continue;
+            }
+        }
         let superscript = is_superscript(item, body_size, baseline, source_span.start > 0);
         let span = Span {
-            id: format!("{id}-s{:03}", source_span.span_index),
-            text: span_text,
-            bbox: union_bbox(
-                text_line.items[source_span.bbox_start_item..=source_span.bbox_end_item]
-                    .iter()
-                    .map(|item| item_bbox(item, page_height)),
-            ),
+            id: format!("{id}-s{:03}", spans.len() + 1),
+            text: assembled.text[start_byte..end_byte].to_owned(),
+            bbox,
             font: item.font.clone(),
             size: round3(f64::from(item.font_size)),
             flags: item.fidelity.as_ref().map_or_else(
@@ -882,32 +784,11 @@ fn line_spans(
             start: source_span.start,
             end: source_span.end,
         };
-        if let Some((previous, previous_item_index)) = spans.last_mut() {
-            let gap_start = assembled.byte(previous.end);
-            let gap_end = assembled.byte(span.start);
-            if same_renderer_span(&text_line.items[*previous_item_index], item)
-                && same_source_text_object(&text_line.items[*previous_item_index], item)
-                && assembled.text[gap_start..gap_end]
-                    .chars()
-                    .all(char::is_whitespace)
-            {
-                previous.end = span.end;
-                previous.text = assembled.text[assembled.byte(previous.start)..end_byte].to_owned();
-                previous.bbox = union_bbox([previous.bbox, span.bbox]);
-                *previous_item_index = source_span.item_index;
-                continue;
-            }
-        }
-        spans.push((span, source_span.item_index));
+        spans.push(span);
+        previous_item_index = Some(source_span.item_index);
+        previous_byte_end = end_byte;
     }
     spans
-        .into_iter()
-        .enumerate()
-        .map(|(index, (mut span, _))| {
-            span.id = format!("{id}-s{:03}", index + 1);
-            span
-        })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -928,8 +809,8 @@ fn line_glyphs(
         let Some(fidelity) = item.fidelity.as_ref() else {
             continue;
         };
-        let start_byte = assembled.byte(source_span.start);
-        let end_byte = assembled.byte(source_span.end);
+        let start_byte = source_span.byte_start;
+        let end_byte = source_span.byte_end;
         let target = &assembled.text[start_byte..end_byte];
         let item_text = normalize_text(&item.text);
         let Some(target_byte) = item_text.find(target) else {
@@ -981,8 +862,12 @@ fn line_words(
     if glyphs.is_empty() {
         return Vec::new();
     }
+    debug_assert!(glyphs
+        .windows(2)
+        .all(|pair| pair[0].start <= pair[1].start && pair[0].end <= pair[1].end));
     let mut words = Vec::new();
     let mut start = None;
+    let mut glyph_index = 0;
     for (char_offset, (byte, character)) in text
         .char_indices()
         .chain(std::iter::once((text.len(), ' ')))
@@ -991,9 +876,15 @@ fn line_words(
         if character.is_whitespace() {
             if let Some((begin, start)) = start.take() {
                 let end = char_offset;
-                let mut boxes = glyphs
+                while glyphs
+                    .get(glyph_index)
+                    .is_some_and(|glyph| glyph.end <= start)
+                {
+                    glyph_index += 1;
+                }
+                let mut boxes = glyphs[glyph_index..]
                     .iter()
-                    .filter(|glyph| glyph.start < end && start < glyph.end)
+                    .take_while(|glyph| glyph.start < end)
                     .map(|glyph| glyph.bbox);
                 let Some(first) = boxes.next() else {
                     return Vec::new();
@@ -1014,26 +905,34 @@ fn line_words(
 }
 
 fn model_line_font_size(line: &Line) -> f64 {
-    let mut sizes = Vec::new();
-    for span in line
+    let has_body = line
         .spans
         .iter()
-        .filter(|span| span.size > 0.0 && !span.superscript)
-    {
-        sizes.extend(std::iter::repeat_n(
-            span.size,
-            span.text.chars().count().clamp(1, 100),
-        ));
-    }
+        .any(|span| span.size > 0.0 && !span.superscript);
+    let mut sizes: Vec<_> = line
+        .spans
+        .iter()
+        .filter(|span| span.size > 0.0 && (!has_body || !span.superscript))
+        .map(|span| (span.size, span.text.chars().count().clamp(1, 100)))
+        .collect();
     if sizes.is_empty() {
-        for span in line.spans.iter().filter(|span| span.size > 0.0) {
-            sizes.extend(std::iter::repeat_n(
-                span.size,
-                span.text.chars().count().clamp(1, 100),
-            ));
+        return 0.0;
+    }
+    sizes.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let count = sizes.iter().map(|(_, count)| count).sum::<usize>();
+    let (left_index, right_index) = ((count - 1) / 2, count / 2);
+    let mut seen = 0;
+    let mut left_value = None;
+    for (size, count) in sizes {
+        seen += count;
+        if left_value.is_none() && seen > left_index {
+            left_value = Some(size);
+        }
+        if seen > right_index {
+            return (left_value.unwrap_or(size) + size) / 2.0;
         }
     }
-    median(sizes)
+    unreachable!("weighted median has at least one value")
 }
 
 fn begins_with_note_label(text: &str) -> bool {
@@ -1054,11 +953,7 @@ fn begins_with_note_label(text: &str) -> bool {
         .is_none_or(|character| character.is_whitespace() || ".)]},:;-".contains(character))
 }
 
-fn separator_y(
-    geometry: PageGeometry,
-    lines: &[Line],
-    rules: &[PdfLine],
-) -> Option<f64> {
+fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLine]) -> Option<f64> {
     let candidates: Vec<(f64, f64)> = rules
         .iter()
         .map(|rule| {
@@ -1231,8 +1126,12 @@ fn group_source_order_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     lines
 }
 
-fn make_ocr_line(result: OcrLine, page_index: usize, local_index: usize) -> Option<Line> {
-    let text = result.text.trim().to_owned();
+fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Line> {
+    let mut text = result.text;
+    let trimmed_end = text.trim_end().len();
+    text.truncate(trimmed_end);
+    let leading = text.len() - text.trim_start().len();
+    text.replace_range(..leading, "");
     if text.is_empty() {
         return None;
     }
@@ -1241,12 +1140,7 @@ fn make_ocr_line(result: OcrLine, page_index: usize, local_index: usize) -> Opti
         .into_iter()
         .enumerate()
         .map(|(index, word)| Word {
-            id: format!(
-                "p{:04}-l{:04}-w{:03}",
-                page_index + 1,
-                local_index,
-                index + 1
-            ),
+            id: format!("p{:04}-l{:04}-w{:03}", page.number, local_index, index + 1),
             text: word.text,
             bbox: word.bbox,
             start: word.start,
@@ -1254,9 +1148,9 @@ fn make_ocr_line(result: OcrLine, page_index: usize, local_index: usize) -> Opti
         })
         .collect();
     Some(Line {
-        id: format!("p{:04}-l{:04}", page_index + 1, local_index),
-        page_index,
-        page_number: u32::try_from(page_index + 1).unwrap_or(u32::MAX),
+        id: format!("p{:04}-l{local_index:04}", page.number),
+        page_index: page.index,
+        page_number: page.number,
         source_index: 0,
         reading_order: 0,
         block_index: local_index,
@@ -1295,11 +1189,13 @@ fn text_quality(lines: &[Line]) -> f64 {
     let printable =
         PRINTABLE.get_or_init(|| Regex::new(r"[\p{L}\p{M}\p{N}\p{P}\p{S} ]").expect("valid regex"));
     let mut count = lines.len().saturating_sub(1);
+    let mut printable_count = 0;
     let mut replacements = 0;
     let mut trimmed = 0;
     let mut trailing_whitespace = 0;
     let mut has_text = false;
     for (index, line) in lines.iter().enumerate() {
+        printable_count += printable.find_iter(&line.text).count();
         if index > 0 && has_text {
             trailing_whitespace += 1;
         }
@@ -1317,111 +1213,19 @@ fn text_quality(lines: &[Line]) -> f64 {
     }
     let count = count.max(1) as f64;
     let replacement_share = replacements as f64 / count;
-    let printable_share = lines
-        .iter()
-        .map(|line| printable.find_iter(&line.text).count())
-        .sum::<usize>() as f64
-        / count;
+    let printable_share = printable_count as f64 / count;
     let quantity = (trimmed as f64 / 100.0).min(1.0);
     ((quantity * printable_share * (1.0 - (replacement_share * 20.0).min(1.0))).max(0.0) * 10_000.0)
         .round_ties_even()
         / 10_000.0
 }
 
-fn pdf_type_name(value: PdfType) -> &'static str {
-    match value {
-        PdfType::TextBased => "TextBased",
-        PdfType::Scanned => "Scanned",
-        PdfType::ImageBased => "ImageBased",
-        PdfType::Mixed => "Mixed",
-    }
-}
-
-fn metadata_text(document: &Document, value: &Object, depth: u8) -> Option<String> {
-    if depth > 8 {
-        return None;
-    }
-    match value {
-        Object::String(_, _) => lopdf::decode_text_string(value).ok(),
-        Object::Name(value) => Some(String::from_utf8_lossy(value).into_owned()),
-        Object::Reference(id) => document
-            .get_object(*id)
-            .ok()
-            .and_then(|value| metadata_text(document, value, depth + 1)),
-        _ => None,
-    }
-    .filter(|value| !value.is_empty())
-}
-
-fn source_metadata(document: &Document) -> Map<String, Value> {
-    let mut metadata = Map::new();
-    for key in [
-        "author",
-        "creationDate",
-        "creator",
-        "keywords",
-        "modDate",
-        "producer",
-        "subject",
-        "title",
-        "trapped",
-    ] {
-        metadata.insert(key.to_owned(), Value::String(String::new()));
-    }
-    metadata.insert("encryption".to_owned(), Value::Null);
-    let info = document
-        .trailer
-        .get(b"Info")
-        .ok()
-        .and_then(|value| match value {
-            Object::Reference(id) => document.get_dictionary(*id).ok(),
-            Object::Dictionary(value) => Some(value),
-            _ => None,
-        });
-    for (json_key, pdf_key) in [
-        ("author", b"Author".as_slice()),
-        ("creationDate", b"CreationDate".as_slice()),
-        ("creator", b"Creator".as_slice()),
-        ("keywords", b"Keywords".as_slice()),
-        ("modDate", b"ModDate".as_slice()),
-        ("producer", b"Producer".as_slice()),
-        ("subject", b"Subject".as_slice()),
-        ("title", b"Title".as_slice()),
-        ("trapped", b"Trapped".as_slice()),
-    ] {
-        if let Some(value) = info
-            .and_then(|dictionary| dictionary.get(pdf_key).ok())
-            .and_then(|value| metadata_text(document, value, 0))
-        {
-            metadata.insert(json_key.to_owned(), Value::String(value));
-        }
-    }
-    let catalog_version = document
-        .trailer
-        .get(b"Root")
-        .ok()
-        .and_then(|value| value.as_reference().ok())
-        .and_then(|id| document.get_dictionary(id).ok())
-        .and_then(|catalog| catalog.get(b"Version").ok())
-        .and_then(|value| metadata_text(document, value, 0));
-    metadata.insert(
-        "format".to_owned(),
-        Value::String(format!(
-            "PDF {}",
-            catalog_version.as_deref().unwrap_or(&document.version)
-        )),
-    );
-    metadata
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct ExtractedPdf {
     pub pages: Vec<Page>,
-    pub tables: Vec<TableBlock>,
-    pub images: Vec<ImageBlock>,
     pub separators: Vec<Option<f64>>,
     pub diagnostics: Vec<Diagnostic>,
-    pub metadata: Map<String, Value>,
+    pub metadata: PdfExtractionMetadata,
 }
 
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
@@ -1440,67 +1244,38 @@ pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
         .map_err(Into::into)
 }
 
-pub fn page_dimensions(document: &Document) -> (Vec<(u32, f64, f64)>, PageGeometryMap) {
-    let geometries: PageGeometryMap = document
+pub fn page_geometries(document: &Document) -> PageGeometryMap {
+    document
         .get_pages()
         .into_iter()
         .map(|(page, id)| (page, (id, page_geometry(document, id))))
-        .collect();
-    let dimensions = geometries
-        .iter()
-        .map(|(&page, (_, geometry))| (page, geometry.raw_width, geometry.raw_height))
-        .collect();
-    (dimensions, geometries)
-}
-
-pub fn project_table(
-    geometries: &PageGeometryMap,
-    page: u32,
-    index: usize,
-    bbox: [f32; 4],
-    cells: Vec<Vec<String>>,
-    method: &str,
-    confidence: f64,
-) -> Option<TableBlock> {
-    let geometry = geometries.get(&page)?.1;
-    Some(TableBlock {
-        id: format!("p{page:04}-table-{:03}", index + 1),
-        page_index: usize::try_from(page.saturating_sub(1)).unwrap_or(usize::MAX),
-        page_number: page,
-        bbox: source_bbox(geometry, bbox),
-        cells,
-        provenance: format!("pdf-inspector:{method}"),
-        confidence,
-    })
+        .collect()
 }
 
 pub fn assemble_pdf(
     pdf: &[u8],
-    document: Document,
     geometries: &PageGeometryMap,
     mut items: Vec<TextItem>,
     painted_rules: Vec<PdfLine>,
     detection: PdfTypeResult,
-    tables: Vec<TableBlock>,
     ocr: Option<&mut dyn PdfOcrProvider>,
     ocr_pages: Option<&[usize]>,
 ) -> Result<ExtractedPdf> {
     if geometries.is_empty() {
         return Err(Error::Message("PDF has no pages".to_owned()));
     }
-    let mut metadata = source_metadata(&document);
-    drop(document);
-
     let mut by_page: HashMap<u32, Vec<TextLine>> = HashMap::new();
-    for item in &mut items {
-        if let Some((_, geometry)) = geometries.get(&item.page) {
-            transform_item(item, *geometry);
+    items.retain_mut(|item| {
+        let is_text = matches!(&item.item_type, ItemType::Text);
+        if is_text {
+            if let Some((_, geometry)) = geometries.get(&item.page) {
+                transform_item(item, *geometry);
+            }
         }
-    }
-    items.retain(has_extraction_evidence);
+        !is_text || !item.text.is_empty()
+    });
     deduplicate_painted_text(&mut items);
     assign_renderer_layout(&mut items);
-    let images = detected_images(&items, &geometries);
     items.retain(|item| matches!(&item.item_type, ItemType::Text));
     for line in group_source_order_lines(items) {
         by_page.entry(line.page).or_default().push(line);
@@ -1569,14 +1344,11 @@ pub fn assemble_pdf(
         }
     }
 
-    let detected_weak_pages = weak_pages.iter().copied().collect::<Vec<_>>();
-    let routed_pages = match ocr_pages {
-        Some(selected) => detected_weak_pages
-            .into_iter()
-            .filter(|page| selected.contains(page))
-            .collect(),
-        None => detected_weak_pages,
-    };
+    let routed_pages: Vec<_> = weak_pages
+        .iter()
+        .copied()
+        .filter(|page| ocr_pages.is_none_or(|selected| selected.contains(page)))
+        .collect();
     let mut reindex = false;
     if let Some(provider) = ocr {
         let requests: Vec<_> = routed_pages
@@ -1599,19 +1371,12 @@ pub fn assemble_pdf(
                     result.page_index
                 )));
             };
-            let mut lines: Vec<_> = result
+            let lines: Vec<_> = result
                 .lines
                 .into_iter()
                 .enumerate()
-                .filter_map(|(index, line)| make_ocr_line(line, result.page_index, index + 1))
+                .filter_map(|(index, line)| make_ocr_line(line, page, index + 1))
                 .collect();
-            for (index, line) in lines.iter_mut().enumerate() {
-                line.id = format!("p{:04}-l{:04}", page.number, index + 1);
-                line.block_index = index + 1;
-                for (word_index, word) in line.words.iter_mut().enumerate() {
-                    word.id = format!("{}-w{:03}", line.id, word_index + 1);
-                }
-            }
             if !lines.is_empty() {
                 reindex = true;
                 page.lines = lines;
@@ -1636,44 +1401,14 @@ pub fn assemble_pdf(
         ));
     }
 
-    metadata.insert(
-        "extractor".to_owned(),
-        Value::String("pdf-inspector".to_owned()),
-    );
-    metadata.insert(
-        "extractor_version".to_owned(),
-        Value::String("1.14.0".to_owned()),
-    );
-    metadata.insert("page_count".to_owned(), json!(pages.len()));
-    metadata.insert(
-        "pdf_type".to_owned(),
-        Value::String(pdf_type_name(detection.pdf_type).to_owned()),
-    );
-    metadata.insert("confidence".to_owned(), json!(detection.confidence));
-    metadata.insert("pages_needing_ocr".to_owned(), json!(unresolved_pages));
-    metadata.insert("ocr_routed_pages".to_owned(), json!(routed_pages));
-    let rotated_pages: Vec<_> = geometries
-        .iter()
-        .filter_map(|(&page, (_, geometry))| {
-            (geometry.rotation != 0).then_some(json!({
-                "page": page,
-                "rotation": geometry.rotation,
-            }))
-        })
-        .collect();
-    if !rotated_pages.is_empty() {
-        metadata.insert(
-            "normalized_rotated_pages".to_owned(),
-            Value::Array(rotated_pages),
-        );
-    }
     Ok(ExtractedPdf {
         pages,
-        tables,
-        images,
         separators,
         diagnostics,
-        metadata,
+        metadata: PdfExtractionMetadata {
+            pages_needing_ocr: unresolved_pages,
+            ocr_routed_pages: routed_pages,
+        },
     })
 }
 
@@ -1692,16 +1427,15 @@ mod tests {
                 })
                 .collect(),
         );
-        let (_, filtered) = extraction_object_filter((1, 0), &mut sparse).unwrap();
+        prune_extraction_object(&mut sparse);
         assert!(matches!(sparse, Object::Null));
-        assert!(matches!(filtered, Object::Null));
 
         let mut page_tree = Object::Array(
             (1..=4096)
                 .map(|index| Object::Reference((index, 0)))
                 .collect(),
         );
-        extraction_object_filter((2, 0), &mut page_tree);
+        prune_extraction_object(&mut page_tree);
         assert!(matches!(page_tree, Object::Array(values) if values.len() == 4096));
     }
 
@@ -1974,37 +1708,6 @@ mod tests {
         };
         assert_eq!(transform_point(geometry, 10.0, 20.0), (0.0, 200.0));
         assert_eq!(transform_point(geometry, 210.0, 120.0), (100.0, 0.0));
-    }
-
-    #[test]
-    fn source_metadata_preserves_info_strings_and_catalog_version() {
-        use lopdf::{dictionary, text_string};
-
-        let mut document = Document::with_version("1.4");
-        let producer = document.add_object(text_string("Indirect Producer"));
-        let info = document.add_object(dictionary! {
-            "Author" => text_string("Renée Author"),
-            "CreationDate" => text_string("D:20260811170703-06'00'"),
-            "Title" => text_string(""),
-            "Trapped" => Object::Name(b"False".to_vec()),
-            "Producer" => Object::Reference(producer),
-        });
-        let catalog = document.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Version" => Object::Name(b"1.7".to_vec()),
-        });
-        document.trailer.set("Info", Object::Reference(info));
-        document.trailer.set("Root", Object::Reference(catalog));
-
-        let metadata = source_metadata(&document);
-
-        assert_eq!(metadata["author"], "Renée Author");
-        assert_eq!(metadata["creationDate"], "D:20260811170703-06'00'");
-        assert_eq!(metadata["trapped"], "False");
-        assert_eq!(metadata["producer"], "Indirect Producer");
-        assert_eq!(metadata["format"], "PDF 1.7");
-        assert_eq!(metadata["title"], "");
-        assert!(metadata["encryption"].is_null());
     }
 
     #[test]

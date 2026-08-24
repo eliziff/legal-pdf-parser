@@ -1,12 +1,19 @@
-use legal_pdf_core::model::{Diagnostic, Footnote, Line, Page};
+use legal_pdf_core::model::{
+    DetachedReference, Diagnostic, Footnote, Line, Page, PdfPairingAudit, PdfSourceSpan,
+};
 use legal_pdf_core::{
     line_font_size, Anchor, NotePairClaim, NotePairKind, PairingOutput, SourceAnchor,
 };
-use legal_pdf_support::{normalize_decimal_digit, normalize_note_symbol, pairing_support};
-use legal_structure::{select_numeric_sequence, NumericSequenceCandidate, NumericSequencePolicy};
+use legal_pdf_support::pairing_support;
+use legal_structure::{
+    normalize_decimal_digit, normalize_note_symbol, select_numeric_sequence,
+    NumericSequenceCandidate, NumericSequencePolicy, ScalarText,
+};
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Deref;
 use std::sync::OnceLock;
 
 const MAX_VALUE: u32 = 999;
@@ -29,40 +36,48 @@ enum Zone {
     Header,
     Number,
     Visual,
-    Other,
 }
 
-#[derive(Debug, Clone)]
-struct PairLine {
+#[derive(Debug)]
+struct PairLine<'a> {
+    line: &'a Line,
     idx: usize,
     page: u32,
     page_index: usize,
     order: usize,
-    id: String,
-    region_id: String,
-    region_type: String,
-    text: String,
-    bbox: [f64; 4],
     page_width: f64,
     page_height: f64,
     zone: Zone,
-    protected_spans: Vec<(usize, usize)>,
+    citation_spans: &'a [PdfSourceSpan],
     outline_spans: Vec<(usize, usize)>,
     note_column_fit: bool,
     small_font: bool,
     prose_like: bool,
     region_witness_demoted: bool,
     native_superscript_spans: Vec<(usize, usize)>,
-    suppress_footnote_label: bool,
-    exclude_from_body: bool,
-    note_region_mode: String,
+    edge_folio: bool,
     note_sequence_restart: bool,
-    detached_references: Vec<Value>,
+    detached_references: Cow<'a, [DetachedReference]>,
 }
 
-impl PairLine {
+impl PairLine<'_> {
     fn height(&self) -> f64 {
         self.bbox[3] - self.bbox[1]
+    }
+
+    fn protected(&self, start: usize, end: usize) -> bool {
+        self.citation_spans
+            .iter()
+            .any(|span| start < span.end && end > span.start)
+            || overlaps(&self.outline_spans, start, end)
+    }
+}
+
+impl Deref for PairLine<'_> {
+    type Target = Line;
+
+    fn deref(&self) -> &Self::Target {
+        self.line
     }
 }
 
@@ -91,7 +106,7 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn pos(&self, lines: &[PairLine]) -> (usize, usize) {
+    fn pos(&self, lines: &[PairLine<'_>]) -> (usize, usize) {
         (lines[self.line].idx, self.start)
     }
 
@@ -100,7 +115,7 @@ impl Candidate {
             .map_or_else(|| self.symbol.clone(), |value| value.to_string())
     }
 
-    fn zone_is_noteish(&self, lines: &[PairLine]) -> bool {
+    fn zone_is_noteish(&self, lines: &[PairLine<'_>]) -> bool {
         let line = &lines[self.line];
         (line.zone == Zone::Note && !line.region_witness_demoted) || line.note_column_fit
     }
@@ -136,12 +151,13 @@ fn chars(value: &str) -> Vec<char> {
     value.chars().collect()
 }
 
-fn char_slice(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+fn char_slice(value: &str, start: usize, end: usize) -> &str {
+    if value.is_ascii() {
+        return &value[start.min(value.len())..end.min(value.len())];
+    }
+    let text = ScalarText::new(value);
+    text.slice(start.min(text.len())..end.min(text.len()))
+        .expect("valid scalar range")
 }
 
 fn chars_slice(values: &[char], start: usize, end: usize) -> String {
@@ -178,6 +194,7 @@ fn numeric_value(value: &str) -> Option<u32> {
 
 fn label_token(text: &str) -> Option<LabelToken> {
     let values = chars(text);
+    let scalar = ScalarText::new(text);
     let mut cursor = 0;
     while cursor < values.len()
         && cursor < 3
@@ -215,7 +232,7 @@ fn label_token(text: &str) -> Option<LabelToken> {
             return None;
         }
         cursor += 1;
-        value = numeric_value(&char_slice(text, token_start, token_end));
+        value = numeric_value(scalar.slice(token_start..token_end)?);
         form = "paren";
     } else if values
         .get(cursor)
@@ -225,7 +242,7 @@ fn label_token(text: &str) -> Option<LabelToken> {
             cursor += 1;
         }
         token_end = cursor;
-        value = numeric_value(&char_slice(text, token_start, token_end));
+        value = numeric_value(scalar.slice(token_start..token_end)?);
         form = "sup";
     } else if values.get(cursor).is_some_and(char::is_ascii_digit) {
         while cursor < values.len() && cursor - token_start < 3 && values[cursor].is_ascii_digit() {
@@ -235,7 +252,7 @@ fn label_token(text: &str) -> Option<LabelToken> {
         if values.get(cursor).is_some_and(char::is_ascii_digit) {
             return None;
         }
-        value = numeric_value(&char_slice(text, token_start, token_end));
+        value = numeric_value(scalar.slice(token_start..token_end)?);
     } else if values
         .get(cursor)
         .is_some_and(|character| is_symbol(*character))
@@ -247,7 +264,7 @@ fn label_token(text: &str) -> Option<LabelToken> {
             cursor += 1;
         }
         token_end = cursor;
-        symbol = normalize_symbol(&char_slice(text, token_start, token_end));
+        symbol = normalize_symbol(scalar.slice(token_start..token_end)?);
         form = "symbol";
     } else {
         return None;
@@ -257,13 +274,13 @@ fn label_token(text: &str) -> Option<LabelToken> {
     while cursor < values.len() && cursor - post_start < 2 && ".)],".contains(values[cursor]) {
         cursor += 1;
     }
-    let observed = char_slice(text, if form == "paren" { start } else { token_start }, end);
+    let observed = scalar.slice(if form == "paren" { start } else { token_start }..end)?;
     let embedded_endnote = format!("endnote {observed}");
-    let remainder = char_slice(text, cursor, text.chars().count());
+    let remainder = scalar.slice(cursor..scalar.len())?;
     let match_end = if form == "plain"
         && remainder
-            .to_ascii_lowercase()
-            .starts_with(&embedded_endnote.to_ascii_lowercase())
+            .get(..embedded_endnote.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&embedded_endnote))
     {
         cursor + embedded_endnote.chars().count()
     } else {
@@ -274,11 +291,11 @@ fn label_token(text: &str) -> Option<LabelToken> {
         start: if form == "paren" { start } else { token_start },
         end,
         match_end,
-        observed,
+        observed: observed.to_owned(),
         value,
         symbol,
         form,
-        post: char_slice(text, post_start, cursor),
+        post: scalar.slice(post_start..cursor)?.to_owned(),
     })
 }
 
@@ -292,25 +309,22 @@ fn classify_zone(line: &Line) -> Zone {
     // core._pair_markers presents region_type twice (region/coarse) and a
     // derived line_type to the canonical pairer. Reconstruct that adapter
     // contract exactly rather than interpreting note_region_mode here.
-    let line_type = if line.region_type == "footnote" {
-        "footnote"
-    } else {
-        "paragraph"
-    };
-    let joined = format!("{} {} {line_type}", line.region_type, line.region_type).to_lowercase();
-    if ["footnote", "endnote", "reference_content", "note"]
-        .iter()
-        .any(|token| joined.contains(token))
+    let footnote = line.region_type == "footnote";
+    let region = line.region_type.to_lowercase();
+    if footnote
+        || ["footnote", "endnote", "reference_content", "note"]
+            .iter()
+            .any(|token| region.contains(token))
     {
         Zone::Note
     } else if ["page_number", "number", "folio"]
         .iter()
-        .any(|token| joined.contains(token))
+        .any(|token| region.contains(token))
     {
         Zone::Number
     } else if ["header", "running"]
         .iter()
-        .any(|token| joined.contains(token))
+        .any(|token| region.contains(token))
     {
         Zone::Header
     } else if [
@@ -324,7 +338,7 @@ fn classify_zone(line: &Line) -> Zone {
         "photo",
     ]
     .iter()
-    .any(|token| joined.contains(token))
+    .any(|token| region.contains(token))
     {
         Zone::Visual
     } else if [
@@ -336,16 +350,13 @@ fn classify_zone(line: &Line) -> Zone {
         "table_of_contents",
     ]
     .iter()
-    .any(|token| joined.contains(token))
+    .any(|token| region.contains(token))
     {
         Zone::Title
-    } else if ["body", "block_quote", "text", "content", "paragraph"]
-        .iter()
-        .any(|token| joined.contains(token))
-    {
-        Zone::Body
     } else {
-        Zone::Other
+        // The canonical adapter supplies "paragraph" as the fallback line
+        // type, so every remaining source region is body text.
+        Zone::Body
     }
 }
 
@@ -416,7 +427,7 @@ fn folded_words(text: &str) -> String {
         .join(" ")
 }
 
-fn annotate_edge_furniture(lines: &mut [PairLine]) {
+fn annotate_edge_furniture(lines: &mut [PairLine<'_>]) {
     static PAGE_LABEL: OnceLock<Regex> = OnceLock::new();
     let page_label = PAGE_LABEL
         .get_or_init(|| Regex::new(r"^\s*(?:[-–—]\s*)?(\d{1,4})(?:\s*[-–—])?\s*$").unwrap());
@@ -480,16 +491,14 @@ fn annotate_edge_furniture(lines: &mut [PairLine]) {
     for indexes in by_page.values() {
         for &index in indexes.iter().take(4) {
             let key = folded_words(&lines[index].text);
-            if matches!(lines[index].zone, Zone::Body | Zone::Other | Zone::Title)
-                && repeated.contains(&key)
-            {
+            if matches!(lines[index].zone, Zone::Body | Zone::Title) && repeated.contains(&key) {
                 lines[index].zone = Zone::Header;
             }
         }
     }
     if let Some(offset) = page_offset {
         for (index, value) in edge_numerals {
-            if matches!(lines[index].zone, Zone::Body | Zone::Other | Zone::Title)
+            if matches!(lines[index].zone, Zone::Body | Zone::Title)
                 && i64::from(value) - i64::from(lines[index].page) == offset
             {
                 lines[index].zone = Zone::Number;
@@ -498,7 +507,10 @@ fn annotate_edge_furniture(lines: &mut [PairLine]) {
     }
 }
 
-fn build_lines(pages: &[Page]) -> Vec<PairLine> {
+fn build_lines<'a>(
+    pages: &'a [Page],
+    protected_citation_spans: &'a BTreeMap<String, Vec<PdfSourceSpan>>,
+) -> Vec<PairLine<'a>> {
     let mut source: Vec<(&Page, &Line)> =
         legal_pdf_support::profile::measure("lines.collect", || {
             pages
@@ -515,52 +527,59 @@ fn build_lines(pages: &[Page]) -> Vec<PairLine> {
                 .then_with(|| left_line.id.cmp(&right_line.id))
         })
     });
-    let mut lines: Vec<PairLine> = legal_pdf_support::profile::measure("lines.construct", || {
-        source
-            .into_iter()
-            .enumerate()
-            .filter(|(_, (_, line))| !line.exclude_from_body)
-            .enumerate()
-            .map(|(idx, (source_order, (page, line)))| {
-                let mut detached_references = line.detached_references.clone();
-                detached_references.extend(isolated_inline_references(line));
-                let text_len = line.text.chars().count();
-                PairLine {
-                    idx,
-                    page: page.number,
-                    page_index: page.index,
-                    order: source_order + 1,
-                    id: line.id.clone(),
-                    region_id: line.region_id.clone(),
-                    region_type: line.region_type.clone(),
-                    text: line.text.clone(),
-                    bbox: line.bbox,
-                    page_width: page.width,
-                    page_height: page.height,
-                    zone: classify_zone(line),
-                    protected_spans: pairing_support::protected_citation_spans(&line.text),
-                    outline_spans: Vec::new(),
-                    note_column_fit: false,
-                    small_font: false,
-                    prose_like: prose_like(&line.text),
-                    region_witness_demoted: false,
-                    native_superscript_spans: line
-                        .spans
-                        .iter()
-                        .filter(|span| {
-                            span.superscript && span.start < span.end && span.end <= text_len
-                        })
-                        .map(|span| (span.start, span.end))
-                        .collect(),
-                    suppress_footnote_label: line.suppress_footnote_label || is_edge_folio(line),
-                    exclude_from_body: line.exclude_from_body,
-                    note_region_mode: line.note_region_mode.clone(),
-                    note_sequence_restart: false,
-                    detached_references,
-                }
-            })
-            .collect()
-    });
+    let mut lines: Vec<PairLine<'_>> =
+        legal_pdf_support::profile::measure("lines.construct", || {
+            source
+                .into_iter()
+                .enumerate()
+                .filter(|(_, (_, line))| !line.exclude_from_body)
+                .enumerate()
+                .map(|(idx, (source_order, (page, line)))| {
+                    let isolated_references = isolated_inline_references(line);
+                    let detached_references = if isolated_references.is_empty() {
+                        Cow::Borrowed(line.detached_references.as_slice())
+                    } else {
+                        Cow::Owned(
+                            line.detached_references
+                                .iter()
+                                .cloned()
+                                .chain(isolated_references)
+                                .collect(),
+                        )
+                    };
+                    let text_len = line.text.chars().count();
+                    PairLine {
+                        line,
+                        idx,
+                        page: page.number,
+                        page_index: page.index,
+                        order: source_order + 1,
+                        page_width: page.width,
+                        page_height: page.height,
+                        zone: classify_zone(line),
+                        citation_spans: protected_citation_spans
+                            .get(&line.id)
+                            .map_or(&[], Vec::as_slice),
+                        outline_spans: Vec::new(),
+                        note_column_fit: false,
+                        small_font: false,
+                        prose_like: prose_like(&line.text),
+                        region_witness_demoted: false,
+                        native_superscript_spans: line
+                            .spans
+                            .iter()
+                            .filter(|span| {
+                                span.superscript && span.start < span.end && span.end <= text_len
+                            })
+                            .map(|span| (span.start, span.end))
+                            .collect(),
+                        edge_folio: is_edge_folio(line),
+                        note_sequence_restart: false,
+                        detached_references,
+                    }
+                })
+                .collect()
+        });
     legal_pdf_support::profile::measure("lines.annotate", || {
         let mut page_local_one_pages = HashSet::new();
         for line in &mut lines {
@@ -613,7 +632,7 @@ fn build_lines(pages: &[Page]) -> Vec<PairLine> {
 /// backend emits the same raised run inline. A visibly separated line-final
 /// digit is the exact case PyMuPDF exposed as its own row; contiguous native
 /// superscripts remain on the monotone pairing path.
-fn isolated_inline_references(line: &Line) -> Vec<Value> {
+fn isolated_inline_references(line: &Line) -> Vec<DetachedReference> {
     let text_len = line.text.chars().count();
     line.spans
         .iter()
@@ -634,20 +653,18 @@ fn isolated_inline_references(line: &Line) -> Vec<Value> {
                 .filter(|span| !span.superscript && span.end == marker.start)
                 .max_by_key(|span| span.end)?;
             let gap = marker.bbox[0] - host.bbox[2];
-            (gap >= host.size.max(1.0) * 0.25).then(|| {
-                json!({
-                    "note_id": selected,
-                    "selected_text": selected,
-                    "start_offset": marker.start,
-                    "end_offset": marker.end,
-                    "source_line_id": line.id,
-                })
+            (gap >= host.size.max(1.0) * 0.25).then(|| DetachedReference {
+                note_id: selected.to_owned(),
+                selected_text: selected.to_owned(),
+                start_offset: marker.start,
+                end_offset: marker.end,
+                source_line_id: line.id.clone(),
             })
         })
         .collect()
 }
 
-fn annotate_hierarchical_outlines(lines: &mut [PairLine]) {
+fn annotate_hierarchical_outlines(lines: &mut [PairLine<'_>]) {
     static OUTLINE: OnceLock<Regex> = OnceLock::new();
     let regex = OUTLINE
         .get_or_init(|| Regex::new(r"^\s*(\d{1,2}(?:\.\d{1,2}){0,3})([.)]?)(\s+)(\S.*)$").unwrap());
@@ -716,21 +733,16 @@ fn annotate_hierarchical_outlines(lines: &mut [PairLine]) {
                 let raw = captures.get(1).expect("outline value").as_str();
                 let punct = captures.get(2).map_or("", |value| value.as_str());
                 let effective_punct = if punct.is_empty() { "." } else { punct };
-                json!({
-                    "line_index": lines[*index].idx,
-                    "kind": "enumerator",
-                    "joined": false,
-                    "value_text": raw,
-                    "punct": effective_punct,
-                    "text": captures.get(4).map_or("", |value| value.as_str()),
-                    "interpretations": pairing_support::enumerator_interpretations(raw, effective_punct),
-                })
+                pairing_support::enumerator_interpretations(raw, effective_punct)
             })
             .collect::<Vec<_>>();
-        if pairing_support::parse_heading_ladder(&grammar)
-            .get("status")
-            .and_then(Value::as_str)
-            != Some("parsed_clean")
+        if pairing_support::parse_heading_ladder(
+            grammar
+                .iter()
+                .map(|interpretations| interpretations.as_slice()),
+        )
+        .status
+            != pairing_support::HeadingLadderStatus::ParsedClean
         {
             continue;
         }
@@ -755,15 +767,14 @@ fn annotate_hierarchical_outlines(lines: &mut [PairLine]) {
             continue;
         }
         for (index, _, start, end) in values {
-            lines[*index].protected_spans.push((*start, *end));
             lines[*index].outline_spans.push((*start, *end));
         }
     }
 }
 
-fn ref_zone_score(line: &PairLine) -> Option<(f64, bool)> {
+fn ref_zone_score(line: &PairLine<'_>) -> Option<(f64, bool)> {
     match line.zone {
-        Zone::Body | Zone::Other => Some((0.6, false)),
+        Zone::Body => Some((0.6, false)),
         Zone::Title => Some((0.1, false)),
         Zone::Visual => Some((-0.4, false)),
         Zone::Note => Some((-0.4, true)),
@@ -799,7 +810,13 @@ fn chars_at_line_end(values: &[char], end: usize) -> bool {
 }
 
 fn at_line_end(text: &str, end: usize) -> bool {
-    chars_at_line_end(&chars(text), end)
+    let text = ScalarText::new(text);
+    text.slice(end.min(text.len())..text.len())
+        .is_some_and(|tail| {
+            tail.trim()
+                .chars()
+                .all(|character| REF_PUNCTUATION.contains(character) || QUOTES.contains(character))
+        })
 }
 
 fn preceding_word(values: &[char], start: usize) -> String {
@@ -863,7 +880,7 @@ fn date_day_site(values: &[char], start: usize, end: usize) -> bool {
 }
 
 fn ref_site_penalty(
-    line: &PairLine,
+    line: &PairLine<'_>,
     values: &[char],
     start: usize,
     end: usize,
@@ -953,14 +970,14 @@ fn ref_site_penalty(
     if overlaps(&line.outline_spans, start, end) {
         return None;
     }
-    if overlaps(&line.protected_spans, start, end) {
+    if line.protected(start, end) {
         let tail_glued = left.is_some_and(|value| ".,".contains(value))
             && start >= 2
             && values[start - 2].is_ascii_digit()
             && line
-                .protected_spans
+                .citation_spans
                 .iter()
-                .any(|(span_start, span_end)| end == *span_end && start > *span_start);
+                .any(|span| end == span.end && start > span.start);
         if !tail_glued {
             return None;
         }
@@ -1056,7 +1073,7 @@ fn symbol_runs(values: &[char]) -> Vec<(usize, usize, String)> {
     result
 }
 
-fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
+fn extract_refs(lines: &[PairLine<'_>]) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let mut previous_body = None;
     let mut previous_page = None;
@@ -1099,7 +1116,7 @@ fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
         let digit_runs = digit_runs(&line_chars);
         let mut seen = HashSet::new();
         for (start, end, observed) in superscript_runs(&line_chars) {
-            if start < label_end || overlaps(&line.protected_spans, start, end) {
+            if start < label_end || line.protected(start, end) {
                 continue;
             }
             let Some(value) = numeric_value(&observed) else {
@@ -1123,10 +1140,7 @@ fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
             });
         }
         for &(start, end) in &line.native_superscript_spans {
-            if seen.contains(&(start, end))
-                || start < label_end
-                || overlaps(&line.protected_spans, start, end)
-            {
+            if seen.contains(&(start, end)) || start < label_end || line.protected(start, end) {
                 continue;
             }
             let observed = chars_slice(&line_chars, start, end);
@@ -1339,7 +1353,7 @@ fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
             if start < label_end
                 || (open > 0 && line_chars[open - 1].is_alphanumeric())
                 || section_before.is_match(&char_slice(&line.text, 0, open))
-                || overlaps(&line.protected_spans, start, end)
+                || line.protected(start, end)
             {
                 continue;
             }
@@ -1373,7 +1387,7 @@ fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
                 if start == 0
                     || seen.contains(&(start, end))
                     || start < label_end
-                    || overlaps(&line.protected_spans, start, end)
+                    || line.protected(start, end)
                 {
                     continue;
                 }
@@ -1426,16 +1440,18 @@ fn extract_refs(lines: &[PairLine]) -> Vec<Candidate> {
 }
 
 fn heading_shaped(body: &str) -> bool {
-    let letters: Vec<char> = body
-        .trim()
-        .chars()
-        .take(40)
-        .filter(|character| character.is_alphabetic())
-        .collect();
-    letters.len() >= 4 && letters.iter().all(|character| character.is_uppercase())
+    let mut letters = 0;
+    body.trim().chars().take(40).all(|character| {
+        if character.is_alphabetic() {
+            letters += 1;
+            character.is_uppercase()
+        } else {
+            true
+        }
+    }) && letters >= 4
 }
 
-fn paren_style(lines: &[PairLine]) -> bool {
+fn paren_style(lines: &[PairLine<'_>]) -> bool {
     let mut paren = 0;
     let mut plain = 0;
     for line in lines.iter().filter(|line| line.zone == Zone::Note) {
@@ -1452,11 +1468,11 @@ fn paren_style(lines: &[PairLine]) -> bool {
 }
 
 fn spaced_symbol_separator(text: &str) -> bool {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    parts.len() >= 3
-        && parts
-            .iter()
-            .all(|part| part.chars().count() == 1 && part.chars().all(is_symbol))
+    let mut parts = 0;
+    text.split_whitespace().all(|part| {
+        parts += 1;
+        part.chars().count() == 1 && part.chars().all(is_symbol)
+    }) && parts >= 3
 }
 
 fn day_list_date(text: &str) -> bool {
@@ -1495,7 +1511,7 @@ fn bracket_year_body(text: &str) -> bool {
         .is_match(text)
 }
 
-fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
+fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> {
     let mut ref_pages: HashMap<u32, HashSet<u32>> = HashMap::new();
     for candidate in refs
         .iter()
@@ -1511,24 +1527,27 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
     let paren_style = paren_style(lines);
     let mut candidates = Vec::new();
     for (line_index, line) in lines.iter().enumerate() {
-        if line.suppress_footnote_label {
+        if line.suppress_footnote_label || line.edge_folio {
             continue;
         }
         let Some(token) = label_token(&line.text) else {
             continue;
         };
-        if overlaps(&line.protected_spans, token.start, token.end) {
+        if line.protected(token.start, token.end) {
             continue;
         }
-        let body = char_slice(&line.text, token.match_end, line.text.chars().count());
+        let scalar = ScalarText::new(&line.text);
+        let body = scalar
+            .slice(token.match_end..scalar.len())
+            .expect("token offsets must be valid");
         let follow = body.chars().next();
         if token.form == "plain"
             && token.value.is_some()
-            && day_list_date(&char_slice(
-                &line.text,
-                token.start,
-                line.text.chars().count(),
-            ))
+            && day_list_date(
+                scalar
+                    .slice(token.start..scalar.len())
+                    .expect("token offsets must be valid"),
+            )
         {
             continue;
         }
@@ -1577,7 +1596,6 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
             Zone::Title => -2.0,
             Zone::Header | Zone::Number => -1.2,
             Zone::Visual => -1.5,
-            Zone::Other => 0.6,
         };
         if line.zone == Zone::Note && line.region_witness_demoted {
             score = 0.6;
@@ -1613,7 +1631,9 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
         if line.small_font {
             score += 0.4;
         }
-        let junk_prefix = char_slice(&line.text, token.pre_start, token.start)
+        let junk_prefix = scalar
+            .slice(token.pre_start..token.start)
+            .expect("token offsets must be valid")
             .trim()
             .to_owned();
         if !junk_prefix.is_empty() {
@@ -1651,11 +1671,16 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
         };
         candidates.push(candidate.clone());
         if token.form == "plain" && token.post.is_empty() && token.observed.chars().count() >= 2 {
-            for cut in 1..token.observed.chars().count() {
-                let head = char_slice(&token.observed, 0, cut);
+            let observed = ScalarText::new(&token.observed);
+            for cut in 1..observed.len() {
+                let head = observed
+                    .slice(0..cut)
+                    .expect("candidate offsets must be valid");
                 let rest = format!(
                     "{}{}",
-                    char_slice(&token.observed, cut, token.observed.chars().count()),
+                    observed
+                        .slice(cut..observed.len())
+                        .expect("candidate offsets must be valid"),
                     body
                 );
                 let Some(head_value) = numeric_value(&head) else {
@@ -1666,7 +1691,7 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
                 }
                 let mut split = candidate.clone();
                 split.end = split.start + cut;
-                split.observed = head;
+                split.observed = head.to_owned();
                 split.value = Some(head_value);
                 split.score -= 1.1;
                 split.reason = "glued_volume_split";
@@ -1687,11 +1712,10 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
     for indexes in by_value.values().filter(|indexes| indexes.len() >= 2) {
         for &index in indexes {
             let candidate = &candidates[index];
-            let continuation = char_slice(
-                &lines[candidate.line].text,
-                candidate.start,
-                lines[candidate.line].text.chars().count(),
-            );
+            let line = ScalarText::new(&lines[candidate.line].text);
+            let continuation = line
+                .slice(candidate.start..line.len())
+                .expect("candidate offsets must be valid");
             if volume_cite_start(&continuation)
                 && indexes.iter().any(|other| {
                     *other != index
@@ -1708,7 +1732,11 @@ fn extract_labels(lines: &[PairLine], refs: &[Candidate]) -> Vec<Candidate> {
     candidates
 }
 
-fn select_backbone(candidates: &[Candidate], lines: &[PairLine]) -> (Vec<Candidate>, Value) {
+fn select_backbone(
+    candidates: &[Candidate],
+    lines: &[PairLine<'_>],
+    include_audit: bool,
+) -> (Vec<Candidate>, Option<Value>) {
     let numeric = candidates
         .iter()
         .enumerate()
@@ -1725,7 +1753,10 @@ fn select_backbone(candidates: &[Candidate], lines: &[PairLine]) -> (Vec<Candida
         .collect::<Vec<_>>();
     let candidate_count = numeric.len();
     if candidate_count == 0 {
-        return (Vec::new(), json!({"candidate_count": 0}));
+        return (
+            Vec::new(),
+            include_audit.then(|| json!({"candidate_count": 0})),
+        );
     }
     let selected = select_numeric_sequence(numeric, NumericSequencePolicy::FootnoteBackbone);
     let chain = selected
@@ -1733,16 +1764,16 @@ fn select_backbone(candidates: &[Candidate], lines: &[PairLine]) -> (Vec<Candida
         .into_iter()
         .map(|index| candidates[index].clone())
         .collect::<Vec<_>>();
-    (
-        chain.clone(),
+    let diagnostic = include_audit.then(|| {
         json!({
             "candidate_count": candidate_count,
             "selected_count": chain.len(),
             "chain_score": (selected.score * 1_000.0).round_ties_even() / 1_000.0,
             "first_value": chain.first().and_then(|candidate| candidate.value),
             "last_value": chain.last().and_then(|candidate| candidate.value),
-        }),
-    )
+        })
+    });
+    (chain, diagnostic)
 }
 
 fn trim_unsupported_tail(mut segment: Vec<Candidate>) -> Vec<Candidate> {
@@ -1762,16 +1793,20 @@ fn trim_unsupported_tail(mut segment: Vec<Candidate>) -> Vec<Candidate> {
     segment
 }
 
-fn select_segments(candidates: &[Candidate], lines: &[PairLine]) -> (Vec<Vec<Candidate>>, Value) {
+fn select_segments(
+    candidates: &[Candidate],
+    lines: &[PairLine<'_>],
+    include_audit: bool,
+) -> (Vec<Vec<Candidate>>, Option<Value>) {
     let mut remaining: Vec<Candidate> = candidates
         .iter()
         .filter(|candidate| candidate.value.is_some())
         .cloned()
         .collect();
     let mut segments: Vec<Vec<Candidate>> = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = include_audit.then(Vec::new);
     for _ in 0..6 {
-        let (chain, diagnostic) = select_backbone(&remaining, lines);
+        let (chain, diagnostic) = select_backbone(&remaining, lines, include_audit);
         if chain.is_empty() {
             break;
         }
@@ -1801,14 +1836,16 @@ fn select_segments(candidates: &[Candidate], lines: &[PairLine]) -> (Vec<Vec<Can
         }
         let used: HashSet<usize> = chain.iter().map(|candidate| candidate.line).collect();
         remaining.retain(|candidate| !used.contains(&candidate.line));
-        diagnostics.push(diagnostic);
+        if let (Some(diagnostics), Some(diagnostic)) = (&mut diagnostics, diagnostic) {
+            diagnostics.push(diagnostic);
+        }
         segments.push(chain);
     }
     segments.sort_by_key(|segment| lines[segment[0].line].idx);
     let count = segments.len();
     (
         segments,
-        json!({"segments": diagnostics, "segment_count": count}),
+        diagnostics.map(|diagnostics| json!({"segments": diagnostics, "segment_count": count})),
     )
 }
 
@@ -1844,7 +1881,7 @@ fn confusable_variants(value: &str) -> HashSet<u32> {
         .collect()
 }
 
-fn gap_line_score(line: &PairLine, body: &str) -> f64 {
+fn gap_line_score(line: &PairLine<'_>, body: &str) -> f64 {
     let mut score = if line.zone == Zone::Note && !line.region_witness_demoted {
         3.0
     } else {
@@ -1859,7 +1896,7 @@ fn gap_line_score(line: &PairLine, body: &str) -> f64 {
     score
 }
 
-fn gap_repair_tokens(line: &PairLine) -> Vec<(String, usize, usize)> {
+fn gap_repair_tokens(line: &PairLine<'_>) -> Vec<(String, usize, usize)> {
     let mut tokens = Vec::new();
     if let Some(token) = label_token(&line.text) {
         if token.value.is_some() && matches!(token.form, "plain" | "sup") {
@@ -1898,7 +1935,7 @@ fn gap_repair_tokens(line: &PairLine) -> Vec<(String, usize, usize)> {
 
 fn gap_repair_claim(
     line_index: usize,
-    line: &PairLine,
+    line: &PairLine<'_>,
     unclaimed: &HashSet<u32>,
     last_value: u32,
 ) -> Option<Candidate> {
@@ -1944,7 +1981,7 @@ fn gap_repair_claim(
 fn sequence_position_rekey(
     window: &[usize],
     residual: &[u32],
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     used_lines: &mut HashSet<usize>,
 ) -> Vec<Candidate> {
     if residual.is_empty() || residual.len() > 8 {
@@ -2014,21 +2051,24 @@ fn sequence_position_rekey(
 
 fn repair_gaps(
     chain: Vec<Candidate>,
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     used_lines: &mut HashSet<usize>,
-) -> (Vec<Candidate>, Vec<Value>) {
+    include_audit: bool,
+) -> (Vec<Candidate>, Option<Vec<Value>>) {
     if chain.is_empty() {
-        return (chain, Vec::new());
+        return (chain, include_audit.then(Vec::new));
     }
     let mut windows = Vec::new();
-    let mut holes = Vec::new();
+    let mut holes = include_audit.then(Vec::new);
     if chain[0].value.is_some_and(|value| (2..=9).contains(&value)) {
         windows.push((0, lines[chain[0].line].idx, 1, chain[0].value.unwrap() - 1));
     } else if chain[0].value.is_some_and(|value| value > 9) {
-        holes.push(json!({
-            "values_before_first": chain[0].value.unwrap() - 1,
-            "reason": "chain_starts_above_one",
-        }));
+        if let Some(holes) = &mut holes {
+            holes.push(json!({
+                "values_before_first": chain[0].value.unwrap() - 1,
+                "reason": "chain_starts_above_one",
+            }));
+        }
     }
     for pair in chain.windows(2) {
         let left = pair[0].value.unwrap();
@@ -2052,8 +2092,7 @@ fn repair_gaps(
             .filter(|(line_index, line)| {
                 !used_lines.contains(line_index)
                     && ((line.zone == Zone::Note && !line.region_witness_demoted)
-                        || ((line.note_column_fit
-                            || matches!(line.zone, Zone::Body | Zone::Other))
+                        || ((line.note_column_fit || line.zone == Zone::Body)
                             && pairing_support::has_legal_citation_cue(&line.text)))
             })
             .map(|(line_index, _)| line_index)
@@ -2104,11 +2143,13 @@ fn repair_gaps(
                 .collect();
             let rekeyed = sequence_position_rekey(&interval, &residual, lines, used_lines);
             if rekeyed.is_empty() {
-                for value in residual {
-                    holes.push(json!({
-                        "value": value,
-                        "reason": "no_confusable_glyph_in_window",
-                    }));
+                if let Some(holes) = &mut holes {
+                    for value in residual {
+                        holes.push(json!({
+                            "value": value,
+                            "reason": "no_confusable_glyph_in_window",
+                        }));
+                    }
                 }
             } else {
                 for candidate in &rekeyed {
@@ -2126,8 +2167,8 @@ fn repair_gaps(
     (result, holes)
 }
 
-fn note_zone_column_split(lines: &[PairLine], page: u32) -> Option<f64> {
-    let candidates: Vec<&PairLine> = lines
+fn note_zone_column_split(lines: &[PairLine<'_>], page: u32) -> Option<f64> {
+    let candidates: Vec<&PairLine<'_>> = lines
         .iter()
         .filter(|line| {
             line.page == page
@@ -2157,11 +2198,11 @@ fn note_zone_column_split(lines: &[PairLine], page: u32) -> Option<f64> {
     if right - left < 0.12 || !(0.25..=0.75).contains(&split) {
         return None;
     }
-    let left_lines: Vec<&&PairLine> = candidates
+    let left_lines: Vec<&&PairLine<'_>> = candidates
         .iter()
         .filter(|line| (line.bbox[0] + line.bbox[2]) / 2.0 / line.page_width < split)
         .collect();
-    let right_lines: Vec<&&PairLine> = candidates
+    let right_lines: Vec<&&PairLine<'_>> = candidates
         .iter()
         .filter(|line| (line.bbox[0] + line.bbox[2]) / 2.0 / line.page_width >= split)
         .collect();
@@ -2213,7 +2254,7 @@ fn recover_out_of_order_labels(
     mut chain: Vec<Candidate>,
     label_candidates: &[Candidate],
     used_lines: &mut HashSet<usize>,
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
 ) -> Vec<Candidate> {
     if chain.len() < 2 {
         return chain;
@@ -2243,7 +2284,7 @@ fn recover_out_of_order_labels(
         };
         let line = &lines[candidate.line];
         let noteish = (line.zone == Zone::Note && !line.region_witness_demoted)
-            || ((line.note_column_fit || matches!(line.zone, Zone::Body | Zone::Other))
+            || ((line.note_column_fit || line.zone == Zone::Body)
                 && pairing_support::has_legal_citation_cue(&line.text));
         if candidate.symbol.is_empty()
             && candidate.form == "plain"
@@ -2299,7 +2340,7 @@ fn recover_out_of_order_labels(
     chain
 }
 
-fn endnote_mode(chain: &[Candidate], lines: &[PairLine]) -> bool {
+fn endnote_mode(chain: &[Candidate], lines: &[PairLine<'_>]) -> bool {
     if chain.len() < ENDNOTE_MIN_LABELS {
         return false;
     }
@@ -2343,7 +2384,7 @@ struct RefState {
 fn select_refs(
     backbone: &[Candidate],
     refs: &[Candidate],
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     endnote: bool,
 ) -> (HashMap<u32, Candidate>, BTreeMap<String, usize>) {
     let mut drop_reasons = BTreeMap::<String, usize>::new();
@@ -2525,7 +2566,7 @@ fn repair_missing_refs(
     chosen: &mut HashMap<u32, Candidate>,
     backbone: &[Candidate],
     refs: &[Candidate],
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     endnote: bool,
 ) -> BTreeMap<String, usize> {
     let mut repair_counts = BTreeMap::<String, usize>::new();
@@ -2602,7 +2643,7 @@ fn repair_missing_refs(
             let left = candidate
                 .start
                 .checked_sub(1)
-                .and_then(|position| chars(&lines[candidate.line].text).get(position).copied());
+                .and_then(|position| lines[candidate.line].text.chars().nth(position));
             let repair_kind = if candidate.value == Some(value) {
                 "window_rescued"
             } else if confusable_variants(&candidate.observed).contains(&value) {
@@ -2655,7 +2696,7 @@ fn rekey_same_value_ref_runs(
     chosen: &mut HashMap<u32, Candidate>,
     backbone: &[Candidate],
     refs: &[Candidate],
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     endnote: bool,
 ) -> BTreeMap<String, usize> {
     let mut repair_counts = BTreeMap::<String, usize>::new();
@@ -2762,7 +2803,7 @@ fn rekey_same_value_ref_runs(
 fn repeated_refs(
     chosen: &HashMap<u32, Candidate>,
     refs: &[Candidate],
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
 ) -> HashMap<u32, Vec<Candidate>> {
     let primary: HashSet<(usize, usize, usize)> = chosen
         .values()
@@ -2787,7 +2828,7 @@ fn repeated_refs(
     result
 }
 
-fn label_only_supported(backbone: &[Candidate], position: usize, lines: &[PairLine]) -> bool {
+fn label_only_supported(backbone: &[Candidate], position: usize, lines: &[PairLine<'_>]) -> bool {
     let label = &backbone[position];
     label.zone_is_noteish(lines)
         && (label.score >= 1.5
@@ -2804,15 +2845,21 @@ fn label_only_supported(backbone: &[Candidate], position: usize, lines: &[PairLi
             }))
 }
 
-fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
-    let lines = legal_pdf_support::profile::measure("pair.build_lines", || build_lines(pages));
+fn build_pairs<'a>(
+    pages: &'a [Page],
+    protected_citation_spans: &'a BTreeMap<String, Vec<PdfSourceSpan>>,
+    include_audit: bool,
+) -> (Vec<Pair>, Vec<PairLine<'a>>, Option<Value>) {
+    let lines = legal_pdf_support::profile::measure("pair.build_lines", || {
+        build_lines(pages, protected_citation_spans)
+    });
     let refs = legal_pdf_support::profile::measure("pair.extract_refs", || extract_refs(&lines));
     let labels = legal_pdf_support::profile::measure("pair.extract_labels", || {
         extract_labels(&lines, &refs)
     });
     let (segments, backbone_summary) =
         legal_pdf_support::profile::measure("pair.select_segments", || {
-            select_segments(&labels, &lines)
+            select_segments(&labels, &lines, include_audit)
         });
     let mut segments: Vec<Vec<Candidate>> = segments
         .into_iter()
@@ -2824,10 +2871,13 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
         .flatten()
         .map(|candidate| candidate.line)
         .collect();
-    let mut sequence_holes = Vec::<Value>::new();
+    let mut sequence_holes = include_audit.then(Vec::<Value>::new);
     for segment in &mut segments {
-        let (repaired, holes) = repair_gaps(std::mem::take(segment), &lines, &mut used);
-        sequence_holes.extend(holes);
+        let (repaired, holes) =
+            repair_gaps(std::mem::take(segment), &lines, &mut used, include_audit);
+        if let (Some(sequence_holes), Some(holes)) = (&mut sequence_holes, holes) {
+            sequence_holes.extend(holes);
+        }
         *segment = recover_out_of_order_labels(repaired, &labels, &mut used, &lines);
     }
     segments.retain(|segment| !segment.is_empty());
@@ -2885,7 +2935,7 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
     let mut repeated_by_segment = Vec::<HashMap<u32, Vec<Candidate>>>::new();
     let mut suppressed = HashSet::<usize>::new();
     let mut suppressed_reasons = HashMap::<usize, &'static str>::new();
-    let mut numbered_diagnostics = Vec::<Value>::new();
+    let mut numbered_diagnostics = include_audit.then(Vec::<Value>::new);
     let mut ref_drop_reasons = BTreeMap::<String, usize>::new();
     let mut ref_repair_counts = BTreeMap::<String, usize>::new();
     for (segment_index, (segment, pool)) in segments.iter().zip(&pools).enumerate() {
@@ -2948,16 +2998,18 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
                 && noteish * 5 < segment.len()
                 && small * 5 < segment.len()
                 && segment_pages.len() * 10 >= article_pages.len() * 6;
-            numbered_diagnostics.push(json!({
-                "segment_index": segment_index,
-                "labels": segment.len(),
-                "chosen_refs": chosen.len(),
-                "noteish_labels": noteish,
-                "small_font_labels": small,
-                "segment_pages": segment_pages.len(),
-                "article_pages": article_pages.len(),
-                "suppressed": fired,
-            }));
+            if let Some(diagnostics) = &mut numbered_diagnostics {
+                diagnostics.push(json!({
+                    "segment_index": segment_index,
+                    "labels": segment.len(),
+                    "chosen_refs": chosen.len(),
+                    "noteish_labels": noteish,
+                    "small_font_labels": small,
+                    "segment_pages": segment_pages.len(),
+                    "article_pages": article_pages.len(),
+                    "suppressed": fired,
+                }));
+            }
             if fired {
                 suppressed.insert(segment_index);
                 suppressed_reasons.insert(segment_index, "numbered_paragraph_segment");
@@ -2976,7 +3028,7 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
             ref_bearing_values.extend(segment.iter().filter_map(|candidate| candidate.value));
         }
     }
-    let mut duplicate_diagnostics = Vec::<Value>::new();
+    let mut duplicate_diagnostics = include_audit.then(Vec::<Value>::new);
     for (segment_index, (segment, chosen)) in segments.iter().zip(&chosen_by_segment).enumerate() {
         if suppressed.contains(&segment_index) || segment.len() < 10 || !chosen.is_empty() {
             continue;
@@ -2997,22 +3049,24 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
             && segment_pages.len() <= 2
             && values.is_subset(&ref_bearing_values)
             && segment.len() * 5 >= page_lines * 2;
-        duplicate_diagnostics.push(json!({
-            "segment_index": segment_index,
-            "labels": segment.len(),
-            "segment_pages": segment_pages.len(),
-            "page_lines": page_lines,
-            "values_covered": values.intersection(&ref_bearing_values).count(),
-            "values_total": values.len(),
-            "suppressed": fired,
-        }));
+        if let Some(diagnostics) = &mut duplicate_diagnostics {
+            diagnostics.push(json!({
+                "segment_index": segment_index,
+                "labels": segment.len(),
+                "segment_pages": segment_pages.len(),
+                "page_lines": page_lines,
+                "values_covered": values.intersection(&ref_bearing_values).count(),
+                "values_total": values.len(),
+                "suppressed": fired,
+            }));
+        }
         if fired {
             suppressed.insert(segment_index);
             suppressed_reasons.insert(segment_index, "duplicate_valueset_zero_ref_segment");
         }
     }
 
-    let mut body_restart_diagnostics = Vec::<Value>::new();
+    let mut body_restart_diagnostics = include_audit.then(Vec::<Value>::new);
     for (segment_index, (segment, chosen)) in segments.iter().zip(&chosen_by_segment).enumerate() {
         if segment_index == 0 || suppressed.contains(&segment_index) || segment.len() < 6 {
             continue;
@@ -3031,15 +3085,17 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
             && values.is_subset(&ref_bearing_values)
             && chosen.len() * 3 <= segment.len()
             && (segment.len() - noteish) * 5 >= segment.len() * 3;
-        body_restart_diagnostics.push(json!({
-            "segment_index": segment_index,
-            "labels": segment.len(),
-            "chosen_refs": chosen.len(),
-            "noteish_labels": noteish,
-            "values_covered": values.intersection(&ref_bearing_values).count(),
-            "values_total": values.len(),
-            "suppressed": fired,
-        }));
+        if let Some(diagnostics) = &mut body_restart_diagnostics {
+            diagnostics.push(json!({
+                "segment_index": segment_index,
+                "labels": segment.len(),
+                "chosen_refs": chosen.len(),
+                "noteish_labels": noteish,
+                "values_covered": values.intersection(&ref_bearing_values).count(),
+                "values_total": values.len(),
+                "suppressed": fired,
+            }));
+        }
         if fired {
             suppressed.insert(segment_index);
             suppressed_reasons.insert(segment_index, "body_zone_restart_segment");
@@ -3159,9 +3215,10 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
     }
 
     pairs.sort_by_key(|pair| pair.label.pos(&lines));
-    let marker_count = pairs.len() + pairs.iter().map(|pair| pair.refs.len()).sum::<usize>();
-    let label_only = pairs.len().saturating_sub(paired_count);
-    let summary = json!({
+    let summary = include_audit.then(|| {
+        let marker_count = pairs.len() + pairs.iter().map(|pair| pair.refs.len()).sum::<usize>();
+        let label_only = pairs.len().saturating_sub(paired_count);
+        json!({
         "schema_version": "oajd.footnote_pairing_v2.v1",
         "engine": "tools.footnotes.footnote_pairing_v2",
         "line_count": lines.len(),
@@ -3184,11 +3241,11 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
             "endnote_mode": endnote,
             "segment_count": segments.len(),
             "skipped_marker_counts": skipped,
-            "numbered_paragraph_guard": numbered_diagnostics,
-            "duplicate_valueset_guard": duplicate_diagnostics,
-            "body_zone_restart_guard": body_restart_diagnostics,
-            "label_backbone": backbone_summary,
-            "sequence_holes": sequence_holes,
+            "numbered_paragraph_guard": numbered_diagnostics.expect("audit enabled"),
+            "duplicate_valueset_guard": duplicate_diagnostics.expect("audit enabled"),
+            "body_zone_restart_guard": body_restart_diagnostics.expect("audit enabled"),
+            "label_backbone": backbone_summary.expect("audit enabled"),
+            "sequence_holes": sequence_holes.expect("audit enabled"),
             "monotone_ref_sequence": {"drop_reason_counts": ref_drop_reasons},
             "ref_repair_counts": ref_repair_counts,
         },
@@ -3205,11 +3262,12 @@ fn build_pairs(pages: &[Page]) -> (Vec<Pair>, Vec<PairLine>, Value) {
                 "materialize"
             ]
         },
+        })
     });
     (pairs, lines, summary)
 }
 
-fn merge_detached_references(pairs: &mut [Pair], lines: &[PairLine]) -> usize {
+fn merge_detached_references(pairs: &mut [Pair], lines: &[PairLine<'_>]) -> usize {
     let mut existing: HashSet<(usize, usize, usize, String)> = pairs
         .iter()
         .flat_map(|pair| pair.refs.iter())
@@ -3224,26 +3282,16 @@ fn merge_detached_references(pairs: &mut [Pair], lines: &[PairLine]) -> usize {
         .collect();
     let mut added = 0;
     for (line_index, line) in lines.iter().enumerate() {
-        for detached in &line.detached_references {
-            let Some(raw) = detached.get("note_id").and_then(Value::as_str) else {
-                continue;
-            };
+        for detached in line.detached_references.iter() {
+            let raw = detached.note_id.as_str();
             let value = numeric_value(raw);
             let symbol = value.map_or_else(|| normalize_symbol(raw), |_| String::new());
             if value.is_none() && symbol.is_empty() {
                 continue;
             }
             let note_id = value.map_or_else(|| symbol.clone(), |number| number.to_string());
-            let start = detached
-                .get("start_offset")
-                .and_then(Value::as_u64)
-                .and_then(|offset| usize::try_from(offset).ok())
-                .unwrap_or(0);
-            let end = detached
-                .get("end_offset")
-                .and_then(Value::as_u64)
-                .and_then(|offset| usize::try_from(offset).ok())
-                .unwrap_or(start);
+            let start = detached.start_offset;
+            let end = detached.end_offset;
             let key = (line_index, start, end, note_id.clone());
             if existing.contains(&key) {
                 continue;
@@ -3271,11 +3319,7 @@ fn merge_detached_references(pairs: &mut [Pair], lines: &[PairLine]) -> usize {
                 line: line_index,
                 start,
                 end,
-                observed: detached
-                    .get("selected_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or(raw)
-                    .to_owned(),
+                observed: detached.selected_text.clone(),
                 value,
                 symbol,
                 form: "detached",
@@ -3321,7 +3365,7 @@ fn normalized_observed(value: &str) -> String {
 
 fn canonical_marker_row(
     candidate: &Candidate,
-    lines: &[PairLine],
+    lines: &[PairLine<'_>],
     role: &str,
     marker_id: String,
     strategy: &str,
@@ -3443,7 +3487,7 @@ fn insert_shared_marker_fields(
     );
 }
 
-fn pair_markers(pairs: &[Pair], lines: &[PairLine]) -> Vec<Value> {
+fn pair_markers(pairs: &[Pair], lines: &[PairLine<'_>]) -> Vec<Value> {
     let mut ordered_pairs: Vec<&Pair> = pairs.iter().collect();
     ordered_pairs.sort_by(|left, right| left.pair_id.cmp(&right.pair_id));
     let mut rows = Vec::<Value>::new();
@@ -3601,22 +3645,12 @@ fn pair_markers(pairs: &[Pair], lines: &[PairLine]) -> Vec<Value> {
         .collect();
     let mut detached_count = 0;
     for (line_index, line) in lines.iter().enumerate() {
-        for detached in &line.detached_references {
-            let Some(raw) = detached.get("note_id").and_then(Value::as_str) else {
-                continue;
-            };
+        for detached in line.detached_references.iter() {
+            let raw = detached.note_id.as_str();
             let note_id =
                 numeric_value(raw).map_or_else(|| normalize_symbol(raw), |n| n.to_string());
-            let start = detached
-                .get("start_offset")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0);
-            let end = detached
-                .get("end_offset")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(start);
+            let start = detached.start_offset;
+            let end = detached.end_offset;
             let Some(pair) = detached_pairs.get(&(line_index, start, end, note_id.clone())) else {
                 continue;
             };
@@ -3627,7 +3661,7 @@ fn pair_markers(pairs: &[Pair], lines: &[PairLine]) -> Vec<Value> {
                 "role": "fn_ref",
                 "safe_to_use": true,
                 "note_id": note_id,
-                "selected_text": detached.get("selected_text").and_then(Value::as_str).unwrap_or(raw),
+                "selected_text": detached.selected_text,
                 "line_id": line.id,
                 "region_id": line.region_id,
                 "region_type": line.region_type,
@@ -3802,15 +3836,9 @@ fn refresh_summary(summary: &mut Value, markers: &[Value]) {
 
 fn materialize(
     pairs: Vec<Pair>,
-    lines: &[PairLine],
-    pages: &[Page],
-    summary: Value,
+    lines: &[PairLine<'_>],
+    pairing_audit: Option<PdfPairingAudit>,
 ) -> PairingOutput {
-    let original: HashMap<&str, &Line> = pages
-        .iter()
-        .flat_map(|page| page.lines.iter())
-        .map(|line| (line.id.as_str(), line))
-        .collect();
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     let continuation_pages: HashSet<u32> = lines
         .iter()
@@ -3844,13 +3872,9 @@ fn materialize(
         let stop = next
             .filter(|value| pair.endnote || allowed_pages.contains(&lines[value.label.line].page))
             .map_or(usize::MAX, |value| lines[value.label.line].idx);
-        let mut body_lines: Vec<&PairLine> = lines[label_line.idx..stop.min(lines.len())]
+        let mut body_lines: Vec<&PairLine<'_>> = lines[label_line.idx..stop.min(lines.len())]
             .iter()
-            .filter(|line| {
-                allowed_pages.contains(&line.page)
-                    && line.region_type == "footnote"
-                    && !line.exclude_from_body
-            })
+            .filter(|line| allowed_pages.contains(&line.page) && line.region_type == "footnote")
             .collect();
         if !pair.endnote && !label_line.region_id.is_empty() {
             let mut accepted = HashSet::from([label_line.region_id.as_str()]);
@@ -3864,7 +3888,7 @@ fn materialize(
                 }
             }
             let mut bounded = Vec::new();
-            let mut prior: Option<&PairLine> = None;
+            let mut prior: Option<&PairLine<'_>> = None;
             let mut blocked = false;
             for line in body_lines {
                 if line.page != label_line.page {
@@ -3876,12 +3900,8 @@ fn materialize(
                     if let Some(previous) = prior {
                         let height = previous.height().max(1.0);
                         let gap = line.bbox[1] - previous.bbox[3];
-                        let previous_size = original
-                            .get(previous.id.as_str())
-                            .map_or(0.0, |line| line_font_size(line));
-                        let size = original
-                            .get(line.id.as_str())
-                            .map_or(0.0, |line| line_font_size(line));
+                        let previous_size = line_font_size(previous.line);
+                        let size = line_font_size(line.line);
                         include = gap <= (3.0_f64).max(height * 0.5)
                             && previous_size > 0.0
                             && (previous_size * 0.75..=previous_size * 1.25).contains(&size);
@@ -3901,18 +3921,16 @@ fn materialize(
         }
         let mut parts = Vec::new();
         for line in &body_lines {
-            let mut text = line.text.clone();
+            let mut text = line.text.as_str();
             if line.id == label_line.id {
-                let body_start = label_token(&text)
+                let body_start = label_token(text)
                     .filter(|token| {
                         token.start == pair.label.start && token.value == pair.label.value
                     })
                     .map_or(pair.label.end, |token| token.match_end);
-                text = char_slice(&text, body_start, text.chars().count())
-                    .trim_start_matches(|character: char| {
-                        character.is_whitespace() || ".)],:;-".contains(character)
-                    })
-                    .to_owned();
+                text = char_slice(text, body_start, text.chars().count()).trim_start_matches(
+                    |character: char| character.is_whitespace() || ".)],:;-".contains(character),
+                );
             }
             if text.is_empty() {
                 continue;
@@ -4010,41 +4028,53 @@ fn materialize(
         diagnostics,
         anchors,
         pair_claims,
-        markers: Vec::new(),
-        summary,
+        pairing_audit,
     }
 }
 
-pub fn pair_footnotes(pages: &[Page]) -> PairingOutput {
-    let (mut pairs, lines, mut summary) =
-        legal_pdf_support::profile::measure("pair.build_pairs", || build_pairs(pages));
+pub fn pair_footnotes(
+    pages: &[Page],
+    protected_citation_spans: &BTreeMap<String, Vec<PdfSourceSpan>>,
+    include_audit: bool,
+) -> PairingOutput {
+    let (mut pairs, lines, summary) =
+        legal_pdf_support::profile::measure("pair.build_pairs", || {
+            build_pairs(pages, protected_citation_spans, include_audit)
+        });
     let detached = legal_pdf_support::profile::measure("pair.merge_detached", || {
         merge_detached_references(&mut pairs, &lines)
     });
-    summary["detached_reference_count"] = json!(detached);
-    let markers =
-        legal_pdf_support::profile::measure("pair.markers", || pair_markers(&pairs, &lines));
-    legal_pdf_support::profile::measure("pair.refresh_summary", || {
-        refresh_summary(&mut summary, &markers)
+    let pairing_audit = summary.map(|mut summary| {
+        summary["detached_reference_count"] = json!(detached);
+        let markers =
+            legal_pdf_support::profile::measure("pair.markers", || pair_markers(&pairs, &lines));
+        legal_pdf_support::profile::measure("pair.refresh_summary", || {
+            refresh_summary(&mut summary, &markers)
+        });
+        PdfPairingAudit {
+            markers,
+            pairing_summary: summary,
+        }
     });
-    let mut output = legal_pdf_support::profile::measure("pair.materialize", || {
-        materialize(pairs, &lines, pages, summary)
-    });
-    output.markers = markers;
-    output
+    legal_pdf_support::profile::measure("pair.materialize", || {
+        materialize(pairs, &lines, pairing_audit)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    static NO_CITATIONS: BTreeMap<String, Vec<PdfSourceSpan>> = BTreeMap::new();
+
     #[test]
     fn empty_input_keeps_the_oracle_empty_identity() {
-        let output = pair_footnotes(&[]);
+        let output = pair_footnotes(&[], &NO_CITATIONS, true);
+        let summary = &output.pairing_audit.unwrap().pairing_summary;
 
-        assert_eq!(output.summary["dataset"], "");
-        assert_eq!(output.summary["article_id"], "");
-        assert_eq!(output.summary["selected_image_count"], 0);
+        assert_eq!(summary["dataset"], "");
+        assert_eq!(summary["article_id"], "");
+        assert_eq!(summary["selected_image_count"], 0);
     }
 
     #[test]
@@ -4065,34 +4095,20 @@ mod tests {
 
     #[test]
     fn native_superscript_symbol_runs_are_reference_candidates() {
-        let line = PairLine {
-            idx: 0,
-            page: 1,
-            page_index: 0,
-            order: 1,
-            id: "byline".to_owned(),
-            region_id: String::new(),
-            region_type: "heading".to_owned(),
-            text: "AUTHOR ****".to_owned(),
-            bbox: [0.0, 0.0, 100.0, 10.0],
-            page_width: 100.0,
-            page_height: 100.0,
-            zone: Zone::Title,
-            protected_spans: Vec::new(),
-            outline_spans: Vec::new(),
-            note_column_fit: false,
-            small_font: false,
-            prose_like: false,
-            region_witness_demoted: false,
-            native_superscript_spans: vec![(7, 11)],
-            suppress_footnote_label: false,
-            exclude_from_body: false,
-            note_region_mode: String::new(),
-            note_sequence_restart: false,
-            detached_references: Vec::new(),
-        };
-
-        let candidates = extract_refs(&[line]);
+        let page: Page = serde_json::from_value(json!({
+            "id": "p0001", "index": 0, "number": 1, "width": 100.0, "height": 100.0,
+            "regions": [],
+            "lines": [{
+                "id": "byline", "page_index": 0, "page_number": 1, "source_index": 1,
+                "reading_order": 1, "block_index": 1, "text": "AUTHOR ****",
+                "bbox": [0.0, 0.0, 100.0, 10.0], "region_type": "heading",
+                "spans": [{"id": "marker", "text": "****", "bbox": [70.0, 0.0, 100.0, 5.0],
+                    "superscript": true, "start": 7, "end": 11}]
+            }]
+        }))
+        .unwrap();
+        let lines = build_lines(std::slice::from_ref(&page), &NO_CITATIONS);
+        let candidates = extract_refs(&lines);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].symbol, "****");
@@ -4134,7 +4150,7 @@ mod tests {
         }))
         .unwrap();
 
-        let lines = build_lines(&[page]);
+        let lines = build_lines(&[page], &NO_CITATIONS);
 
         assert_eq!(
             lines.iter().map(|line| line.idx).collect::<Vec<_>>(),
@@ -4175,11 +4191,11 @@ mod tests {
             "regions": []
         }))
         .unwrap();
-        let lines = build_lines(&[page]);
+        let lines = build_lines(&[page], &NO_CITATIONS);
         let refs = extract_refs(&lines);
 
         assert_eq!(lines[0].zone, Zone::Body);
-        assert!(lines[0].suppress_footnote_label);
+        assert!(lines[0].edge_folio);
         assert!(extract_labels(&lines, &refs).is_empty());
     }
 
@@ -4220,7 +4236,7 @@ mod tests {
         }))
         .unwrap();
 
-        let output = pair_footnotes(&[page]);
+        let output = pair_footnotes(&[page], &NO_CITATIONS, true);
 
         assert!(output.footnotes.is_empty());
     }
@@ -4262,7 +4278,7 @@ mod tests {
             "regions": []
         }))
         .unwrap();
-        let lines = build_lines(std::slice::from_ref(&page));
+        let lines = build_lines(std::slice::from_ref(&page), &NO_CITATIONS);
         let candidate = |line: usize, value: u32| Candidate {
             line,
             start: 0,
@@ -4290,7 +4306,7 @@ mod tests {
             provenance: "test".to_owned(),
         };
 
-        let output = materialize(vec![pair(0, 1), pair(3, 2)], &lines, &[page], json!({}));
+        let output = materialize(vec![pair(0, 1), pair(3, 2)], &lines, json!({}));
 
         assert_eq!(
             output.footnotes[0].body_line_ids,
@@ -4311,38 +4327,30 @@ mod tests {
 
     #[test]
     fn monotone_backbone_ignores_a_high_scoring_out_of_sequence_number() {
-        let lines = ["1 One", "99 Noise", "2 Two", "3 Three"]
+        let source_lines = ["1 One", "99 Noise", "2 Two", "3 Three"]
             .into_iter()
             .enumerate()
-            .map(|(idx, text)| PairLine {
-                idx,
-                page: 1,
-                page_index: 0,
-                order: idx + 1,
-                id: format!("l{idx}"),
-                region_id: String::new(),
-                region_type: "footnote".to_owned(),
-                text: text.to_owned(),
-                bbox: [0.0, idx as f64, 10.0, idx as f64 + 1.0],
-                page_width: 100.0,
-                page_height: 100.0,
-                zone: Zone::Note,
-                protected_spans: Vec::new(),
-                outline_spans: Vec::new(),
-                note_column_fit: true,
-                small_font: true,
-                prose_like: false,
-                region_witness_demoted: false,
-                native_superscript_spans: Vec::new(),
-                suppress_footnote_label: false,
-                exclude_from_body: false,
-                note_region_mode: "footnote".to_owned(),
-                note_sequence_restart: false,
-                detached_references: Vec::new(),
+            .map(|(idx, text)| {
+                json!({
+                    "id": format!("l{idx}"), "page_index": 0, "page_number": 1,
+                    "source_index": idx + 1, "reading_order": idx + 1, "block_index": 1,
+                    "text": text, "bbox": [0.0, idx as f64, 10.0, idx as f64 + 1.0],
+                    "region_type": "footnote", "note_region_mode": "footnote"
+                })
             })
             .collect::<Vec<_>>();
+        let page: Page = serde_json::from_value(json!({
+            "id": "p0001", "index": 0, "number": 1, "width": 100.0, "height": 100.0,
+            "lines": source_lines, "regions": []
+        }))
+        .unwrap();
+        let mut lines = build_lines(std::slice::from_ref(&page), &NO_CITATIONS);
+        for line in &mut lines {
+            line.note_column_fit = true;
+            line.small_font = true;
+        }
         let candidates = extract_labels(&lines, &[]);
-        let (chain, _) = select_backbone(&candidates, &lines);
+        let (chain, _) = select_backbone(&candidates, &lines, false);
         assert_eq!(
             chain
                 .iter()
@@ -4409,8 +4417,8 @@ mod tests {
         assert!(isolated_inline_references(&line(0.0)).is_empty());
         let evidence = isolated_inline_references(&line(4.0));
         assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0]["note_id"], "7");
-        assert_eq!(evidence[0]["start_offset"], 9);
-        assert_eq!(evidence[0]["end_offset"], 10);
+        assert_eq!(evidence[0].note_id, "7");
+        assert_eq!(evidence[0].start_offset, 9);
+        assert_eq!(evidence[0].end_offset, 10);
     }
 }

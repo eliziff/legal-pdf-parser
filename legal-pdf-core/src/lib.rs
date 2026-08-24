@@ -16,7 +16,7 @@ pub use ort_backend::OrtBackend;
 #[doc(hidden)]
 pub use ort_runtime::init as init_ort_runtime;
 pub use storage::{
-    atomic_write_with, python_json, read_gzip_json, write_gzip_bytes, write_gzip_json, write_json,
+    atomic_write_with, python_json, read_gzip_json, write_gzip_json, write_json,
 };
 
 pub fn line_font_size(line: &model::Line) -> f64 {

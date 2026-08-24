@@ -1,31 +1,8 @@
 use legal_pdf_core::model::LegalDocument;
 use legal_pdf_core::{Error, Result};
+use legal_structure::ScalarText;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-
-fn anchor_pair_id(anchor: &Value) -> Result<String> {
-    anchor
-        .get("pair_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| Error::Message("footnote anchor has no pair_id".to_owned()))
-}
-
-fn anchor_offset(anchor: &Value) -> Result<usize> {
-    anchor
-        .get("offset")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .ok_or_else(|| Error::Message("footnote anchor has no offset".to_owned()))
-}
-
-fn char_to_byte(value: &str, index: usize) -> Option<usize> {
-    if index == value.chars().count() {
-        Some(value.len())
-    } else {
-        value.char_indices().nth(index).map(|(offset, _)| offset)
-    }
-}
 
 fn replace_first(value: &mut String, needle: &str, replacement: &str) -> Option<usize> {
     let byte = value.find(needle)?;
@@ -52,9 +29,7 @@ pub fn to_alr_payload(document: &LegalDocument) -> Value {
             let mut text = paragraph.text.clone();
             let mut anchors = Vec::new();
             for anchor in &paragraph.anchors {
-                let Some(pair_id) = anchor.get("pair_id").and_then(Value::as_str) else {
-                    continue;
-                };
+                let pair_id = anchor.pair_id.as_str();
                 let Some(internal) = internal_by_pair.get(pair_id) else {
                     continue;
                 };
@@ -90,7 +65,6 @@ pub fn to_alr_payload(document: &LegalDocument) -> Value {
         "metadata": {
             "legalpdf_document_id": document.document_id,
             "legalpdf_source_sha256": document.source_sha256,
-            "pairing_summary": document.metadata.get("pairing").cloned().unwrap_or_else(|| json!({})),
             "pdf_line_count": document.line_count(),
             "legalpdf_usable_footnotes": usable.len(),
             "legalpdf_omitted_unusable_footnotes": document.footnotes.len() - usable.len(),
@@ -107,17 +81,18 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
         .collect();
     let mut units = Vec::with_capacity(document.paragraphs.len() + document.footnotes.len());
     for (ordinal, paragraph) in document.paragraphs.iter().enumerate() {
+        let coordinates = ScalarText::new(&paragraph.text);
         let mut anchors = paragraph.anchors.iter().collect::<Vec<_>>();
-        anchors.sort_by_key(|anchor| anchor_offset(anchor).unwrap_or(usize::MAX));
+        anchors.sort_by_key(|anchor| anchor.offset);
         let mut rendered = String::new();
         let mut references = Vec::new();
         let mut cursor = 0;
         let mut clean_length = 0;
         for anchor in anchors {
-            let pair_id = anchor_pair_id(anchor)?;
+            let pair_id = &anchor.pair_id;
             let marker = format!("⟦FN:{pair_id}⟧");
-            let start = anchor_offset(anchor)?;
-            let byte_start = char_to_byte(&paragraph.text, start).ok_or_else(|| {
+            let start = anchor.offset;
+            let byte_start = coordinates.byte_at_scalar(start).ok_or_else(|| {
                 Error::Message(format!("Invalid footnote anchor in {}", paragraph.id))
             })?;
             if !paragraph.text[byte_start..].starts_with(&marker) {
@@ -126,7 +101,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
                     paragraph.id
                 )));
             }
-            let byte_cursor = char_to_byte(&paragraph.text, cursor).ok_or_else(|| {
+            let byte_cursor = coordinates.byte_at_scalar(cursor).ok_or_else(|| {
                 Error::Message(format!("Invalid footnote anchor in {}", paragraph.id))
             })?;
             let segment = &paragraph.text[byte_cursor..byte_start];
@@ -141,7 +116,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
             references.push(json!([internal, clean_length]));
             cursor = start + marker.chars().count();
         }
-        let byte_cursor = char_to_byte(&paragraph.text, cursor).ok_or_else(|| {
+        let byte_cursor = coordinates.byte_at_scalar(cursor).ok_or_else(|| {
             Error::Message(format!("Invalid footnote anchor in {}", paragraph.id))
         })?;
         rendered.push_str(&paragraph.text[byte_cursor..]);
@@ -171,7 +146,9 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legal_pdf_core::model::{Footnote, Paragraph, PARSER_VERSION, SCHEMA_VERSION};
+    use legal_pdf_core::model::{
+        Footnote, Paragraph, ParagraphAnchor, PARSER_VERSION, SCHEMA_VERSION,
+    };
 
     fn note(pair_id: &str, body: &str, usable: bool) -> Footnote {
         Footnote {
@@ -213,8 +190,16 @@ mod tests {
                 page_index: 0,
                 region_type: "body".to_owned(),
                 anchors: vec![
-                    json!({"pair_id": first, "offset": 5}),
-                    json!({"pair_id": second, "offset": 5 + first_marker.chars().count() + 5}),
+                    ParagraphAnchor {
+                        pair_id: first.to_owned(),
+                        label: "1".to_owned(),
+                        offset: 5,
+                    },
+                    ParagraphAnchor {
+                        pair_id: second.to_owned(),
+                        label: "2".to_owned(),
+                        offset: 5 + first_marker.chars().count() + 5,
+                    },
                 ],
                 text,
                 line_ids: vec!["body-line".to_owned()],
@@ -224,18 +209,13 @@ mod tests {
                 note(second, "Second note.", true),
                 note("omitted", "No reference.", false),
             ],
-            tables: vec![],
-            images: vec![],
             structure_graph: serde_json::from_value(serde_json::json!({
                 "schema_version": "legalpdf.document-structure.v1", "document_id": "doc",
                 "offset_unit": "utf16", "text": "", "text_sha256": "00",
                 "scope": {"kind": "complete"}, "origins": [], "nodes": [], "diagnostics": []
             }))
             .unwrap(),
-            pdf_source_map: Default::default(),
-            pairing_audit: None,
             diagnostics: vec![],
-            repairs: vec![],
             metadata: Map::new(),
             provenance: Map::new(),
             schema_version: SCHEMA_VERSION.to_owned(),

@@ -1,8 +1,9 @@
 use crate::grammar_tables::{compile_table_entry, find_table_matches};
 use crate::{Error, Result};
 use fancy_regex::Regex;
+use legal_structure::ScalarText;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const REPORTER_IDS: &[&str] = &[
@@ -89,7 +90,7 @@ fn masked_ranges(text: &str) -> Result<Vec<(usize, usize)>> {
         .collect())
 }
 
-fn top_level_indices(text: &str) -> Result<HashSet<usize>> {
+fn top_level_indices(text: &str) -> Result<Vec<bool>> {
     let masked = masked_ranges(text)?;
     let mut masked_index = 0;
     let mut round_depth = 0;
@@ -97,7 +98,7 @@ fn top_level_indices(text: &str) -> Result<HashSet<usize>> {
     let mut curly_depth = 0;
     let mut smart_quote = false;
     let mut straight_quote = false;
-    let mut positions = HashSet::new();
+    let mut positions = vec![false; text.len() + 1];
     for (index, character) in text.char_indices() {
         while masked_index < masked.len() && index >= masked[masked_index].1 {
             masked_index += 1;
@@ -114,7 +115,7 @@ fn top_level_indices(text: &str) -> Result<HashSet<usize>> {
             && square_depth == 0
             && curly_depth == 0
         {
-            positions.insert(index);
+            positions[index] = true;
         }
         match character {
             '“' => smart_quote = true,
@@ -132,18 +133,13 @@ fn top_level_indices(text: &str) -> Result<HashSet<usize>> {
     Ok(positions)
 }
 
-fn top_level_semicolons(text: &str) -> Result<Vec<usize>> {
-    let top = top_level_indices(text)?;
-    Ok(text
-        .char_indices()
-        .filter_map(|(index, character)| {
-            (character == ';' && top.contains(&index)).then_some(index)
-        })
-        .collect())
+fn top_level_semicolons(text: &str, top: &[bool]) -> Vec<usize> {
+    text.char_indices()
+        .filter_map(|(index, character)| (character == ';' && top[index]).then_some(index))
+        .collect()
 }
 
-fn top_level_signals(text: &str) -> Result<Vec<usize>> {
-    let top = top_level_indices(text)?;
+fn top_level_signals(text: &str, top: &[bool]) -> Result<Vec<usize>> {
     let mut positions = Vec::new();
     let regex = pattern("signal.source")?;
     for captures in regex.captures_iter(text) {
@@ -152,7 +148,7 @@ fn top_level_signals(text: &str) -> Result<Vec<usize>> {
             .name("sentence")
             .or_else(|| captures.name("inline"))
             .expect("signal grammar has a named branch");
-        if top.contains(&matched.start()) {
+        if top[matched.start()] {
             positions.push(matched.start());
         }
     }
@@ -240,10 +236,6 @@ fn trim_bounds(text: &str, mut start: usize, mut end: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn byte_to_char(text: &str, byte: usize) -> usize {
-    text[..byte].chars().count()
-}
-
 fn back_chars(text: &str, end: usize, count: usize) -> usize {
     text[..end]
         .char_indices()
@@ -252,7 +244,12 @@ fn back_chars(text: &str, end: usize, count: usize) -> usize {
         .map_or(0, |(index, _)| index)
 }
 
-fn clause(start: usize, end: usize, text: &str) -> Result<Option<DeterministicPart>> {
+fn clause(
+    start: usize,
+    end: usize,
+    text: &str,
+    coordinates: &ScalarText<'_>,
+) -> Result<Option<DeterministicPart>> {
     let (start, end) = trim_bounds(text, start, end);
     if start >= end {
         return Ok(None);
@@ -260,8 +257,10 @@ fn clause(start: usize, end: usize, text: &str) -> Result<Option<DeterministicPa
     let value = &text[start..end];
     if is_full_match("ref.pure.splitter", value)? {
         return Ok(Some(DeterministicPart {
-            start: byte_to_char(text, start),
-            end: byte_to_char(text, end),
+            start: coordinates
+                .scalar_at_byte(start)
+                .expect("citation boundary"),
+            end: coordinates.scalar_at_byte(end).expect("citation boundary"),
             text: value.to_owned(),
             anchors: vec!["reference".to_owned()],
         }));
@@ -271,15 +270,17 @@ fn clause(start: usize, end: usize, text: &str) -> Result<Option<DeterministicPa
         return Ok(None);
     }
     Ok(Some(DeterministicPart {
-        start: byte_to_char(text, start),
-        end: byte_to_char(text, end),
+        start: coordinates
+            .scalar_at_byte(start)
+            .expect("citation boundary"),
+        end: coordinates.scalar_at_byte(end).expect("citation boundary"),
         text: value.to_owned(),
         anchors: values.into_iter().map(|item| item.2).collect(),
     }))
 }
 
-fn strip_signals(text: &str) -> Result<String> {
-    let mut value = text.trim().to_owned();
+fn strip_signals(text: &str) -> Result<&str> {
+    let mut value = text.trim();
     let regex = pattern("signal.prefix.splitter")?;
     for _ in 0..3 {
         let Some(matched) = regex
@@ -291,11 +292,11 @@ fn strip_signals(text: &str) -> Result<String> {
         if matched.start() != 0 {
             break;
         }
-        let stripped = value[matched.end()..].to_owned();
+        let stripped = &value[matched.end()..];
         if stripped == value {
             break;
         }
-        value = stripped.trim().to_owned();
+        value = stripped.trim();
     }
     Ok(value)
 }
@@ -308,21 +309,20 @@ fn pin_values(value: &str, expand_ranges: bool) -> Vec<String> {
     let numbers = NUMBERS.get_or_init(|| regex::Regex::new(r"\d+(?:\.\d+)?").unwrap());
     let mut result = Vec::new();
     for item in items.split(value) {
-        let numbers = numbers
-            .find_iter(item)
-            .map(|matched| matched.as_str())
-            .collect::<Vec<_>>();
-        let Some(first) = numbers.first() else {
+        let mut numbers = numbers.find_iter(item).map(|matched| matched.as_str());
+        let Some(first) = numbers.next() else {
             continue;
         };
-        result.push((*first).to_owned());
-        if !expand_ranges || numbers.len() < 2 || first.contains('.') || numbers[1].contains('.') {
+        result.push(first.to_owned());
+        if !expand_ranges || first.contains('.') {
             continue;
         }
+        let Some(end_text) = numbers.next().filter(|value| !value.contains('.')) else {
+            continue;
+        };
         let Ok(start) = first.parse::<u32>() else {
             continue;
         };
-        let end_text = numbers[1];
         let end = if end_text.len() < first.len() {
             let magnitude = 10_u32.pow(end_text.len() as u32);
             let mut end = start - start % magnitude + end_text.parse::<u32>().unwrap_or(start);
@@ -392,14 +392,14 @@ fn pinpoints(text: &str, kind: &str) -> Result<(Vec<String>, Vec<u32>)> {
         }
     }
     if law_source || unresolved {
-        let reporter_spans = REPORTER_IDS
-            .iter()
-            .map(|id| find_matches(id, text))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .map(|matched| (matched.start(), matched.end()))
-            .collect::<Vec<_>>();
+        let mut reporter_spans = Vec::new();
+        for &id in REPORTER_IDS {
+            reporter_spans.extend(
+                find_matches(id, text)?
+                    .into_iter()
+                    .map(|matched| (matched.start(), matched.end())),
+            );
+        }
         let regex = pattern("pinpoint.section.splitter")?;
         for captures in regex.captures_iter(text) {
             let captures = captures.map_err(|error| Error::Message(error.to_string()))?;
@@ -456,17 +456,18 @@ fn short_form(text: &str, kind: &str) -> Result<String> {
         .is_match(text)
         .map_err(|error| Error::Message(error.to_string()))?
     {
-        if find_matches("ref.token", text)?
-            .into_iter()
+        let references = find_matches("ref.token", text)?;
+        if references
+            .iter()
             .any(|matched| matched.as_str().eq_ignore_ascii_case("ibid"))
         {
             return Ok("Ibid".to_owned());
         }
-        let prefix = find_matches("ref.token", text)?
+        let prefix = references
             .into_iter()
             .find(|matched| matched.as_str().eq_ignore_ascii_case("supra"))
             .map_or(text, |matched| &text[..matched.start()]);
-        return Ok(trim_chars(strip_signals(prefix)?.as_str()).to_owned());
+        return Ok(trim_chars(strip_signals(prefix)?).to_owned());
     }
     if matches!(kind, "journal" | "book" | "essay_collection" | "report") {
         let quote = [text.find('"'), text.find('“')].into_iter().flatten().min();
@@ -489,7 +490,7 @@ fn short_form(text: &str, kind: &str) -> Result<String> {
         let tokens = TOKENS
             .get_or_init(|| regex::Regex::new(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*").unwrap());
         let mut surnames = Vec::new();
-        for author in authors.split(&prefix) {
+        for author in authors.split(prefix) {
             let values = tokens
                 .find_iter(author)
                 .map(|matched| matched.as_str())
@@ -546,22 +547,22 @@ fn has_embedded_source_signal(text: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn inside_quotes(text: &str, position: usize) -> bool {
-    let mut inside = false;
-    for character in text[..position].chars() {
+fn enclosure_states(text: &str) -> Vec<(bool, bool)> {
+    let mut states = vec![(false, false); text.len() + 1];
+    let (mut quoted, mut bracketed) = (false, false);
+    for (position, character) in text.char_indices() {
+        states[position] = (quoted, bracketed);
         match character {
-            '“' => inside = true,
-            '”' => inside = false,
-            '"' => inside = !inside,
+            '“' => quoted = true,
+            '”' => quoted = false,
+            '"' => quoted = !quoted,
+            '[' => bracketed = true,
+            ']' => bracketed = false,
             _ => {}
         }
     }
-    inside
-}
-
-fn inside_square_brackets(text: &str, position: usize) -> bool {
-    let prefix = &text[..position];
-    prefix.rfind('[') > prefix.rfind(']')
+    states[text.len()] = (quoted, bracketed);
+    states
 }
 
 fn source_evidence(text: &str) -> Result<bool> {
@@ -590,7 +591,7 @@ fn source_evidence(text: &str) -> Result<bool> {
         .is_match(text))
 }
 
-fn sentence_starts(text: &str) -> Result<Vec<usize>> {
+fn sentence_starts(text: &str, enclosure: &[(bool, bool)]) -> Result<Vec<usize>> {
     let mut starts = Vec::new();
     static ABBREVIATION: OnceLock<regex::Regex> = OnceLock::new();
     static CORPORATE: OnceLock<regex::Regex> = OnceLock::new();
@@ -602,7 +603,7 @@ fn sentence_starts(text: &str) -> Result<Vec<usize>> {
         .get_or_init(|| regex::Regex::new(r"(?i)\b(?:Ltd|Inc|Corp|Co|LLC|LLP)\.$").unwrap());
     let versus = VERSUS.get_or_init(|| regex::Regex::new(r"(?i)^v\.?(?:\s|$)").unwrap());
     for matched in find_matches("boundary.sentence.splitter", text)? {
-        if inside_quotes(text, matched.start()) {
+        if enclosure[matched.start()].0 {
             continue;
         }
         let prefix = &text[..matched.start() + 1];
@@ -665,10 +666,15 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
         })
         .collect();
 
-    let sentence_starts = sentence_starts(text)?;
-    let mut sentence_ends = sentence_starts.iter().skip(1).copied().collect::<Vec<_>>();
-    sentence_ends.push(text.len());
-    for (&start, end) in sentence_starts.iter().zip(sentence_ends) {
+    let enclosure = enclosure_states(text);
+    let sentence_starts = sentence_starts(text, &enclosure)?;
+    for (&start, end) in sentence_starts.iter().zip(
+        sentence_starts
+            .iter()
+            .skip(1)
+            .copied()
+            .chain(std::iter::once(text.len())),
+    ) {
         if !text[..start].trim().is_empty() && source_evidence(&text[start..end])? {
             boundaries.push((start, start, "new_citation_sentence".to_owned()));
         }
@@ -683,21 +689,13 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
     hard_positions.sort_unstable();
     hard_positions.dedup();
     for matched in find_matches("signal.aggressive", text)? {
-        if inside_quotes(text, matched.start()) {
+        if enclosure[matched.start()].0 {
             continue;
         }
         let left = hard_positions
-            .iter()
-            .copied()
-            .filter(|position| *position <= matched.start())
-            .max()
-            .unwrap_or(0);
-        let right = hard_positions
-            .iter()
-            .copied()
-            .filter(|position| *position >= matched.end())
-            .min()
-            .unwrap_or(text.len());
+            [hard_positions.partition_point(|position| *position <= matched.start()) - 1];
+        let right =
+            hard_positions[hard_positions.partition_point(|position| *position < matched.end())];
         if source_evidence(&text[left..matched.start()])?
             && source_evidence(&text[matched.start()..right])?
         {
@@ -721,11 +719,11 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
         }
     }
 
-    let author_starts = find_matches("ref.quoted-work-author", text)?
+    for position in find_matches("ref.quoted-work-author", text)?
         .into_iter()
         .map(|matched| matched.start())
-        .collect::<Vec<_>>();
-    for position in author_starts.into_iter().skip(1) {
+        .skip(1)
+    {
         let start = segment_start(&boundaries, position);
         let end = segment_end(&boundaries, position, text.len());
         if source_evidence(&text[start..position])? && source_evidence(&text[position..end])? {
@@ -733,11 +731,11 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
         }
     }
 
-    let note_starts = find_matches("ref.note-reference", text)?
+    for position in find_matches("ref.note-reference", text)?
         .into_iter()
         .map(|matched| matched.start())
-        .collect::<Vec<_>>();
-    for position in note_starts.into_iter().skip(1) {
+        .skip(1)
+    {
         let start = segment_start(&boundaries, position);
         if source_evidence(&text[start..position])? {
             boundaries.push((position, position, "new_note_reference".to_owned()));
@@ -768,7 +766,7 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
     }
 
     for matched in find_matches("boundary.conjunction", text)? {
-        if inside_quotes(text, matched.start()) {
+        if enclosure[matched.start()].0 {
             continue;
         }
         let start = segment_start(&boundaries, matched.start());
@@ -786,9 +784,7 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
 
     let legal_starts = find_matches("title.legal.splitter", text)?
         .into_iter()
-        .filter(|matched| {
-            !inside_quotes(text, matched.start()) && !inside_square_brackets(text, matched.start())
-        })
+        .filter(|matched| !enclosure[matched.start()].0 && !enclosure[matched.start()].1)
         .map(|matched| matched.start())
         .collect::<Vec<_>>();
     for &position in &legal_starts {
@@ -810,28 +806,38 @@ fn recall_boundaries(text: &str) -> Result<Vec<(usize, usize, String)>> {
         .filter(|(left, right, _)| right > left)
         .map(|(left, _, _)| *left)
         .collect::<HashSet<_>>();
-    let mut deduped = BTreeMap::new();
     boundaries.sort();
-    for (left, right, reason) in boundaries {
-        if left == right
-            && (semicolons.contains(&left)
-                || left.checked_sub(1).is_some_and(|p| semicolons.contains(&p)))
-        {
-            continue;
-        }
-        deduped.entry((left, right)).or_insert(reason);
-    }
-    Ok(deduped
-        .into_iter()
-        .map(|((left, right), reason)| (left, right, reason))
-        .collect())
+    boundaries.retain(|(left, right, _)| {
+        left != right
+            || (!semicolons.contains(left)
+                && !left.checked_sub(1).is_some_and(|p| semicolons.contains(&p)))
+    });
+    boundaries.dedup_by_key(|(left, right, _)| (*left, *right));
+    Ok(boundaries)
 }
 
 fn distinct_reasons(boundaries: &[(usize, usize, String)]) -> Vec<String> {
     let mut seen = HashSet::new();
     boundaries
         .iter()
-        .filter_map(|(_, _, reason)| seen.insert(reason.clone()).then_some(reason.clone()))
+        .filter_map(|(_, _, reason)| seen.insert(reason.as_str()).then(|| reason.clone()))
+        .collect()
+}
+
+fn delimiters(
+    text: &str,
+    coordinates: &ScalarText<'_>,
+    parts: &[DeterministicPart],
+) -> Vec<(usize, usize, String)> {
+    parts
+        .windows(2)
+        .map(|pair| {
+            let start = pair[0].end;
+            let end = pair[1].start;
+            let byte_start = coordinates.byte_at_scalar(start).unwrap_or(text.len());
+            let byte_end = coordinates.byte_at_scalar(end).unwrap_or(text.len());
+            (start, end, text[byte_start..byte_end].to_owned())
+        })
         .collect()
 }
 
@@ -844,6 +850,7 @@ pub fn split_footnote_recall_first(text: &str) -> Result<DeterministicSplit> {
             reasons: vec!["empty".to_owned()],
         });
     }
+    let coordinates = ScalarText::new(text);
     let boundaries = recall_boundaries(text)?;
     let starts = std::iter::once(0).chain(boundaries.iter().map(|(_, right, _)| *right));
     let ends = boundaries
@@ -862,8 +869,10 @@ pub fn split_footnote_recall_first(text: &str) -> Result<DeterministicSplit> {
             kinds = vec!["reference".to_owned()];
         }
         parts.push(DeterministicPart {
-            start: byte_to_char(text, start),
-            end: byte_to_char(text, end),
+            start: coordinates
+                .scalar_at_byte(start)
+                .expect("citation boundary"),
+            end: coordinates.scalar_at_byte(end).expect("citation boundary"),
             text: value.to_owned(),
             anchors: kinds,
         });
@@ -876,24 +885,7 @@ pub fn split_footnote_recall_first(text: &str) -> Result<DeterministicSplit> {
             reasons: vec!["empty_parts".to_owned()],
         });
     }
-    let delimiters = parts
-        .windows(2)
-        .map(|pair| {
-            let byte_start = text
-                .char_indices()
-                .nth(pair[0].end)
-                .map_or(text.len(), |(index, _)| index);
-            let byte_end = text
-                .char_indices()
-                .nth(pair[1].start)
-                .map_or(text.len(), |(index, _)| index);
-            (
-                pair[0].end,
-                pair[1].start,
-                text[byte_start..byte_end].to_owned(),
-            )
-        })
-        .collect();
+    let delimiters = delimiters(text, &coordinates, &parts);
     let reasons = distinct_reasons(&boundaries);
     Ok(DeterministicSplit {
         status: "deterministic_complete".to_owned(),
@@ -916,11 +908,13 @@ pub fn split_footnote(text: &str) -> Result<DeterministicSplit> {
             reasons: vec!["empty".to_owned()],
         });
     }
-    let mut boundaries = top_level_semicolons(text)?
+    let coordinates = ScalarText::new(text);
+    let top = top_level_indices(text)?;
+    let mut boundaries = top_level_semicolons(text, &top)
         .into_iter()
         .map(|position| (position, position + 1, "top_level_semicolon".to_owned()))
         .collect::<Vec<_>>();
-    for position in top_level_signals(text)? {
+    for position in top_level_signals(text, &top)? {
         boundaries.sort();
         let segment_start = boundaries
             .iter()
@@ -934,8 +928,8 @@ pub fn split_footnote(text: &str) -> Result<DeterministicSplit> {
             .map(|(left, _, _)| *left)
             .min()
             .unwrap_or(text.len());
-        if clause(segment_start, position, text)?.is_some()
-            && clause(position, segment_end, text)?.is_some()
+        if clause(segment_start, position, text, &coordinates)?.is_some()
+            && clause(position, segment_end, text, &coordinates)?.is_some()
         {
             boundaries.push((position, position, "explicit_source_signal".to_owned()));
         }
@@ -945,7 +939,9 @@ pub fn split_footnote(text: &str) -> Result<DeterministicSplit> {
         if is_full_match("ref.pure.splitter", text)? {
             return Ok(DeterministicSplit {
                 status: "deterministic_complete".to_owned(),
-                parts: vec![clause(0, text.len(), text)?.expect("pure reference clause")],
+                parts: vec![
+                    clause(0, text.len(), text, &coordinates)?.expect("pure reference clause")
+                ],
                 delimiters: vec![],
                 reasons: vec!["pure_reference".to_owned()],
             });
@@ -964,7 +960,7 @@ pub fn split_footnote(text: &str) -> Result<DeterministicSplit> {
         .chain(std::iter::once(text.len()));
     let mut parts = Vec::new();
     for (start, end) in starts.zip(ends) {
-        let Some(part) = clause(start, end, text)? else {
+        let Some(part) = clause(start, end, text, &coordinates)? else {
             return Ok(DeterministicSplit {
                 status: "abstain".to_owned(),
                 parts: vec![],
@@ -974,24 +970,7 @@ pub fn split_footnote(text: &str) -> Result<DeterministicSplit> {
         };
         parts.push(part);
     }
-    let delimiters = parts
-        .windows(2)
-        .map(|pair| {
-            let byte_start = text
-                .char_indices()
-                .nth(pair[0].end)
-                .map_or(text.len(), |(index, _)| index);
-            let byte_end = text
-                .char_indices()
-                .nth(pair[1].start)
-                .map_or(text.len(), |(index, _)| index);
-            (
-                pair[0].end,
-                pair[1].start,
-                text[byte_start..byte_end].to_owned(),
-            )
-        })
-        .collect();
+    let delimiters = delimiters(text, &coordinates, &parts);
     let used = boundaries
         .iter()
         .map(|(_, _, reason)| reason.as_str())
@@ -1085,13 +1064,16 @@ fn bare_citation(text: &str, kind: &str) -> Result<String> {
                 .map(|matched| matched.start())
         })
         .min();
-    Ok(start.map_or(value.clone(), |index| value[index..].to_owned()))
+    Ok(match start {
+        Some(index) => value[index..].to_owned(),
+        None => value,
+    })
 }
 
 pub fn extract_fields(part: &DeterministicPart) -> Result<DeterministicFields> {
     let text = part.text.trim().to_owned();
     let kind = kind(&text, &part.anchors)?;
-    let styled = strip_signals(&text)?;
+    let styled = strip_signals(&text)?.to_owned();
     let (pinpoint_fragments, page_pinpoints) = pinpoints(&styled, &kind)?;
     let direct_link = find_matches("cite.url", &text)?.into_iter().next();
     let link = direct_link.map_or_else(

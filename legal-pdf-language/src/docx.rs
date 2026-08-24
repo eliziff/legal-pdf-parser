@@ -8,6 +8,7 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use quick_xml::Writer;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -15,8 +16,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -67,6 +69,67 @@ impl Default for DocxPlanOptions {
             timeout_seconds: 600,
         }
     }
+}
+
+#[derive(Clone, Serialize)]
+struct FootnoteRecord {
+    id: String,
+    label: String,
+    text: String,
+    proposition: String,
+}
+
+impl FootnoteRecord {
+    fn from_value(value: &Value) -> Result<Self> {
+        let object = value.as_object();
+        let id = object
+            .and_then(|object| object.get("id"))
+            .ok_or_else(|| Error::Message("missing required property: id".to_owned()))?;
+        let text = object
+            .and_then(|object| object.get("text"))
+            .ok_or_else(|| Error::Message("missing required property: text".to_owned()))?;
+        let id = value_string(Some(id));
+        let label = value_string(object.and_then(|object| object.get("label")));
+        Ok(Self {
+            label: if label.is_empty() { id.clone() } else { label },
+            id,
+            text: value_string(Some(text)),
+            proposition: value_string(object.and_then(|object| object.get("proposition"))),
+        })
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct CitationIntent {
+    part_id: String,
+    verbatim: String,
+    corrected: String,
+    kind: String,
+    pinpoint_fragments: Vec<String>,
+    page_pinpoints: Vec<i64>,
+    short_form: String,
+    bare_citation: String,
+    citation_with_style: String,
+    support_quote: String,
+    locator_kind: &'static str,
+    locator: String,
+    route: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_part_id: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelPart {
+    verbatim: String,
+    corrected: String,
+    kind: String,
+    pinpoint_fragments: Vec<String>,
+    page_pinpoints: Vec<i64>,
+    short_form: String,
+    bare_citation: String,
+    citation_with_style: String,
+    support_quote: String,
 }
 
 fn grammar(
@@ -120,36 +183,21 @@ fn sha256_path(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn py_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|number| number != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
-}
-
-fn py_string(value: Option<&Value>) -> String {
-    let Some(value) = value.filter(|value| py_truthy(value)) else {
+fn value_string(value: Option<&Value>) -> String {
+    let Some(value) = value else {
         return String::new();
     };
     match value {
-        Value::Null => "None".to_owned(),
+        Value::Null | Value::Bool(false) => String::new(),
         Value::Bool(true) => "True".to_owned(),
-        Value::Bool(false) => "False".to_owned(),
         Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        Value::Array(_) | Value::Object(_) => python_json(value).unwrap_or_default(),
+        Value::Number(value) if value.as_f64().is_some_and(|number| number != 0.0) => {
+            value.to_string()
+        }
+        Value::Array(values) if !values.is_empty() => python_json(value).unwrap_or_default(),
+        Value::Object(values) if !values.is_empty() => python_json(value).unwrap_or_default(),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => String::new(),
     }
-}
-
-fn required<'a>(value: &'a Value, key: &str) -> Result<&'a Value> {
-    value
-        .as_object()
-        .and_then(|object| object.get(key))
-        .ok_or_else(|| Error::Message(format!("missing required property: {key}")))
 }
 
 fn object_with_exact_keys(value: &Value, keys: &[&str]) -> bool {
@@ -164,22 +212,21 @@ fn make_intent(
     verbatim: String,
     corrected: String,
     kind: String,
-    pinpoint_fragments: &[Value],
-    page_pinpoints: &[Value],
+    pinpoint_fragments: Vec<String>,
+    page_pinpoints: Vec<i64>,
     short_form: String,
     bare_citation: String,
     citation_with_style: String,
     support_quote: String,
     route: &str,
-) -> Value {
+) -> CitationIntent {
     let fragments = pinpoint_fragments
-        .iter()
-        .map(|value| py_string(Some(value)).trim().to_owned())
+        .into_iter()
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let pages = page_pinpoints
-        .iter()
-        .filter_map(|value| value.as_i64())
+        .into_iter()
         .filter(|value| *value > 0)
         .collect::<Vec<_>>();
     let (locator_kind, locator) = if let Some(first) = fragments.first() {
@@ -208,24 +255,33 @@ fn make_intent(
     } else {
         "other".to_owned()
     };
-    json!({
-        "part_id": part_id,
-        "verbatim": verbatim,
-        "corrected": corrected,
-        "kind": kind,
-        "pinpoint_fragments": fragments,
-        "page_pinpoints": pages,
-        "short_form": short_form,
-        "bare_citation": if bare_citation.is_empty() { verbatim.clone() } else { bare_citation },
-        "citation_with_style": if citation_with_style.is_empty() { verbatim } else { citation_with_style },
-        "support_quote": support_quote,
-        "locator_kind": locator_kind,
-        "locator": locator,
-        "route": route,
-    })
+    CitationIntent {
+        part_id,
+        corrected,
+        kind,
+        pinpoint_fragments: fragments,
+        page_pinpoints: pages,
+        short_form,
+        bare_citation: if bare_citation.is_empty() {
+            verbatim.clone()
+        } else {
+            bare_citation
+        },
+        citation_with_style: if citation_with_style.is_empty() {
+            verbatim.clone()
+        } else {
+            citation_with_style
+        },
+        verbatim,
+        support_quote,
+        locator_kind,
+        locator,
+        route: route.to_owned(),
+        origin_part_id: None,
+    }
 }
 
-pub fn deterministic_docx_intents(footnote_id: &str, text: &str) -> Result<Option<Vec<Value>>> {
+fn deterministic_intents(footnote_id: &str, text: &str) -> Result<Option<Vec<CitationIntent>>> {
     let split = split_footnote(text)?;
     if split.status != "deterministic_complete" || split.parts.is_empty() {
         return Ok(None);
@@ -252,25 +308,17 @@ pub fn deterministic_docx_intents(footnote_id: &str, text: &str) -> Result<Optio
     Ok(Some(
         split
             .parts
-            .iter()
+            .into_iter()
             .zip(fields)
             .enumerate()
             .map(|(index, (part, field))| {
                 make_intent(
                     format!("{footnote_id}:{}", index + 1),
-                    part.text.clone(),
+                    part.text,
                     field.corrected,
                     field.kind,
-                    &field
-                        .pinpoint_fragments
-                        .into_iter()
-                        .map(Value::String)
-                        .collect::<Vec<_>>(),
-                    &field
-                        .page_pinpoints
-                        .into_iter()
-                        .map(Value::from)
-                        .collect::<Vec<_>>(),
+                    field.pinpoint_fragments,
+                    field.page_pinpoints.into_iter().map(i64::from).collect(),
                     field.short_form,
                     field.bare_citation,
                     field.citation_with_style,
@@ -280,6 +328,18 @@ pub fn deterministic_docx_intents(footnote_id: &str, text: &str) -> Result<Optio
             })
             .collect(),
     ))
+}
+
+pub fn deterministic_docx_intents(footnote_id: &str, text: &str) -> Result<Option<Vec<Value>>> {
+    deterministic_intents(footnote_id, text)?
+        .map(|intents| {
+            intents
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<serde_json::Result<_>>()
+        })
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn normalize_with_map(value: &str) -> (String, Vec<(usize, usize)>) {
@@ -327,14 +387,17 @@ fn core_without_separators(value: &str) -> String {
         .collect()
 }
 
-fn snap_parts(text: &str, parts: &[Value]) -> Result<Vec<Value>> {
+fn model_part(value: &Value) -> Result<ModelPart> {
+    serde_json::from_value(value.clone())
+        .map_err(|_| Error::Message("worker part has invalid fields".to_owned()))
+}
+
+fn snap_parts(text: &str, mut parts: Vec<ModelPart>) -> Result<Vec<ModelPart>> {
     let (normalized, positions) = normalize_with_map(text);
     let mut spans = Vec::<(usize, usize)>::new();
     let mut cursor = 0;
-    for part in parts {
-        let (wanted, _) = normalize_with_map(&py_string(
-            part.as_object().and_then(|object| object.get("verbatim")),
-        ));
+    for part in &parts {
+        let (wanted, _) = normalize_with_map(&part.verbatim);
         let wanted = wanted.trim();
         if wanted.is_empty() {
             return Err(Error::Message(
@@ -371,8 +434,7 @@ fn snap_parts(text: &str, parts: &[Value]) -> Result<Vec<Value>> {
             last.1 = normalized.len();
         }
     }
-    let mut snapped = Vec::with_capacity(parts.len());
-    for (part, (start, end)) in parts.iter().zip(spans) {
+    for (part, (start, end)) in parts.iter_mut().zip(spans) {
         if end <= start {
             return Err(Error::Message(
                 "worker returned an empty citation span".to_owned(),
@@ -382,29 +444,24 @@ fn snap_parts(text: &str, parts: &[Value]) -> Result<Vec<Value>> {
         let last = char_index(&normalized, end) - 1;
         let source_start = positions[first].0;
         let source_end = positions[last].1;
-        let mut item = part
-            .as_object()
-            .cloned()
-            .ok_or_else(|| Error::Message("worker part is not an object".to_owned()))?;
-        item.insert(
-            "verbatim".to_owned(),
-            Value::String(text[source_start..source_end].trim().to_owned()),
-        );
-        snapped.push(Value::Object(item));
+        part.verbatim = text[source_start..source_end].trim().to_owned();
     }
-    let actual = snapped
+    let actual = parts
         .iter()
-        .map(|part| py_string(part.get("verbatim")))
+        .map(|part| part.verbatim.as_str())
         .collect::<String>();
     if core_without_separators(text) != core_without_separators(&actual) {
         return Err(Error::Message(
             "worker split lost, gained, or reordered footnote characters".to_owned(),
         ));
     }
-    Ok(snapped)
+    Ok(parts)
 }
 
-pub fn validate_docx_response(response: &Value, records: &[Value]) -> Result<Value> {
+fn validate_response(
+    response: &Value,
+    records: &[FootnoteRecord],
+) -> Result<BTreeMap<String, Vec<ModelPart>>> {
     if fancy_match(url_re()?, &python_json(response)?)? {
         return Err(Error::Message("worker output contains a URL".to_owned()));
     }
@@ -418,76 +475,69 @@ pub fn validate_docx_response(response: &Value, records: &[Value]) -> Result<Val
         .ok_or_else(|| Error::Message("worker results is not an array".to_owned()))?;
     let record_by_id = records
         .iter()
-        .map(|record| Ok((py_string(Some(required(record, "id")?)), record)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
+        .map(|record| (record.id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
     let result_ids = results
         .iter()
         .filter_map(Value::as_object)
-        .map(|item| py_string(item.get("id")))
+        .map(|item| value_string(item.get("id")))
         .collect::<Vec<_>>();
     let unique = result_ids.iter().collect::<HashSet<_>>();
     if result_ids.len() != unique.len()
-        || result_ids.iter().cloned().collect::<BTreeSet<_>>()
-            != record_by_id.keys().cloned().collect()
+        || result_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != record_by_id.keys().copied().collect()
     {
         return Err(Error::Message(
             "worker result ids do not exactly match the request".to_owned(),
         ));
     }
-    let expected_part_keys = [
-        "verbatim",
-        "corrected",
-        "kind",
-        "pinpoint_fragments",
-        "page_pinpoints",
-        "short_form",
-        "bare_citation",
-        "citation_with_style",
-        "support_quote",
-    ];
-    let mut validated = Map::new();
+    let mut validated = BTreeMap::new();
     for raw in results {
         if !object_with_exact_keys(raw, &["id", "parts"]) {
             return Err(Error::Message(
                 "worker result has an unsupported property".to_owned(),
             ));
         }
-        let id = py_string(raw.get("id"));
+        let id = value_string(raw.get("id"));
         let record = record_by_id
-            .get(&id)
+            .get(id.as_str())
             .ok_or_else(|| Error::Message("worker result id is unknown".to_owned()))?;
         let parts = raw["parts"]
             .as_array()
             .filter(|parts| (1..=20).contains(&parts.len()))
             .ok_or_else(|| Error::Message("worker returned an invalid part count".to_owned()))?;
-        let snapped = snap_parts(&py_string(record.get("text")), parts)?;
-        let allowed_quote_text = format!(
-            "{} {}",
-            py_string(record.get("text")),
-            py_string(record.get("proposition"))
-        );
+        let parts = parts.iter().map(model_part).collect::<Result<Vec<_>>>()?;
+        let snapped = snap_parts(&record.text, parts)?;
+        let allowed_quote_text = format!("{} {}", record.text, record.proposition);
         for part in &snapped {
-            if !object_with_exact_keys(part, &expected_part_keys) {
-                return Err(Error::Message(
-                    "worker part has an unsupported property".to_owned(),
-                ));
-            }
-            let kind = part.get("kind").and_then(Value::as_str).unwrap_or_default();
-            if !KINDS.contains(&kind) {
+            if !KINDS.contains(&part.kind.as_str()) {
                 return Err(Error::Message(
                     "worker returned an unsupported citation kind".to_owned(),
                 ));
             }
-            let quote = py_string(part.get("support_quote")).trim().to_owned();
+            let quote = part.support_quote.trim();
             if !quote.is_empty() && !allowed_quote_text.contains(&quote) {
                 return Err(Error::Message(
                     "worker support_quote is not copied from the input".to_owned(),
                 ));
             }
         }
-        validated.insert(id, Value::Array(snapped));
+        validated.insert(id, snapped);
     }
-    Ok(Value::Object(validated))
+    Ok(validated)
+}
+
+pub fn validate_docx_response(response: &Value, records: &[Value]) -> Result<Value> {
+    let records = records
+        .iter()
+        .map(FootnoteRecord::from_value)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::to_value(validate_response(
+        response, &records,
+    )?)?)
 }
 
 fn response_schema() -> Value {
@@ -549,7 +599,44 @@ fn response_schema() -> Value {
     })
 }
 
-fn prompt(records: &[Value]) -> Result<String> {
+#[derive(Clone, Serialize)]
+struct RouteSummary {
+    recommended_strategy: &'static str,
+    footnote_count: usize,
+    deterministic_count: usize,
+    fallback_count: usize,
+    estimated_direct_tokens: usize,
+    estimated_hybrid_tokens: usize,
+    estimated_token_savings: isize,
+    fixed_codex_tokens_per_batch: usize,
+    minimum_route_savings: isize,
+}
+
+struct RouteAssessment {
+    summary: RouteSummary,
+    deterministic: BTreeMap<String, Vec<CitationIntent>>,
+    fallback: Vec<usize>,
+}
+
+impl RouteAssessment {
+    fn into_value(self, fallback: impl Serialize) -> Value {
+        json!({
+            "recommended_strategy": self.summary.recommended_strategy,
+            "footnote_count": self.summary.footnote_count,
+            "deterministic_count": self.summary.deterministic_count,
+            "fallback_count": self.summary.fallback_count,
+            "estimated_direct_tokens": self.summary.estimated_direct_tokens,
+            "estimated_hybrid_tokens": self.summary.estimated_hybrid_tokens,
+            "estimated_token_savings": self.summary.estimated_token_savings,
+            "fixed_codex_tokens_per_batch": self.summary.fixed_codex_tokens_per_batch,
+            "minimum_route_savings": self.summary.minimum_route_savings,
+            "_deterministic": self.deterministic,
+            "_fallback": fallback,
+        })
+    }
+}
+
+fn prompt(records: &[FootnoteRecord]) -> Result<String> {
     Ok(
         "You are a bounded citation-intent worker for legal DOCX footnotes. \
 For every record, split its footnote into source-level parts using the \
@@ -600,24 +687,22 @@ fn minimum_route_savings() -> Result<isize> {
         .map_err(Error::Message)
 }
 
-fn batch(records: &[Value]) -> Result<Vec<Vec<Value>>> {
-    let mut batches = Vec::<Vec<Value>>::new();
-    let mut current = Vec::<Value>::new();
+fn batch(records: &[FootnoteRecord]) -> Result<Vec<&[FootnoteRecord]>> {
+    let mut batches = Vec::new();
+    let mut start = 0;
     let mut chars = 0;
-    for record in records {
-        let size = py_string(record.get("text")).chars().count()
-            + py_string(record.get("proposition")).chars().count();
-        if !current.is_empty()
-            && (current.len() >= MAX_BATCH_FOOTNOTES || chars + size > MAX_BATCH_CHARS)
+    for (index, record) in records.iter().enumerate() {
+        let size = record.text.chars().count() + record.proposition.chars().count();
+        if index > start && (index - start >= MAX_BATCH_FOOTNOTES || chars + size > MAX_BATCH_CHARS)
         {
-            batches.push(std::mem::take(&mut current));
+            batches.push(&records[start..index]);
+            start = index;
             chars = 0;
         }
-        current.push(record.clone());
         chars += size;
     }
-    if !current.is_empty() {
-        batches.push(current);
+    if start < records.len() {
+        batches.push(&records[start..]);
     }
     if batches.len() > MAX_BATCHES {
         return Err(Error::Message(format!(
@@ -628,7 +713,7 @@ fn batch(records: &[Value]) -> Result<Vec<Vec<Value>>> {
     Ok(batches)
 }
 
-fn token_estimate(records: &[Value]) -> Result<usize> {
+fn token_estimate(records: &[FootnoteRecord]) -> Result<usize> {
     let batches = batch(records)?;
     let chars = batches
         .iter()
@@ -639,47 +724,62 @@ fn token_estimate(records: &[Value]) -> Result<usize> {
     Ok(batches.len() * fixed_codex_tokens()? + chars.div_ceil(4))
 }
 
-fn route_assessment(footnotes: &[Value]) -> Result<Value> {
-    let mut deterministic = Map::new();
+fn route_assessment(footnotes: &[FootnoteRecord]) -> Result<RouteAssessment> {
+    let mut deterministic = BTreeMap::new();
     let mut fallback = Vec::new();
-    for note in footnotes {
-        let note_id = py_string(Some(required(note, "id")?));
-        let text = py_string(Some(required(note, "text")?));
-        if let Some(intents) = deterministic_docx_intents(&note_id, &text)? {
-            deterministic.insert(note_id, Value::Array(intents));
+    for (index, note) in footnotes.iter().enumerate() {
+        if let Some(intents) = deterministic_intents(&note.id, &note.text)? {
+            deterministic.insert(note.id.clone(), intents);
         } else {
-            fallback.push(note.clone());
+            fallback.push(index);
         }
     }
     let direct_tokens = token_estimate(footnotes)?;
     let hybrid_tokens = if fallback.is_empty() {
         0
     } else {
+        let fallback = fallback
+            .iter()
+            .map(|index| footnotes[*index].clone())
+            .collect::<Vec<_>>();
         token_estimate(&fallback)?
     };
     let savings = direct_tokens as isize - hybrid_tokens as isize;
-    let recommended = if !deterministic.is_empty() && savings >= minimum_route_savings()? {
+    let minimum_savings = minimum_route_savings()?;
+    let recommended_strategy = if !deterministic.is_empty() && savings >= minimum_savings {
         "hybrid"
     } else {
         "direct"
     };
-    Ok(json!({
-        "recommended_strategy": recommended,
-        "footnote_count": footnotes.len(),
-        "deterministic_count": deterministic.len(),
-        "fallback_count": fallback.len(),
-        "estimated_direct_tokens": direct_tokens,
-        "estimated_hybrid_tokens": hybrid_tokens,
-        "estimated_token_savings": savings,
-        "fixed_codex_tokens_per_batch": fixed_codex_tokens()?,
-        "minimum_route_savings": minimum_route_savings()?,
-        "_deterministic": deterministic,
-        "_fallback": fallback,
-    }))
+    Ok(RouteAssessment {
+        summary: RouteSummary {
+            recommended_strategy,
+            footnote_count: footnotes.len(),
+            deterministic_count: deterministic.len(),
+            fallback_count: fallback.len(),
+            estimated_direct_tokens: direct_tokens,
+            estimated_hybrid_tokens: hybrid_tokens,
+            estimated_token_savings: savings,
+            fixed_codex_tokens_per_batch: fixed_codex_tokens()?,
+            minimum_route_savings: minimum_savings,
+        },
+        deterministic,
+        fallback,
+    })
 }
 
 pub fn assess_docx_route(footnotes: &[Value]) -> Result<Value> {
-    route_assessment(footnotes)
+    let normalized = footnotes
+        .iter()
+        .map(FootnoteRecord::from_value)
+        .collect::<Result<Vec<_>>>()?;
+    let assessment = route_assessment(&normalized)?;
+    let fallback = assessment
+        .fallback
+        .iter()
+        .map(|index| &footnotes[*index])
+        .collect::<Vec<_>>();
+    Ok(assessment.into_value(fallback))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -748,12 +848,12 @@ fn cache_root(cache_dir: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn invoke_batch(
-    records: &[Value],
+    records: &[FootnoteRecord],
     model: &str,
     effort: &str,
     cache_dir: &Path,
     timeout_seconds: u64,
-) -> Result<(Map<String, Value>, Value)> {
+) -> Result<(BTreeMap<String, Vec<ModelPart>>, Value)> {
     let prompt_text = prompt(records)?;
     let key = crate::codex::stable_hash(&json!({
         "prompt_version": DOCX_PROMPT_VERSION,
@@ -768,7 +868,7 @@ fn invoke_batch(
         let response = serde_json::from_slice(
             &fs::read(&response_path).map_err(|source| Error::io(&response_path, source))?,
         )?;
-        let validated = validate_docx_response(&response, records)?;
+        let validated = validate_response(&response, records)?;
         let mut metadata = serde_json::from_slice::<Value>(
             &fs::read(&metadata_path).map_err(|source| Error::io(&metadata_path, source))?,
         )?
@@ -776,10 +876,7 @@ fn invoke_batch(
         .cloned()
         .ok_or_else(|| Error::Message("cached DOCX metadata is not an object".to_owned()))?;
         metadata.insert("cache_hit".to_owned(), Value::Bool(true));
-        return Ok((
-            validated.as_object().cloned().expect("validated object"),
-            Value::Object(metadata),
-        ));
+        return Ok((validated, Value::Object(metadata)));
     }
     fs::create_dir_all(&entry).map_err(|source| Error::io(&entry, source))?;
     let schema_path = cache_dir.join(format!("{DOCX_PROMPT_VERSION}.schema.json"));
@@ -795,7 +892,7 @@ fn invoke_batch(
         &entry,
         timeout_seconds,
     )?;
-    let validated = validate_docx_response(&response, records)?;
+    let validated = validate_response(&response, records)?;
     let metadata = json!({
         "schema_version": "legalpdf.docx_link_batch.v1",
         "prompt_version": DOCX_PROMPT_VERSION,
@@ -809,10 +906,7 @@ fn invoke_batch(
         "cache_hit": false,
     });
     write_json(&metadata_path, &metadata)?;
-    Ok((
-        validated.as_object().cloned().expect("validated object"),
-        metadata,
-    ))
+    Ok((validated, metadata))
 }
 
 fn round_four(value: f64) -> f64 {
@@ -825,98 +919,130 @@ fn contains_ibid(text: &str) -> bool {
         .is_match(text)
 }
 
-fn resolve_references(footnotes: &mut [Value]) -> Result<()> {
+#[derive(Serialize)]
+struct PlannedFootnote {
+    id: String,
+    label: String,
+    text: String,
+    proposition: String,
+    parts: Vec<CitationIntent>,
+}
+
+struct FootnotePlan {
+    schema_version: &'static str,
+    source: Option<String>,
+    source_sha256: Option<String>,
+    model: String,
+    effort: String,
+    strategy_requested: String,
+    strategy_used: String,
+    assessment: RouteSummary,
+    footnotes: Vec<PlannedFootnote>,
+    telemetry: Value,
+}
+
+impl FootnotePlan {
+    fn into_value(self) -> Value {
+        let Self {
+            schema_version,
+            source,
+            source_sha256,
+            model,
+            effort,
+            strategy_requested,
+            strategy_used,
+            assessment,
+            footnotes,
+            telemetry,
+        } = self;
+        let mut value = json!({
+            "schema_version": schema_version,
+            "model": model,
+            "effort": effort,
+            "strategy_requested": strategy_requested,
+            "strategy_used": strategy_used,
+            "assessment": assessment,
+            "footnotes": footnotes,
+            "telemetry": telemetry,
+        });
+        let object = value.as_object_mut().expect("serialized DOCX plan object");
+        if let Some(source) = source {
+            object.insert("source".to_owned(), Value::String(source));
+        }
+        if let Some(source_sha256) = source_sha256 {
+            object.insert("source_sha256".to_owned(), Value::String(source_sha256));
+        }
+        value
+    }
+}
+
+fn resolve_references(footnotes: &mut [PlannedFootnote]) -> Result<()> {
     let by_label = footnotes
         .iter()
-        .map(|note| (py_string(note.get("label")), note.clone()))
+        .map(|note| (note.label.clone(), note.parts.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut previous: Option<Value> = None;
+    let mut previous: Option<CitationIntent> = None;
     for note in footnotes {
-        let parts = note
-            .get_mut("parts")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| Error::Message("planned footnote has no parts".to_owned()))?;
-        for part in parts {
-            let text = py_string(part.get("verbatim"));
+        for part in &mut note.parts {
+            let text = part.verbatim.as_str();
             let mut origin = None;
-            if contains_ibid(&text) {
+            if contains_ibid(text) {
                 origin = previous.clone();
             } else if let Some(captures) = supra_note_re()?
-                .captures(&text)
+                .captures(text)
                 .map_err(|error| Error::Message(format!("supra-note search failed: {error}")))?
             {
                 if let Some(note_match) = captures.get(1) {
                     let candidates = by_label
                         .get(note_match.as_str())
-                        .and_then(|note| note.get("parts"))
-                        .and_then(Value::as_array)
-                        .cloned()
+                        .map(Vec::as_slice)
                         .unwrap_or_default();
                     let whole = captures.get(0).expect("whole supra-note match");
                     let hint = text[..whole.start()]
                         .trim_matches(&[' ', ',', '.', ';', '[', ']', '(', ')'][..]);
                     let hint_folded = hint.to_lowercase();
-                    let matching = candidates
-                        .iter()
-                        .filter(|candidate| {
-                            !hint.is_empty()
-                                && format!(
-                                    "{} {}",
-                                    py_string(candidate.get("short_form")),
-                                    py_string(candidate.get("citation_with_style"))
-                                )
+                    let mut matching = candidates.iter().filter(|candidate| {
+                        !hint.is_empty()
+                            && format!("{} {}", candidate.short_form, candidate.citation_with_style)
                                 .to_lowercase()
                                 .contains(&hint_folded)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    origin = if matching.len() == 1 {
-                        matching.into_iter().next()
+                    });
+                    let first = matching.next();
+                    origin = if first.is_some() && matching.next().is_none() {
+                        first.cloned()
                     } else if candidates.len() == 1 {
-                        candidates.into_iter().next()
+                        candidates.first().cloned()
                     } else {
                         None
                     };
                 }
             }
-            let object = part.as_object_mut().ok_or_else(|| {
-                Error::Message("planned citation part is not an object".to_owned())
-            })?;
+            let keep_previous = origin
+                .as_ref()
+                .map_or(part.kind.as_str(), |origin| origin.kind.as_str())
+                != "other"
+                || !fancy_match(reference_re()?, text)?;
             if let Some(origin) = origin {
-                for key in ["kind", "bare_citation", "citation_with_style"] {
-                    object.insert(key.to_owned(), required(&origin, key)?.clone());
-                }
-                object.insert(
-                    "origin_part_id".to_owned(),
-                    required(&origin, "part_id")?.clone(),
-                );
+                part.kind = origin.kind;
+                part.bare_citation = origin.bare_citation;
+                part.citation_with_style = origin.citation_with_style;
+                part.origin_part_id = Some(origin.part_id);
             } else {
-                object.insert("origin_part_id".to_owned(), Value::String(String::new()));
+                part.origin_part_id = Some(String::new());
             }
-            let current = Value::Object(object.clone());
-            let kind = py_string(current.get("kind"));
-            if kind != "other" || !fancy_match(reference_re()?, &text)? {
-                previous = Some(current);
+            if keep_previous {
+                previous = Some(part.clone());
             }
         }
     }
     Ok(())
 }
 
-pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Value> {
+fn plan_records(
+    normalized: Vec<FootnoteRecord>,
+    options: &DocxPlanOptions,
+) -> Result<FootnotePlan> {
     let started = Instant::now();
-    let mut normalized = Vec::new();
-    for note in notes.iter().take(MAX_FOOTNOTES + 1) {
-        let id = py_string(Some(required(note, "id")?));
-        let label = py_string(note.get("label"));
-        let label = if label.is_empty() { id.clone() } else { label };
-        normalized.push(json!({
-            "id": id,
-            "label": label,
-            "text": py_string(Some(required(note, "text")?)),
-            "proposition": py_string(note.get("proposition")),
-        }));
-    }
     if normalized.len() > MAX_FOOTNOTES {
         return Err(Error::Message(format!(
             "DOCX has more than {MAX_FOOTNOTES} linkable footnotes"
@@ -924,32 +1050,32 @@ pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Valu
     }
     let assessment = route_assessment(&normalized)?;
     let selected = if options.strategy == "auto" {
-        py_string(assessment.get("recommended_strategy"))
+        assessment.summary.recommended_strategy.to_owned()
     } else {
         options.strategy.clone()
     };
-    let deterministic = if selected == "hybrid" {
-        assessment["_deterministic"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
+    let RouteAssessment {
+        summary,
+        deterministic,
+        fallback,
+    } = assessment;
+    let (deterministic, model_records) = if selected == "hybrid" {
+        (
+            deterministic,
+            fallback
+                .into_iter()
+                .map(|index| normalized[index].clone())
+                .collect(),
+        )
     } else {
-        Map::new()
-    };
-    let model_records = if selected == "hybrid" {
-        assessment["_fallback"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        normalized.clone()
+        (BTreeMap::new(), normalized.clone())
     };
     let root = cache_root(options.cache_dir.as_deref())?;
-    let mut model_results = Map::new();
+    let mut model_results = BTreeMap::new();
     let mut telemetry = Vec::new();
     for records in batch(&model_records)? {
         let (results, metadata) = invoke_batch(
-            &records,
+            records,
             &options.model,
             &options.effort,
             &root,
@@ -960,45 +1086,42 @@ pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Valu
     }
     let mut planned = Vec::with_capacity(normalized.len());
     for note in normalized {
-        let note_id = py_string(note.get("id"));
-        let raw_parts = if let Some(parts) = deterministic.get(&note_id).and_then(Value::as_array) {
+        let note_id = note.id.as_str();
+        let parts = if let Some(parts) = deterministic.get(note_id) {
             parts.clone()
         } else {
-            let parts = model_results
-                .get(&note_id)
-                .and_then(Value::as_array)
+            model_results
+                .get(note_id)
                 .ok_or_else(|| {
                     Error::Message(format!("citation worker returned no result for {note_id}"))
-                })?;
-            parts
+                })?
                 .iter()
+                .cloned()
                 .enumerate()
                 .map(|(index, part)| {
                     make_intent(
                         format!("{note_id}:{}", index + 1),
-                        py_string(part.get("verbatim")),
-                        py_string(part.get("corrected")),
-                        py_string(part.get("kind")),
-                        part.get("pinpoint_fragments")
-                            .and_then(Value::as_array)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                        part.get("page_pinpoints")
-                            .and_then(Value::as_array)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                        py_string(part.get("short_form")),
-                        py_string(part.get("bare_citation")),
-                        py_string(part.get("citation_with_style")),
-                        py_string(part.get("support_quote")),
+                        part.verbatim,
+                        part.corrected,
+                        part.kind,
+                        part.pinpoint_fragments,
+                        part.page_pinpoints,
+                        part.short_form,
+                        part.bare_citation,
+                        part.citation_with_style,
+                        part.support_quote,
                         "codex",
                     )
                 })
                 .collect()
         };
-        let mut note = note.as_object().cloned().expect("normalized note object");
-        note.insert("parts".to_owned(), Value::Array(raw_parts));
-        planned.push(Value::Object(note));
+        planned.push(PlannedFootnote {
+            id: note.id,
+            label: note.label,
+            text: note.text,
+            proposition: note.proposition,
+            parts,
+        });
     }
     resolve_references(&mut planned)?;
     let mut token_usage = Map::new();
@@ -1014,22 +1137,17 @@ pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Valu
             }
         }
     }
-    let assessment_public = assessment
-        .as_object()
-        .expect("assessment object")
-        .iter()
-        .filter(|(key, _)| !key.starts_with('_'))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<Map<_, _>>();
-    Ok(json!({
-        "schema_version": "legalpdf.footnote_link_plan.v1",
-        "model": options.model,
-        "effort": options.effort,
-        "strategy_requested": options.strategy,
-        "strategy_used": selected,
-        "assessment": assessment_public,
-        "footnotes": planned,
-        "telemetry": {
+    Ok(FootnotePlan {
+        schema_version: "legalpdf.footnote_link_plan.v1",
+        source: None,
+        source_sha256: None,
+        model: options.model.clone(),
+        effort: options.effort.clone(),
+        strategy_requested: options.strategy.clone(),
+        strategy_used: selected,
+        assessment: summary,
+        footnotes: planned,
+        telemetry: json!({
             "elapsed_seconds": round_four(started.elapsed().as_secs_f64()),
             "codex_batches": telemetry.len(),
             "live_codex_batches": telemetry.iter().filter(|item| {
@@ -1037,8 +1155,17 @@ pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Valu
             }).count(),
             "token_usage": token_usage,
             "batches": telemetry,
-        }
-    }))
+        }),
+    })
+}
+
+pub fn plan_footnotes(notes: &[Value], options: &DocxPlanOptions) -> Result<Value> {
+    let normalized = notes
+        .iter()
+        .take(MAX_FOOTNOTES + 1)
+        .map(FootnoteRecord::from_value)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(plan_records(normalized, options)?.into_value())
 }
 
 #[derive(Clone)]
@@ -1778,6 +1905,22 @@ fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String,
     Ok(files)
 }
 
+fn write_docx_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, value) in files {
+        if name.ends_with('/') {
+            archive.add_directory(name, options)?;
+        } else {
+            archive.start_file(name, options)?;
+            archive
+                .write_all(value)
+                .map_err(|error| Error::io("DOCX output", error))?;
+        }
+    }
+    Ok(archive.finish()?.into_inner())
+}
+
 fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     file_bytes(files, name).map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
@@ -2053,22 +2196,8 @@ pub fn fix_docx_supra_cross_references(bytes: &[u8]) -> Result<DocxSupraCleanup>
         "word/footnotes.xml",
         next_footnotes.into_bytes(),
     );
-    let writer = Cursor::new(Vec::new());
-    let mut archive = ZipWriter::new(writer);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    for (name, value) in files {
-        if name.ends_with('/') {
-            archive.add_directory(name, options)?;
-        } else {
-            archive.start_file(name, options)?;
-            archive
-                .write_all(&value)
-                .map_err(|error| Error::io("DOCX output", error))?;
-        }
-    }
-    let output = archive.finish()?.into_inner();
     Ok(DocxSupraCleanup {
-        bytes: output,
+        bytes: write_docx_files(&files)?,
         detected,
         converted,
         already_linked,
@@ -2108,13 +2237,262 @@ fn paragraphs_under<'a>(
     found
 }
 
-fn positive_word_int(element: Option<&XmlElement>, name: &str) -> usize {
+fn word_int(element: Option<&XmlElement>, name: &str) -> Option<usize> {
     element
         .and_then(|element| element.direct_elements().find(|child| child.is(W_NS, name)))
         .and_then(|element| element.attribute(None, "val"))
         .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
+}
+
+fn strip_heading_numbering(xml: &str) -> String {
+    static PARAGRAPH_PROPERTIES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<w:pPr>(.*?)</w:pPr>").expect("literal DOCX heading regex")
+    });
+    static HEADING_STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<w:pStyle\b[^>]*w:val="Heading(\d+)""#)
+            .expect("literal DOCX heading style regex")
+    });
+    static NUMBERING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<w:numPr\b.*?</w:numPr>").expect("literal DOCX numbering regex")
+    });
+    static OUTLINE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<w:outlineLvl\b").expect("literal DOCX outline regex"));
+    PARAGRAPH_PROPERTIES
+        .replace_all(xml, |captures: &regex::Captures<'_>| {
+            let inner = &captures[1];
+            let Some(level) = HEADING_STYLE.captures(inner).and_then(|style| style.get(1)) else {
+                return captures[0].to_owned();
+            };
+            if !NUMBERING.is_match(inner) {
+                return captures[0].to_owned();
+            }
+            let mut inner = NUMBERING.replace_all(inner, "").into_owned();
+            if !OUTLINE.is_match(&inner) {
+                let Some(level) = level
+                    .as_str()
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|level| (1..=6).contains(level))
+                    .map(|level| level - 1)
+                else {
+                    return format!("<w:pPr>{inner}</w:pPr>");
+                };
+                inner.insert_str(0, &format!(r#"<w:outlineLvl w:val="{level}"/>"#));
+            }
+            format!("<w:pPr>{inner}</w:pPr>")
+        })
+        .into_owned()
+}
+
+fn normalize_heading_styles(xml: &str) -> String {
+    static DEFAULT_STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<w:style\b[^>]*\bw:default="1""#).expect("literal DOCX default style regex")
+    });
+    static HEADING_STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<w:style\b[^>]*\bw:styleId="Heading\d+".*?</w:style>"#)
+            .expect("literal DOCX heading style regex")
+    });
+    static HEADING_NAME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)(<w:name\b[^>]*w:val=")Heading ([0-9])(")"#)
+            .expect("literal DOCX heading name regex")
+    });
+    static STYLE_LEVEL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"w:styleId="Heading([1-6])""#).expect("literal DOCX heading level regex")
+    });
+    static OUTLINE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<w:outlineLvl\b").expect("literal DOCX outline regex"));
+    static PARAGRAPH_PROPERTIES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(<w:pPr[\s>][^<]*)").expect("literal DOCX style properties regex")
+    });
+
+    let xml = if DEFAULT_STYLE.is_match(xml) {
+        xml.to_owned()
+    } else {
+        xml.replacen(
+            "</w:styles>",
+            r#"<w:style w:default="1" w:styleId="Normal" w:type="paragraph"><w:name w:val="Normal"/><w:qFormat/></w:style></w:styles>"#,
+            1,
+        )
+    };
+    HEADING_STYLE
+        .replace_all(&xml, |captures: &regex::Captures<'_>| {
+            let mut style = HEADING_NAME
+                .replace(&captures[0], "${1}heading ${2}${3}")
+                .into_owned();
+            if !OUTLINE.is_match(&style) {
+                if let Some(level) = STYLE_LEVEL
+                    .captures(&style)
+                    .and_then(|capture| capture.get(1))
+                {
+                    let level = level.as_str().parse::<u8>().unwrap_or(1) - 1;
+                    style = PARAGRAPH_PROPERTIES
+                        .replacen(
+                            &style,
+                            1,
+                            format!("$1<w:outlineLvl w:val=\"{level}\"/>").as_str(),
+                        )
+                        .into_owned();
+                }
+            }
+            style
+        })
+        .into_owned()
+}
+
+fn drafting_docx_input(bytes: &[u8]) -> Result<Vec<u8>> {
+    static HEADING_STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<w:style\b[^>]*\bw:styleId="Heading\d+""#)
+            .expect("literal DOCX heading style regex")
+    });
+    let inspected = read_docx_files(bytes, Some(&["word/document.xml", "word/styles.xml"]))?;
+    let document = docx_part(&inspected, "word/document.xml")
+        .ok_or_else(|| Error::Message("Drafting mode requires a valid DOCX".to_owned()))?;
+    let stripped = strip_heading_numbering(&document);
+    let mut changed = stripped != document;
+    let styles = docx_part(&inspected, "word/styles.xml");
+    let normalized_styles = if let Some(styles) = styles {
+        if HEADING_STYLE.is_match(&styles) {
+            let normalized = normalize_heading_styles(&styles);
+            changed |= normalized != styles;
+            Some(normalized)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if !changed {
+        return Ok(bytes.to_vec());
+    }
+    let mut files = read_docx_files(bytes, None)?;
+    if stripped != document {
+        replace_file(&mut files, "word/document.xml", stripped.into_bytes());
+    }
+    if let Some(styles) = normalized_styles {
+        replace_file(&mut files, "word/styles.xml", styles.into_bytes());
+    }
+    write_docx_files(&files)
+}
+
+fn clean_process_error(bytes: &[u8]) -> String {
+    legal_structure::normalize_javascript_whitespace(&String::from_utf8_lossy(bytes))
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn pandoc_drafting_markdown(bytes: Vec<u8>) -> Result<String> {
+    const MAX_OUTPUT: usize = MAX_DOCX_SUPRA_BYTES;
+    const SYSTEM_ENV: [&str; 20] = [
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "SHELL",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ];
+    let mut command = Command::new("pandoc");
+    command
+        .args([
+            "-f",
+            "docx",
+            "-t",
+            "gfm",
+            "--sandbox",
+            "--wrap=none",
+            "-o",
+            "-",
+        ])
+        .env_clear();
+    for (name, value) in env::vars_os() {
+        let permitted = {
+            let name_string = name.to_string_lossy();
+            SYSTEM_ENV
+                .iter()
+                .any(|allowed| name_string.eq_ignore_ascii_case(allowed))
+        };
+        if permitted {
+            command.env(name, value);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = crate::process::run(command, bytes, Duration::from_secs(120), MAX_OUTPUT, 8_192)
+        .map_err(|error| match error {
+        crate::process::RunError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Error::Message(
+                "Pandoc is required for drafting mode but was not found on PATH".to_owned(),
+            )
+        }
+        crate::process::RunError::Io(source) => Error::Message(format!(
+            "Pandoc conversion failed: {}",
+            clean_process_error(source.to_string().as_bytes())
+        )),
+        crate::process::RunError::Timeout => {
+            Error::Message("Pandoc conversion timed out".to_owned())
+        }
+    })?;
+    if output.stdout_exceeded {
+        return Err(Error::Message(
+            "Pandoc conversion output exceeded 25 MiB".to_owned(),
+        ));
+    }
+    if !output.status.success() {
+        return Err(Error::Message(format!(
+            "Pandoc conversion failed (exit {}): {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            clean_process_error(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn clean_drafting_markdown(markdown: String) -> String {
+    static HTML_IMAGE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)<img\b[^>]*\/?>").expect("literal HTML image regex"));
+    static MARKDOWN_IMAGE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"!\[[^\]]*\]\([^)]*\)(?:\{[^}]*\})?").expect("literal Markdown image regex")
+    });
+    static EMPTY_LINK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?m)^\[\]\([^)]*\){}*$",
+            legal_structure::JS_WHITESPACE_CLASS
+        ))
+        .expect("literal empty link regex")
+    });
+    static UNSAFE_LINK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\[[^\]]*\]\((?:data|javascript):[^)]*\)")
+            .expect("literal unsafe link regex")
+    });
+    static ESCAPED_BRACKET: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\([\[\]])").expect("literal escaped bracket regex"));
+    let markdown = markdown.replace("\r\n", "\n").replace('\r', "\n");
+    let markdown = HTML_IMAGE.replace_all(&markdown, "[Image omitted]");
+    let markdown = MARKDOWN_IMAGE.replace_all(&markdown, "[Image omitted]");
+    let markdown = EMPTY_LINK.replace_all(&markdown, "");
+    let markdown = UNSAFE_LINK.replace_all(&markdown, "");
+    let markdown = ESCAPED_BRACKET.replace_all(&markdown, "$1");
+    legal_structure::trim_javascript_whitespace(&markdown).to_owned()
 }
 
 fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -2146,12 +2524,10 @@ fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(xml)
 }
 
-/// Parse the accepted DOCX text and authoritative table coordinates once, then
-/// feed the canonical Rust detector directly.
-pub fn analyze_docx_bytes(
+fn docx_structure_input(
     bytes: &[u8],
-    document_id: String,
-) -> Result<legal_structure::DocumentStructure> {
+    include_tables: bool,
+) -> Result<(Vec<String>, Vec<legal_structure::AuthoritativeTableCell>)> {
     let xml = docx_document_xml(bytes)?;
     let document = match parse_xml(&xml) {
         Ok(document) => document,
@@ -2159,9 +2535,7 @@ pub fn analyze_docx_bytes(
             let xml = std::str::from_utf8(&xml)
                 .map_err(|error| Error::Message(format!("DOCX XML is not UTF-8: {error}")))?;
             let paragraphs = tolerant_docx_paragraphs(xml)?;
-            let structure = legal_structure::analyze_docx(document_id, paragraphs, &[])
-                .map_err(|error| Error::Message(error.to_string()))?;
-            return Ok(structure);
+            return Ok((paragraphs, Vec::new()));
         }
     };
     let root = document.root()?;
@@ -2171,7 +2545,7 @@ pub fn analyze_docx_bytes(
         .ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
 
     let mut all = Vec::new();
-    walk_elements(root, &mut all);
+    walk_elements(body, &mut all);
     let canonical_elements = all
         .iter()
         .copied()
@@ -2181,6 +2555,9 @@ pub fn analyze_docx_bytes(
         .iter()
         .map(|paragraph| normalized_docx_paragraph(paragraph))
         .collect::<Result<Vec<_>>>()?;
+    if !include_tables {
+        return Ok((paragraphs, Vec::new()));
+    }
     let mut starts = Vec::with_capacity(paragraphs.len());
     let mut text_length = 0;
     for (index, paragraph) in paragraphs.iter().enumerate() {
@@ -2218,31 +2595,67 @@ pub fn analyze_docx_bytes(
     }
 
     let mut table_cells = Vec::new();
-    for (table_index, table) in nested_word_elements(body, "tbl").into_iter().enumerate() {
+    for (table_index, table) in all
+        .iter()
+        .copied()
+        .filter(|element| element.is(W_NS, "tbl"))
+        .enumerate()
+    {
+        let mut vertical_anchors = HashMap::<usize, usize>::new();
         for (row_index, row) in nested_word_elements(table, "tr").into_iter().enumerate() {
             let row_properties = row
                 .direct_elements()
                 .find(|element| element.is(W_NS, "trPr"));
-            let mut column = positive_word_int(row_properties, "gridBefore");
+            let mut column = 1 + word_int(row_properties, "gridBefore").unwrap_or(0);
+            let mut next_vertical_anchors = HashMap::new();
+            let mut horizontal_anchor = None;
             for cell in nested_word_elements(row, "tc") {
                 let cell_properties = cell
                     .direct_elements()
                     .find(|element| element.is(W_NS, "tcPr"));
-                let column_span = positive_word_int(cell_properties, "gridSpan");
-                let merged = cell_properties.is_some_and(|properties| {
-                    ["vMerge", "hMerge"].into_iter().any(|name| {
-                        properties
-                            .direct_elements()
-                            .find(|element| element.is(W_NS, name))
-                            .is_some_and(|element| {
-                                !element
-                                    .attribute(None, "val")
-                                    .unwrap_or_default()
-                                    .eq_ignore_ascii_case("restart")
-                            })
+                let column_span = word_int(cell_properties, "gridSpan")
+                    .filter(|value| *value > 0)
+                    .unwrap_or(1);
+                let column_end = column + column_span;
+                let merge = |name| {
+                    cell_properties
+                        .and_then(|properties| {
+                            properties
+                                .direct_elements()
+                                .find(|element| element.is(W_NS, name))
+                        })
+                        .map(|element| {
+                            element
+                                .attribute(None, "val")
+                                .is_some_and(|value| value.eq_ignore_ascii_case("restart"))
+                        })
+                };
+                let vertical_merge = merge("vMerge");
+                let horizontal_merge = merge("hMerge");
+                let vertical_continuation = vertical_merge == Some(false);
+                let horizontal_continuation = horizontal_merge == Some(false);
+                let vertical_anchor = vertical_continuation
+                    .then(|| {
+                        vertical_anchors.get(&column).copied().filter(|anchor| {
+                            (column..column_end)
+                                .all(|covered| vertical_anchors.get(&covered) == Some(anchor))
+                        })
                     })
-                });
-                if !merged {
+                    .flatten();
+                let continuation_anchor = if (!vertical_continuation || vertical_anchor.is_some())
+                    && (!horizontal_continuation || horizontal_anchor.is_some())
+                    && (!vertical_continuation
+                        || !horizontal_continuation
+                        || vertical_anchor == horizontal_anchor)
+                {
+                    vertical_anchor.or(horizontal_anchor)
+                } else {
+                    None
+                };
+                let continuation = vertical_continuation || horizontal_continuation;
+                let anchor = if continuation {
+                    continuation_anchor
+                } else {
                     let contents = paragraphs_under(cell, &by_element);
                     let empty_at = || {
                         let preceding = entry_paragraph
@@ -2261,17 +2674,113 @@ pub fn analyze_docx_bytes(
                         row: row_index + 1,
                         column,
                         row_span: None,
-                        column_span: Some(column_span),
+                        column_span: (column_span > 1).then_some(column_span),
                         address: None,
+                        display_value: None,
                         start,
                         end,
                     });
+                    Some(table_cells.len() - 1)
+                };
+                if let Some(anchor) = anchor {
+                    if vertical_continuation {
+                        let span = row_index + 2 - table_cells[anchor].row;
+                        let span = span.max(table_cells[anchor].row_span.unwrap_or(1));
+                        table_cells[anchor].row_span = (span > 1).then_some(span);
+                    }
+                    if horizontal_continuation {
+                        let span = column_end - table_cells[anchor].column;
+                        let span = span.max(table_cells[anchor].column_span.unwrap_or(1));
+                        table_cells[anchor].column_span = (span > 1).then_some(span);
+                    }
+                    if vertical_merge.is_some() {
+                        for covered in column..column_end {
+                            next_vertical_anchors.insert(covered, anchor);
+                        }
+                    }
                 }
-                column += column_span;
+                horizontal_anchor = if horizontal_merge.is_some() {
+                    anchor
+                } else {
+                    None
+                };
+                column = column_end;
             }
+            vertical_anchors = next_vertical_anchors;
         }
     }
+    Ok((paragraphs, table_cells))
+}
+
+/// Return the accepted model-visible DOCX text without running structure
+/// detection. Drafting mode uses the same Pandoc adaptation as full analysis.
+pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
+    if drafting {
+        return drafting_docx_text(bytes);
+    }
+    docx_structure_input(bytes, false).map(|(paragraphs, _)| paragraphs.join("\n"))
+}
+
+/// Parse the accepted DOCX text and authoritative table coordinates once, then
+/// feed the canonical Rust detector directly.
+pub fn analyze_docx_bytes(
+    bytes: &[u8],
+    document_id: String,
+) -> Result<legal_structure::DocumentStructure> {
+    let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
     legal_structure::analyze_docx(document_id, paragraphs, &table_cells)
+        .map_err(|error| Error::Message(error.to_string()))
+}
+
+fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() || bytes.len() > MAX_DOCX_SUPRA_BYTES {
+        return Err(Error::Message(
+            "Precedent DOCX exceeds the drafting read limit".to_owned(),
+        ));
+    }
+    let input = drafting_docx_input(bytes).map_err(|error| match error {
+        Error::Zip(_) => Error::Message("Precedent DOCX is corrupted or truncated".to_owned()),
+        Error::Message(message) if message.contains("XML part exceeds") => {
+            Error::Message("Precedent DOCX contains an oversized XML part".to_owned())
+        }
+        Error::Message(message) => Error::Message(
+            message
+                .strip_prefix("DOCX ")
+                .map_or(message.clone(), |detail| format!("Precedent DOCX {detail}")),
+        ),
+        error => error,
+    })?;
+    let markdown = pandoc_drafting_markdown(input).map_err(|error| {
+        if error.to_string().contains("was not found on PATH") {
+            error
+        } else {
+            Error::Message(format!(
+                "Precedent DOCX contains malformed XML in word/document.xml: {error}"
+            ))
+        }
+    })?;
+    let markdown = clean_drafting_markdown(markdown);
+    if markdown.is_empty() {
+        let text = docx_text(bytes, false)?;
+        return if text.trim().is_empty() {
+            Err(Error::Message(
+                "Precedent DOCX has no readable drafting structure".to_owned(),
+            ))
+        } else {
+            Ok(text)
+        };
+    }
+    Ok(markdown)
+}
+
+/// Build the model-visible drafting document in one Rust operation. OOXML and
+/// Pandoc adaptation stay here; the resulting text uses the canonical detector.
+pub fn analyze_docx_drafting_bytes(
+    bytes: &[u8],
+    document_id: String,
+) -> Result<legal_structure::DocumentStructure> {
+    let markdown = drafting_docx_text(bytes)?;
+    legal_structure::analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
 }
 
@@ -2377,8 +2886,38 @@ fn file_bytes<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]
         .map(|(_, bytes)| bytes.as_slice())
 }
 
-pub fn extract_docx_gold(path: impl AsRef<Path>) -> Result<Value> {
-    let source = absolute_path(path.as_ref())?;
+#[derive(Serialize)]
+struct GoldParagraph {
+    text: String,
+    style: String,
+    footnote_ids: Vec<String>,
+    endnote_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GoldFootnote {
+    ooxml_id: String,
+    kind: String,
+    label: String,
+    occurrence: usize,
+    body: String,
+    sentence_proposition: String,
+    passage_since_prior_note: String,
+}
+
+#[derive(Serialize)]
+struct DocxGold {
+    schema_version: &'static str,
+    source_name: String,
+    source_sha256: String,
+    paragraphs: Vec<GoldParagraph>,
+    footnotes: Vec<GoldFootnote>,
+    note_counts: BTreeMap<String, usize>,
+    citations: Vec<String>,
+}
+
+fn extract_docx_gold_typed(path: &Path) -> Result<DocxGold> {
+    let source = absolute_path(path)?;
     if source
         .extension()
         .and_then(|value| value.to_str())
@@ -2404,18 +2943,20 @@ pub fn extract_docx_gold(path: impl AsRef<Path>) -> Result<Value> {
             continue;
         }
         reference_order.extend(references.iter().cloned());
-        paragraphs.push(json!({
-            "text": text,
-            "style": paragraph_style(paragraph),
-            "footnote_ids": references
+        paragraphs.push(GoldParagraph {
+            text,
+            style: paragraph_style(paragraph),
+            footnote_ids: references
                 .iter()
                 .filter_map(|key| key.strip_prefix("footnote:"))
-                .collect::<Vec<_>>(),
-            "endnote_ids": references
+                .map(str::to_owned)
+                .collect(),
+            endnote_ids: references
                 .iter()
                 .filter_map(|key| key.strip_prefix("endnote:"))
-                .collect::<Vec<_>>(),
-        }));
+                .map(str::to_owned)
+                .collect(),
+        });
     }
     let mut note_text = Vec::<(String, String)>::new();
     for (kind, member_name) in [
@@ -2481,7 +3022,7 @@ pub fn extract_docx_gold(path: impl AsRef<Path>) -> Result<Value> {
     let mut propositions = BTreeMap::<String, (String, String)>::new();
     let mut passage_parts = Vec::<String>::new();
     for paragraph in &paragraphs {
-        let text = paragraph["text"].as_str().expect("paragraph text");
+        let text = paragraph.text.as_str();
         let mut previous_offset = 0;
         for captures in marker_re().captures_iter(text) {
             let matched = captures.get(0).expect("marker match");
@@ -2518,77 +3059,80 @@ pub fn extract_docx_gold(path: impl AsRef<Path>) -> Result<Value> {
             text_by_key.get(key).map(|body| {
                 let (kind, id) = key.split_once(':').unwrap_or_default();
                 let proposition = propositions.get(key);
-                json!({
-                    "ooxml_id": id,
-                    "kind": kind,
-                    "label": display_by_key[key],
-                    "occurrence": 1,
-                    "body": body,
-                    "sentence_proposition": proposition.map(|value| value.0.as_str()).unwrap_or_default(),
-                    "passage_since_prior_note": proposition.map(|value| value.1.as_str()).unwrap_or_default(),
-                })
+                GoldFootnote {
+                    ooxml_id: id.to_owned(),
+                    kind: kind.to_owned(),
+                    label: display_by_key[key].clone(),
+                    occurrence: 1,
+                    body: body.clone(),
+                    sentence_proposition: proposition
+                        .map(|value| value.0.clone())
+                        .unwrap_or_default(),
+                    passage_since_prior_note: proposition
+                        .map(|value| value.1.clone())
+                        .unwrap_or_default(),
+                }
             })
         })
         .collect::<Vec<_>>();
     let body_text = paragraphs
         .iter()
-        .map(|paragraph| paragraph["text"].as_str().expect("paragraph text"))
+        .map(|paragraph| paragraph.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
     let citation_input = format!(
         "{body_text}\n{}",
-        text_by_key.values().cloned().collect::<Vec<_>>().join("\n")
+        text_by_key
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     let citations = citation_strings(&citation_input);
-    let mut note_counts = BTreeMap::<&str, usize>::new();
+    let mut note_counts = BTreeMap::<String, usize>::new();
     for note in &footnotes {
-        *note_counts
-            .entry(note["kind"].as_str().unwrap_or_default())
-            .or_default() += 1;
+        *note_counts.entry(note.kind.clone()).or_default() += 1;
     }
-    let result = json!({
-        "schema_version": "legalpdf.docx_gold.v2",
-        "source_name": source.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
-        "source_sha256": sha256_path(&source)?,
-        "paragraphs": paragraphs,
-        "footnotes": footnotes,
-        "note_counts": note_counts,
-        "citations": citations,
-    });
-    Ok(result)
+    Ok(DocxGold {
+        schema_version: "legalpdf.docx_gold.v2",
+        source_name: source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned(),
+        source_sha256: sha256_path(&source)?,
+        paragraphs,
+        footnotes,
+        note_counts,
+        citations,
+    })
+}
+
+pub fn extract_docx_gold(path: impl AsRef<Path>) -> Result<Value> {
+    Ok(serde_json::to_value(extract_docx_gold_typed(
+        path.as_ref(),
+    )?)?)
 }
 
 pub fn plan_docx_links(path: impl AsRef<Path>, options: &DocxPlanOptions) -> Result<Value> {
     let source = absolute_path(path.as_ref())?;
-    let gold = extract_docx_gold(&source)?;
-    let notes = gold["footnotes"]
-        .as_array()
-        .expect("DOCX gold footnotes")
-        .iter()
-        .map(|note| {
-            json!({
-                "id": note["ooxml_id"],
-                "label": note["label"],
-                "text": note["body"],
-                "proposition": note["passage_since_prior_note"],
-            })
+    let gold = extract_docx_gold_typed(&source)?;
+    let source_sha256 = gold.source_sha256.clone();
+    let notes = gold
+        .footnotes
+        .into_iter()
+        .map(|note| FootnoteRecord {
+            id: note.ooxml_id,
+            label: note.label,
+            text: note.body,
+            proposition: note.passage_since_prior_note,
         })
         .collect::<Vec<_>>();
-    let mut plan = plan_footnotes(&notes, options)?;
-    let object = plan.as_object_mut().expect("DOCX plan object");
-    object.insert(
-        "schema_version".to_owned(),
-        Value::String("legalpdf.docx_link_plan.v1".to_owned()),
-    );
-    object.insert(
-        "source".to_owned(),
-        Value::String(source.to_string_lossy().into_owned()),
-    );
-    object.insert(
-        "source_sha256".to_owned(),
-        Value::String(sha256_path(&source)?),
-    );
-    Ok(plan)
+    let mut plan = plan_records(notes, options)?;
+    plan.schema_version = "legalpdf.docx_link_plan.v1";
+    plan.source = Some(source.to_string_lossy().into_owned());
+    plan.source_sha256 = Some(source_sha256);
+    Ok(plan.into_value())
 }
 
 fn new_element(qname: &str, namespace: &str, local: &str) -> XmlElement {
@@ -2706,9 +3250,55 @@ fn link_paragraph(
     Ok(linked)
 }
 
+struct LinkPart {
+    part_id: String,
+    verbatim: String,
+}
+
+struct LinkNote {
+    id: String,
+    parts: Vec<LinkPart>,
+}
+
+struct ApplyPlan {
+    source_sha256: Option<String>,
+    footnotes: Vec<LinkNote>,
+}
+
+impl ApplyPlan {
+    fn from_value(value: &Value) -> Self {
+        let footnotes = value
+            .get("footnotes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|note| LinkNote {
+                id: value_string(note.get("id")),
+                parts: note
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|part| LinkPart {
+                        part_id: value_string(part.get("part_id")),
+                        verbatim: value_string(part.get("verbatim")),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self {
+            source_sha256: value
+                .get("source_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            footnotes,
+        }
+    }
+}
+
 fn link_note_paragraphs(
     element: &mut XmlElement,
-    parts: &[Value],
+    parts: &[LinkPart],
     links: &BTreeMap<String, String>,
     relationship_ids: &BTreeMap<String, String>,
     found_part_ids: &mut HashSet<String>,
@@ -2724,17 +3314,15 @@ fn link_note_paragraphs(
         let mut spans = Vec::new();
         let mut cursor = 0;
         for part in parts {
-            let part_id = py_string(part.get("part_id"));
-            let verbatim = py_string(part.get("verbatim"));
             let start = text[cursor..]
-                .find(&verbatim)
+                .find(&part.verbatim)
                 .map(|offset| cursor + offset)
-                .or_else(|| text.find(&verbatim));
+                .or_else(|| text.find(&part.verbatim));
             if let Some(start) = start {
-                cursor = start + verbatim.len();
-                if let Some(url) = links.get(&part_id) {
+                cursor = start + part.verbatim.len();
+                if let Some(url) = links.get(&part.part_id) {
                     spans.push((start, cursor, url.clone()));
-                    found_part_ids.insert(part_id);
+                    found_part_ids.insert(part.part_id.clone());
                 }
             }
         }
@@ -2810,7 +3398,8 @@ pub fn apply_docx_links(
 ) -> Result<Value> {
     let source = absolute_path(docx_path.as_ref())?;
     let target = absolute_path(output_path.as_ref())?;
-    if plan.get("source_sha256").and_then(Value::as_str) != Some(&sha256_path(&source)?) {
+    let plan = ApplyPlan::from_value(plan);
+    if plan.source_sha256.as_deref() != Some(&sha256_path(&source)?) {
         return Err(Error::Message(
             "link plan does not match the DOCX bytes".to_owned(),
         ));
@@ -2896,20 +3485,9 @@ pub fn apply_docx_links(
     }
     let mut linked_parts = 0;
     let mut skipped_parts = 0;
-    for note in plan
-        .get("footnotes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-    {
-        let id = py_string(note.get("id"));
-        let parts = note
-            .get("parts")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let Some(index) = note_indices.get(&id).copied() else {
-            skipped_parts += parts.len();
+    for note in plan.footnotes {
+        let Some(index) = note_indices.get(&note.id).copied() else {
+            skipped_parts += note.parts.len();
             continue;
         };
         let XmlNode::Element(node) = &mut root.children[index] else {
@@ -2918,18 +3496,16 @@ pub fn apply_docx_links(
         let mut found = HashSet::new();
         link_note_paragraphs(
             node,
-            &parts,
+            &note.parts,
             &links,
             &relationship_ids,
             &mut found,
             &mut linked_parts,
         )?;
-        skipped_parts += parts
+        skipped_parts += note
+            .parts
             .iter()
-            .filter(|part| {
-                let id = py_string(part.get("part_id"));
-                links.contains_key(&id) && !found.contains(&id)
-            })
+            .filter(|part| links.contains_key(&part.part_id) && !found.contains(&part.part_id))
             .count();
     }
     replace_file(&mut files, "word/footnotes.xml", serialize_xml(&footnotes)?);
