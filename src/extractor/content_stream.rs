@@ -7,27 +7,134 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{
+    FidelityGlyph, FidelityTextInfo, ItemType, PageExtraction, PdfLine, PdfRect, TextItem,
+};
 use crate::PdfError;
+use crate::detector::{analyze_page_content_streams, PageDetectionEvidence};
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache,
+    build_font_encodings, build_font_fidelity, build_font_widths, build_type3_scales,
+    compute_string_width_ts, descriptor_style_flags, extract_fidelity_glyphs,
+    extract_text_from_operand, extract_text_from_operand_fidelity, get_font_file2_obj_num,
+    get_operand_bytes, CMapDecisionCache, FontFidelity, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
+use super::xobjects::{expand_page_content, MAX_EXPANDED_OPERATIONS};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+
+fn fidelity_info(
+    fonts: Option<&HashMap<String, FontFidelity>>,
+    resource: &str,
+    text: String,
+    text_object: u32,
+    source_line: u32,
+    text_rise: f32,
+    mut glyphs: Vec<FidelityGlyph>,
+    combined: [f32; 6],
+    font_size: f32,
+    type3_scale: f32,
+    advance_ts: f32,
+) -> Option<Box<FidelityTextInfo>> {
+    let fonts = fonts?;
+    let font = fonts.get(resource);
+    let ascender = font.map_or(1.0, |value| value.ascender);
+    let descender = font.map_or(-0.2, |value| value.descender);
+    let axis = [combined[0], combined[1]];
+    let axis_length = axis[0].hypot(axis[1]);
+    let em = [
+        combined[2] * font_size * type3_scale,
+        combined[3] * font_size * type3_scale,
+    ];
+    for glyph in &mut glyphs {
+        let start = glyph.x0;
+        let end = glyph.x1;
+        let points = [
+            [
+                combined[4] + start * axis[0] + descender * em[0],
+                combined[5] + start * axis[1] + descender * em[1],
+            ],
+            [
+                combined[4] + start * axis[0] + ascender * em[0],
+                combined[5] + start * axis[1] + ascender * em[1],
+            ],
+            [
+                combined[4] + end * axis[0] + descender * em[0],
+                combined[5] + end * axis[1] + descender * em[1],
+            ],
+            [
+                combined[4] + end * axis[0] + ascender * em[0],
+                combined[5] + end * axis[1] + ascender * em[1],
+            ],
+        ];
+        glyph.x0 = start * axis_length;
+        glyph.x1 = end * axis_length;
+        glyph.bbox = [
+            points
+                .iter()
+                .map(|point| point[0])
+                .fold(f32::INFINITY, f32::min),
+            points
+                .iter()
+                .map(|point| point[1])
+                .fold(f32::INFINITY, f32::min),
+            points
+                .iter()
+                .map(|point| point[0])
+                .fold(f32::NEG_INFINITY, f32::max),
+            points
+                .iter()
+                .map(|point| point[1])
+                .fold(f32::NEG_INFINITY, f32::max),
+        ];
+    }
+    Some(Box::new(FidelityTextInfo {
+        text,
+        font: font
+            .map(|value| value.name.clone())
+            .unwrap_or_else(|| resource.to_owned()),
+        resource: resource.to_owned(),
+        flags: font.map_or(0, |value| value.flags),
+        ascender,
+        descender,
+        text_object,
+        source_line,
+        renderer_line: 0,
+        renderer_block: 0,
+        text_rise,
+        baseline: [combined[4], combined[5]],
+        advance: [advance_ts * axis[0], advance_ts * axis[1]],
+        em,
+        glyphs,
+    }))
+}
+
+pub(super) fn append_tj_text(current: &mut String, pending_space: &mut bool, text: &str) {
+    let Some(first) = text.chars().next() else {
+        return;
+    };
+    let current_has_space = current.chars().next_back().is_some_and(char::is_whitespace);
+    let text_has_space = first.is_whitespace();
+    if *pending_space && !current_has_space && !text_has_space {
+        current.push(' ');
+    }
+    *pending_space = false;
+    if current_has_space && text_has_space {
+        current.push_str(&text[first.len_utf8()..]);
+    } else {
+        current.push_str(text);
+    }
+}
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
 ///
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
-fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+pub(super) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
         return data.to_vec();
@@ -149,8 +256,94 @@ pub(crate) fn extract_page_text_items(
     font_cmaps: &FontCMaps,
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
-    form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
+    extract_page_text_items_impl(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        true,
+        true,
+        false,
+    )
+}
+
+pub(crate) fn extract_page_text_items_preserving_scripts(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
+    extract_page_text_items_impl(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        true,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn extract_page_text_items_raw(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
+    extract_page_text_items_impl(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        false,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn extract_page_text_items_fidelity(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
+    extract_page_text_items_impl(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        false,
+        false,
+        true,
+    )
+}
+
+fn extract_page_text_items_impl(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    merge_text: bool,
+    merge_scripts: bool,
+    fidelity: bool,
+) -> Result<(PageExtraction, bool, bool, bool, PageDetectionEvidence), PdfError> {
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -177,8 +370,45 @@ pub(crate) fn extract_page_text_items(
     let mut pending_re_rects: Vec<PdfRect> = Vec::new();
     let mut painted_rects: Vec<PdfRect> = Vec::new();
 
-    // Get fonts for encoding
-    let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+    // Decode page and nested Form content before building font state. Form
+    // resources are qualified while their operations are inlined, so every
+    // text-show operation below travels through this one interpreter.
+    let page_fonts = doc.get_page_fonts(page_id).unwrap_or_default();
+    let content_data = doc
+        .get_page_content(page_id)
+        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    let content_data = strip_pdf_comments(&content_data);
+    let detection = fidelity
+        .then(|| analyze_page_content_streams(doc, page_id, [content_data.as_slice()]))
+        .unwrap_or_default();
+    let content = match super::content_decode::decode_content_bounded(
+        &content_data,
+        super::content_decode::MAX_PAGE_OPERATIONS,
+    )? {
+        Some(content) => content,
+        None => {
+            log::warn!(
+                "page {page_num}: skipping extraction because content exceeds the operation limit"
+            );
+            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false, detection));
+        }
+    };
+    let expanded = expand_page_content(doc, page_id, content.operations, page_fonts);
+    if expanded.exceeded_limit {
+        log::warn!(
+            "page {}: skipping extraction — expanded content exceeds {} operations",
+            page_num,
+            MAX_EXPANDED_OPERATIONS
+        );
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false, detection));
+    }
+    if expanded.form_truncated {
+        log::warn!("page {page_num}: Form XObject expansion was truncated");
+    }
+    let fonts = expanded.fonts;
+    let font_names = expanded.font_names;
+    let xobjects = expanded.images;
+    let operations = expanded.operations;
 
     // Build font encoding maps from Differences arrays
     let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
@@ -234,6 +464,7 @@ pub(crate) fn extract_page_text_items(
             }
         }
     }
+    let font_fidelity = fidelity.then(|| build_font_fidelity(doc, &fonts, style_cache));
 
     // Cache font encodings from lopdf (once per font, not per text operand).
     // This avoids re-parsing ToUnicode CMap streams for every Tj/TJ operator.
@@ -246,34 +477,6 @@ pub(crate) fn extract_page_text_items(
     }
 
     let mut cmap_decisions = CMapDecisionCache::new();
-
-    // Get XObjects (images) from page resources
-    let xobjects = get_page_xobjects(doc, page_id);
-
-    // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
-
-    // Strip PDF comments (% to end of line) from the content stream.
-    // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
-    // Content::decode parser, causing it to skip operators like ET and Q.
-    let content_data = strip_pdf_comments(&content_data);
-
-    let content = match super::content_decode::decode_content_bounded(
-        &content_data,
-        super::content_decode::MAX_PAGE_OPERATIONS,
-    )? {
-        Some(content) => content,
-        None => {
-            log::warn!(
-                "page {}: skipping extraction — content stream exceeds {} operations",
-                page_num,
-                super::content_decode::MAX_PAGE_OPERATIONS
-            );
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
-        }
-    };
 
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
@@ -289,23 +492,30 @@ pub(crate) fn extract_page_text_items(
         line_width: f32,
         char_spacing: f32,
         word_spacing: f32,
+        horizontal_scaling: f32,
         text_rise: f32,
         text_leading: f32,
         current_font: String,
+        current_font_name: String,
         current_font_size: f32,
     }
     let mut gstate_stack: Vec<SavedGraphicsState> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
+    let mut current_font_name = String::new();
     let mut current_font_size: f32 = 12.0;
     let mut text_leading: f32 = 0.0; // TL parameter (in text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
+    let mut horizontal_scaling: f32 = 1.0; // Tz percentage as a multiplier
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
+    let mut text_object_index = 0u32;
+    let mut source_line_index = 0u32;
+    let mut source_line_has_text = false;
 
     // Track text direction votes: (horizontal_count, rotated_count).
     // For each text item, if |combined[0]| > |combined[1]| the text runs
@@ -333,9 +543,17 @@ pub(crate) fn extract_page_text_items(
         stack.iter().rev().find_map(|e| e.mcid)
     }
 
-    for op in &content.operations {
+    for op in &operations {
         trace!("{} {:?}", op.operator, op.operands);
-        match op.operator.as_str() {
+        let mut operator = op.operator.as_str();
+        let mut quote_operand = None;
+        if operator == "\"" && op.operands.len() >= 3 {
+            word_spacing = get_number(&op.operands[0]).unwrap_or(word_spacing);
+            char_spacing = get_number(&op.operands[1]).unwrap_or(char_spacing);
+            quote_operand = op.operands.get(2);
+            operator = "'";
+        }
+        match operator {
             "q" => {
                 // Save graphics state
                 gstate_stack.push(SavedGraphicsState {
@@ -344,9 +562,11 @@ pub(crate) fn extract_page_text_items(
                     line_width,
                     char_spacing,
                     word_spacing,
+                    horizontal_scaling,
                     text_rise,
                     text_leading,
                     current_font: current_font.clone(),
+                    current_font_name: current_font_name.clone(),
                     current_font_size,
                 });
             }
@@ -358,9 +578,11 @@ pub(crate) fn extract_page_text_items(
                     line_width = saved.line_width;
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
+                    horizontal_scaling = saved.horizontal_scaling;
                     text_rise = saved.text_rise;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
+                    current_font_name = saved.current_font_name;
                     current_font_size = saved.current_font_size;
                 }
             }
@@ -386,9 +608,11 @@ pub(crate) fn extract_page_text_items(
             "BT" => {
                 // Begin text block
                 in_text_block = true;
+                text_object_index = text_object_index.saturating_add(1);
+                source_line_index = source_line_index.saturating_add(1);
+                source_line_has_text = false;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                text_rendering_mode = 0;
             }
             "ET" => {
                 // End text block
@@ -399,6 +623,10 @@ pub(crate) fn extract_page_text_items(
                 if op.operands.len() >= 2 {
                     if let Ok(name) = op.operands[0].as_name() {
                         current_font = String::from_utf8_lossy(name).to_string();
+                        current_font_name = font_names
+                            .get(&current_font)
+                            .cloned()
+                            .unwrap_or_else(|| current_font.clone());
                     }
                     if let Ok(size) = op.operands[1].as_f32() {
                         current_font_size = size;
@@ -431,6 +659,11 @@ pub(crate) fn extract_page_text_items(
                     word_spacing = tw;
                 }
             }
+            "Tz" => {
+                if let Some(tz) = op.operands.first().and_then(get_number) {
+                    horizontal_scaling = tz / 100.0;
+                }
+            }
             "Ts" => {
                 // Set text rise (baseline shift for superscripts/subscripts)
                 if let Some(ts) = op.operands.first().and_then(get_number) {
@@ -441,6 +674,10 @@ pub(crate) fn extract_page_text_items(
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
                 if op.operands.len() >= 2 {
+                    if source_line_has_text {
+                        source_line_index = source_line_index.saturating_add(1);
+                        source_line_has_text = false;
+                    }
                     let tx = get_number(&op.operands[0]).unwrap_or(0.0);
                     let ty = get_number(&op.operands[1]).unwrap_or(0.0);
                     line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
@@ -454,6 +691,10 @@ pub(crate) fn extract_page_text_items(
             "Tm" => {
                 // Set text matrix
                 if op.operands.len() >= 6 {
+                    if source_line_has_text {
+                        source_line_index = source_line_index.saturating_add(1);
+                        source_line_has_text = false;
+                    }
                     for (i, operand) in op.operands.iter().take(6).enumerate() {
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
@@ -463,11 +704,9 @@ pub(crate) fn extract_page_text_items(
             }
             "T*" => {
                 // Move to start of next line: equivalent to 0 -TL Td
-                let tl = if text_leading != 0.0 {
-                    text_leading
-                } else {
-                    current_font_size * 1.2
-                };
+                source_line_index = source_line_index.saturating_add(1);
+                source_line_has_text = false;
+                let tl = text_leading;
                 line_matrix[4] += (-tl) * line_matrix[2]; // Usually 0 for non-rotated text
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
@@ -475,6 +714,7 @@ pub(crate) fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
+                    source_line_has_text = true;
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                         get_operand_bytes(&op.operands[0]).map(|raw| {
@@ -484,7 +724,7 @@ pub(crate) fn extract_page_text_items(
                                 current_font_size,
                                 char_spacing,
                                 word_spacing,
-                            )
+                            ) * horizontal_scaling
                         })
                     });
                     // ActualText: suppress glyph extraction, just advance text matrix.
@@ -521,6 +761,45 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
+                    let mut glyph_cursor = 0.0f32;
+                    let fidelity_glyphs: Vec<_> = if fidelity {
+                        extract_fidelity_glyphs(
+                            &op.operands[0],
+                            &current_font,
+                            font_base_names.get(&current_font).map(String::as_str),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                            current_font_size,
+                            char_spacing,
+                            word_spacing,
+                        )
+                        .into_iter()
+                        .map(|(text, advance)| {
+                            let advance = advance * horizontal_scaling;
+                            let glyph = FidelityGlyph {
+                                text,
+                                x0: glyph_cursor,
+                                x1: glyph_cursor + advance,
+                                bbox: [0.0; 4],
+                            };
+                            glyph_cursor += advance;
+                            glyph
+                        })
+                        .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let fidelity_text = (!fidelity_glyphs.is_empty()).then(|| {
+                        fidelity_glyphs
+                            .iter()
+                            .map(|glyph| glyph.text.as_str())
+                            .collect()
+                    });
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
@@ -546,13 +825,16 @@ pub(crate) fn extract_page_text_items(
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
-                            (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
+                            let axis_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                            let axis_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
+                            (w_ts * axis_x.hypot(axis_y)).abs()
                         } else {
                             0.0
                         };
-                        // Only create text item for non-whitespace; whitespace
-                        // still advances the text matrix above so gap detection works
-                        if !text.trim().is_empty() {
+                        // Fidelity consumers need whitespace geometry as grouping
+                        // evidence. The legal layer removes whitespace-only spans
+                        // after it has reconstructed renderer lines.
+                        if fidelity || !text.trim().is_empty() {
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -595,6 +877,19 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                fidelity: fidelity_info(
+                                    font_fidelity.as_ref(),
+                                    &current_font,
+                                    fidelity_text.unwrap_or_else(|| text.clone()),
+                                    text_object_index,
+                                    source_line_index,
+                                    text_rise,
+                                    fidelity_glyphs,
+                                    combined,
+                                    current_font_size,
+                                    type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                    w_ts_opt.unwrap_or(0.0),
+                                ),
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -605,6 +900,7 @@ pub(crate) fn extract_page_text_items(
             "TJ" => {
                 // Show text with positioning — split at column-sized gaps
                 if in_text_block && !op.operands.is_empty() {
+                    source_line_has_text = true;
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
                         // Numeric-only TJ arrays (pure kerning) show no
@@ -637,8 +933,12 @@ pub(crate) fn extract_page_text_items(
 
                         // Track sub-items for column-gap splitting:
                         // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, String, Vec<FidelityGlyph>, f32, f32)> =
+                            Vec::new();
                         let mut current_text = String::new();
+                        let mut current_fidelity_text = String::new();
+                        let mut current_fidelity_glyphs = Vec::new();
+                        let mut pending_space = false;
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
@@ -649,7 +949,9 @@ pub(crate) fn extract_page_text_items(
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0
+                                        * current_font_size
+                                        * horizontal_scaling;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -664,8 +966,11 @@ pub(crate) fn extract_page_text_items(
                                         && !current_text.is_empty()
                                     {
                                         // Column gap: flush current segment
+                                        pending_space = false;
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
+                                            std::mem::take(&mut current_fidelity_text),
+                                            std::mem::take(&mut current_fidelity_glyphs),
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
@@ -678,14 +983,16 @@ pub(crate) fn extract_page_text_items(
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
-                                            current_text.push(' ');
+                                            pending_space = true;
                                         }
                                     }
                                     continue;
                                 }
                                 Object::Real(n) => {
                                     let n_val = *n;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0
+                                        * current_font_size
+                                        * horizontal_scaling;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -699,8 +1006,11 @@ pub(crate) fn extract_page_text_items(
                                         && n_val < -column_gap_threshold
                                         && !current_text.is_empty()
                                     {
+                                        pending_space = false;
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
+                                            std::mem::take(&mut current_fidelity_text),
+                                            std::mem::take(&mut current_fidelity_glyphs),
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
@@ -713,13 +1023,14 @@ pub(crate) fn extract_page_text_items(
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
-                                            current_text.push(' ');
+                                            pending_space = true;
                                         }
                                     }
                                     continue;
                                 }
                                 _ => {}
                             }
+                            let element_start_width_ts = total_width_ts;
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
                                     total_width_ts += compute_string_width_ts(
@@ -728,10 +1039,67 @@ pub(crate) fn extract_page_text_items(
                                         current_font_size,
                                         char_spacing,
                                         word_spacing,
-                                    );
+                                    ) * horizontal_scaling;
                                 }
                             }
                             if !is_invisible {
+                                if fidelity {
+                                    let glyphs = extract_fidelity_glyphs(
+                                        element,
+                                        &current_font,
+                                        font_base_names.get(&current_font).map(String::as_str),
+                                        font_cmaps,
+                                        &font_tounicode_refs,
+                                        &inline_cmaps,
+                                        &font_encodings,
+                                        &encoding_cache,
+                                        &mut cmap_decisions,
+                                        &font_widths,
+                                        current_font_size,
+                                        char_spacing,
+                                        word_spacing,
+                                    );
+                                    if !glyphs.is_empty() {
+                                        if pending_space
+                                            && !current_fidelity_text.ends_with(char::is_whitespace)
+                                            && !glyphs[0].0.starts_with(char::is_whitespace)
+                                        {
+                                            current_fidelity_text.push(' ');
+                                            let x = element_start_width_ts - sub_start_width_ts;
+                                            current_fidelity_glyphs.push(FidelityGlyph {
+                                                text: " ".to_owned(),
+                                                x0: x,
+                                                x1: x,
+                                                bbox: [0.0; 4],
+                                            });
+                                        }
+                                        let mut glyph_cursor = element_start_width_ts;
+                                        for (text, advance) in glyphs {
+                                            let advance = advance * horizontal_scaling;
+                                            current_fidelity_text.push_str(&text);
+                                            current_fidelity_glyphs.push(FidelityGlyph {
+                                                text,
+                                                x0: glyph_cursor - sub_start_width_ts,
+                                                x1: glyph_cursor + advance - sub_start_width_ts,
+                                                bbox: [0.0; 4],
+                                            });
+                                            glyph_cursor += advance;
+                                        }
+                                    } else if let Some(text) = extract_text_from_operand_fidelity(
+                                        element,
+                                        &current_font,
+                                        font_base_names.get(&current_font).map(String::as_str),
+                                        font_cmaps,
+                                        &font_tounicode_refs,
+                                        &inline_cmaps,
+                                        &font_encodings,
+                                        &encoding_cache,
+                                        &mut cmap_decisions,
+                                        &font_widths,
+                                    ) {
+                                        current_fidelity_text.push_str(&text);
+                                    }
+                                }
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
@@ -744,13 +1112,22 @@ pub(crate) fn extract_page_text_items(
                                     &mut cmap_decisions,
                                     &font_widths,
                                 ) {
-                                    current_text.push_str(&text);
+                                    append_tj_text(&mut current_text, &mut pending_space, &text);
                                 }
                             }
                         }
                         // Flush remaining text
-                        if !is_invisible && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                        if !is_invisible
+                            && (fidelity || !current_text.trim().is_empty())
+                            && !current_text.is_empty()
+                        {
+                            sub_items.push((
+                                current_text,
+                                current_fidelity_text,
+                                current_fidelity_glyphs,
+                                sub_start_width_ts,
+                                total_width_ts,
+                            ));
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -779,7 +1156,9 @@ pub(crate) fn extract_page_text_items(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            let advance_scale = scale_x.hypot(scale_y);
+                            for (text, fidelity_text, fidelity_glyphs, start_w, end_w) in &sub_items
+                            {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -792,7 +1171,7 @@ pub(crate) fn extract_page_text_items(
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
                                 let (x, y) = (combined[4], combined[5]);
                                 let width = if font_info.is_some() {
-                                    ((end_w - start_w) * scale_x).abs()
+                                    ((end_w - start_w) * advance_scale).abs()
                                 } else {
                                     0.0
                                 };
@@ -828,6 +1207,23 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    fidelity: fidelity_info(
+                                        font_fidelity.as_ref(),
+                                        &current_font,
+                                        if fidelity_text.is_empty() {
+                                            text.clone()
+                                        } else {
+                                            fidelity_text.clone()
+                                        },
+                                        text_object_index,
+                                        source_line_index,
+                                        text_rise,
+                                        fidelity_glyphs.clone(),
+                                        combined,
+                                        current_font_size,
+                                        type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                        end_w - start_w,
+                                    ),
                                     item_type: ItemType::Text,
                                     mcid: current_mcid(&marked_content_stack),
                                 });
@@ -843,11 +1239,9 @@ pub(crate) fn extract_page_text_items(
             }
             "'" => {
                 // Move to next line and show text (equivalent to T* then Tj)
-                let tl = if text_leading != 0.0 {
-                    text_leading
-                } else {
-                    current_font_size * 1.2
-                };
+                source_line_index = source_line_index.saturating_add(1);
+                source_line_has_text = true;
+                let tl = text_leading;
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
@@ -860,15 +1254,16 @@ pub(crate) fn extract_page_text_items(
                 // Advance width, as for Tj — without it the item stays
                 // zero-width and geometric underline/strikeout detection
                 // rejects it (`is_underline_candidate` needs width > 0).
+                let shown = quote_operand.or_else(|| op.operands.first());
                 let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                    op.operands.first().and_then(get_operand_bytes).map(|raw| {
+                    shown.and_then(get_operand_bytes).map(|raw| {
                         compute_string_width_ts(
                             raw,
                             fi,
                             current_font_size,
                             char_spacing,
                             word_spacing,
-                        )
+                        ) * horizontal_scaling
                     })
                 });
                 if text_rendering_mode == 3
@@ -883,10 +1278,66 @@ pub(crate) fn extract_page_text_items(
                 }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
-                    || op.operands.is_empty())
+                    || shown.is_none())
                 {
+                    let mut glyph_cursor = 0.0f32;
+                    let fidelity_glyphs: Vec<_> = if fidelity {
+                        extract_fidelity_glyphs(
+                            shown.expect("show operand exists"),
+                            &current_font,
+                            font_base_names.get(&current_font).map(String::as_str),
+                            font_cmaps,
+                            &font_tounicode_refs,
+                            &inline_cmaps,
+                            &font_encodings,
+                            &encoding_cache,
+                            &mut cmap_decisions,
+                            &font_widths,
+                            current_font_size,
+                            char_spacing,
+                            word_spacing,
+                        )
+                        .into_iter()
+                        .map(|(text, advance)| {
+                            let advance = advance * horizontal_scaling;
+                            let glyph = FidelityGlyph {
+                                text,
+                                x0: glyph_cursor,
+                                x1: glyph_cursor + advance,
+                                bbox: [0.0; 4],
+                            };
+                            glyph_cursor += advance;
+                            glyph
+                        })
+                        .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let fidelity_text = fidelity.then(|| {
+                        if fidelity_glyphs.is_empty() {
+                            extract_text_from_operand_fidelity(
+                                shown.expect("show operand exists"),
+                                &current_font,
+                                font_base_names.get(&current_font).map(String::as_str),
+                                font_cmaps,
+                                &font_tounicode_refs,
+                                &inline_cmaps,
+                                &font_encodings,
+                                &encoding_cache,
+                                &mut cmap_decisions,
+                                &font_widths,
+                            )
+                        } else {
+                            Some(
+                                fidelity_glyphs
+                                    .iter()
+                                    .map(|glyph| glyph.text.as_str())
+                                    .collect(),
+                            )
+                        }
+                    });
                     if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
+                        shown.expect("show operand exists"),
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
                         font_cmaps,
@@ -897,7 +1348,7 @@ pub(crate) fn extract_page_text_items(
                         &mut cmap_decisions,
                         &font_widths,
                     ) {
-                        if !text.trim().is_empty() {
+                        if fidelity || !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                             if combined[0].abs() >= combined[1].abs() {
@@ -910,8 +1361,9 @@ pub(crate) fn extract_page_text_items(
                             let (x, y) = (combined[4], combined[5]);
                             let width = w_ts_opt
                                 .map(|w_ts| {
-                                    (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2]))
-                                        .abs()
+                                    let axis_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
+                                    let axis_y = text_matrix[0] * ctm[1] + text_matrix[1] * ctm[3];
+                                    (w_ts * axis_x.hypot(axis_y)).abs()
                                 })
                                 .unwrap_or(0.0);
                             let base_font = font_base_names
@@ -949,6 +1401,19 @@ pub(crate) fn extract_page_text_items(
                                 is_italic: is_italic_font(base_font) || desc_italic,
                                 is_underline: false,
                                 is_strikeout: false,
+                                fidelity: fidelity_info(
+                                    font_fidelity.as_ref(),
+                                    &current_font,
+                                    fidelity_text.flatten().unwrap_or_else(|| text.clone()),
+                                    text_object_index,
+                                    source_line_index,
+                                    text_rise,
+                                    fidelity_glyphs,
+                                    combined,
+                                    current_font_size,
+                                    type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                    w_ts_opt.unwrap_or(0.0),
+                                ),
                                 item_type: ItemType::Text,
                                 mcid: current_mcid(&marked_content_stack),
                             });
@@ -963,60 +1428,31 @@ pub(crate) fn extract_page_text_items(
                 }
             }
             "Do" => {
-                // XObject invocation - could be an image or form
-                if !op.operands.is_empty() {
-                    if let Ok(name) = op.operands[0].as_name() {
-                        let xobj_name = String::from_utf8_lossy(name).to_string();
-
-                        if let Some(xobj_type) = xobjects.get(&xobj_name) {
-                            match xobj_type {
-                                XObjectType::Image => {
-                                    // Emit a positional placeholder for the image
-                                    // so downstream consumers (layout-aware
-                                    // pipelines, figure-OCR routers) can locate
-                                    // raster figures without parsing the PDF
-                                    // again. The text field carries the
-                                    // XObject resource name in the legacy
-                                    // `[Image: Im0]` format that the markdown
-                                    // emitter already recognizes.
-                                    let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                                    items.push(TextItem {
-                                        text: format!("[Image: {}]", xobj_name),
-                                        x,
-                                        y,
-                                        width,
-                                        height,
-                                        font: String::new(),
-                                        font_tag: String::new(),
-                                        font_size: 0.0,
-                                        page: page_num,
-                                        is_bold: false,
-                                        is_italic: false,
-                                        is_underline: false,
-                                        is_strikeout: false,
-                                        item_type: ItemType::Image,
-                                        mcid: current_mcid(&marked_content_stack),
-                                    });
-                                }
-                                XObjectType::Form(form_id) => {
-                                    // Extract text from Form XObject
-                                    extract_form_xobject_text(
-                                        doc,
-                                        *form_id,
-                                        page_num,
-                                        font_cmaps,
-                                        &ctm,
-                                        &mut cmap_decisions,
-                                        style_cache,
-                                        form_budget,
-                                    )
-                                    .append_into(
-                                        &mut items,
-                                        &mut rtl_visual_candidates,
-                                        &mut rtl_logical_ops,
-                                    );
-                                }
-                            }
+                // Forms were expanded before interpretation, so any remaining
+                // XObject invocation is an image in the resolved resource scope.
+                if !suppress_glyph_extraction {
+                    if let Some(name) = op.operands.first().and_then(|value| value.as_name().ok()) {
+                        let resource_name = String::from_utf8_lossy(name);
+                        if let Some(display_name) = xobjects.get(resource_name.as_ref()) {
+                            let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                            items.push(TextItem {
+                                text: format!("[Image: {}]", display_name),
+                                x,
+                                y,
+                                width,
+                                height,
+                                font: String::new(),
+                                font_tag: String::new(),
+                                font_size: 0.0,
+                                page: page_num,
+                                is_bold: false,
+                                is_italic: false,
+                                is_underline: false,
+                                is_strikeout: false,
+                                fidelity: None,
+                                item_type: ItemType::Image,
+                                mcid: current_mcid(&marked_content_stack),
+                            });
                         }
                     }
                 }
@@ -1081,11 +1517,25 @@ pub(crate) fn extract_page_text_items(
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
-                            // Width in device space from text matrix delta
-                            let delta_ts = text_matrix[4] - start_tm[4];
-                            let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
-                            let width = (delta_ts * scale_x).abs();
-                            if !at.trim().is_empty() {
+                            // The translation slots already include the text
+                            // matrix's scale. Project their delta back onto the
+                            // text axis before fidelity_info applies the CTM.
+                            // Using the raw translation delta multiplied scaled
+                            // ActualText advances twice (for example, a 10x Tm
+                            // turned a 72pt heading into a 720pt run).
+                            let delta =
+                                [text_matrix[4] - start_tm[4], text_matrix[5] - start_tm[5]];
+                            let axis = [start_tm[0], start_tm[1]];
+                            let axis_squared = axis[0] * axis[0] + axis[1] * axis[1];
+                            let advance_ts = if axis_squared > f32::EPSILON {
+                                (delta[0] * axis[0] + delta[1] * axis[1]) / axis_squared
+                            } else {
+                                0.0
+                            };
+                            let axis_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
+                            let axis_y = start_tm[0] * ctm[1] + start_tm[1] * ctm[3];
+                            let width = (advance_ts * axis_x.hypot(axis_y)).abs();
+                            if fidelity || !at.trim().is_empty() {
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
@@ -1112,6 +1562,19 @@ pub(crate) fn extract_page_text_items(
                                     is_italic: is_italic_font(base_font) || desc_italic,
                                     is_underline: false,
                                     is_strikeout: false,
+                                    fidelity: fidelity_info(
+                                        font_fidelity.as_ref(),
+                                        &current_font,
+                                        at.clone(),
+                                        text_object_index,
+                                        source_line_index,
+                                        rise,
+                                        Vec::new(),
+                                        combined,
+                                        current_font_size,
+                                        type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                        advance_ts,
+                                    ),
                                     item_type: ItemType::Text,
                                     mcid: entry
                                         .mcid
@@ -1387,12 +1850,6 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
-    if form_budget.was_truncated() {
-        log::warn!(
-            "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
-        );
-    }
-
     // Underline detection reads only painted ink: `re` rects confirmed by
     // a paint operator plus filled-subpath rects — never clip-only rects,
     // which draw nothing.
@@ -1444,13 +1901,22 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
-    let items = super::merge_subscript_items(items);
+    let items = if merge_text {
+        super::merge_text_items(items)
+    } else {
+        items
+    };
+    let items = if merge_scripts {
+        super::merge_subscript_items(items)
+    } else {
+        items
+    };
     Ok((
         (items, rects, lines),
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,
+        detection,
     ))
 }
 
@@ -1494,18 +1960,18 @@ fn correct_rotated_page(
     // The layout engine sorts by y descending (highest = top of page), so
     // we negate old_x so that visual-top (low device x) gets high new_y.
     for item in &mut items {
-        let new_x = item.y;
-        let new_y = -item.x;
-        item.x = new_x;
-        item.y = new_y;
-        // For rotated text, the "width" along the reading direction was
-        // lost (computed as 0 due to scale_x ≈ 0).  Estimate from text
-        // length × approximate char width.  font_size is the rendered
-        // height in device space, which for 90° rotation corresponds to
-        // the horizontal extent of one em.
-        if item.width < 0.5 {
-            let char_count = item.text.chars().count() as f32;
-            item.width = char_count * item.font_size * 0.5;
+        let old_x = item.x;
+        item.x = item.y;
+        item.y = -old_x;
+        if let Some(fidelity) = item.fidelity.as_mut() {
+            let old_baseline = fidelity.baseline;
+            fidelity.baseline = [old_baseline[1], -old_baseline[0]];
+            fidelity.advance = [fidelity.advance[1], -fidelity.advance[0]];
+            fidelity.em = [fidelity.em[1], -fidelity.em[0]];
+            for glyph in &mut fidelity.glyphs {
+                let bbox = glyph.bbox;
+                glyph.bbox = [bbox[1], -bbox[2], bbox[3], -bbox[0]];
+            }
         }
     }
 
@@ -1644,6 +2110,96 @@ mod tests {
         (doc, page_id)
     }
 
+    fn simple_doc_with_form(
+        form_content: &[u8],
+        page_tail: &[u8],
+        form_width: Option<i64>,
+        form_matrix: Option<[i64; 6]>,
+        properties: Option<lopdf::Dictionary>,
+    ) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Dictionary, Object, Stream};
+
+        fn font(doc: &mut lopdf::Document, base: &str, width: i64) -> lopdf::ObjectId {
+            let widths: Vec<Object> = (0..=255).map(|_| width.into()).collect();
+            doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => base,
+                "FirstChar" => 0,
+                "LastChar" => 255,
+                "Widths" => Object::Array(widths),
+            })
+        }
+
+        let mut doc = lopdf::Document::new();
+        let page_font = font(&mut doc, "Helvetica", 600);
+        let mut form_resources = Dictionary::new();
+        if let Some(width) = form_width {
+            let form_font = font(&mut doc, "Courier", width);
+            form_resources.set("Font", dictionary! { "F1" => Object::Reference(form_font) });
+        }
+        if let Some(properties) = properties {
+            form_resources.set("Properties", properties);
+        }
+
+        let mut form_dictionary = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        };
+        if !form_resources.is_empty() {
+            form_dictionary.set("Resources", form_resources);
+        }
+        if let Some(matrix) = form_matrix {
+            form_dictionary.set(
+                "Matrix",
+                Object::Array(matrix.into_iter().map(Object::Integer).collect()),
+            );
+        }
+        let form = doc.add_object(Stream::new(form_dictionary, form_content.to_vec()));
+
+        let mut page_content = b"/Fm Do\n".to_vec();
+        page_content.extend_from_slice(page_tail);
+        let content = doc.add_object(Stream::new(dictionary! {}, page_content));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(page_font) },
+                "XObject" => dictionary! { "Fm" => Object::Reference(form) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog));
+        (doc, page_id)
+    }
+
+    fn extract_doc_fidelity_items(
+        doc: &lopdf::Document,
+        page_id: lopdf::ObjectId,
+    ) -> Vec<TextItem> {
+        let font_cmaps = FontCMaps::from_doc(doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items_fidelity(
+            doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+        )
+        .unwrap();
+        items
+    }
+
     fn extract_simple_items(content: &[u8]) -> Vec<TextItem> {
         use crate::tounicode::FontCMaps;
 
@@ -1656,10 +2212,239 @@ mod tests {
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
-            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items
+    }
+
+    fn extract_simple_raw_items(content: &[u8]) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items_raw(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    fn extract_simple_fidelity_items(content: &[u8]) -> Vec<TextItem> {
+        use crate::tounicode::FontCMaps;
+
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, _) = extract_page_text_items_fidelity(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontStyleCache::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    #[test]
+    fn zero_leading_t_star_does_not_invent_a_line_advance() {
+        let items =
+            extract_simple_raw_items(b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (A) Tj T* (B) Tj ET");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].y, items[1].y);
+    }
+
+    #[test]
+    fn horizontal_scaling_applies_to_text_and_glyph_advances() {
+        let items =
+            extract_simple_fidelity_items(b"BT /F1 12 Tf 50 Tz 1 0 0 1 100 500 Tm (AB) Tj ET");
+        assert_eq!(items.len(), 1);
+        assert!((items[0].width - 7.2).abs() < 0.01);
+        let glyphs = &items[0].fidelity.as_ref().unwrap().glyphs;
+        assert_eq!(glyphs.len(), 2);
+        assert!((glyphs[0].x1 - 3.6).abs() < 0.01);
+        assert!((glyphs[1].x1 - 7.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn fidelity_keeps_whitespace_geometry_for_line_grouping() {
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm ( ) Tj ET";
+        assert!(extract_simple_items(content).is_empty());
+
+        let items = extract_simple_fidelity_items(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, " ");
+        assert!(items[0].width > 0.0);
+        assert_eq!(items[0].fidelity.as_ref().unwrap().glyphs.len(), 1);
+    }
+
+    #[test]
+    fn fidelity_keeps_whitespace_actual_text() {
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm \
+/Span <</ActualText <feff00a0>>> BDC ( ) Tj EMC ET";
+        assert!(extract_simple_items(content).is_empty());
+
+        let items = extract_simple_fidelity_items(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "\u{00a0}");
+        assert!(items[0].width > 0.0);
+    }
+
+    #[test]
+    fn scaled_actual_text_advance_is_not_multiplied_twice() {
+        let items = extract_simple_fidelity_items(
+            b"BT /F1 1 Tf 10 0 0 10 100 500 Tm \
+/Span <</ActualText (replacement) >> BDC (AB) Tj EMC ET",
+        );
+        let item = &items[0];
+        let fidelity = item.fidelity.as_ref().unwrap();
+
+        assert!((item.width - 12.0).abs() < 0.01);
+        assert!((fidelity.advance[0] - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rotated_fidelity_uses_source_advances_and_glyph_bounds() {
+        let items = extract_simple_fidelity_items(
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (AB) Tj ET \
+              BT /F1 12 Tf 0 1 -1 0 240 100 Tm (CD) Tj ET",
+        );
+        let first = items.iter().find(|item| item.text == "AB").unwrap();
+        let fidelity = first.fidelity.as_ref().unwrap();
+
+        assert!((first.width - 14.4).abs() < 0.01);
+        assert!((fidelity.advance[0] - 14.4).abs() < 0.01);
+        assert!(fidelity.advance[1].abs() < 0.01);
+        assert_eq!(fidelity.glyphs.len(), 2);
+        assert!((fidelity.glyphs[0].bbox[2] - fidelity.glyphs[0].bbox[0] - 7.2).abs() < 0.01);
+        assert!(fidelity.glyphs[1].bbox[0] >= fidelity.glyphs[0].bbox[2] - 0.01);
+    }
+
+    #[test]
+    fn form_content_uses_the_full_text_state_machine() {
+        let (doc, page_id) = simple_doc_with_form(
+            b"BT /F1 12 Tf 50 Tz 14 TL 1 0 0 1 100 500 Tm (A) Tj 3 Ts 1 2 (B) \" ET",
+            b"",
+            None,
+            Some([1, 0, 0, 1, 20, 30]),
+            None,
+        );
+        let items = extract_doc_fidelity_items(&doc, page_id);
+
+        assert_eq!(items.len(), 2);
+        assert!((items[0].x - 120.0).abs() < 0.01);
+        assert!((items[0].y - 530.0).abs() < 0.01);
+        assert!((items[0].width - 3.6).abs() < 0.01);
+        assert!((items[1].x - 120.0).abs() < 0.01);
+        assert!((items[1].y - 519.0).abs() < 0.01);
+        assert!((items[1].width - 4.6).abs() < 0.01);
+        assert!((items[1].fidelity.as_ref().unwrap().glyphs[0].x1 - 4.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn form_resources_do_not_collide_with_page_resources() {
+        let (doc, page_id) = simple_doc_with_form(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (FORM) Tj ET",
+            b"BT /F1 12 Tf 1 0 0 1 100 450 Tm (PAGE) Tj ET",
+            Some(500),
+            None,
+            None,
+        );
+        let items = extract_doc_fidelity_items(&doc, page_id);
+        let form = items.iter().find(|item| item.text == "FORM").unwrap();
+        let page = items.iter().find(|item| item.text == "PAGE").unwrap();
+
+        assert!((form.width - 24.0).abs() < 0.01);
+        assert!((page.width - 28.8).abs() < 0.01);
+        assert_eq!(form.font, "F1");
+        assert_eq!(page.font, "F1");
+        assert_eq!(form.fidelity.as_ref().unwrap().font, "Courier");
+        assert_eq!(page.fidelity.as_ref().unwrap().font, "Helvetica");
+    }
+
+    #[test]
+    fn form_named_actual_text_is_resolved_in_its_resource_scope() {
+        use lopdf::{dictionary, Object};
+
+        let properties = dictionary! {
+            "P1" => dictionary! {
+                "ActualText" => Object::string_literal("replacement"),
+                "MCID" => Object::Integer(7),
+            },
+        };
+        let (doc, page_id) = simple_doc_with_form(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm /Span /P1 BDC (raw) Tj EMC ET",
+            b"",
+            Some(600),
+            None,
+            Some(properties),
+        );
+        let items = extract_doc_fidelity_items(&doc, page_id);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "replacement");
+        assert_eq!(items[0].mcid, Some(7));
+    }
+
+    #[test]
+    fn form_graphics_state_is_restored_before_page_text() {
+        let (doc, page_id) = simple_doc_with_form(
+            b"3 Tr BT /F1 12 Tf 1 0 0 1 100 500 Tm (HIDDEN) Tj ET",
+            b"BT /F1 12 Tf 1 0 0 1 100 450 Tm (PAGE) Tj ET",
+            None,
+            None,
+            None,
+        );
+        let items = extract_doc_fidelity_items(&doc, page_id);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "PAGE");
+    }
+
+    #[test]
+    fn double_quote_sets_spacing_moves_line_and_shows_text() {
+        let items = extract_simple_raw_items(
+            b"BT /F1 12 Tf 12 TL 1 0 0 1 100 512 Tm 20 2 (AB) \" (CD) Tj ET",
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "AB");
+        assert!((items[0].y - 500.0).abs() < 0.01);
+        assert!((items[0].width - 18.4).abs() < 0.01);
+        assert_eq!(items[1].text, "CD");
+        assert!((items[1].x - 118.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_rendering_mode_persists_between_text_objects() {
+        let items = extract_simple_raw_items(
+            b"BT /F1 12 Tf 3 Tr 1 0 0 1 100 500 Tm (A) Tj ET BT 1 0 0 1 100 480 Tm (B) Tj ET",
+        );
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn tj_inferred_space_does_not_duplicate_a_literal_space() {
+        let items = extract_simple_raw_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm [(General) -300 ( statutory)] TJ ET",
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "General statutory");
+    }
+
+    #[test]
+    fn tj_adjacent_literals_do_not_duplicate_their_boundary_space() {
+        let items = extract_simple_raw_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm [(General ) -300 ( statutory)] TJ ET",
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "General statutory");
     }
 
     #[test]
@@ -1886,7 +2671,6 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
-            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
@@ -1977,7 +2761,6 @@ BT 30 700 Tm <41> Tj ET";
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
-            &mut FormWalkBudget::new(),
         )
         .unwrap();
         let text = items
@@ -2053,7 +2836,6 @@ end"#;
             &font_cmaps,
             false,
             &mut FontStyleCache::new(),
-            &mut FormWalkBudget::new(),
         )
         .unwrap();
         items

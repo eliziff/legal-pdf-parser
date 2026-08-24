@@ -49,6 +49,7 @@ pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
+pub use extractor::extract_fidelity_from_doc;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
     extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
@@ -1058,11 +1059,7 @@ pub fn extract_text_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        // Extract text items for this page. The Form XObject budget is shared
-        // with the invisible-layer retry below so one page cannot consume two
-        // full expansion budgets.
-        let mut form_budget = extractor::FormWalkBudget::new();
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
+        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1070,7 +1067,6 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
-                &mut form_budget,
             )?;
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
@@ -1091,7 +1087,7 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
+            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _, _)) =
                 extractor::content_stream::extract_page_text_items(
                     &doc,
                     page_id,
@@ -1099,7 +1095,6 @@ pub fn extract_text_in_regions_mem(
                     &font_cmaps,
                     true,
                     &mut style_cache,
-                    &mut form_budget,
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
@@ -1274,7 +1269,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1282,7 +1277,6 @@ pub fn extract_tables_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1586,7 +1580,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1594,7 +1588,6 @@ pub fn detect_vector_grid_in_region_mem(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1789,7 +1782,6 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
-                &mut crate::extractor::FormWalkBudget::new(),
             )
             .unwrap();
 
@@ -1833,7 +1825,6 @@ mod vector_grid_tests {
                 &cmaps,
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
-                &mut crate::extractor::FormWalkBudget::new(),
             )
             .unwrap();
 
@@ -2563,7 +2554,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -2571,7 +2562,6 @@ pub fn extract_tables_with_structure_cells_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -3366,7 +3356,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible, _) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -3374,7 +3364,6 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {

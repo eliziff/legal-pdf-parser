@@ -188,6 +188,37 @@ pub(crate) fn detect_from_document(
 ) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
+    Ok(classify_page_evidence(
+        page_count,
+        total_pages,
+        get_document_title(doc),
+        config,
+        |page_num| {
+            pages
+                .get(&page_num)
+                .map(|&page_id| analyze_page_content(doc, page_id))
+        },
+    ))
+}
+
+pub(crate) fn detect_from_page_evidence(
+    pages: &[PageDetectionEvidence],
+    title: Option<String>,
+    config: &DetectionConfig,
+) -> PdfTypeResult {
+    let page_count = pages.len() as u32;
+    classify_page_evidence(page_count, page_count, title, config, |page_num| {
+        pages.get((page_num - 1) as usize).cloned()
+    })
+}
+
+fn classify_page_evidence(
+    page_count: u32,
+    total_pages: u32,
+    title: Option<String>,
+    config: &DetectionConfig,
+    mut page_evidence: impl FnMut(u32) -> Option<PageDetectionEvidence>,
+) -> PdfTypeResult {
 
     // Select pages to scan based on strategy
     let (sample_indices, allow_early_exit) = match &config.strategy {
@@ -215,12 +246,11 @@ pub(crate) fn detect_from_document(
     let mut pages_with_vector_text = 0u32;
     let mut total_text_ops = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
-    let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
+    let mut analysis_cache: HashMap<u32, PageDetectionEvidence> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
 
     for page_num in &sample_indices {
-        if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+        if let Some(analysis) = page_evidence(*page_num) {
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -385,11 +415,10 @@ pub(crate) fn detect_from_document(
             for page_num in 1..=total_pages {
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
                     cached.clone()
-                } else if let Some(&page_id) = pages.get(&page_num) {
+                } else if let Some(a) = page_evidence(page_num) {
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -441,8 +470,7 @@ pub(crate) fn detect_from_document(
             if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
                 continue;
             }
-            if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+            if let Some(analysis) = page_evidence(page_num) {
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -468,10 +496,7 @@ pub(crate) fn detect_from_document(
         ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
     }
 
-    // Try to get title from metadata
-    let title = get_document_title(doc);
-
-    Ok(PdfTypeResult {
+    PdfTypeResult {
         pdf_type,
         page_count,
         pages_sampled,
@@ -481,7 +506,7 @@ pub(crate) fn detect_from_document(
         ocr_recommended,
         pages_needing_ocr,
         ocr_reasons_by_page,
-    })
+    }
 }
 
 /// Distribute `n` page indices evenly across `total` pages (1-indexed).
@@ -521,7 +546,7 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 
 /// Page content analysis result
 #[derive(Clone, Default)]
-struct PageAnalysis {
+pub(crate) struct PageAnalysis {
     text_operator_count: u32,
     has_images: bool,
     /// Whether page has a large background/template image (>50% coverage)
@@ -555,6 +580,8 @@ struct PageAnalysis {
     /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
     has_decodable_text_fonts: bool,
 }
+
+pub(crate) type PageDetectionEvidence = PageAnalysis;
 
 /// Explain *why* a page needs OCR, from its content analysis. Priority:
 /// undecodable fonts (`suspected_garbled_text`) and vector-outlined text
@@ -740,6 +767,26 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
+    let contents = doc
+        .get_page_contents(page_id)
+        .into_iter()
+        .filter_map(|content_id| match doc.get_object(content_id) {
+            Ok(Object::Stream(stream)) => Some(
+                stream
+                    .decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone()),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    analyze_page_content_streams(doc, page_id, contents.iter().map(Vec::as_slice))
+}
+
+pub(crate) fn analyze_page_content_streams<'a>(
+    doc: &Document,
+    page_id: ObjectId,
+    contents: impl IntoIterator<Item = &'a [u8]>,
+) -> PageDetectionEvidence {
     let mut text_ops = 0u32;
     let mut has_images = false;
     let mut image_count = 0u32;
@@ -755,25 +802,16 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // page-level Resources + Form XObject Resources.
     let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
 
-    // Get content streams for this page — these use the page's resource dict
-    let content_streams = doc.get_page_contents(page_id);
-
     // We need the page's resource dict to resolve font names from page content.
     // get_page_resources returns (Option<&Dictionary>, Vec<ObjectId>) for
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
-    for content_id in content_streams {
-        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
-
+    for content in contents {
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
             let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
-                &content,
+                content,
                 &mut all_unique_chars,
                 &mut page_font_names,
             );
@@ -795,7 +833,6 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut used_font_ids,
                 );
             }
-        }
     }
 
     // Scan XObject Form contents for text operators, collect their fonts,
@@ -1941,7 +1978,7 @@ fn collect_images_from_resources(
 }
 
 /// Get document title from Info dictionary
-fn get_document_title(doc: &Document) -> Option<String> {
+pub(crate) fn get_document_title(doc: &Document) -> Option<String> {
     let info_ref = doc.trailer.get(b"Info").ok()?.as_reference().ok()?;
     let info = doc.get_dictionary(info_ref).ok()?;
     let title_obj = info.get(b"Title").ok()?;

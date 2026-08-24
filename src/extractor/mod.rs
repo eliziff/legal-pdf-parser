@@ -16,6 +16,10 @@ use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
+use crate::detector::{
+    detect_from_page_evidence, get_document_title, PageDetectionEvidence,
+};
+use crate::{DetectionConfig, PdfTypeResult};
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -38,11 +42,25 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
-pub(crate) use xobjects::FormWalkBudget;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Extract source-faithful text and classify a PDF the caller already loaded.
+pub fn extract_fidelity_from_doc(
+    doc: &Document,
+) -> Result<(PageExtraction, PdfTypeResult), PdfError> {
+    let font_cmaps = FontCMaps::from_doc(doc);
+    let (extraction, _, _, evidence) =
+        extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
+    let detection = detect_from_page_evidence(
+        &evidence,
+        get_document_title(doc),
+        &DetectionConfig::default(),
+    );
+    Ok((extraction, detection))
+}
 
 pub(crate) fn trace_text_preview(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
@@ -77,6 +95,44 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
 /// Extract text with position information from PDF file
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_pages(path, None)
+}
+
+/// Extract positioned text without folding raised or lowered digit runs into
+/// neighboring text items. This preserves their original font and geometry
+/// for structure-aware consumers.
+pub fn extract_text_with_positions_preserving_scripts<P: AsRef<Path>>(
+    path: P,
+) -> Result<Vec<TextItem>, PdfError> {
+    crate::validate_pdf_file(&path)?;
+    let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages, _) =
+        extract_positioned_text_from_doc_preserving_scripts(&doc, &font_cmaps, None)?;
+    Ok(items)
+}
+
+/// Extract positioned text items in content-stream order before adjacent text
+/// and script runs are merged.
+pub fn extract_text_with_positions_raw<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
+    crate::validate_pdf_file(&path)?;
+    let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages, _) =
+        extract_positioned_text_from_doc_raw(&doc, &font_cmaps, None)?;
+    Ok(items)
+}
+
+/// Extract unmerged positioned runs with source-faithful text, font metrics,
+/// flags, and provenance in `TextItem::fidelity`.
+pub fn extract_text_with_positions_fidelity<P: AsRef<Path>>(
+    path: P,
+) -> Result<Vec<TextItem>, PdfError> {
+    crate::validate_pdf_file(&path)?;
+    let (doc, _) = crate::load_document_from_path_with_password(&path, None)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages, _) =
+        extract_positioned_text_from_doc_fidelity(&doc, &font_cmaps, None)?;
+    Ok(items)
 }
 
 /// Extract text with positions from a file, limited to specific pages.
@@ -162,7 +218,84 @@ pub(crate) fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
+    let (extraction, thresholds, gid_pages, _) =
+        extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None, true, true, false)?;
+    Ok((extraction, thresholds, gid_pages))
+}
+
+fn extract_positioned_text_from_doc_preserving_scripts(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<
+    (
+        PageExtraction,
+        PageThresholds,
+        HashSet<u32>,
+        Vec<PageDetectionEvidence>,
+    ),
+    PdfError,
+> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        None,
+        true,
+        false,
+        false,
+    )
+}
+
+fn extract_positioned_text_from_doc_raw(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<
+    (
+        PageExtraction,
+        PageThresholds,
+        HashSet<u32>,
+        Vec<PageDetectionEvidence>,
+    ),
+    PdfError,
+> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+}
+
+fn extract_positioned_text_from_doc_fidelity(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<
+    (
+        PageExtraction,
+        PageThresholds,
+        HashSet<u32>,
+        Vec<PageDetectionEvidence>,
+    ),
+    PdfError,
+> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        None,
+        false,
+        false,
+        true,
+    )
 }
 
 /// Extract selected pages and gather document-wide folio evidence only when a
@@ -192,19 +325,33 @@ fn extract_positioned_text_with_folio_context_impl(
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let Some(required_pages) = page_filter else {
-        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+        let (extraction, thresholds, gid_pages, _) = extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            None,
+            include_invisible,
+            None,
+            true,
+            true,
+            false,
+        )?;
+        return Ok((extraction, thresholds, gid_pages));
     };
 
     let (
         (mut selected_items, mut selected_rects, mut selected_lines),
         mut page_thresholds,
         mut gid_encoded_pages,
+        _,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
         Some(required_pages),
         include_invisible,
         None,
+        true,
+        true,
+        false,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
@@ -220,13 +367,21 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
-    let ((context_items, context_rects, context_lines), context_thresholds, context_gid_pages) =
+    let (
+        (context_items, context_rects, context_lines),
+        context_thresholds,
+        context_gid_pages,
+        _,
+    ) =
         extract_positioned_text_impl(
             doc,
             font_cmaps,
             Some(&context_pages),
             include_invisible,
             Some(required_pages),
+            true,
+            true,
+            false,
         )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
@@ -247,7 +402,17 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
+    let (extraction, thresholds, gid_pages, _) = extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        None,
+        false,
+        Some(required_pages),
+        true,
+        true,
+        false,
+    )?;
+    Ok((extraction, thresholds, gid_pages))
 }
 
 fn extract_positioned_text_impl(
@@ -256,13 +421,25 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    merge_text: bool,
+    merge_scripts: bool,
+    fidelity: bool,
+) -> Result<
+    (
+        PageExtraction,
+        PageThresholds,
+        HashSet<u32>,
+        Vec<PageDetectionEvidence>,
+    ),
+    PdfError,
+> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    let mut detection = Vec::with_capacity(if fidelity { pages.len() } else { 0 });
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -277,29 +454,63 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
-            doc,
-            page_id,
-            *page_num,
-            font_cmaps,
-            include_invisible,
-            &mut style_cache,
-            &mut FormWalkBudget::new(),
-        );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
-            match page_result {
-                Ok(extraction) => extraction,
-                Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
-                {
-                    debug!(
-                        "page {}: skipping context-only extraction error: {}",
-                        page_num, error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let page_result = if fidelity {
+            content_stream::extract_page_text_items_fidelity(
+                doc,
+                page_id,
+                *page_num,
+                font_cmaps,
+                include_invisible,
+                &mut style_cache,
+            )
+        } else if !merge_text {
+            content_stream::extract_page_text_items_raw(
+                doc,
+                page_id,
+                *page_num,
+                font_cmaps,
+                include_invisible,
+                &mut style_cache,
+            )
+        } else if merge_scripts {
+            extract_page_text_items(
+                doc,
+                page_id,
+                *page_num,
+                font_cmaps,
+                include_invisible,
+                &mut style_cache,
+            )
+        } else {
+            content_stream::extract_page_text_items_preserving_scripts(
+                doc,
+                page_id,
+                *page_num,
+                font_cmaps,
+                include_invisible,
+                &mut style_cache,
+            )
+        };
+        let (
+            (mut items, mut rects, mut lines),
+            has_gid_fonts,
+            coords_rotated,
+            _skipped_invisible,
+            page_detection,
+        ) = match page_result {
+            Ok(extraction) => extraction,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if fidelity {
+            detection.push(page_detection);
+        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -438,6 +649,7 @@ fn extract_positioned_text_impl(
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        detection,
     ))
 }
 
@@ -1128,6 +1340,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                fidelity: None,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
             });
@@ -1432,6 +1645,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            fidelity: None,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1691,6 +1905,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1708,6 +1923,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -1725,6 +1941,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2512,6 +2729,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2529,6 +2747,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2546,6 +2765,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2574,6 +2794,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2591,6 +2812,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2608,6 +2830,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2638,6 +2861,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -2675,6 +2899,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             }
@@ -2713,6 +2938,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2730,6 +2956,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2747,6 +2974,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2772,6 +3000,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            fidelity: None,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -2912,6 +3141,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2929,6 +3159,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2956,6 +3187,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -2973,6 +3205,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             },
@@ -3016,6 +3249,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3063,6 +3297,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3110,6 +3345,7 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                fidelity: None,
                 item_type: ItemType::Text,
                 mcid: None,
             }],
@@ -3150,6 +3386,7 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            fidelity: None,
             item_type: ItemType::Text,
             mcid: None,
         }

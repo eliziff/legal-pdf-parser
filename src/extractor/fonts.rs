@@ -699,6 +699,74 @@ pub(crate) fn compute_string_width_ts(
         + num_spaces as f32 * word_spacing
 }
 
+/// Decode each source character code independently and retain its exact text
+/// and advance. A decoded code may yield multiple Unicode scalars (for
+/// example a ligature); it is still one positioned PDF glyph.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_fidelity_glyphs(
+    obj: &Object,
+    current_font: &str,
+    base_font_name: Option<&str>,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &HashMap<String, u32>,
+    inline_cmaps: &HashMap<String, crate::tounicode::CMapEntry>,
+    font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
+    font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+) -> Vec<(String, f32)> {
+    let Some(bytes) = get_operand_bytes(obj) else {
+        return Vec::new();
+    };
+    let code_len = inline_cmaps
+        .get(current_font)
+        .map(|entry| entry.primary.code_byte_length as usize)
+        .or_else(|| {
+            font_tounicode_refs
+                .get(current_font)
+                .and_then(|id| font_cmaps.get_by_obj(*id))
+                .map(|entry| entry.primary.code_byte_length as usize)
+        })
+        .unwrap_or_else(|| {
+            if font_widths
+                .get(current_font)
+                .is_some_and(|font| font.is_cid)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .max(1);
+    let Some(widths) = font_widths.get(current_font) else {
+        return Vec::new();
+    };
+    bytes
+        .chunks(code_len)
+        .filter_map(|code| {
+            let operand = Object::String(code.to_vec(), lopdf::StringFormat::Hexadecimal);
+            let text = extract_text_from_operand_fidelity(
+                &operand,
+                current_font,
+                base_font_name,
+                font_cmaps,
+                font_tounicode_refs,
+                inline_cmaps,
+                font_encodings,
+                encoding_cache,
+                cmap_decisions,
+                font_widths,
+            )?;
+            let advance =
+                compute_string_width_ts(code, widths, font_size, char_spacing, word_spacing);
+            Some((text, advance))
+        })
+        .collect()
+}
+
 /// Extract raw bytes from a PDF operand (String object)
 pub(crate) fn get_operand_bytes(obj: &Object) -> Option<&[u8]> {
     if let Object::String(bytes, _) = obj {
@@ -847,6 +915,18 @@ pub(crate) fn parse_encoding_dictionary(
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
                 let mapped_char = glyph_to_char(&glyph_name)
+                    // Adobe composite glyph names use underscores between
+                    // components (`T_h`, `f_f_i`, ...). MuPDF's extraction
+                    // contract for a simple-font Differences entry keeps the
+                    // first component when the font provides no usable
+                    // ToUnicode entry. Falling through to the literal byte
+                    // instead turns these glyphs into punctuation (`!`, `"`,
+                    // `#`, ...), even though the PDF renders letters.
+                    .or_else(|| {
+                        glyph_name
+                            .split_once('_')
+                            .and_then(|(first, _)| glyph_to_char(first))
+                    })
                     .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
                 if mapped_char.is_some_and(is_ligature_char) {
                     debug!(
@@ -994,7 +1074,150 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
 /// (the common case: regular fonts report neither italic nor bold).
 #[derive(Debug, Default)]
 pub(crate) struct FontStyleCache {
-    by_font_file: HashMap<ObjectId, (bool, bool)>,
+    by_font_file: HashMap<ObjectId, EmbeddedFontInfo>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct EmbeddedFontInfo {
+    italic: bool,
+    bold: bool,
+    serif: bool,
+    fixed: bool,
+    ascender: f32,
+    descender: f32,
+}
+
+impl Default for EmbeddedFontInfo {
+    fn default() -> Self {
+        Self {
+            italic: false,
+            bold: false,
+            serif: false,
+            fixed: false,
+            ascender: 1.0,
+            descender: -0.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FontFidelity {
+    pub(crate) name: String,
+    pub(crate) flags: u32,
+    pub(crate) ascender: f32,
+    pub(crate) descender: f32,
+}
+
+pub(crate) fn build_font_fidelity(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    style_cache: &mut FontStyleCache,
+) -> HashMap<String, FontFidelity> {
+    let mut result = HashMap::new();
+    for (resource, font) in fonts {
+        let resource = String::from_utf8_lossy(resource).to_string();
+        let name = font
+            .get(b"BaseFont")
+            .ok()
+            .and_then(|value| value.as_name().ok())
+            .map(|value| strip_subset_prefix(&String::from_utf8_lossy(value)).to_owned())
+            .unwrap_or_else(|| resource.clone());
+        let descriptor = font_descriptor(doc, font);
+        let descriptor_flags = descriptor
+            .and_then(|value| value.get(b"Flags").ok())
+            .and_then(|value| value.as_i64().ok())
+            .unwrap_or(0);
+        let (italic, bold) = descriptor_style_flags(doc, font, style_cache);
+        let embedded = descriptor
+            .and_then(font_file_ref)
+            .map(|file| embedded_font_info_cached(doc, file, style_cache));
+        let lower_name = name.to_ascii_lowercase();
+        let serif_name = [
+            "serif",
+            "times",
+            "garamond",
+            "minion",
+            "georgia",
+            "cambria",
+            "baskerville",
+            "caslon",
+            "palatino",
+            "bookman",
+            "century",
+            "roman",
+        ]
+        .iter()
+        .any(|part| lower_name.contains(part));
+        let fixed_name = ["mono", "courier", "consolas"]
+            .iter()
+            .any(|part| lower_name.contains(part));
+        let serif = descriptor_flags & (1 << 1) != 0
+            || embedded.is_some_and(|value| value.serif)
+            || serif_name;
+        let fixed =
+            descriptor_flags & 1 != 0 || embedded.is_some_and(|value| value.fixed) || fixed_name;
+        let flags = if italic || crate::text_utils::is_italic_font(&name) {
+            2
+        } else {
+            0
+        } | if serif { 4 } else { 0 }
+            | if fixed { 8 } else { 0 }
+            | if bold || crate::text_utils::is_bold_font(&name) {
+                16
+            } else {
+                0
+            };
+        let (ascender, descender) = font_metrics(doc, descriptor, style_cache);
+        result.insert(
+            resource,
+            FontFidelity {
+                name,
+                flags,
+                ascender,
+                descender,
+            },
+        );
+    }
+    result
+}
+
+fn font_descriptor<'a>(
+    doc: &'a Document,
+    font: &'a lopdf::Dictionary,
+) -> Option<&'a lopdf::Dictionary> {
+    font.get(b"FontDescriptor")
+        .ok()
+        .and_then(|value| resolve_dict(doc, value))
+        .or_else(|| {
+            let descendants = resolve_array(doc, font.get(b"DescendantFonts").ok()?)?;
+            let descendant = resolve_dict(doc, descendants.first()?)?;
+            resolve_dict(doc, descendant.get(b"FontDescriptor").ok()?)
+        })
+}
+
+fn font_metrics(
+    doc: &Document,
+    descriptor: Option<&lopdf::Dictionary>,
+    style_cache: &mut FontStyleCache,
+) -> (f32, f32) {
+    let Some(descriptor) = descriptor else {
+        return (1.0, -0.2);
+    };
+    let number = |key: &[u8]| {
+        descriptor.get(key).ok().and_then(|value| match value {
+            Object::Integer(value) => Some(*value as f32),
+            Object::Real(value) => Some(*value),
+            _ => None,
+        })
+    };
+    if let (Some(ascender), Some(descender)) = (number(b"Ascent"), number(b"Descent")) {
+        return (ascender / 1000.0, descender / 1000.0);
+    }
+    if let Some(file) = font_file_ref(descriptor) {
+        let info = embedded_font_info_cached(doc, file, style_cache);
+        return (info.ascender, info.descender);
+    }
+    (1.0, -0.2)
 }
 
 impl FontStyleCache {
@@ -1053,38 +1276,61 @@ pub(crate) fn descriptor_style_flags(
     // fsSelection (via `Face::is_italic`) and the post table's italicAngle.
     if !italic || !bold {
         if let Some(ff_ref) = font_file_ref(descriptor) {
-            let (emb_italic, emb_bold) = *style_cache
-                .by_font_file
-                .entry(ff_ref)
-                .or_insert_with(|| embedded_style_flags(doc, ff_ref));
-            italic = italic || emb_italic;
-            bold = bold || emb_bold;
+            let embedded = embedded_font_info_cached(doc, ff_ref, style_cache);
+            italic = italic || embedded.italic;
+            bold = bold || embedded.bold;
         }
     }
     (italic, bold)
 }
 
 /// Style flags parsed from an embedded font program stream.
-fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
+fn embedded_font_info_cached(
+    doc: &Document,
+    ff_ref: ObjectId,
+    style_cache: &mut FontStyleCache,
+) -> EmbeddedFontInfo {
+    if let Some(info) = style_cache.by_font_file.get(&ff_ref) {
+        return *info;
+    }
+    let info = embedded_font_info(doc, ff_ref);
+    style_cache.by_font_file.insert(ff_ref, info);
+    info
+}
+
+fn embedded_font_info(doc: &Document, ff_ref: ObjectId) -> EmbeddedFontInfo {
     let Some(data) = font_file_data(doc, ff_ref) else {
-        return (false, false);
+        return EmbeddedFontInfo::default();
     };
     if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
-        (
-            face.is_italic() || face.italic_angle().abs() >= 4.0,
-            face.is_bold(),
-        )
+        let units = f32::from(face.units_per_em()).max(1.0);
+        let os2 = face.raw_face().table(ttf_parser::Tag::from_bytes(b"OS/2"));
+        let panose_serif = os2.is_some_and(|table| {
+            table.get(32) == Some(&2) && table.get(33).is_some_and(|style| (2..=10).contains(style))
+        });
+        let family_serif = os2
+            .and_then(|table| table.get(30).copied())
+            .is_some_and(|family| matches!(family, 1 | 2 | 3 | 4 | 5 | 7));
+        EmbeddedFontInfo {
+            italic: face.is_italic() || face.italic_angle().abs() >= 4.0,
+            bold: face.is_bold(),
+            serif: panose_serif || family_serif,
+            fixed: face.is_monospaced(),
+            ascender: f32::from(face.ascender()) / units,
+            descender: f32::from(face.descender()) / units,
+        }
     } else if let Some(name) = cff_font_name(&data) {
         // FontFile3 is bare CFF (no sfnt container) — ttf_parser
         // can't open it, but the CFF Name INDEX keeps the real
         // PostScript name ("XXXXXX+Amplitude-LightItalic") even
         // when the descriptor was rewritten to claim upright.
-        (
-            crate::text_utils::is_italic_font(&name),
-            crate::text_utils::is_bold_font(&name),
-        )
+        EmbeddedFontInfo {
+            italic: crate::text_utils::is_italic_font(&name),
+            bold: crate::text_utils::is_bold_font(&name),
+            ..EmbeddedFontInfo::default()
+        }
     } else {
-        (false, false)
+        EmbeddedFontInfo::default()
     }
 }
 
@@ -1165,6 +1411,68 @@ pub(crate) fn extract_text_from_operand(
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
 ) -> Option<String> {
+    extract_text_from_operand_impl(
+        obj,
+        current_font,
+        base_font_name,
+        font_cmaps,
+        font_tounicode_refs,
+        inline_cmaps,
+        font_encodings,
+        encoding_cache,
+        cmap_decisions,
+        font_widths,
+        false,
+    )
+}
+
+/// Decode a content-stream string without presentation cleanup. Legal and
+/// archival consumers need the codepoints supplied by the PDF: ligatures,
+/// soft hyphens, NBSPs, and private-use glyphs are evidence, not formatting
+/// noise. The ordinary extractor deliberately keeps its searchable-Markdown
+/// cleanup through [`extract_text_from_operand`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_text_from_operand_fidelity(
+    obj: &Object,
+    current_font: &str,
+    base_font_name: Option<&str>,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
+    font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
+) -> Option<String> {
+    extract_text_from_operand_impl(
+        obj,
+        current_font,
+        base_font_name,
+        font_cmaps,
+        font_tounicode_refs,
+        inline_cmaps,
+        font_encodings,
+        encoding_cache,
+        cmap_decisions,
+        font_widths,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_text_from_operand_impl(
+    obj: &Object,
+    current_font: &str,
+    base_font_name: Option<&str>,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
+    font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
+    fidelity: bool,
+) -> Option<String> {
     let is_type0_cid_font = font_widths
         .get(current_font)
         .is_some_and(|info| info.is_cid);
@@ -1232,6 +1540,14 @@ pub(crate) fn extract_text_from_operand(
                 if let Some(remapped) = entry.remapped.as_ref() {
                     let decoded_remap = remapped.decode_cids(bytes);
                     let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
+
+                    // A declared ToUnicode map is authoritative on the
+                    // fidelity path. Sequential-GID remapping is a useful
+                    // rescue heuristic for presentation extraction, but it
+                    // must not silently replace valid source text.
+                    if fidelity && !decoded_primary.is_empty() {
+                        return Some(decoded_primary);
+                    }
 
                     if let Some(choice) = cmap_decisions
                         .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
@@ -1437,8 +1753,11 @@ pub(crate) fn extract_text_from_operand(
         }
     })();
     result.map(|text| {
-        let text = clean_symbol_pua(text);
-        let text = remap_texcm_math_symbols(text, base_font_name);
+        let text = if fidelity {
+            text
+        } else {
+            remap_texcm_math_symbols(clean_symbol_pua(text), base_font_name)
+        };
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
 }
@@ -1697,6 +2016,23 @@ mod tests {
         // is_cid_font keys on the C2_/C0_ prefix for micro-gap joining.
         assert_eq!(item_font_name("C2_0", "ABCDEE+SimSun"), "C2_0");
         assert_eq!(item_font_name("C0_1", "ABCDEE+MSMincho"), "C0_1");
+    }
+
+    #[test]
+    fn descriptor_metrics_are_the_renderer_contract() {
+        use lopdf::{dictionary, Document};
+
+        let document = Document::new();
+        let descriptor = dictionary! {
+            "Ascent" => 891,
+            "Descent" => -216,
+        };
+        let mut cache = super::FontStyleCache::new();
+
+        assert_eq!(
+            super::font_metrics(&document, Some(&descriptor), &mut cache),
+            (0.891, -0.216)
+        );
     }
 
     #[test]
@@ -2134,6 +2470,66 @@ mod tests {
         assert!(!result.map.contains_key(&0x88u8));
         assert_eq!(result.map.get(&0x89u8), Some(&'\u{FB01}'));
         assert_eq!(result.map.get(&0xADu8), Some(&'\u{FB02}'));
+    }
+
+    #[test]
+    fn composite_differences_name_uses_first_component() {
+        let doc = Document::with_version("1.7");
+        let font_dict = dictionary! {
+            "BaseFont" => Object::Name(b"AAAAAW+AGaramondPro-Regular".to_vec()),
+            "Encoding" => dictionary! {
+                "Differences" => Object::Array(vec![
+                    Object::Integer(33),
+                    Object::Name(b"T_h".to_vec()),
+                    Object::Name(b"f_f_i".to_vec()),
+                ]),
+            },
+        };
+
+        let result = parse_font_encoding(&doc, &font_dict).expect("encoding should parse");
+        assert_eq!(result.map.get(&33), Some(&'T'));
+        assert_eq!(result.map.get(&34), Some(&'\u{FB03}'));
+    }
+
+    #[test]
+    fn fidelity_decode_preserves_private_use_symbol() {
+        let obj = Object::String(vec![0xB7], lopdf::StringFormat::Hexadecimal);
+        let font_cmaps = FontCMaps::default();
+        let refs = HashMap::new();
+        let inline = HashMap::new();
+        let encodings = HashMap::new();
+        let cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let widths = HashMap::new();
+
+        let presentation = extract_text_from_operand(
+            &obj,
+            "F1",
+            Some("Wingdings"),
+            &font_cmaps,
+            &refs,
+            &inline,
+            &encodings,
+            &cache,
+            &mut CMapDecisionCache::new(),
+            &widths,
+        )
+        .expect("presentation decode");
+        let fidelity = extract_text_from_operand_fidelity(
+            &obj,
+            "F1",
+            Some("Wingdings"),
+            &font_cmaps,
+            &refs,
+            &inline,
+            &encodings,
+            &cache,
+            &mut CMapDecisionCache::new(),
+            &widths,
+        )
+        .expect("fidelity decode");
+
+        assert_eq!(presentation, "\u{2022}");
+        assert_eq!(fidelity, "\u{F0B7}");
     }
 
     #[test]
