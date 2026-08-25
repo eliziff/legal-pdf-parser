@@ -35,14 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Open-Legal-Products/mike
-          ref: 32a6cf57be442296edae072f91c75c7d059adc46
-          path: shared
-          sparse-checkout: legal-structure
+          repository: eliziff/legal-structure
+          ref: 46e23615828d9cdd00578de2172f6dd2ff568ad7
+          path: legal-structure
           persist-credentials: false
-      - name: Install pinned legal-structure
-        shell: pwsh
-        run: Copy-Item shared/legal-structure legal-structure -Recurse
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: github.event_name == 'pull_request'
         with:
