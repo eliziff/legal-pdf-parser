@@ -47,7 +47,7 @@ legalpdf --version
 ```
 
 Provider-neutral detection and document queries live in the standalone
-[`legal-structure`](https://github.com/eliziff/legal-structure) crate.
+[`legal-structure`](https://github.com/eliziff/legal-structure-parser) crate.
 The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
 `ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
 separate runtime/model pack are required. The root package has no default

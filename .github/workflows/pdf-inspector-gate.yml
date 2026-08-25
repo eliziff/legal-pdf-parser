@@ -35,8 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: eliziff/legal-structure
-          ref: 46e23615828d9cdd00578de2172f6dd2ff568ad7
+          repository: eliziff/legal-structure-parser
+          ref: 2e3be0e2c907ee11814ccf8be42855d325dbe27e
           path: legal-structure
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
