@@ -11,8 +11,8 @@ default-members = ["."]
 resolver = "2"
 
 [workspace.dependencies]
-legal-grammar-tables = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "2e3be0e2c907ee11814ccf8be42855d325dbe27e" }
-legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "2e3be0e2c907ee11814ccf8be42855d325dbe27e" }
+legal-grammar-tables = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "45df479a09a3588525017f3128ecb38b9b44ec32" }
+legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "45df479a09a3588525017f3128ecb38b9b44ec32" }
 pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", branch = "pdf-inspector", default-features = false }
 
 [features]
