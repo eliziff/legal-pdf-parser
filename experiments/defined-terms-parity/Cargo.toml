@@ -7,6 +7,6 @@ publish = false
 [workspace]
 
 [dependencies]
-legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "be0a6277cbe23b9c590ef320c47a14ce2b5f060f" }
+legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "66ebb038dc0b95fc3d8b8b8f952caf82d9c95d2e" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
