@@ -113,6 +113,7 @@ pub struct KrakenOptions {
     pub batch_size: usize,
     pub runtime_batch_size: usize,
     pub width_bucket: usize,
+    #[serde(skip, default = "default_input_height")]
     pub input_height: usize,
     pub width_scale: Option<f32>,
     pub tier: KrakenTier,
@@ -142,7 +143,7 @@ impl Default for KrakenOptions {
             batch_size: 0,
             runtime_batch_size: 0,
             width_bucket: 0,
-            input_height: 48,
+            input_height: default_input_height(),
             width_scale: None,
             tier: KrakenTier::Quality,
             layout: KrakenLayout::Tesseract,
@@ -153,6 +154,10 @@ impl Default for KrakenOptions {
             expected_identity: None,
         }
     }
+}
+
+fn default_input_height() -> usize {
+    48
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
