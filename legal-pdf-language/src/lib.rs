@@ -1,8 +1,5 @@
-mod codex;
-mod deterministic_citations;
 mod docx;
 mod error;
-mod grammar_tables;
 mod process;
 
 pub use docx::{

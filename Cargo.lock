@@ -616,8 +616,6 @@ dependencies = [
 name = "legal-pdf-language"
 version = "0.1.0"
 dependencies = [
- "fancy-regex",
- "legal-grammar-tables",
  "legal-pdf-core",
  "legal-structure",
  "libc",
@@ -625,7 +623,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "zip",
 ]

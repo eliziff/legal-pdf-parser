@@ -8,6 +8,7 @@ use legal_pdf_structure::{replay, status, validate_document, StructureIdentity, 
 #[cfg(feature = "pdf")]
 use serde_json::Map;
 
+#[cfg(feature = "pdf")]
 use legal_structure::{DocumentStructure, EngineError};
 
 #[cfg(feature = "pdf")]
