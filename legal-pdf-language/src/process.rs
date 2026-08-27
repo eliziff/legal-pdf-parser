@@ -55,7 +55,6 @@ pub(crate) struct Output {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_exceeded: bool,
-    pub elapsed: Duration,
 }
 
 pub(crate) enum RunError {
@@ -122,9 +121,8 @@ pub(crate) fn run(
     let stdout_exceeded = Arc::new(AtomicBool::new(false));
     let writer = thread::spawn(move || stdin.write_all(&input));
     let stdout_signal = Arc::clone(&stdout_exceeded);
-    let stdout = thread::spawn(move || {
-        read_bounded(stdout, stdout_limit, false, Some(&stdout_signal))
-    });
+    let stdout =
+        thread::spawn(move || read_bounded(stdout, stdout_limit, false, Some(&stdout_signal)));
     let stderr = thread::spawn(move || read_bounded(stderr, stderr_limit, true, None));
     let status = loop {
         match child.try_wait() {
@@ -153,7 +151,6 @@ pub(crate) fn run(
     let (stdout, stdout_exceeded) = stdout.map_err(RunError::Io)?;
     let (stderr, _) = stderr.map_err(RunError::Io)?;
     let status = status?;
-    let elapsed = started.elapsed();
     if status.success() && !stdout_exceeded {
         writer.map_err(RunError::Io)?;
     }
@@ -162,6 +159,5 @@ pub(crate) fn run(
         stdout,
         stderr,
         stdout_exceeded,
-        elapsed,
     })
 }
