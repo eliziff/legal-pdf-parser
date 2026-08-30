@@ -485,7 +485,7 @@ pub(crate) fn parse_pdf(
             derived.footnotes,
             derived.structure_graph,
         )
-    });
+    })?;
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
         let cache_path = parse_cache_root(root)

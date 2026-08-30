@@ -9,9 +9,8 @@ use legal_structure::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
-use serde_json::json;
-#[cfg(test)]
 use serde_json::Map;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -41,6 +40,7 @@ pub struct PdfDocument {
     structure: legal_structure::DocumentStructure,
     pages: Vec<ProjectionPage>,
     footnotes: Vec<ProjectionFootnote>,
+    authority_text_units: Vec<Value>,
     summary: PdfSummary,
 }
 
@@ -145,16 +145,25 @@ impl PdfDocument {
         paragraphs: Vec<Paragraph>,
         footnotes: Vec<Footnote>,
         mut structure: DocumentStructure,
-    ) -> Self {
+    ) -> legal_pdf_core::Result<Self> {
+        let authority_text_units =
+            crate::adapters::to_toa_text_units_from_parts(&paragraphs, &footnotes)?;
         attach_rendered_text(&paragraphs, &pages, &footnotes, &mut structure);
         let page_count = pages.len();
         let summary = summary(source_sha256, cache_key, page_count, status, metadata);
-        Self::project(pages, footnotes, structure, summary)
+        Ok(Self::project(
+            pages,
+            footnotes,
+            authority_text_units,
+            structure,
+            summary,
+        ))
     }
 
     fn project(
         pages: Vec<Page>,
         footnotes: Vec<Footnote>,
+        authority_text_units: Vec<Value>,
         structure: DocumentStructure,
         summary: PdfSummary,
     ) -> Self {
@@ -214,6 +223,7 @@ impl PdfDocument {
                     },
                 )
                 .collect(),
+            authority_text_units,
             summary,
         }
     }
@@ -232,6 +242,10 @@ impl PdfDocument {
 
     pub fn summary(&self) -> &PdfSummary {
         &self.summary
+    }
+
+    pub fn authority_text_units(&self) -> &[Value] {
+        &self.authority_text_units
     }
 
     pub fn fingerprint(&self) -> DocumentFingerprint {
@@ -1119,6 +1133,19 @@ mod tests {
         )
     }
 
+    fn pdf_summary() -> PdfSummary {
+        PdfSummary {
+            sha256: "00".repeat(32),
+            parser_version: PARSER_VERSION.to_owned(),
+            cache_key: "cache".to_owned(),
+            page_count: 1,
+            projection_page_count: 1,
+            status: "ready".to_owned(),
+            pages_needing_ocr: vec![],
+            ocr_routed_pages: vec![],
+        }
+    }
+
     #[test]
     fn invalid_lookup_is_bounded_without_guessing() {
         let mut document = LegalDocument {
@@ -1188,8 +1215,9 @@ mod tests {
         let document = PdfDocument::project(
             document.pages,
             document.footnotes,
+            vec![],
             document.structure_graph,
-            json!({}),
+            pdf_summary(),
         );
         assert!(matches!(
             document.lookup(&PdfLookupRequest::new("page", "")).status,
@@ -1277,10 +1305,66 @@ mod tests {
         let document = PdfDocument::project(
             document.pages,
             document.footnotes,
+            vec![],
             document.structure_graph,
-            json!({}),
+            pdf_summary(),
         );
         let lookup = document.lookup(&PdfLookupRequest::new("section", "section:section-000001"));
         assert!(matches!(lookup.status, PdfLookupStatus::NotFound));
+    }
+
+    #[test]
+    fn cache_round_trip_keeps_authority_text_units() {
+        let expected = json!({
+            "key": "body:0", "kind": "body", "ordinal": 0,
+            "footnote_id": null, "text": "😀", "footnote_refs": [[1, 2]],
+        });
+        let marker = "⟦FN:one⟧";
+        let document = PdfDocument::from_parts(
+            &"00".repeat(32),
+            "cache",
+            "ready".to_owned(),
+            PdfExtractionMetadata {
+                pages_needing_ocr: vec![],
+                ocr_routed_pages: vec![],
+            },
+            vec![],
+            vec![Paragraph {
+                id: "p".to_owned(),
+                page_index: 0,
+                region_type: "body".to_owned(),
+                text: format!("😀{marker}"),
+                line_ids: vec![],
+                anchors: vec![legal_pdf_core::model::ParagraphAnchor {
+                    pair_id: "one".to_owned(),
+                    label: "1".to_owned(),
+                    offset: 1,
+                }],
+            }],
+            vec![Footnote {
+                pair_id: "one".to_owned(),
+                label: "1".to_owned(),
+                occurrence: 1,
+                restart_sequence: 1,
+                reference_page: Some(1),
+                body_pages: vec![1],
+                reference_line_id: Some("p".to_owned()),
+                body_line_ids: vec![],
+                body: "Note.".to_owned(),
+                sentence_proposition: String::new(),
+                passage_since_prior_note: String::new(),
+                confidence: 1.0,
+                provenance: "deterministic".to_owned(),
+                warnings: vec![],
+                crossrefs: vec![],
+            }],
+            structure_graph(vec![node("p", NodeKind::Prose)]),
+        )
+        .unwrap();
+        assert_eq!(document.authority_text_units()[0], expected);
+
+        let restored: PdfDocument =
+            serde_json::from_value(serde_json::to_value(document).unwrap()).unwrap();
+        assert_eq!(restored.authority_text_units()[0], expected);
     }
 }
