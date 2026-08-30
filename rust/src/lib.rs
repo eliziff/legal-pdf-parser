@@ -21,8 +21,9 @@ pub use legal_pdf_core::model::*;
 pub use legal_pdf_core::{Error, Result};
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
-    analyze_docx_bytes, analyze_docx_drafting_bytes, docx_text, fix_docx_supra_cross_references,
-    has_docx_supra_references, DocxSupraCleanup, MAX_DOCX_SUPRA_BYTES,
+    analyze_docx_bytes, analyze_docx_drafting_bytes, docx_text, docx_to_toa_text_units,
+    fix_docx_supra_cross_references, has_docx_supra_references, DocxSupraCleanup,
+    MAX_DOCX_SUPRA_BYTES,
 };
 #[cfg(feature = "kraken")]
 pub use legal_pdf_ocr::{

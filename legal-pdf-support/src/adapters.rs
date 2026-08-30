@@ -1,4 +1,4 @@
-use legal_pdf_core::model::LegalDocument;
+use legal_pdf_core::model::{Footnote, LegalDocument, Paragraph};
 use legal_pdf_core::{Error, Result};
 use legal_structure::ScalarText;
 use serde_json::{json, Map, Value};
@@ -73,14 +73,20 @@ pub fn to_alr_payload(document: &LegalDocument) -> Value {
 }
 
 pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
-    let internal_by_pair: HashMap<&str, usize> = document
-        .footnotes
+    to_toa_text_units_from_parts(&document.paragraphs, &document.footnotes)
+}
+
+pub(crate) fn to_toa_text_units_from_parts(
+    paragraphs: &[Paragraph],
+    footnotes: &[Footnote],
+) -> Result<Vec<Value>> {
+    let internal_by_pair: HashMap<&str, usize> = footnotes
         .iter()
         .enumerate()
         .map(|(index, note)| (note.pair_id.as_str(), index + 1))
         .collect();
-    let mut units = Vec::with_capacity(document.paragraphs.len() + document.footnotes.len());
-    for (ordinal, paragraph) in document.paragraphs.iter().enumerate() {
+    let mut units = Vec::with_capacity(paragraphs.len() + footnotes.len());
+    for (ordinal, paragraph) in paragraphs.iter().enumerate() {
         let coordinates = ScalarText::new(&paragraph.text);
         let mut anchors = paragraph.anchors.iter().collect::<Vec<_>>();
         anchors.sort_by_key(|anchor| anchor.offset);
@@ -106,7 +112,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
             })?;
             let segment = &paragraph.text[byte_cursor..byte_start];
             rendered.push_str(segment);
-            clean_length += segment.chars().count();
+            clean_length += legal_structure::utf16_len(segment);
             let internal = internal_by_pair.get(pair_id.as_str()).ok_or_else(|| {
                 Error::Message(format!(
                     "Unknown footnote pair {pair_id} in {}",
@@ -129,7 +135,7 @@ pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
             "footnote_refs": references,
         }));
     }
-    units.extend(document.footnotes.iter().enumerate().map(|(index, note)| {
+    units.extend(footnotes.iter().enumerate().map(|(index, note)| {
         let ordinal = index + 1;
         json!({
             "key": format!("footnote:{ordinal}"),
@@ -237,5 +243,21 @@ mod tests {
         let toa = to_toa_text_units(&document).unwrap();
         assert_eq!(toa[0]["text"], "Alpha beta gamma.");
         assert_eq!(toa[0]["footnote_refs"], json!([[1, 5], [2, 10]]));
+    }
+
+    #[test]
+    fn toa_reference_offsets_are_javascript_utf16() {
+        let mut document = document();
+        let marker = "⟦FN:first⟧";
+        document.paragraphs[0].text = format!("😀{marker}");
+        document.paragraphs[0].anchors = vec![ParagraphAnchor {
+            pair_id: "first".to_owned(),
+            label: "1".to_owned(),
+            offset: 1,
+        }];
+
+        let toa = to_toa_text_units(&document).unwrap();
+        assert_eq!(toa[0]["text"], "😀");
+        assert_eq!(toa[0]["footnote_refs"], json!([[1, 2]]));
     }
 }

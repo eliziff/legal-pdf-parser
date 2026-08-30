@@ -667,6 +667,136 @@ fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     file_bytes(files, name).map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
+fn authority_text(
+    element: &XmlElement,
+    text: &mut String,
+    references: &mut Vec<(i64, usize)>,
+) -> Result<()> {
+    if element.is(W_NS, "del") {
+        return Ok(());
+    }
+    if element.is(W_NS, "t") {
+        text.push_str(&element_text(element)?);
+        return Ok(());
+    }
+    if element.is(W_NS, "tab") {
+        text.push('\t');
+        return Ok(());
+    }
+    if element.is(W_NS, "br") || element.is(W_NS, "cr") {
+        text.push('\n');
+        return Ok(());
+    }
+    if element.is(W_NS, "footnoteReference") {
+        if let Some(id) = element.attribute(None, "id") {
+            references.push((
+                id.parse()
+                    .map_err(|_| Error::Message(format!("Invalid DOCX footnote id {id}")))?,
+                legal_structure::utf16_len(text),
+            ));
+        }
+        return Ok(());
+    }
+    for child in element.direct_elements() {
+        authority_text(child, text, references)?;
+    }
+    Ok(())
+}
+
+/// Return body paragraphs followed by Word footnotes in citation-review order.
+pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
+    let files = read_docx_files(bytes, Some(&["word/document.xml", "word/footnotes.xml"]))?;
+    let document = parse_xml(
+        file_bytes(&files, "word/document.xml")
+            .ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?,
+    )?;
+    let body = document
+        .root()?
+        .direct_elements()
+        .find(|element| element.is(W_NS, "body"))
+        .ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
+    let mut elements = Vec::new();
+    walk_elements(body, &mut elements);
+    let mut body_units = Vec::new();
+    for (ordinal, paragraph) in elements
+        .into_iter()
+        .filter(|element| element.is(W_NS, "p"))
+        .enumerate()
+    {
+        let mut text = String::new();
+        let mut references = Vec::new();
+        authority_text(paragraph, &mut text, &mut references)?;
+        if !text.trim().is_empty() {
+            body_units.push((ordinal, text, references));
+        }
+    }
+
+    let mut footnotes = Vec::new();
+    let mut footnote_numbers = HashMap::new();
+    if let Some(xml) = file_bytes(&files, "word/footnotes.xml") {
+        let document = parse_xml(xml)?;
+        let mut elements = Vec::new();
+        walk_elements(document.root()?, &mut elements);
+        for footnote in elements
+            .into_iter()
+            .filter(|element| element.is(W_NS, "footnote"))
+        {
+            let Some(raw_id) = footnote.attribute(None, "id") else {
+                continue;
+            };
+            let raw_id: i64 = raw_id
+                .parse()
+                .map_err(|_| Error::Message(format!("Invalid DOCX footnote id {raw_id}")))?;
+            if raw_id <= 0 {
+                continue;
+            }
+            let mut text = String::new();
+            authority_text(footnote, &mut text, &mut Vec::new())?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            let ordinal = footnotes.len() + 1;
+            footnote_numbers.insert(raw_id, ordinal);
+            footnotes.push((raw_id, ordinal, text));
+        }
+    }
+
+    let mut units = Vec::with_capacity(body_units.len() + footnotes.len());
+    units.extend(body_units.into_iter().map(|(ordinal, text, references)| {
+        let references = references
+            .into_iter()
+            .map(|(id, offset)| {
+                serde_json::json!([
+                    footnote_numbers
+                        .get(&id)
+                        .copied()
+                        .map_or(id, |id| id as i64),
+                    offset
+                ])
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "key": format!("body:{ordinal}"),
+            "kind": "body",
+            "ordinal": ordinal,
+            "footnote_id": serde_json::Value::Null,
+            "text": text,
+            "footnote_refs": references,
+        })
+    }));
+    units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text)| {
+        serde_json::json!({
+            "key": format!("footnote:{raw_id}"),
+            "kind": "footnote",
+            "ordinal": ordinal,
+            "footnote_id": ordinal,
+            "text": text,
+            "footnote_refs": [],
+        })
+    }));
+    Ok(units)
+}
+
 fn footnote_reference_ids(document: &str) -> Vec<usize> {
     FOOTNOTE_REFERENCE
         .captures_iter(document)
@@ -1524,4 +1654,43 @@ pub fn analyze_docx_drafting_bytes(
     let markdown = drafting_docx_text(bytes)?;
     legal_structure::analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn authority_units_keep_utf16_references_and_word_footnote_order() {
+        let document = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:body>
+                <w:p/>
+                <w:p><w:r><w:t>A😀</w:t><w:footnoteReference w:id="7"/><w:tab/><w:t>B</w:t></w:r></w:p>
+                <w:p><w:r><w:t>C</w:t><w:footnoteReference w:id="3"/></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let footnotes = format!(
+            r#"<w:footnotes xmlns:w="{W_NS}">
+                <w:footnote w:id="-1"><w:p><w:r><w:t>separator</w:t></w:r></w:p></w:footnote>
+                <w:footnote w:id="3"><w:p><w:r><w:t>First</w:t><w:tab/><w:t>note.</w:t></w:r></w:p></w:footnote>
+                <w:footnote w:id="7"><w:p><w:r><w:t>Second</w:t><w:br/><w:t>note.</w:t></w:r></w:p></w:footnote>
+            </w:footnotes>"#
+        );
+        let bytes = write_docx_files(&[
+            ("word/document.xml".to_owned(), document.into_bytes()),
+            ("word/footnotes.xml".to_owned(), footnotes.into_bytes()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            docx_to_toa_text_units(&bytes).unwrap(),
+            vec![
+                json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"text":"A😀\tB","footnote_refs":[[2,3]]}),
+                json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"text":"C","footnote_refs":[[1,1]]}),
+                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"text":"First\tnote.","footnote_refs":[]}),
+                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"text":"Second\nnote.","footnote_refs":[]}),
+            ]
+        );
+    }
 }
