@@ -780,6 +780,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
             "kind": "body",
             "ordinal": ordinal,
             "footnote_id": serde_json::Value::Null,
+            "page_numbers": [],
             "text": text,
             "footnote_refs": references,
         })
@@ -790,6 +791,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
+            "page_numbers": [],
             "text": text,
             "footnote_refs": [],
         })
@@ -1686,10 +1688,10 @@ mod tests {
         assert_eq!(
             docx_to_toa_text_units(&bytes).unwrap(),
             vec![
-                json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"text":"A😀\tB","footnote_refs":[[2,3]]}),
-                json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"text":"C","footnote_refs":[[1,1]]}),
-                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"text":"First\tnote.","footnote_refs":[]}),
-                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"text":"Second\nnote.","footnote_refs":[]}),
+                json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"page_numbers":[],"text":"A😀\tB","footnote_refs":[[2,3]]}),
+                json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"page_numbers":[],"text":"C","footnote_refs":[[1,1]]}),
+                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
+                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
             ]
         );
     }

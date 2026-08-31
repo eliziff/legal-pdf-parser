@@ -131,17 +131,25 @@ pub(crate) fn to_toa_text_units_from_parts(
             "kind": "body",
             "ordinal": ordinal,
             "footnote_id": Value::Null,
+            "page_numbers": [paragraph.page_index + 1],
             "text": rendered,
             "footnote_refs": references,
         }));
     }
     units.extend(footnotes.iter().enumerate().map(|(index, note)| {
         let ordinal = index + 1;
+        let mut pages = note.body_pages.clone();
+        if pages.is_empty() {
+            pages.extend(note.reference_page);
+        }
+        pages.sort_unstable();
+        pages.dedup();
         json!({
             "key": format!("footnote:{ordinal}"),
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
+            "page_numbers": pages,
             "text": note.body,
             "footnote_refs": [],
         })
@@ -243,6 +251,8 @@ mod tests {
         let toa = to_toa_text_units(&document).unwrap();
         assert_eq!(toa[0]["text"], "Alpha beta gamma.");
         assert_eq!(toa[0]["footnote_refs"], json!([[1, 5], [2, 10]]));
+        assert_eq!(toa[0]["page_numbers"], json!([1]));
+        assert_eq!(toa[1]["page_numbers"], json!([1]));
     }
 
     #[test]
@@ -259,5 +269,17 @@ mod tests {
         let toa = to_toa_text_units(&document).unwrap();
         assert_eq!(toa[0]["text"], "😀");
         assert_eq!(toa[0]["footnote_refs"], json!([[1, 2]]));
+    }
+
+    #[test]
+    fn toa_footnotes_prefer_body_pages_and_fallback_to_the_reference_page() {
+        let mut document = document();
+        document.footnotes[0].body_pages = vec![4, 2, 4];
+        document.footnotes[1].body_pages.clear();
+        document.footnotes[1].reference_page = Some(3);
+
+        let toa = to_toa_text_units(&document).unwrap();
+        assert_eq!(toa[1]["page_numbers"], json!([2, 4]));
+        assert_eq!(toa[2]["page_numbers"], json!([3]));
     }
 }
