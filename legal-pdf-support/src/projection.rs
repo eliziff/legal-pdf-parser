@@ -1317,6 +1317,7 @@ mod tests {
     fn cache_round_trip_keeps_authority_text_units() {
         let expected = json!({
             "key": "body:0", "kind": "body", "ordinal": 0,
+            "page_numbers": [1],
             "footnote_id": null, "text": "😀", "footnote_refs": [[1, 2]],
         });
         let marker = "⟦FN:one⟧";

@@ -2929,6 +2929,7 @@ fn derive_prepared(
     let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         resolve_structure_graph(
             identity.document_id,
+            "local-pdf".to_owned(),
             resolution.index.text(),
             Some(identity.source_sha256),
             nodes,
