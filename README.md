@@ -57,6 +57,38 @@ The Node binding returns one opaque native document that owns the canonical
 structure and only the extra PDF evidence required for exact lookups, without
 serializing an intermediary.
 
+## Structure boundaries and refactor direction
+
+PDF extraction owns physical pages, geometry, reading order, OCR, and native
+witnesses. Shared semantic operations use the pinned `legal-structure` crate.
+The existence of a shared engine does not imply that every numbering sequence
+has the same role or that document profiles should be removed.
+
+A document's primary structural profile governs its paragraphs and sections.
+Numbering inside quoted legislation, agreements, or decisions remains
+subordinate to that document; it must not take over primary navigation.
+Local layout and sequence evidence must be interpreted within this ownership.
+
+Compound records require separate treatment: a motion record or combined
+submission can contain tabs and appended documents with distinct primary
+profiles over bounded spans. A tab, numbering restart, page break, or font
+change alone does not prove a constituent-document boundary. Package locators,
+constituent locators, and quoted labels must remain distinct, with exact
+physical-page and source-text mapping preserved.
+
+This is a refactor constraint, not a claim of complete compound-record support.
+Preserve proven profile behavior while sharing identical mechanics. Validate
+quotation containment before changing primary structure, and establish reviewed
+compound boundaries before introducing segmentation. Ambiguous boundaries must
+retain exact page/text access without fabricated document identities.
+
+Behavioral changes require separate checks for quotation ownership, compound
+boundaries, cached-extraction structure fidelity, and the full extraction/OCR
+lifecycle. Existing benchmark figures do not certify those new capabilities.
+Publish only a validated combination of parser and structure revisions; a local
+dependency override is not proof that the standalone Git pin has been updated
+or tested.
+
 ## Credits
 
 The recognition model is my legal-domain fine-tune of
