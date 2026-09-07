@@ -1,105 +1,81 @@
 # Legal PDF Parser
 
-Fast local OCR and reliable legal structure on consumer hardware.
+Local PDF extraction, OCR routing and exact legal-document navigation. Digital-born
+pages use native extraction; scanned pages require an explicitly enabled OCR
+profile and its runtime assets. Results retain physical pages, geometry, reading
+order and source witnesses, with content-addressed reuse of completed work.
 
-Legal PDF Parser turns scanned, digital-born, and mixed PDFs into searchable
-text with stable pages, paragraphs, sections, footnotes, tables, references,
-reading order, and pinpoint locators. It runs locally and caches completed work.
+## Build and use
 
-## Performance
+From this repository's root, with the Rust toolchain installed:
 
-| OCR profile | Core i3 laptop | RTX 3080 Ti desktop | Character error rate |
-| --- | ---: | ---: | ---: |
-| Quality | 2.18 pages/s | **6.26 pages/s** | **2.57%** |
-| Turbo | 2.50 pages/s | **6.59 pages/s** | 3.14% |
-| Native Tesseract 5.4 | **2.76 pages/s** | — | 3.83% |
-
-These are end-to-end results on a sample of 153 scanned legal pages.
-The full reproducible receipt is in
-[`experiments/kraken-lite/cpu-benchmark/RESULTS.md`](experiments/kraken-lite/cpu-benchmark/RESULTS.md).
-
-Digital-born PDFs avoid OCR:
-
-| Native benchmark | Documents | Pages | Throughput | Peak memory |
-| --- | ---: | ---: | ---: | ---: |
-| Legal PDFs, fresh cache | 8 | 425 | **134.0 pages/s** | **49.3 MiB** |
-
-This measures process launch, extraction, structure, page queries, and JSON
-serialization. Three isolated runs per document produced identical output.
-The fixed corpus and runner live in
-[`experiments/digitalborn-benchmark`](experiments/digitalborn-benchmark).
-
-## Capabilities
-
-- Fast local OCR for scanned legal material.
-- Native extraction for digital-born pages.
-- Deterministic headings, paragraphs, footnotes, tables, references, and
-  reading order.
-- Exact lookup by page, paragraph, section, or footnote.
-- Stable source hashes and pinpoint locators for applications and agent tools.
-- A compressed content-addressed cache for immediate repeat access.
-
-## Use
-
-```powershell
+```sh
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
-legalpdf --version
+./target/release/legalpdf --version
 ```
 
-Provider-neutral detection and document queries live in the standalone
-[`legal-structure`](https://github.com/eliziff/legal-structure-parser) crate.
-The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
-`ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
-separate runtime/model pack are required. The root package has no default
-features, so every shipped artifact declares its capabilities explicitly.
+On Windows, the executable is `target\release\legalpdf.exe`; the configured
+`rust-lld.exe` linker must be available. `cargo build` does not install the command
+on PATH. Build/cache settings are in [.cargo/config.toml](.cargo/config.toml).
 
-The Node binding returns one opaque native document that owns the canonical
-structure and only the extra PDF evidence required for exact lookups, without
-serializing an intermediary.
+No features are enabled by default. [Cargo.toml](Cargo.toml) defines the profiles:
 
-## Structure boundaries and refactor direction
+| Profile | Capability |
+| --- | --- |
+| `pdf` | Native PDF extraction, structure and queries; no OCR or layout models |
+| `kraken` | PDF plus Kraken OCR |
+| `ppdoc-openvino` / `ppdoc-full` | PDF with the corresponding layout runtime |
+| `full` | Language support, Kraken OCR and the full layout profile |
 
-PDF extraction owns physical pages, geometry, reading order, OCR, and native
-witnesses. Shared semantic operations use the pinned `legal-structure` crate.
-The existence of a shared engine does not imply that every numbering sequence
-has the same role or that document profiles should be removed.
+Enabling a feature does not provide its separately licensed model/runtime pack.
+Do not describe a source-only build as a complete OCR distribution. Browser OCR
+and its single-file HTML application live in
+[Legal Browser OCR](https://github.com/eliziff/legal-browser-ocr), not this crate.
 
-A document's primary structural profile governs its paragraphs and sections.
-Numbering inside quoted legislation, agreements, or decisions remains
-subordinate to that document; it must not take over primary navigation.
-Local layout and sequence evidence must be interpreted within this ownership.
+## Architecture and integration
 
-Compound records require separate treatment: a motion record or combined
-submission can contain tabs and appended documents with distinct primary
-profiles over bounded spans. A tab, numbering restart, page break, or font
-change alone does not prove a constituent-document boundary. Package locators,
-constituent locators, and quoted labels must remain distinct, with exact
-physical-page and source-text mapping preserved.
+This repository owns PDF extraction, geometry, reading order, OCR and PDF-specific
+witnesses. Provider-neutral structure, citations, text coordinates and document
+queries come from the pinned
+[Legal Structure Parser](https://github.com/eliziff/legal-structure-parser).
+Its README owns the shared profile, quotation-containment and query-lifetime
+contract; Beaver owns application policy and its Node adapter.
 
-This is a refactor constraint, not a claim of complete compound-record support.
-Preserve proven profile behavior while sharing identical mechanics. Validate
-quotation containment before changing primary structure, and establish reviewed
-compound boundaries before introducing segmentation. Ambiguous boundaries must
-retain exact page/text access without fabricated document identities.
+A document's primary paragraphs/sections must not be replaced by numbering inside
+quotations. Compound records require separately reviewed constituent boundaries;
+a tab, numbering restart or style change alone is not enough. Ambiguous structure
+must retain exact page/text access. This is a constraint, not a claim that compound
+records are completely supported.
 
-Behavioral changes require separate checks for quotation ownership, compound
-boundaries, cached-extraction structure fidelity, and the full extraction/OCR
-lifecycle. Existing benchmark figures do not certify those new capabilities.
-Publish only a validated combination of parser and structure revisions; a local
-dependency override is not proof that the standalone Git pin has been updated
-or tested.
+[Beaver](https://github.com/eliziff/Beaver) consumes this repository through a pinned
+submodule. Its adapter can override the structure dependency with a local path;
+that does not validate the Git revision shipped by a standalone parser. Publish
+only an explicitly validated parser/structure combination. The PDF extraction
+backbone is the single `pdf-inspector` branch selected by the Cargo manifest;
+do not create another private fork to bypass its gate.
 
-## Credits
+## Validation and evidence
 
-The recognition model is my legal-domain fine-tune of
-[CATMuS Print Small](https://zenodo.org/records/10602357), built with the
-[Kraken](https://kraken.re/) OCR ecosystem and the work of the
-[CATMuS project](https://huggingface.co/CATMuS). This project adds the legal
-fine-tune, optimized Rust/ONNX runtime, PDF routing, deterministic legal
-structure, exact lookup, and application contract. The PDF extraction backbone
-is the MIT-licensed `pdf-inspector`.
+Follow [AGENTS.md](AGENTS.md) for focused checks and reuse of warm builds. Select
+the feature profile being changed, batch source edits, and run the appropriate
+behavioral gate on the final candidate. Quotation ownership, constituent boundaries,
+cached-extraction structure replay and the full extraction/OCR lifecycle need
+separate evidence; passing unit tests or old throughput numbers does not certify
+all of them.
 
-## License
+[Documentation and benchmark receipts](docs/README.md) identify reproducible
+measurements and historical records. Existing OCR results use a 153-page legal
+print sample; the native benchmark uses eight documents/425 pages. Those results
+are corpus- and machine-specific, not promises for every document or release.
+Cross-project priorities belong to
+[Beaver's structure plan](https://github.com/eliziff/Beaver/blob/main/docs/roadmap/document-structure.md).
 
-Legal PDF Parser is MIT licensed. Third-party components and model assets
-retain their own licenses and notices.
+## Credits and license
+
+Recognition uses a legal-domain fine-tune of
+[CATMuS Print Small](https://zenodo.org/records/10602357), trained with
+[Kraken](https://kraken.re/) and the [CATMuS project](https://huggingface.co/CATMuS).
+The PDF extraction backbone is the MIT-licensed `pdf-inspector`.
+
+[MIT](LICENSE). Third-party components and model assets retain their own licenses
+and notices.
