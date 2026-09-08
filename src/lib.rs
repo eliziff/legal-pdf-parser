@@ -44,6 +44,7 @@ pub mod text_utils;
 pub mod tounicode;
 pub mod types;
 pub mod vision;
+mod xref_repair;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
@@ -4078,6 +4079,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    add_repair_candidate(
+        &mut candidates,
+        xref_repair::rebuild_short_xref_entries(buf),
+        buf,
+    );
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -4090,6 +4096,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
         add_repair_candidate(
             &mut candidates,
             recover_startxref_pointer(stripped_buf),
+            buf,
+        );
+        add_repair_candidate(
+            &mut candidates,
+            xref_repair::rebuild_short_xref_entries(stripped_buf),
             buf,
         );
     }
