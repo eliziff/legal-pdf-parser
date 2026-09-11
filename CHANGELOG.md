@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A contents page whose entries end in right-aligned page numbers without dot
+  leaders — an edited volume's table of contents with the chapter authors on
+  their own lines — is rendered as a contents list, one entry per line with
+  its page number tab-separated, instead of being read as a two-column page
+  whose titles and numbers interleave into a paragraph.
+
 ## [1.19.0] - 2026-09-09
 
 Changes since 1.18.0.
