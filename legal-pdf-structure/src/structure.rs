@@ -1528,30 +1528,29 @@ fn apply_text_fidelity_headings(
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
-        if target_is_heading {
-            continue;
-        }
-        if !ladder_clean
-            || !decision.text_plausible
-            || matches!(
-                decision.action,
-                HeadingAction::IllegalRestart | HeadingAction::Violation
-            )
-        {
-            continue;
-        }
-        if decision.footnote_suspect || decision.level.unwrap_or(0) == 0 {
-            continue;
-        }
-        let page = &pages[page_slot];
-        if has_body_flow(page, target_slot, &structural, page_slot) {
-            continue;
-        }
-        let target = &page.lines[target_slot];
-        let visual = bold_char_share(target) >= 0.60
-            || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
-        if !visual && !decision.coherent_family {
-            continue;
+        if !target_is_heading {
+            if !ladder_clean
+                || !decision.text_plausible
+                || matches!(
+                    decision.action,
+                    HeadingAction::IllegalRestart | HeadingAction::Violation
+                )
+            {
+                continue;
+            }
+            if decision.footnote_suspect || decision.level.unwrap_or(0) == 0 {
+                continue;
+            }
+            let page = &pages[page_slot];
+            if has_body_flow(page, target_slot, &structural, page_slot) {
+                continue;
+            }
+            let target = &page.lines[target_slot];
+            let visual = bold_char_share(target) >= 0.60
+                || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
+            if !visual && !decision.coherent_family {
+                continue;
+            }
         }
         pages[page_slot].lines[target_slot].region_type = "heading".to_owned();
         if target_slot != marker_slot && marker_slot < pages[page_slot].lines.len() {
@@ -1642,7 +1641,14 @@ fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
                 || line
                     .detached_references
                     .iter()
-                    .any(|reference| matches_label(&reference.note_id)))
+                    .any(|reference| matches_label(&reference.note_id))
+                || (label.chars().all(is_note_symbol)
+                    && line
+                        .text
+                        .trim_end()
+                        .strip_suffix(label)
+                        .and_then(|before| before.chars().next_back())
+                        .is_some_and(char::is_alphanumeric)))
     })
 }
 
@@ -2037,7 +2043,7 @@ fn classify_pages_with_source(
                 let size = line_sizes[*index];
                 let reference_backed = page.lines[*index].bbox[1] >= page.height * 0.48
                     && size > 0.0
-                    && size <= body_size * 0.90
+                    && (size <= body_size * 0.90 || prefix.label.chars().all(is_note_symbol))
                     && has_prior_reference(page, &prefix.label, page.lines[*index].bbox[1]);
                 let in_margin = margin_model.zip(margin_side).is_some_and(|(model, side)| {
                     usize::from(line_center_x(&page.lines[*index]) >= model.split_x) == side
@@ -2925,7 +2931,12 @@ fn derive_prepared(
     legal_pdf_support::profile::measure("derive.crossrefs", || {
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
-    let nodes = native_graph_parts(&resolution.index, pages, &paragraphs)?;
+    let nodes = native_graph_parts(
+        &resolution.index,
+        pages,
+        &paragraphs,
+        &prepared.primitives.heading_levels,
+    )?;
     let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         resolve_structure_graph(
             identity.document_id,
