@@ -570,7 +570,7 @@ dependencies = [
 [[package]]
 name = "legal-grammar-tables"
 version = "0.1.0"
-source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=66ebb038dc0b95fc3d8b8b8f952caf82d9c95d2e#66ebb038dc0b95fc3d8b8b8f952caf82d9c95d2e"
+source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=c1d92f0400bf3c2abe2a55d50aae91c33039e034#c1d92f0400bf3c2abe2a55d50aae91c33039e034"
 dependencies = [
  "fancy-regex",
  "regex",
@@ -703,7 +703,7 @@ dependencies = [
 [[package]]
 name = "legal-structure"
 version = "0.1.0"
-source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=66ebb038dc0b95fc3d8b8b8f952caf82d9c95d2e#66ebb038dc0b95fc3d8b8b8f952caf82d9c95d2e"
+source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=c1d92f0400bf3c2abe2a55d50aae91c33039e034#c1d92f0400bf3c2abe2a55d50aae91c33039e034"
 dependencies = [
  "aho-corasick",
  "legal-grammar-tables",
