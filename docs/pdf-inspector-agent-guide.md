@@ -1,0 +1,1 @@
+PDF Inspector in `eliziff/legal-pdf-parser` is validated by `.github/workflows/pdf-inspector-gate.yml` against `experiments/cache-contract-fidelity/manifest.json`, without Firecrawl's private `pdf-evals` repository.

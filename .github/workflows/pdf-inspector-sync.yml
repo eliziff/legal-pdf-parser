@@ -47,17 +47,10 @@ jobs:
           upstream_sha="$(git -C inspector rev-parse FETCH_HEAD)"
           echo "parser_sha=$parser_sha" >> "$GITHUB_OUTPUT"
           echo "previous_sha=$previous_sha" >> "$GITHUB_OUTPUT"
-          if git -C inspector merge-base --is-ancestor "$upstream_sha" HEAD; then
-            candidate_sha="$previous_sha"
-          else
-            git -C inspector config user.name github-actions[bot]
-            git -C inspector config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            if ! git -C inspector merge --no-edit "$upstream_sha"; then
-              git -C inspector merge --abort || true
-              exit 1
-            fi
-            candidate_sha="$(git -C inspector rev-parse HEAD)"
-          fi
+          git -C inspector config user.name github-actions[bot]
+          git -C inspector config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          bash parser/tools/merge-pdf-inspector.sh inspector "$upstream_sha" parser/docs/pdf-inspector-agent-guide.md
+          candidate_sha="$(git -C inspector rev-parse HEAD)"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           if test "$candidate_sha" = "$pinned_sha"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
