@@ -1,10 +1,9 @@
 # Legal PDF Parser
 
-Fast local OCR and reliable legal structure on consumer hardware.
-
-Legal PDF Parser turns scanned, digital-born, and mixed PDFs into searchable
-text with stable pages, paragraphs, sections, footnotes, tables, references,
-reading order, and pinpoint locators. It runs locally and caches completed work.
+Local PDF extraction, OCR routing and exact legal-document navigation. Digital-born
+pages use native extraction; scanned pages require an explicitly enabled OCR
+profile and its runtime assets. Results retain physical pages, geometry, reading
+order and source witnesses, with content-addressed reuse of completed work.
 
 ## Performance
 
@@ -39,67 +38,57 @@ The fixed corpus and runner live in
 - Stable source hashes and pinpoint locators for applications and agent tools.
 - A compressed content-addressed cache for immediate repeat access.
 
-## Use
+## Build and use
 
-```powershell
+From this repository's root, with the Rust toolchain installed:
+
+```sh
 cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
-legalpdf --version
+./target/release/legalpdf --version
 ```
 
-Provider-neutral detection and document queries live in the standalone
-[`legal-structure`](https://github.com/eliziff/legal-structure-parser) crate.
-The `pdf` parser profile ships neither OCR nor layout models; use `kraken`,
-`ppdoc-openvino`, `ppdoc-full`, or `full` only when that capability and its
-separate runtime/model pack are required. The root package has no default
-features, so every shipped artifact declares its capabilities explicitly.
+On Windows, the executable is `target\release\legalpdf.exe`; the configured
+`rust-lld.exe` linker must be available. `cargo build` does not install the command
+on PATH. Build/cache settings are in [.cargo/config.toml](.cargo/config.toml).
 
-The Node binding returns one opaque native document that owns the canonical
-structure and only the extra PDF evidence required for exact lookups, without
-serializing an intermediary.
+No features are enabled by default. [Cargo.toml](Cargo.toml) defines the profiles:
 
-## Structure boundaries and refactor direction
+| Profile | Capability |
+| --- | --- |
+| `pdf` | Native PDF extraction, structure and queries; no OCR or layout models |
+| `kraken` | PDF plus Kraken OCR |
+| `ppdoc-openvino` / `ppdoc-full` | PDF with the corresponding layout runtime |
+| `full` | Language support, Kraken OCR and the full layout profile |
 
-PDF extraction owns physical pages, geometry, reading order, OCR, and native
-witnesses. Shared semantic operations use the pinned `legal-structure` crate.
-The existence of a shared engine does not imply that every numbering sequence
-has the same role or that document profiles should be removed.
+Enabling a feature does not provide its separately licensed model/runtime pack.
+A source-only build needs these assets to run OCR. Browser OCR
+and its single-file HTML application live in
+[Legal Browser OCR](https://github.com/eliziff/legal-browser-ocr), not this crate.
 
-A document's primary structural profile governs its paragraphs and sections.
-Numbering inside quoted legislation, agreements, or decisions remains
-subordinate to that document; it must not take over primary navigation.
-Local layout and sequence evidence must be interpreted within this ownership.
+## Structure and queries
 
-Compound records require separate treatment: a motion record or combined
-submission can contain tabs and appended documents with distinct primary
-profiles over bounded spans. A tab, numbering restart, page break, or font
-change alone does not prove a constituent-document boundary. Package locators,
-constituent locators, and quoted labels must remain distinct, with exact
-physical-page and source-text mapping preserved.
+[Legal Structure Parser](https://github.com/eliziff/legal-structure-parser)
+provides paragraph, section, citation and text queries. PDF extraction adds
+physical pages, geometry, reading order and OCR evidence.
 
-This is a refactor constraint, not a claim of complete compound-record support.
-Preserve proven profile behavior while sharing identical mechanics. Validate
-quotation containment before changing primary structure, and establish reviewed
-compound boundaries before introducing segmentation. Ambiguous boundaries must
-retain exact page/text access without fabricated document identities.
+Numbering inside quotations is distinct from the document's own paragraphs.
+Automatic constituent-document detection in combined records is not complete;
+physical-page and exact-text lookup remain available when boundaries are
+ambiguous.
 
-Behavioral changes require separate checks for quotation ownership, compound
-boundaries, cached-extraction structure fidelity, and the full extraction/OCR
-lifecycle. Existing benchmark figures do not certify those new capabilities.
-Publish only a validated combination of parser and structure revisions; a local
-dependency override is not proof that the standalone Git pin has been updated
-or tested.
+## Development
 
-## Credits
+See [AGENTS.md](AGENTS.md) for build and test commands, and the
+[documentation index](docs/README.md) for benchmark runners and recorded results.
+The published performance figures describe their recorded corpus, hardware and
+revision; they are not measurements of every release.
 
-The recognition model is my legal-domain fine-tune of
-[CATMuS Print Small](https://zenodo.org/records/10602357), built with the
-[Kraken](https://kraken.re/) OCR ecosystem and the work of the
-[CATMuS project](https://huggingface.co/CATMuS). This project adds the legal
-fine-tune, optimized Rust/ONNX runtime, PDF routing, deterministic legal
-structure, exact lookup, and application contract. The PDF extraction backbone
-is the MIT-licensed `pdf-inspector`.
+## Credits and license
 
-## License
+Recognition uses a legal-domain fine-tune of
+[CATMuS Print Small](https://zenodo.org/records/10602357), trained with
+[Kraken](https://kraken.re/) and the [CATMuS project](https://huggingface.co/CATMuS).
+The PDF extraction backbone is the MIT-licensed `pdf-inspector`.
 
-Legal PDF Parser is MIT licensed. Third-party components and model assets
-retain their own licenses and notices.
+[MIT](LICENSE). Third-party components and model assets retain their own licenses
+and notices.
