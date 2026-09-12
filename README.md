@@ -5,6 +5,39 @@ pages use native extraction; scanned pages require an explicitly enabled OCR
 profile and its runtime assets. Results retain physical pages, geometry, reading
 order and source witnesses, with content-addressed reuse of completed work.
 
+## Performance
+
+| OCR profile | Core i3 laptop | RTX 3080 Ti desktop | Character error rate |
+| --- | ---: | ---: | ---: |
+| Quality | 2.18 pages/s | **6.26 pages/s** | **2.57%** |
+| Turbo | 2.50 pages/s | **6.59 pages/s** | 3.14% |
+| Native Tesseract 5.4 | **2.76 pages/s** | — | 3.83% |
+
+These are end-to-end results on a sample of 153 scanned legal pages.
+The full reproducible receipt is in
+[`experiments/kraken-lite/cpu-benchmark/RESULTS.md`](experiments/kraken-lite/cpu-benchmark/RESULTS.md).
+
+Digital-born PDFs avoid OCR:
+
+| Native benchmark | Documents | Pages | Throughput | Peak memory |
+| --- | ---: | ---: | ---: | ---: |
+| Legal PDFs, fresh cache | 8 | 425 | **134.0 pages/s** | **49.3 MiB** |
+
+This measures process launch, extraction, structure, page queries, and JSON
+serialization. Three isolated runs per document produced identical output.
+The fixed corpus and runner live in
+[`experiments/digitalborn-benchmark`](experiments/digitalborn-benchmark).
+
+## Capabilities
+
+- Fast local OCR for scanned legal material.
+- Native extraction for digital-born pages.
+- Deterministic headings, paragraphs, footnotes, tables, references, and
+  reading order.
+- Exact lookup by page, paragraph, section, or footnote.
+- Stable source hashes and pinpoint locators for applications and agent tools.
+- A compressed content-addressed cache for immediate repeat access.
+
 ## Build and use
 
 From this repository's root, with the Rust toolchain installed:
@@ -28,47 +61,27 @@ No features are enabled by default. [Cargo.toml](Cargo.toml) defines the profile
 | `full` | Language support, Kraken OCR and the full layout profile |
 
 Enabling a feature does not provide its separately licensed model/runtime pack.
-Do not describe a source-only build as a complete OCR distribution. Browser OCR
+A source-only build needs these assets to run OCR. Browser OCR
 and its single-file HTML application live in
 [Legal Browser OCR](https://github.com/eliziff/legal-browser-ocr), not this crate.
 
-## Architecture and integration
+## Structure and queries
 
-This repository owns PDF extraction, geometry, reading order, OCR and PDF-specific
-witnesses. Provider-neutral structure, citations, text coordinates and document
-queries come from the pinned
-[Legal Structure Parser](https://github.com/eliziff/legal-structure-parser).
-Its README owns the shared profile, quotation-containment and query-lifetime
-contract; Beaver owns application policy and its Node adapter.
+[Legal Structure Parser](https://github.com/eliziff/legal-structure-parser)
+provides paragraph, section, citation and text queries. PDF extraction adds
+physical pages, geometry, reading order and OCR evidence.
 
-A document's primary paragraphs/sections must not be replaced by numbering inside
-quotations. Compound records require separately reviewed constituent boundaries;
-a tab, numbering restart or style change alone is not enough. Ambiguous structure
-must retain exact page/text access. This is a constraint, not a claim that compound
-records are completely supported.
+Numbering inside quotations is distinct from the document's own paragraphs.
+Automatic constituent-document detection in combined records is not complete;
+physical-page and exact-text lookup remain available when boundaries are
+ambiguous.
 
-[Beaver](https://github.com/eliziff/Beaver) consumes this repository through a pinned
-submodule. Its adapter can override the structure dependency with a local path;
-that does not validate the Git revision shipped by a standalone parser. Publish
-only an explicitly validated parser/structure combination. The PDF extraction
-backbone is the single `pdf-inspector` branch selected by the Cargo manifest;
-do not create another private fork to bypass its gate.
+## Development
 
-## Validation and evidence
-
-Follow [AGENTS.md](AGENTS.md) for focused checks and reuse of warm builds. Select
-the feature profile being changed, batch source edits, and run the appropriate
-behavioral gate on the final candidate. Quotation ownership, constituent boundaries,
-cached-extraction structure replay and the full extraction/OCR lifecycle need
-separate evidence; passing unit tests or old throughput numbers does not certify
-all of them.
-
-[Documentation and benchmark receipts](docs/README.md) identify reproducible
-measurements and historical records. Existing OCR results use a 153-page legal
-print sample; the native benchmark uses eight documents/425 pages. Those results
-are corpus- and machine-specific, not promises for every document or release.
-Cross-project priorities belong to
-[Beaver's structure plan](https://github.com/eliziff/Beaver/blob/main/docs/roadmap/document-structure.md).
+See [AGENTS.md](AGENTS.md) for build and test commands, and the
+[documentation index](docs/README.md) for benchmark runners and recorded results.
+The published performance figures describe their recorded corpus, hardware and
+revision; they are not measurements of every release.
 
 ## Credits and license
 
