@@ -390,22 +390,6 @@ fn result(
     }
 }
 
-fn clean_text(value: &str) -> Cow<'_, str> {
-    static MARKER: OnceLock<Regex> = OnceLock::new();
-    let value = value.trim();
-    if !value.contains("⟦FN:") {
-        Cow::Borrowed(value)
-    } else {
-        Cow::Owned(
-            MARKER
-                .get_or_init(|| Regex::new(r"⟦FN:[^⟧]+⟧").unwrap())
-                .replace_all(value, "")
-                .trim()
-                .to_owned(),
-        )
-    }
-}
-
 fn nfkc_text(value: &str) -> Cow<'_, str> {
     if value.is_ascii() {
         Cow::Borrowed(value)
@@ -994,79 +978,74 @@ fn attach_rendered_text(
     let mut id_ranges = HashMap::new();
     let mut line_ranges = HashMap::new();
     let mut page_ranges: HashMap<usize, ScalarRange> = HashMap::new();
-    let mut position = 0;
+    let mut owners = HashMap::new();
     for paragraph in paragraphs {
-        let paragraph_text = clean_text(&paragraph.text);
-        if paragraph_text.is_empty() {
-            continue;
-        }
-        if !text.is_empty() {
-            append(&mut text, &mut position, "\n\n");
-        }
-        let start = position;
-        append(&mut text, &mut position, &paragraph_text);
-        let range = ScalarRange {
-            start,
-            end: position,
-        };
-        if !paragraph.id.is_empty() {
-            id_ranges.insert(paragraph.id.as_str(), range);
-        }
-        for line_id in &paragraph.line_ids {
-            line_ranges.insert(line_id.as_str(), range);
-        }
-        page_ranges
-            .entry(paragraph.page_index)
-            .and_modify(|page| {
-                page.start = page.start.min(range.start);
-                page.end = page.end.max(range.end);
-            })
-            .or_insert(range);
-    }
-    for page in pages {
-        if !page.id.is_empty() {
-            if let Some(range) = page_ranges.get(&page.index) {
-                id_ranges.insert(page.id.as_str(), *range);
-            }
+        for line in &paragraph.line_ids {
+            owners.insert(line.as_str(), paragraph.id.as_str());
         }
     }
-
+    let mut note_lines = HashSet::new();
     for note in footnotes {
-        let lines_range = note
-            .body_line_ids
+        for line in &note.body_line_ids {
+            owners.insert(line.as_str(), note.pair_id.as_str());
+            note_lines.insert(line.as_str());
+        }
+    }
+    let mut position = 0;
+    for page in pages {
+        let mut lines: Vec<_> = page
+            .lines
             .iter()
-            .filter_map(|id| line_ranges.get(id.as_str()))
-            .copied()
-            .fold(None, extend_range);
-        let range = if let Some(range) = lines_range {
-            Some(range)
-        } else {
-            let body = clean_text(&note.body);
-            if body.is_empty() {
-                None
-            } else if let Some(start_byte) = text.find(body.as_ref()) {
-                let start = utf16_len(&text[..start_byte]);
-                Some(ScalarRange {
-                    start,
-                    end: start + utf16_len(&body),
-                })
-            } else {
+            .filter(|line| !line.text.trim().is_empty())
+            .collect();
+        lines.sort_by_key(|line| (line.reading_order, line.source_index));
+        // Classification controls organization, never whether source text survives.
+        // Keep reference glyphs in the body and put each page's note text last.
+        let mut previous_owner = None;
+        for notes in [false, true] {
+            if notes {
+                previous_owner = None;
+            }
+            for line in lines.iter().filter(|line| {
+                (note_lines.contains(line.id.as_str())
+                    || matches!(line.region_type.as_str(), "footnote" | "endnote" | "note"))
+                    == notes
+            }) {
+                let owner = owners
+                    .get(line.id.as_str())
+                    .copied()
+                    .unwrap_or(line.id.as_str());
                 if !text.is_empty() {
-                    append(&mut text, &mut position, "\n\n");
+                    append(
+                        &mut text,
+                        &mut position,
+                        if previous_owner == Some(owner) {
+                            " "
+                        } else {
+                            "\n\n"
+                        },
+                    );
                 }
                 let start = position;
-                append(&mut text, &mut position, &body);
-                Some(ScalarRange {
+                append(&mut text, &mut position, line.text.trim());
+                let range = ScalarRange {
                     start,
                     end: position,
-                })
+                };
+                line_ranges.insert(line.id.as_str(), range);
+                id_ranges
+                    .entry(owner)
+                    .and_modify(|prior: &mut ScalarRange| prior.end = range.end)
+                    .or_insert(range);
+                page_ranges
+                    .entry(page.index)
+                    .and_modify(|prior| prior.end = range.end)
+                    .or_insert(range);
+                previous_owner = Some(owner);
             }
-        };
-        if let Some(range) = range {
-            id_ranges.insert(note.pair_id.as_str(), range);
-            for line_id in &note.body_line_ids {
-                line_ranges.entry(line_id.as_str()).or_insert(range);
-            }
+        }
+        if let Some(range) = page_ranges.get(&page.index) {
+            id_ranges.insert(page.id.as_str(), *range);
         }
     }
 
@@ -1133,6 +1112,16 @@ mod tests {
         )
     }
 
+    fn source_line(id: &str, text: &str) -> Line {
+        serde_json::from_value(json!({
+            "id": id, "page_index": 0, "page_number": 1,
+            "source_index": 1, "reading_order": 1, "block_index": 1,
+            "text": text, "bbox": [60.0, 100.0, 300.0, 112.0],
+            "region_type": "body", "source": "native"
+        }))
+        .unwrap()
+    }
+
     fn pdf_summary() -> PdfSummary {
         PdfSummary {
             sha256: "00".repeat(32),
@@ -1143,6 +1132,54 @@ mod tests {
             status: "ready".to_owned(),
             pages_needing_ocr: vec![],
             ocr_routed_pages: vec![],
+        }
+    }
+
+    #[test]
+    fn projection_preserves_source_text_and_moves_only_notes_to_page_end() {
+        let mut body = source_line("body", "44. Repeated wording\u{1f600}1");
+        body.reading_order = 0;
+        let mut note = source_line("note", "1 Repeated wording\u{1f600}");
+        note.reading_order = 1;
+        note.region_type = "footnote".into();
+        let mut unclassified = source_line("unclassified", "Unclassified source text");
+        unclassified.reading_order = 2;
+        unclassified.region_type = "unknown".into();
+        unclassified.exclude_from_body = true;
+        let pages = vec![Page {
+            id: "page-1".into(),
+            index: 0,
+            number: 1,
+            width: 612.0,
+            height: 792.0,
+            lines: vec![note, unclassified, body],
+            regions: vec![],
+            source: "native".into(),
+            text_quality: 1.0,
+            printed_label: None,
+            printed_label_source: None,
+            printed_label_line_id: None,
+        }];
+        let mut nodes = vec![];
+        for id in ["body", "note", "unclassified"] {
+            let mut item = node(id, NodeKind::Prose);
+            item.line_ids = vec![id.into()];
+            nodes.push(item);
+        }
+        let mut graph = structure_graph(nodes);
+        attach_rendered_text(&[], &pages, &[], &mut graph);
+        let text = graph.rendered_text.as_ref().unwrap();
+        assert_eq!(text, "44. Repeated wording\u{1f600}1\n\nUnclassified source text\n\n1 Repeated wording\u{1f600}");
+        let encoded: Vec<u16> = text.encode_utf16().collect();
+        for item in &graph.nodes {
+            let range = item.rendered_range.unwrap();
+            let restored = String::from_utf16(&encoded[range.start..range.end]).unwrap();
+            let original = pages[0]
+                .lines
+                .iter()
+                .find(|line| line.id == item.id)
+                .unwrap();
+            assert_eq!(restored, original.text);
         }
     }
 
@@ -1160,7 +1197,7 @@ mod tests {
                 number: 1,
                 width: 612.0,
                 height: 792.0,
-                lines: vec![],
+                lines: vec![source_line("l1", "text")],
                 regions: vec![],
                 source: "native".to_owned(),
                 text_quality: 1.0,
@@ -1182,7 +1219,7 @@ mod tests {
                     page_index: 0,
                     region_type: "body".to_owned(),
                     text: "text".to_owned(),
-                    line_ids: vec![],
+                    line_ids: vec!["l1".to_owned()],
                     anchors: vec![],
                 },
             ],
@@ -1262,7 +1299,7 @@ mod tests {
                 number: 1,
                 width: 612.0,
                 height: 792.0,
-                lines: vec![],
+                lines: vec![source_line("l1", &text)],
                 regions: vec![],
                 source: "native".to_owned(),
                 text_quality: 1.0,
@@ -1275,7 +1312,7 @@ mod tests {
                 page_index: 0,
                 region_type: "heading".to_owned(),
                 text: text.clone(),
-                line_ids: vec![],
+                line_ids: vec!["l1".to_owned()],
                 anchors: vec![],
             }],
             footnotes: vec![],

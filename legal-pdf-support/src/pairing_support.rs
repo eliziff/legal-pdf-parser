@@ -37,7 +37,7 @@ fn citation_continuation_re() -> &'static Regex {
 }
 
 pub fn has_legal_citation_cue(text: &str) -> bool {
-    citation_cue_re().is_match(text)
+    citation_cue_re().is_match(text) || protected_re(5).is_match(text)
 }
 
 pub fn is_legal_citation_continuation(text: &str) -> bool {
@@ -45,7 +45,7 @@ pub fn is_legal_citation_continuation(text: &str) -> bool {
 }
 
 fn protected_re(index: usize) -> &'static Regex {
-    static RES: OnceLock<[OnceLock<Regex>; 5]> = OnceLock::new();
+    static RES: OnceLock<[OnceLock<Regex>; 6]> = OnceLock::new();
     RES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()))[index].get_or_init(|| {
         let pattern = match index {
             0 => format!(r"(?i)(?P<span>\[(?:17|18|19|20)\d{{2}}\]\s+(?:\d{{1,4}}\s+)?(?:{REPORTER_TOKEN_PATTERN})\s+\d{{1,4}}|\((?:17|18|19|20)\d{{2}}\)\s+\d{{1,4}}\s+(?:{REPORTER_TOKEN_PATTERN})\s+\d{{1,4}}|\b\d{{1,4}}\s+(?:{REPORTER_TOKEN_PATTERN})\s*(?:\(\d{{1,4}}[a-z]{{0,2}}\))?\s+\d{{1,4}})(?:[^\d]|$)"),
@@ -53,6 +53,7 @@ fn protected_re(index: usize) -> &'static Regex {
             2 => format!(r"(?i)(?P<span>\b(?:{STATUTE_PATTERN})\s+(?:17|18|19|20)\d{{2}},?\s+c(?:h)?\.?\s+[A-Z0-9][A-Z0-9.\-]*)"),
             3 => r"(?P<span>\((?:17|18|19|20)\d{2}\)\s+\d{1,4}(?::\d{1,4})?\s+[A-Z][A-Za-z&.'\-\s]{2,60}\s+\d{1,4}\b)".to_owned(),
             4 => r"(?i)(?:^|[^A-Za-z0-9])(?P<span>(?:at\s+|pp?\.?\s+|pages?\s+|paras?\.?\s+|ss?\.?\s+)\d{1,4}[A-Za-z]?(?:\.\d{1,4})?(?:\s*(?:,|and|-|to|–)\s*\d{1,4}[A-Za-z]?(?:\.\d{1,4})?)*)(?:[^\d]|$)".to_owned(),
+            5 => r"(?i)(?P<span>\b\d{1,3}\s+(?:U\.?\s*S\.?\s*C\.?|C\.?\s*F\.?\s*R\.?)\s*(?:\x{00a7}{1,2}\s*)?\d+[A-Za-z]?(?:[.\-]\d+[A-Za-z]?)*(?:\([A-Za-z0-9]+\))*)".to_owned(),
             _ => unreachable!(),
         };
         Regex::new(&pattern).expect("frozen protected citation regex")
@@ -131,7 +132,7 @@ pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
             });
     let pinpoint_prefix = has_pinpoint_prefix(text);
     let mut spans = Vec::new();
-    for index in 0..5 {
+    for index in 0..6 {
         if (index < 2 && digit_runs < 2)
             || (index == 2 && !statute_source)
             || (index == 3 && digit_runs < 3)
@@ -655,6 +656,30 @@ mod tests {
         for (value, expected) in vectors {
             assert_eq!(heading_text_plausible(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn us_statute_and_regulation_citations_are_not_outline_markers() {
+        for citation in [
+            "15 U.S.C. \u{00a7} 78j(b)",
+            "17 C.F.R. \u{00a7} 240.10b-5(c)",
+        ] {
+            let text = format!("Under {citation}, liability follows.");
+            let spans = protected_citation_spans(&text);
+            assert!(
+                spans.into_iter().any(|(start, end)| {
+                    text.chars()
+                        .skip(start)
+                        .take(end - start)
+                        .collect::<String>()
+                        == citation
+                }),
+                "{text}"
+            );
+            assert!(has_legal_citation_cue(citation));
+            assert!(!heading_text_plausible(citation));
+        }
+        assert!(protected_citation_spans("15. The defendant acted knowingly.").is_empty());
     }
 
     #[test]
