@@ -2490,6 +2490,18 @@ impl FontCMaps {
                 Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
             }
         }
+        for (_, stream, _, _) in crate::extractor::annotation_appearances(doc, page_id) {
+            if let Some(resources) = stream
+                .dict
+                .get(b"Resources")
+                .ok()
+                .and_then(|value| doc.dereference(value).ok())
+                .and_then(|(_, value)| value.as_dict().ok())
+            {
+                Self::collect_resource_fonts(resources, doc, by_obj_num);
+                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            }
+        }
     }
 
     /// Recursively collect font CMaps from XObjects in a resource dictionary.
@@ -2530,30 +2542,43 @@ impl FontCMaps {
                 continue;
             }
             // Collect fonts from this Form XObject's Resources
-            if let Ok(form_resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
-                // Extract font dict from the Form's resources
-                let font_dict_obj = match form_resources.get(b"Font") {
-                    Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-                    Ok(Object::Dictionary(dict)) => Some(dict),
-                    _ => None,
-                };
-                if let Some(font_dict) = font_dict_obj {
-                    let mut fonts = std::collections::BTreeMap::new();
-                    for (name, value) in font_dict.iter() {
-                        let font = match value {
-                            Object::Reference(id) => doc.get_dictionary(*id).ok(),
-                            Object::Dictionary(dict) => Some(dict),
-                            _ => None,
-                        };
-                        if let Some(font) = font {
-                            fonts.insert(name.clone(), font);
-                        }
-                    }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
-                }
-                // Recurse into nested XObjects
+            if let Some(form_resources) = stream
+                .dict
+                .get(b"Resources")
+                .ok()
+                .and_then(|value| doc.dereference(value).ok())
+                .and_then(|(_, value)| value.as_dict().ok())
+            {
+                Self::collect_resource_fonts(form_resources, doc, by_obj_num);
                 Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
             }
+        }
+    }
+
+    fn collect_resource_fonts(
+        form_resources: &lopdf::Dictionary,
+        doc: &Document,
+        by_obj_num: &mut HashMap<u32, CMapEntry>,
+    ) {
+        // Extract font dict from the Form's resources
+        let font_dict_obj = match form_resources.get(b"Font") {
+            Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+            Ok(Object::Dictionary(dict)) => Some(dict),
+            _ => None,
+        };
+        if let Some(font_dict) = font_dict_obj {
+            let mut fonts = std::collections::BTreeMap::new();
+            for (name, value) in font_dict.iter() {
+                let font = match value {
+                    Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                    Object::Dictionary(dict) => Some(dict),
+                    _ => None,
+                };
+                if let Some(font) = font {
+                    fonts.insert(name.clone(), font);
+                }
+            }
+            Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
         }
     }
 

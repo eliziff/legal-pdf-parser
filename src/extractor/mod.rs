@@ -16,6 +16,7 @@ mod scripts;
 mod text_paint;
 pub(crate) mod underline;
 mod xobjects;
+pub(crate) use xobjects::annotation_appearances;
 
 use crate::detector::{detect_from_page_evidence, get_document_title, PageDetectionEvidence};
 use crate::text_utils::{is_cjk_char, is_rtl_text};

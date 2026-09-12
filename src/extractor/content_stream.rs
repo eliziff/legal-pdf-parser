@@ -3159,6 +3159,57 @@ mod tests {
         (doc, page_id)
     }
 
+    #[test]
+    fn annotation_appearances_preserve_visible_text_and_page_coordinates() {
+        use lopdf::{dictionary, Object, Stream};
+        let (mut doc, page) =
+            simple_doc_with_content(b"BT /F1 10 Tf 20 700 Td (Body) Tj ET 4 0 0 4 0 0 cm");
+        let cmap = doc.add_object(Stream::new(dictionary! {}, b"begincmap 1 begincodespacerange <00> <ff> endcodespacerange 5 beginbfchar <41> <004A> <42> <0055> <43> <0044> <44> <0047> <45> <0045> endbfchar endcmap".to_vec()));
+        let mut font = doc.get_page_fonts(page).unwrap()[b"F1".as_slice()].clone();
+        font.set("ToUnicode", cmap);
+        let font = doc.add_object(font);
+        let resources = dictionary! { "Font" => dictionary! { "F1" => font } };
+        let stamp = doc.add_object(Stream::new(
+            dictionary! {
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+                "Matrix" => vec![2.into(), 0.into(), 0.into(), 2.into(), 30.into(), 40.into()],
+                "Resources" => resources,
+            },
+            b"BT /F1 10 Tf 5 5 Td (ABCDE) Tj ET".to_vec(),
+        ));
+        let mut alternate = doc.get_object(stamp).unwrap().as_stream().unwrap().clone();
+        alternate.content = b"BT /F1 10 Tf 5 5 Td (UNSELECTED) Tj ET".to_vec();
+        let alternate = doc.add_object(alternate);
+        let mut annotations = Vec::new();
+        for flags in [0, 2, 32] {
+            annotations.push(Object::Dictionary(dictionary! {
+                "Subtype" => "Stamp", "F" => flags,
+                "Rect" => vec![100.into(), 200.into(), 300.into(), 240.into()],
+                "AP" => dictionary! { "N" => dictionary! { "Chosen" => stamp, "Off" => alternate }, "R" => alternate, "D" => alternate },
+                "AS" => "Chosen",
+            }));
+        }
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", annotations);
+        let items = extract_doc_fidelity_items(&doc, page);
+        assert_eq!(items.len(), 2);
+        assert!(!items.iter().any(|item| item.text.contains("UNSELECTED")));
+        assert_eq!(items.iter().filter(|item| item.text == "Body").count(), 1);
+        let stamps: Vec<_> = items.iter().filter(|item| item.text == "JUDGE").collect();
+        assert_eq!(
+            stamps.len(),
+            1,
+            "hidden and NoView appearances must not enter extracted text"
+        );
+        let evidence = stamps[0].fidelity.as_ref().unwrap();
+        assert!((evidence.baseline[0] - 110.).abs() < 0.01);
+        assert!((evidence.baseline[1] - 210.).abs() < 0.01);
+    }
+
     fn extract_doc_fidelity_items(
         doc: &lopdf::Document,
         page_id: lopdf::ObjectId,
