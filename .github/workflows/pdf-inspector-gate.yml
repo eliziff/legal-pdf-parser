@@ -30,40 +30,50 @@ jobs:
     if: >-
       github.event_name == 'workflow_call' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64, legalpdf-corpus-ephemeral]
+    runs-on: windows-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: eliziff/legal-structure-parser
-          ref: 45df479a09a3588525017f3128ecb38b9b44ec32
-          path: legal-structure
+          repository: eliziff/Beaver
+          ref: bebcff314d348932d149e3ef1f2b2fb77c797b2a
+          path: corpus
+          sparse-checkout: |
+            benchmarks/legal-generalization-corpus/gold/maud-v1/MAUD_v1_README.pdf
+            benchmarks/legal-generalization-corpus/raw/ca-case-2014-scc-bhasin-v-hrynew.pdf
+            benchmarks/legal-generalization-corpus/raw/ca-case-2021-scc-wastech-services.pdf
+            benchmarks/legal-generalization-corpus/raw/us-complaint-2020-sec-honig.pdf
+            benchmarks/legal-generalization-corpus/raw/us-complaint-2023-sec-comp25666.pdf
+            benchmarks/legal-generalization-corpus/raw/us-court-opinion-ilnd-05-cv-03198.pdf
+            benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-10-cv-04728.pdf
+            benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-16-cv-01947-westport.pdf
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           path: base
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           path: head
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_call'
         with:
           path: base
           ref: ${{ inputs.parser-ref }}
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_call'
         with:
           path: head
           ref: ${{ inputs.parser-ref }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: github.event_name == 'workflow_call'
         with:
           name: ${{ inputs.candidate-artifact }}
@@ -92,10 +102,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Candidate lockfile update failed" }
       - name: Build and compare raw-PDF products
         shell: pwsh
-        env:
-          LEGALPDF_CORPUS_ROOT: ${{ vars.LEGALPDF_CORPUS_ROOT }}
         run: |
-          if (-not $env:LEGALPDF_CORPUS_ROOT) { throw "LEGALPDF_CORPUS_ROOT is not configured" }
+          $env:LEGALPDF_CORPUS_ROOT = Join-Path $env:GITHUB_WORKSPACE 'corpus'
           $target = Join-Path $env:RUNNER_TEMP legalpdf-pdf-inspector-target
           $baseBinary = Join-Path $env:RUNNER_TEMP legalpdf-base.exe
           $headBinary = Join-Path $env:RUNNER_TEMP legalpdf-head.exe
