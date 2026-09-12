@@ -511,6 +511,7 @@ mod tests {
     fn line(text: &str, y: f32, x: f32, size: f32, font: &str, bold: bool) -> TextLine {
         TextLine {
             items: vec![TextItem {
+                fidelity: None,
                 text: text.into(),
                 x,
                 y,
@@ -518,14 +519,18 @@ mod tests {
                 height: size,
                 font: font.into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: size,
                 page: 1,
                 is_bold: bold,
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
             y,
             page: 1,
@@ -670,6 +675,7 @@ mod tests {
     fn dominant_title_size_survives_smaller_number_prefix() {
         let mut parent = line("7.", 700.0, 72.0, 6.0, "Section", true);
         parent.items.push(TextItem {
+            fidelity: None,
             text: "Theory".into(),
             x: 86.0,
             y: 700.0,
@@ -677,14 +683,18 @@ mod tests {
             height: 12.0,
             font: "Section".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: true,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         });
         let lines = vec![
             parent,

@@ -79,13 +79,15 @@ fn format_items_json(items: &[TextItem]) -> String {
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
                 item.y,
                 item.width,
                 item.height,
+                item.rotation,
+                item.advance_known,
                 json_escape(&item.font),
                 json_escape(&item.font_tag),
                 item.font_size,
@@ -93,6 +95,7 @@ fn format_items_json(items: &[TextItem]) -> String {
                 item.is_italic,
                 item.is_underline,
                 item.is_strikeout,
+                item.baseline_shift,
                 item_type_label(&item.item_type),
                 mcid,
                 link_url,
@@ -276,14 +279,18 @@ mod tests {
             height: 9.876,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 2,
             is_bold: false,
             is_italic: true,
             is_underline: true,
             is_strikeout: true,
+            rotation: 90.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: Some(7),
+            baseline_shift: 3.5,
         }];
 
         let json = format_items_json(&items);
@@ -291,7 +298,10 @@ mod tests {
         assert!(json.contains(r#""text":"A \"quoted\" item""#));
         assert!(json.contains(r#""page":2"#));
         assert!(json.contains(r#""x":12.35"#));
+        assert!(json.contains(r#""rotation":90.00"#));
+        assert!(json.contains(r#""advance_known":true"#));
         assert!(json.contains(r#""is_underline":true"#));
+        assert!(json.contains(r#""baseline_shift":3.50"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));
     }

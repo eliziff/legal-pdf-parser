@@ -1147,8 +1147,8 @@ fn detect_stacked_box_table(
             return None;
         }
         in_box.sort_by(|a, b| {
-            b.1.y
-                .partial_cmp(&a.1.y)
+            b.1.line_y()
+                .partial_cmp(&a.1.line_y())
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     a.1.x
@@ -1165,19 +1165,22 @@ fn detect_stacked_box_table(
         let mut runs = 1usize;
         for pair in in_box.windows(2) {
             let (prev, item) = (pair[0].1, pair[1].1);
-            if (prev.y - item.y).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0 {
+            if (prev.line_y() - item.line_y()).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0
+            {
                 runs += 1;
             }
         }
         if runs >= 2 {
             multi_run_boxes += 1;
         }
-        let text = in_box
-            .iter()
-            .map(|(_, it)| it.text.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut text = String::new();
+        let mut last = None;
+        for (_, it) in &in_box {
+            let trimmed = it.text.trim();
+            if !trimmed.is_empty() {
+                super::cell_text::push_cell_item(&mut text, &mut last, it, trimmed);
+            }
+        }
         if text.is_empty() || text.chars().count() > 120 {
             return None;
         }
@@ -1731,18 +1734,27 @@ pub(crate) fn assign_items_to_grid(
         vec![vec![Vec::new(); num_cols]; num_rows];
     let mut indices = Vec::new();
 
+    // Row bands as baselines for the vertical-run test: a run standing
+    // across rows is judged by the bands it covers.
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
     for (idx, item) in items.iter().enumerate() {
         if item.page != page {
             continue;
         }
-        // Use item center for assignment
+        // Use item center for assignment; a super/subscript run is assigned
+        // by the body baseline it belongs to, not its own raised/lowered one.
         let cx = item.x + item.width / 2.0;
-        let cy = item.y;
+        let cy = item.line_y();
 
         // Find column: cx must be between col_edges[c] and col_edges[c+1]
         let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
         // Find row: cy must be between row_edges[r+1] (bottom) and row_edges[r] (top)
         let row = (0..num_rows).find(|&r| cy >= row_edges[r + 1] - 2.0 && cy <= row_edges[r] + 2.0);
+        if super::crosses_other_rows(item, &row_centers, row) {
+            continue;
+        }
 
         if let (Some(c), Some(r)) = (col, row) {
             cell_items[r][c].push((idx, item));
@@ -1766,13 +1778,13 @@ pub(crate) fn assign_items_to_grid(
                 crate::text_utils::sort_rtl_cell_items(
                     col_items,
                     |(_, i)| i.x,
-                    |(_, i)| i.y,
+                    |(_, i)| i.line_y(),
                     |(_, i)| i.text.as_str(),
                 );
             } else {
                 col_items.sort_by(|a, b| {
-                    b.1.y
-                        .partial_cmp(&a.1.y)
+                    b.1.line_y()
+                        .partial_cmp(&a.1.line_y())
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| {
                             a.1.x
@@ -1781,12 +1793,21 @@ pub(crate) fn assign_items_to_grid(
                         })
                 });
             }
-            let text = col_items
-                .iter()
-                .map(|(_, item)| item.text.trim())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+            // A cell holding a super/subscript run goes through the shared
+            // cell joiner so the run keeps its markup and edge spacing
+            // ("V<sub>f</sub>", "Total<sup>2</sup>"); plain cells keep the
+            // space join they always had.
+            let text = if col_items.iter().any(|(_, item)| item.is_script()) {
+                let refs: Vec<&TextItem> = col_items.iter().map(|(_, item)| *item).collect();
+                super::cell_text::join_cell_items(&refs)
+            } else {
+                col_items
+                    .iter()
+                    .map(|(_, item)| item.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             let text = remove_inner_delimiter_spaces(&text);
             row_cells.push(text);
         }
@@ -3574,6 +3595,7 @@ mod tests {
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
         TextItem {
+            fidelity: None,
             text: text.to_string(),
             x,
             y,
@@ -3581,14 +3603,18 @@ mod tests {
             height: font_size,
             font: "TestFont".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -4423,6 +4449,33 @@ mod tests {
     }
 
     // --- assign_items_to_grid ---
+
+    #[test]
+    fn long_vertical_runs_never_fill_a_cell() {
+        // A journal running head standing beside a turned table (a 200pt
+        // vertical run) covers the other row's band and must not be poured
+        // into the cell its foot touches; a rotated column header, 40pt tall
+        // and confined to its own header row, still fills its cell.
+        let mut running_head = make_item("Diversity and Distributions, 1-15", 15.0, 45.0, 9.0);
+        running_head.rotation = 90.0;
+        running_head.width = 9.0;
+        running_head.height = 200.0;
+        let mut header = make_item("Total", 55.0, 75.0, 9.0);
+        header.rotation = 90.0;
+        header.width = 9.0;
+        header.height = 40.0;
+        let items = vec![running_head, header, make_item("A", 15.0, 85.0, 10.0)];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![120.0, 70.0, 55.0, 40.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices, vec![1, 2]);
+        assert_eq!(cells[0][0], "A");
+        assert_eq!(cells[0][1], "Total");
+        assert!(
+            cells.iter().flatten().all(|c| !c.contains("Diversity")),
+            "{cells:?}"
+        );
+    }
 
     #[test]
     fn test_assign_items_basic() {
@@ -5275,6 +5328,7 @@ mod tests {
         for row in 0..4 {
             for col in 0..3 {
                 items.push(TextItem {
+                    fidelity: None,
                     text: format!("cell{}_{}", row, col),
                     x: 60.0 + col as f32 * 120.0,
                     y: 120.0 + row as f32 * 40.0,
@@ -5282,14 +5336,18 @@ mod tests {
                     height: 10.0,
                     font: String::new(),
                     font_tag: String::new(),
+                    legacy_symbol_rewrite: false,
                     font_size: 10.0,
                     page: 1,
                     is_bold: false,
                     is_italic: false,
                     is_underline: false,
                     is_strikeout: false,
+                    rotation: 0.0,
+                    advance_known: true,
                     item_type: crate::types::ItemType::Text,
                     mcid: None,
+                    baseline_shift: 0.0,
                 });
             }
         }
@@ -5587,6 +5645,7 @@ mod tests {
         let mut items: Vec<TextItem> = Vec::new();
         for col in 0..8 {
             items.push(TextItem {
+                fidelity: None,
                 text: format!("hdr{}", col),
                 x: 55.0 + col as f32 * 50.0,
                 y: 655.0,
@@ -5594,14 +5653,18 @@ mod tests {
                 height: 10.0,
                 font: String::new(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 10.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: crate::types::ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
         }
         let rects: Vec<crate::types::PdfRect> = page_rects

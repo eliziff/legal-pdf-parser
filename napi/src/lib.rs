@@ -88,15 +88,50 @@ pub struct PdfClassification {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// `x`/`y` are PDF points relative to the page's **visible page box**
+/// (`CropBox ∩ MediaBox`, else the MediaBox; a CropBox that does not overlap
+/// the MediaBox is ignored, and a page without a MediaBox is measured against
+/// US Letter), origin at the box's lower-left corner with `y` growing upward.
+/// [`extractTextInRegions`] reads its regions relative to the same box but
+/// from its top-left corner with `y` growing downward; flip with the box
+/// height. `/Rotate` is not applied.
+///
+/// On a page whose text is predominantly rotated the extractor turns the
+/// coordinate frame so that text reads left-to-right, and the shift into the
+/// visible page box is turned the same way; items on such a page are
+/// expressed in that turned frame. Use
+/// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
+/// in JavaScript) to learn which pages were turned and which way.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     pub x: f64,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in `[0, 360)`: `0` for ordinary horizontal text, `90`
+    /// for text reading bottom-to-top (a rotated margin stamp), `270` for
+    /// top-to-bottom, `180` for upside-down. `x`/`y`/`width`/`height` is the
+    /// run's axis-aligned box, so a vertical run is tall and thin (height
+    /// ≫ width) instead of zero-width.
+    pub rotation: f64,
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or an ActualText span's advance
+    /// could not be recovered): the box's extent along the baseline is then
+    /// an estimate of half an em per painted glyph (an ActualText span counts
+    /// the glyphs it covers, not its replacement text), not a measurement.
+    pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
+    /// Present only when legacy private-use symbol cleanup changed a source
+    /// character. This is decoding provenance, not a request to run OCR.
+    /// Merged items retain evidence from all contributing runs.
+    pub legacy_symbol_rewrite: Option<bool>,
     pub font_size: f64,
     pub page: u32,
     pub is_bold: bool,
@@ -107,6 +142,13 @@ pub struct TextItem {
     /// Strikeout detected geometrically (rule crossing the glyphs at mid
     /// x-height).
     pub is_strikeout: bool,
+    /// Signed baseline offset (PDF points, y-up) of a super/subscript glyph
+    /// run from the body baseline it is attached to; `0` for normal text.
+    /// Positive = raised (superscript: footnote/affiliation markers,
+    /// exponents), negative = lowered (subscript). Emit `<sup>`/`<sub>` from
+    /// the sign. Digit-only markers beside a word are already fused into it
+    /// as Unicode super/subscript characters ("word²") and carry `0`.
+    pub baseline_shift: f64,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -121,7 +163,9 @@ pub struct TextItem {
 #[napi(object)]
 pub struct PageRegions {
     pub page: u32,
-    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin.
+    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin of the
+    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox) — the
+    /// frame of a rendered page image.
     pub regions: Vec<Vec<f64>>,
 }
 
@@ -475,6 +519,11 @@ pub fn extract_text(buffer: Buffer) -> Result<String> {
 }
 
 /// Extract text with position information from a PDF Buffer.
+///
+/// Items are reported in PDF points relative to the page's visible page box
+/// (`CropBox ∩ MediaBox`, else the MediaBox) with the box's lower-left
+/// corner as origin — see [`TextItem`]. `pages` is 1-indexed (matching
+/// `TextItem.page`); omit it for the whole document.
 #[napi]
 pub fn extract_text_with_positions(
     buffer: Buffer,
@@ -495,30 +544,87 @@ pub fn extract_text_with_positions(
                 .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
         };
 
-        Ok(items
+        Ok(items.into_iter().map(convert_text_item).collect())
+    })
+}
+
+fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
+    let (item_type, link_url) = convert_item_type(&item.item_type);
+    TextItem {
+        text: item.text,
+        x: item.x as f64,
+        y: item.y as f64,
+        width: item.width as f64,
+        height: item.height as f64,
+        font: item.font,
+        font_tag: item.font_tag,
+        legacy_symbol_rewrite: item.legacy_symbol_rewrite.then_some(true),
+        font_size: item.font_size as f64,
+        page: item.page,
+        is_bold: item.is_bold,
+        is_italic: item.is_italic,
+        is_underline: item.is_underline,
+        is_strikeout: item.is_strikeout,
+        rotation: item.rotation as f64,
+        advance_known: item.advance_known,
+        baseline_shift: item.baseline_shift as f64,
+        item_type,
+        link_url,
+        mcid: item.mcid,
+    }
+}
+
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[napi(object)]
+pub struct PageRotation {
+    /// 1-indexed page number, matching `TextItem.page`.
+    pub page: u32,
+    /// `"ccw"` when the page's runs read bottom-to-top and the frame was
+    /// turned so they read left-to-right, `"cw"` for runs reading
+    /// top-to-bottom.
+    pub rotation: String,
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[napi(object)]
+pub struct PositionedText {
+    pub items: Vec<TextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    pub page_rotations: Vec<PageRotation>,
+}
+
+/// Extract text with positions from a PDF Buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+/// Items on such a page are expressed in the turned frame (their dominant
+/// runs read left-to-right there); pages absent from `pageRotations` are
+/// upright.
+#[napi]
+pub fn extract_text_with_positions_and_rotations(buffer: Buffer) -> Result<PositionedText> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_text_with_positions_and_rotations", move || {
+        let (items, rotations) =
+            pdf_inspector::extract_text_with_positions_and_rotations_mem(&bytes)
+                .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
+        let mut page_rotations: Vec<PageRotation> = rotations
             .into_iter()
-            .map(|item| {
-                let (item_type, link_url) = convert_item_type(&item.item_type);
-                TextItem {
-                    text: item.text,
-                    x: item.x as f64,
-                    y: item.y as f64,
-                    width: item.width as f64,
-                    height: item.height as f64,
-                    font: item.font,
-                    font_tag: item.font_tag,
-                    font_size: item.font_size as f64,
-                    page: item.page,
-                    is_bold: item.is_bold,
-                    is_italic: item.is_italic,
-                    is_underline: item.is_underline,
-                    is_strikeout: item.is_strikeout,
-                    item_type,
-                    link_url,
-                    mcid: item.mcid,
-                }
+            .filter_map(|(page, rotation)| {
+                let rotation = match rotation {
+                    pdf_inspector::PageRotation::Upright => return None,
+                    pdf_inspector::PageRotation::Ccw => "ccw",
+                    pdf_inspector::PageRotation::Cw => "cw",
+                };
+                Some(PageRotation {
+                    page,
+                    rotation: rotation.to_string(),
+                })
             })
-            .collect())
+            .collect();
+        page_rotations.sort_by_key(|r| r.page);
+        Ok(PositionedText {
+            items: items.into_iter().map(convert_text_item).collect(),
+            page_rotations,
+        })
     })
 }
 
@@ -579,7 +685,13 @@ pub fn extract_structure_elements(
 /// Each region result includes `needsOcr` — set when the extracted text
 /// is unreliable (empty, GID-encoded fonts, garbage, encoding issues).
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same box
+/// [`extractTextWithPositions`] reports items in, flipped to a top-left
+/// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
+/// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
+/// covers the glyph band above the baseline; for image, link and form-field
+/// items `y` is the rect bottom and that box is exact.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,
@@ -604,7 +716,8 @@ pub fn extract_text_in_regions(
 /// `needsOcr` is `false`. When no table is found, `text` is empty and
 /// `needsOcr` is `true` so the caller can fall back to GPU OCR.
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (see `extractTextInRegions`).
 #[napi]
 pub fn extract_tables_in_regions(
     buffer: Buffer,
@@ -626,7 +739,8 @@ pub fn extract_tables_in_regions(
 /// `null` when the region does not contain a valid vector grid.
 ///
 /// `pageIdx` is 0-indexed. `regionPdfPtBbox` is `[x1,y1,x2,y2]` in PDF
-/// points with top-left origin. `renderDpi` is the DPI of the crop image that
+/// points with top-left origin, relative to the visible page box (see
+/// `extractTextInRegions`). `renderDpi` is the DPI of the crop image that
 /// will consume the returned cell bboxes.
 #[napi]
 pub fn detect_vector_grid_in_region(
@@ -679,7 +793,8 @@ pub struct TsrTableInputJs {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// top-left origin.
+    /// top-left origin, relative to the visible page box (see
+    /// `extractTextInRegions`).
     pub crop_pdf_pt_bbox: Vec<f64>,
     /// DPI the crop image was rendered at (e.g. `200.0`).
     pub render_dpi: f64,
@@ -729,7 +844,8 @@ pub struct StructuredCellJs {
     /// Text extracted from the native PDF for this cell (may be empty).
     pub text: String,
     /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
-    /// origin. Useful for debug overlays or per-cell post-processing.
+    /// origin, relative to the visible page box (the crop's own frame).
+    /// Useful for debug overlays or per-cell post-processing.
     pub page_pt_bbox: Vec<f64>,
 }
 

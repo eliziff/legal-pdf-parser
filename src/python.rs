@@ -343,19 +343,45 @@ impl PyPagesExtractionResult {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// x/y are PDF points relative to the page's visible page box (CropBox ∩
+/// MediaBox, else MediaBox; a CropBox that does not overlap the MediaBox is
+/// ignored, and a page without a MediaBox is measured against US Letter),
+/// origin at the box's lower-left corner with y growing upward.
+/// extract_text_in_regions reads its regions relative to the same box but
+/// from its top-left corner with y growing downward; flip with the box
+/// height. Pages whose text is drawn rotated by 90° are normalized into a
+/// synthetic landscape frame before the shift, and /Rotate is not applied.
 #[pyclass(name = "TextItem")]
 #[derive(Clone)]
 pub struct PyTextItem {
     #[pyo3(get)]
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     #[pyo3(get)]
     pub x: f32,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     #[pyo3(get)]
     pub y: f32,
     #[pyo3(get)]
     pub width: f32,
     #[pyo3(get)]
     pub height: f32,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for
+    /// text reading bottom-to-top (a rotated margin stamp), 270 for
+    /// top-to-bottom, 180 for upside-down. x/y/width/height is the run's
+    /// axis-aligned box, so a vertical run is tall and thin.
+    #[pyo3(get)]
+    pub rotation: f32,
+    /// Whether the run's advance came from font metrics. False when the font
+    /// carries no width information (or an ActualText span's advance could
+    /// not be recovered): the box's extent along the baseline is then an
+    /// estimate of half an em per painted glyph (an ActualText span counts the
+    /// glyphs it covers, not its replacement text), not a measurement.
+    #[pyo3(get)]
+    pub advance_known: bool,
     #[pyo3(get)]
     pub font: String,
     #[pyo3(get)]
@@ -372,6 +398,11 @@ pub struct PyTextItem {
     pub is_underline: bool,
     #[pyo3(get)]
     pub is_strikeout: bool,
+    /// Signed baseline offset (points) of a super/subscript glyph run from
+    /// the body baseline it is attached to; 0.0 for normal text. Positive =
+    /// raised (superscript), negative = lowered (subscript).
+    #[pyo3(get)]
+    pub baseline_shift: f32,
     #[pyo3(get)]
     pub item_type: String,
     /// Marked Content ID from the content stream's BDC/BMC operator, None
@@ -586,6 +617,9 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
+            advance_known: item.advance_known,
+            baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
         })
@@ -843,6 +877,17 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 }
 
 /// Extract text with position information from a file.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When None (default), the whole document is returned.
+///
+/// Returns:
+///     List of TextItem. x/y are PDF points relative to the page's visible
+///     page box (CropBox ∩ MediaBox, else MediaBox), origin at its lower-left
+///     corner with y up; extract_text_in_regions reads regions relative to
+///     the same box from its top-left corner (flip y with the box height).
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
@@ -856,7 +901,86 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
     Ok(convert_text_items(items))
 }
 
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[pyclass(name = "PageRotation")]
+#[derive(Clone)]
+pub struct PyPageRotation {
+    /// 1-indexed page number, matching TextItem.page.
+    #[pyo3(get)]
+    pub page: u32,
+    /// "ccw" when the page's runs read bottom-to-top and the frame was turned
+    /// so they read left-to-right, "cw" for runs reading top-to-bottom.
+    #[pyo3(get)]
+    pub rotation: String,
+}
+
+#[pymethods]
+impl PyPageRotation {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageRotation(page={}, rotation='{}')",
+            self.page, self.rotation
+        )
+    }
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[pyclass(name = "PositionedText")]
+pub struct PyPositionedText {
+    #[pyo3(get)]
+    pub items: Vec<PyTextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    #[pyo3(get)]
+    pub page_rotations: Vec<PyPageRotation>,
+}
+
+fn convert_page_rotations(
+    rotations: std::collections::HashMap<u32, crate::PageRotation>,
+) -> Vec<PyPageRotation> {
+    let mut out: Vec<PyPageRotation> = rotations
+        .into_iter()
+        .filter_map(|(page, rotation)| {
+            let rotation = match rotation {
+                crate::PageRotation::Upright => return None,
+                crate::PageRotation::Ccw => "ccw",
+                crate::PageRotation::Cw => "cw",
+            };
+            Some(PyPageRotation {
+                page,
+                rotation: rotation.to_string(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.page);
+    out
+}
+
+/// Extract text with positions from a PDF file, together with the coordinate
+/// frame of every page whose text was predominantly rotated. Items on such a
+/// page are expressed in the turned frame (their dominant runs read
+/// left-to-right there); pages absent from `page_rotations` are upright.
+#[pyfunction]
+fn extract_text_with_positions_and_rotations(path: &str) -> PyResult<PyPositionedText> {
+    let data = std::fs::read(path).map_err(|e| to_py_err(crate::PdfError::Io(e)))?;
+    extract_text_with_positions_and_rotations_bytes(&data)
+}
+
+/// Extract text with positions from bytes, together with the coordinate frame
+/// of every page whose text was predominantly rotated.
+#[pyfunction]
+fn extract_text_with_positions_and_rotations_bytes(data: &[u8]) -> PyResult<PyPositionedText> {
+    let (items, rotations) =
+        crate::extract_text_with_positions_and_rotations_mem(data).map_err(to_py_err)?;
+    Ok(PyPositionedText {
+        items: convert_text_items(items),
+        page_rotations: convert_page_rotations(rotations),
+    })
+}
+
 /// Extract text with position information from bytes.
+///
+/// See extract_text_with_positions for the arguments and coordinate frame.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn extract_text_with_positions_bytes(
@@ -879,7 +1003,10 @@ fn extract_text_with_positions_bytes(
 /// Args:
 ///     path: Path to the PDF file.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
@@ -897,7 +1024,10 @@ fn extract_text_in_regions(
 /// Args:
 ///     data: PDF file contents as bytes.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
@@ -1020,6 +1150,16 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations_bytes,
+        m
+    )?)?;
+    m.add_class::<PyPageRotation>()?;
+    m.add_class::<PyPositionedText>()?;
     m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;

@@ -90,6 +90,35 @@ console.log(result.pagesNeedingOcr) // [5, 12, 15] (0-indexed)
 console.log(result.confidence)     // 0.875
 ```
 
+### `extractTextWithPositions(buffer: Buffer, pages?: number[]): TextItem[]`
+
+Every text item (plus image placeholders, links and form fields) with its font
+and position. `x`/`y` are PDF points relative to the page's **visible page
+box** (`CropBox ∩ MediaBox`, else the MediaBox), origin at the box's lower-left
+corner with `y` growing upward. `extractTextInRegions` reads its regions
+relative to the same box but from its top-left corner with `y` growing
+downward, so flip with the box height: `boxHeight - y`. For text items `y` is
+the baseline and `height` the font size, so
+`[x, boxHeight - y - height, x + width, boxHeight - y]` covers the glyph band
+above the baseline (descenders fall below it); for image, link and form-field
+items `y` is the rect bottom and that box is exact. Pages whose CropBox equals
+the MediaBox at `(0, 0)` are unaffected.
+
+`legacySymbolRewrite: true` marks items whose decoded text includes a character
+changed by legacy symbol cleanup. Merged items retain this evidence from either
+source, and split items conservatively inherit it. The field is omitted when
+that cleanup did not change a character; absence is not a general guarantee of
+decoding accuracy. Consumers correcting other text can use the marker to avoid
+treating a rewritten symbol as an authoritative Unicode value.
+
+```typescript
+import { extractTextWithPositions } from '@firecrawl/pdf-inspector'
+
+for (const item of extractTextWithPositions(pdf, [1])) { // pages are 1-indexed
+  console.log(item.page, item.text, item.x, item.y, item.fontSize)
+}
+```
+
 ### `extractTextInRegions(buffer: Buffer, pageRegions: PageRegions[]): PageRegionTexts[]`
 
 Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pipelines where a layout model detects regions in rendered page images, and this function extracts text from the PDF structure for text-based pages — skipping GPU OCR.
@@ -103,7 +132,7 @@ const result = extractTextInRegions(pdf, [
   {
     page: 0, // 0-indexed
     regions: [
-      [0, 0, 300, 400],    // [x1, y1, x2, y2] in PDF points, top-left origin
+      [0, 0, 300, 400],    // [x1, y1, x2, y2] in PDF points, top-left origin of the visible page box (CropBox)
       [300, 0, 612, 400],
     ]
   }
@@ -146,7 +175,7 @@ interface PdfClassification {
 
 interface PageRegions {
   page: number              // 0-indexed
-  regions: number[][]       // [[x1, y1, x2, y2], ...] in PDF points, top-left origin
+  regions: number[][]       // [[x1, y1, x2, y2], ...] in PDF points, top-left origin of the visible page box
 }
 
 interface PageRegionTexts {

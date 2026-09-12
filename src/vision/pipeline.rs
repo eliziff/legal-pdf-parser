@@ -1141,14 +1141,18 @@ mod tests {
             height,
             font: "PDFium native text".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
