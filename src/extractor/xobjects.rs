@@ -84,6 +84,35 @@ pub(super) fn expand_page_content<'a>(
     expander.prior_operations = budget.operations;
     expander.max_invocations = budget.max_invocations;
     expander.max_operations = budget.max_operations;
+    let appearances = annotation_appearances(doc, page_id);
+    if !appearances.is_empty() {
+        // Annotation appearances start in default page space, independent of
+        // the graphics state left by the page's content streams.
+        expander.push(Operation::new("q", Vec::new()));
+        expander.expand_stream(operations, &page_resources, false);
+        expander.push(Operation::new("Q", Vec::new()));
+        for (id, stream, rect, matrix) in appearances {
+            expander.push(Operation::new("q", Vec::new()));
+            expander.push(Operation::new(
+                "re",
+                vec![
+                    rect[0].into(),
+                    rect[1].into(),
+                    (rect[2] - rect[0]).into(),
+                    (rect[3] - rect[1]).into(),
+                ],
+            ));
+            expander.push(Operation::new("W", Vec::new()));
+            expander.push(Operation::new("n", Vec::new()));
+            expander.push(Operation::new(
+                "cm",
+                matrix.into_iter().map(Object::Real).collect(),
+            ));
+            expander.expand_form(id, stream, &page_resources);
+            expander.push(Operation::new("Q", Vec::new()));
+        }
+        return expander.finish(budget);
+    }
     if !page_resources
         .xobjects
         .values()
@@ -541,6 +570,108 @@ fn object_dictionary<'a>(doc: &'a Document, value: &'a Object) -> Option<&'a Dic
         Object::Stream(stream) => Some(&stream.dict),
         _ => None,
     }
+}
+
+// ISO 32000-1 12.5.5: map the Matrix-transformed appearance BBox to Rect.
+pub(crate) fn annotation_appearances<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+) -> Vec<(Option<ObjectId>, &'a Stream, [f32; 4], [f32; 6])> {
+    let Some(annotations) = doc
+        .get_dictionary(page_id)
+        .ok()
+        .and_then(|page| page.get(b"Annots").ok())
+        .and_then(|value| doc.dereference(value).ok().map(|(_, value)| value))
+        .and_then(|value| value.as_array().ok())
+    else {
+        return Vec::new();
+    };
+    annotations
+        .iter()
+        .filter_map(|value| {
+            let annotation = object_dictionary(doc, value)?;
+            let flags = annotation
+                .get(b"F")
+                .ok()
+                .and_then(|value| value.as_i64().ok())
+                .unwrap_or(0);
+            if flags & (1 | 2 | 32) != 0 {
+                return None;
+            }
+            let appearance = object_dictionary(doc, annotation.get(b"AP").ok()?)?;
+            let mut normal = appearance.get(b"N").ok()?;
+            let (_, resolved) = doc.dereference(normal).ok()?;
+            if let Object::Dictionary(states) = resolved {
+                normal = states
+                    .get(annotation.get(b"AS").ok()?.as_name().ok()?)
+                    .ok()?;
+            }
+            let (id, resolved) = doc.dereference(normal).ok()?;
+            let stream = resolved.as_stream().ok()?;
+            let numbers = |value: &Object| -> Option<Vec<f32>> {
+                doc.dereference(value)
+                    .ok()?
+                    .1
+                    .as_array()
+                    .ok()?
+                    .iter()
+                    .map(|value| value.as_float().ok().filter(|value| value.is_finite()))
+                    .collect()
+            };
+            let rect: [f32; 4] = numbers(annotation.get(b"Rect").ok()?)?.try_into().ok()?;
+            let bbox: [f32; 4] = numbers(stream.dict.get(b"BBox").ok()?)?.try_into().ok()?;
+            let matrix: [f32; 6] = match stream.dict.get(b"Matrix") {
+                Ok(value) => numbers(value)?.try_into().ok()?,
+                Err(_) => [1., 0., 0., 1., 0., 0.],
+            };
+            let mut bounds = [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ];
+            for (x, y) in [
+                (bbox[0], bbox[1]),
+                (bbox[0], bbox[3]),
+                (bbox[2], bbox[1]),
+                (bbox[2], bbox[3]),
+            ] {
+                let tx = matrix[0] * x + matrix[2] * y + matrix[4];
+                let ty = matrix[1] * x + matrix[3] * y + matrix[5];
+                bounds[0] = bounds[0].min(tx);
+                bounds[2] = bounds[2].max(tx);
+                bounds[1] = bounds[1].min(ty);
+                bounds[3] = bounds[3].max(ty);
+            }
+            let rect = [
+                rect[0].min(rect[2]),
+                rect[1].min(rect[3]),
+                rect[0].max(rect[2]),
+                rect[1].max(rect[3]),
+            ];
+            if bounds[2] <= bounds[0]
+                || bounds[3] <= bounds[1]
+                || rect[2] <= rect[0]
+                || rect[3] <= rect[1]
+            {
+                return None;
+            }
+            let sx = (rect[2] - rect[0]) / (bounds[2] - bounds[0]);
+            let sy = (rect[3] - rect[1]) / (bounds[3] - bounds[1]);
+            let placement = [
+                sx,
+                0.,
+                0.,
+                sy,
+                rect[0] - sx * bounds[0],
+                rect[1] - sy * bounds[1],
+            ];
+            placement
+                .iter()
+                .all(|value| value.is_finite())
+                .then_some((id, stream, rect, placement))
+        })
+        .collect()
 }
 
 fn form_matrix(doc: &Document, stream: &Stream) -> Option<Vec<Object>> {
