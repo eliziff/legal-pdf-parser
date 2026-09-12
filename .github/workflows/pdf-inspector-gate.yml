@@ -1,6 +1,8 @@
 name: PDF Inspector preflight
 
 on:
+  push:
+    branches: [main]
   pull_request:
     paths:
       - "Cargo.lock"
@@ -31,7 +33,7 @@ permissions:
 jobs:
   source-document-preflight:
     if: >-
-      github.event_name == 'workflow_call' ||
+      inputs.candidate-sha != '' || github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 120
@@ -53,25 +55,25 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'pull_request'
+        if: inputs.candidate-sha == ''
         with:
           path: base
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'pull_request'
+        if: inputs.candidate-sha == ''
         with:
           path: head
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'workflow_call'
+        if: inputs.candidate-sha != ''
         with:
           path: base
           ref: ${{ inputs.parser-ref }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'workflow_call'
+        if: inputs.candidate-sha != ''
         with:
           path: head
           ref: ${{ inputs.parser-ref }}
@@ -80,12 +82,12 @@ jobs:
         shell: bash
         run: bash head/tools/test-merge-pdf-inspector.sh
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: github.event_name == 'workflow_call'
+        if: inputs.candidate-sha != ''
         with:
           name: ${{ inputs.candidate-artifact }}
           path: candidate
       - name: Use candidate PDF Inspector
-        if: github.event_name == 'workflow_call'
+        if: inputs.candidate-sha != ''
         shell: pwsh
         env:
           CANDIDATE_SHA: ${{ inputs.candidate-sha }}
