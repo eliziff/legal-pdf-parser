@@ -505,12 +505,13 @@ impl ProseLineStats {
             return;
         }
         self.total_lines += 1;
-        self.total_items += line_items.len();
+        // Marker runs ride on a line, they are not table-like items.
+        self.total_items += line_items.iter().filter(|i| !i.is_script()).count();
 
-        let line_y = line_items[0].y;
+        let line_y = line_items[0].line_y();
         let line_height = line_items
             .iter()
-            .map(|i| i.height)
+            .map(|i| i.cross_extent())
             .fold(0.0_f32, f32::max)
             .max(1.0);
         if let Some(previous_y) = self.previous_line_y {
@@ -590,7 +591,7 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
 
         // Sort by Y descending (top of page = higher Y in PDF coords)
         let mut sorted: Vec<&TextItem> = col_items;
-        sorted.sort_by(|a, b| b.y.total_cmp(&a.y));
+        sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()));
 
         // Group into lines by Y-proximity and measure fill + item count
         let mut stats = ProseLineStats::default();
@@ -598,15 +599,15 @@ fn columns_have_prose(columns: &[ColumnRegion], items: &[&TextItem]) -> bool {
         let mut line_y = f32::NAN;
 
         for item in &sorted {
-            if line_items.is_empty() || (line_y - item.y).abs() < Y_TOL {
+            if line_items.is_empty() || (line_y - item.line_y()).abs() < Y_TOL {
                 if line_items.is_empty() {
-                    line_y = item.y;
+                    line_y = item.line_y();
                 }
                 line_items.push(item);
             } else {
                 stats.flush_line(&line_items, col, col_width);
                 line_items.clear();
-                line_y = item.y;
+                line_y = item.line_y();
                 line_items.push(item);
             }
         }
@@ -2632,7 +2633,9 @@ fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f3
     let mut intervals: Vec<(f32, f32)> = text_items
         .iter()
         .filter(|i| effective_width(i) <= wide_threshold)
-        .map(|i| (i.y + i.height.max(0.0), i.y))
+        // Em box, not `height`: a vertical run's height is its advance and
+        // would fill the very gap its neighbours' whitespace should expose.
+        .map(|i| (i.y + i.cross_extent().max(0.0), i.y))
         .filter(|(top, bottom)| top.is_finite() && bottom.is_finite())
         .collect();
     if intervals.len() < 10 {
@@ -2927,15 +2930,20 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
     let use_y_sorting = should_use_y_sorting(&items);
 
     let items = if use_y_sorting {
-        // Sort by Y descending (top to bottom in PDF coords)
+        // Sort by Y descending (top to bottom in PDF coords). Script glyphs
+        // sort by their anchor's baseline so a raised footnote marker lands
+        // beside its word instead of ahead of the whole line.
         let mut sorted = items;
-        sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+        sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
         sorted
     } else {
         items
     };
 
-    // Group items into lines
+    // Group items into lines. Baselines are compared through `line_y`, which
+    // snaps super/subscript runs to the body baseline they belong to; a
+    // fixed 3pt window on raw `y` split 4-5pt raised markers into their own
+    // orphan "line".
     let mut lines: Vec<TextLine> = Vec::new();
     let y_tolerance = 3.0;
 
@@ -2945,7 +2953,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
             if last_line.page != item.page {
                 return false;
             }
-            let y_diff = (last_line.y - item.y).abs();
+            let y_diff = (last_line.y - item.line_y()).abs();
             if y_diff >= y_tolerance {
                 return false;
             }
@@ -3027,7 +3035,7 @@ fn group_single_column(items: Vec<TextItem>, adaptive_threshold: f32) -> Vec<Tex
             lines.last_mut().unwrap().items.push(item);
         } else {
             // Create new line
-            let y = item.y;
+            let y = item.line_y();
             let page = item.page;
             lines.push(TextLine {
                 items: vec![item],
@@ -3057,6 +3065,7 @@ mod tests {
     /// Helper: create a TextItem at given position with given width text.
     fn make_item(page: u32, x: f32, y: f32, text: &str) -> TextItem {
         TextItem {
+            fidelity: None,
             text: text.to_string(),
             x,
             y,
@@ -3065,13 +3074,17 @@ mod tests {
             font_size: 12.0,
             font: String::new(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             page,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -3805,6 +3818,7 @@ mod tests {
                 let text_len = (item_width / 6.0).ceil() as usize;
                 let text: String = "W".repeat(text_len);
                 items.push(TextItem {
+                    fidelity: None,
                     text,
                     x,
                     y,
@@ -3813,13 +3827,17 @@ mod tests {
                     font_size: 12.0,
                     font: String::new(),
                     font_tag: String::new(),
+                    legacy_symbol_rewrite: false,
                     page,
                     is_bold: false,
                     is_italic: false,
                     is_underline: false,
                     is_strikeout: false,
+                    rotation: 0.0,
+                    advance_known: true,
                     item_type: ItemType::Text,
                     mcid: None,
+                    baseline_shift: 0.0,
                 });
             }
             y -= 14.0;

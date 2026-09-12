@@ -219,7 +219,6 @@ fn classify_page_evidence(
     config: &DetectionConfig,
     mut page_evidence: impl FnMut(u32) -> Option<PageDetectionEvidence>,
 ) -> PdfTypeResult {
-
     // Select pages to scan based on strategy
     let (sample_indices, allow_early_exit) = match &config.strategy {
         ScanStrategy::EarlyExit => ((1..=total_pages).collect::<Vec<_>>(), true),
@@ -808,31 +807,28 @@ pub(crate) fn analyze_page_content_streams<'a>(
     let page_resources = doc.get_page_resources(page_id).ok();
 
     for content in contents {
-            // Scan for text operators, collecting raw font names
-            let mut page_font_names = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
-                content,
-                &mut all_unique_chars,
-                &mut page_font_names,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+        // Scan for text operators, collecting raw font names
+        let mut page_font_names = HashSet::new();
+        let (ops, imgs, paths, fonts) =
+            scan_content_for_text_operators(content, &mut all_unique_chars, &mut page_font_names);
+        text_ops += ops;
+        image_count += imgs;
+        path_ops += paths;
+        font_changes += fonts;
+        has_images = has_images || imgs > 0;
 
-            // Resolve font names against the page's resource dictionaries,
-            // respecting PDF resource inheritance shadowing: the most-specific
-            // scope (page's own /Resources) wins over inherited ancestors.
-            if let Some((ref resource_dict, ref resource_ids)) = page_resources {
-                resolve_with_shadowing(
-                    doc,
-                    *resource_dict,
-                    resource_ids,
-                    &page_font_names,
-                    &mut used_font_ids,
-                );
-            }
+        // Resolve font names against the page's resource dictionaries,
+        // respecting PDF resource inheritance shadowing: the most-specific
+        // scope (page's own /Resources) wins over inherited ancestors.
+        if let Some((ref resource_dict, ref resource_ids)) = page_resources {
+            resolve_with_shadowing(
+                doc,
+                *resource_dict,
+                resource_ids,
+                &page_font_names,
+                &mut used_font_ids,
+            );
+        }
     }
 
     // Scan XObject Form contents for text operators, collect their fonts,
@@ -996,7 +992,7 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
                 has_undecodable_identity_h = true;
             }
             Some(b"Type3") => {
-                // Type3 fonts are handled separately by page_has_only_type3_fonts;
+                // Type3 fonts are handled separately by used_fonts_are_only_type3;
                 // don't count them as decodable here.
             }
             _ => {
@@ -1070,6 +1066,19 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
             if embedded_font_has_cmap(doc, ff_ref) {
                 return true;
             }
+            // Fallback 3: no cmap, but the glyph order is the standard
+            // Macintosh one and the metrics corroborate it (see
+            // `mac_glyph_order`); extraction decodes it.
+            if crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
+                && doc
+                    .get_object(ff_ref)
+                    .and_then(Object::as_stream)
+                    .ok()
+                    .and_then(|stream| stream.decompressed_content().ok())
+                    .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
+            {
+                return true;
+            }
         }
     }
 
@@ -1107,44 +1116,6 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         }
     }
     false
-}
-
-/// Returns true if every font on the page is Type3 (no normal text fonts).
-/// Type3 fonts render glyphs as custom drawings/bitmaps. Without a ToUnicode
-/// CMap, character codes can't be mapped to Unicode — the page needs OCR.
-///
-/// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
-/// Kept for existing unit tests.
-#[cfg(test)]
-fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
-    let fonts = match doc.get_page_fonts(page_id) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    if fonts.is_empty() {
-        return false;
-    }
-    let mut has_type3 = false;
-    for font_dict in fonts.values() {
-        let subtype = font_dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name().ok());
-        if subtype == Some(b"Type3") {
-            // Type3 with a ToUnicode CMap can still produce usable text
-            if font_dict.get(b"ToUnicode").is_ok() {
-                return false;
-            }
-            has_type3 = true;
-        } else {
-            // Has a non-Type3 font — page has real text fonts
-            return false;
-        }
-    }
-    if has_type3 {
-        log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
-    }
-    has_type3
 }
 
 /// Check if the page has at least one font that can produce decodable Unicode text.
@@ -1246,7 +1217,7 @@ fn used_fonts_have_identity_h_no_tounicode(
 
 /// Usage-based check: are ALL used fonts Type3 without ToUnicode?
 ///
-/// Unlike `page_has_only_type3_fonts`, this only considers fonts actually referenced
+/// This considers only fonts actually referenced
 /// by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
 fn used_fonts_are_only_type3(
     used_font_ids: &HashSet<ObjectId>,
@@ -1683,7 +1654,10 @@ fn collect_text_chars_before(
 }
 
 fn collect_hex_chars(bytes: &[u8], unique_chars: &mut [bool; 256]) {
-    let mut hex = bytes.iter().copied().filter(|byte| !byte.is_ascii_whitespace());
+    let mut hex = bytes
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace());
     while let (Some(high), Some(low)) = (hex.next(), hex.next()) {
         if let (Some(high), Some(low)) = (hex_val(high), hex_val(low)) {
             let byte = (high << 4) | low;
@@ -2084,7 +2058,7 @@ mod tests {
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 3);
         for &ch in b"HeloWrdM" {
-            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+            assert!(uchars[ch as usize], "missing char {}", ch as char);
         }
     }
 
@@ -2098,7 +2072,7 @@ mod tests {
             scan_content_for_text_operators(content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, 1);
         for &ch in b"HeloTjWrd" {
-            assert!(uchars.contains(&ch), "missing char {}", ch as char);
+            assert!(uchars[ch as usize], "missing char {}", ch as char);
         }
     }
 
@@ -2116,7 +2090,7 @@ mod tests {
         let (ops, _, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
         assert_eq!(ops, n as u32);
-        assert!(uchars.is_empty());
+        assert!(!uchars.iter().any(|present| *present));
     }
 
     #[test]
@@ -2500,7 +2474,6 @@ mod tests {
 
         // Normal doc: low text ops — doesn't qualify at all
         let text_ops = 300u32;
-        let font_changes = 50u32;
         assert!(text_ops < 1500);
     }
 
@@ -2878,14 +2851,14 @@ mod tests {
         // Standard pattern: /F1 12 Tf
         let content = b"/F1 12 Tf";
         let name = extract_font_name_before_tf(content, 6, 0); // 'T' is at index 6
-        assert_eq!(name, Some(b"F1".to_vec()));
+        assert_eq!(name, Some(b"F1".as_slice()));
     }
 
     #[test]
     fn test_extract_font_name_long_name() {
         let content = b"/ArialMT-Bold 9.5 Tf";
         let name = extract_font_name_before_tf(content, 18, 0);
-        assert_eq!(name, Some(b"ArialMT-Bold".to_vec()));
+        assert_eq!(name, Some(b"ArialMT-Bold".as_slice()));
     }
 
     #[test]
@@ -2894,8 +2867,8 @@ mod tests {
         let mut fonts = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         scan_content_for_text_operators(content, &mut uchars, &mut fonts);
-        assert!(fonts.contains(&b"F1".to_vec()), "should collect F1");
-        assert!(fonts.contains(&b"F2".to_vec()), "should collect F2");
+        assert!(fonts.contains(b"F1".as_slice()), "should collect F1");
+        assert!(fonts.contains(b"F2".as_slice()), "should collect F2");
         assert_eq!(fonts.len(), 2);
     }
 

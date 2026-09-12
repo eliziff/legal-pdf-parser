@@ -619,6 +619,7 @@ mod tests {
 
     fn make_item(text: &str, font_size: f32, mcid: Option<i64>) -> TextItem {
         TextItem {
+            fidelity: None,
             text: text.to_string(),
             x: 0.0,
             y: 0.0,
@@ -626,14 +627,18 @@ mod tests {
             height: font_size,
             font: "TestFont".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

@@ -77,10 +77,18 @@ else:
 # Plain text extraction
 text = pdf_inspector.extract_text("document.pdf")
 
-# Positioned text items with font info
+# Positioned text items with font info. x/y are PDF points relative to the
+# visible page box (CropBox ∩ MediaBox), origin at its lower-left corner, y up.
+# extract_text_in_regions uses the same box from its top-left corner (y down).
 items = pdf_inspector.extract_text_with_positions("document.pdf")
 for item in items[:5]:
     print(f"'{item.text}' at ({item.x:.0f}, {item.y:.0f}) size={item.font_size}")
+
+# Pages whose text is predominantly rotated are re-based so it reads
+# left-to-right; ask for the frame of each such page alongside the items
+positioned = pdf_inspector.extract_text_with_positions_and_rotations("document.pdf")
+for frame in positioned.page_rotations:
+    print(f"page {frame.page} turned {frame.rotation}")
 
 # Per-page markdown (one Markdown string per page, plus layout metadata)
 result = pdf_inspector.extract_pages_markdown("document.pdf")
@@ -129,9 +137,11 @@ headings = [
 | `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
-| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords and font info |
+| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords (visible-page-box frame) and font info |
 | `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
-| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions |
+| `extract_text_with_positions_and_rotations(path)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
+| `extract_text_with_positions_and_rotations_bytes(data)` | The same from bytes |
+| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
 | `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
@@ -208,10 +218,12 @@ class PdfClassification:             # classify_pdf
 
 class TextItem:                      # extract_text_with_positions
     text: str
-    x: float
-    y: float
+    x: float                         # PDF points from the visible page box's lower-left corner
+    y: float                         # (CropBox ∩ MediaBox, else MediaBox); y grows upward
     width: float
-    height: float
+    height: float                    # axis-aligned box; y is the baseline for horizontal text
+    rotation: float                  # baseline angle in degrees CCW: 0 horizontal, 90 bottom-to-top, 270 top-to-bottom
+    advance_known: bool              # False when the font has no width metrics or an ActualText advance could not be recovered: the extent along the baseline is then estimated
     font: str
     font_size: float
     page: int
@@ -219,8 +231,17 @@ class TextItem:                      # extract_text_with_positions
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)
     item_type: str
     mcid: int | None                 # marked-content ID for tagged PDFs (None otherwise)
+
+class PageRotation:                  # extract_text_with_positions_and_rotations
+    page: int                        # 1-indexed (matches TextItem.page)
+    rotation: Literal["ccw", "cw"]   # how the page's frame was turned so its text reads left-to-right
+
+class PositionedText:                # extract_text_with_positions_and_rotations
+    items: list[TextItem]            # on a page listed below, in that page's turned frame
+    page_rotations: list[PageRotation]
 
 class StructureElement:              # extract_structure_elements
     page: int                        # 1-indexed (matches TextItem.page)
