@@ -1,9 +1,6 @@
 # Parser documentation
 
-The [root README](../README.md) owns current setup, feature profiles, PDF boundaries
-and validation requirements. The standalone
-[structure README](https://github.com/eliziff/legal-structure-parser) owns shared
-legal-structure semantics. Do not copy either contract into another refactor plan.
+See the [root README](../README.md) for installation and feature profiles.
 
 ## Measurements and historical receipts
 
@@ -16,11 +13,8 @@ legal-structure semantics. Do not copy either contract into another refactor pla
 | [Pairer parity, July 30](canonical-pairer-parity-2026-07-30.md) | Historical pairing comparison |
 | [Real-model benchmark, July 26](real-model-benchmark-2026-07-26.md) | Historical model/corpus evidence |
 
-Keep the original receipts, inputs and reproduction limits with their experiments.
-Do not relabel them as validation of the current binary. In particular, July DOCX
-and model notes describe former Python modules, tools and model-routing choices;
-they are not current installation instructions or authorization to spend API
-credits or send private documents to a provider.
+These records describe the measured revisions. July DOCX and model benchmarks
+use the former Python implementation and are not current installation guides.
 
 ## Historical lineage
 
@@ -32,9 +26,3 @@ ALR Quote Verifier's `verifier_core/pdf_adapter.py`, including upstream revision
 runtime dependency or automatic synchronization policy. The old Python
 `src/legalpdf/core.py`, `to_alr_payload()` and `tests/test_engine.py` instructions
 are not the current Rust API.
-
-The former DOCX citation-linking plan duplicated an obsolete application-worker
-implementation. Current Word mutation, linking and application integration belong
-to [Beaver's document-capabilities plan](https://github.com/eliziff/Beaver/blob/main/docs/roadmap/document-capabilities.md)
-and its current contracts, not the PDF parser. Git history retains the original
-plans; remaining cross-project work stays in Beaver's roadmap.
