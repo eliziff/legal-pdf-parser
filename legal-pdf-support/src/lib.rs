@@ -2,10 +2,11 @@ mod adapters;
 pub mod pairing_support;
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 mod ppdoc;
+#[cfg(feature = "ppdoc-inference")]
+pub mod ppdoc_inference;
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 mod ppdoc_openvino;
-#[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
-mod ppdoc_postprocess;
+pub mod ppdoc_postprocess;
 pub use legal_pdf_core::profile;
 mod projection;
 

@@ -2,6 +2,195 @@ use super::*;
 use legal_pdf_core::model::Word;
 
 #[test]
+fn source_heading_witnesses_reach_the_ladder_and_join_wrapped_titles() {
+    for ocr in [false, true] {
+        let mut lines = vec![
+            sized_line("I. GOVERNING FRAMEWORK", [60.0, 80.0, 340.0, 92.0], 10.0),
+            sized_line(
+                "The parties have obligations under this agreement.",
+                [60.0, 110.0, 520.0, 122.0],
+                11.0,
+            ),
+            sized_line("A.FIRST PART OF", [60.0, 160.0, 300.0, 172.0], 10.0),
+            sized_line("THE FRAMEWORK", [60.0, 173.0, 300.0, 185.0], 10.0),
+            sized_line(
+                "The parties must comply with the applicable requirements.",
+                [60.0, 210.0, 520.0, 222.0],
+                11.0,
+            ),
+            sized_line("B.SECOND PART", [60.0, 260.0, 300.0, 272.0], 10.0),
+            sized_line(
+                "The parties must perform the agreed services.",
+                [60.0, 300.0, 520.0, 312.0],
+                11.0,
+            ),
+        ];
+        for (index, line) in lines.iter_mut().enumerate() {
+            line.block_index = index + 1;
+        }
+        if !ocr {
+            lines[2].text = "A. FIRST PART OF".into();
+            lines[5].text = "B. SECOND PART".into();
+        }
+        mark_source_body(&mut lines);
+        for index in [0, 2, 3, 5] {
+            lines[index].region_type = "paragraph_title".into();
+            lines[index].region_id = format!("heading-{}", if index == 3 { 2 } else { index });
+            lines[index].spans[0].flags = 16;
+        }
+        if ocr {
+            for line in &mut lines {
+                line.source = "ocr".into();
+                line.spans.clear();
+            }
+        }
+        let mut pages = vec![test_page(lines)];
+        let output = derive(
+            &mut pages,
+            &[None],
+            StructureIdentity {
+                document_id: "witness-test".into(),
+                source_sha256: String::new(),
+            },
+        )
+        .unwrap();
+        let headings = output
+            .structure_graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Heading)
+            .collect::<Vec<_>>();
+        assert_eq!(headings.len(), 3, "ocr={ocr}: {headings:?}");
+        assert_eq!(
+            headings[1].label.as_deref(),
+            Some(if ocr {
+                "A.FIRST PART OF\nTHE FRAMEWORK"
+            } else {
+                "A. FIRST PART OF\nTHE FRAMEWORK"
+            })
+        );
+        assert_eq!(headings[1].parent_id.as_ref(), Some(&headings[0].id));
+        assert_eq!(headings[2].parent_id.as_ref(), Some(&headings[0].id));
+    }
+}
+
+#[test]
+fn bare_dotted_pdf_markers_reach_the_existing_heading_ladder() {
+    for split in [false, true] {
+        let mut lines = Vec::new();
+        for (index, title) in [
+            "Number and types of Standing Offer Agreement",
+            "Duration and Extension",
+            "Future Adjustment",
+            "Replenishment",
+            "Evaluation of Consultants",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 100.0 + index as f64 * 100.0;
+            let marker = format!("2.{}", index + 1);
+            if split {
+                lines.push(sized_line(&marker, [40.0, y, 60.0, y + 12.0], 11.0));
+            }
+            lines.push(sized_line(
+                &if split {
+                    title.to_string()
+                } else {
+                    format!("{marker} {title}")
+                },
+                [70.0, y, 400.0, y + 12.0],
+                11.0,
+            ));
+            lines.last_mut().unwrap().spans[0].flags = 16;
+            lines.push(sized_line(
+                "The parties will perform their obligations under this agreement.",
+                [70.0, y + 30.0, 520.0, y + 42.0],
+                11.0,
+            ));
+        }
+        mark_source_body(&mut lines);
+        let mut pages = vec![test_page(lines)];
+        classify_pages(&mut pages, &[None]);
+        for title in [
+            "Number and types of Standing Offer Agreement",
+            "Duration and Extension",
+            "Future Adjustment",
+            "Replenishment",
+            "Evaluation of Consultants",
+        ] {
+            assert!(
+                pages[0]
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains(title) && line.region_type == "heading"),
+                "{title}, split={split}: {:?}",
+                pages[0]
+                    .lines
+                    .iter()
+                    .map(|l| (&l.text, &l.region_type))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() {
+    let rows = [
+        ("Definitions", "paragraph_title", 100.0),
+        (
+            "The parties agree to perform their obligations.",
+            "unknown",
+            140.0,
+        ),
+        ("Payment", "paragraph_title", 200.0),
+        (
+            "This is ordinary prose with enough words to remain ordinary prose.",
+            "paragraph_title",
+            240.0,
+        ),
+        ("Journal furniture", "header", 25.0),
+        (
+            "1 A footnote citation with explanatory prose.",
+            "footnote",
+            740.0,
+        ),
+        ("o", "paragraph_title", 220.0),
+    ];
+    let lines = rows
+        .iter()
+        .map(|(text, role, y)| {
+            let mut line = sized_line(text, [60.0, *y, 520.0, y + 12.0], 11.0);
+            line.source = "ocr".to_owned();
+            line.spans.clear();
+            line.region_type = (*role).to_owned();
+            line
+        })
+        .collect();
+    let mut pages = vec![test_page(lines)];
+    classify_pages(&mut pages, &[None]);
+    assert_eq!(
+        pages[0]
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.region_type.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        [
+            (rows[4].0, "header"),
+            (rows[0].0, "heading"),
+            (rows[1].0, "body"),
+            (rows[2].0, "heading"),
+            (rows[6].0, "body"),
+            (rows[3].0, "body"),
+            (rows[5].0, "footnote"),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
 fn pdf_text_index_preserves_exact_lines_and_scalar_offsets() {
     let pages: Vec<Page> = serde_json::from_value(json!([
         {
@@ -2266,13 +2455,15 @@ fn smaller_quoted_text_does_not_make_normal_prose_a_heading() {
 }
 
 #[test]
-fn region_dependent_lanes_require_a_complete_source_contract() {
+fn region_dependent_lanes_only_admit_lines_with_source_roles() {
     let mut pages = vec![test_page(vec![
         sized_line("Known body", [60.0, 100.0, 300.0, 112.0], 11.0),
         sized_line("Unknown peer", [60.0, 120.0, 300.0, 132.0], 11.0),
     ])];
     pages[0].lines[0].region_type = "body".to_owned();
-    assert!(!source_regions_available(&pages));
+    let roles = source_region_contract(&pages).unwrap();
+    assert!(heading_source_eligible(&roles, &pages[0].lines[0]));
+    assert!(!heading_source_eligible(&roles, &pages[0].lines[1]));
 
     pages[0].lines[1].region_type = "text".to_owned();
     assert!(source_regions_available(&pages));

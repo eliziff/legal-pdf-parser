@@ -8,7 +8,8 @@ license = "MIT"
 default = []
 profiling = ["legal-pdf-core/profiling"]
 allocation-profiling = ["profiling", "legal-pdf-core/allocation-profiling"]
-ppdoc-openvino = ["dep:hayro", "dep:image", "dep:libloading"]
+ppdoc-inference = ["dep:image"]
+ppdoc-openvino = ["ppdoc-inference", "dep:hayro", "dep:libloading"]
 ppdoc = ["ppdoc-openvino", "dep:ort", "legal-pdf-core/ort-runtime"]
 
 [dependencies]
