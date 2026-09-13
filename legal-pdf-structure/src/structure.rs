@@ -2234,7 +2234,13 @@ fn classify_pages_with_source(
                 // OCR has no font metrics. Retain validated source roles before
                 // applying the shared heading grammar and prose demotion below.
                 line.region_type = match line.region_type.as_str() {
-                    "paragraph_title" | "heading" => "heading",
+                    "paragraph_title" | "heading"
+                        if heading_text_plausible(&line.text)
+                            || heading_style_corroborated(&line.text)
+                            || caps_warble(&line.text) =>
+                    {
+                        "heading"
+                    }
                     "footnote" => "footnote",
                     _ => "body",
                 }

@@ -22,6 +22,7 @@ fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() 
             "footnote",
             740.0,
         ),
+        ("o", "paragraph_title", 220.0),
     ];
     let lines = rows
         .iter()
@@ -40,15 +41,18 @@ fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() 
             .lines
             .iter()
             .map(|line| (line.text.as_str(), line.region_type.as_str()))
-            .collect::<Vec<_>>(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         [
             (rows[4].0, "header"),
             (rows[0].0, "heading"),
             (rows[1].0, "body"),
             (rows[2].0, "heading"),
+            (rows[6].0, "body"),
             (rows[3].0, "body"),
             (rows[5].0, "footnote"),
         ]
+        .into_iter()
+        .collect()
     );
 }
 
