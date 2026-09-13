@@ -1185,6 +1185,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn partial_coverage_keeps_matched_regions_and_uncovered_source_evidence() {
+        let regions = vec![region("paragraph_title", 1, [100.0, 200.0, 400.0, 240.0])];
+        let mut first = page(0, &regions, &[(1, &["Payment Terms"])]);
+        first.lines.push(line(
+            2,
+            "Uncovered body text.",
+            [100.0, 400.0, 600.0, 420.0],
+        ));
+        let untouched = serde_json::to_value(&first.lines[1]).unwrap();
+        let second = page(1, &regions, &[(1, &["Termination"])]);
+        let mut pages = vec![first, second];
+        let diagnostics = annotate_regions(&mut pages, vec![regions.clone(), regions], 2).unwrap();
+        assert_eq!(pages[0].lines[0].region_type, "paragraph_title");
+        assert_eq!(pages[1].lines[0].region_type, "paragraph_title");
+        assert_eq!(serde_json::to_value(&pages[0].lines[1]).unwrap(), untouched);
+        assert_eq!(diagnostics[0].line_ids, vec!["l2"]);
+        assert_eq!(diagnostics[0].details["matched_lines"], 2);
+    }
+
     fn label(regions: &[RegionDetection], raw_index: usize) -> Option<&str> {
         regions
             .iter()
@@ -1386,7 +1406,7 @@ mod tests {
     }
 }
 
-/// Apply model regions atomically using the same rules on every runtime.
+/// Apply matched model regions; uncovered lines retain their original evidence.
 pub fn annotate_regions(
     pages: &mut [Page],
     mut regions_by_page: Vec<Vec<RegionDetection>>,
@@ -1422,10 +1442,11 @@ pub fn annotate_regions(
         }
     }
 
+    let mut diagnostics = Vec::new();
     if !unmatched.is_empty() {
         let mut diagnostic = Diagnostic::warning(
             "PPDOC_LAYOUT_INCOMPLETE",
-            "PPdoc did not cover every text line; model regions were discarded.",
+            "PPdoc did not cover every text line; matched regions were retained and uncovered lines keep their original evidence.",
             None,
         );
         diagnostic.line_ids = unmatched;
@@ -1435,7 +1456,7 @@ pub fn annotate_regions(
         diagnostic
             .details
             .insert("matched_lines".to_owned(), serde_json::json!(pending.len()));
-        return Ok(vec![diagnostic]);
+        diagnostics.push(diagnostic);
     }
 
     for (page_index, line_index, label, region_id) in pending {
@@ -1443,5 +1464,5 @@ pub fn annotate_regions(
         line.region_type = label;
         line.region_id = region_id;
     }
-    Ok(Vec::new())
+    Ok(diagnostics)
 }
