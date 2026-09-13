@@ -279,13 +279,11 @@ fn standalone_enumerator_re() -> &'static Regex {
     })
 }
 
-fn inline_enumerator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
-        )
-        .unwrap()
+fn inline_enumerator_re(ocr: bool) -> &'static Regex {
+    static RE: [OnceLock<Regex>; 2] = [const { OnceLock::new() }; 2];
+    RE[usize::from(ocr)].get_or_init(|| {
+        let spacing = if ocr { r"\s*" } else { r"\s+" };
+        Regex::new(&format!(r"^\s*(\d{{1,2}}(?:\.\d{{1,2}}){{1,3}}|[IVXLCDM]{{1,7}}|[A-Za-z]|\d{{1,3}})([.)]){spacing}(\S.*)$")).unwrap()
     })
 }
 
@@ -975,7 +973,6 @@ fn heading_candidates<'a>(
     primitives: &PdfPrimitiveEvidence,
 ) -> Vec<HeadingCandidate<'a>> {
     let regions = primitives.source_regions.as_ref().expect("source regions");
-    let inline = inline_enumerator_re();
     let standalone = standalone_enumerator_re();
     let mut candidates = Vec::new();
     for (page_slot, page) in pages.iter().enumerate() {
@@ -1004,7 +1001,10 @@ fn heading_candidates<'a>(
                 }
                 continue;
             }
-            if let Some(capture) = inline.captures(line.text.trim()) {
+            if let Some(capture) = inline_enumerator_re(line.source == "ocr")
+                .captures(line.text.trim())
+                .filter(|_| bare.is_none())
+            {
                 let value = capture.get(1).unwrap().as_str();
                 let punct = capture.get(2).unwrap().as_str();
                 let text = capture.get(3).unwrap().as_str().trim();
@@ -1247,10 +1247,22 @@ fn wrapped_heading_continuation(
     let internal_gap = continuation.bbox[1] - heading.bbox[3];
     let internal_step = continuation.bbox[1] - heading.bbox[1];
     let following_step = following.bbox[1] - continuation.bbox[1];
-    (heading_size > 0.0
-        && continuation_size > 0.0
-        && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
-        && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
+    let same_style = if heading.source == "ocr" && continuation.source == "ocr" {
+        // OCR cannot supply font metrics. A shared source heading region is
+        // the existing visual witness; do not infer one from line height.
+        !heading.region_id.is_empty()
+            && heading.region_id == continuation.region_id
+            && matches!(continuation_source, Some("paragraph_title" | "heading"))
+            && source_regions
+                .get(&heading.id)
+                .is_some_and(|role| matches!(role.as_str(), "paragraph_title" | "heading"))
+    } else {
+        heading_size > 0.0
+            && continuation_size > 0.0
+            && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+            && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
+    };
+    (same_style
         && (continuation_height - heading_height).abs() <= heading_height * 0.05
         && (-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
         && (-heading_height * 0.2..=(heading_height * 0.8).max(6.0)).contains(&internal_gap)
@@ -1294,7 +1306,7 @@ fn heading_style_corroborated(text: &str) -> bool {
     {
         return true;
     }
-    if let Some(capture) = inline_enumerator_re().captures(text) {
+    if let Some(capture) = inline_enumerator_re(false).captures(text) {
         if heading_text_plausible(capture.get(3).unwrap().as_str()) && !text.ends_with('.') {
             return true;
         }
@@ -1561,10 +1573,7 @@ fn apply_text_fidelity_headings(
         if page_slot >= pages.len() || target_slot >= pages[page_slot].lines.len() {
             continue;
         }
-        if !source_regions
-            .get(&pages[page_slot].lines[target_slot].id)
-            .is_some_and(|region| matches!(region.as_str(), "text" | "body"))
-        {
+        if !heading_source_eligible(source_regions, &pages[page_slot].lines[target_slot]) {
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
@@ -2276,9 +2285,12 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
-            } else if line.source == "ocr" && size == 0.0 && evidence.source_regions.is_some() {
-                // OCR has no font metrics. Retain validated source roles before
-                // applying the shared heading grammar and prose demotion below.
+            } else if evidence.source_regions.is_some()
+                && (matches!(line.region_type.as_str(), "paragraph_title" | "heading")
+                    || (line.source == "ocr" && size == 0.0))
+            {
+                // Retain source heading evidence before shared grammar and prose
+                // demotion. Small-caps native headings need not exceed body size.
                 line.region_type = match line.region_type.as_str() {
                     "paragraph_title" | "heading"
                         if heading_text_plausible(&line.text)

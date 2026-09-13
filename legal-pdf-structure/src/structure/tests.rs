@@ -2,6 +2,76 @@ use super::*;
 use legal_pdf_core::model::Word;
 
 #[test]
+fn source_heading_witnesses_reach_the_ladder_and_join_wrapped_titles() {
+    for ocr in [false, true] {
+        let mut lines = vec![
+            sized_line("I. GOVERNING FRAMEWORK", [60.0, 80.0, 340.0, 92.0], 10.0),
+            sized_line(
+                "The parties have obligations under this agreement.",
+                [60.0, 110.0, 520.0, 122.0],
+                11.0,
+            ),
+            sized_line("A.FIRST PART OF", [60.0, 160.0, 300.0, 172.0], 10.0),
+            sized_line("THE FRAMEWORK", [60.0, 173.0, 300.0, 185.0], 10.0),
+            sized_line(
+                "The parties must comply with the applicable requirements.",
+                [60.0, 210.0, 520.0, 222.0],
+                11.0,
+            ),
+            sized_line("B.SECOND PART", [60.0, 260.0, 300.0, 272.0], 10.0),
+            sized_line(
+                "The parties must perform the agreed services.",
+                [60.0, 300.0, 520.0, 312.0],
+                11.0,
+            ),
+        ];
+        if !ocr {
+            lines[2].text = "A. FIRST PART OF".into();
+            lines[5].text = "B. SECOND PART".into();
+        }
+        mark_source_body(&mut lines);
+        for index in [0, 2, 3, 5] {
+            lines[index].region_type = "paragraph_title".into();
+            lines[index].region_id = format!("heading-{}", if index == 3 { 2 } else { index });
+            lines[index].spans[0].flags = 16;
+        }
+        if ocr {
+            for line in &mut lines {
+                line.source = "ocr".into();
+                line.spans.clear();
+            }
+        }
+        let mut pages = vec![test_page(lines)];
+        let output = derive(
+            &mut pages,
+            &[None],
+            StructureIdentity {
+                document_id: "witness-test".into(),
+                source_sha256: String::new(),
+            },
+        )
+        .unwrap();
+        let headings = output
+            .structure_graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Heading)
+            .collect::<Vec<_>>();
+        assert_eq!(headings.len(), 3, "ocr={ocr}: {headings:?}");
+        assert_eq!(
+            headings[1].label.as_deref(),
+            Some(if ocr {
+                "A.FIRST PART OF\nTHE FRAMEWORK"
+            } else {
+                "A. FIRST PART OF\nTHE FRAMEWORK"
+            })
+        );
+        assert_eq!(headings[1].parent_id.as_ref(), Some(&headings[0].id));
+        assert_eq!(headings[2].parent_id.as_ref(), Some(&headings[0].id));
+    }
+}
+
+#[test]
 fn bare_dotted_pdf_markers_reach_the_existing_heading_ladder() {
     for split in [false, true] {
         let mut lines = Vec::new();
