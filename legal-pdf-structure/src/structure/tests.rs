@@ -25,6 +25,9 @@ fn source_heading_witnesses_reach_the_ladder_and_join_wrapped_titles() {
                 11.0,
             ),
         ];
+        for (index, line) in lines.iter_mut().enumerate() {
+            line.block_index = index + 1;
+        }
         if !ocr {
             lines[2].text = "A. FIRST PART OF".into();
             lines[5].text = "B. SECOND PART".into();
