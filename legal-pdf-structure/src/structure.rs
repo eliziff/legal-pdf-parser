@@ -2230,6 +2230,18 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
+            } else if line.source == "ocr" && size == 0.0 && evidence.source_regions.is_some() {
+                // OCR has no font metrics. Retain validated source roles before
+                // applying the shared heading grammar and prose demotion below.
+                line.region_type = match line.region_type.as_str() {
+                    "paragraph_title" | "heading" => "heading",
+                    "footnote" => "footnote",
+                    _ => "body",
+                }
+                .to_owned();
+                if line.region_type == "footnote" {
+                    line.note_region_mode = "footnote".to_owned();
+                }
             } else if line.text.chars().count() <= 180
                 && size
                     >= (if article_body_size > 0.0 {

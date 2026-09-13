@@ -2,6 +2,57 @@ use super::*;
 use legal_pdf_core::model::Word;
 
 #[test]
+fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() {
+    let rows = [
+        ("Definitions", "paragraph_title", 100.0),
+        (
+            "The parties agree to perform their obligations.",
+            "text",
+            140.0,
+        ),
+        ("Payment", "paragraph_title", 200.0),
+        (
+            "This is ordinary prose with enough words to remain ordinary prose.",
+            "paragraph_title",
+            240.0,
+        ),
+        ("Journal furniture", "header", 25.0),
+        (
+            "1 A footnote citation with explanatory prose.",
+            "footnote",
+            740.0,
+        ),
+    ];
+    let lines = rows
+        .iter()
+        .map(|(text, role, y)| {
+            let mut line = sized_line(text, [60.0, *y, 520.0, y + 12.0], 11.0);
+            line.source = "ocr".to_owned();
+            line.spans.clear();
+            line.region_type = (*role).to_owned();
+            line
+        })
+        .collect();
+    let mut pages = vec![test_page(lines)];
+    classify_pages(&mut pages, &[None]);
+    assert_eq!(
+        pages[0]
+            .lines
+            .iter()
+            .map(|line| (line.text.as_str(), line.region_type.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (rows[4].0, "header"),
+            (rows[0].0, "heading"),
+            (rows[1].0, "body"),
+            (rows[2].0, "heading"),
+            (rows[3].0, "body"),
+            (rows[5].0, "footnote"),
+        ]
+    );
+}
+
+#[test]
 fn pdf_text_index_preserves_exact_lines_and_scalar_offsets() {
     let pages: Vec<Page> = serde_json::from_value(json!([
         {
@@ -372,8 +423,9 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
     assert!(diagnostics
         .iter()
         .all(|item| item.code == "note_pair_unmaterialized"));
-    assert_eq!(diagnostics[346].candidate_ids, ["zero-label"]);
-    assert_eq!(diagnostics[347].candidate_ids, ["zero-reference"]);
+    // Unmaterialized pairs have no graph nodes in the current public contract.
+    assert!(diagnostics[346].node_ids.is_empty());
+    assert!(diagnostics[347].node_ids.is_empty());
 }
 
 fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {

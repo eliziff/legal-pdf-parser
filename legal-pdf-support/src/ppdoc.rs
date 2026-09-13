@@ -1,7 +1,6 @@
 use crate::ppdoc_openvino::OpenVinoSession;
-use crate::ppdoc_postprocess::{
-    best_region_index, postprocess_document, scale_detections, RegionDetection,
-};
+pub use crate::ppdoc_postprocess::PPDocDetection;
+use crate::ppdoc_postprocess::{annotate_regions, scale_detections, RegionDetection};
 use image::{imageops, ImageReader, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
 pub use legal_pdf_core::OrtBackend as PPDocBackend;
@@ -13,7 +12,7 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session, SessionInputValue},
     value::Tensor,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 #[cfg(feature = "ppdoc")]
 use std::ffi::{c_char, c_void, CStr};
@@ -55,15 +54,6 @@ impl Default for PPDocOptions {
             expected_identity: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PPDocDetection {
-    pub label_id: usize,
-    pub label: String,
-    pub score: f32,
-    pub bbox: [f32; 4],
-    pub order: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -751,54 +741,7 @@ impl PPDocLayout {
                 scale_detections(page.width, page.height, width, height, &detections);
         }
 
-        crate::profile::measure("ppdoc_postprocess", || {
-            postprocess_document(pages, &mut regions_by_page)
-        });
-        let mut pending = Vec::<(usize, usize, String, String)>::new();
-        let mut unmatched = Vec::new();
-        for (page_position, page) in pages.iter().enumerate() {
-            for (line_index, line) in page.lines.iter().enumerate() {
-                if line.exclude_from_body || line.text.trim().is_empty() {
-                    continue;
-                }
-                let Some(region_index) =
-                    best_region_index(line.bbox, &regions_by_page[page_position])
-                else {
-                    unmatched.push(line.id.clone());
-                    continue;
-                };
-                let region = &regions_by_page[page_position][region_index];
-                pending.push((
-                    page_position,
-                    line_index,
-                    region.label.clone(),
-                    format!("{}-ppdoc-r{:04}", page.id, region.raw_index),
-                ));
-            }
-        }
-
-        if !unmatched.is_empty() {
-            let mut diagnostic = Diagnostic::warning(
-                "PPDOC_LAYOUT_INCOMPLETE",
-                "PPdoc did not cover every text line; model regions were discarded.",
-                None,
-            );
-            diagnostic.line_ids = unmatched;
-            diagnostic
-                .details
-                .insert("detections".to_owned(), serde_json::json!(detection_count));
-            diagnostic
-                .details
-                .insert("matched_lines".to_owned(), serde_json::json!(pending.len()));
-            return Ok(vec![diagnostic]);
-        }
-
-        for (page_index, line_index, label, region_id) in pending {
-            let line = &mut pages[page_index].lines[line_index];
-            line.region_type = label;
-            line.region_id = region_id;
-        }
-        Ok(Vec::new())
+        annotate_regions(pages, regions_by_page, detection_count)
     }
 }
 

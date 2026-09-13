@@ -1,4 +1,13 @@
-use crate::ppdoc::PPDocDetection;
+use legal_pdf_core::{Diagnostic, Result};
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PPDocDetection {
+    pub label_id: usize,
+    pub label: String,
+    pub score: f32,
+    pub bbox: [f32; 4],
+    pub order: Option<usize>,
+}
+
 use legal_pdf_core::model::{Line, Page};
 use regex::Regex;
 use std::cmp::Ordering;
@@ -15,7 +24,7 @@ const BLOCK_QUOTE_MIN_LINES: usize = 2;
 const OVERLAP_THRESHOLD: f64 = 0.35;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RegionDetection {
+pub struct RegionDetection {
     pub(crate) label: String,
     pub(crate) score: f32,
     pub(crate) bbox: [f64; 4],
@@ -44,7 +53,7 @@ struct TextRow {
     is_inset: bool,
 }
 
-pub(crate) fn scale_detections(
+pub fn scale_detections(
     page_width: f64,
     page_height: f64,
     image_width: u32,
@@ -1375,4 +1384,64 @@ mod tests {
         assert_eq!(label(&all[0], 1), None);
         assert_eq!(label(&all[0], 2), Some("footnote"));
     }
+}
+
+/// Apply model regions atomically using the same rules on every runtime.
+pub fn annotate_regions(
+    pages: &mut [Page],
+    mut regions_by_page: Vec<Vec<RegionDetection>>,
+    detection_count: usize,
+) -> Result<Vec<Diagnostic>> {
+    if pages.len() != regions_by_page.len() {
+        return Err(legal_pdf_core::Error::Message(
+            "Layout page count mismatch".to_owned(),
+        ));
+    }
+    crate::profile::measure("ppdoc_postprocess", || {
+        postprocess_document(pages, &mut regions_by_page)
+    });
+    let mut pending = Vec::<(usize, usize, String, String)>::new();
+    let mut unmatched = Vec::new();
+    for (page_position, page) in pages.iter().enumerate() {
+        for (line_index, line) in page.lines.iter().enumerate() {
+            if line.exclude_from_body || line.text.trim().is_empty() {
+                continue;
+            }
+            let Some(region_index) = best_region_index(line.bbox, &regions_by_page[page_position])
+            else {
+                unmatched.push(line.id.clone());
+                continue;
+            };
+            let region = &regions_by_page[page_position][region_index];
+            pending.push((
+                page_position,
+                line_index,
+                region.label.clone(),
+                format!("{}-ppdoc-r{:04}", page.id, region.raw_index),
+            ));
+        }
+    }
+
+    if !unmatched.is_empty() {
+        let mut diagnostic = Diagnostic::warning(
+            "PPDOC_LAYOUT_INCOMPLETE",
+            "PPdoc did not cover every text line; model regions were discarded.",
+            None,
+        );
+        diagnostic.line_ids = unmatched;
+        diagnostic
+            .details
+            .insert("detections".to_owned(), serde_json::json!(detection_count));
+        diagnostic
+            .details
+            .insert("matched_lines".to_owned(), serde_json::json!(pending.len()));
+        return Ok(vec![diagnostic]);
+    }
+
+    for (page_index, line_index, label, region_id) in pending {
+        let line = &mut pages[page_index].lines[line_index];
+        line.region_type = label;
+        line.region_id = region_id;
+    }
+    Ok(Vec::new())
 }
