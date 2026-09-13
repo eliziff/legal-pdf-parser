@@ -427,9 +427,9 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
     assert!(diagnostics
         .iter()
         .all(|item| item.code == "note_pair_unmaterialized"));
-    // Unmaterialized pairs have no graph nodes in the current public contract.
-    assert!(diagnostics[346].node_ids.is_empty());
-    assert!(diagnostics[347].node_ids.is_empty());
+    assert!(diagnostics
+        .iter()
+        .all(|item| item.node_ids.is_empty() && item.ranges.is_empty()));
 }
 
 fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
@@ -767,6 +767,35 @@ fn textual_table_caption_does_not_force_geometry_order() {
     }
 
     assert!(!contents_grid(&lines, 600.0));
+}
+
+#[test]
+fn source_witness_table_retains_its_referenced_note() {
+    let source: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/nz-witness-table.json")).unwrap();
+    let lines = source["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| {
+            sized_line(
+                line[0].as_str().unwrap(),
+                serde_json::from_value(line[1].clone()).unwrap(),
+                line[2].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    let mut page = test_page(lines);
+    page.width = source["width"].as_f64().unwrap();
+    page.height = source["height"].as_f64().unwrap();
+    classify_pages(std::slice::from_mut(&mut page), &[None]);
+    let note = page
+        .lines
+        .iter()
+        .find(|line| line.text.starts_with("* witnesses"))
+        .unwrap();
+    assert_eq!(note.region_type, "footnote");
+    assert!(!note.suppress_footnote_label);
 }
 
 #[test]
@@ -2639,4 +2668,53 @@ fn crossref_shortform_uses_python_word_boundaries_at_join_controls() {
     let text = "\u{200c}Godin, supra note 41";
     let start = text.find("supra").unwrap();
     assert_eq!(crossref_shortform(text, start), "Godin");
+}
+
+#[test]
+fn accepted_heading_and_separate_marker_terminate_numbered_prose() {
+    let mut lines = vec![
+        sized_line(
+            "1. Ordinary narrative ends here.",
+            [60.0, 100.0, 500.0, 112.0],
+            11.0,
+        ),
+        sized_line("I.", [60.0, 145.0, 75.0, 157.0], 11.0),
+        sized_line("INTRODUCTION", [100.0, 145.0, 250.0, 157.0], 11.0),
+        sized_line(
+            "2. Further narrative starts here.",
+            [60.0, 180.0, 500.0, 192.0],
+            11.0,
+        ),
+        sized_line("II.", [60.0, 220.0, 80.0, 232.0], 11.0),
+        sized_line("BACKGROUND", [100.0, 220.0, 250.0, 232.0], 11.0),
+    ];
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+    let evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    for line in &mut pages[0].lines {
+        line.region_type = "body".into();
+    }
+    apply_text_fidelity_headings(&mut pages, 11.0, &evidence);
+    assert!(pages[0]
+        .lines
+        .iter()
+        .filter(|line| ["I.", "II.", "INTRODUCTION", "BACKGROUND"].contains(&line.text.as_str()))
+        .all(|line| line.region_type == "heading"));
+    let resolution = PdfResolutionInput::from_pages(&pages, &evidence);
+    let first = resolution
+        .runs
+        .iter()
+        .filter(|run| run.grammar == CandidateGrammar::Numeric)
+        .flat_map(|run| &run.markers)
+        .find(|marker| marker.grammar_value == "1")
+        .unwrap();
+    assert_eq!(
+        ScalarText::new(resolution.index.text())
+            .slice(first.range.start..first.range.end)
+            .unwrap(),
+        "1. Ordinary narrative ends here.\n"
+    );
 }
