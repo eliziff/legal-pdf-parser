@@ -141,7 +141,7 @@ fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() 
         ("Definitions", "paragraph_title", 100.0),
         (
             "The parties agree to perform their obligations.",
-            "text",
+            "unknown",
             140.0,
         ),
         ("Payment", "paragraph_title", 200.0),
@@ -2455,13 +2455,15 @@ fn smaller_quoted_text_does_not_make_normal_prose_a_heading() {
 }
 
 #[test]
-fn region_dependent_lanes_require_a_complete_source_contract() {
+fn region_dependent_lanes_only_admit_lines_with_source_roles() {
     let mut pages = vec![test_page(vec![
         sized_line("Known body", [60.0, 100.0, 300.0, 112.0], 11.0),
         sized_line("Unknown peer", [60.0, 120.0, 300.0, 132.0], 11.0),
     ])];
     pages[0].lines[0].region_type = "body".to_owned();
-    assert!(!source_regions_available(&pages));
+    let roles = source_region_contract(&pages).unwrap();
+    assert!(heading_source_eligible(&roles, &pages[0].lines[0]));
+    assert!(!heading_source_eligible(&roles, &pages[0].lines[1]));
 
     pages[0].lines[1].region_type = "text".to_owned();
     assert!(source_regions_available(&pages));
