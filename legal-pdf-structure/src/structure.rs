@@ -289,6 +289,11 @@ fn inline_enumerator_re() -> &'static Regex {
     })
 }
 
+fn bare_dotted_heading_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(\d{1,2}(?:\.\d{1,2}){1,3})(?:\s+(\S.*))?$").unwrap())
+}
+
 fn standalone_enumerator(text: &str) -> bool {
     standalone_enumerator_re().is_match(text)
 }
@@ -982,6 +987,23 @@ fn heading_candidates<'a>(
                 && matches!(line.region_type.as_str(), "body" | "heading")
                 && heading_source_eligible(regions, line)
         }) {
+            let bare = bare_dotted_heading_re().captures(line.text.trim());
+            if let Some(capture) = bare.as_ref().filter(|capture| capture.get(2).is_some()) {
+                let text = capture.get(2).unwrap().as_str().trim();
+                let interpretations = enumerator_interpretations(&capture[1], "");
+                if (heading_text_plausible(text) || bold_char_share(line) >= 0.60)
+                    && !interpretations.is_empty()
+                {
+                    candidates.push(HeadingCandidate {
+                        page_slot,
+                        line_slot,
+                        joined_line_slot: None,
+                        text,
+                        interpretations,
+                    });
+                }
+                continue;
+            }
             if let Some(capture) = inline.captures(line.text.trim()) {
                 let value = capture.get(1).unwrap().as_str();
                 let punct = capture.get(2).unwrap().as_str();
@@ -998,7 +1020,20 @@ fn heading_candidates<'a>(
                 }
                 continue;
             }
-            let Some(capture) = standalone.captures(line.text.trim()) else {
+            let punctuated = standalone.captures(line.text.trim());
+            let Some((value, punct)) = punctuated
+                .as_ref()
+                .map(|capture| {
+                    (
+                        capture.get(1).unwrap().as_str(),
+                        capture.get(2).unwrap().as_str(),
+                    )
+                })
+                .or_else(|| {
+                    bare.as_ref()
+                        .map(|capture| (capture.get(1).unwrap().as_str(), ""))
+                })
+            else {
                 continue;
             };
             let follower = ((line_slot + 1)..(line_slot + 3).min(page.lines.len())).find(|index| {
@@ -1012,10 +1047,11 @@ fn heading_candidates<'a>(
                 continue;
             };
             let text = page.lines[follower_slot].text.trim();
-            let value = capture.get(1).unwrap().as_str();
-            let punct = capture.get(2).unwrap().as_str();
             let interpretations = enumerator_interpretations(value, punct);
-            if heading_text_plausible(text) && !interpretations.is_empty() {
+            if (heading_text_plausible(text)
+                || (bare.is_some() && bold_char_share(&page.lines[follower_slot]) >= 0.60))
+                && !interpretations.is_empty()
+            {
                 candidates.push(HeadingCandidate {
                     page_slot,
                     line_slot,
@@ -1470,7 +1506,11 @@ fn apply_text_fidelity_headings(
                     page_slot: candidate.page_slot,
                     line_slot: candidate.line_slot,
                     joined_line_slot: candidate.joined_line_slot,
-                    text_plausible: heading_text_plausible(candidate.text),
+                    text_plausible: heading_text_plausible(candidate.text)
+                        || bold_char_share(
+                            &pages[candidate.page_slot].lines
+                                [candidate.joined_line_slot.unwrap_or(candidate.line_slot)],
+                        ) >= 0.60,
                     level: assignment.level,
                     action: assignment.action,
                     coherent_family: family.is_some_and(coherent_heading_family),

@@ -2,6 +2,67 @@ use super::*;
 use legal_pdf_core::model::Word;
 
 #[test]
+fn bare_dotted_pdf_markers_reach_the_existing_heading_ladder() {
+    for split in [false, true] {
+        let mut lines = Vec::new();
+        for (index, title) in [
+            "Number and types of Standing Offer Agreement",
+            "Duration and Extension",
+            "Future Adjustment",
+            "Replenishment",
+            "Evaluation of Consultants",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 100.0 + index as f64 * 100.0;
+            let marker = format!("2.{}", index + 1);
+            if split {
+                lines.push(sized_line(&marker, [40.0, y, 60.0, y + 12.0], 11.0));
+            }
+            lines.push(sized_line(
+                &if split {
+                    title.to_string()
+                } else {
+                    format!("{marker} {title}")
+                },
+                [70.0, y, 400.0, y + 12.0],
+                11.0,
+            ));
+            lines.last_mut().unwrap().spans[0].flags = 16;
+            lines.push(sized_line(
+                "The parties will perform their obligations under this agreement.",
+                [70.0, y + 30.0, 520.0, y + 42.0],
+                11.0,
+            ));
+        }
+        mark_source_body(&mut lines);
+        let mut pages = vec![test_page(lines)];
+        classify_pages(&mut pages, &[None]);
+        for title in [
+            "Number and types of Standing Offer Agreement",
+            "Duration and Extension",
+            "Future Adjustment",
+            "Replenishment",
+            "Evaluation of Consultants",
+        ] {
+            assert!(
+                pages[0]
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains(title) && line.region_type == "heading"),
+                "{title}, split={split}: {:?}",
+                pages[0]
+                    .lines
+                    .iter()
+                    .map(|l| (&l.text, &l.region_type))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
 fn ocr_source_roles_survive_absent_fonts_without_promoting_furniture_or_prose() {
     let rows = [
         ("Definitions", "paragraph_title", 100.0),
