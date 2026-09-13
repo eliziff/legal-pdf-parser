@@ -912,23 +912,23 @@ fn article_body_font_size(pages: &[Page]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Region-dependent Text-Fidelity lanes are fail-closed. A complete set of
-/// non-unknown line labels may come from PPDoc or any MLLM; consumers depend
-/// on the region contract, not the provider identity. The snapshot survives
-/// the engine's later ordering and normalized-label passes.
+/// Snapshot supplied roles without inventing roles for uncovered lines.
+/// Region-dependent consumers admit only lines present in this map. Source
+/// identity must remain unambiguous across ordering and normalized-label passes.
 fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
     let mut regions = HashMap::new();
+    let mut ids = HashSet::new();
     for line in pages
         .iter()
         .flat_map(|page| &page.lines)
         .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
     {
-        let region = line.region_type.trim().to_ascii_lowercase();
-        if line.id.is_empty()
-            || matches!(region.as_str(), "" | "unknown" | "unknown_region")
-            || regions.insert(line.id.clone(), region).is_some()
-        {
+        if line.id.is_empty() || !ids.insert(&line.id) {
             return None;
+        }
+        let region = line.region_type.trim().to_ascii_lowercase();
+        if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {
+            regions.insert(line.id.clone(), region);
         }
     }
     (!regions.is_empty()).then_some(regions)
@@ -2273,7 +2273,10 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
-            } else if evidence.source_regions.is_some()
+            } else if evidence
+                .source_regions
+                .as_ref()
+                .is_some_and(|regions| regions.contains_key(&line.id))
                 && (matches!(line.region_type.as_str(), "paragraph_title" | "heading")
                     || (line.source == "ocr" && size == 0.0))
             {
