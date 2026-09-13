@@ -1207,7 +1207,12 @@ pub(super) fn build_regions(pages: &mut [Page]) {
             if groups.last().is_some_and(|group| {
                 let prior = &page.lines[*group.last().expect("non-empty group")];
                 prior.region_type == page.lines[index].region_type
-                    && prior.block_index == page.lines[index].block_index
+                    && (prior.block_index == page.lines[index].block_index
+                        // A model heading region already groups its display lines.
+                        // Keep that witness when OCR supplies separate line blocks.
+                        || (prior.region_type == "heading"
+                            && !prior.region_id.is_empty()
+                            && prior.region_id == page.lines[index].region_id))
             }) {
                 groups.last_mut().expect("group exists").push(index);
             } else {

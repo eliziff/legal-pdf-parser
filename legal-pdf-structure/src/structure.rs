@@ -1247,22 +1247,10 @@ fn wrapped_heading_continuation(
     let internal_gap = continuation.bbox[1] - heading.bbox[3];
     let internal_step = continuation.bbox[1] - heading.bbox[1];
     let following_step = following.bbox[1] - continuation.bbox[1];
-    let same_style = if heading.source == "ocr" && continuation.source == "ocr" {
-        // OCR cannot supply font metrics. A shared source heading region is
-        // the existing visual witness; do not infer one from line height.
-        !heading.region_id.is_empty()
-            && heading.region_id == continuation.region_id
-            && matches!(continuation_source, Some("paragraph_title" | "heading"))
-            && source_regions
-                .get(&heading.id)
-                .is_some_and(|role| matches!(role.as_str(), "paragraph_title" | "heading"))
-    } else {
-        heading_size > 0.0
-            && continuation_size > 0.0
-            && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
-            && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
-    };
-    (same_style
+    (heading_size > 0.0
+        && continuation_size > 0.0
+        && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+        && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
         && (continuation_height - heading_height).abs() <= heading_height * 0.05
         && (-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
         && (-heading_height * 0.2..=(heading_height * 0.8).max(6.0)).contains(&internal_gap)
