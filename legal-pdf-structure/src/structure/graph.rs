@@ -8,7 +8,7 @@ use legal_structure::{
     ScalarText, StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
 };
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,7 +280,30 @@ pub(super) fn index_pages(pages: &[Page]) -> HashSet<usize> {
 impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
-        let runs = detect_structure_candidate_runs(index.text());
+        let mut runs = detect_structure_candidate_runs(index.text());
+        let heading_starts = pages
+            .iter()
+            .flat_map(|page| &page.lines)
+            .filter(|line| line.region_type == "heading")
+            .filter_map(|line| {
+                index
+                    .range_for_line_ids(&[line.id.clone()])
+                    .map(|range| range.start)
+            })
+            .collect::<BTreeSet<_>>();
+        for run in &mut runs {
+            if run.grammar != CandidateGrammar::Numeric {
+                continue;
+            }
+            for candidate in &mut run.markers {
+                if let Some(&end) = heading_starts
+                    .range(candidate.content_start..candidate.range.end)
+                    .next()
+                {
+                    candidate.range.end = end;
+                }
+            }
+        }
         let transcript_line_number_pages = transcript_line_number_pages(pages);
         let index_pages = index_pages(pages);
         let by_line = pages
@@ -624,6 +647,7 @@ pub(super) fn native_graph_parts(
     index: &PdfTextIndex,
     pages: &[Page],
     paragraphs: &[Paragraph],
+    heading_levels: &HashMap<String, usize>,
 ) -> Result<Vec<StructureNode>> {
     const ORIGIN: &str = "legalpdf.pdf-structure.v2";
     let mut nodes = Vec::new();
@@ -647,6 +671,7 @@ pub(super) fn native_graph_parts(
         node.line_ids = index.line_ids(range);
         nodes.push(node);
     }
+    let mut heading_stack: Vec<(usize, String)> = Vec::new();
     for paragraph in paragraphs {
         let range = index
             .range_for_line_ids(&paragraph.line_ids)
@@ -678,6 +703,23 @@ pub(super) fn native_graph_parts(
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
         node.grammar = heading.then(|| "accepted_heading".to_owned());
+        if heading {
+            if let Some(level) = paragraph
+                .line_ids
+                .iter()
+                .filter_map(|id| heading_levels.get(id))
+                .min()
+            {
+                while heading_stack
+                    .last()
+                    .is_some_and(|(prior, _)| prior >= level)
+                {
+                    heading_stack.pop();
+                }
+                node.parent_id = heading_stack.last().map(|(_, id)| id.clone());
+                heading_stack.push((*level, node.id.clone()));
+            }
+        }
         nodes.push(node);
     }
     Ok(nodes)

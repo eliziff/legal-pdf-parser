@@ -1,0 +1,102 @@
+{
+  "description": "Frozen regression products, not independent accuracy gold. Source-reviewed semantic assertions are checked separately; changes require source review, not automatic regeneration.",
+  "documents": [
+    {
+      "path": "benchmarks/legal-generalization-corpus/gold/maud-v1/MAUD_v1_README.pdf",
+      "source_sha256": "104356b913a7e0a955eaca62f991c28c5d801c67a80e3e4f37629420e9aad778",
+      "product_sha256": "dfff66d759bf63523f8b92163be0d1820a14029da0231d311f0454c4b6ed39a4"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2014-scc-bhasin-v-hrynew.pdf",
+      "source_sha256": "3eed42bcc7dad404dd18201a7281d9555e868cc8ee07bbd6d02ce89467d531ca",
+      "product_sha256": "5fb499be704a77199e0b271b8aeec1de4495749367df3f3314e0fc25a2b98352"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2021-scc-wastech-services.pdf",
+      "source_sha256": "fe6909b730a055d6dcbb70ae33b85640d6951680c471a6a670f1dc22610b34ac",
+      "product_sha256": "d72b79e4622fdbe22f92baa840e60bde037ae1f3791f7012600198c42f96fd48"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2020-sec-honig.pdf",
+      "source_sha256": "714fe3b6f64f030be0a43dd162ccec66611576dc5f086ba69006b9f87b64e469",
+      "product_sha256": "fbddd546c64049b1222a97e18dc098a97329d6dfb7495d3ba50fbf54ca1be032"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2023-sec-comp25666.pdf",
+      "source_sha256": "8c4578992501e4d3739e07e81b81e52b88d93e429afe6e1cefedec0585615027",
+      "product_sha256": "0c8930e9d7e2ba83c080ac6095a71027e6ade60de81d48e2fe223add4ee14578"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-ilnd-05-cv-03198.pdf",
+      "source_sha256": "fa3081cf2f54431cfe969c9e71be3b262847f9978285edc0c243dcba7a4d9564",
+      "product_sha256": "215b6dddeb54312775b744f9fd85d1c30257b92921038e0721a4c993784e34a5"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-10-cv-04728.pdf",
+      "source_sha256": "da417a2aede8d12adc5e77cfe1cbc49797f2c9672cfa431d7c1436fba2734c29",
+      "product_sha256": "1a70c2fafac8730fa19a4a24cb6028dd860b88d42c2f5370adb05cb71a5e716c"
+    },
+    {
+      "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-16-cv-01947-westport.pdf",
+      "source_sha256": "44d79a58446882328a18dcca31cb1bb29d96487c6624a27e9de65297767da972",
+      "product_sha256": "9197c4b23c3ffbf33ca2fa197d909cc619072702d4d594b606eed032b976e985"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/petition/crtc-legislative-review/ca-bce-inc-an-international-comparison-of-end-to-end-facilities-based-competition-in-telecomm-40941dbae646.pdf",
+      "source_sha256": "40941dbae64682c658781dd5ebb49e1dd4ea7c46306e0aa57f2abfcd52a52c85",
+      "product_sha256": "d8a7237abe1e24828a26a0301fdf71d3228b423f7dffb0303a7a34f0d6a5b543"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/nz/digitalborn/opening_submission/waitangi-tribunal/nz-t-bennion-e-whiley-kudrat-wai-2139-opening-submissions-for-wai-2139-the-mua-poko-lands-res-0950c3b8cd3b.pdf",
+      "source_sha256": "0950c3b8cd3be84ee72f8d4b5002be0075bd52fafed3e65d454c87fe339c8489",
+      "product_sha256": "e130cd92cad1d689ded3c9877fbc558b23c9c05e7d392b7b1a8422d2971086f6"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/presentation/foreign-interference-commission/ca-examples-of-media-diaspora-and-non-governmental-organization-concern-about-foreign-interfe-af11dde972f5.pdf",
+      "source_sha256": "af11dde972f508fde9ebb63bbc855202500589f25801d8b4b06977ec757bd858",
+      "product_sha256": "eb99abc9058dce95c44f05ad93d3f11956b3c29095fc971551d5a9c4c4ad1351"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/legal_submission/cnsc-hearing-documents/ca-cmd-25-m4-8-submission-from-the-manitoba-m-tis-federation-pdf-23-pages-760-kb-0ed0e1e6b3f2.pdf",
+      "source_sha256": "0ed0e1e6b3f28fd6c8c3a57647925b873549e528eb70e9d072277bb3f4bd147a",
+      "product_sha256": "d6fe1eabf9e328e0a4aba1bf7adbbae5c9929d86db275bcacbfd630cc59d6b3e"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/risk_assessment/cullen-commission/ca-us-national-money-laundering-risk-assessment-2015-e5293c3f7d29.pdf",
+      "source_sha256": "e5293c3f7d294ebe88759effe749f26c52eaa770177a5747efd4201239c816a0",
+      "product_sha256": "7d70cbdee0b52e87f465480f8ee13df7fe52a71c8b6f6b0867c9eb8224a2f538"
+    }
+  ],
+  "additional_sources": [
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/petition/crtc-legislative-review/ca-bce-inc-an-international-comparison-of-end-to-end-facilities-based-competition-in-telecomm-40941dbae646.pdf",
+      "sha256": "40941dbae64682c658781dd5ebb49e1dd4ea7c46306e0aa57f2abfcd52a52c85",
+      "pages": 113,
+      "url": "https://ised-isde.canada.ca/site/broadcasting-telecommunications-legislative-review/sites/default/files/attachments/958_BCEInc_Attachment5-B-2007CRAIReport.pdf"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/nz/digitalborn/opening_submission/waitangi-tribunal/nz-t-bennion-e-whiley-kudrat-wai-2139-opening-submissions-for-wai-2139-the-mua-poko-lands-res-0950c3b8cd3b.pdf",
+      "sha256": "0950c3b8cd3be84ee72f8d4b5002be0075bd52fafed3e65d454c87fe339c8489",
+      "pages": 36,
+      "url": "https://forms.justice.govt.nz/search/Documents/WT/wt_DOC_253805216/Wai%202200%2C%203.3.131.pdf"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/presentation/foreign-interference-commission/ca-examples-of-media-diaspora-and-non-governmental-organization-concern-about-foreign-interfe-af11dde972f5.pdf",
+      "sha256": "af11dde972f508fde9ebb63bbc855202500589f25801d8b4b06977ec757bd858",
+      "pages": 14,
+      "url": "https://foreigninterferencecommission.ca/fileadmin/foreign_interference_commission/Documents/Exhibits_and_Presentations/Overview_Reports/COM0000332.pdf"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/legal_submission/cnsc-hearing-documents/ca-cmd-25-m4-8-submission-from-the-manitoba-m-tis-federation-pdf-23-pages-760-kb-0ed0e1e6b3f2.pdf",
+      "sha256": "0ed0e1e6b3f28fd6c8c3a57647925b873549e528eb70e9d072277bb3f4bd147a",
+      "pages": 23,
+      "url": "https://api.cnsc-ccsn.gc.ca/dms/digital-medias/CMD25-M4-8.pdf/object"
+    },
+    {
+      "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/risk_assessment/cullen-commission/ca-us-national-money-laundering-risk-assessment-2015-e5293c3f7d29.pdf",
+      "sha256": "e5293c3f7d294ebe88759effe749f26c52eaa770177a5747efd4201239c816a0",
+      "pages": 100,
+      "url": "https://ag-pssg-sharedservices-ex.objectstore.gov.bc.ca/ag-pssg-cc-exh-prod-bkt-ex/34%20-%20US%20NRA%202015.pdf"
+    }
+  ]
+}

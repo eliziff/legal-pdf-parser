@@ -14,6 +14,8 @@ on:
       - "AGENTS.md"
       - "docs/pdf-inspector-agent-guide.md"
       - "tools/*merge-pdf-inspector.sh"
+      - "tools/check-pdf-source-gold.py"
+      - "tools/pdf-inspector-regression.json"
   workflow_call:
     inputs:
       parser-ref:
@@ -55,28 +57,9 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.candidate-sha == ''
-        with:
-          path: base
-          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.candidate-sha == ''
         with:
           path: head
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.candidate-sha != ''
-        with:
-          path: base
-          ref: ${{ inputs.parser-ref }}
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.candidate-sha != ''
-        with:
-          path: head
-          ref: ${{ inputs.parser-ref }}
+          ref: ${{ inputs.parser-ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify fork guidance survives upstream merges
         shell: bash
@@ -108,35 +91,28 @@ jobs:
           )
           cargo update --manifest-path $manifest -p pdf-inspector
           if ($LASTEXITCODE -ne 0) { throw "Candidate lockfile update failed" }
-      - name: Build and compare raw-PDF products
+      - name: Check candidate against frozen products and source gold
         shell: pwsh
         run: |
           $env:LEGALPDF_CORPUS_ROOT = Join-Path $env:GITHUB_WORKSPACE 'corpus'
           $target = Join-Path $env:RUNNER_TEMP legalpdf-pdf-inspector-target
-          $baseBinary = Join-Path $env:RUNNER_TEMP legalpdf-base.exe
-          $headBinary = Join-Path $env:RUNNER_TEMP legalpdf-head.exe
-          $baseSnapshot = Join-Path $env:RUNNER_TEMP legalpdf-base-products.jsonl
           $headSnapshot = Join-Path $env:RUNNER_TEMP legalpdf-head-products.jsonl
-          $baseManifest = Join-Path $env:GITHUB_WORKSPACE 'base/Cargo.toml'
           $headManifest = Join-Path $env:GITHUB_WORKSPACE 'head/Cargo.toml'
-          $gateManifest = Join-Path $env:GITHUB_WORKSPACE 'head/experiments/cache-contract-fidelity/manifest.json'
+          $manifest = Get-Content head/experiments/cache-contract-fidelity/manifest.json -Raw | ConvertFrom-Json
+          $regression = Get-Content head/tools/pdf-inspector-regression.json -Raw | ConvertFrom-Json
+          foreach ($source in $regression.additional_sources) {
+            $destination = Join-Path $env:LEGALPDF_CORPUS_ROOT $source.path
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Invoke-WebRequest -Uri $source.url -OutFile $destination -UserAgent 'Mozilla/5.0' -TimeoutSec 60
+            $manifest.documents += $source | Select-Object path, sha256, pages
+          }
+          $gateManifest = Join-Path $env:RUNNER_TEMP legalpdf-source-manifest.json
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $gateManifest
           $env:CARGO_TARGET_DIR = $target
 
-          cargo build --manifest-path $baseManifest --locked --no-default-features --features pdf --bin legalpdf
-          if ($LASTEXITCODE -ne 0) { throw "Base legalpdf build failed" }
-          Copy-Item (Join-Path $target debug/legalpdf.exe) $baseBinary
           cargo build --manifest-path $headManifest --locked --no-default-features --features pdf --bin legalpdf
-          if ($LASTEXITCODE -ne 0) { throw "Head legalpdf build failed" }
-          Copy-Item (Join-Path $target debug/legalpdf.exe) $headBinary
-
-          & $baseBinary _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $baseSnapshot
-          if ($LASTEXITCODE -ne 0) { throw "Base PDF Inspector product gate failed" }
-          & $headBinary _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $headSnapshot
-          if ($LASTEXITCODE -ne 0) { throw "Head PDF Inspector product gate failed" }
-
-          $baseHash = (Get-FileHash -Algorithm SHA256 $baseSnapshot).Hash.ToLowerInvariant()
-          $headHash = (Get-FileHash -Algorithm SHA256 $headSnapshot).Hash.ToLowerInvariant()
-          if ($baseHash -ne $headHash) {
-            throw "PDF Inspector product parity failed: $baseHash != $headHash"
-          }
-          "PDF Inspector product parity: $headHash"
+          if ($LASTEXITCODE -ne 0) { throw "Candidate legalpdf build failed" }
+          & (Join-Path $target debug/legalpdf.exe) _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $headSnapshot
+          if ($LASTEXITCODE -ne 0) { throw "Candidate PDF Inspector product gate failed" }
+          python head/tools/check-pdf-source-gold.py $headSnapshot head/tools/pdf-inspector-regression.json
+          if ($LASTEXITCODE -ne 0) { throw "PDF source gold or frozen regression check failed" }

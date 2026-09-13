@@ -158,6 +158,7 @@ fn transform_fidelity_item(item: &mut TextItem, geometry: PageGeometry) -> bool 
     let Some(fidelity) = item.fidelity.as_mut() else {
         return false;
     };
+    fidelity.flags |= if item.is_bold { 16 } else { 0 } | if item.is_italic { 2 } else { 0 };
     let baseline = transform_point(
         geometry,
         f64::from(fidelity.baseline[0]),
@@ -769,7 +770,7 @@ fn line_spans(
                 continue;
             }
         }
-        let superscript = is_superscript(item, body_size, baseline, source_span.start > 0);
+        let superscript = is_superscript(item, body_size, baseline, assembled.spans.len() > 1);
         let span = Span {
             id: format!("{id}-s{:03}", spans.len() + 1),
             text: assembled.text[start_byte..end_byte].to_owned(),
@@ -960,55 +961,78 @@ fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLine]) -> Opt
             let first = transform_point(geometry, f64::from(rule.x1), f64::from(rule.y1));
             let second = transform_point(geometry, f64::from(rule.x2), f64::from(rule.y2));
             (
-                (second.0 - first.0).abs(),
+                first.0.min(second.0),
+                first.0.max(second.0),
                 geometry.height - (first.1 + second.1) / 2.0,
             )
         })
-        .filter(|(length, y)| {
-            *length >= geometry.width * 0.20
+        .filter(|(left, right, y)| {
+            right - left >= geometry.width * 0.20
                 && geometry.height * 0.30 <= *y
                 && *y <= geometry.height * 0.98
+                // Underlines and strikeouts cross a text line's glyph band;
+                // they do not separate the body from a footnote region.
+                && !lines.iter().any(|line| {
+                    line.bbox[1] <= *y && *y <= line.bbox[3]
+                        && line.bbox[0] < *right && *left < line.bbox[2]
+                })
         })
+        .map(|(left, right, y)| (right - left, y))
         .collect();
     if candidates.is_empty() {
         return None;
     }
-    let body_size = median(
-        lines
+    // Prefer prose-length lines: a dense table must not redefine the body font.
+    let mut sizes: Vec<_> = lines
+        .iter()
+        .filter(|line| line.bbox[1] < geometry.height * 0.80 && line.text.chars().count() >= 40)
+        .map(model_line_font_size)
+        .filter(|size| *size > 0.0)
+        .collect();
+    if sizes.is_empty() {
+        sizes = lines
             .iter()
-            .filter(|line| line.bbox[1] < geometry.height * 0.70)
+            .filter(|line| line.bbox[1] < geometry.height * 0.80)
             .map(model_line_font_size)
             .filter(|size| *size > 0.0)
-            .collect(),
-    );
-    let first_label = lines
+            .collect();
+    }
+    let body_size = median(sizes);
+    let labels: Vec<_> = lines
         .iter()
         .filter(|line| {
-            line.bbox[1] >= geometry.height * 0.48
-                && begins_with_note_label(&line.text)
+            (begins_with_note_label(&line.text)
+                || line
+                    .spans
+                    .first()
+                    .is_some_and(|span| span.superscript && begins_with_note_label(&span.text)))
                 && body_size > 0.0
                 && (model_line_font_size(line) <= body_size * 0.90
                     || line
                         .spans
                         .first()
                         .is_some_and(|span| span.size <= body_size * 0.78))
+                // A detached label needs a body to its right; a footer page
+                // number alone cannot establish a note region.
+                && (line.text.chars().any(char::is_alphabetic)
+                    || lines.iter().any(|body| {
+                        body.bbox[0] >= line.bbox[2]
+                            && body.bbox[1] < line.bbox[3]
+                            && line.bbox[1] < body.bbox[3]
+                            && body.text.chars().any(char::is_alphabetic)
+                    }))
         })
         .map(|line| line.bbox[1])
-        .min_by(f64::total_cmp);
-    if let Some(first_label) = first_label {
-        if let Some((_, y)) = candidates
-            .iter()
-            .filter(|(_, y)| *y <= first_label + (geometry.height * 0.004).max(1.0))
-            .max_by(|left, right| left.1.total_cmp(&right.1))
-        {
-            return Some(*y);
-        }
-    }
+        .collect();
     candidates
-        .into_iter()
-        .filter(|(_, y)| *y <= geometry.height * 0.92)
-        .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)))
-        .map(|(_, y)| y)
+        .iter()
+        .filter(|(_, y)| {
+            labels.iter().any(|label| {
+                *y <= *label + (geometry.height * 0.004).max(1.0) && *label - *y <= body_size * 3.0
+            })
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(_, y)| *y)
 }
 
 fn make_line(
@@ -1060,7 +1084,7 @@ fn make_line(
         suppress_footnote_label: false,
         note_region_mode: String::new(),
         region_id: String::new(),
-        region_type: "unknown".to_owned(),
+        region_type: "text".to_owned(),
         source: "native".to_owned(),
     })
 }
@@ -1455,6 +1479,10 @@ mod tests {
             is_underline: false,
             is_strikeout: false,
             fidelity: None,
+            legacy_symbol_rewrite: false,
+            rotation: 0.0,
+            advance_known: true,
+            baseline_shift: 0.0,
             item_type: ItemType::Text,
             mcid: None,
         }
@@ -1658,8 +1686,105 @@ mod tests {
         let visible = text_item("■", 10.0, 80.0, 10.0, 0.0);
         let empty = text_item("", 10.0, 80.0, 0.0, 0.0);
 
-        assert!(has_extraction_evidence(&visible));
-        assert!(!has_extraction_evidence(&empty));
+        assert_eq!(
+            make_line(text_line(visible), 0, 1, 1, 100.0).unwrap().text,
+            "\u{25a0}"
+        );
+        assert!(make_line(text_line(empty), 0, 1, 1, 100.0).is_none());
+    }
+
+    #[test]
+    fn footnote_separator_requires_nearby_note_text() {
+        let geometry = PageGeometry {
+            x0: 0.0,
+            y0: 0.0,
+            raw_width: 600.0,
+            raw_height: 800.0,
+            rotation: 0,
+            width: 600.0,
+            height: 800.0,
+        };
+        let line = |text, y, size| {
+            make_line(
+                text_line(text_item(text, 60.0, y, 300.0, size)),
+                0,
+                1,
+                1,
+                800.0,
+            )
+            .unwrap()
+        };
+        let mut lines = vec![
+            line("COMPLAINT", 500.0, 12.0),
+            line("1. The plaintiff alleges the following facts.", 450.0, 12.0),
+            line("Ordinary body text continues here.", 420.0, 12.0),
+        ];
+        let caption_rule = PdfLine {
+            x1: 60.0,
+            x2: 360.0,
+            y1: 480.0,
+            y2: 480.0,
+            page: 1,
+        };
+        assert_eq!(separator_y(geometry, &lines, &[caption_rule.clone()]), None);
+        lines.push(line("1 A genuine smaller footnote.", 180.0, 9.0));
+        assert_eq!(separator_y(geometry, &lines, &[caption_rule]), None);
+        let note_rule = PdfLine {
+            x1: 60.0,
+            x2: 210.0,
+            y1: 195.0,
+            y2: 195.0,
+            page: 1,
+        };
+        assert_eq!(
+            separator_y(geometry, &lines, &[note_rule.clone()]),
+            Some(605.0)
+        );
+        // Table cells are smaller than both the prose and the genuine notes.
+        for row in 0..8u8 {
+            lines.push(line("Table cell", 700.0 - f32::from(row) * 12.0, 8.0));
+        }
+        lines.push(line("57", 35.0, 8.0));
+        let footer_rule = PdfLine {
+            y1: 48.0,
+            y2: 48.0,
+            ..note_rule.clone()
+        };
+        assert_eq!(
+            separator_y(geometry, &lines, &[note_rule, footer_rule]),
+            Some(605.0)
+        );
+        // Long footnotes may begin above the page midpoint.
+        let high_rule = PdfLine {
+            y1: 440.0,
+            y2: 440.0,
+            x1: 60.0,
+            x2: 210.0,
+            page: 1,
+        };
+        lines.push(line(
+            "7 A note region beginning higher on the page.",
+            425.0,
+            9.0,
+        ));
+        assert_eq!(
+            separator_y(geometry, &lines, &[high_rule.clone()]),
+            Some(360.0)
+        );
+        // A painted superscript can touch the first word without a space.
+        let text_line = group_source_order_lines(vec![
+            text_item("4", 60.0, 427.0, 3.0, 6.0),
+            text_item(
+                "This includes staff of the federal regulators.",
+                63.0,
+                425.0,
+                240.0,
+                9.0,
+            ),
+        ])
+        .remove(0);
+        *lines.last_mut().unwrap() = make_line(text_line, 0, 1, 1, geometry.height).unwrap();
+        assert_eq!(separator_y(geometry, &lines, &[high_rule]), Some(360.0));
     }
 
     #[test]
