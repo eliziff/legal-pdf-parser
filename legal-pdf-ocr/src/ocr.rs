@@ -639,15 +639,7 @@ pub(crate) fn raster_separator_y(
                 / 256) as u8
         })
         .collect::<Vec<_>>();
-    let record = crate::separator::scan_gray_page(&gray, width, height);
-    if !matches!(record.separator_status, Some("found" | "found_two_column")) {
-        return None;
-    }
-    record.separators.and_then(|separators| {
-        separators
-            .first()
-            .map(|rule| rule.y_center_ratio * page_height)
-    })
+    crate::raster_separator_y_from_gray(&gray, width, height, page_height)
 }
 
 #[cfg(test)]
