@@ -333,6 +333,247 @@ pub fn is_bold_font(font_name: &str) -> bool {
         || lower.contains("-medi") && !lower.contains("mediumital")
 }
 
+/// Weight class named by a font's style tokens, on the 100..=900 scale
+/// shared by CSS `font-weight` and the OS/2 `usWeightClass` field:
+/// Thin 100, ExtraLight/UltraLight 200, Light 300, Regular/Book/Roman 400,
+/// Medium 500, SemiBold/DemiBold 600, Bold 700, ExtraBold/UltraBold 800,
+/// Black/Heavy/Ultra 900. `None` when the name carries no weight word.
+///
+/// The name is split at the separators producers use (`-`, `_`, `,`,
+/// space) and at lowercase→uppercase boundaries, and each piece is matched
+/// whole; a qualifier reaches the word after it across either kind of
+/// seam ("ExtraLight", "Extra-Light", "Extra Light" are all 200). The
+/// abbreviations of foundry style suffixes read ("-Md",
+/// "-Lt", "-Bd", "-Sb", "-Dm", "-Hv", "-Blk", "-XBd", "-Ult", "-UltLt",
+/// "-W1".."-W9") while "Bookman" is not Book. Abbreviations count only
+/// after the family name (a leading "TH" is a Thai family, not Thin) and
+/// only in the mixed case foundries write them in: an all-caps "LT" or
+/// "MT" is the Linotype or Monotype acronym, not Light. Inside the family
+/// name — the first separator-delimited token — a weight word counts only
+/// when it ends the family or is followed by nothing but style words and
+/// foundry marks ("ArialBlack", "TimesNewRomanPSMT", "HelveticaNeueLightItalic"),
+/// never when it starts it or is followed by another word ("BlackChancery",
+/// "BookAntiqua", "OldBlackLetter"). A piece written in one case ("BOLDMT")
+/// is searched for the full words instead. The last weight word wins, since
+/// style suffixes follow the family ("Bookman-Demi").
+pub fn font_weight_from_name(font_name: &str) -> Option<u16> {
+    // Subset tags ("ABCDEF+Face-Md") carry no style.
+    let name = font_name
+        .split_once('+')
+        .map_or(font_name, |(_, rest)| rest);
+    // The name's tokens and their pieces, walked as one sequence so a
+    // qualifier reaches its word across a separator ("Foo-Extra-Light").
+    let tokens: Vec<Vec<&str>> = name
+        .split(['-', '_', ',', ' ', '.'])
+        .filter(|token| !token.is_empty())
+        .map(camel_pieces)
+        .collect();
+    let flat: Vec<(usize, usize)> = tokens
+        .iter()
+        .enumerate()
+        .flat_map(|(t, pieces)| (0..pieces.len()).map(move |i| (t, i)))
+        .collect();
+    let lower = |&(t, i): &(usize, usize)| tokens[t][i].to_ascii_lowercase();
+    let mut weight = None;
+    let mut k = 0;
+    while k < flat.len() {
+        let (t, i) = flat[k];
+        let piece = lower(&flat[k]);
+        let next = flat.get(k + 1).map(lower).unwrap_or_default();
+        // "Extra"/"Ultra"/"X" and "Semi"/"Demi" qualify the word after
+        // them; on their own only "Ultra" and "Demi" name a weight.
+        let extra = matches!(piece.as_str(), "extra" | "ultra" | "ult" | "x");
+        let semi = matches!(piece.as_str(), "semi" | "demi" | "sm" | "dm");
+        let qualified = match next.as_str() {
+            "light" | "lt" if extra => Some(200),
+            "bold" | "bd" if extra => Some(800),
+            "black" | "blk" if extra => Some(900),
+            "bold" | "bd" if semi => Some(600),
+            _ => None,
+        };
+        let width = if qualified.is_some() { 2 } else { 1 };
+        let whole = qualified.or_else(|| weight_word(&piece)).or_else(|| {
+            (t > 0 || i > 0)
+                .then(|| weight_abbreviation(tokens[t][i]))
+                .flatten()
+        });
+        let found = if whole.is_some() {
+            // A weight word inside the family name is a style only at its
+            // end; a family that starts with one, or goes on with another
+            // word after it, merely contains the word.
+            let (last_t, last_i) = flat[k + width - 1];
+            let rest = &tokens[last_t][last_i + 1..];
+            let in_family = t == 0 && (i == 0 || !rest.iter().all(|rest| is_style_or_mark(rest)));
+            (!in_family).then_some(whole).flatten()
+        } else {
+            // A piece written in one case has no seams to split at: look
+            // for the words inside it, at its end when it is the family.
+            let flat_case = tokens[t][i].chars().all(|c| !c.is_lowercase())
+                || tokens[t][i].chars().all(|c| !c.is_uppercase());
+            flat_case
+                .then(|| weight_word_substring(&piece, t == 0))
+                .flatten()
+        };
+        if found.is_some() {
+            weight = found;
+        }
+        k += width;
+    }
+    weight
+}
+
+/// The pieces of one name token, split where a lowercase letter meets an
+/// uppercase one ("BoldMT" → "Bold", "MT"; "UltLt" → "Ult", "Lt").
+fn camel_pieces(token: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut previous_lower = false;
+    for (index, c) in token.char_indices() {
+        if c.is_uppercase() && previous_lower && index > start {
+            pieces.push(&token[start..index]);
+            start = index;
+        }
+        previous_lower = c.is_lowercase();
+    }
+    if start < token.len() {
+        pieces.push(&token[start..]);
+    }
+    pieces
+}
+
+/// Whether a piece following a weight word inside a family name is a style
+/// word or a foundry mark rather than another word of the family: slant and
+/// width words, and all-caps acronyms such as "MT", "PS", "PSMT" or "LT".
+fn is_style_or_mark(piece: &str) -> bool {
+    if piece
+        .chars()
+        .all(|c| c.is_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    matches!(
+        piece.to_ascii_lowercase().as_str(),
+        "italic"
+            | "oblique"
+            | "it"
+            | "ital"
+            | "obl"
+            | "condensed"
+            | "cond"
+            | "cn"
+            | "cd"
+            | "narrow"
+            | "compressed"
+            | "extended"
+            | "ext"
+            | "expanded"
+            | "std"
+            | "pro"
+    )
+}
+
+/// Weight of one whole style word, lowercased.
+fn weight_word(piece: &str) -> Option<u16> {
+    Some(match piece {
+        "thin" | "hairline" => 100,
+        "extralight" | "ultralight" => 200,
+        "light" => 300,
+        "regular" | "book" | "roman" | "normal" => 400,
+        "medium" => 500,
+        "semibold" | "demibold" | "demi" => 600,
+        "bold" => 700,
+        "extrabold" | "ultrabold" => 800,
+        "black" | "heavy" | "ultra" | "extrablack" => 900,
+        _ => return None,
+    })
+}
+
+/// Weight of one whole style abbreviation, as written: the short codes of
+/// foundry style suffixes and the "W1".."W9" weight digit of Japanese
+/// families, a hundredth of the weight class (Hiragino's W3 is 300, its W6
+/// 600). The codes are written in mixed case ("Md", "Lt", "XBd"); an
+/// all-caps piece is a family or foundry acronym ("LT" for Linotype, "MT"
+/// for Monotype, "ITC") and is not read.
+fn weight_abbreviation(piece: &str) -> Option<u16> {
+    if let Some(digit) = piece.strip_prefix(['W', 'w']) {
+        if let Some(n) = digit.parse::<u16>().ok().filter(|n| (1..=9).contains(n)) {
+            return Some(n * 100);
+        }
+    }
+    if !piece.chars().any(char::is_lowercase) || !piece.chars().any(char::is_uppercase) {
+        return None;
+    }
+    Some(match piece.to_ascii_lowercase().as_str() {
+        "th" => 100,
+        "ultlt" | "xlt" => 200,
+        "lt" => 300,
+        "rg" | "reg" | "bk" => 400,
+        "md" | "med" | "medi" => 500,
+        "sb" | "sbd" | "smbd" | "dm" | "dmbd" => 600,
+        "bd" => 700,
+        "xbd" => 800,
+        "ult" | "blk" | "hv" | "xblk" => 900,
+        _ => return None,
+    })
+}
+
+/// Full weight words inside one lowercased piece written in a single case
+/// ("boldmt", "boldoblique"), where the case split above finds no seam.
+/// Compound words are tried first so "extrabold" is not read as bold; the
+/// last word in the piece wins. In the family name (`in_family`) only a
+/// word ending the piece counts, foundry marks aside: "arialblack" is
+/// black, "blackchancery" merely contains the word.
+fn weight_word_substring(piece: &str, in_family: bool) -> Option<u16> {
+    const COMPOUND: [(&str, u16); 6] = [
+        ("extralight", 200),
+        ("ultralight", 200),
+        ("extrabold", 800),
+        ("ultrabold", 800),
+        ("semibold", 600),
+        ("demibold", 600),
+    ];
+    let piece = if in_family {
+        ["psmt", "mt", "ps"]
+            .iter()
+            .find_map(|mark| piece.strip_suffix(mark))
+            .unwrap_or(piece)
+    } else {
+        piece
+    };
+    if let Some((_, weight)) = COMPOUND
+        .iter()
+        .find(|(word, _)| in_family && piece.ends_with(word) || !in_family && piece.contains(word))
+    {
+        return Some(*weight);
+    }
+    const WORDS: [(&str, u16); 13] = [
+        ("black", 900),
+        ("heavy", 900),
+        ("ultra", 900),
+        ("bold", 700),
+        ("demi", 600),
+        ("medium", 500),
+        ("light", 300),
+        ("regular", 400),
+        ("roman", 400),
+        ("book", 400),
+        ("normal", 400),
+        ("thin", 100),
+        ("hairline", 100),
+    ];
+    if in_family {
+        return WORDS
+            .iter()
+            .find(|(word, _)| piece.ends_with(word))
+            .map(|(_, weight)| *weight);
+    }
+    WORDS
+        .iter()
+        .filter_map(|(word, weight)| piece.rfind(word).map(|at| (at, *weight)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, weight)| weight)
+}
+
 /// Detect if a font name indicates italic/oblique style
 /// Common patterns: "Italic", "It", "Oblique", "Obl", "Slant", "Inclined"
 pub fn is_italic_font(font_name: &str) -> bool {
@@ -1156,6 +1397,128 @@ mod tests {
     use crate::types::ItemType;
 
     #[test]
+    fn font_weight_reads_full_style_words() {
+        let cases = [
+            ("Helvetica", None),
+            ("ABCDEF+Helvetica-Bold", Some(700)),
+            ("Arial-BoldMT", Some(700)),
+            ("Arial,BoldItalic", Some(700)),
+            ("TimesNewRomanPSMT", Some(400)),
+            ("TimesNewRomanPS-BoldMT", Some(700)),
+            ("Calibri-Light", Some(300)),
+            ("SegoeUI-Semibold", Some(600)),
+            ("OpenSans-ExtraBold", Some(800)),
+            ("Roboto-Black", Some(900)),
+            ("Lato-Heavy", Some(900)),
+            ("Montserrat-Thin", Some(100)),
+            ("Montserrat-ExtraLightItalic", Some(200)),
+            ("Foo-MediumItalic", Some(500)),
+            ("ITCAvantGardeStd-Demi", Some(600)),
+            ("Bookman-Demi", Some(600)),
+            ("CenturyGothic-Book", Some(400)),
+            ("Roboto-Regular", Some(400)),
+            ("NimbusRomNo9L-Medi", Some(500)),
+            ("ARIALBOLD", Some(700)),
+            ("HELVETICA-BOLDOBLIQUE", Some(700)),
+            ("AVANTGARDEDEMI", Some(600)),
+            ("ARIALTHIN", Some(100)),
+            ("ARIALBLACK", Some(900)),
+            ("ARIALBOLDMT", Some(700)),
+            ("TIMESNEWROMANPSMT", Some(400)),
+            ("helveticaneue-ultra", Some(900)),
+            ("FrutigerLT-Roman", Some(400)),
+            ("Frutiger LT 45 Light", Some(300)),
+            ("ArialBlack", Some(900)),
+            ("Arial Black", Some(900)),
+            ("ArialBoldMT", Some(700)),
+            ("HelveticaNeueLightItalic", Some(300)),
+            ("GillSansUltraBold", Some(800)),
+            ("Foo-Extra-Light", Some(200)),
+            ("Foo-Ultra-Light", Some(200)),
+            ("Foo-Semi-Bold", Some(600)),
+            ("Foo-Demi-Bold", Some(600)),
+            ("Open Sans Extra Bold", Some(800)),
+            ("Foo-Extra-Black", Some(900)),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(font_weight_from_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn font_weight_reads_style_abbreviations_after_the_family() {
+        let cases = [
+            ("AAAAAB+HelveticaNeueLTStd-Md", Some(500)),
+            ("HelveticaNeueLTStd-Lt", Some(300)),
+            ("HelveticaNeueLTStd-Bd", Some(700)),
+            ("HelveticaNeueLTStd-BdCn", Some(700)),
+            ("HelveticaNeueLTStd-MdIt", Some(500)),
+            ("HelveticaNeueLTStd-UltLt", Some(200)),
+            ("HelveticaNeueLTStd-Hv", Some(900)),
+            ("HelveticaNeueLTStd-Blk", Some(900)),
+            ("HelveticaNeueLTStd-XBlk", Some(900)),
+            ("HelveticaNeueLTStd-Th", Some(100)),
+            ("FrutigerLTStd-Ult", Some(900)),
+            ("ITCFranklinGothicStd-Dm", Some(600)),
+            ("ITCFranklinGothicStd-DmCd", Some(600)),
+            ("Foo-Sb", Some(600)),
+            ("Foo-SBd", Some(600)),
+            ("Foo-Smbd", Some(600)),
+            ("Foo-XBd", Some(800)),
+            ("Foo-XBdIt", Some(800)),
+            ("Foo-Bk", Some(400)),
+            ("Foo-Rg", Some(400)),
+            ("HiraginoSans-W1", Some(100)),
+            ("HiraginoSans-W2", Some(200)),
+            ("HiraKakuProN-W3", Some(300)),
+            ("HiraKakuProN-W6", Some(600)),
+            ("KozMinPr6N-W9", Some(900)),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(font_weight_from_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn font_weight_ignores_width_style_and_family_words() {
+        // Condensed and script faces, the all-caps "LT" and "MT" acronyms
+        // of Linotype and Monotype, a Thai family's leading "TH", families
+        // that start with or contain a weight word, and the weight digit
+        // only after a "W".
+        let cases = [
+            "HelveticaNeueLTStd-Cn",
+            "Roboto-Condensed",
+            "Roboto-CondensedItalic",
+            "SignPainter-HouseScript",
+            "FZXXLB--B51-0",
+            "FZHTB--B51-0",
+            "Frutiger LT Std",
+            "Helvetica LT Condensed",
+            "Frutiger-LT",
+            "Foo-MT",
+            "THSarabunNew",
+            "TH-Sarabun",
+            "BlackadderITC",
+            "Bookman",
+            "BlackChancery",
+            "Black Chancery",
+            "BLACKCHANCERY",
+            "BlackOak",
+            "BookAntiqua",
+            "OldBlackLetter",
+            "LightRail",
+            "HeavyMetal",
+            "Foo-W95",
+            "HiraginoSans-W0",
+            "Wingdings",
+            "ABCDEF+Tc1",
+        ];
+        for name in cases {
+            assert_eq!(font_weight_from_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
     fn bold_font_urw_medi_abbreviation() {
         // URW Type 1 fonts (LaTeX default Times) abbreviate Medium as "Medi"
         assert!(is_bold_font("NROFIU+NimbusRomNo9L-Medi"));
@@ -1370,6 +1733,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1574,6 +1938,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1700,6 +2065,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,
@@ -1783,6 +2149,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1885,6 +2252,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
