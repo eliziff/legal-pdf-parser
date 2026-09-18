@@ -32,6 +32,22 @@ version and date. Earlier releases are described in their
   run inside a lighter paragraph keeps its own item. Off by default, where
   `is_bold` and item merging are unchanged.
 
+### Fixed
+
+- Text painted wholly outside the rectangular clip in force when it was
+  shown is no longer extracted. Such runs are invisible on the rendered page
+  — labels a charting library parks off its plot area, content the producer
+  cropped away — yet used to come back as ordinary text and leak into the
+  words around the figure, on every API. Only a single finite, axis-aligned
+  rectangle clip counts (nested `q`/`Q` and intersections of rectangles
+  included); text under a path, text-mode or turned clip is kept as before,
+  as are runs inside Form XObjects, rotated runs and runs whose advance is
+  unknown. A run has to lie a quarter of its height clear of the clip on
+  every side, so glyphs straddling an edge stay. Unlike render-mode-3 text,
+  the left-out runs are not an invisible layer that transcribes the page:
+  `include_invisible` does not bring them back, and a page whose every run
+  is clipped away reports no text, like an image-only page.
+
 ### Changed
 
 - Rust `TextItem` literals must include the new `font_weight` field (`None`
