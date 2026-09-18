@@ -311,6 +311,21 @@ fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
+/// Leading bytes before the header, e.g. an echoed multipart envelope: a
+/// boundary line and part headers before `%PDF`, a closing boundary after
+/// `%%EOF`.
+fn wrap_in_multipart_envelope(pdf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pdf.len() + 256);
+    out.extend_from_slice(
+        b"------------------------------123\r\n\
+          Content-Disposition: form-data; name=\"file\"; filename=\"file.pdf\"\r\n\
+          Content-Type: application/pdf\r\n\r\n",
+    );
+    out.extend_from_slice(pdf);
+    out.extend_from_slice(b"\r\n------------------------------123--\r\n");
+    out
+}
+
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
     use pdf_inspector::types::ItemType;
@@ -1218,6 +1233,134 @@ fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
             .contains("Hello World"),
         "repaired PDF should still extract text"
     );
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_leading_bytes_before_header() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    assert!(!wrapped.starts_with(b"%PDF"));
+
+    let expected = process_pdf_mem(&original).expect("clean PDF should load");
+    let result =
+        process_pdf_mem(&wrapped).expect("leading bytes before the header should be tolerated");
+
+    assert_eq!(result.pdf_type, expected.pdf_type);
+    assert_eq!(result.page_count, expected.page_count);
+    assert_eq!(result.markdown, expected.markdown);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "wrapped PDF should still extract text"
+    );
+}
+
+fn page_texts(result: &pdf_inspector::PagesExtractionResult) -> Vec<String> {
+    result.pages.iter().map(|p| p.markdown.clone()).collect()
+}
+
+#[test]
+fn test_detect_and_extract_tolerate_leading_bytes_before_header() {
+    let original = std::fs::read("tests/fixtures/shannon-entropy-p1-2.pdf").unwrap();
+    let wrapped = wrap_in_multipart_envelope(&original);
+
+    let expected = pdf_inspector::detect_pdf_type_mem(&original).unwrap();
+    let detected = pdf_inspector::detect_pdf_type_mem(&wrapped)
+        .expect("detection should tolerate leading bytes before the header");
+    assert_eq!(detected.pdf_type, expected.pdf_type);
+    assert_eq!(detected.page_count, expected.page_count);
+    assert!(detected.page_count > 1);
+
+    let expected_pages = extract_pages_markdown_mem(&original, None).unwrap();
+    let pages = extract_pages_markdown_mem(&wrapped, None)
+        .expect("page extraction should tolerate leading bytes before the header");
+    assert_eq!(page_texts(&pages), page_texts(&expected_pages));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.pdf");
+    std::fs::write(&path, &wrapped).unwrap();
+    let from_path =
+        detect_pdf_type(&path).expect("path-based detection should tolerate leading bytes");
+    assert_eq!(from_path.page_count, expected.page_count);
+    let from_path_pages = extract_pages_markdown(&path, None)
+        .expect("path-based extraction should tolerate leading bytes");
+    assert_eq!(page_texts(&from_path_pages), page_texts(&expected_pages));
+}
+
+#[test]
+fn test_process_pdf_mem_skips_version_like_text_before_header() {
+    // Leading metadata that mentions version-like `%PDF-1` strings, even
+    // several of them, must not shadow the real header (the ranking picks the
+    // canonical line; a mention that did win would still load through xref
+    // reconstruction, as the prefix-counted-offsets test shows).
+    let mut buf =
+        b"X-A: %PDF-1.4 body\r\nX-B: %PDF-1 x\r\nX-C: %PDF-1.7 y\r\nX-D: %PDF-2 z\r\n\r\n".to_vec();
+    buf.extend_from_slice(&make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&buf).expect("real header should still be found");
+
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+/// Rewrite a classic xref table and `startxref` so every offset counts an
+/// extra `shift` bytes, as if the writer had measured from the start of the
+/// leading bytes rather than from the header.
+fn shift_xref_offsets(pdf: &[u8], shift: usize) -> Vec<u8> {
+    let text = String::from_utf8(pdf.to_vec()).expect("minimal PDF is ASCII");
+    let entry = regex::Regex::new(r"(?m)^(\d{10}) (\d{5}) n").unwrap();
+    let shifted = entry.replace_all(&text, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("{:010} {} n", off + shift, &caps[2])
+    });
+    let start = regex::Regex::new(r"startxref\s*(\d+)").unwrap();
+    let shifted = start.replace(&shifted, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("startxref\n{}", off + shift)
+    });
+    shifted.into_owned().into_bytes()
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_prefix_counted_xref_offsets() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    let prefix_len =
+        wrapped.len() - original.len() - b"\r\n------------------------------123--\r\n".len();
+    let mut buf = wrapped[..prefix_len].to_vec();
+    buf.extend_from_slice(&shift_xref_offsets(&original, prefix_len));
+    assert_ne!(buf[prefix_len..], original[..]);
+
+    let result = process_pdf_mem(&buf).expect("prefix-counted offsets should be recovered");
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+#[test]
+fn test_bare_pdf_marker_without_dash_is_still_not_a_pdf() {
+    // A bare `%PDF` is not a header lopdf can load, so it fails the cheap
+    // magic check exactly as before.
+    let text = b"Notes: the %PDF marker alone is not a document.";
+    assert_not_a_pdf(process_pdf_mem(text), "plain text");
+    assert_not_a_pdf(pdf_inspector::detect_pdf_type_mem(text), "plain text");
+}
+
+#[test]
+fn test_header_beyond_search_window_is_not_a_pdf() {
+    let mut buf = vec![b'x'; 2048];
+    buf.extend_from_slice(&make_minimal_text_pdf());
+    assert_not_a_pdf(process_pdf_mem(&buf), "plain text");
 }
 
 #[test]
