@@ -55,8 +55,11 @@ pub use extractor::extract_fidelity_from_doc;
 pub use extractor::geometry::PageRotation;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
-    extract_text_with_positions_mem, extract_text_with_positions_pages,
-    extract_text_with_positions_pages_with_password,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_with_options, extract_text_with_positions_mem,
+    extract_text_with_positions_mem_in_frame, extract_text_with_positions_mem_with_options,
+    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    PositionFrame, PositionOptions,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -838,6 +841,7 @@ mod ocr_header_footer_tests {
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1030,9 +1034,13 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 /// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
 ///   Coordinates are in **PDF points** with **top-left origin**, relative to
 ///   the page's **visible page box** (`CropBox ∩ MediaBox`, else the
-///   MediaBox) — the frame of a rendered page image, and the frame
+///   MediaBox) as laid out in the content stream — the frame
 ///   [`extract_text_with_positions_mem`] reports items in (with `y` flipped
-///   by the box height). `/Rotate` is not applied.
+///   by the box height). `/Rotate` is not applied and a page whose text is
+///   predominantly rotated is turned (see [`PageRotation`]), so this matches
+///   a rendered page image only for pages with `/Rotate 0` whose text is not
+///   predominantly rotated; rects taken from a rendered page go through
+///   [`extract_text_in_regions_mem_in_frame`] with [`PositionFrame::Display`].
 ///
 /// # Returns
 ///
@@ -1041,6 +1049,39 @@ pub fn extract_text_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_text_in_regions_mem_in_frame(buffer, page_regions, PositionFrame::Sheet)
+}
+
+/// [`extract_text_in_regions_mem`] with the frame of the region rects given
+/// explicitly. [`PositionFrame::Sheet`] reads them as that function does;
+/// [`PositionFrame::Display`] reads them on the rendered page — the visible
+/// page box turned clockwise by the page's inheritable `/Rotate`, top-left
+/// origin, `y` down — the frame a layout model working on a page image
+/// reports boxes in. Pages whose text is predominantly rotated are handled
+/// the same way in both frames.
+pub fn extract_text_in_regions_mem_in_frame(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    frame: PositionFrame,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_text_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`]: the frame the region rects are read in, and whether
+/// bold is also read from the font's weight class (`bold_from_weight`, which
+/// also keeps runs of different weight apart while the region's lines are
+/// assembled). The default options are [`extract_text_in_regions_mem`].
+pub fn extract_text_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1060,6 +1101,7 @@ pub fn extract_text_in_regions_mem(
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontProductCache::new();
+    let mut display_pages: HashMap<u32, extractor::DisplayPage> = HashMap::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1078,16 +1120,22 @@ pub fn extract_text_in_regions_mem(
             skipped_invisible,
             page_box,
             ..
-        } = extractor::extract_page_text_items_in_page_box(
+        } = extractor::extract_page_text_items_in_page_box_with_options(
             &doc,
             page_id,
             *page_num,
             &font_cmaps,
-            false,
+            options.text_extraction(false),
             &mut style_cache,
             &mut form_budget,
         )?;
         page_heights.insert(*page_num, page_box.height());
+        if frame == PositionFrame::Display {
+            display_pages.insert(
+                *page_num,
+                extractor::DisplayPage::new(&doc, page_id, page_box),
+            );
+        }
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
         // pass sees nothing there but `[Image: ...]` placeholders, so every
@@ -1107,12 +1155,12 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box(
+            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box_with_options(
                 &doc,
                 page_id,
                 *page_num,
                 &font_cmaps,
-                true,
+                options.text_extraction(true),
                 &mut style_cache,
                 &mut form_budget,
             ) {
@@ -1159,6 +1207,7 @@ pub fn extract_text_in_regions_mem(
             .get(&page_1idx)
             .copied()
             .unwrap_or(RegionCoordSpace::Standard);
+        let display = display_pages.get(&page_1idx).copied();
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -1173,7 +1222,7 @@ pub fn extract_text_in_regions_mem(
         let all_bounds: Vec<RegionBounds> = regions
             .iter()
             .map(|rect| {
-                let [rx1, ry1, rx2, ry2] = *rect;
+                let [rx1, ry1, rx2, ry2] = sheet_region_rect(*rect, display);
                 region_bounds(rx1, ry1, rx2, ry2, page_h, coords)
             })
             .collect();
@@ -1266,6 +1315,31 @@ pub fn extract_tables_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_tables_in_regions_mem_in_frame(buffer, page_regions, PositionFrame::Sheet)
+}
+
+/// [`extract_tables_in_regions_mem`] with the frame of the region rects given
+/// explicitly — see [`extract_text_in_regions_mem_in_frame`].
+pub fn extract_tables_in_regions_mem_in_frame(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    frame: PositionFrame,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_tables_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_tables_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`] — see [`extract_text_in_regions_mem_with_options`].
+pub fn extract_tables_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1281,6 +1355,7 @@ pub fn extract_tables_in_regions_mem(
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
     let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontProductCache::new();
+    let mut display_pages: HashMap<u32, extractor::DisplayPage> = HashMap::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
@@ -1294,16 +1369,22 @@ pub fn extract_tables_in_regions_mem(
             coords_rotated,
             page_box,
             ..
-        } = extractor::extract_page_text_items_in_page_box(
+        } = extractor::extract_page_text_items_in_page_box_with_options(
             &doc,
             page_id,
             *page_num,
             &font_cmaps,
-            false,
+            options.text_extraction(false),
             &mut style_cache,
             &mut extractor::FormWalkBudget::new(),
         )?;
         page_heights.insert(*page_num, page_box.height());
+        if frame == PositionFrame::Display {
+            display_pages.insert(
+                *page_num,
+                extractor::DisplayPage::new(&doc, page_id, page_box),
+            );
+        }
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -1330,11 +1411,12 @@ pub fn extract_tables_in_regions_mem(
             .get(&page_1idx)
             .copied()
             .unwrap_or(RegionCoordSpace::Standard);
+        let display = display_pages.get(&page_1idx).copied();
 
         let mut page_results = Vec::with_capacity(regions.len());
 
         for rect in regions {
-            let [rx1, ry1, rx2, ry2] = *rect;
+            let [rx1, ry1, rx2, ry2] = sheet_region_rect(*rect, display);
 
             // Note: we intentionally DO NOT bail on page_has_gid here.
             // The GID flag means some font on the page uses unresolvable
@@ -3621,6 +3703,16 @@ impl From<extractor::geometry::PageRotation> for RegionCoordSpace {
     }
 }
 
+/// A region rect in the sheet frame's top-left space: unchanged when the
+/// caller gave it there, turned back from the rendered page when it came in
+/// the display frame (`display` is the page's mapping in that case).
+fn sheet_region_rect(rect: [f32; 4], display: Option<extractor::DisplayPage>) -> [f32; 4] {
+    match display {
+        Some(page) => page.region_to_sheet(rect),
+        None => rect,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RegionBounds {
     x_min: f32,
@@ -3967,6 +4059,16 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    // Drop anything before the `%PDF-` header. Cross-reference offsets are
+    // header-relative in every major reader (mupdf, pdfium, poppler, pdf.js;
+    // lopdf slices at `%PDF-` internally as well), so this keeps them exact
+    // for lopdf and for the repair candidates below. A file whose offsets are
+    // off by a constant anyway — they count the leading bytes, or a
+    // version-like mention in the leading bytes was taken for the header — is
+    // recovered by lopdf's cross-reference reconstruction, the same path every
+    // reader takes for it.
+    let buffer = strip_leading_bytes_before_header(buffer);
+
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
@@ -4094,26 +4196,6 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
         xref_repair::rebuild_short_xref_entries(buf),
         buf,
     );
-
-    let stripped = strip_leading_pdf_container_bytes(buf);
-    if let Some(stripped_buf) = stripped.as_deref() {
-        add_repair_candidate(&mut candidates, Some(stripped_buf.to_vec()), buf);
-        add_repair_candidate(
-            &mut candidates,
-            append_missing_eof_marker(stripped_buf),
-            buf,
-        );
-        add_repair_candidate(
-            &mut candidates,
-            recover_startxref_pointer(stripped_buf),
-            buf,
-        );
-        add_repair_candidate(
-            &mut candidates,
-            xref_repair::rebuild_short_xref_entries(stripped_buf),
-            buf,
-        );
-    }
 
     candidates
 }
@@ -4278,29 +4360,6 @@ fn contains_recent_eof_marker(buf: &[u8]) -> bool {
     buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
 }
 
-fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
-    let mut start = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3
-    } else {
-        0
-    };
-
-    while start < buf.len() && buf[start].is_ascii_whitespace() {
-        start += 1;
-    }
-
-    if start > 0 && buf[start..].starts_with(b"%PDF-") {
-        Some(buf[start..].to_vec())
-    } else {
-        None
-    }
-}
-
-/// Recover a PDF whose beginning was accidentally duplicated in front of the
-/// complete file. The final `startxref` offset is relative to the later PDF
-/// header, so only accept a suffix when that relative offset lands on a valid
-/// classic cross-reference table. This avoids mistaking an embedded PDF stream
-/// for the outer document.
 fn strip_duplicated_pdf_prefix(buf: &[u8]) -> Option<Vec<u8>> {
     let marker = b"startxref";
     let marker_pos = buf
@@ -4315,7 +4374,6 @@ fn strip_duplicated_pdf_prefix(buf: &[u8]) -> Option<Vec<u8>> {
         .ok()?
         .parse::<usize>()
         .ok()?;
-
     buf.windows(b"%PDF-".len())
         .enumerate()
         .skip(1)
@@ -5611,6 +5669,7 @@ mod text_cluster_column_undercount_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -5893,6 +5952,7 @@ mod table_candidate_selection_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -6680,18 +6740,87 @@ fn detect_file_type_hint(bytes: &[u8]) -> String {
     "file is not a PDF".to_string()
 }
 
+/// The `%PDF` header must *start* within this many bytes of the buffer.
+///
+/// mupdf, pdfium and poppler all accept a header that is not at offset 0
+/// (leading bytes before the header, e.g. an echoed multipart envelope or a
+/// UTF-8 BOM); this mirrors that tolerance with a bounded search.
+const PDF_HEADER_SEARCH_WINDOW: usize = 1024;
+
+/// Longest header the locator inspects: `%PDF-M.N` plus its line ending.
+const PDF_HEADER_PROBE_LEN: usize = 9;
+
+/// Byte offset of the `%PDF-` header within the first
+/// [`PDF_HEADER_SEARCH_WINDOW`] bytes of `buffer`.
+///
+/// Candidates are ranked by how much they look like a real header line, and
+/// by buffer order within a rank: a canonical `%PDF-M.N` line (starting a
+/// line and ending at a line break) first, then `%PDF-` followed by a version
+/// digit, then any other `%PDF-`. A version-like mention inside leading text
+/// (`X-Note: %PDF-1.4`, say) therefore does not outrank the actual header.
+/// lopdf's own header parser requires the literal `%PDF-`, so a bare `%PDF`
+/// is not a candidate.
+fn pdf_header_offset(buffer: &[u8]) -> Option<usize> {
+    // Only the start of the marker is bounded by the window; let the marker
+    // itself run past it.
+    let probe_end = (PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN).min(buffer.len());
+    let probe = &buffer[..probe_end];
+
+    let mut best: Option<(u8, usize)> = None;
+    for (offset, window) in probe
+        .windows(b"%PDF-".len())
+        .enumerate()
+        .take(PDF_HEADER_SEARCH_WINDOW)
+    {
+        if window != b"%PDF-" {
+            continue;
+        }
+        let version = &probe[offset + b"%PDF-".len()..];
+        let at_line_start = offset == 0 || matches!(probe[offset - 1], b'\r' | b'\n');
+        let rank = if at_line_start && is_canonical_pdf_version_line(version) {
+            return Some(offset);
+        } else if version.first().is_some_and(u8::is_ascii_digit) {
+            1
+        } else {
+            2
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, offset));
+        }
+    }
+    best.map(|(_, offset)| offset)
+}
+
+/// `M.N` immediately followed by a line ending (or the end of the probe),
+/// i.e. the bytes after `%PDF-` on a canonical header line.
+fn is_canonical_pdf_version_line(version: &[u8]) -> bool {
+    matches!(version, [major, b'.', minor, rest @ ..]
+        if major.is_ascii_digit()
+            && minor.is_ascii_digit()
+            && rest.first().is_none_or(|b| matches!(b, b'\r' | b'\n')))
+}
+
+/// Return `buffer` starting at its `%PDF-` header, dropping any leading bytes.
+///
+/// Returns `buffer` unchanged when no header is found so the loader reports
+/// its own error.
+fn strip_leading_bytes_before_header(buffer: &[u8]) -> &[u8] {
+    match pdf_header_offset(buffer) {
+        Some(offset) if offset > 0 => {
+            log::debug!("dropping {offset} leading bytes before the %PDF- header");
+            &buffer[offset..]
+        }
+        _ => buffer,
+    }
+}
+
 /// Validate that a byte buffer looks like a PDF (has `%PDF-` magic).
 ///
-/// Scans the first 1024 bytes, allowing for a UTF-8 BOM and leading whitespace.
+/// The header must start within the first [`PDF_HEADER_SEARCH_WINDOW`] bytes;
+/// see [`pdf_header_offset`]. Leading bytes before it are tolerated here and
+/// dropped by the loader.
 pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
-    if buffer.is_empty() {
-        return Err(PdfError::NotAPdf(detect_file_type_hint(buffer)));
-    }
-
-    let header = &buffer[..buffer.len().min(1024)];
-    let trimmed = strip_bom_and_whitespace(header);
-
-    if trimmed.starts_with(b"%PDF-") {
+    if pdf_header_offset(buffer).is_some() {
         Ok(())
     } else {
         Err(PdfError::NotAPdf(detect_file_type_hint(buffer)))
@@ -6700,11 +6829,11 @@ pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
 
 /// Validate that a file on disk looks like a PDF.
 ///
-/// Reads only the first 1024 bytes and delegates to [`validate_pdf_bytes`].
+/// Reads only the header search window and delegates to [`validate_pdf_bytes`].
 pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN];
     let n = file.read(&mut buf)?;
     validate_pdf_bytes(&buf[..n])
 }
@@ -6713,6 +6842,95 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn pdf_header_offset_finds_header_at_start() {
+        assert_eq!(pdf_header_offset(b"%PDF-1.4\n%%EOF"), Some(0));
+    }
+
+    #[test]
+    fn pdf_header_offset_skips_bom_and_whitespace() {
+        let mut buf = vec![0xEF, 0xBB, 0xBF, b'\n', b'\t'];
+        buf.extend_from_slice(b"%PDF-1.7\n");
+        assert_eq!(pdf_header_offset(&buf), Some(5));
+    }
+
+    #[test]
+    fn pdf_header_offset_finds_header_after_leading_bytes() {
+        // Leading bytes before the header, e.g. an echoed multipart envelope.
+        let prefix = b"--boundary\r\nContent-Type: application/pdf\r\n\r\n";
+        let mut buf = prefix.to_vec();
+        buf.extend_from_slice(b"%PDF-1.5\n%%EOF");
+        assert_eq!(pdf_header_offset(&buf), Some(prefix.len()));
+    }
+
+    #[test]
+    fn pdf_header_offset_ignores_bare_marker_in_leading_text() {
+        let buf = b"filename=\"%PDF.pdf\"\r\n\r\n%PDF-1.6\n";
+        let expected = buf.len() - b"%PDF-1.6\n".len();
+        assert_eq!(pdf_header_offset(buf), Some(expected));
+        assert_eq!(pdf_header_offset(b"xx%PDF\n1 0 obj"), None);
+    }
+
+    #[test]
+    fn pdf_header_offset_accepts_dash_without_version_digit() {
+        assert_eq!(pdf_header_offset(b"%PDF-\n1 0 obj"), Some(0));
+    }
+
+    #[test]
+    fn pdf_header_offset_accepts_header_at_window_edge() {
+        let mut buf = vec![b' '; PDF_HEADER_SEARCH_WINDOW - 1];
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(pdf_header_offset(&buf), Some(PDF_HEADER_SEARCH_WINDOW - 1));
+    }
+
+    #[test]
+    fn pdf_header_offset_rejects_header_beyond_window() {
+        let mut buf = vec![b' '; PDF_HEADER_SEARCH_WINDOW];
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(pdf_header_offset(&buf), None);
+        assert_eq!(pdf_header_offset(b""), None);
+        assert_eq!(pdf_header_offset(b"just some text"), None);
+    }
+
+    #[test]
+    fn pdf_header_offset_ranks_canonical_header_lines_first() {
+        // dashed-only at 0, version digit at 7, canonical lines at 19 and 28.
+        let buf = b"%PDF-x\n%PDF-1 note\n%PDF-1.4\n%PDF-2.0\r\n";
+        assert_eq!(pdf_header_offset(buf), Some(19));
+        // A canonical-looking version mid-line is only a version-digit match.
+        let buf = b"X-Note: %PDF-1.4\n%PDF-1.7\n";
+        assert_eq!(pdf_header_offset(buf), Some(17));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n%PDF-1 note\n"), Some(7));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n"), Some(0));
+
+        // Many version-like mentions never outrank the real header line.
+        let mut buf = b"x: %PDF-1\n".repeat(50);
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(
+            pdf_header_offset(&buf),
+            Some(buf.len() - b"%PDF-1.4\n".len())
+        );
+    }
+
+    #[test]
+    fn strip_leading_bytes_before_header_slices_to_header() {
+        let buf = b"junk\r\n%PDF-1.4\n%%EOF";
+        assert_eq!(strip_leading_bytes_before_header(buf), b"%PDF-1.4\n%%EOF");
+        let clean = b"%PDF-1.4\n%%EOF";
+        assert_eq!(strip_leading_bytes_before_header(clean), clean);
+        let none = b"not a pdf";
+        assert_eq!(strip_leading_bytes_before_header(none), none);
+    }
+
+    #[test]
+    fn validate_pdf_bytes_accepts_leading_bytes_and_rejects_text() {
+        assert!(validate_pdf_bytes(b"--b\r\n\r\n%PDF-1.4\n").is_ok());
+        match validate_pdf_bytes(b"This is plain text mentioning %PDF, not a PDF.") {
+            Err(PdfError::NotAPdf(hint)) => assert!(hint.contains("plain text"), "{hint}"),
+            other => panic!("expected NotAPdf, got {other:?}"),
+        }
+    }
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
         TextItem {
@@ -6729,6 +6947,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -7959,6 +8178,7 @@ mod rotated_run_region_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

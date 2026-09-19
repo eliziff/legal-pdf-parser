@@ -15,6 +15,16 @@ use pdf_inspector::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
+use pdf_inspector::{
+    extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_mem_in_frame, PositionFrame,
+};
+use pdf_inspector::{
+    extract_text_in_regions_mem_with_options,
+    extract_text_with_positions_and_rotations_mem_with_options,
+    extract_text_with_positions_mem_with_options, PositionOptions,
+};
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
@@ -23,10 +33,28 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
 
 /// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
 fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
+    make_text_pdf_with_rotate(content, media_box, crop_box, None, None)
+}
+
+/// Like [`make_text_pdf_with_boxes`], optionally declaring a `/Rotate` on
+/// the page (`page_rotate`) and on the `/Pages` node (`pages_rotate`).
+fn make_text_pdf_with_rotate(
+    content: &str,
+    media_box: &str,
+    crop_box: Option<&str>,
+    page_rotate: Option<i64>,
+    pages_rotate: Option<i64>,
+) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
     let crop_entry = crop_box
         .map(|b| format!(" /CropBox [{b}]"))
+        .unwrap_or_default();
+    let page_rotate_entry = page_rotate
+        .map(|r| format!(" /Rotate {r}"))
+        .unwrap_or_default();
+    let pages_rotate_entry = pages_rotate
+        .map(|r| format!(" /Rotate {r}"))
         .unwrap_or_default();
 
     fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
@@ -46,14 +74,14 @@ fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&st
         &mut pdf,
         &mut offsets,
         2,
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< /Type /Pages /Kids [3 0 R] /Count 1{pages_rotate_entry} >>"),
     );
     add_object(
         &mut pdf,
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry}{page_rotate_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -283,6 +311,21 @@ fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
+/// Leading bytes before the header, e.g. an echoed multipart envelope: a
+/// boundary line and part headers before `%PDF`, a closing boundary after
+/// `%%EOF`.
+fn wrap_in_multipart_envelope(pdf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pdf.len() + 256);
+    out.extend_from_slice(
+        b"------------------------------123\r\n\
+          Content-Disposition: form-data; name=\"file\"; filename=\"file.pdf\"\r\n\
+          Content-Type: application/pdf\r\n\r\n",
+    );
+    out.extend_from_slice(pdf);
+    out.extend_from_slice(b"\r\n------------------------------123--\r\n");
+    out
+}
+
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
     use pdf_inspector::types::ItemType;
@@ -300,6 +343,7 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         page,
         is_bold: false,
         is_italic: false,
+        font_weight: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -333,6 +377,7 @@ fn make_text_item_with_font(
         page,
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
+        font_weight: None,
         is_underline: false,
         is_strikeout: false,
         rotation: 0.0,
@@ -1190,6 +1235,134 @@ fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
             .contains("Hello World"),
         "repaired PDF should still extract text"
     );
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_leading_bytes_before_header() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    assert!(!wrapped.starts_with(b"%PDF"));
+
+    let expected = process_pdf_mem(&original).expect("clean PDF should load");
+    let result =
+        process_pdf_mem(&wrapped).expect("leading bytes before the header should be tolerated");
+
+    assert_eq!(result.pdf_type, expected.pdf_type);
+    assert_eq!(result.page_count, expected.page_count);
+    assert_eq!(result.markdown, expected.markdown);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "wrapped PDF should still extract text"
+    );
+}
+
+fn page_texts(result: &pdf_inspector::PagesExtractionResult) -> Vec<String> {
+    result.pages.iter().map(|p| p.markdown.clone()).collect()
+}
+
+#[test]
+fn test_detect_and_extract_tolerate_leading_bytes_before_header() {
+    let original = std::fs::read("tests/fixtures/shannon-entropy-p1-2.pdf").unwrap();
+    let wrapped = wrap_in_multipart_envelope(&original);
+
+    let expected = pdf_inspector::detect_pdf_type_mem(&original).unwrap();
+    let detected = pdf_inspector::detect_pdf_type_mem(&wrapped)
+        .expect("detection should tolerate leading bytes before the header");
+    assert_eq!(detected.pdf_type, expected.pdf_type);
+    assert_eq!(detected.page_count, expected.page_count);
+    assert!(detected.page_count > 1);
+
+    let expected_pages = extract_pages_markdown_mem(&original, None).unwrap();
+    let pages = extract_pages_markdown_mem(&wrapped, None)
+        .expect("page extraction should tolerate leading bytes before the header");
+    assert_eq!(page_texts(&pages), page_texts(&expected_pages));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.pdf");
+    std::fs::write(&path, &wrapped).unwrap();
+    let from_path =
+        detect_pdf_type(&path).expect("path-based detection should tolerate leading bytes");
+    assert_eq!(from_path.page_count, expected.page_count);
+    let from_path_pages = extract_pages_markdown(&path, None)
+        .expect("path-based extraction should tolerate leading bytes");
+    assert_eq!(page_texts(&from_path_pages), page_texts(&expected_pages));
+}
+
+#[test]
+fn test_process_pdf_mem_skips_version_like_text_before_header() {
+    // Leading metadata that mentions version-like `%PDF-1` strings, even
+    // several of them, must not shadow the real header (the ranking picks the
+    // canonical line; a mention that did win would still load through xref
+    // reconstruction, as the prefix-counted-offsets test shows).
+    let mut buf =
+        b"X-A: %PDF-1.4 body\r\nX-B: %PDF-1 x\r\nX-C: %PDF-1.7 y\r\nX-D: %PDF-2 z\r\n\r\n".to_vec();
+    buf.extend_from_slice(&make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&buf).expect("real header should still be found");
+
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+/// Rewrite a classic xref table and `startxref` so every offset counts an
+/// extra `shift` bytes, as if the writer had measured from the start of the
+/// leading bytes rather than from the header.
+fn shift_xref_offsets(pdf: &[u8], shift: usize) -> Vec<u8> {
+    let text = String::from_utf8(pdf.to_vec()).expect("minimal PDF is ASCII");
+    let entry = regex::Regex::new(r"(?m)^(\d{10}) (\d{5}) n").unwrap();
+    let shifted = entry.replace_all(&text, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("{:010} {} n", off + shift, &caps[2])
+    });
+    let start = regex::Regex::new(r"startxref\s*(\d+)").unwrap();
+    let shifted = start.replace(&shifted, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("startxref\n{}", off + shift)
+    });
+    shifted.into_owned().into_bytes()
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_prefix_counted_xref_offsets() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    let prefix_len =
+        wrapped.len() - original.len() - b"\r\n------------------------------123--\r\n".len();
+    let mut buf = wrapped[..prefix_len].to_vec();
+    buf.extend_from_slice(&shift_xref_offsets(&original, prefix_len));
+    assert_ne!(buf[prefix_len..], original[..]);
+
+    let result = process_pdf_mem(&buf).expect("prefix-counted offsets should be recovered");
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+#[test]
+fn test_bare_pdf_marker_without_dash_is_still_not_a_pdf() {
+    // A bare `%PDF` is not a header lopdf can load, so it fails the cheap
+    // magic check exactly as before.
+    let text = b"Notes: the %PDF marker alone is not a document.";
+    assert_not_a_pdf(process_pdf_mem(text), "plain text");
+    assert_not_a_pdf(pdf_inspector::detect_pdf_type_mem(text), "plain text");
+}
+
+#[test]
+fn test_header_beyond_search_window_is_not_a_pdf() {
+    let mut buf = vec![b'x'; 2048];
+    buf.extend_from_slice(&make_minimal_text_pdf());
+    assert_not_a_pdf(process_pdf_mem(&buf), "plain text");
 }
 
 #[test]
@@ -5345,4 +5518,633 @@ BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
         !md.contains("List of figures vii List of tables"),
         "entries interleaved into a paragraph: {md}"
     );
+}
+
+// =========================================================================
+// Display frame: positions and regions on the rendered page
+// =========================================================================
+
+fn display_items(buf: &[u8]) -> Vec<TextItem> {
+    extract_text_with_positions_mem_in_frame(buf, None, PositionFrame::Display).unwrap()
+}
+
+fn display_region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem_in_frame(buf, &[(0, vec![region])], PositionFrame::Display)
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+/// Both extractions report the same items with the same geometry, exactly.
+fn assert_same_geometry(expected: &[TextItem], actual: &[TextItem]) {
+    assert_eq!(expected.len(), actual.len(), "{expected:#?}\n{actual:#?}");
+    for (e, a) in expected.iter().zip(actual) {
+        assert_eq!(e.text, a.text);
+        assert_eq!(e.page, a.page);
+        assert_eq!(
+            (e.x, e.y, e.width, e.height, e.rotation),
+            (a.x, a.y, a.width, a.height, a.rotation),
+            "{:?}",
+            e.text
+        );
+    }
+}
+
+#[test]
+fn test_display_frame_equals_sheet_frame_on_unrotated_pages() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    // The default frame is unchanged and is what `PositionFrame::Sheet` names.
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&sheet, "Anchor");
+    assert_eq!(
+        (anchor.x, anchor.y, anchor.height, anchor.rotation),
+        (72.0, 700.0, 12.0, 0.0)
+    );
+    let explicit =
+        extract_text_with_positions_mem_in_frame(&buf, None, PositionFrame::Sheet).unwrap();
+    assert_same_geometry(&sheet, &explicit);
+
+    // Without a /Rotate the rendered page is the sheet, so both frames agree
+    // for items and for regions.
+    assert_same_geometry(&sheet, &display_items(&buf));
+    let region = item_region(anchor, 792.0);
+    assert_eq!(region_text(&buf, region).trim(), "Anchor");
+    assert_eq!(display_region_text(&buf, region).trim(), "Anchor");
+
+    // The rotations variant takes the same page filter as the positions one.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Display,
+    )
+    .unwrap();
+    assert_same_geometry(&sheet, &items);
+    assert!(rotations.is_empty());
+    let absent: HashSet<u32> = [2].into_iter().collect();
+    let (items, _) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&absent),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(items.is_empty());
+}
+
+#[test]
+fn test_positions_and_rotations_honour_the_page_filter() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let pages: HashSet<u32> = [2].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(!items.is_empty());
+    assert!(items.iter().all(|item| item.page == 2));
+    assert!(rotations.is_empty());
+    let filtered =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&pages))
+            .unwrap();
+    assert_same_geometry(&filtered, &items);
+}
+
+#[test]
+fn test_display_frame_renders_bottom_to_top_text_under_rotate_90() {
+    // Two lines reading bottom-to-top, the second 30pt to the right of the
+    // first: a page laid out sideways that `/Rotate 90` displays upright.
+    let content = "BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+
+    // The sheet frame turns the page so the runs read along +x ...
+    let (sheet, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Ccw));
+    let hello = find_item(&sheet, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, -40.0);
+    assert_eq!(hello.rotation, 0.0);
+
+    // ... and the display frame puts them where a renderer draws them: on
+    // the 792 x 612 rendered page, a horizontal line starting 420pt from the
+    // left edge whose top sits 40 - 12 = 28pt below the top edge.
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(
+        rotations.get(&1),
+        Some(&PageRotation::Ccw),
+        "the turn is still reported"
+    );
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, 612.0 - 40.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    assert!(
+        hello.width > 30.0 && hello.width < 50.0,
+        "width = {}",
+        hello.width
+    );
+    let world = find_item(&display, "WORLD");
+    assert_close(world.x, 420.0);
+    assert_close(world.y, 612.0 - 70.0);
+    assert_eq!(world.rotation, 0.0);
+    assert!(hello.y > world.y, "HELLO renders above WORLD");
+
+    // Region rects on the rendered page (top-left origin) select exactly the
+    // line they cover: HELLO occupies y ∈ [28, 40], WORLD y ∈ [58, 70].
+    let hello_rect = [400.0, 20.0, 700.0, 45.0];
+    let world_rect = [400.0, 55.0, 700.0, 75.0];
+    assert_eq!(display_region_text(&buf, hello_rect).trim(), "HELLO");
+    assert_eq!(display_region_text(&buf, world_rect).trim(), "WORLD");
+    // Read in the sheet frame, the same rects land on empty paper.
+    assert_eq!(region_text(&buf, hello_rect).trim(), "");
+}
+
+#[test]
+fn test_display_frame_renders_top_to_bottom_text_under_rotate_270() {
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(270), None);
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+
+    // Sheet box x ∈ [300, 312], y ∈ [700 - advance, 700]; `/Rotate 270`
+    // renders it as a horizontal line at x = 792 - 700 with its baseline at
+    // y = 300 on the 792 x 612 page.
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 92.0);
+    assert_close(hello.y, 300.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    let second = find_item(&display, "SECOND");
+    assert_close(second.x, 92.0);
+    assert_close(second.y, 270.0);
+    assert!(hello.y > second.y, "HELLO renders above SECOND");
+
+    // HELLO's band is y ∈ [300, 312] from the top, SECOND's y ∈ [330, 342].
+    assert_eq!(
+        display_region_text(&buf, [80.0, 295.0, 200.0, 315.0]).trim(),
+        "HELLO"
+    );
+    assert_eq!(
+        display_region_text(&buf, [80.0, 325.0, 200.0, 345.0]).trim(),
+        "SECOND"
+    );
+}
+
+#[test]
+fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    // `/Rotate 180` on the /Pages node only.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, None, Some(180));
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor_sheet = find_item(&sheet, "Anchor");
+    assert_eq!((anchor_sheet.x, anchor_sheet.y), (72.0, 700.0));
+
+    let display = display_items(&buf);
+    let anchor = find_item(&display, "Anchor");
+    assert_close(anchor.x, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.y, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.width, anchor_sheet.width);
+    assert_close(anchor.height, 12.0);
+    assert_eq!(anchor.rotation, 180.0);
+    let second = find_item(&display, "Second");
+    assert_close(second.y, 792.0 - 680.0 - 12.0);
+    // Anchor's band on the 612 x 792 rendered page is y ∈ [700, 712] from
+    // the top; Second sits above it at y ∈ [680, 692].
+    assert_eq!(
+        display_region_text(&buf, [400.0, 695.0, 560.0, 715.0]).trim(),
+        "Anchor"
+    );
+
+    // The page's own /Rotate wins over the inherited one.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), Some(180));
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 700.0);
+    assert_close(anchor.y, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.width, 12.0);
+    assert_close(anchor.height, anchor_sheet.width);
+    assert_eq!(anchor.rotation, 270.0);
+
+    // A negative angle folds the way renderers fold it: -90 is 270.
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(-90), None);
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.y, 72.0);
+    assert_eq!(anchor.rotation, 90.0);
+}
+
+#[test]
+fn test_display_frame_with_an_offset_cropbox_under_rotate_90() {
+    // MediaBox 400 x 500 with CropBox [50 60 350 460]: a 300 x 400 visible
+    // box that `/Rotate 90` renders as a 400 x 300 page.
+    let content =
+        "BT /F1 12 Tf 120 300 Td (Visible glyph) Tj ET\nBT /F1 12 Tf 120 280 Td (Second line) Tj ET";
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 400 500",
+        Some("50 60 350 460"),
+        Some(90),
+        None,
+    );
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph_sheet = find_item(&sheet, "Visible glyph");
+    assert_close(glyph_sheet.x, 70.0);
+    assert_close(glyph_sheet.y, 240.0);
+
+    let display = display_items(&buf);
+    let glyph = find_item(&display, "Visible glyph");
+    assert_close(glyph.x, 240.0);
+    assert_close(glyph.y, 300.0 - 70.0 - glyph_sheet.width);
+    assert_close(glyph.width, 12.0);
+    assert_close(glyph.height, glyph_sheet.width);
+    assert_eq!(glyph.rotation, 270.0);
+
+    // Its own box on the 400 x 300 rendered page selects it alone.
+    let text = display_region_text(&buf, item_region(glyph, 300.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+}
+
+#[test]
+fn test_display_frame_region_tables_follow_the_rect_frame() {
+    // A small aligned grid on a page displayed sideways: the table detector
+    // sees the same items whether the region arrives in the sheet frame or,
+    // turned, in the display frame.
+    let content = "BT /F1 12 Tf 72 700 Td (Name) Tj ET\n\
+BT /F1 12 Tf 200 700 Td (Qty) Tj ET\n\
+BT /F1 12 Tf 330 700 Td (Price) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Apple) Tj ET\n\
+BT /F1 12 Tf 200 680 Td (3) Tj ET\n\
+BT /F1 12 Tf 330 680 Td (1.50) Tj ET\n\
+BT /F1 12 Tf 72 660 Td (Pear) Tj ET\n\
+BT /F1 12 Tf 200 660 Td (5) Tj ET\n\
+BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+    let sheet_rect = [60.0, 80.0, 400.0, 137.0];
+    // The same area on the 792 x 612 rendered page.
+    let display_rect = [792.0 - 137.0, 60.0, 792.0 - 80.0, 400.0];
+
+    let from_sheet = extract_tables_in_regions_mem(&buf, &[(0, vec![sheet_rect])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0);
+    let from_display = extract_tables_in_regions_mem_in_frame(
+        &buf,
+        &[(0, vec![display_rect])],
+        PositionFrame::Display,
+    )
+    .unwrap()
+    .remove(0)
+    .regions
+    .remove(0);
+    assert_eq!(
+        from_display.text,
+        "|Name|Qty|Price|\n|---|---|---|\n|Apple|3|1.50|\n|Pear|5|2.25|\n"
+    );
+    assert_eq!(from_display.text, from_sheet.text);
+    assert!(!from_display.needs_ocr);
+    assert_eq!(from_display.needs_ocr, from_sheet.needs_ocr);
+
+    // Text regions agree too, and the display rect read in the sheet frame
+    // misses the grid entirely.
+    let text_from_sheet = region_text(&buf, sheet_rect);
+    assert!(text_from_sheet.contains("Apple"), "got {text_from_sheet:?}");
+    assert_eq!(display_region_text(&buf, display_rect), text_from_sheet);
+    assert_eq!(region_text(&buf, display_rect).trim(), "");
+}
+
+// =========================================================================
+// Font weight: the `font_weight` field and the `bold_from_weight` option
+// =========================================================================
+
+/// One page whose single line is set in three non-embedded faces that differ
+/// only in weight: `Face-Lt` and `Face-Md` name theirs, the third has an
+/// opaque name and says `/FontWeight 700` in its descriptor. None of them is
+/// bold by the flags or the name words the default extraction reads.
+fn synthetic_three_weights_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let mut font = |base_font: &str, font_weight: Option<i64>| {
+        let mut descriptor = dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => base_font,
+            "Flags" => 32,
+            "ItalicAngle" => 0,
+        };
+        if let Some(weight) = font_weight {
+            descriptor.set("FontWeight", weight);
+        }
+        let descriptor_id = doc.add_object(descriptor);
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => base_font,
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths.clone()),
+            "FontDescriptor" => descriptor_id,
+        })
+    };
+    let light = font("ABCDEF+Face-Lt", None);
+    let medium = font("ABCDEF+Face-Md", None);
+    let heavy = font("ABCDEF+Opaque", Some(700));
+
+    let content =
+        b"BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => light,
+                "F2" => medium,
+                "F3" => heavy,
+            },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn text_and_style(items: &[TextItem]) -> Vec<(String, bool, Option<u16>)> {
+    items
+        .iter()
+        .map(|item| (item.text.clone(), item.is_bold, item.font_weight))
+        .collect()
+}
+
+#[test]
+fn test_font_weight_is_reported_and_bold_from_weight_is_off_by_default() {
+    let buf = synthetic_three_weights_pdf();
+
+    // Default: the three runs merge into one item as they always did, none
+    // is bold, and the item carries its first run's weight class.
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert_eq!(
+        text_and_style(&plain),
+        [
+            ("Light Medium Heavy".to_string(), false, Some(300)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+
+    // Default options are the default extraction, item for item.
+    let explicit =
+        extract_text_with_positions_mem_with_options(&buf, None, PositionOptions::new()).unwrap();
+    assert_same_geometry(&plain, &explicit);
+    assert_eq!(text_and_style(&plain), text_and_style(&explicit));
+    let (rotated, rotations) = extract_text_with_positions_and_rotations_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&plain), text_and_style(&rotated));
+    assert!(rotations.is_empty());
+}
+
+#[test]
+fn test_bold_from_weight_keeps_weights_apart_and_reads_bold_from_600() {
+    let buf = synthetic_three_weights_pdf();
+    let options = PositionOptions::new().bold_from_weight(true);
+
+    // Runs of different weight stay separate items; the 700 face is bold,
+    // the 300 and 500 faces are not; same-weight runs still merge.
+    let weighted = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(
+        text_and_style(&weighted),
+        [
+            ("Light ".to_string(), false, Some(300)),
+            ("Medium ".to_string(), false, Some(500)),
+            ("Heavy".to_string(), true, Some(700)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+    let light = find_item(&weighted, "Light");
+    let medium = find_item(&weighted, "Medium");
+    let heavy = find_item(&weighted, "Heavy");
+    assert_close(light.x, 72.0);
+    assert_close(medium.x, light.x + light.width);
+    assert_close(heavy.x, medium.x + medium.width);
+    for item in &weighted {
+        assert_close(
+            item.y,
+            if item.text.starts_with("Same") {
+                680.0
+            } else {
+                700.0
+            },
+        );
+    }
+
+    // The rotations variant and the page filter take the same options.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, _) =
+        extract_text_with_positions_and_rotations_mem_with_options(&buf, Some(&pages), options)
+            .unwrap();
+    assert_eq!(text_and_style(&items), text_and_style(&weighted));
+
+    // A region's text reads the same whether or not the runs were kept
+    // apart: the option changes items, not the words on the page.
+    let region = [60.0, 792.0 - 712.0, 400.0, 792.0 - 676.0];
+    let plain_region = extract_text_in_regions_mem(&buf, &[(0, vec![region])]).unwrap();
+    let weighted_region =
+        extract_text_in_regions_mem_with_options(&buf, &[(0, vec![region])], options).unwrap();
+    assert_eq!(
+        weighted_region[0].regions[0].text,
+        plain_region[0].regions[0].text
+    );
+    assert!(plain_region[0].regions[0]
+        .text
+        .contains("Light Medium Heavy"));
+}
+
+// ---------------------------------------------------------------------------
+// Text painted outside its clip
+// ---------------------------------------------------------------------------
+
+/// Body text, a rectangular clip around a plot area with a legend inside it,
+/// three runs the same clip hides (below and to the right of the plot area,
+/// one of them shown with `'`), one run straddling the clip's bottom edge,
+/// and body text after the clip is restored.
+fn make_clipped_text_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 12 Tf 72 720 Td (Body text above the plot) Tj ET\n\
+         q 72 400 300 200 re W n\n\
+         BT /F1 12 Tf 80 500 Td (Legend inside the plot) Tj ET\n\
+         BT /F1 12 Tf 80 300 Td (Hidden below the plot) Tj ET\n\
+         BT /F1 12 Tf 400 500 Td (Hidden right of the plot) Tj ET\n\
+         BT /F1 12 Tf 14 TL 80 300 Td (Hidden below via quote) ' ET\n\
+         BT /F1 12 Tf 80 395 Td (Straddles the bottom edge) Tj ET\n\
+         Q\n\
+         BT /F1 12 Tf 72 200 Td (Body text after the clip ends) Tj ET",
+        "0 0 612 792",
+    )
+}
+
+const CLIPPED_PDF_KEPT: [&str; 4] = [
+    "Body text above the plot",
+    "Legend inside the plot",
+    "Straddles the bottom edge",
+    "Body text after the clip ends",
+];
+const CLIPPED_PDF_HIDDEN: [&str; 3] = [
+    "Hidden below the plot",
+    "Hidden right of the plot",
+    "Hidden below via quote",
+];
+
+fn joined_text(items: &[TextItem]) -> String {
+    items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// A run the active rectangular clip hides entirely is invisible on the
+/// rendered page and must not be extracted; runs inside the clip, runs
+/// straddling its edge and runs shown after the clip is restored stay.
+#[test]
+fn test_text_painted_outside_its_clip_is_not_extracted() {
+    let buf = make_clipped_text_pdf();
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(text.contains(kept), "{kept:?} missing from {text:?}");
+    }
+    for hidden in CLIPPED_PDF_HIDDEN {
+        assert!(
+            !text.contains(hidden),
+            "{hidden:?} is clipped away and must not be extracted, got {text:?}"
+        );
+    }
+}
+
+/// The region API sees the same page: the hidden runs neither appear in a
+/// full-page region nor in a region drawn around where they were painted,
+/// and the page's visible text keeps the invisible-layer retry from firing.
+#[test]
+fn test_region_text_omits_runs_painted_outside_their_clip() {
+    let buf = make_clipped_text_pdf();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(
+            page.text.contains(kept),
+            "{kept:?} missing from {:?}",
+            page.text
+        );
+    }
+    assert!(!page.text.contains("Hidden"), "{:?}", page.text);
+    assert!(!page.needs_ocr);
+
+    // Top-left page coordinates over the band the two hidden runs below the
+    // plot were painted in (y 286..312 from the bottom on a 792 pt page).
+    let band = [60.0, 792.0 - 320.0, 400.0, 792.0 - 280.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![band])]).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.trim().is_empty(),
+        "nothing visible is painted in the band, got {:?}",
+        region.text
+    );
+}
+
+/// Only a single axis-aligned rectangle establishes what a clip hides. A
+/// path clip and a rectangle drawn under a turned CTM say nothing about
+/// their extent, so text under them is kept even when it lies outside the
+/// path's bounds.
+#[test]
+fn test_text_under_an_unknown_clip_is_kept() {
+    let buf = make_text_pdf(
+        "q 72 400 m 372 400 l 222 600 l h W n\n\
+         BT /F1 12 Tf 80 300 Td (Under a path clip) Tj ET Q\n\
+         q 0.7071 0.7071 -0.7071 0.7071 0 0 cm 0 0 100 100 re W n\n\
+         0.7071 -0.7071 0.7071 0.7071 0 0 cm\n\
+         BT /F1 12 Tf 80 300 Td (Under a turned clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(text.contains("Under a path clip"), "{text:?}");
+    assert!(text.contains("Under a turned clip"), "{text:?}");
+}
+
+/// Nested rectangles intersect and `Q` restores the outer clip: the same
+/// run is hidden under the inner clip and visible once it is restored.
+#[test]
+fn test_nested_clips_intersect_and_restore() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n\n\
+         q 100 450 50 50 re W n\n\
+         BT /F1 12 Tf 80 560 Td (Hidden by the inner clip) Tj ET Q\n\
+         BT /F1 12 Tf 80 560 Td (Visible under the outer clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(!text.contains("Hidden by the inner clip"), "{text:?}");
+    assert!(text.contains("Visible under the outer clip"), "{text:?}");
+}
+
+/// A page whose every run is clipped out of view has no text on it. Unlike
+/// an invisible (Tr 3) OCR layer, which transcribes the visible raster, the
+/// runs describe nothing that can be seen, so the region API must not adopt
+/// them through its invisible-layer retry: the region is empty and goes to
+/// OCR like an image-only page.
+#[test]
+fn test_page_with_only_clipped_away_text_reports_no_native_text() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n BT /F1 12 Tf 16 TL 80 300 Td \
+         (The quick brown fox jumps over the lazy dog) Tj T* \
+         (Pack my box with five dozen liquor jugs tonight) Tj T* \
+         (Sphinx of black quartz judge my vow carefully) Tj ET Q",
+        "0 0 612 792",
+    );
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().all(|item| !item.text.contains("quick")),
+        "{:?}",
+        joined_text(&items)
+    );
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    assert!(
+        page.text.trim().is_empty(),
+        "clipped-away runs must not come back through the invisible-layer retry, got {:?}",
+        page.text
+    );
+    assert!(page.needs_ocr);
 }

@@ -7,15 +7,125 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.21.0] - 2026-09-18
+
+Changes since 1.20.0.
+
+### Added
+
+- `TextItem::font_weight`: the font's weight class on the 100..=900 scale
+  (400 regular, 700 bold), read from the embedded font program's OS/2
+  `usWeightClass`, else the FontDescriptor's `/FontWeight`, else a weight word
+  in the font name, foundry abbreviations included ("Light", "Medium", "-Md",
+  "-Lt", "-Blk", "W6"); `None` when none of them says. Node `fontWeight`
+  (omitted when unknown), Python `font_weight` and the `pdf2md --items-json`
+  field `font_weight` report the same value. `is_bold` is unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
+- An opt-in `bold_from_weight` on the positioned-text and region APIs, next
+  to the frame option: Rust `PositionOptions` with the `_with_options`
+  variants (`extract_text_with_positions_mem_with_options`,
+  `extract_text_with_positions_and_rotations_mem_with_options`,
+  `extract_text_in_regions_mem_with_options`,
+  `extract_tables_in_regions_mem_with_options`), Node `{ boldFromWeight: true }`
+  in the options of the same four functions, Python `bold_from_weight=True`
+  on `extract_text_with_positions`, `extract_text_with_positions_and_rotations`,
+  `extract_text_in_regions` and their `_bytes` variants. When on, `is_bold` is
+  also `true` for a weight class of 600 or more, and adjacent runs whose
+  weight class differs stay separate items instead of merging, so a heavier
+  run inside a lighter paragraph keeps its own item. Off by default, where
+  `is_bold` and item merging are unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
 
 ### Fixed
 
+- Text painted wholly outside the rectangular clip in force when it was
+  shown is no longer extracted. Such runs are invisible on the rendered page
+  — labels a charting library parks off its plot area, content the producer
+  cropped away — yet used to come back as ordinary text and leak into the
+  words around the figure, on every API. Only a single finite, axis-aligned
+  rectangle clip counts (nested `q`/`Q` and intersections of rectangles
+  included); text under a path, text-mode or turned clip is kept as before,
+  as are runs inside Form XObjects, rotated runs and runs whose advance is
+  unknown. A run has to lie a quarter of its height clear of the clip on
+  every side, so glyphs straddling an edge stay. Unlike render-mode-3 text,
+  the left-out runs are not an invisible layer that transcribes the page:
+  `include_invisible` does not bring them back, and a page whose every run
+  is clipped away reports no text, like an image-only page.
+  ([#539](https://github.com/firecrawl/pdf-inspector/pull/539))
+- A file whose `%PDF-` header is preceded by other bytes — an echoed
+  multipart envelope, a line of text — is no longer rejected as not a PDF,
+  on every API. The header is located within the first 1024 bytes, as
+  mupdf, pdfium and poppler do, and the file is read from there so its
+  cross-reference offsets stay exact; a canonical `%PDF-M.N` header line
+  outranks a version-like mention in the leading bytes. A byte order mark
+  or whitespace before the header was already tolerated, and a bare `%PDF`
+  without the dash is still not a header.
+  ([#538](https://github.com/firecrawl/pdf-inspector/pull/538))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `font_weight` field (`None`
+  for items whose weight class is unknown).
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
+
+## [1.20.0] - 2026-09-14
+
+Changes since 1.19.0.
+
+### Added
+
+- An optional display frame for the positioned-text and region APIs. Rust
+  `extract_text_with_positions_mem_in_frame`,
+  `extract_text_with_positions_and_rotations_mem_in_frame`,
+  `extract_text_in_regions_mem_in_frame` and
+  `extract_tables_in_regions_mem_in_frame` take a `PositionFrame`; Node
+  `extractTextWithPositions`, `extractTextWithPositionsAndRotations`,
+  `extractTextInRegions` and `extractTablesInRegions` take an optional
+  `{ frame: "sheet" | "display" }`. `"display"` reports items in, and reads
+  region rects from, the rendered page — the visible page box turned clockwise
+  by the page's inheritable `/Rotate`, with the turn of a predominantly rotated
+  page undone — so boxes line up with a rendered page image. `"sheet"`, the
+  default, is unchanged. `extractTextWithPositionsAndRotations` also accepts
+  the same 1-indexed `pages` filter as `extractTextWithPositions`.
+  ([#533](https://github.com/firecrawl/pdf-inspector/pull/533))
+
+### Fixed
+
+- Preserve word spaces painted as separate whitespace runs squeezed by
+  negative character spacing, so adjacent words no longer merge.
+  ([#517](https://github.com/firecrawl/pdf-inspector/pull/517))
+- Read blank, advancing glyphs in symbolic TrueType fonts as word spaces
+  while preserving invisible text layers and formatting characters.
+  ([#521](https://github.com/firecrawl/pdf-inspector/pull/521))
+- Recover text from cmap-less TrueType subsets using standard Macintosh
+  glyph ordering when the embedded font's metrics corroborate the mapping.
+  ([#522](https://github.com/firecrawl/pdf-inspector/pull/522))
+- Decode painted glyphs when `ActualText` contains replacement characters,
+  and keep spaced or separately painted dot leaders with their text line.
+  ([#523](https://github.com/firecrawl/pdf-inspector/pull/523))
+- Start `TJ` sub-runs at their first painted glyph after leading positioning
+  offsets, correcting their bounds and the order of split words.
+  ([#527](https://github.com/firecrawl/pdf-inspector/pull/527))
+- Word spaces carried by character spacing instead of space glyphs — the two
+  glyphs around a word boundary shown as one string with a `Tc` as wide as a
+  word space, the spacing taken back with a positive `TJ` offset or by
+  positioning the next run — no longer glue their words together
+  ("sendtoMars"). Such a string reads with its spaces once the spacing after
+  it is seen to be taken back; tracked display text, whose spacing never is,
+  keeps its letters together.
+  ([#530](https://github.com/firecrawl/pdf-inspector/pull/530))
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+  ([#493](https://github.com/firecrawl/pdf-inspector/pull/493))
+
+### Changed
+
+- Upgrade `lopdf` to 0.45.0 for improved recovery of malformed cross-reference
+  entries and `startxref` / `/Prev` offsets.
+  ([#534](https://github.com/firecrawl/pdf-inspector/pull/534))
 
 ## [1.19.0] - 2026-09-09
 

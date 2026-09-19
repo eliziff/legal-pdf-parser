@@ -392,6 +392,7 @@ impl<'a> Expander<'a> {
         stream: &'a Stream,
         parent_resources: &Resources<'a>,
     ) {
+        self.push(Operation::new("_FormBoundary", Vec::new()));
         if self.form_invocations >= self.max_invocations {
             self.form_truncated = true;
             return;
@@ -431,6 +432,7 @@ impl<'a> Expander<'a> {
             }
             self.expand_stream(operations.iter().cloned(), resources, true);
             self.push(Operation::new("Q", Vec::new()));
+            self.push(Operation::new("_FormBoundary", Vec::new()));
         } else {
             log::warn!("skipping undecodable Form XObject {id:?}");
         }
@@ -1656,5 +1658,58 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
             b"BT /F1 12 Tf 72 700 Td (for) Tj -6 Tc 1 0 0 1 60 700 Tm [-2800 ( )] TJ 0 Tc 1 0 0 1 94.8 700 Tm (the) Tj ET",
         );
         find(&items, "for the");
+    }
+
+    /// Word gaps carried by character spacing inside a form read as word
+    /// spaces once the spacing is taken back, for every show operator —
+    /// `"` sets the spacing itself; spacing that stays is tracking.
+    #[test]
+    fn character_spacing_word_gaps_inside_form_read_as_word_spaces() {
+        for (content, expected) in [
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 300 (oM)] TJ 0 Tc 30 0 Td (ars) Tj ET",
+                "send to Mars",
+            ),
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td (dt) Tj 0 Tc 15 0 Td (o) Tj ET",
+                "send to",
+            ),
+            ("BT /F1 10 Tf 12 TL 72 712 Td 3 Tc (dt) ' 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 12 TL 72 712 Td 0 3 (dt) \" 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc [(dt) 20] TJ 0 Tc 14.8 0 Td (o) Tj ET", "d to"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj 18 0 Td (o) Tj ET", "dto"),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (HEADING) Tj ET", "HEADING"),
+        ] {
+            let items = form_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}: {items:?}");
+        }
+    }
+
+    /// An XObject painted between a candidate and the run that would have
+    /// taken its spacing back belongs to another stream: the candidate is
+    /// dropped, on the page and inside a form alike.
+    #[test]
+    fn an_xobject_in_between_drops_the_word_gap_candidate() {
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj q /X1 Do Q 0 Tc 15 0 Td (o) Tj ET q /X2 Do Q",
+            &[
+                b"",
+                b"BT /F1 10 Tf 72 600 Td 3 Tc (dt) Tj q /X1 Do Q 0 Tc 15 0 Td (o) Tj ET",
+            ],
+        );
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontProductCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["dto", "dto"], "{items:?}");
     }
 }
