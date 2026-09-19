@@ -6,6 +6,7 @@ mod base14;
 mod clip_boundaries;
 mod content_decode;
 pub(crate) mod content_stream;
+pub(crate) mod display_frame;
 mod fonts;
 pub(crate) mod geometry;
 mod layout;
@@ -15,6 +16,7 @@ mod reading_order;
 mod scripts;
 mod text_paint;
 pub(crate) mod underline;
+pub(crate) mod word_gaps;
 mod xobjects;
 pub(crate) use xobjects::annotation_appearances;
 
@@ -29,7 +31,68 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::extract_page_text_items_with_options;
+pub(crate) use content_stream::TextExtractionOptions;
+pub(crate) use display_frame::DisplayPage;
+pub use display_frame::PositionFrame;
+
+/// Options of the positioned-text and region APIs, taken by their
+/// `_with_options` variants ([`extract_text_with_positions_mem_with_options`],
+/// [`extract_text_with_positions_and_rotations_mem_with_options`],
+/// [`extract_text_in_regions_mem_with_options`](crate::extract_text_in_regions_mem_with_options),
+/// [`extract_tables_in_regions_mem_with_options`](crate::extract_tables_in_regions_mem_with_options)).
+/// The default is what the plain and `_in_frame` variants do.
+///
+/// ```
+/// use pdf_inspector::{PositionFrame, PositionOptions};
+///
+/// let options = PositionOptions::new()
+///     .frame(PositionFrame::Display)
+///     .bold_from_weight(true);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PositionOptions {
+    /// Coordinate frame items are reported in and region rects are read
+    /// in; [`PositionFrame::Sheet`] by default.
+    pub frame: PositionFrame,
+    /// Read bold from the font's weight class as well. When set,
+    /// `TextItem::is_bold` is also `true` for items whose
+    /// `TextItem::font_weight` is 600 (SemiBold) or more, and adjacent runs
+    /// whose `font_weight` differs stay separate items instead of merging,
+    /// so a heavier run inside a lighter paragraph keeps its own item. Off
+    /// by default: `is_bold` and item merging are then exactly what they
+    /// were before the option existed, and `font_weight` is reported
+    /// either way.
+    pub bold_from_weight: bool,
+}
+
+impl PositionOptions {
+    /// The defaults: sheet frame, bold not read from the weight class.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the coordinate frame.
+    pub fn frame(mut self, frame: PositionFrame) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    /// Set whether bold is also read from the weight class.
+    pub fn bold_from_weight(mut self, bold_from_weight: bool) -> Self {
+        self.bold_from_weight = bold_from_weight;
+        self
+    }
+
+    /// The content-stream switches these options ask for.
+    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
+        TextExtractionOptions {
+            include_invisible,
+            bold_from_weight: self.bold_from_weight,
+        }
+    }
+}
 use links::{extract_form_fields, extract_page_links};
 pub(crate) use page_box::{visible_page_box, PageBox};
 
@@ -202,7 +265,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
     let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, false)?;
     Ok(extraction)
 }
 
@@ -218,8 +281,45 @@ pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines, _rules) =
-        extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
+    extract_text_with_positions_mem_in_frame(buffer, page_filter, PositionFrame::Sheet)
+}
+
+/// Extract text with positions from a memory buffer in the given coordinate
+/// frame, limited to specific pages.
+///
+/// [`PositionFrame::Sheet`] is the frame of [`extract_text_with_positions`]:
+/// the visible page box as laid out in the content stream, `/Rotate` not
+/// applied, with predominantly rotated pages turned so their text reads
+/// left-to-right. [`PositionFrame::Display`] reports every item — text and
+/// image placeholders, links and form fields alike — in the rendered page's
+/// frame instead: the visible box turned clockwise by the page's inheritable
+/// `/Rotate`, lower-left origin, `y` up, with the turn of a rotated page
+/// undone first. Baseline angles (`TextItem::rotation`) are expressed in the
+/// same frame, so text that renders horizontally reads as `0`.
+pub fn extract_text_with_positions_mem_in_frame(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    frame: PositionFrame,
+) -> Result<Vec<TextItem>, PdfError> {
+    extract_text_with_positions_mem_with_options(
+        buffer,
+        page_filter,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_with_positions_mem_in_frame`] with every option of the
+/// positioned-text APIs given as a [`PositionOptions`]: the frame, and
+/// whether bold is also read from the font's weight class
+/// (`bold_from_weight`). The default options are that function with
+/// [`PositionFrame::Sheet`].
+pub fn extract_text_with_positions_mem_with_options(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _page_rotations) =
+        extract_text_with_positions_and_rotations_mem_with_options(buffer, page_filter, options)?;
     Ok(items)
 }
 
@@ -235,25 +335,50 @@ pub fn extract_text_with_positions_mem_pages(
 pub fn extract_text_with_positions_and_rotations_mem(
     buffer: &[u8],
 ) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
-    crate::validate_pdf_bytes(buffer)?;
-    let (doc, _) = crate::load_document_from_mem(buffer)?;
-    let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((items, _rects, _lines, _rules), _thresholds, _gid_pages, page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, None)?;
-    Ok((items, page_rotations))
+    extract_text_with_positions_and_rotations_mem_in_frame(buffer, None, PositionFrame::Sheet)
 }
 
-/// Extract text with positions and rectangles from memory buffer.
-pub(crate) fn extract_text_with_positions_mem_and_rects(
+/// [`extract_text_with_positions_and_rotations_mem`] limited to specific
+/// pages and reporting items in the given coordinate frame (see
+/// [`extract_text_with_positions_mem_in_frame`]).
+///
+/// The returned map names the pages whose text was predominantly rotated
+/// whatever the frame: in the display frame their turn has already been
+/// undone, so the map is informational there.
+pub fn extract_text_with_positions_and_rotations_mem_in_frame(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
-) -> Result<PageExtraction, PdfError> {
+    frame: PositionFrame,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    extract_text_with_positions_and_rotations_mem_with_options(
+        buffer,
+        page_filter,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_with_positions_and_rotations_mem_in_frame`] with every
+/// option given as a [`PositionOptions`] — see
+/// [`extract_text_with_positions_mem_with_options`].
+pub fn extract_text_with_positions_and_rotations_mem_with_options(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
-    Ok(extraction)
+    let ((mut items, _rects, _lines, _rules), _thresholds, _gid_pages, page_rotations) =
+        extract_positioned_text_from_doc_in_page_box(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            options.bold_from_weight,
+        )?;
+    if options.frame == PositionFrame::Display {
+        display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
+    }
+    Ok((items, page_rotations))
 }
 
 /// One page's geometry in the visible-page-box frame, from
@@ -289,6 +414,31 @@ pub(crate) fn extract_page_text_items_in_page_box(
     style_cache: &mut FontProductCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<PageBoxExtraction, PdfError> {
+    extract_page_text_items_in_page_box_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        TextExtractionOptions {
+            include_invisible,
+            ..TextExtractionOptions::default()
+        },
+        style_cache,
+        form_budget,
+    )
+}
+
+/// [`extract_page_text_items_in_page_box`] with every content-stream switch
+/// given.
+pub(crate) fn extract_page_text_items_in_page_box_with_options(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    style_cache: &mut FontProductCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<PageBoxExtraction, PdfError> {
     let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
     let (
         (mut items, mut rects, mut lines, _rules),
@@ -296,12 +446,12 @@ pub(crate) fn extract_page_text_items_in_page_box(
         coords_rotated,
         skipped_invisible,
         _,
-    ) = extract_page_text_items(
+    ) = extract_page_text_items_with_options(
         doc,
         page_id,
         page_num,
         font_cmaps,
-        include_invisible,
+        options,
         style_cache,
         form_budget,
     )?;
@@ -341,7 +491,7 @@ pub(crate) fn extract_positioned_text_from_doc(
         doc,
         font_cmaps,
         page_filter,
-        false,
+        TextExtractionOptions::default(),
         None,
         true,
         true,
@@ -369,7 +519,7 @@ fn extract_positioned_text_from_doc_preserving_scripts(
         doc,
         font_cmaps,
         page_filter,
-        false,
+        TextExtractionOptions::default(),
         None,
         true,
         false,
@@ -396,7 +546,7 @@ fn extract_positioned_text_from_doc_raw(
         doc,
         font_cmaps,
         page_filter,
-        false,
+        TextExtractionOptions::default(),
         None,
         false,
         false,
@@ -423,7 +573,7 @@ fn extract_positioned_text_from_doc_fidelity(
         doc,
         font_cmaps,
         page_filter,
-        false,
+        TextExtractionOptions::default(),
         None,
         false,
         false,
@@ -436,12 +586,16 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    bold_from_weight: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     let (extraction, thresholds, gid_pages, _, rotations) = extract_positioned_text_impl(
         doc,
         font_cmaps,
         page_filter,
-        false,
+        TextExtractionOptions {
+            include_invisible: false,
+            bold_from_weight,
+        },
         None,
         true,
         true,
@@ -489,12 +643,16 @@ fn extract_positioned_text_with_folio_context_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
+    let options = TextExtractionOptions {
+        include_invisible,
+        ..TextExtractionOptions::default()
+    };
     let Some(required_pages) = page_filter else {
         let (extraction, thresholds, gid_pages, _, rotations) = extract_positioned_text_impl(
             doc,
             font_cmaps,
             None,
-            include_invisible,
+            options,
             None,
             true,
             true,
@@ -514,7 +672,7 @@ fn extract_positioned_text_with_folio_context_impl(
         doc,
         font_cmaps,
         Some(required_pages),
-        include_invisible,
+        options,
         None,
         true,
         true,
@@ -551,7 +709,7 @@ fn extract_positioned_text_with_folio_context_impl(
         doc,
         font_cmaps,
         Some(&context_pages),
-        include_invisible,
+        options,
         Some(required_pages),
         true,
         true,
@@ -589,7 +747,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
         doc,
         font_cmaps,
         None,
-        false,
+        TextExtractionOptions::default(),
         Some(required_pages),
         true,
         true,
@@ -603,7 +761,7 @@ fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-    include_invisible: bool,
+    options: TextExtractionOptions,
     required_pages: Option<&HashSet<u32>>,
     merge_text: bool,
     merge_scripts: bool,
@@ -659,47 +817,19 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = if fidelity {
-            content_stream::extract_page_text_items_fidelity(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                include_invisible,
-                &mut font_cache,
-                &mut FormWalkBudget::new(),
-            )
-        } else if !merge_text {
-            content_stream::extract_page_text_items_raw(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                include_invisible,
-                &mut font_cache,
-                &mut FormWalkBudget::new(),
-            )
-        } else if merge_scripts {
-            extract_page_text_items(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                include_invisible,
-                &mut font_cache,
-                &mut FormWalkBudget::new(),
-            )
-        } else {
-            content_stream::extract_page_text_items_preserving_scripts(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                include_invisible,
-                &mut font_cache,
-                &mut FormWalkBudget::new(),
-            )
-        };
+        let page_result = content_stream::extract_page_text_items_impl(
+            doc,
+            page_id,
+            *page_num,
+            font_cmaps,
+            options.include_invisible,
+            &mut font_cache,
+            &mut FormWalkBudget::new(),
+            options.bold_from_weight,
+            merge_text,
+            merge_scripts,
+            fidelity,
+        );
         let (
             (mut items, mut rects, mut lines, mut rules),
             has_gid_fonts,
@@ -1253,7 +1383,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
 /// Han/Kana scripts write without inter-word spaces. Hangul (Korean) DOES
 /// space between words and deliberately stays out of this set — a Korean
 /// tracked run keeps normal word-boundary handling.
-fn is_spaceless_cjk(c: char) -> bool {
+pub(crate) fn is_spaceless_cjk(c: char) -> bool {
     matches!(c,
         '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
         | '\u{3040}'..='\u{309F}' // Hiragana
@@ -1454,26 +1584,33 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+#[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    merge_text_items_with_clips(items, &[])
+    merge_text_items_with_clips(items, &[], false)
 }
 fn merge_text_item_refs<'a>(items: impl IntoIterator<Item = &'a TextItem>) -> Vec<TextItem> {
-    merge_text_item_refs_with_clips(items, &HashMap::new())
+    merge_text_item_refs_with_clips(items, &HashMap::new(), false)
 }
+
+/// `keep_weights_apart` refuses to merge runs whose `font_weight` differs
+/// (`PositionOptions::bold_from_weight`), the way bold and plain runs are
+/// already kept apart.
 fn merge_text_items_with_clips(
     items: Vec<TextItem>,
     clips: &[Option<clip_boundaries::ClipRect>],
+    keep_weights_apart: bool,
 ) -> Vec<TextItem> {
     let clip_by_item = items
         .iter()
         .zip(clips)
         .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
         .collect();
-    merge_text_item_refs_with_clips(&items, &clip_by_item)
+    merge_text_item_refs_with_clips(&items, &clip_by_item, keep_weights_apart)
 }
 fn merge_text_item_refs_with_clips<'a>(
     items: impl IntoIterator<Item = &'a TextItem>,
     clip_by_item: &HashMap<*const TextItem, clip_boundaries::ClipRect>,
+    keep_weights_apart: bool,
 ) -> Vec<TextItem> {
     // Group items by (page, Y position) with 5pt tolerance
     let y_tolerance = 5.0;
@@ -1640,7 +1777,8 @@ fn merge_text_item_refs_with_clips<'a>(
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                let bold_boundary = next.is_bold != first.is_bold;
+                let bold_boundary = next.is_bold != first.is_bold
+                    || (keep_weights_apart && next.font_weight != first.font_weight);
                 let explicit_bold_space = bold_boundary
                     && (text.ends_with(char::is_whitespace)
                         || next.text.starts_with(char::is_whitespace));
@@ -1712,6 +1850,7 @@ fn merge_text_item_refs_with_clips<'a>(
                 page: first.page,
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
+                font_weight: first.font_weight,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
                 fidelity: None,
@@ -1860,6 +1999,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             fidelity: None,
@@ -1929,6 +2069,47 @@ mod tests {
         assert!(merged[1].is_italic && !merged[1].is_underline);
         assert!(merged[2].is_underline && !merged[2].is_italic);
         assert!(!merged[3].is_underline && !merged[3].is_italic);
+    }
+
+    #[test]
+    fn weight_boundary_splits_runs_only_when_asked() {
+        // A medium-weight label leading a light paragraph: by default the
+        // runs merge into one item as they always did; with the weights
+        // kept apart the label stays its own item, and the merge still
+        // decides the word space the way an unstyled merge would, so the
+        // later line assembler does not glue "Label:" onto "body".
+        let mut label = make_merge_item("Label:", 100.0, 36.0);
+        label.font_weight = Some(500);
+        let mut body = make_merge_item("body", 137.2, 24.0);
+        body.font_weight = Some(300);
+        let mut more = make_merge_item("text", 163.6, 24.0);
+        more.font_weight = Some(300);
+        let items = vec![label, body, more];
+
+        let merged = merge_text_items_with_clips(items.clone(), &[], false);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Label: body text");
+        assert_eq!(merged[0].font_weight, Some(500));
+
+        let apart = merge_text_items_with_clips(items, &[], true);
+        assert_eq!(apart.len(), 2);
+        assert_eq!(apart[0].text, "Label: ");
+        assert_eq!(apart[0].font_weight, Some(500));
+        assert_eq!(apart[1].text, "body text");
+        assert_eq!(apart[1].font_weight, Some(300));
+        assert!(!apart[0].is_bold, "the merge reads weights, not bold");
+
+        // Runs that agree on their weight, or know none, merge as before.
+        let mut a = make_merge_item("same", 100.0, 24.0);
+        a.font_weight = Some(400);
+        let mut b = make_merge_item("weight", 125.2, 36.0);
+        b.font_weight = Some(400);
+        let unknown = vec![
+            make_merge_item("no", 100.0, 12.0),
+            make_merge_item("weight", 113.2, 36.0),
+        ];
+        assert_eq!(merge_text_items_with_clips(vec![a, b], &[], true).len(), 1);
+        assert_eq!(merge_text_items_with_clips(unknown, &[], true).len(), 1);
     }
 
     #[test]
@@ -2254,6 +2435,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -2276,6 +2458,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -2298,6 +2481,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3090,6 +3274,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3112,6 +3297,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3134,6 +3320,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3167,6 +3354,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3189,6 +3377,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3211,6 +3400,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3246,6 +3436,7 @@ mod tests {
                 page: 1,
                 is_bold: true,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3288,6 +3479,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3331,6 +3523,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3353,6 +3546,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3375,6 +3569,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3405,6 +3600,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             fidelity: None,
@@ -3550,6 +3746,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3572,6 +3769,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3604,6 +3802,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3626,6 +3825,7 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3674,6 +3874,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3726,6 +3927,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3778,6 +3980,7 @@ mod tests {
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
                 is_underline: false,
                 is_strikeout: false,
                 fidelity: None,
@@ -3823,6 +4026,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             fidelity: None,

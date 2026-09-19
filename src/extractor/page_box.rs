@@ -48,6 +48,10 @@ impl PageBox {
         (page_box.x1 > page_box.x0 && page_box.y1 > page_box.y0).then_some(page_box)
     }
 
+    pub fn width(&self) -> f32 {
+        self.x1 - self.x0
+    }
+
     pub fn height(&self) -> f32 {
         self.y1 - self.y0
     }
@@ -386,6 +390,7 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

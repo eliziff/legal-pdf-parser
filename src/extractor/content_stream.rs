@@ -20,9 +20,10 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_fidelity, build_font_widths, build_type3_scales,
-    build_type3_y_flips, compute_string_width_ts, descriptor_style_flags, extract_fidelity_glyphs,
-    extract_text_from_operand, extract_text_from_operand_fidelity, get_font_file2_obj_num,
-    get_operand_bytes, CMapDecisionCache, FontFidelity, FontStyleCache,
+    build_type3_y_flips, compute_string_width_ts, extract_fidelity_glyphs,
+    extract_text_from_operand, extract_text_from_operand_fidelity, font_style,
+    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontFidelity, FontStyle,
+    FontStyleCache,
 };
 use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
@@ -30,6 +31,10 @@ use super::geometry::{
 };
 use super::text_paint::{PaintResources, TextPaint};
 use super::underline::UnderlineLine;
+use super::word_gaps::{
+    offset_takes_spacing_back, word_gap_candidate, word_gap_threshold, PendingWordGaps,
+    WordGapCandidate,
+};
 use super::xobjects::{expand_page_content, FormWalkBudget, MAX_EXPANDED_OPERATIONS};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -42,7 +47,7 @@ struct FontProducts {
     base_names: HashMap<String, String>,
     tounicode_refs: HashMap<String, u32>,
     inline_cmaps: HashMap<String, crate::tounicode::CMapEntry>,
-    style_flags: HashMap<String, (bool, bool)>,
+    style_flags: HashMap<String, FontStyle>,
     fidelity: Option<HashMap<String, FontFidelity>>,
 }
 
@@ -94,8 +99,8 @@ impl FontProductCache {
             {
                 base_names.insert(resource.clone(), String::from_utf8_lossy(name).into_owned());
             }
-            let style = descriptor_style_flags(doc, font, &mut self.style);
-            if style != (false, false) {
+            let style = font_style(doc, font, &mut self.style);
+            if style != FontStyle::default() {
                 style_flags.insert(resource.clone(), style);
             }
             match font.get(b"ToUnicode") {
@@ -654,14 +659,23 @@ impl ActualTextBounds {
     }
 }
 
-/// Returns `(page_extraction, has_gid_fonts, page_rotation, skipped_invisible)`
-/// where `has_gid_fonts` indicates the page uses fonts with unresolvable
-/// gid-encoded glyphs, `page_rotation` says whether (and which way) the
-/// coordinate frame was turned so predominantly rotated text reads along +x
-/// — region boxes must follow it (see `PageRotation`) — and
-/// `skipped_invisible` reports that invisible (Tr 3) text was present but
-/// suppressed — callers can use it to decide whether an `include_invisible`
-/// retry could recover anything at all.
+/// Switches of one page's text extraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TextExtractionOptions {
+    /// Keep invisible (Tr 3) text instead of skipping it.
+    pub(crate) include_invisible: bool,
+    /// Read bold from the weight class too and keep runs of different
+    /// weight apart — see `PositionOptions::bold_from_weight`.
+    pub(crate) bold_from_weight: bool,
+}
+
+/// Weight class from which `bold_from_weight` reads `is_bold`: SemiBold and
+/// heavier.
+pub(crate) const BOLD_WEIGHT_CLASS: u16 = 600;
+
+/// [`extract_page_text_items_with_options`] with only `include_invisible`
+/// set — the shape the extraction tests drive pages through.
+#[cfg(test)]
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -688,44 +702,14 @@ pub(crate) fn extract_page_text_items(
         include_invisible,
         font_cache,
         form_budget,
+        false,
         true,
         true,
         false,
     )
 }
 
-pub(crate) fn extract_page_text_items_preserving_scripts(
-    doc: &Document,
-    page_id: ObjectId,
-    page_num: u32,
-    font_cmaps: &FontCMaps,
-    include_invisible: bool,
-    font_cache: &mut FontProductCache,
-    form_budget: &mut FormWalkBudget,
-) -> Result<
-    (
-        PageExtraction,
-        bool,
-        PageRotation,
-        bool,
-        PageDetectionEvidence,
-    ),
-    PdfError,
-> {
-    extract_page_text_items_impl(
-        doc,
-        page_id,
-        page_num,
-        font_cmaps,
-        include_invisible,
-        font_cache,
-        form_budget,
-        true,
-        false,
-        false,
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn extract_page_text_items_raw(
     doc: &Document,
     page_id: ObjectId,
@@ -755,9 +739,11 @@ pub(crate) fn extract_page_text_items_raw(
         false,
         false,
         false,
+        false,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn extract_page_text_items_fidelity(
     doc: &Document,
     page_id: ObjectId,
@@ -786,11 +772,45 @@ pub(crate) fn extract_page_text_items_fidelity(
         form_budget,
         false,
         false,
+        false,
         true,
     )
 }
 
-fn extract_page_text_items_impl(
+pub(crate) fn extract_page_text_items_with_options(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    font_cache: &mut FontProductCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<
+    (
+        PageExtraction,
+        bool,
+        PageRotation,
+        bool,
+        PageDetectionEvidence,
+    ),
+    PdfError,
+> {
+    extract_page_text_items_impl(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options.include_invisible,
+        font_cache,
+        form_budget,
+        options.bold_from_weight,
+        true,
+        true,
+        false,
+    )
+}
+
+pub(crate) fn extract_page_text_items_impl(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
@@ -798,6 +818,7 @@ fn extract_page_text_items_impl(
     include_invisible: bool,
     font_cache: &mut FontProductCache,
     form_budget: &mut FormWalkBudget,
+    bold_from_weight: bool,
     merge_text: bool,
     merge_scripts: bool,
     fidelity: bool,
@@ -940,7 +961,7 @@ fn extract_page_text_items_impl(
     let font_base_names = &products.base_names;
     let font_tounicode_refs = &products.tounicode_refs;
     let inline_cmaps = &products.inline_cmaps;
-    let font_style_flags = &products.style_flags;
+    let font_styles = &products.style_flags;
     let font_fidelity = &products.fidelity;
 
     // Cache font encodings from lopdf (once per font, not per text operand).
@@ -989,6 +1010,7 @@ fn extract_page_text_items_impl(
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut horizontal_scale: f32 = 1.0; // Tz, stored as a ratio
     let mut pending_space: Option<PendingSpace> = None; // squeezed space run awaiting its next run
+    let mut pending_word_gaps: Option<PendingWordGaps> = None; // wide-spaced boundary string awaiting its next run
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -1051,6 +1073,10 @@ fn extract_page_text_items_impl(
             operator = "'";
         }
         match operator {
+            "_FormBoundary" => {
+                // Inlined forms have their own word-gap provenance, including empty forms.
+                pending_word_gaps = None;
+            }
             "q" => {
                 // Save graphics state
                 gstate_stack.push(SavedGraphicsState {
@@ -1114,8 +1140,11 @@ fn extract_page_text_items_impl(
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
             }
             "ET" => {
-                // End text block
+                // End text block. A wide-spaced boundary string is continued
+                // within its text object; a later object's geometry is
+                // unrelated to it.
                 in_text_block = false;
+                pending_word_gaps = None;
             }
             "Tf" => {
                 // Set font and size
@@ -1216,6 +1245,14 @@ fn extract_page_text_items_impl(
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
                     source_line_has_text = true;
+                    // Where this run starts says whether the run before it, a
+                    // wide-spaced boundary string, had its spacing taken back.
+                    // An empty show paints nothing and decides nothing.
+                    if get_operand_bytes(&op.operands[0]).is_some_and(|raw| !raw.is_empty()) {
+                        if let Some(pending) = pending_word_gaps.take() {
+                            pending.resolve(&mut items, &text_matrix, &ctm);
+                        }
+                    }
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                         get_operand_bytes(&op.operands[0]).map(|raw| {
@@ -1387,10 +1424,8 @@ fn extract_page_text_items_impl(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             if crate::text_utils::is_visual_rtl_candidate(&text) {
                                 // combined[0] is the device-space advance
                                 // direction: forward paint order means the
@@ -1435,6 +1470,7 @@ fn extract_page_text_items_impl(
                                             &ctm,
                                         )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
+                                font_weight: style.weight,
                                 is_underline: false,
                                 is_strikeout: false,
                                 fidelity: fidelity_info(
@@ -1456,6 +1492,43 @@ fn extract_page_text_items_impl(
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
                             });
+                            // A short string with word-gap character spacing
+                            // shows its spaces once the next run proves the
+                            // spacing after it was taken back (see `word_gaps`).
+                            pending_word_gaps = op
+                                .operands
+                                .last()
+                                .and_then(get_operand_bytes)
+                                .and_then(|raw| {
+                                    PendingWordGaps::for_shown_string(
+                                        items.len() - 1,
+                                        raw,
+                                        &text,
+                                        font_widths.get(&current_font),
+                                        current_font_size,
+                                        char_spacing,
+                                        word_spacing,
+                                        &text_matrix,
+                                        &ctm,
+                                        horizontal_scale,
+                                        |code| {
+                                            extract_text_from_operand(
+                                                code,
+                                                &current_font,
+                                                font_base_names
+                                                    .get(&current_font)
+                                                    .map(|s| s.as_str()),
+                                                font_cmaps,
+                                                &font_tounicode_refs,
+                                                &inline_cmaps,
+                                                &font_encodings,
+                                                &encoding_cache,
+                                                &mut cmap_decisions,
+                                                &font_widths,
+                                            )
+                                        },
+                                    )
+                                });
                         }
                     }
                 }
@@ -1478,14 +1551,9 @@ fn extract_page_text_items_impl(
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
-                        // Compute space threshold based on font metrics when available
-                        let space_threshold = if let Some(font_info) = font_info {
-                            let space_em = font_info.space_width as f32 * font_info.units_scale;
-                            let threshold = space_em * 1000.0 * 0.4;
-                            threshold.max(80.0)
-                        } else {
-                            120.0
-                        };
+                        // Word-space threshold for `TJ` offsets and character
+                        // spacing alike, from the font metrics when available.
+                        let space_threshold = word_gap_threshold(font_info);
                         let column_gap_threshold = space_threshold * 4.0;
 
                         // Track sub-items for column-gap splitting:
@@ -1517,7 +1585,15 @@ fn extract_page_text_items_impl(
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
                         let mut backward_jump = false;
-                        for element in array {
+                        // The array's last string, when it is a wide-spaced
+                        // boundary string, and the sub-run text before it.
+                        let mut deferred_word_gaps: Option<(String, WordGapCandidate)> = None;
+                        // Only positioning may follow the array's last string;
+                        // the next run decides for a candidate there.
+                        let last_string_index = array.iter().rposition(|el| {
+                            get_operand_bytes(el).is_some_and(|raw| !raw.is_empty())
+                        });
+                        for (index, element) in array.iter().enumerate() {
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
@@ -1609,6 +1685,17 @@ fn extract_page_text_items_impl(
                             {
                                 sub_start_width_ts = total_width_ts;
                                 sub_run_painted = true;
+                                if let Some(pending) = pending_word_gaps.take() {
+                                    pending.resolve(
+                                        &mut items,
+                                        &advanced_tm(
+                                            &text_matrix,
+                                            total_width_ts,
+                                            horizontal_scale,
+                                        ),
+                                        &ctm,
+                                    );
+                                }
                                 // An ActualText span starts at its first
                                 // painted glyph too.
                                 if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
@@ -1768,6 +1855,58 @@ fn extract_page_text_items_impl(
                                         )
                                     })
                                 {
+                                    // A short string with word-gap character
+                                    // spacing shows its spaces once the spacing
+                                    // after it is taken back: by the positive
+                                    // offset that follows it here, or — for the
+                                    // array's last string — by where the next
+                                    // run starts (see `word_gaps`).
+                                    let candidate = get_operand_bytes(element).and_then(|raw| {
+                                        word_gap_candidate(
+                                            raw,
+                                            &text,
+                                            font_info,
+                                            current_font_size,
+                                            char_spacing,
+                                            word_spacing,
+                                            space_threshold,
+                                            |code| {
+                                                extract_text_from_operand(
+                                                    code,
+                                                    &current_font,
+                                                    font_base_names
+                                                        .get(&current_font)
+                                                        .map(|s| s.as_str()),
+                                                    font_cmaps,
+                                                    &font_tounicode_refs,
+                                                    &inline_cmaps,
+                                                    &font_encodings,
+                                                    &encoding_cache,
+                                                    &mut cmap_decisions,
+                                                    &font_widths,
+                                                )
+                                            },
+                                        )
+                                    });
+                                    let strings_follow =
+                                        last_string_index.is_some_and(|last| index < last);
+                                    let text = match (candidate, array.get(index + 1)) {
+                                        (Some(candidate), Some(next))
+                                            if offset_takes_spacing_back(
+                                                next,
+                                                candidate.trailing_spacing_ts,
+                                                current_font_size,
+                                            ) =>
+                                        {
+                                            candidate.spaced_text
+                                        }
+                                        (Some(candidate), _) if !strings_follow => {
+                                            deferred_word_gaps =
+                                                Some((current_text.clone(), candidate));
+                                            text
+                                        }
+                                        _ => text,
+                                    };
                                     append_tj_text(&mut current_text, &mut pending_tj_space, &text);
                                     current_symbol_rewrite |= legacy_symbol_rewrite;
                                 }
@@ -1823,10 +1962,8 @@ fn extract_page_text_items_impl(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             let scale_x = (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])
                                 * horizontal_scale;
                             // Rotated matrices carry no horizontal evidence:
@@ -1928,6 +2065,7 @@ fn extract_page_text_items_impl(
                                                 &ctm,
                                             )),
                                     is_italic: is_italic_font(base_font) || desc_italic,
+                                    font_weight: style.weight,
                                     is_underline: false,
                                     is_strikeout: false,
                                     fidelity: fidelity_info(
@@ -1959,6 +2097,21 @@ fn extract_page_text_items_impl(
                         // measured, or estimated for a font without metrics.
                         text_matrix[4] += total_width_ts * horizontal_scale * text_matrix[0];
                         text_matrix[5] += total_width_ts * horizontal_scale * text_matrix[1];
+                        // The array's last string was a candidate: the next
+                        // run decides, against the pen it left.
+                        if let Some((prefix, candidate)) = deferred_word_gaps {
+                            if !sub_items.is_empty() {
+                                pending_word_gaps = Some(PendingWordGaps::new(
+                                    items.len() - 1,
+                                    expand_ligatures(&format!("{prefix}{}", candidate.spaced_text)),
+                                    &text_matrix,
+                                    &ctm,
+                                    horizontal_scale,
+                                    candidate.trailing_spacing_ts,
+                                    current_font_size,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1970,6 +2123,18 @@ fn extract_page_text_items_impl(
                 line_matrix[4] += (-tl) * line_matrix[2];
                 line_matrix[5] += (-tl) * line_matrix[3];
                 text_matrix = line_matrix;
+                // A new line never continues a wide-spaced boundary string;
+                // the geometry says so. An empty show decides nothing.
+                if op
+                    .operands
+                    .last()
+                    .and_then(get_operand_bytes)
+                    .is_some_and(|raw| !raw.is_empty())
+                {
+                    if let Some(pending) = pending_word_gaps.take() {
+                        pending.resolve(&mut items, &text_matrix, &ctm);
+                    }
+                }
                 // Capture first-glyph position for ActualText AFTER the
                 // line move — the BDC-entry matrix is on the previous line.
                 if suppress_glyph_extraction
@@ -2162,10 +2327,8 @@ fn extract_page_text_items_impl(
                                 .get(&current_font)
                                 .map(|s| s.as_str())
                                 .unwrap_or(&current_font);
-                            let (desc_italic, desc_bold) = font_style_flags
-                                .get(&current_font)
-                                .copied()
-                                .unwrap_or((false, false));
+                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
+                            let (desc_italic, desc_bold) = style.flags();
                             if crate::text_utils::is_visual_rtl_candidate(&text)
                                 && combined[0].abs() > combined[1].abs()
                             {
@@ -2203,6 +2366,7 @@ fn extract_page_text_items_impl(
                                             &ctm,
                                         )),
                                 is_italic: is_italic_font(base_font) || desc_italic,
+                                font_weight: style.weight,
                                 is_underline: false,
                                 is_strikeout: false,
                                 fidelity: fidelity_info(
@@ -2224,6 +2388,47 @@ fn extract_page_text_items_impl(
                                 mcid: current_mcid(&marked_content_stack),
                                 baseline_shift: 0.0,
                             });
+                            // A short string with word-gap character spacing
+                            // shows its spaces once the next run proves the
+                            // spacing after it was taken back (see `word_gaps`).
+                            pending_word_gaps = op
+                                .operands
+                                .last()
+                                .and_then(get_operand_bytes)
+                                .and_then(|raw| {
+                                    PendingWordGaps::for_shown_string(
+                                        items.len() - 1,
+                                        raw,
+                                        &text,
+                                        font_widths.get(&current_font),
+                                        current_font_size,
+                                        char_spacing,
+                                        word_spacing,
+                                        &advanced_tm(
+                                            &text_matrix,
+                                            w_ts_opt.unwrap_or(estimate_ts),
+                                            horizontal_scale,
+                                        ),
+                                        &ctm,
+                                        horizontal_scale,
+                                        |code| {
+                                            extract_text_from_operand(
+                                                code,
+                                                &current_font,
+                                                font_base_names
+                                                    .get(&current_font)
+                                                    .map(|s| s.as_str()),
+                                                font_cmaps,
+                                                &font_tounicode_refs,
+                                                &inline_cmaps,
+                                                &font_encodings,
+                                                &encoding_cache,
+                                                &mut cmap_decisions,
+                                                &font_widths,
+                                            )
+                                        },
+                                    )
+                                });
                         }
                     }
                 }
@@ -2234,6 +2439,7 @@ fn extract_page_text_items_impl(
                 text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
             }
             "Do" => {
+                pending_word_gaps = None;
                 // Forms were expanded before interpretation, so any remaining
                 // XObject invocation is an image in the resolved resource scope.
                 if !suppress_glyph_extraction {
@@ -2255,6 +2461,7 @@ fn extract_page_text_items_impl(
                                 is_italic: false,
                                 is_underline: false,
                                 is_strikeout: false,
+                                font_weight: None,
                                 fidelity: None,
                                 rotation: 0.0,
                                 advance_known: true,
@@ -2406,10 +2613,9 @@ fn extract_page_text_items_impl(
                                     .get(&current_font)
                                     .map(|s| s.as_str())
                                     .unwrap_or(&current_font);
-                                let (desc_italic, desc_bold) = font_style_flags
-                                    .get(&current_font)
-                                    .copied()
-                                    .unwrap_or((false, false));
+                                let style =
+                                    font_styles.get(&current_font).copied().unwrap_or_default();
+                                let (desc_italic, desc_bold) = style.flags();
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -2430,6 +2636,7 @@ fn extract_page_text_items_impl(
                                     page: page_num,
                                     is_bold: is_bold_font(base_font) || desc_bold,
                                     is_italic: is_italic_font(base_font) || desc_italic,
+                                    font_weight: style.weight,
                                     is_underline: false,
                                     is_strikeout: false,
                                     fidelity: fidelity_info(
@@ -2802,6 +3009,21 @@ fn extract_page_text_items_impl(
     // (merge_text_items below reshapes the item list).
     crate::text_utils::fix_visual_order_rtl(&mut items, &rtl_visual_candidates, rtl_logical_ops);
 
+    // Runs painted wholly outside the rectangular clip in force when they
+    // were shown are invisible on the rendered page: labels a charting
+    // library parks off its plot area, content the producer cropped away.
+    // Leave them out so they cannot leak into the surrounding text. Unlike
+    // render-mode-3 text they transcribe nothing that is visible, so
+    // `include_invisible` does not bring them back and they do not count
+    // towards `skipped_invisible`: a page whose every run is clipped away
+    // reports no text, like an image-only page. After the RTL fix, which
+    // indexes items; before the rotation correction, which moves them out
+    // of the clip's frame.
+    let dropped = super::clip_boundaries::drop_clipped_away_runs(&mut items, &mut item_clips);
+    if dropped > 0 {
+        log::debug!("page {page_num}: {dropped} text run(s) painted outside their clip left out");
+    }
+
     // Detect dominant text rotation and transform coordinates if needed.
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
@@ -2828,11 +3050,18 @@ fn extract_page_text_items_impl(
         page_num,
     );
 
+    if bold_from_weight {
+        for item in &mut items {
+            if item.font_weight.is_some_and(|w| w >= BOLD_WEIGHT_CLASS) {
+                item.is_bold = true;
+            }
+        }
+    }
     let items = if merge_text {
         if page_rotation == PageRotation::Upright {
-            super::merge_text_items_with_clips(items, &item_clips)
+            super::merge_text_items_with_clips(items, &item_clips, bold_from_weight)
         } else {
-            super::merge_text_items(items)
+            super::merge_text_items_with_clips(items, &[], bold_from_weight)
         }
     } else {
         items
@@ -3522,6 +3751,46 @@ mod tests {
                 ("Body", false)
             ]
         );
+    }
+
+    #[test]
+    fn runs_painted_outside_their_clip_are_left_out_even_when_invisible_text_is_wanted() {
+        use crate::tounicode::FontCMaps;
+
+        let content = b"
+            BT /F1 12 Tf 72 700 Td (Body) Tj ET
+            q 72 400 300 200 re W n
+            BT /F1 12 Tf 80 500 Td (Inside) Tj ET
+            BT /F1 12 Tf 80 300 Td (Below) Tj ET
+            BT /F1 12 Tf 80 395 Td (Straddling) Tj ET
+            Q
+            BT /F1 12 Tf 80 200 Td (After) Tj ET";
+        let (doc, page_id) = simple_doc_with_content(content);
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let extract = |include_invisible: bool| {
+            let ((items, _, _, _), _, _, skipped_invisible, _) = extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &font_cmaps,
+                include_invisible,
+                &mut FontProductCache::new(),
+                &mut FormWalkBudget::new(),
+            )
+            .unwrap();
+            let mut texts: Vec<String> = items.into_iter().map(|item| item.text).collect();
+            texts.sort();
+            (texts, skipped_invisible)
+        };
+
+        // Clipped-away runs are not an invisible layer: `include_invisible`
+        // does not bring them back, and they do not trigger the retry that
+        // recovers render-mode-3 text.
+        for include_invisible in [false, true] {
+            let (texts, skipped_invisible) = extract(include_invisible);
+            assert_eq!(texts, ["After", "Body", "Inside", "Straddling"]);
+            assert!(!skipped_invisible);
+        }
     }
 
     #[test]
@@ -4901,6 +5170,7 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
@@ -4986,6 +5256,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (   ) Tj ET",
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
@@ -5211,5 +5482,131 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
         assert_eq!(items[0].text, "ODUCTION");
         assert!((items[0].x - 154.0).abs() < 0.05, "{items:?}");
         assert!((items[0].width - 48.0).abs() < 0.05, "{items:?}");
+    }
+
+    /// Word spaces carried by character spacing: the producer raises `Tc`
+    /// for the two-glyph string that straddles the boundary and takes the
+    /// spacing back where the glyphs kern together — with a positive `TJ`
+    /// offset, or by positioning the next run that far before the pen. The
+    /// 0.3 em spacing (6pt glyphs at 10pt) then reads as the word space it
+    /// is, and the merge pass joins the words.
+    #[test]
+    fn character_spacing_word_gaps_taken_back_read_as_word_spaces() {
+        for (content, expected) in [
+            // `+300` at 10pt takes the 3pt spacing after "t" back.
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 300 (oM)] TJ 0 Tc 30 0 Td (ars) Tj ET",
+                "send to Mars",
+            ),
+            // The next run's `Td` puts it 3pt before the pen.
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td (dt) Tj 0 Tc 15 0 Td (o) Tj ET",
+                "send to",
+            ),
+            // Trailing positioning after the array's last string leaves the
+            // decision to the next run all the same.
+            (
+                "BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 0 ()] TJ 0 Tc 15 0 Td (o) Tj ET",
+                "send to",
+            ),
+            // Likewise after the next-line show operator.
+            ("BT /F1 10 Tf 12 TL 72 712 Td 3 Tc (dt) ' 0 Tc 15 0 Td (o) Tj ET", "d to"),
+            // An empty show in between paints nothing and decides nothing.
+            (
+                "BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj () Tj 0 Tc 15 0 Td (o) Tj ET",
+                "d to",
+            ),
+            // Punctuation before the gap keeps its glyph and takes the space.
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (,b) Tj 0 Tc 15 0 Td (ut) Tj ET", ", but"),
+            // A one-letter word between two boundaries.
+            (
+                "BT /F1 10 Tf 72 700 Td (i) Tj 3 Tc 6 0 Td (sad) Tj 0 Tc 24 0 Td (ay) Tj ET",
+                "is a day",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}: {items:?}");
+        }
+        // The item keeps its box: "sen" at 72 through "ars" ending at 138.
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 72 700 Td (sen) Tj 3 Tc 18 0 Td [(dt) 300 (oM)] TJ 0 Tc 30 0 Td (ars) Tj ET",
+        );
+        assert!((items[0].x - 72.0).abs() < 0.05, "{items:?}");
+        assert!((items[0].width - 66.0).abs() < 0.05, "{items:?}");
+    }
+
+    /// Wide spacing that is not taken back is tracking — a kerned pair
+    /// positioned at its own pen, a small kern in the array, a heading's
+    /// letters — and keeps the string whole, as does spacing under the
+    /// threshold, a junction before joining punctuation, or a candidate
+    /// nothing follows.
+    #[test]
+    fn tracked_or_narrow_character_spacing_keeps_the_string_whole() {
+        for (content, expected) in [
+            (
+                "BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj 18 0 Td (o) Tj ET",
+                "dto",
+            ),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc [(dt) 50 (oM)] TJ ET", "dtoM"),
+            // A kern two thirds of the spacing is not a take-back.
+            ("BT /F1 10 Tf 72 700 Td 3 Tc [(dt) 200 (oM)] TJ ET", "dtoM"),
+            // Next run at the pen: nothing taken back, whatever its spacing.
+            (
+                "BT /F1 10 Tf 72 700 Td (wit) Tj 3 Tc 18 0 Td (ha) Tj 0 Tc 18 0 Td (spring) Tj ET",
+                "withaspring",
+            ),
+            (
+                "BT /F1 10 Tf 72 700 Td 3 Tc (HEADING) Tj 0 Tc 60 0 Td (x) Tj ET",
+                "HEADINGx",
+            ),
+            // 0.2 em at 10pt: under 0.4 of the font's 0.6 em space width.
+            (
+                "BT /F1 10 Tf 72 700 Td 2 Tc (dt) Tj 0 Tc 14 0 Td (o) Tj ET",
+                "dto",
+            ),
+            (
+                "BT /F1 10 Tf 72 700 Td 3 Tc (t,) Tj 0 Tc 15 0 Td (x) Tj ET",
+                "t,x",
+            ),
+            ("BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj ET", "dt"),
+            // A later text object's geometry is unrelated.
+            (
+                "BT /F1 10 Tf 72 700 Td 3 Tc (dt) Tj ET BT /F1 10 Tf 0 Tc 87 700 Td (o) Tj ET",
+                "dto",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}: {items:?}");
+        }
+    }
+
+    /// Han text never spaces between glyphs, however wide the tracking.
+    #[test]
+    fn character_spacing_never_splits_han_glyphs() {
+        const HAN_CMAP: &[u8] = br#"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Test-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+2 beginbfchar
+<41> <4E2D>
+<42> <6587>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"#;
+        let items = extract_items_with_cmap(
+            b"BT /F1 10 Tf 72 700 Td 3 Tc <4142> Tj 0 Tc 10 0 Td <41> Tj ET",
+            HAN_CMAP,
+        );
+        assert_eq!(items[0].text, "\u{4E2D}\u{6587}", "{items:?}");
+        assert!(items.iter().all(|i| !i.text.contains(' ')), "{items:?}");
     }
 }
