@@ -279,14 +279,17 @@ fn standalone_enumerator_re() -> &'static Regex {
     })
 }
 
-fn inline_enumerator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
-        )
-        .unwrap()
+fn inline_enumerator_re(ocr: bool) -> &'static Regex {
+    static RE: [OnceLock<Regex>; 2] = [const { OnceLock::new() }; 2];
+    RE[usize::from(ocr)].get_or_init(|| {
+        let spacing = if ocr { r"\s*" } else { r"\s+" };
+        Regex::new(&format!(r"^\s*(\d{{1,2}}(?:\.\d{{1,2}}){{1,3}}|[IVXLCDM]{{1,7}}|[A-Za-z]|\d{{1,3}})([.)]){spacing}(\S.*)$")).unwrap()
     })
+}
+
+fn bare_dotted_heading_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(\d{1,2}(?:\.\d{1,2}){1,3})(?:\s+(\S.*))?$").unwrap())
 }
 
 fn standalone_enumerator(text: &str) -> bool {
@@ -909,23 +912,23 @@ fn article_body_font_size(pages: &[Page]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Region-dependent Text-Fidelity lanes are fail-closed. A complete set of
-/// non-unknown line labels may come from PPDoc or any MLLM; consumers depend
-/// on the region contract, not the provider identity. The snapshot survives
-/// the engine's later ordering and normalized-label passes.
+/// Snapshot supplied roles without inventing roles for uncovered lines.
+/// Region-dependent consumers admit only lines present in this map. Source
+/// identity must remain unambiguous across ordering and normalized-label passes.
 fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
     let mut regions = HashMap::new();
+    let mut ids = HashSet::new();
     for line in pages
         .iter()
         .flat_map(|page| &page.lines)
         .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
     {
-        let region = line.region_type.trim().to_ascii_lowercase();
-        if line.id.is_empty()
-            || matches!(region.as_str(), "" | "unknown" | "unknown_region")
-            || regions.insert(line.id.clone(), region).is_some()
-        {
+        if line.id.is_empty() || !ids.insert(&line.id) {
             return None;
+        }
+        let region = line.region_type.trim().to_ascii_lowercase();
+        if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {
+            regions.insert(line.id.clone(), region);
         }
     }
     (!regions.is_empty()).then_some(regions)
@@ -970,7 +973,6 @@ fn heading_candidates<'a>(
     primitives: &PdfPrimitiveEvidence,
 ) -> Vec<HeadingCandidate<'a>> {
     let regions = primitives.source_regions.as_ref().expect("source regions");
-    let inline = inline_enumerator_re();
     let standalone = standalone_enumerator_re();
     let mut candidates = Vec::new();
     for (page_slot, page) in pages.iter().enumerate() {
@@ -982,7 +984,27 @@ fn heading_candidates<'a>(
                 && matches!(line.region_type.as_str(), "body" | "heading")
                 && heading_source_eligible(regions, line)
         }) {
-            if let Some(capture) = inline.captures(line.text.trim()) {
+            let bare = bare_dotted_heading_re().captures(line.text.trim());
+            if let Some(capture) = bare.as_ref().filter(|capture| capture.get(2).is_some()) {
+                let text = capture.get(2).unwrap().as_str().trim();
+                let interpretations = enumerator_interpretations(&capture[1], "");
+                if (heading_text_plausible(text) || bold_char_share(line) >= 0.60)
+                    && !interpretations.is_empty()
+                {
+                    candidates.push(HeadingCandidate {
+                        page_slot,
+                        line_slot,
+                        joined_line_slot: None,
+                        text,
+                        interpretations,
+                    });
+                }
+                continue;
+            }
+            if let Some(capture) = inline_enumerator_re(line.source == "ocr")
+                .captures(line.text.trim())
+                .filter(|_| bare.is_none())
+            {
                 let value = capture.get(1).unwrap().as_str();
                 let punct = capture.get(2).unwrap().as_str();
                 let text = capture.get(3).unwrap().as_str().trim();
@@ -998,7 +1020,20 @@ fn heading_candidates<'a>(
                 }
                 continue;
             }
-            let Some(capture) = standalone.captures(line.text.trim()) else {
+            let punctuated = standalone.captures(line.text.trim());
+            let Some((value, punct)) = punctuated
+                .as_ref()
+                .map(|capture| {
+                    (
+                        capture.get(1).unwrap().as_str(),
+                        capture.get(2).unwrap().as_str(),
+                    )
+                })
+                .or_else(|| {
+                    bare.as_ref()
+                        .map(|capture| (capture.get(1).unwrap().as_str(), ""))
+                })
+            else {
                 continue;
             };
             let follower = ((line_slot + 1)..(line_slot + 3).min(page.lines.len())).find(|index| {
@@ -1012,10 +1047,11 @@ fn heading_candidates<'a>(
                 continue;
             };
             let text = page.lines[follower_slot].text.trim();
-            let value = capture.get(1).unwrap().as_str();
-            let punct = capture.get(2).unwrap().as_str();
             let interpretations = enumerator_interpretations(value, punct);
-            if heading_text_plausible(text) && !interpretations.is_empty() {
+            if (heading_text_plausible(text)
+                || (bare.is_some() && bold_char_share(&page.lines[follower_slot]) >= 0.60))
+                && !interpretations.is_empty()
+            {
                 candidates.push(HeadingCandidate {
                     page_slot,
                     line_slot,
@@ -1258,7 +1294,7 @@ fn heading_style_corroborated(text: &str) -> bool {
     {
         return true;
     }
-    if let Some(capture) = inline_enumerator_re().captures(text) {
+    if let Some(capture) = inline_enumerator_re(false).captures(text) {
         if heading_text_plausible(capture.get(3).unwrap().as_str()) && !text.ends_with('.') {
             return true;
         }
@@ -1470,7 +1506,11 @@ fn apply_text_fidelity_headings(
                     page_slot: candidate.page_slot,
                     line_slot: candidate.line_slot,
                     joined_line_slot: candidate.joined_line_slot,
-                    text_plausible: heading_text_plausible(candidate.text),
+                    text_plausible: heading_text_plausible(candidate.text)
+                        || bold_char_share(
+                            &pages[candidate.page_slot].lines
+                                [candidate.joined_line_slot.unwrap_or(candidate.line_slot)],
+                        ) >= 0.60,
                     level: assignment.level,
                     action: assignment.action,
                     coherent_family: family.is_some_and(coherent_heading_family),
@@ -1521,10 +1561,7 @@ fn apply_text_fidelity_headings(
         if page_slot >= pages.len() || target_slot >= pages[page_slot].lines.len() {
             continue;
         }
-        if !source_regions
-            .get(&pages[page_slot].lines[target_slot].id)
-            .is_some_and(|region| matches!(region.as_str(), "text" | "body"))
-        {
+        if !heading_source_eligible(source_regions, &pages[page_slot].lines[target_slot]) {
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
@@ -2236,6 +2273,30 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
+            } else if evidence
+                .source_regions
+                .as_ref()
+                .is_some_and(|regions| regions.contains_key(&line.id))
+                && (matches!(line.region_type.as_str(), "paragraph_title" | "heading")
+                    || (line.source == "ocr" && size == 0.0))
+            {
+                // Retain source heading evidence before shared grammar and prose
+                // demotion. Small-caps native headings need not exceed body size.
+                line.region_type = match line.region_type.as_str() {
+                    "paragraph_title" | "heading"
+                        if heading_text_plausible(&line.text)
+                            || heading_style_corroborated(&line.text)
+                            || caps_warble(&line.text) =>
+                    {
+                        "heading"
+                    }
+                    "footnote" => "footnote",
+                    _ => "body",
+                }
+                .to_owned();
+                if line.region_type == "footnote" {
+                    line.note_region_mode = "footnote".to_owned();
+                }
             } else if line.text.chars().count() <= 180
                 && size
                     >= (if article_body_size > 0.0 {
