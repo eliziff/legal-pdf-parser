@@ -1,0 +1,36 @@
+name: OCR geometry cache validation
+on:
+  push:
+    branches: [fix/retain-ocr-selection-geometry]
+    paths: [.github/workflows/ocr-selection-candidate.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reject pre-geometry caches instead of returning empty selection data
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('legal-pdf-support/src/projection.rs'); s=p.read_text()
+          old='    #[serde(default, skip_serializing_if = "Vec::is_empty")]\n    recognized_pages: Vec<PdfTextPage>,'
+          assert old in s
+          s=s.replace(old, '    recognized_pages: Vec<PdfTextPage>,', 1)
+          needle='        assert!(native.recognized_pages().is_empty());'
+          assert needle in s
+          s=s.replace(needle, needle+'\n        let mut old_cache = serde_json::to_value(&native).unwrap();\n        old_cache.as_object_mut().unwrap().remove("recognized_pages");\n        assert!(serde_json::from_value::<PdfDocument>(old_cache).is_err());',1)
+          p.write_text(s)
+      - run: rustfmt --edition 2021 --check legal-pdf-support/src/projection.rs
+      - run: cargo check -p legal-pdf-support --lib
+      - run: cargo test -p legal-pdf-support --lib projection::tests::projection_preserves_source_text_and_moves_only_notes_to_page_end -- --exact
+      - name: Publish source without temporary workflow
+        run: |
+          git diff --check
+          rm .github/workflows/ocr-selection-candidate.yml
+          git add legal-pdf-support/src/projection.rs .github/workflows/ocr-selection-candidate.yml
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: invalidate prepared caches that discarded OCR geometry'
+          git push origin HEAD:fix/retain-ocr-selection-geometry
