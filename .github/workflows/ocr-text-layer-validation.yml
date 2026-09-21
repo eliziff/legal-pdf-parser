@@ -1,0 +1,31 @@
+name: OCR text layer validation
+on:
+  push:
+    branches: [fix/retain-ocr-text-layer]
+    paths: [.github/workflows/ocr-text-layer-validation.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/fix/retain-ocr-text-layer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply only the reviewed geometry patch
+        run: |
+          git apply --check .github/ocr-text-layer.patch
+          git apply .github/ocr-text-layer.patch
+          rustfmt --edition 2021 legal-pdf-support/src/projection.rs
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add legal-pdf-support/src/projection.rs
+          git commit -m 'fix: retain selectable OCR geometry in prepared PDF projections'
+          git push origin HEAD:fix/retain-ocr-text-layer
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Metadata check
+        run: cargo quick -p legal-pdf-support
+      - name: Verify cached OCR geometry and stable evidence identity
+        run: cargo test --locked --offline -p legal-pdf-support recognized_geometry_survives_cache_without_changing_evidence_fingerprints -- --nocapture
