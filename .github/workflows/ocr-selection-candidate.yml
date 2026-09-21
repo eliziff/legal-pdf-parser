@@ -1,0 +1,101 @@
+name: Retained OCR geometry candidate
+on:
+  push:
+    branches: [fix/retain-ocr-selection-geometry]
+    paths: [.github/workflows/ocr-selection-candidate.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Retain provider geometry in the prepared document
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('legal-pdf-support/src/projection.rs'); s=p.read_text()
+          assert 'recognized_pages: Vec<PdfTextPage>' not in s
+          s=s.replace('    summary: PdfSummary,\n}', '    summary: PdfSummary,\n    #[serde(default, skip_serializing_if = "Vec::is_empty")]\n    recognized_pages: Vec<PdfTextPage>,\n}', 1)
+          pos=s.index('#[derive(Clone, Deserialize, Serialize)]')
+          s=s[:pos]+'''/// Display-space OCR geometry retained with the prepared document, never re-OCRed by a reader.
+          #[derive(Deserialize, Serialize)]
+          #[serde(rename_all = "camelCase")]
+          pub struct PdfTextPage {
+              pub page_number: u32,
+              pub width: f64,
+              pub height: f64,
+              pub lines: Vec<PdfTextLine>,
+          }
+
+          #[derive(Deserialize, Serialize)]
+          pub struct PdfTextLine {
+              pub id: String,
+              pub rect: [f64; 4],
+              pub words: Vec<PdfTextWord>,
+          }
+
+          #[derive(Deserialize, Serialize)]
+          pub struct PdfTextWord {
+              pub text: String,
+              pub rect: [f64; 4],
+          }
+
+          '''+s[pos:]
+          pos=s.index('        Self {\n            structure,',s.index('    fn project('))
+          s=s[:pos]+'''        let recognized_pages = pages.iter().filter(|page| page.source != "native")
+                      .map(|page| PdfTextPage {
+                          page_number: page.number, width: page.width, height: page.height,
+                          lines: page.lines.iter().map(|line| PdfTextLine {
+                              id: line.id.clone(), rect: line.bbox,
+                              words: line.words.iter().map(|word| PdfTextWord {
+                                  text: word.text.clone(), rect: word.bbox,
+                              }).collect(),
+                          }).collect(),
+                      }).collect();
+          '''+s[pos:]
+          s=s.replace('        Self {\n            structure,','        Self {\n            recognized_pages,\n            structure,',1)
+          s=s.replace('    pub fn structure(&self)', '    pub fn recognized_pages(&self) -> &[PdfTextPage] {\n        &self.recognized_pages\n    }\n\n    pub fn structure(&self)',1)
+          pos=s.index('\n    #[test]\n    fn invalid_lookup'); a=s.rindex('    }',0,pos)
+          s=s[:a]+'''
+                  let native = PdfDocument::project(pages.clone(), vec![], vec![], graph.clone(), pdf_summary());
+                  assert!(native.recognized_pages().is_empty());
+                  let mut scanned = pages;
+                  scanned[0].source = "ocr".into();
+                  scanned[0].lines[0].words.push(legal_pdf_core::model::Word {
+                      id: "w1".into(), text: "Recognized".into(), bbox: [60.0, 100.0, 120.0, 112.0], start: 0, end: 10,
+                  });
+                  let prepared = PdfDocument::project(scanned, vec![], vec![], graph, pdf_summary());
+                  let restored: PdfDocument = serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+                  let page = &restored.recognized_pages()[0];
+                  assert_eq!((page.page_number, page.width, page.height), (1, 612.0, 792.0));
+                  assert_eq!(page.lines[0].words[0].text, "Recognized");
+                  assert_eq!(page.lines[0].words[0].rect, [60.0, 100.0, 120.0, 112.0]);
+          '''+s[a:]
+          p.write_text(s)
+          p=Path('legal-pdf-support/src/lib.rs'); s=p.read_text().replace('PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary,','PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PdfTextLine,\n    PdfTextPage, PdfTextWord,');p.write_text(s)
+      - name: Format only the touched Rust files
+        run: rustfmt --edition 2021 legal-pdf-support/src/projection.rs legal-pdf-support/src/lib.rs
+      - name: Affected crate metadata check
+        run: cargo check -p legal-pdf-support --lib
+      - name: Prepared OCR geometry and cache round trip
+        run: cargo test -p legal-pdf-support --lib projection::tests::projection_preserves_source_text_and_moves_only_notes_to_page_end -- --exact
+      - name: Publish the validated source changes only
+        run: |
+          git diff --check
+          rm .github/workflows/ocr-selection-candidate.yml
+          git add legal-pdf-support/src/projection.rs legal-pdf-support/src/lib.rs .github/workflows/ocr-selection-candidate.yml
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: retain recognized word geometry in prepared PDF caches'
+          git push origin HEAD:fix/retain-ocr-selection-geometry
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retained-ocr-candidate
+          path: |
+            legal-pdf-support/src/projection.rs
+            legal-pdf-support/src/lib.rs
+          retention-days: 1
