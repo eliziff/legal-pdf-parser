@@ -59,6 +59,8 @@ pub struct PdfTextPage {
 #[derive(Deserialize, Serialize)]
 pub struct PdfTextLine {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
     pub rect: [f64; 4],
     pub words: Vec<PdfTextWord>,
 }
@@ -204,6 +206,11 @@ impl PdfDocument {
                     .iter()
                     .map(|line| PdfTextLine {
                         id: line.id.clone(),
+                        text: if line.words.is_empty() {
+                            line.text.clone()
+                        } else {
+                            String::new()
+                        },
                         rect: line.bbox,
                         words: line
                             .words
@@ -1274,6 +1281,9 @@ mod tests {
             (1, 612.0, 792.0)
         );
         assert_eq!(page.lines[0].words[0].text, "Recognized");
+        assert!(page.lines[0].text.is_empty());
+        assert_eq!(page.lines[1].text, "Unclassified source text");
+        assert!(page.lines[1].words.is_empty());
         assert_eq!(page.lines[0].words[0].rect, [60.0, 100.0, 120.0, 112.0]);
     }
 
