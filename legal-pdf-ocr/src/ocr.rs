@@ -601,12 +601,28 @@ pub(crate) fn tsv_lines(
                     confidence_count += 1;
                 }
             }
+            let mut text = String::new();
+            let mut offset = 0;
+            let recognized_words = words
+                .into_iter()
+                .map(|word| {
+                    if !text.is_empty() {
+                        text.push(' ');
+                        offset += 1;
+                    }
+                    let start = offset;
+                    offset += word.text.chars().count();
+                    text.push_str(&word.text);
+                    legal_pdf_core::OcrWord {
+                        text: word.text,
+                        bbox: word.bbox,
+                        start,
+                        end: offset,
+                    }
+                })
+                .collect();
             Some(OcrLine {
-                text: words
-                    .into_iter()
-                    .map(|word| word.text)
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                text,
                 bbox,
                 confidence: if confidence_count == 0 {
                     0.0
@@ -615,7 +631,7 @@ pub(crate) fn tsv_lines(
                 },
                 baseline: vec![],
                 boundary: vec![],
-                words: vec![],
+                words: recognized_words,
                 region_id: String::new(),
                 region_type: "unknown".to_owned(),
                 block_index: 0,
@@ -676,5 +692,22 @@ mod tests {
         assert_eq!(lines[0].text, "Hello world");
         assert_eq!(lines[0].bbox, [5.0, 5.0, 40.0, 7.5]);
         assert_eq!(lines[0].confidence, 0.85);
+        assert_eq!(
+            lines[0].words,
+            vec![
+                legal_pdf_core::OcrWord {
+                    text: "Hello".into(),
+                    bbox: [5.0, 5.0, 20.0, 7.5],
+                    start: 0,
+                    end: 5
+                },
+                legal_pdf_core::OcrWord {
+                    text: "world".into(),
+                    bbox: [22.5, 5.0, 40.0, 7.5],
+                    start: 6,
+                    end: 11
+                },
+            ]
+        );
     }
 }
