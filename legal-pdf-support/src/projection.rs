@@ -42,8 +42,8 @@ pub struct PdfDocument {
     footnotes: Vec<ProjectionFootnote>,
     authority_text_units: Vec<Value>,
     summary: PdfSummary,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    recognized_pages: Vec<PdfTextPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recognized_pages: Option<Vec<PdfTextPage>>,
 }
 
 /// Display-space OCR geometry retained with the prepared document, never re-OCRed by a reader.
@@ -218,7 +218,7 @@ impl PdfDocument {
             })
             .collect();
         Self {
-            recognized_pages,
+            recognized_pages: Some(recognized_pages),
             structure,
             pages: pages
                 .into_iter()
@@ -279,8 +279,12 @@ impl PdfDocument {
         }
     }
 
+    pub fn has_recognized_geometry(&self) -> bool {
+        self.recognized_pages.is_some()
+    }
+
     pub fn recognized_pages(&self) -> &[PdfTextPage] {
-        &self.recognized_pages
+        self.recognized_pages.as_deref().unwrap_or(&[])
     }
 
     pub fn structure(&self) -> &legal_structure::DocumentStructure {
@@ -1240,6 +1244,18 @@ mod tests {
         let native =
             PdfDocument::project(pages.clone(), vec![], vec![], graph.clone(), pdf_summary());
         assert!(native.recognized_pages().is_empty());
+        assert!(native.has_recognized_geometry());
+        let mut old_cache = serde_json::to_value(&native).unwrap();
+        old_cache
+            .as_object_mut()
+            .unwrap()
+            .remove("recognized_pages");
+        let old: PdfDocument = serde_json::from_value(old_cache).unwrap();
+        assert!(!old.has_recognized_geometry());
+        assert_eq!(
+            old.fingerprint().result_sha256,
+            native.fingerprint().result_sha256
+        );
         let mut scanned = pages;
         scanned[0].source = "ocr".into();
         scanned[0].lines[0].words.push(legal_pdf_core::model::Word {
