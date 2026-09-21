@@ -20,5 +20,6 @@ pub use pairing_support::{
 pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions, PreparedPPDoc};
 pub use projection::{
     numeric_range, parse_ordinal, PdfDocument, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
-    PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary,
+    PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PdfTextLine,
+    PdfTextPage, PdfTextWord,
 };
