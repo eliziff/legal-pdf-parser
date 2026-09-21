@@ -42,6 +42,32 @@ pub struct PdfDocument {
     footnotes: Vec<ProjectionFootnote>,
     authority_text_units: Vec<Value>,
     summary: PdfSummary,
+    // Older cached projections discarded OCR geometry; None requests a one-time
+    // upgrade without making historical evidence projections unreadable.
+    #[serde(default)]
+    recognized_text: Option<Vec<PdfRecognizedPage>>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfRecognizedPage {
+    pub page_number: u32,
+    pub width: f64,
+    pub height: f64,
+    pub lines: Vec<PdfRecognizedLine>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PdfRecognizedLine {
+    pub id: String,
+    pub rect: [f64; 4],
+    pub words: Vec<PdfRecognizedWord>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PdfRecognizedWord {
+    pub text: String,
+    pub rect: [f64; 4],
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -167,7 +193,36 @@ impl PdfDocument {
         structure: DocumentStructure,
         summary: PdfSummary,
     ) -> Self {
+        let recognized_text = pages
+            .iter()
+            .filter(|page| page.source != "native" && !page.lines.is_empty())
+            .map(|page| {
+                let mut lines = page.lines.iter().collect::<Vec<_>>();
+                lines.sort_by_key(|line| line.reading_order);
+                PdfRecognizedPage {
+                    page_number: page.number,
+                    width: page.width,
+                    height: page.height,
+                    lines: lines
+                        .into_iter()
+                        .map(|line| PdfRecognizedLine {
+                            id: line.id.clone(),
+                            rect: line.bbox,
+                            words: line
+                                .words
+                                .iter()
+                                .map(|word| PdfRecognizedWord {
+                                    text: word.text.clone(),
+                                    rect: word.bbox,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
         Self {
+            recognized_text: Some(recognized_text),
             structure,
             pages: pages
                 .into_iter()
@@ -238,6 +293,12 @@ impl PdfDocument {
 
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Selectable OCR geometry from the same prepared source and profile. Native
+    /// pages stay in the PDF renderer; no second full-document extraction is needed.
+    pub fn recognized_text(&self) -> Option<&[PdfRecognizedPage]> {
+        self.recognized_text.as_deref()
     }
 
     pub fn summary(&self) -> &PdfSummary {
@@ -1133,6 +1194,66 @@ mod tests {
             pages_needing_ocr: vec![],
             ocr_routed_pages: vec![],
         }
+    }
+
+    #[test]
+    fn recognized_geometry_survives_cache_without_changing_evidence_fingerprints() {
+        let mut line = source_line("ocr-line", "Recognized words");
+        line.source = "ocr".into();
+        line.words = vec![legal_pdf_core::model::Word {
+            id: "word".into(),
+            text: "Recognized".into(),
+            bbox: [60.0, 100.0, 160.0, 112.0],
+            start: 0,
+            end: 10,
+        }];
+        let mut native: Page = serde_json::from_value(json!({
+            "id": "page-1", "index": 0, "number": 1,
+            "width": 792.0, "height": 612.0, "lines": [], "regions": [],
+        }))
+        .unwrap();
+        let mut scanned = native.clone();
+        scanned.id = "page-2".into();
+        scanned.index = 1;
+        scanned.number = 2;
+        scanned.source = "ocr".into();
+        scanned.lines.push(line.clone());
+        native.lines.push(line);
+        let document = PdfDocument::project(
+            vec![native, scanned],
+            vec![],
+            vec![],
+            structure_graph(vec![]),
+            pdf_summary(),
+        );
+        let serialized = serde_json::to_value(&document).unwrap();
+        let restored: PdfDocument = serde_json::from_value(serialized.clone()).unwrap();
+        let geometry = serde_json::to_value(restored.recognized_text()).unwrap();
+        assert_eq!(geometry.as_array().unwrap().len(), 1);
+        assert_eq!(geometry[0]["pageNumber"], 2);
+        assert_eq!(geometry[0]["width"], 792.0);
+        assert_eq!(geometry[0]["height"], 612.0);
+        assert_eq!(
+            geometry[0]["lines"][0]["words"][0]["rect"],
+            json!([60.0, 100.0, 160.0, 112.0])
+        );
+        assert_eq!(geometry[0]["lines"][0]["words"][0]["text"], "Recognized");
+        let mut old = serialized;
+        old.as_object_mut().unwrap().remove("recognized_text");
+        let old: PdfDocument = serde_json::from_value(old).unwrap();
+        assert!(old.recognized_text().is_none());
+        assert_eq!(
+            old.fingerprint().result_sha256,
+            restored.fingerprint().result_sha256
+        );
+        let native_only = PdfDocument::project(
+            vec![],
+            vec![],
+            vec![],
+            structure_graph(vec![]),
+            pdf_summary(),
+        );
+        assert_eq!(native_only.recognized_text().unwrap().len(), 0);
     }
 
     #[test]
