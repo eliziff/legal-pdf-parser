@@ -42,6 +42,33 @@ pub struct PdfDocument {
     footnotes: Vec<ProjectionFootnote>,
     authority_text_units: Vec<Value>,
     summary: PdfSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recognized_pages: Option<Vec<PdfTextPage>>,
+}
+
+/// Display-space OCR geometry retained with the prepared document, never re-OCRed by a reader.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfTextPage {
+    pub page_number: u32,
+    pub width: f64,
+    pub height: f64,
+    pub lines: Vec<PdfTextLine>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PdfTextLine {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    pub rect: [f64; 4],
+    pub words: Vec<PdfTextWord>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PdfTextWord {
+    pub text: String,
+    pub rect: [f64; 4],
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -167,7 +194,38 @@ impl PdfDocument {
         structure: DocumentStructure,
         summary: PdfSummary,
     ) -> Self {
+        let recognized_pages = pages
+            .iter()
+            .filter(|page| page.source != "native")
+            .map(|page| PdfTextPage {
+                page_number: page.number,
+                width: page.width,
+                height: page.height,
+                lines: page
+                    .lines
+                    .iter()
+                    .map(|line| PdfTextLine {
+                        id: line.id.clone(),
+                        text: if line.words.is_empty() {
+                            line.text.clone()
+                        } else {
+                            String::new()
+                        },
+                        rect: line.bbox,
+                        words: line
+                            .words
+                            .iter()
+                            .map(|word| PdfTextWord {
+                                text: word.text.clone(),
+                                rect: word.bbox,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
         Self {
+            recognized_pages: Some(recognized_pages),
             structure,
             pages: pages
                 .into_iter()
@@ -226,6 +284,14 @@ impl PdfDocument {
             authority_text_units,
             summary,
         }
+    }
+
+    pub fn has_recognized_geometry(&self) -> bool {
+        self.recognized_pages.is_some()
+    }
+
+    pub fn recognized_pages(&self) -> &[PdfTextPage] {
+        self.recognized_pages.as_deref().unwrap_or(&[])
     }
 
     pub fn structure(&self) -> &legal_structure::DocumentStructure {
@@ -1181,6 +1247,44 @@ mod tests {
                 .unwrap();
             assert_eq!(restored, original.text);
         }
+
+        let native =
+            PdfDocument::project(pages.clone(), vec![], vec![], graph.clone(), pdf_summary());
+        assert!(native.recognized_pages().is_empty());
+        assert!(native.has_recognized_geometry());
+        let mut old_cache = serde_json::to_value(&native).unwrap();
+        old_cache
+            .as_object_mut()
+            .unwrap()
+            .remove("recognized_pages");
+        let old: PdfDocument = serde_json::from_value(old_cache).unwrap();
+        assert!(!old.has_recognized_geometry());
+        assert_eq!(
+            old.fingerprint().result_sha256,
+            native.fingerprint().result_sha256
+        );
+        let mut scanned = pages;
+        scanned[0].source = "ocr".into();
+        scanned[0].lines[0].words.push(legal_pdf_core::model::Word {
+            id: "w1".into(),
+            text: "Recognized".into(),
+            bbox: [60.0, 100.0, 120.0, 112.0],
+            start: 0,
+            end: 10,
+        });
+        let prepared = PdfDocument::project(scanned, vec![], vec![], graph, pdf_summary());
+        let restored: PdfDocument =
+            serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+        let page = &restored.recognized_pages()[0];
+        assert_eq!(
+            (page.page_number, page.width, page.height),
+            (1, 612.0, 792.0)
+        );
+        assert_eq!(page.lines[0].words[0].text, "Recognized");
+        assert!(page.lines[0].text.is_empty());
+        assert_eq!(page.lines[1].text, "Unclassified source text");
+        assert!(page.lines[1].words.is_empty());
+        assert_eq!(page.lines[0].words[0].rect, [60.0, 100.0, 120.0, 112.0]);
     }
 
     #[test]
