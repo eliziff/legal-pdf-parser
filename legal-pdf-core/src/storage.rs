@@ -16,6 +16,17 @@ fn io<T>(path: &Path, result: std::io::Result<T>) -> Result<T> {
     result.map_err(|source| Error::io(path, source))
 }
 
+// WASI has one process and no process id; the sequence and exclusive create keep names unique.
+#[cfg(not(target_os = "wasi"))]
+fn process_id() -> u32 {
+    std::process::id()
+}
+
+#[cfg(target_os = "wasi")]
+fn process_id() -> u32 {
+    0
+}
+
 fn temporary_path(path: &Path, attempt: u64) -> Result<PathBuf> {
     let name = path
         .file_name()
@@ -23,7 +34,7 @@ fn temporary_path(path: &Path, attempt: u64) -> Result<PathBuf> {
         .ok_or_else(|| Error::Message(format!("unsafe output path: {}", path.display())))?;
     Ok(path.with_file_name(format!(
         ".{name}.{}.{}.tmp",
-        std::process::id(),
+        process_id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed) + attempt
     )))
 }
