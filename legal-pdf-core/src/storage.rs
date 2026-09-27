@@ -21,9 +21,14 @@ fn temporary_path(path: &Path, attempt: u64) -> Result<PathBuf> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::Message(format!("unsafe output path: {}", path.display())))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let process_id = std::process::id();
+    // Browser WASI has no process IDs; create_new and the sequence distinguish files.
+    #[cfg(target_arch = "wasm32")]
+    let process_id = 0;
     Ok(path.with_file_name(format!(
         ".{name}.{}.{}.tmp",
-        std::process::id(),
+        process_id,
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed) + attempt
     )))
 }
