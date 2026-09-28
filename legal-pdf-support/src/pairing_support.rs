@@ -5,12 +5,11 @@ use std::sync::OnceLock;
 const MAX_COUNTER_VALUE: u32 = 200;
 const MAX_OUTLINE_DEPTH: usize = 4;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
-const ALL_CAPS_MIN_RATIO: f64 = 0.85;
-const TITLECASE_MIN_RATIO: f64 = 0.6;
 
 pub use legal_citations::cues::{
-    has_citation_cue as has_legal_citation_cue, has_citation_signal,
-    is_citation_continuation as is_legal_citation_continuation, reporter_abbreviation_regex,
+    crossref_short_form, has_citation_cue as has_legal_citation_cue, has_citation_signal,
+    heading_text_plausible, is_citation_continuation as is_legal_citation_continuation,
+    is_citation_shaped_tail, is_counter_noun, reporter_abbreviation_regex,
 };
 
 pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
@@ -24,56 +23,6 @@ pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
             )
         })
         .collect()
-}
-
-pub fn heading_text_plausible(value: &str) -> bool {
-    let text = value.trim();
-    if text.is_empty() || text.chars().count() > 100 {
-        return false;
-    }
-    let Some(first) = text.chars().next() else {
-        return false;
-    };
-    if !first.is_alphabetic() || !first.is_uppercase() {
-        return false;
-    }
-    static TRAILING_DIGIT: OnceLock<Regex> = OnceLock::new();
-    if TRAILING_DIGIT
-        .get_or_init(|| Regex::new(r"\d\s*[.,;]?\s*$").expect("trailing digit regex"))
-        .is_match(text)
-    {
-        return false;
-    }
-    static POSSESSIVE: OnceLock<Regex> = OnceLock::new();
-    let citation_text = POSSESSIVE
-        .get_or_init(|| Regex::new(r"(?i)([A-Za-z])['’]s\b").expect("possessive suffix regex"))
-        .replace_all(text, "$1");
-    if has_legal_citation_cue(&citation_text) || has_citation_signal(&citation_text) {
-        return false;
-    }
-    let letters = text
-        .chars()
-        .filter(|character| character.is_alphabetic())
-        .collect::<Vec<_>>();
-    let all_caps = letters.len() >= 4
-        && letters
-            .iter()
-            .filter(|character| character.is_uppercase())
-            .count() as f64
-            / letters.len() as f64
-            >= ALL_CAPS_MIN_RATIO;
-    let words = text
-        .split_whitespace()
-        .filter(|word| word.chars().any(|character| character.is_alphabetic()))
-        .collect::<Vec<_>>();
-    let titlecase = !words.is_empty()
-        && words
-            .iter()
-            .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
-            .count() as f64
-            / words.len() as f64
-            >= TITLECASE_MIN_RATIO;
-    all_caps || titlecase
 }
 
 fn roman_to_int(value: &str) -> Option<u32> {

@@ -18,8 +18,11 @@ use legal_pdf_support::{
     enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
     EnumeratorInterpretation, HeadingAction, HeadingFamilyStats, HeadingLadderStatus,
 };
+use legal_pdf_support::pairing_support::{
+    crossref_short_form as crossref_shortform, is_citation_shaped_tail as citation_shaped_tail,
+};
 use legal_structure::{
-    last_scalars, normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph,
+    normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph,
     utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 #[cfg(test)]
@@ -2352,17 +2355,6 @@ fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn citation_shaped_tail(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s+(?:\[\d{4}\]\s+)?(?:[A-Z][A-Za-z0-9.&'-]*\s+){1,4}(?:\([^\)\r\n]{1,40}\)\s+)?\d+\b",
-        )
-        .unwrap()
-    })
-    .is_match(text)
-}
-
 fn join_lines(lines: &[&Line]) -> (String, Vec<Option<(usize, usize)>>) {
     let mut text = String::new();
     let mut offsets = Vec::with_capacity(lines.len());
@@ -2637,33 +2629,6 @@ fn infer_note_region_modes(pages: &mut [Page]) {
             expected_endnote = None;
         }
         prior_note_page = !footnote_indexes.is_empty();
-    }
-}
-
-fn crossref_shortform(text: &str, byte_start: usize) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let pattern = RE.get_or_init(|| {
-        Regex::new(
-            r"(?:\[|^|[^\p{L}\p{M}\p{N}_])([A-Z][\w.'’&-]*(?:\s+(?:[A-Z][\w.'’&-]*|v\.?|c\.?|de|du|and|&)){0,5})\]?[,:]?\s*$",
-        )
-        .unwrap()
-    });
-    let Some(capture) = pattern.captures(last_scalars(&text[..byte_start], 70)) else {
-        return String::new();
-    };
-    let short = capture
-        .get(1)
-        .map_or("", |value| value.as_str())
-        .trim()
-        .trim_end_matches([',', '.', ';', ':'])
-        .to_owned();
-    if "see in the but and also supra infra ibid at"
-        .split(' ')
-        .any(|word| short.eq_ignore_ascii_case(word))
-    {
-        String::new()
-    } else {
-        short
     }
 }
 

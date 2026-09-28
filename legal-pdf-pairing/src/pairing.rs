@@ -5,6 +5,7 @@ use legal_pdf_core::{
     line_font_size, Anchor, NotePairClaim, NotePairKind, PairingOutput, SourceAnchor,
 };
 use legal_pdf_support::pairing_support;
+use legal_pdf_support::pairing_support::is_counter_noun as counter_noun;
 use legal_structure::{
     normalize_decimal_digit, normalize_note_symbol, select_numeric_sequence,
     NumericSequenceCandidate, NumericSequencePolicy, ScalarText,
@@ -834,11 +835,6 @@ fn spaced_preceding_word(values: &[char], start: usize) -> String {
         end -= 1;
     }
     preceding_word(values, end)
-}
-
-fn counter_noun(word: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(?:notes?|supra|infra|pages?|pp|paras?|paragraphs?|secs?|sections?|arts?|articles?|vols?|volumes?|nos?|numbers?|chapters?|parts?|clauses?|rules?|regs?|schedules?|appendix|appendices|tables?|figures?|figs?|charts?|columns?|cols?|books?|editions?|amend)$").unwrap()).is_match(word)
 }
 
 fn abbreviation_pinpoint(prefix: &str) -> bool {

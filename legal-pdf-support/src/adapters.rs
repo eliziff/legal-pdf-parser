@@ -149,6 +149,8 @@ pub(crate) fn to_toa_text_units_from_parts(
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
+            "note_number": note.label.parse::<u32>().ok(),
+            "restart_sequence": note.restart_sequence,
             "page_numbers": pages,
             "text": note.body,
             "footnote_refs": [],
