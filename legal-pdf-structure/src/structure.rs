@@ -2325,17 +2325,8 @@ fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
             .lines
             .iter()
             .enumerate()
-            .filter_map(|(index, line)| {
-                let label = printed_label(&line.text)?;
-                let header_limit = if label.bytes().all(|byte| byte.is_ascii_digit()) {
-                    0.14
-                } else {
-                    0.12
-                };
-                (line.region_type == "footer"
-                    || (line.region_type == "header" && line.bbox[3] < page.height * header_limit))
-                    .then_some((label, index))
-            })
+            .filter(|(_, line)| matches!(line.region_type.as_str(), "header" | "footer"))
+            .filter_map(|(index, line)| printed_label(&line.text).map(|label| (label, index)))
             .collect();
         let labels: BTreeSet<String> = candidates
             .iter()

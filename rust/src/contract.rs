@@ -31,6 +31,7 @@ pub struct PdfRequest {
     max_output_bytes: Option<usize>,
     #[serde(default, deserialize_with = "present")]
     pages: Option<Vec<usize>>,
+    supplied_ocr: Option<crate::supplied_ocr::SuppliedOcr>,
     id: Option<String>,
     url: Option<String>,
     #[cfg(feature = "ocr")]
@@ -128,6 +129,7 @@ fn sha256_field(value: &Option<String>, key: &str) -> Result<Option<String>> {
 fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     let mut options = ParseOptions {
         cache_dir: request.cache_dir.clone(),
+        supplied_ocr: request.supplied_ocr.clone(),
         ocr_pages: selected_pages(request.pages.as_deref())?,
         cache_key: sha256_field(&request.cache_key, "cache_key")?,
         max_output_bytes: request.max_output_bytes,
@@ -139,6 +141,11 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
         ..ParseOptions::default()
     };
 
+    if request.supplied_ocr.is_some() && (request.ocr.is_some() || request.cache_key.is_some()) {
+        return Err(Error::Message(
+            "Supplied OCR cannot be combined with a provider or cache key".into(),
+        ));
+    }
     #[cfg(feature = "ocr")]
     if let Some(request) = &request.ocr {
         options.ocr = match request {

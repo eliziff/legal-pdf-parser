@@ -3,6 +3,8 @@ mod contract;
 #[cfg(feature = "pdf")]
 mod engine;
 mod structure_engine;
+#[cfg(feature = "pdf")]
+mod supplied_ocr;
 
 #[cfg(all(feature = "allocation-profiling", feature = "fast-allocator"))]
 compile_error!("profiling and fast-allocator cannot select two global allocators");

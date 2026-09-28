@@ -79,6 +79,7 @@ pub(crate) struct ParseOptions {
     pub use_cache: bool,
     pub expected_source_sha256: Option<String>,
     pub max_output_bytes: Option<usize>,
+    pub supplied_ocr: Option<crate::supplied_ocr::SuppliedOcr>,
     #[cfg(feature = "ocr")]
     pub ocr: Option<OcrOptions>,
     /// Zero-based pages eligible for OCR. Native extraction still inspects the
@@ -97,6 +98,7 @@ impl Default for ParseOptions {
             use_cache: true,
             expected_source_sha256: None,
             max_output_bytes: None,
+            supplied_ocr: None,
             #[cfg(feature = "ocr")]
             ocr: None,
             ocr_pages: None,
@@ -404,6 +406,11 @@ pub(crate) fn parse_pdf(
         .map(|provider| provider.identity().to_owned());
     #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
     let ppdoc_identity: Option<String> = None;
+    let ocr_identity = if let Some(supplied) = &options.supplied_ocr {
+        Some(("supplied".to_owned(), supplied.identity(&source_hash)?))
+    } else {
+        ocr_identity
+    };
     let key = cache_key(
         &source_hash,
         identity,
@@ -439,6 +446,11 @@ pub(crate) fn parse_pdf(
         .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
     #[cfg(not(feature = "ocr"))]
     let selected_ocr = None;
+    let mut supplied = options.supplied_ocr.as_ref();
+    let selected_ocr = match supplied.as_mut() {
+        Some(provider) => Some(provider as &mut dyn legal_pdf_core::PdfOcrProvider),
+        None => selected_ocr,
+    };
     let mut extracted = profile::measure("extract_pdf", || {
         extract_pdf(bytes, selected_ocr, options.ocr_pages.as_deref())
     })?;

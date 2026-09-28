@@ -7,14 +7,18 @@ const MAX_OUTLINE_DEPTH: usize = 4;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
 
 pub use legal_citations::cues::{
-    crossref_short_form, has_citation_cue as has_legal_citation_cue, has_citation_signal,
-    heading_text_plausible, is_citation_continuation as is_legal_citation_continuation,
-    is_citation_shaped_tail, is_counter_noun, reporter_abbreviation_regex,
+    crossref_short_form, is_citation_shaped_tail, is_counter_noun, reporter_abbreviation_regex,
+};
+pub use legal_citations::cues::{
+    layout_has_citation_cue as has_legal_citation_cue,
+    layout_has_citation_signal as has_citation_signal,
+    layout_heading_text_plausible as heading_text_plausible,
+    layout_is_citation_continuation as is_legal_citation_continuation,
 };
 
 pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
     let document = legal_citations::text::ScalarText::new(text);
-    legal_citations::cues::protected_spans(text)
+    legal_citations::cues::layout_protected_spans(text)
         .into_iter()
         .map(|span| {
             (
