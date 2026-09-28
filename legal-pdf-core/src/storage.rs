@@ -145,7 +145,11 @@ impl Formatter for PythonFormatter {
 pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write_with_sync(path, false, |writer| {
         let mut gzip = GzBuilder::new().mtime(0).write(writer, Compression::fast());
-        serde_json::to_writer(&mut gzip, value)?;
+        // Batch JSON's tiny token writes before feeding the compressor.
+        let mut buffered = BufWriter::new(&mut gzip);
+        serde_json::to_writer(&mut buffered, value)?;
+        buffered.flush().map_err(|source| Error::io(path, source))?;
+        drop(buffered);
         gzip.finish().map_err(|source| Error::io(path, source))?;
         Ok(())
     })

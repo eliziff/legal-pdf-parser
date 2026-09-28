@@ -1,7 +1,7 @@
 use legal_pdf_core::{profile, PdfOcrProvider};
 use legal_pdf_extraction_processor as processor;
 
-pub use legal_pdf_extraction_processor::{Error, ExtractedPdf, Result};
+pub use legal_pdf_extraction_processor::{recognize_pdf, Error, ExtractedPdf, Result};
 
 pub fn extract_pdf(
     bytes: &[u8],
@@ -18,9 +18,10 @@ pub fn extract_pdf(
         profile::measure("extract.fidelity", || {
             pdf_inspector::extract_fidelity_from_doc(&document)
         })?;
+    let embedded_page_labels = processor::embedded_page_labels(&document, page_geometries.len());
     drop(document);
     drop((rects, lines));
-    profile::measure("extract.assemble", || {
+    let mut extracted = profile::measure("extract.assemble", || {
         processor::assemble_pdf(
             bytes,
             &page_geometries,
@@ -30,5 +31,7 @@ pub fn extract_pdf(
             ocr,
             ocr_pages,
         )
-    })
+    })?;
+    extracted.metadata.embedded_page_labels = embedded_page_labels;
+    Ok(extracted)
 }

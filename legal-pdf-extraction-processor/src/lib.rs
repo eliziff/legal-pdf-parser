@@ -1,5 +1,9 @@
 mod error;
+mod page_labels;
 mod pdf;
+pub use page_labels::embedded_page_labels;
 
 pub use error::{Error, Result};
-pub use pdf::{assemble_pdf, load_extraction_document, page_geometries, ExtractedPdf};
+pub use pdf::{
+    assemble_pdf, load_extraction_document, page_geometries, recognize_pdf, ExtractedPdf,
+};

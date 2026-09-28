@@ -1306,7 +1306,7 @@ pub fn assemble_pdf(
     }
 
     let mut pages = Vec::with_capacity(geometries.len());
-    let mut diagnostics = Vec::new();
+    let diagnostics = Vec::new();
     let mut source_offset = 0;
     let mut weak_pages = BTreeSet::<usize>::new();
     for (&number, &(_, geometry)) in geometries {
@@ -1348,7 +1348,7 @@ pub fn assemble_pdf(
     for rule in painted_rules {
         rules_by_page.entry(rule.page).or_default().push(rule);
     }
-    let mut separators = profile::measure("extract.separators", || {
+    let separators = profile::measure("extract.separators", || {
         geometries
             .iter()
             .zip(&pages)
@@ -1368,6 +1368,35 @@ pub fn assemble_pdf(
         }
     }
 
+    let mut extracted = ExtractedPdf {
+        pages,
+        separators,
+        diagnostics,
+        metadata: PdfExtractionMetadata {
+            embedded_page_labels: Vec::new(),
+            pages_needing_ocr: weak_pages.into_iter().collect(),
+            ocr_routed_pages: Vec::new(),
+        },
+    };
+    recognize_pdf(pdf, &mut extracted, ocr, ocr_pages)?;
+    Ok(extracted)
+}
+
+/// Apply recognition to extracted pages without loading or extracting the PDF again.
+pub fn recognize_pdf(
+    pdf: &[u8],
+    extracted: &mut ExtractedPdf,
+    ocr: Option<&mut dyn PdfOcrProvider>,
+    ocr_pages: Option<&[usize]>,
+) -> Result<()> {
+    let ExtractedPdf {
+        pages,
+        separators,
+        diagnostics,
+        metadata,
+    } = extracted;
+    let mut weak_pages: BTreeSet<usize> = metadata.pages_needing_ocr.iter().copied().collect();
+    diagnostics.retain(|diagnostic| diagnostic.code != "OCR_REQUIRED");
     let routed_pages: Vec<_> = weak_pages
         .iter()
         .copied()
@@ -1414,7 +1443,7 @@ pub fn assemble_pdf(
         }
     }
     if reindex {
-        reindex_source_lines(&mut pages);
+        reindex_source_lines(pages);
     }
     let unresolved_pages: Vec<_> = weak_pages.into_iter().collect();
     for &page_index in &unresolved_pages {
@@ -1425,15 +1454,9 @@ pub fn assemble_pdf(
         ));
     }
 
-    Ok(ExtractedPdf {
-        pages,
-        separators,
-        diagnostics,
-        metadata: PdfExtractionMetadata {
-            pages_needing_ocr: unresolved_pages,
-            ocr_routed_pages: routed_pages,
-        },
-    })
+    metadata.pages_needing_ocr = unresolved_pages;
+    metadata.ocr_routed_pages = routed_pages;
+    Ok(())
 }
 
 #[cfg(test)]
