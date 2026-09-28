@@ -655,10 +655,23 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
 
 fn printed_label(value: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})$").unwrap())
-        .captures(value.trim())
-        .and_then(|capture| capture.get(1))
-        .map(|value| value.as_str().to_owned())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})|-\s*(\d{1,6})\s*-)$").unwrap()
+    })
+    .captures(value.trim())
+    .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
+    .map(|value| value.as_str().to_owned())
+}
+
+#[cfg(test)]
+#[test]
+fn printed_label_accepts_symmetric_numeric_folios_only() {
+    assert_eq!(printed_label("- 13 -").as_deref(), Some("13"));
+    assert_eq!(printed_label("- 2 -").as_deref(), Some("2"));
+    assert_eq!(printed_label("Page 13").as_deref(), Some("13"));
+    assert_eq!(printed_label("IV").as_deref(), Some("IV"));
+    assert_eq!(printed_label("- IV -"), None);
+    assert_eq!(printed_label("- 13"), None);
 }
 
 fn footer_page_number(value: &str) -> bool {
@@ -2312,8 +2325,17 @@ fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| matches!(line.region_type.as_str(), "header" | "footer"))
-            .filter_map(|(index, line)| printed_label(&line.text).map(|label| (label, index)))
+            .filter_map(|(index, line)| {
+                let label = printed_label(&line.text)?;
+                let header_limit = if label.bytes().all(|byte| byte.is_ascii_digit()) {
+                    0.14
+                } else {
+                    0.12
+                };
+                (line.region_type == "footer"
+                    || (line.region_type == "header" && line.bbox[3] < page.height * header_limit))
+                    .then_some((label, index))
+            })
             .collect();
         let labels: BTreeSet<String> = candidates
             .iter()
