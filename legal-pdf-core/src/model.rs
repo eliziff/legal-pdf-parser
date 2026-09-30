@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 pub const SCHEMA_VERSION: &str = "legalpdf.document.v4";
-pub const PARSER_VERSION: &str = "0.3.0";
+pub const PARSER_VERSION: &str = "0.3.1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
@@ -220,6 +220,8 @@ pub struct PdfPairingAudit {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PdfExtractionMetadata {
+    #[serde(default)]
+    pub embedded_page_labels: Vec<Option<String>>,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
 }

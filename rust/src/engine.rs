@@ -4,7 +4,7 @@ use legal_pdf_core::model::{
     SCHEMA_VERSION,
 };
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
-use legal_pdf_extraction::{extract_pdf, ExtractedPdf};
+use legal_pdf_extraction::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 use legal_pdf_structure::{
@@ -35,6 +35,15 @@ struct DeferredOcrProvider<'a> {
     options: &'a OcrOptions,
     prepared: Option<PreparedOcrProvider>,
     runtime: Option<OcrProvider>,
+    cache_root: Option<PathBuf>,
+    cache_identity: String,
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Serialize, Deserialize)]
+struct CachedOcrPage {
+    key: String,
+    page: legal_pdf_core::OcrPageResult,
 }
 
 #[cfg(feature = "ocr")]
@@ -47,6 +56,37 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        let mut results = Vec::new();
+        let mut missing = Vec::new();
+        let mut paths = BTreeMap::new();
+        for request in requests {
+            let key = serialization_sha256(&(
+                &self.cache_identity,
+                request.page_index,
+                request.width,
+                request.height,
+            ))?;
+            let path = self
+                .cache_root
+                .as_ref()
+                .map(|root| root.join(format!("{key}.json.gz")));
+            let cached = path
+                .as_ref()
+                .and_then(|path| read_gzip_json::<CachedOcrPage>(path).ok())
+                .filter(|cached| cached.key == key && cached.page.page_index == request.page_index);
+            if let Some(cached) = cached {
+                if let Some(path) = &path {
+                    touch_cache(path);
+                }
+                results.push(cached.page);
+            } else {
+                missing.push(*request);
+                paths.insert(request.page_index, (key, path));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(results);
+        }
         if self.runtime.is_none() {
             let prepared = self.prepared.take().ok_or_else(|| {
                 Error::Message("OCR runtime preparation was already consumed".to_owned())
@@ -55,20 +95,44 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 OcrProvider::from_prepared(self.options, prepared)
             })?);
         }
-        legal_pdf_core::PdfOcrProvider::extract_pages(
+        let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
             self.runtime.as_mut().expect("OCR runtime initialized"),
             pdf,
-            requests,
-        )
+            &missing,
+        )?;
+        for page in recognized {
+            let Some((key, path)) = paths.remove(&page.page_index) else {
+                return Err(Error::Message(
+                    "OCR returned an unexpected or repeated page".to_owned(),
+                ));
+            };
+            if let Some(path) = path {
+                write_gzip_json(
+                    &path,
+                    &CachedOcrPage {
+                        key,
+                        page: page.clone(),
+                    },
+                )?;
+            }
+            results.push(page);
+        }
+        if !paths.is_empty() {
+            return Err(Error::Message(
+                "OCR did not return every requested page".to_owned(),
+            ));
+        }
+        results.sort_by_key(|page| page.page_index);
+        Ok(results)
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct CachedExtraction {
+struct CachedExtraction<T = ExtractedPdf> {
     schema_version: String,
     source_sha256: String,
     cache_key: String,
-    extraction: ExtractedPdf,
+    extraction: T,
 }
 
 #[derive(Debug, Clone)]
@@ -275,8 +339,9 @@ fn touch_cache(path: &Path) {
 }
 
 fn prune_document_cache(root: &Path) {
-    let mut files = fs::read_dir(parse_cache_root(root).join("documents"))
+    let mut files = ["documents", "extractions", "recognition"]
         .into_iter()
+        .flat_map(|directory| fs::read_dir(parse_cache_root(root).join(directory)))
         .flatten()
         .flatten()
         .filter_map(|entry| {
@@ -430,6 +495,16 @@ pub(crate) fn parse_pdf(
         return Ok(None);
     };
     #[cfg(feature = "ocr")]
+    let recognition_key = cache_key(
+        &source_hash,
+        identity,
+        ocr_identity
+            .as_ref()
+            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
+        None,
+        None,
+    )?;
+    #[cfg(feature = "ocr")]
     let mut ocr_provider =
         options
             .ocr
@@ -439,6 +514,10 @@ pub(crate) fn parse_pdf(
                 options,
                 prepared: Some(prepared),
                 runtime: None,
+                cache_root: cache_root
+                    .as_ref()
+                    .map(|root| parse_cache_root(root).join("recognition")),
+                cache_identity: recognition_key.clone(),
             });
     #[cfg(feature = "ocr")]
     let selected_ocr = ocr_provider
@@ -451,9 +530,59 @@ pub(crate) fn parse_pdf(
         Some(provider) => Some(provider as &mut dyn legal_pdf_core::PdfOcrProvider),
         None => selected_ocr,
     };
-    let mut extracted = profile::measure("extract_pdf", || {
-        extract_pdf(bytes, selected_ocr, options.ocr_pages.as_deref())
-    })?;
+    let extraction_key = cache_key(&source_hash, identity, None, None, None)?;
+    let extraction_path = cache_root.as_ref().map(|root| {
+        parse_cache_root(root)
+            .join("extractions")
+            .join(format!("{extraction_key}.json.gz"))
+    });
+    let cached = extraction_path
+        .as_ref()
+        .and_then(|path| {
+            profile::measure("extraction_cache_read", || {
+                read_gzip_json::<CachedExtraction>(path)
+            })
+            .ok()
+        })
+        .filter(|cached| {
+            cached.schema_version == EXTRACTION_CACHE_SCHEMA
+                && cached.source_sha256 == source_hash
+                && cached.cache_key == extraction_key
+                && !cached.extraction.pages.is_empty()
+                && cached.extraction.pages.len() == cached.extraction.separators.len()
+        });
+    let mut extracted = if let Some(cached) = cached {
+        if let Some(path) = &extraction_path {
+            touch_cache(path);
+        }
+        cached.extraction
+    } else {
+        let extracted = profile::measure("extract_pdf", || extract_pdf(bytes, None, None))?;
+        if let Some(path) = &extraction_path {
+            let result = profile::measure("extraction_cache_write", || {
+                write_gzip_json(
+                    path,
+                    &CachedExtraction {
+                        schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(),
+                        source_sha256: source_hash.clone(),
+                        cache_key: extraction_key,
+                        extraction: &extracted,
+                    },
+                )
+            });
+            if options.require_cache_write {
+                result?;
+            }
+        }
+        extracted
+    };
+    recognize_pdf(
+        bytes,
+        &mut extracted,
+        selected_ocr,
+        options.ocr_pages.as_deref(),
+    )?;
+    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
         options
@@ -486,7 +615,7 @@ pub(crate) fn parse_pdf(
         )
     })?;
     let document_status = status(&extracted.diagnostics, &extracted.pages);
-    let parsed = profile::measure("project_document", || {
+    let mut parsed = profile::measure("project_document", || {
         PdfDocument::from_parts(
             &source_hash,
             &key,
@@ -498,6 +627,7 @@ pub(crate) fn parse_pdf(
             derived.structure_graph,
         )
     })?;
+    parsed.set_passage_evidence(passage_pages);
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
         let cache_path = parse_cache_root(root)

@@ -47,7 +47,7 @@ pub struct OcrPageRequest {
     pub height: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrPageResult {
     pub page_index: usize,
     pub lines: Vec<OcrLine>,

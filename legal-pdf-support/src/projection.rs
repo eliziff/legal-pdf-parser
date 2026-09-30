@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use unicode_normalization::UnicodeNormalization;
 
 const MAX_UNITS: usize = 20;
@@ -44,13 +44,15 @@ pub struct PdfDocument {
     summary: PdfSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recognized_pages: Option<Vec<PdfTextPage>>,
+    passage_pages: Arc<Vec<PdfTextPage>>,
 }
 
-/// Display-space OCR geometry retained with the prepared document, never re-OCRed by a reader.
+/// Display-space text geometry retained with the prepared document.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PdfTextPage {
     pub page_number: u32,
+    pub source: String,
     pub width: f64,
     pub height: f64,
     pub lines: Vec<PdfTextLine>,
@@ -74,6 +76,7 @@ pub struct PdfTextWord {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PdfSummary {
+    pub embedded_page_labels: Vec<Option<String>>,
     pub sha256: String,
     pub parser_version: String,
     pub cache_key: String,
@@ -150,6 +153,7 @@ fn summary(
     pdf_metadata: PdfExtractionMetadata,
 ) -> PdfSummary {
     PdfSummary {
+        embedded_page_labels: pdf_metadata.embedded_page_labels,
         sha256: sha256.to_owned(),
         parser_version: PARSER_VERSION.to_owned(),
         cache_key: cache_key.to_owned(),
@@ -199,6 +203,7 @@ impl PdfDocument {
             .filter(|page| page.source != "native")
             .map(|page| PdfTextPage {
                 page_number: page.number,
+                source: page.source.clone(),
                 width: page.width,
                 height: page.height,
                 lines: page
@@ -225,6 +230,7 @@ impl PdfDocument {
             })
             .collect();
         Self {
+            passage_pages: Arc::new(Vec::new()),
             recognized_pages: Some(recognized_pages),
             structure,
             pages: pages
@@ -290,6 +296,48 @@ impl PdfDocument {
         self.recognized_pages.is_some()
     }
 
+    /// Capture extraction witnesses before structural derivation rewrites lines.
+    pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<PdfTextPage>> {
+        Arc::new(
+            pages
+                .iter()
+                .map(|page| PdfTextPage {
+                    page_number: page.number,
+                    source: page.source.clone(),
+                    width: page.width,
+                    height: page.height,
+                    // OCR geometry already lives in recognized_pages; do not retain a second copy.
+                    lines: page
+                        .lines
+                        .iter()
+                        .filter(|_| page.source == "native")
+                        .map(|line| PdfTextLine {
+                            id: line.id.clone(),
+                            text: line.text.clone(),
+                            rect: line.bbox,
+                            words: line
+                                .words
+                                .iter()
+                                .map(|word| PdfTextWord {
+                                    text: word.text.clone(),
+                                    rect: word.bbox,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    }
+
+    pub fn set_passage_evidence(&mut self, pages: Arc<Vec<PdfTextPage>>) {
+        self.passage_pages = pages;
+    }
+
+    pub fn passage_pages(&self) -> Arc<Vec<PdfTextPage>> {
+        Arc::clone(&self.passage_pages)
+    }
+
     pub fn recognized_pages(&self) -> &[PdfTextPage] {
         self.recognized_pages.as_deref().unwrap_or(&[])
     }
@@ -316,7 +364,12 @@ impl PdfDocument {
 
     pub fn fingerprint(&self) -> DocumentFingerprint {
         let mut fingerprint = document_fingerprint(&self.structure);
-        let product = serialization_sha256(&(&self.pages, &self.footnotes, &self.summary));
+        let product = serialization_sha256(&(
+            &self.pages,
+            &self.footnotes,
+            &self.summary,
+            &self.passage_pages,
+        ));
         fingerprint.components.insert("pdf", product.clone());
         fingerprint.result_sha256 =
             serialization_sha256(&(fingerprint.result_sha256.as_str(), product));
@@ -1190,6 +1243,7 @@ mod tests {
 
     fn pdf_summary() -> PdfSummary {
         PdfSummary {
+            embedded_page_labels: Vec::new(),
             sha256: "00".repeat(32),
             parser_version: PARSER_VERSION.to_owned(),
             cache_key: "cache".to_owned(),
@@ -1467,6 +1521,7 @@ mod tests {
             "cache",
             "ready".to_owned(),
             PdfExtractionMetadata {
+                embedded_page_labels: Vec::new(),
                 pages_needing_ocr: vec![],
                 ocr_routed_pages: vec![],
             },
