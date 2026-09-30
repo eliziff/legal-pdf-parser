@@ -71,12 +71,28 @@ def check_westport(structure):
         "Westport's visible judicial stamp must be extracted"
 
 
+def check_omni_folios(structure):
+    # Source review: the 75-page Omni opinion prints -1- through -75- in
+    # its footers. Confirmed independently in the PDF, including both ends.
+    pages = [node for node in structure["nodes"] if node["kind"] == "page"]
+    assert len(pages) == 75
+    source = structure["text"].encode("utf-16-le")
+    for number, page in enumerate(pages, 1):
+        assert page["label"] == f"page{number}"
+        assert page.get("aliases") == [str(number)], f"Missing printed folio {number}"
+        assert page.get("anchor"), f"Printed folio {number} has no source anchor"
+        span = page["range"]
+        text = source[span["start"]*2:span["end"]*2].decode("utf-16-le")
+        assert text.strip().endswith(f"-{number}-"), f"Wrong source footer for page {number}"
+
+
 if __name__ == "__main__":
     raw = Path(sys.argv[1]).read_bytes()
     rows = [json.loads(line) for line in raw.decode("utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig").splitlines()]
     checks = {SOURCE: check,
               "40941dbae64682c658781dd5ebb49e1dd4ea7c46306e0aa57f2abfcd52a52c85": check_bce,
-              "44d79a58446882328a18dcca31cb1bb29d96487c6624a27e9de65297767da972": check_westport}
+              "44d79a58446882328a18dcca31cb1bb29d96487c6624a27e9de65297767da972": check_westport,
+              "da417a2aede8d12adc5e77cfe1cbc49797f2c9672cfa431d7c1436fba2734c29": check_omni_folios}
     checks.update({sha: check_note_gold for sha in NOTE_GOLD})
     matched = 0
     for sha, verify in checks.items():

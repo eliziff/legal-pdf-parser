@@ -1059,7 +1059,7 @@ dependencies = [
 [[package]]
 name = "legal-structure"
 version = "0.1.0"
-source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=282971c60f5d31fa134299f5c17bef6ec8650c06#282971c60f5d31fa134299f5c17bef6ec8650c06"
+source = "git+https://github.com/eliziff/legal-structure-parser.git?rev=7812b88a4d468f49bee5fddae8061fb1ec513a5b#7812b88a4d468f49bee5fddae8061fb1ec513a5b"
 dependencies = [
  "aho-corasick",
  "legal-citations",
