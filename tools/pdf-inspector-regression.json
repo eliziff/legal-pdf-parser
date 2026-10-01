@@ -24,12 +24,12 @@
     {
       "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2023-sec-comp25666.pdf",
       "source_sha256": "8c4578992501e4d3739e07e81b81e52b88d93e429afe6e1cefedec0585615027",
-      "product_sha256": "0c8930e9d7e2ba83c080ac6095a71027e6ade60de81d48e2fe223add4ee14578"
+      "product_sha256": "d029803afc16f396f0b9f31b3ca9cc8da31a57607bdd403fdfd23ebc86454790"
     },
     {
       "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-ilnd-05-cv-03198.pdf",
       "source_sha256": "fa3081cf2f54431cfe969c9e71be3b262847f9978285edc0c243dcba7a4d9564",
-      "product_sha256": "215b6dddeb54312775b744f9fd85d1c30257b92921038e0721a4c993784e34a5"
+      "product_sha256": "32feba65e6ad2ea642400328252fc2ca2c1fd0e377a227bff5b20a78456128d4"
     },
     {
       "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-10-cv-04728.pdf",
@@ -39,7 +39,7 @@
     {
       "path": "benchmarks/legal-generalization-corpus/raw/us-court-opinion-txsd-16-cv-01947-westport.pdf",
       "source_sha256": "44d79a58446882328a18dcca31cb1bb29d96487c6624a27e9de65297767da972",
-      "product_sha256": "4e066e36ce4bded5f669ec32722465db33c4787901d9de0ade4966fbc0669bf6"
+      "product_sha256": "d9ac7fa35693d168b9dcddbf41e111892f9cf0fd5d4292867ff0a4bf6bbe6bf3"
     },
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/petition/crtc-legislative-review/ca-bce-inc-an-international-comparison-of-end-to-end-facilities-based-competition-in-telecomm-40941dbae646.pdf",
@@ -49,7 +49,7 @@
     {
       "path": "experiments/legal_pdf_corpus/pdfs/nz/digitalborn/opening_submission/waitangi-tribunal/nz-t-bennion-e-whiley-kudrat-wai-2139-opening-submissions-for-wai-2139-the-mua-poko-lands-res-0950c3b8cd3b.pdf",
       "source_sha256": "0950c3b8cd3be84ee72f8d4b5002be0075bd52fafed3e65d454c87fe339c8489",
-      "product_sha256": "28bdf557a3ab4ac12a18cb5c3a77dc4f20a3863c1857c44ce0429cdd6b2f7c95"
+      "product_sha256": "32fa59039efecca796d3fbf4df72869cf257f2bfc85994af6640588b68d59966"
     },
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/presentation/foreign-interference-commission/ca-examples-of-media-diaspora-and-non-governmental-organization-concern-about-foreign-interfe-af11dde972f5.pdf",

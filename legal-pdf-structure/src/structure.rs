@@ -356,7 +356,8 @@ struct FolioCandidate {
     line_slot: usize,
     page_number: u32,
     printed_number: u32,
-    right: bool,
+    /// The bottom edge's left (-1), centre (0) or right (1).
+    side: i8,
     y_ratio: f64,
     x_ratio: f64,
 }
@@ -381,7 +382,9 @@ fn arabic_page_number(value: &str) -> Option<u32> {
 /// Text-Fidelity's alternating-folio witness. A singleton Arabic number at
 /// each outer bottom edge is furniture only when at least four consecutive
 /// PDF pages carry a +1 printed sequence, alternate sides, and remain aligned
-/// within each page parity.
+/// within each page parity. A number centred at the bottom is furniture on the
+/// same sequence without alternating, whatever its type: a statute sets its
+/// folio as small as its notes.
 fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
     let mut singletons = Vec::new();
     for (page_slot, page) in pages.iter().enumerate() {
@@ -396,10 +399,12 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
                 let printed_number = arabic_page_number(&line.text)?;
                 let center_x = (line.bbox[0] + line.bbox[2]) / 2.0;
                 let x_ratio = center_x / page.width;
-                let right = if x_ratio < FOLIO_EDGE_MAX_FRAC {
-                    false
+                let side = if x_ratio < FOLIO_EDGE_MAX_FRAC {
+                    -1
                 } else if x_ratio > 1.0 - FOLIO_EDGE_MAX_FRAC {
-                    true
+                    1
+                } else if (x_ratio - 0.5).abs() <= FURNITURE_X_TOLERANCE_FRAC {
+                    0
                 } else {
                     return None;
                 };
@@ -408,7 +413,7 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
                     line_slot,
                     page_number: page.number,
                     printed_number,
-                    right,
+                    side,
                     y_ratio: line.bbox[1] / page.height,
                     x_ratio,
                 })
@@ -423,11 +428,16 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
 
     fn aligned(run: &[FolioCandidate], candidate: FolioCandidate) -> bool {
         let previous = run.last().expect("nonempty folio run");
+        let centred = candidate.side == 0 || previous.side == 0;
         if candidate.page_number != previous.page_number + 1
             || candidate.printed_number != previous.printed_number + 1
-            || candidate.right == previous.right
+            || if centred {
+                candidate.side != previous.side
+            } else {
+                candidate.side == previous.side
+            }
             || run.iter().any(|old| {
-                old.page_number % 2 == candidate.page_number % 2 && old.right != candidate.right
+                old.page_number % 2 == candidate.page_number % 2 && old.side != candidate.side
             })
         {
             return false;
@@ -439,7 +449,7 @@ fn alternating_folios(pages: &[Page]) -> HashSet<(usize, usize)> {
         for old in run {
             y_min = y_min.min(old.y_ratio);
             y_max = y_max.max(old.y_ratio);
-            if old.right == candidate.right {
+            if old.side == candidate.side {
                 side_x_min = side_x_min.min(old.x_ratio);
                 side_x_max = side_x_max.max(old.x_ratio);
             }
@@ -1418,6 +1428,10 @@ fn wrapped_heading_continuations(
             )
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
+            // A title's line opens on a word; a caption's bracket column (")", "§") is no title.
+            && continuation_text.starts_with(|character: char| {
+                character.is_alphanumeric() || "(['\"\u{2018}\u{201c}".contains(character)
+            })
             && !(caps_head && continuation_text.chars().any(char::is_lowercase))
             && (!sentence_ended(continuation_text) || continuation_text.ends_with('?') || cited)
             && !starts_note_or_list(continuation_text)
@@ -1442,7 +1456,8 @@ fn wrapped_heading_continuations(
             break;
         }
     }
-    // The body resumes below the title's last line, further than the title's own leading.
+    // The body resumes below the title's last line, further than the title's own leading, or
+    // in lower case under a title in capitals.
     while let Some(&last) = wrapped.last() {
         let line = &page.lines[last];
         let above = if last == heading_slot + 1 {
@@ -1457,8 +1472,10 @@ fn wrapped_heading_continuations(
                     Some("text" | "body")
                 )
                 && has_valid_bbox(following)
-                && following.bbox[1] - line.bbox[1]
-                    >= line.bbox[1] - above.bbox[1] + ((line.bbox[3] - line.bbox[1]) * 0.5).max(8.0)
+                && (following.bbox[1] - line.bbox[1]
+                    >= line.bbox[1] - above.bbox[1]
+                        + ((line.bbox[3] - line.bbox[1]) * 0.5).max(8.0)
+                    || caps_head && following.text.chars().any(char::is_lowercase))
         });
         if resumed {
             break;
@@ -1666,19 +1683,32 @@ fn apply_text_fidelity_headings(
         return HashMap::new();
     };
     let toc_leader = contents_leader_re();
-    for page in pages.iter_mut() {
-        if primitives.contents_pages.contains(&page.index)
-            || page
-                .lines
-                .iter()
-                .filter(|line| toc_leader.is_match(&line.text))
-                .take(5)
-                .count()
-                >= 5
-        {
+    let mut capitalised = Vec::new();
+    for (page_slot, page) in pages.iter_mut().enumerate() {
+        if primitives.contents_pages.contains(&page.index) {
             continue;
         }
-        for line in &mut page.lines {
+        // A page carrying a contents list is read below the list: its entries are no headings.
+        let listed = page
+            .lines
+            .iter()
+            .filter(|line| toc_leader.is_match(&line.text))
+            .take(5)
+            .count()
+            >= 5;
+        let list_bottom = page
+            .lines
+            .iter()
+            .filter(|line| primitives.contents_line_ids.contains(&line.id))
+            .map(|line| line.bbox[3])
+            .max_by(f64::total_cmp);
+        if listed && list_bottom.is_none() {
+            continue;
+        }
+        for (line_slot, line) in page.lines.iter_mut().enumerate() {
+            if listed && list_bottom.is_some_and(|bottom| line.bbox[1] < bottom) {
+                continue;
+            }
             let text = line.text.trim();
             let letters = text
                 .chars()
@@ -1697,6 +1727,7 @@ fn apply_text_fidelity_headings(
                 && heading_text_plausible(text)
             {
                 line.region_type = "heading".to_owned();
+                capitalised.push((page_slot, line_slot));
             }
         }
     }
@@ -1779,6 +1810,25 @@ fn apply_text_fidelity_headings(
         })
         .collect();
 
+    // A title in capitals can wrap ("ON APPEAL FROM THE COURT OF APPEAL FOR" / "ALBERTA").
+    for (page_slot, line_slot) in capitalised {
+        if structural.contains(&(page_slot, line_slot))
+            || pages[page_slot].lines[line_slot].region_type != "heading"
+        {
+            continue;
+        }
+        let block = pages[page_slot].lines[line_slot].block_index;
+        for continuation_slot in wrapped_heading_continuations(
+            &pages[page_slot],
+            line_slot,
+            &structural,
+            page_slot,
+            source_regions,
+        ) {
+            pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
+            pages[page_slot].lines[continuation_slot].block_index = block;
+        }
+    }
     for decision in &decisions {
         let page_slot = decision.page_slot;
         let marker_slot = decision.line_slot;
@@ -2690,9 +2740,9 @@ fn classify_pages_with_source(
         build_regions(std::slice::from_mut(page));
     }
     evidence.translation_line_ids = translation;
+    evidence.contents_line_ids.extend(contents_line_ids);
     let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
-    evidence.contents_line_ids.extend(contents_line_ids);
     build_regions(pages);
     diagnostics
 }

@@ -3252,3 +3252,134 @@ fn a_name_s_initials_are_no_heading() {
     }
     assert_eq!(heading_texts(lines), ["A. The Tow", "B. The Mooring"]);
 }
+
+#[test]
+fn a_heading_below_a_contents_list_on_its_page_is_read() {
+    let mut lines = Vec::new();
+    let mut y = 90.0;
+    for text in [
+        "TABLE OF CONTENTS",
+        "INTRODUCTION ......................................................... 1",
+        "I. THE FORESHORE ...................................................... 3",
+        "II. MOORINGS AND BERTHS .............................................. 7",
+        "III. THE HARBOUR MASTER'S ORDERS ..................................... 11",
+        "IV. CONCLUSION ...................................................... 15",
+    ] {
+        lines.push(sized_line(text, [54.0, y, 398.0, y + 11.0], 10.0));
+        y += 13.0;
+    }
+    lines.push(sized_line(
+        "INTRODUCTION",
+        [184.0, 200.0, 251.0, 211.0],
+        10.0,
+    ));
+    for row in 0..4 {
+        let top = 224.0 + row as f64 * 12.0;
+        lines.push(sized_line(
+            "Harbour commissions have long settled where a barge may lie at low water.",
+            [36.0, top, 399.0, top + 11.0],
+            10.0,
+        ));
+    }
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+
+    classify_pages(&mut pages, &[None]);
+
+    let headings = pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.region_type == "heading")
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(headings, ["INTRODUCTION"]);
+}
+
+#[test]
+fn a_title_in_capitals_wrapped_onto_a_short_line_is_one_heading() {
+    let mut lines = vec![sized_line(
+        "Present: Aubry, Okafor and Lindqvist JJ.",
+        [66.0, 416.0, 234.0, 427.0],
+        9.5,
+    )];
+    lines.push(sized_line(
+        "ON REVIEW FROM THE MARINE TRIBUNAL FOR",
+        [66.0, 455.0, 282.0, 466.0],
+        9.8,
+    ));
+    lines.push(sized_line("NUNAVUT", [66.0, 466.0, 109.0, 477.0], 9.8));
+    for row in 0..4 {
+        let top = 483.0 + row as f64 * 11.0;
+        lines.push(sized_line(
+            "Shipping law — Moorings — Whether a harbour may bar a barge at low water",
+            [66.0, top, 284.0, top + 11.0],
+            9.5,
+        ));
+    }
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+    let evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+
+    apply_text_fidelity_headings(&mut pages, 10.0, &evidence);
+
+    let lines = &pages[0].lines;
+    assert_eq!(lines[1].region_type, "heading");
+    assert_eq!(lines[2].region_type, "heading");
+    assert_eq!(lines[1].block_index, lines[2].block_index);
+    assert!(lines[3..].iter().all(|line| line.region_type == "body"));
+}
+
+#[test]
+fn a_page_number_centred_in_small_type_is_furniture() {
+    let mut pages = Vec::new();
+    for page in 0..5_usize {
+        let mut lines = Vec::new();
+        for row in 0..12 {
+            let top = 80.0 + row as f64 * 12.0;
+            lines.push(sized_line(
+                &format!(
+                    "{} The harbour authority may make rules for the berths, row {row}.",
+                    page * 12 + row + 1
+                ),
+                [48.0, top, 294.0, top + 11.0],
+                9.7,
+            ));
+        }
+        lines.push(sized_line(
+            &(page + 1).to_string(),
+            [304.0, 757.0, 308.0, 767.0],
+            6.0,
+        ));
+        lines.push(sized_line(
+            "Updated to March 3, 2031",
+            [48.0, 758.0, 135.0, 767.0],
+            6.0,
+        ));
+        mark_source_body(&mut lines);
+        let mut page_record = test_page(lines);
+        page_record.width = 612.0;
+        page_record.height = 792.0;
+        page_record.index = page;
+        page_record.number = page as u32 + 1;
+        page_record.id = format!("p{:04}", page + 1);
+        for line in &mut page_record.lines {
+            line.id = line.id.replacen("p0001", &page_record.id, 1);
+            line.page_index = page;
+            line.page_number = page as u32 + 1;
+        }
+        pages.push(page_record);
+    }
+
+    mark_repeated_furniture(&mut pages);
+
+    for page in &pages {
+        assert_eq!(
+            page.lines[12].region_type, "footer",
+            "folio {}",
+            page.lines[12].text
+        );
+    }
+}
