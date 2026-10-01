@@ -21,7 +21,8 @@ use legal_pdf_support::pairing_support::{
 };
 use legal_pdf_support::{
     enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
-    EnumeratorInterpretation, HeadingAction, HeadingFamilyStats, HeadingLadderStatus,
+    styled_heading_text_plausible, EnumeratorInterpretation, HeadingAction, HeadingFamilyStats,
+    HeadingLadderStatus,
 };
 use legal_structure::{
     normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph, utf16_len,
@@ -1026,12 +1027,21 @@ fn heading_source_eligible(regions: &HashMap<String, String>, line: &Line) -> bo
     })
 }
 
-struct HeadingCandidate<'a> {
+struct HeadingCandidate {
     page_slot: usize,
     line_slot: usize,
     joined_line_slot: Option<usize>,
-    text: &'a str,
+    text_plausible: bool,
     interpretations: Vec<EnumeratorInterpretation>,
+}
+
+/// A title set apart in bold may name a case by its parties; one in body type may not.
+fn heading_title_plausible(line: &Line, text: &str) -> bool {
+    if bold_char_share(line) >= 0.60 {
+        styled_heading_text_plausible(text)
+    } else {
+        heading_text_plausible(text)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1042,14 +1052,12 @@ struct HeadingDecision {
     text_plausible: bool,
     level: Option<usize>,
     action: HeadingAction,
+    ladder_clean: bool,
     coherent_family: bool,
     footnote_suspect: bool,
 }
 
-fn heading_candidates<'a>(
-    pages: &'a [Page],
-    primitives: &PdfPrimitiveEvidence,
-) -> Vec<HeadingCandidate<'a>> {
+fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
     let regions = primitives.source_regions.as_ref().expect("source regions");
     let inline = inline_enumerator_re();
     let standalone = standalone_enumerator_re();
@@ -1072,12 +1080,14 @@ fn heading_candidates<'a>(
                 let punct = capture.get(2).unwrap().as_str();
                 let text = capture.get(3).unwrap().as_str().trim();
                 let interpretations = enumerator_interpretations(value, punct);
-                if heading_text_plausible(text) && !interpretations.is_empty() {
+                // A line opening "v. Party, 2016 ONCA 409" carries a style of cause on.
+                let versus = value == "v" && punct == ".";
+                if !versus && heading_title_plausible(line, text) && !interpretations.is_empty() {
                     candidates.push(HeadingCandidate {
                         page_slot,
                         line_slot,
                         joined_line_slot: None,
-                        text,
+                        text_plausible: true,
                         interpretations,
                     });
                 }
@@ -1102,12 +1112,15 @@ fn heading_candidates<'a>(
             // "v." alone between two parties' names is the style of cause's versus.
             let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
-            if !versus && heading_text_plausible(text) && !interpretations.is_empty() {
+            if !versus
+                && heading_title_plausible(&page.lines[follower_slot], text)
+                && !interpretations.is_empty()
+            {
                 candidates.push(HeadingCandidate {
                     page_slot,
                     line_slot,
                     joined_line_slot: Some(follower_slot),
-                    text,
+                    text_plausible: true,
                     interpretations,
                 });
             }
@@ -1273,22 +1286,20 @@ fn coherent_heading_family(family: &HeadingFamilyStats) -> bool {
     family.count >= 2 && family.violations == 0 && family.level_votes.len() == 1
 }
 
-fn wrapped_heading_continuation(
+/// The lines an enumerated heading's title wraps onto: set in its type, flush under it or centred
+/// beneath it, at its leading, with the body resuming further down. A title can run to
+/// several lines, end in a question, and name a decision ("... 2021 ABCA 273, 30" /
+/// "Alta. L.R. (7th) 1 (...)") when the whole title still reads as one.
+fn wrapped_heading_continuations(
     page: &Page,
     heading_slot: usize,
     structural: &HashSet<(usize, usize)>,
     page_slot: usize,
     source_regions: &HashMap<String, String>,
-) -> Option<usize> {
-    static INLINE: OnceLock<Regex> = OnceLock::new();
-    if heading_slot + 2 >= page.lines.len() {
-        return None;
-    }
+) -> Vec<usize> {
+    const MAX_WRAPPED_LINES: usize = 3;
     let heading = &page.lines[heading_slot];
-    let continuation = &page.lines[heading_slot + 1];
-    let following = &page.lines[heading_slot + 2];
     let heading_text = heading.text.trim();
-    let continuation_text = continuation.text.trim();
     let caps_head = heading_text.split_whitespace().count() >= 2
         && heading_text
             .chars()
@@ -1297,54 +1308,83 @@ fn wrapped_heading_continuation(
             >= 8
         && !heading_text.chars().any(char::is_lowercase)
         && !heading_text.ends_with(['.', '?', '!', ';', ':']);
-    let wrap_capable = INLINE
-        .get_or_init(|| {
-            Regex::new(
-                r"^\s*(?:[IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})[.)]\s+\S",
-            )
-            .unwrap()
-        })
-        .is_match(heading_text)
-        || (caps_head && !continuation_text.chars().any(char::is_lowercase));
-    let continuation_source = source_regions.get(&continuation.id).map(String::as_str);
-    let following_source = source_regions.get(&following.id).map(String::as_str);
-    if !wrap_capable
-        || structural.contains(&(page_slot, heading_slot + 1))
-        || !matches!(
-            continuation_source,
-            Some("text" | "body" | "paragraph_title" | "heading" | "block_quote")
-        )
-        || !matches!(following_source, Some("text" | "body"))
-        || !matches!(continuation.region_type.as_str(), "body" | "heading")
-        || following.region_type != "body"
-        || continuation_text.is_empty()
-        || !(1..=12).contains(&continuation_text.split_whitespace().count())
-        || sentence_ended(continuation_text)
-        || has_citation_signal(continuation_text)
-        || starts_note_or_list(continuation_text)
-        || !has_valid_bbox(heading)
-        || !has_valid_bbox(continuation)
-        || !has_valid_bbox(following)
-    {
-        return None;
+    if !has_valid_bbox(heading) {
+        return Vec::new();
     }
+    let mut title = inline_enumerator_re()
+        .captures(heading_text)
+        .map_or(heading_text, |capture| capture.get(3).unwrap().as_str())
+        .trim()
+        .to_owned();
     let heading_size = line_font_size(heading);
-    let continuation_size = line_font_size(continuation);
     let heading_height = (heading.bbox[3] - heading.bbox[1]).max(1.0);
-    let continuation_height = (continuation.bbox[3] - continuation.bbox[1]).max(1.0);
-    let x0_delta = continuation.bbox[0] - heading.bbox[0];
-    let internal_gap = continuation.bbox[1] - heading.bbox[3];
-    let internal_step = continuation.bbox[1] - heading.bbox[1];
-    let following_step = following.bbox[1] - continuation.bbox[1];
-    (heading_size > 0.0
-        && continuation_size > 0.0
-        && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
-        && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
-        && (continuation_height - heading_height).abs() <= heading_height * 0.05
-        && (-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
-        && (-heading_height * 0.2..=(heading_height * 0.8).max(6.0)).contains(&internal_gap)
-        && following_step >= internal_step + (continuation_height * 0.5).max(8.0))
-    .then_some(heading_slot + 1)
+    let centre_tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
+    let mut wrapped = Vec::new();
+    let mut previous = heading;
+    for slot in heading_slot + 1..page.lines.len().min(heading_slot + 1 + MAX_WRAPPED_LINES) {
+        let continuation = &page.lines[slot];
+        let continuation_text = continuation.text.trim();
+        let continuation_size = line_font_size(continuation);
+        let continuation_height = (continuation.bbox[3] - continuation.bbox[1]).max(1.0);
+        let x0_delta = continuation.bbox[0] - heading.bbox[0];
+        let internal_gap = continuation.bbox[1] - previous.bbox[3];
+        let joined = format!("{title} {continuation_text}");
+        let cited = has_citation_signal(&joined);
+        let continues = !structural.contains(&(page_slot, slot))
+            && matches!(
+                source_regions.get(&continuation.id).map(String::as_str),
+                Some("text" | "body" | "paragraph_title" | "heading" | "block_quote")
+            )
+            && matches!(continuation.region_type.as_str(), "body" | "heading")
+            && (1..=12).contains(&continuation_text.split_whitespace().count())
+            && !(caps_head && continuation_text.chars().any(char::is_lowercase))
+            && (!sentence_ended(continuation_text) || continuation_text.ends_with('?') || cited)
+            && !starts_note_or_list(continuation_text)
+            && (!cited || heading_title_plausible(heading, &joined))
+            && has_valid_bbox(continuation)
+            && heading_size > 0.0
+            && continuation_size > 0.0
+            && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+            && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
+            && (continuation_height - heading_height).abs() <= heading_height * 0.05
+            && ((-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
+                || (line_center_x(continuation) - line_center_x(heading)).abs()
+                    <= centre_tolerance)
+            && (-heading_height * 0.2..=(heading_height * 0.8).max(6.0)).contains(&internal_gap);
+        if !continues {
+            break;
+        }
+        wrapped.push(slot);
+        title = joined;
+        previous = continuation;
+        if continuation_text.ends_with('?') {
+            break;
+        }
+    }
+    // The body resumes below the title's last line, further than the title's own leading.
+    while let Some(&last) = wrapped.last() {
+        let line = &page.lines[last];
+        let above = if last == heading_slot + 1 {
+            heading
+        } else {
+            &page.lines[last - 1]
+        };
+        let resumed = page.lines.get(last + 1).is_some_and(|following| {
+            following.region_type == "body"
+                && matches!(
+                    source_regions.get(&following.id).map(String::as_str),
+                    Some("text" | "body")
+                )
+                && has_valid_bbox(following)
+                && following.bbox[1] - line.bbox[1]
+                    >= line.bbox[1] - above.bbox[1] + ((line.bbox[3] - line.bbox[1]) * 0.5).max(8.0)
+        });
+        if resumed {
+            break;
+        }
+        wrapped.pop();
+    }
+    wrapped
 }
 
 fn titlecase_ratio(text: &str) -> f64 {
@@ -1580,31 +1620,49 @@ fn apply_text_fidelity_headings(
         }
     }
 
-    let (ladder_clean, decisions) = {
+    let decisions = {
         let candidates = heading_candidates(pages, primitives);
-        let parsed = parse_heading_ladder(
-            candidates
-                .iter()
-                .map(|candidate| candidate.interpretations.as_slice()),
-        );
-        let decisions = candidates
+        let interpretations = candidates
             .iter()
-            .zip(&parsed.assignments)
-            .map(|(candidate, assignment)| {
-                let family = parsed.families.get(assignment.family);
-                HeadingDecision {
-                    page_slot: candidate.page_slot,
-                    line_slot: candidate.line_slot,
-                    joined_line_slot: candidate.joined_line_slot,
-                    text_plausible: heading_text_plausible(candidate.text),
-                    level: assignment.level,
-                    action: assignment.action,
-                    coherent_family: family.is_some_and(coherent_heading_family),
-                    footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
-                }
-            })
+            .map(|candidate| candidate.interpretations.as_slice())
             .collect::<Vec<_>>();
-        (parsed.status == HeadingLadderStatus::ParsedClean, decisions)
+        // A judgment with more than one set of reasons numbers each from "I." again: every
+        // restart of the outermost numbering opens a ladder of its own.
+        let mut sets = parse_heading_ladder(interpretations.iter().copied())
+            .assignments
+            .iter()
+            .enumerate()
+            .filter(|(_, assignment)| {
+                assignment.action == HeadingAction::IllegalRestart && assignment.level == Some(1)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        sets.insert(0, 0);
+        sets.push(candidates.len());
+        sets.windows(2)
+            .flat_map(|set| {
+                let parsed = parse_heading_ladder(interpretations[set[0]..set[1]].iter().copied());
+                let clean = parsed.status == HeadingLadderStatus::ParsedClean;
+                candidates[set[0]..set[1]]
+                    .iter()
+                    .zip(&parsed.assignments)
+                    .map(|(candidate, assignment)| {
+                        let family = parsed.families.get(assignment.family);
+                        HeadingDecision {
+                            page_slot: candidate.page_slot,
+                            line_slot: candidate.line_slot,
+                            joined_line_slot: candidate.joined_line_slot,
+                            text_plausible: candidate.text_plausible,
+                            level: assignment.level,
+                            action: assignment.action,
+                            ladder_clean: clean,
+                            coherent_family: family.is_some_and(coherent_heading_family),
+                            footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     };
     demote_false_headings(pages, &decisions, source_regions);
     let mut heading_levels = decisions
@@ -1655,7 +1713,7 @@ fn apply_text_fidelity_headings(
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
         if !target_is_heading {
-            if !ladder_clean
+            if !decision.ladder_clean
                 || !decision.text_plausible
                 || matches!(
                     decision.action,
@@ -1684,7 +1742,7 @@ fn apply_text_fidelity_headings(
             pages[page_slot].lines[marker_slot].region_type = "heading".to_owned();
             pages[page_slot].lines[marker_slot].block_index = block;
         }
-        if let Some(continuation_slot) = wrapped_heading_continuation(
+        for continuation_slot in wrapped_heading_continuations(
             &pages[page_slot],
             target_slot,
             &structural,

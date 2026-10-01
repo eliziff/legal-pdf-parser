@@ -3012,3 +3012,110 @@ fn a_running_head_naming_each_page_s_sections_is_furniture() {
         );
     }
 }
+
+fn heading_texts(lines: Vec<Line>) -> Vec<String> {
+    let mut lines = lines;
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+    let evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    apply_text_fidelity_headings(&mut pages, 10.0, &evidence);
+    pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.region_type == "heading")
+        .map(|line| line.text.clone())
+        .collect()
+}
+
+#[test]
+fn each_set_of_reasons_reads_its_own_heading_ladder() {
+    let mut lines = Vec::new();
+    let mut y = 50.0;
+    for title in [
+        "I. Overview",
+        "II. Background",
+        "A. The Tow",
+        "B. The Mooring",
+        "III. Disposition",
+        "I. Introduction",
+        "II. Analysis",
+        "III. Conclusion",
+    ] {
+        lines.push(sized_line(title, [60.0, y, 520.0, y + 11.0], 10.0));
+        lines.push(sized_line(
+            "The tow line parted under a load the tug could bear.",
+            [60.0, y + 30.0, 520.0, y + 41.0],
+            10.0,
+        ));
+        y += 70.0;
+    }
+    assert_eq!(
+        heading_texts(lines),
+        [
+            "I. Overview",
+            "II. Background",
+            "A. The Tow",
+            "B. The Mooring",
+            "III. Disposition",
+            "I. Introduction",
+            "II. Analysis",
+            "III. Conclusion",
+        ]
+    );
+}
+
+#[test]
+fn an_enumerated_title_wraps_over_several_lines() {
+    let mut lines = Vec::new();
+    let mut push =
+        |text: &str, y: f64| lines.push(sized_line(text, [60.0, y, 520.0, y + 11.0], 10.0));
+    push("I. THE TUG, THE BARGE AND THE", 110.0);
+    push("HARBOUR MASTER: WHO PAYS FOR", 122.0);
+    push("THE BERTH?", 134.0);
+    push(
+        "The tow line parted under a load the tug could bear.",
+        164.0,
+    );
+    push("II. THE RULE", 194.0);
+    push(
+        "The barge was moored where the harbour master said it was.",
+        224.0,
+    );
+    assert_eq!(
+        heading_texts(lines),
+        [
+            "I. THE TUG, THE BARGE AND THE",
+            "HARBOUR MASTER: WHO PAYS FOR",
+            "THE BERTH?",
+            "II. THE RULE",
+        ]
+    );
+}
+
+#[test]
+fn a_title_standing_above_a_parallel_english_column_is_no_translation() {
+    let prose = (
+        "The tug owner says that the barge was not in the way of it.",
+        "Le propriétaire du remorqueur affirme que la barge ne gênait pas",
+    );
+    let mut rows = vec![("", "FILE 31-H7.B"), ("", ""), ("", "")];
+    rows.extend([prose; 8]);
+    let mut pages = vec![parallel_page(&rows)];
+    let mut evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    classify_pages_with_source(&mut pages, &[None], &mut evidence);
+    for line in &pages[0].lines {
+        let french = line.bbox[0] >= 300.0 && line.text != "FILE 31-H7.B";
+        assert_eq!(
+            evidence.translation_line_ids.contains(&line.id),
+            french,
+            "{}",
+            line.text
+        );
+    }
+}

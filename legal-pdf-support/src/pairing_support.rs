@@ -6,15 +6,107 @@ const MAX_COUNTER_VALUE: u32 = 200;
 const MAX_OUTLINE_DEPTH: usize = 4;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
 
+use legal_citations::cues::layout_heading_text_plausible;
 pub use legal_citations::cues::{
     crossref_short_form, is_citation_shaped_tail, is_counter_noun, reporter_abbreviation_regex,
 };
 pub use legal_citations::cues::{
     layout_has_citation_cue as has_legal_citation_cue,
     layout_has_citation_signal as has_citation_signal,
-    layout_heading_text_plausible as heading_text_plausible,
     layout_is_citation_continuation as is_legal_citation_continuation,
 };
+
+const TITLECASE_MIN_RATIO: f64 = 0.6;
+
+/// Whether a short line is plausibly a heading's title: capitalized, in title case or
+/// capitals, and not a citation. A title can name a decision or a provision ("Court of
+/// Appeal of Alberta, 2021 ABCA 273, ..." or "Section 33.1 Infringes Sections 7 and
+/// 11(d)"); what it says around its citations and provision numbers must then read as a
+/// title, without a citation's style of cause, pinpoint or signal.
+pub fn heading_text_plausible(value: &str) -> bool {
+    // A title ending in a comma is a sentence's opening ("In these Regulations,").
+    !value.trim_end().ends_with(',')
+        && (layout_heading_text_plausible(value) || titled_around_references(value.trim()))
+}
+
+/// A title set apart in bold can also name a case by its parties ("R. v. Stone and
+/// Automatons"), when it carries no citation the citation grammar finds and does not end
+/// in a page number, as a contents entry or a cited page does.
+pub fn styled_heading_text_plausible(value: &str) -> bool {
+    let text = value.trim();
+    heading_text_plausible(text)
+        || (text
+            .starts_with(|character: char| character.is_alphabetic() && character.is_uppercase())
+            && !text.ends_with(',')
+            && !text
+                .rsplit(char::is_whitespace)
+                .next()
+                .is_some_and(|word| word.chars().all(|character| character.is_ascii_digit()))
+            && legal_citations::extract(text, &legal_citations::Options::default()).is_empty()
+            && title_cased(text.split_whitespace()))
+}
+
+fn title_cased<'a>(words: impl Iterator<Item = &'a str>) -> bool {
+    let lettered = words
+        .filter_map(|word| word.chars().find(|character| character.is_alphabetic()))
+        .collect::<Vec<_>>();
+    let capitalized = lettered
+        .iter()
+        .filter(|character| character.is_uppercase())
+        .count();
+    capitalized >= 2 && capitalized as f64 / lettered.len() as f64 >= TITLECASE_MIN_RATIO
+}
+
+fn titled_around_references(text: &str) -> bool {
+    if !text.starts_with(|character: char| character.is_alphabetic() && character.is_uppercase())
+        || text.chars().count() > 200
+    {
+        return false;
+    }
+    // Each citation, its style of cause, pinpoints and parentheticals included, is cut out.
+    let mut uncited = String::new();
+    let mut from = 0;
+    for citation in legal_citations::extract(text, &legal_citations::Options::default()) {
+        let span = &citation.full_span;
+        if span.start < from || text.get(span.start..span.end) != Some(span.text.as_str()) {
+            continue;
+        }
+        if text[..span.start].trim().is_empty() {
+            return false;
+        }
+        uncited.push_str(&text[from..span.start]);
+        uncited.push(' ');
+        from = span.end;
+    }
+    uncited.push_str(&text[from..]);
+    // A counted provision ("Section 33.1", "Sections 7 and 11(d)") keeps its noun as a
+    // title word; its numbers, and the noun, are no citation cue.
+    let mut words = Vec::new();
+    let mut prose = Vec::new();
+    let (mut counting, mut counted) = (false, false);
+    for word in uncited.split_whitespace() {
+        let numbered = word.chars().any(|character| character.is_ascii_digit());
+        if numbered || (counting && matches!(word, "and" | "or" | "to" | "&")) {
+            if counting {
+                counted = true;
+            } else {
+                prose.push(word);
+            }
+            continue;
+        }
+        counting =
+            is_counter_noun(word.trim_matches(|character: char| !character.is_alphanumeric()));
+        if !counting {
+            prose.push(word);
+        }
+        words.push(word);
+    }
+    let prose = prose.join(" ");
+    (from > 0 || counted)
+        && !has_legal_citation_cue(&prose)
+        && !has_citation_signal(&prose)
+        && title_cased(words.into_iter())
+}
 
 pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
     let document = legal_citations::text::ScalarText::new(text);
@@ -328,6 +420,42 @@ mod tests {
         for (value, expected) in vectors {
             assert_eq!(heading_text_plausible(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn a_title_naming_a_decision_or_provision_is_a_heading_and_a_citation_is_not() {
+        for title in [
+            "Court of Appeal for Ontario, 2031 ONCA 412, 88 O.R. (3d) 1 (Lane, Ortiz and Webb JJ.A.)",
+            "Court of Appeal for Ontario, 2031 ONCA 412, 88",
+            "Section 12.4 Infringes Sections 7 and 11(b)",
+            "Is Section 12.4 Saved Under Section 1?",
+        ] {
+            assert!(heading_text_plausible(title), "{title}");
+        }
+        for citation in [
+            "Harbour v. Tug Co., 2031 SCC 9",
+            "R. v. Mariner, [2031] 2 S.C.R. 101",
+            "R. v. Mariner",
+            "Navigation Act, R.S.C. 1985, c. N-22, s. 4",
+            "Ibid at para 5",
+            "Mariner, supra note 4 at para 12",
+            "See Section 12.4",
+            "In these Regulations,",
+        ] {
+            assert!(!heading_text_plausible(citation), "{citation}");
+        }
+        assert!(!heading_text_plausible(
+            "R. V. MARINER AND HARBOUR PILOTS: SOME LIMITS"
+        ));
+        assert!(styled_heading_text_plausible(
+            "R. V. MARINER AND HARBOUR PILOTS: SOME LIMITS"
+        ));
+        assert!(!styled_heading_text_plausible(
+            "R. v. Mariner, [2031] 2 S.C.R. 101"
+        ));
+        assert!(!styled_heading_text_plausible(
+            "Mariner v Harbour Pilots 214"
+        ));
     }
 
     #[test]

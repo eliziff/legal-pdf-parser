@@ -525,12 +525,35 @@ pub(super) fn translation_lines(pages: &[Page]) -> HashSet<String> {
     let mut translation = HashSet::new();
     for (page, page_split) in pages.iter().zip(&models) {
         let split = page_split.unwrap_or(split);
-        let french = page
+        let mut french = page
             .lines
             .iter()
             .filter(body)
             .filter(|line| side(line, split) == Some(french_right))
             .collect::<Vec<_>>();
+        // What stands apart above the English column, a cover page's file number or a
+        // memo's title, is no part of the translation beside it.
+        let english_top = page
+            .lines
+            .iter()
+            .filter(body)
+            .filter(|line| (line_center_x(line) >= split) != french_right)
+            .map(|line| line.bbox[1])
+            .min_by(f64::total_cmp);
+        if let Some(top) = english_top {
+            french.sort_by(|a, b| a.bbox[1].total_cmp(&b.bbox[1]));
+            let apart = french
+                .windows(2)
+                .filter(|pair| {
+                    let height = pair[0].bbox[3] - pair[0].bbox[1];
+                    pair[0].bbox[3] <= top && pair[1].bbox[1] - pair[0].bbox[3] >= height * 2.0
+                })
+                .map(|pair| pair[0].bbox[3])
+                .max_by(f64::total_cmp);
+            if let Some(cut) = apart {
+                french.retain(|line| line.bbox[3] > cut);
+            }
+        }
         if confirmed.contains(&page.index)
             || column_language(language_votes(french.iter().copied()), 3) == Some(true)
         {
