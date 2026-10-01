@@ -195,15 +195,24 @@ fn validate_selected_pages(selected: Option<&[usize]>, count: usize) -> Result<(
 
 pub fn derive_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfDocument> {
     let options = parse_options(request)?;
-    let document = parse_pdf(Some(bytes), &options)?
+    let document = parse_pdf(Some(bytes), &options, None)?
         .ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
     finish_pdf_document(document, request, &options)
 }
 
 pub fn prepare_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfSummary> {
+    prepare_pdf_document_reporting(bytes, request, None)
+}
+
+/// Prepares the PDF, reporting recognized pages of the pages to recognize as they finish.
+pub fn prepare_pdf_document_reporting(
+    bytes: &[u8],
+    request: &PdfRequest,
+    progress: crate::engine::RecognitionProgress<'_>,
+) -> Result<PdfSummary> {
     let mut options = parse_options(request)?;
     options.require_cache_write = true;
-    let document = parse_pdf(Some(bytes), &options)?
+    let document = parse_pdf(Some(bytes), &options, progress)?
         .ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
     validate_selected_pages(options.ocr_pages.as_deref(), document.page_count())?;
     Ok(document.summary().clone())
@@ -211,7 +220,7 @@ pub fn prepare_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfSum
 
 pub fn restore_pdf_document(request: &PdfRequest) -> Result<Option<PdfDocument>> {
     let options = parse_options(request)?;
-    parse_pdf(None, &options)?
+    parse_pdf(None, &options, None)?
         .map(|document| finish_pdf_document(document, request, &options))
         .transpose()
 }

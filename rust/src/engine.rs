@@ -30,6 +30,9 @@ use std::time::SystemTime;
 const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v1";
 const PARSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Recognized pages so far, and pages to recognize, as recognition proceeds.
+pub type RecognitionProgress<'a> = Option<&'a (dyn Fn(usize, usize) + Sync)>;
+
 #[cfg(feature = "ocr")]
 struct DeferredOcrProvider<'a> {
     options: &'a OcrOptions,
@@ -37,6 +40,7 @@ struct DeferredOcrProvider<'a> {
     runtime: Option<OcrProvider>,
     cache_root: Option<PathBuf>,
     cache_identity: String,
+    progress: RecognitionProgress<'a>,
 }
 
 #[cfg(feature = "ocr")]
@@ -84,6 +88,13 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 paths.insert(request.page_index, (key, path));
             }
         }
+        let progress = self.progress;
+        let report = |done: usize| {
+            if let Some(progress) = progress {
+                progress(done, requests.len());
+            }
+        };
+        report(results.len());
         if missing.is_empty() {
             return Ok(results);
         }
@@ -95,27 +106,40 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 OcrProvider::from_prepared(self.options, prepared)
             })?);
         }
-        let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
-            self.runtime.as_mut().expect("OCR runtime initialized"),
-            pdf,
-            &missing,
-        )?;
-        for page in recognized {
-            let Some((key, path)) = paths.remove(&page.page_index) else {
-                return Err(Error::Message(
-                    "OCR returned an unexpected or repeated page".to_owned(),
-                ));
-            };
-            if let Some(path) = path {
-                write_gzip_json(
-                    &path,
-                    &CachedOcrPage {
-                        key,
-                        page: page.clone(),
-                    },
-                )?;
+        // Progress is reported per window of 4, 8 and then 16 pages, one runtime throughout.
+        let mut windows = Vec::new();
+        let mut rest = missing.as_slice();
+        let mut size = if progress.is_some() { 4 } else { rest.len() };
+        while !rest.is_empty() {
+            let (window, after) = rest.split_at(size.min(rest.len()));
+            windows.push(window);
+            rest = after;
+            size = (size * 2).min(16);
+        }
+        for window in windows {
+            let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
+                self.runtime.as_mut().expect("OCR runtime initialized"),
+                pdf,
+                window,
+            )?;
+            for page in recognized {
+                let Some((key, path)) = paths.remove(&page.page_index) else {
+                    return Err(Error::Message(
+                        "OCR returned an unexpected or repeated page".to_owned(),
+                    ));
+                };
+                if let Some(path) = path {
+                    write_gzip_json(
+                        &path,
+                        &CachedOcrPage {
+                            key,
+                            page: page.clone(),
+                        },
+                    )?;
+                }
+                results.push(page);
             }
-            results.push(page);
+            report(results.len());
         }
         if !paths.is_empty() {
             return Err(Error::Message(
@@ -411,6 +435,7 @@ fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocum
 pub(crate) fn parse_pdf(
     bytes: Option<&[u8]>,
     options: &ParseOptions,
+    #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
 ) -> Result<Option<PdfDocument>> {
     let _profile = profile::scope("parse_pdf");
     let source_hash = if let Some(bytes) = bytes {
@@ -518,6 +543,7 @@ pub(crate) fn parse_pdf(
                     .as_ref()
                     .map(|root| parse_cache_root(root).join("recognition")),
                 cache_identity: recognition_key.clone(),
+                progress,
             });
     #[cfg(feature = "ocr")]
     let selected_ocr = ocr_provider
