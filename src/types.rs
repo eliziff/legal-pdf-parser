@@ -119,6 +119,7 @@ pub(crate) enum BaseEncoding {
 }
 
 /// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
+#[derive(Clone)]
 pub(crate) struct FontEncoding {
     /// The character of each code the font's `/Differences` name by a name
     /// that reads as one (through the embedded program for a numbered

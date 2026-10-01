@@ -36,6 +36,7 @@ use super::word_gaps::{
 use super::xobjects::{expand_page_content, FormWalkBudget, MAX_EXPANDED_OPERATIONS};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
+#[derive(Clone)]
 struct FontProducts {
     encodings: crate::types::PageFontEncodings,
     has_gid_fonts: bool,
@@ -50,9 +51,64 @@ struct FontProducts {
     fidelity: Option<HashMap<String, FontFidelity>>,
 }
 
+type FontSetKey = (bool, Vec<(Vec<u8>, usize)>);
+type FontIdentity = (usize, Option<Vec<u8>>);
+
 pub(crate) struct FontProductCache {
     style: FontStyleCache,
-    sets: HashMap<(bool, Vec<(Vec<u8>, usize)>), FontProducts>,
+    sets: HashMap<FontSetKey, FontProducts>,
+    /// The first set built from the same fonts, by font and not by resource
+    /// name, with a name it gave each font: a producer that names a font
+    /// afresh each time it is set (pdf-lib does, with a random suffix) shares
+    /// one set of fonts across every page under ever different names.
+    by_fonts: HashMap<(bool, Vec<FontIdentity>), (FontSetKey, HashMap<FontIdentity, String>)>,
+}
+
+/// A font's resource name reaches its products only as their key, unless the
+/// font has no `BaseFont` name: then the resource name stands in for it.
+fn font_identity(name: &[u8], font: &lopdf::Dictionary) -> FontIdentity {
+    let named = font
+        .get(b"BaseFont")
+        .ok()
+        .is_some_and(|value| value.as_name().is_ok());
+    (
+        std::ptr::from_ref(font) as usize,
+        (!named).then(|| name.to_vec()),
+    )
+}
+
+/// Each page name's entry, read from the entry its font has under `from`.
+fn projected<V: Clone>(map: &HashMap<String, V>, names: &[(String, &String)]) -> HashMap<String, V> {
+    names
+        .iter()
+        .filter_map(|(name, from)| Some((name.clone(), map.get(*from)?.clone())))
+        .collect()
+}
+
+impl FontProducts {
+    /// The same fonts' products under another page's resource names.
+    fn projected(&self, names: &[(String, &String)]) -> Self {
+        Self {
+            encodings: projected(&self.encodings, names),
+            has_gid_fonts: self.has_gid_fonts,
+            widths: projected(&self.widths, names),
+            kinds: projected(&self.kinds, names),
+            type3_scales: projected(&self.type3_scales, names),
+            type3_y_flips: names
+                .iter()
+                .filter(|(_, from)| self.type3_y_flips.contains(*from))
+                .map(|(name, _)| name.clone())
+                .collect(),
+            base_names: projected(&self.base_names, names),
+            tounicode_refs: projected(&self.tounicode_refs, names),
+            inline_cmaps: projected(&self.inline_cmaps, names),
+            style_flags: projected(&self.style_flags, names),
+            fidelity: self
+                .fidelity
+                .as_ref()
+                .map(|fidelity| projected(fidelity, names)),
+        }
+    }
 }
 
 impl FontProductCache {
@@ -60,6 +116,7 @@ impl FontProductCache {
         Self {
             style: FontStyleCache::new(),
             sets: HashMap::new(),
+            by_fonts: HashMap::new(),
         }
     }
 
@@ -80,6 +137,23 @@ impl FontProductCache {
         if self.sets.contains_key(&key) {
             return &self.sets[&key];
         }
+        let identities = fonts
+            .iter()
+            .map(|(name, font)| (font_identity(name, font), String::from_utf8_lossy(name).into_owned()))
+            .collect::<Vec<_>>();
+        let mut distinct = identities.iter().map(|(identity, _)| identity.clone()).collect::<Vec<_>>();
+        distinct.sort();
+        distinct.dedup();
+        let fonts_key = (fidelity, distinct);
+        if let Some((first, first_names)) = self.by_fonts.get(&fonts_key) {
+            let names = identities
+                .iter()
+                .map(|(identity, name)| (name.clone(), &first_names[identity]))
+                .collect::<Vec<_>>();
+            let products = self.sets[first].projected(&names);
+            return self.sets.entry(key).or_insert(products);
+        }
+        self.by_fonts.insert(fonts_key, (key.clone(), identities.into_iter().collect()));
 
         let (encodings, has_gid_fonts) = build_font_encodings(doc, fonts, cmaps, &mut self.style);
         let widths = build_font_widths(doc, fonts, &mut self.style);
