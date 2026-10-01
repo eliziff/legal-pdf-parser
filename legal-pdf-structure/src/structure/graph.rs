@@ -259,10 +259,20 @@ fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
         .collect()
 }
 
+/// Word-index and concordance pages: short headwords in alphabetical order, each
+/// followed by an occurrence count or `page:line` / `page/line` locators.
 pub(super) fn index_pages(pages: &[Page]) -> HashSet<usize> {
-    static ENTRY: OnceLock<Regex> = OnceLock::new();
-    let entry = ENTRY
-        .get_or_init(|| Regex::new(r"\[\d{1,3}\]\s+\d{1,3}:\d{1,3}").expect("index entry regex"));
+    static COUNTED: OnceLock<Regex> = OnceLock::new();
+    static HEADWORD: OnceLock<Regex> = OnceLock::new();
+    let counted = COUNTED.get_or_init(|| {
+        Regex::new(r"\[\d{1,3}\]\s+\d{1,4}[:/]\d{1,3}").expect("index entry regex")
+    });
+    let headword = HEADWORD.get_or_init(|| {
+        Regex::new(
+            r"^\s*(\S+(?:\s\S+){0,2}?)\s+(?:[\[(]\d{1,3}[\])]\s*$|(?:[\[(]\d{1,3}[\])]\s+)?\d{1,4}[:/]\d{1,3}(?:[\s,;]|$))",
+        )
+        .expect("index headword regex")
+    });
     pages
         .iter()
         .filter_map(|page| {
@@ -272,7 +282,23 @@ pub(super) fn index_pages(pages: &[Page]) -> HashSet<usize> {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-            (entry.find_iter(&text).take(5).count() >= 5).then_some(page.index)
+            let headwords = page
+                .lines
+                .iter()
+                .filter_map(|line| headword.captures(&line.text))
+                .map(|capture| {
+                    capture[1]
+                        .trim_start_matches(['\'', '"', '\u{2018}', '\u{201c}'])
+                        .to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            let ascending = headwords
+                .windows(2)
+                .filter(|pair| pair[0] <= pair[1])
+                .count();
+            (counted.find_iter(&text).take(5).count() >= 5
+                || headwords.len() >= 5 && ascending * 5 >= (headwords.len() - 1) * 4)
+                .then_some(page.index)
         })
         .collect()
 }
@@ -486,6 +512,7 @@ impl PdfResolutionInput {
                         .get(indexed.line_id.as_str())
                         .is_some_and(|(page, line)| {
                             primitives.contents_pages.contains(&page.index)
+                                || primitives.contents_line_ids.contains(&line.id)
                                 || contents_row(&line.text)
                         })
                 });

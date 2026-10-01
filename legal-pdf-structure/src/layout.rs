@@ -995,7 +995,7 @@ pub(super) fn band_geometry_top(line: &Line) -> f64 {
         .unwrap_or(line.bbox[1])
 }
 
-fn band_geometry_order(left: &Line, right: &Line) -> std::cmp::Ordering {
+pub(super) fn band_geometry_order(left: &Line, right: &Line) -> std::cmp::Ordering {
     band_geometry_top(left)
         .total_cmp(&band_geometry_top(right))
         .then(left.bbox[0].total_cmp(&right.bbox[0]))

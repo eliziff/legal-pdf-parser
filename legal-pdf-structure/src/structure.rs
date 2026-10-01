@@ -3,10 +3,12 @@
 mod graph;
 
 use crate::layout::*;
-pub use graph::PdfTextIndex;
-use graph::{contents_leader_re, map_note_pairs, native_graph_parts, PdfResolutionInput};
 #[cfg(test)]
-use graph::{contents_row, index_pages};
+use graph::contents_row;
+pub use graph::PdfTextIndex;
+use graph::{
+    contents_leader_re, index_pages, map_note_pairs, native_graph_parts, PdfResolutionInput,
+};
 use legal_pdf_core::model::{
     DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
     Paragraph, ParagraphAnchor, PdfPairingAudit,
@@ -14,16 +16,16 @@ use legal_pdf_core::model::{
 #[cfg(test)]
 use legal_pdf_core::model::{NotePairClaim, NotePairKind, Span};
 use legal_pdf_core::{line_font_size, Anchor, Error, Result};
+use legal_pdf_support::pairing_support::{
+    crossref_short_form as crossref_shortform, is_citation_shaped_tail as citation_shaped_tail,
+};
 use legal_pdf_support::{
     enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
     EnumeratorInterpretation, HeadingAction, HeadingFamilyStats, HeadingLadderStatus,
 };
-use legal_pdf_support::pairing_support::{
-    crossref_short_form as crossref_shortform, is_citation_shaped_tail as citation_shaped_tail,
-};
 use legal_structure::{
-    normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph,
-    utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
+    normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph, utf16_len,
+    DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 #[cfg(test)]
 use legal_structure::{CandidateGrammar, CandidateObservationV2};
@@ -52,6 +54,7 @@ pub(super) struct LabelPrefix {
 struct PdfPrimitiveEvidence {
     source_regions: Option<HashMap<String, String>>,
     contents_pages: HashSet<usize>,
+    contents_line_ids: HashSet<String>,
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
@@ -1668,6 +1671,81 @@ fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
     })
 }
 
+/// The rows of a contents list on a page that is not wholly a contents grid: the
+/// contents heading and the entries contiguous with it, where an entry is a
+/// leader-dotted title ending in a locator or, under a heading or on a
+/// continuation page, a row of the page's dense table. Titles wrapped between
+/// entries and locators split onto their own line belong to the list; lines
+/// before the list and the body heading or paragraph after it stay body.
+fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option<Vec<usize>> {
+    const MIN_ENTRIES: usize = 5;
+    const MAX_WRAPPED: usize = 6;
+    let leader = contents_leader_re();
+    let heading = |line: &Line| {
+        matches!(
+            line.text.trim().to_lowercase().as_str(),
+            "contents" | "table of contents" | "table des matières" | "table of provisions"
+        )
+    };
+    let tabular = continuing || page.lines.iter().any(heading) && table.strong();
+    let entry = |index: usize| {
+        let line = &page.lines[index];
+        leader.is_match(&line.text)
+            && line.text.chars().any(char::is_alphabetic)
+            && line.text.trim_end().ends_with(|c: char| c.is_ascii_digit())
+            || tabular && table.lines.contains(&index)
+    };
+    let locator = |index: usize| {
+        let text = page.lines[index].text.trim();
+        text.chars().any(|c| c.is_ascii_digit())
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c.is_whitespace())
+    };
+    let mut order: Vec<usize> = (0..page.lines.len())
+        .filter(|index| {
+            let line = &page.lines[*index];
+            has_valid_bbox(line)
+                && !line.exclude_from_body
+                && !matches!(line.region_type.as_str(), "header" | "footer")
+        })
+        .collect();
+    order.sort_by(|left, right| band_geometry_order(&page.lines[*left], &page.lines[*right]));
+    let mut rows = Vec::new();
+    let mut wrapped = Vec::new();
+    let mut text_lines = 0;
+    let mut entries = 0;
+    for (position, &index) in order.iter().enumerate() {
+        if rows.is_empty() {
+            if continuing && position > 1 {
+                return None;
+            }
+            if heading(&page.lines[index]) || entry(index) {
+                rows.push(index);
+                entries = usize::from(entry(index));
+            }
+        } else if entry(index) {
+            text_lines = 0;
+            rows.append(&mut wrapped);
+            rows.push(index);
+            entries += 1;
+        } else if locator(index) || text_lines < MAX_WRAPPED {
+            wrapped.push(index);
+            text_lines += usize::from(!locator(index));
+        } else if entries >= MIN_ENTRIES {
+            break;
+        } else {
+            rows.clear();
+            wrapped.clear();
+            text_lines = 0;
+            if heading(&page.lines[index]) {
+                rows.push(index);
+            }
+        }
+    }
+    (entries >= MIN_ENTRIES).then_some(rows)
+}
+
 fn classify_pages_with_source(
     pages: &mut [Page],
     separators: &[Option<f64>],
@@ -1682,16 +1760,36 @@ fn classify_pages_with_source(
     let mut expected_endnote: Option<u32> = None;
     let mut continuing_size: Option<f64> = None;
     let mut continuing_table = false;
+    let mut continuing_contents = false;
+    let mut contents_line_ids = HashSet::new();
+    let index_pages = index_pages(pages);
     let table_pages: Vec<_> = pages
         .iter()
         .zip(separators.iter().copied())
         .map(|(page, separator)| {
             let continuation = continuing_table;
             let table = table_evidence(&page.lines, page.width);
+            let caption = has_table_caption(&page.lines);
+            let rows = (!table.contents && !index_pages.contains(&page.index))
+                .then(|| {
+                    let continuing =
+                        continuing_contents && !caption && table.continuation_on_page(page.height);
+                    contents_rows(page, &table, continuing)
+                })
+                .flatten();
+            continuing_contents = table.contents
+                || rows.as_ref().is_some_and(|rows| {
+                    rows.last()
+                        .is_some_and(|last| page.lines[*last].bbox[3] >= page.height * 0.70)
+                });
+            contents_line_ids.extend(
+                rows.into_iter()
+                    .flatten()
+                    .map(|index| page.lines[index].id.clone()),
+            );
             evidence
                 .contents_pages
                 .extend(table.contents.then_some(page.index));
-            let caption = has_table_caption(&page.lines);
             let is_table = caption
                 || strong_table_evidence(&table, &page.lines)
                 || continuation && table.continuation_on_page(page.height);
@@ -2302,6 +2400,7 @@ fn classify_pages_with_source(
     }
     let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
+    evidence.contents_line_ids.extend(contents_line_ids);
     build_regions(pages);
     diagnostics
 }

@@ -225,6 +225,78 @@ fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
 }
 
 #[test]
+fn contents_rows_end_where_the_body_begins() {
+    let texts = [
+        "TABLE OF CONTENTS",
+        "1 Topic one ........................ 3",
+        "2 Topic two ........................ 4",
+        "3 A title that wraps",
+        "onto a second line ........................",
+        "5",
+        "4 Topic four ........................ 6",
+        "5 Topic five ........................ 7",
+        "6 Topic six ........................ 8",
+        "INTRODUCTION",
+        "1",
+        "These submissions are filed under the directive.",
+    ];
+    let page = test_page(
+        texts
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                let top = 80.0 + row as f64 * 20.0;
+                test_line(text, [72.0, top, 520.0, top + 12.0], vec![])
+            })
+            .collect(),
+    );
+    let table = table_evidence(&page.lines, page.width);
+    assert_eq!(contents_rows(&page, &table, false), Some((0..9).collect()));
+}
+
+#[test]
+fn word_concordance_pages_are_index_pages_not_contents() {
+    let page = |entries: &[&str]| {
+        test_page(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(row, text)| {
+                    let top = 80.0 + row as f64 * 14.0;
+                    test_line(text, [72.0, top, 260.0, top + 10.0], vec![])
+                })
+                .collect(),
+        )
+    };
+    let concordance = page(&[
+        "'a [1]  126/21",
+        "abandon [2]  12/3 45/6",
+        "able [4]  3/1 7/9",
+        "access [12]",
+        "account [3]  9/4 9/8",
+        "yes [211]",
+    ]);
+    assert!(index_pages(&[concordance]).contains(&0));
+    let shuffled = page(&[
+        "yes [211]",
+        "able [4]  3/1 7/9",
+        "access [12]",
+        "'a [1]  126/21",
+        "zone [3]  9/4 9/8",
+        "abandon [2]  12/3 45/6",
+    ]);
+    assert!(index_pages(&[shuffled]).is_empty());
+    let contents = page(&[
+        "Alpha ............ 3",
+        "Beta ............ 4",
+        "Gamma ............ 5",
+        "Delta ............ 6",
+        "Epsilon ............ 7",
+    ]);
+    assert!(index_pages(&[contents]).is_empty());
+}
+
+#[test]
 fn typed_note_pairs_keep_every_exact_reference_anchor() {
     let pages: Vec<Page> = serde_json::from_value(json!([{
         "id": "page-1",
