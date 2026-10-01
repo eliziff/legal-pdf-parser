@@ -2930,3 +2930,85 @@ fn a_page_headed_by_its_contents_list_is_that_list() {
     let table = table_evidence(&page.lines, page.width);
     assert_eq!(contents_rows(&page, &table, false), Some((1..6).collect()));
 }
+
+#[test]
+fn a_statute_history_note_is_no_footnote_label() {
+    let mut lines = Vec::new();
+    let mut y = 80.0;
+    for (block, note) in [
+        "1988, c. 40, s. 3; 2031, c. 7, s. 2.",
+        "2004, c. 12, s. 9.",
+        "1997, c. 3, s. 1; 2019, c. 25, s. 4.",
+        "2008, c. 6, s. 11.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for row in 0..5 {
+            let text = format!(
+                "({}) The harbour authority may make rules for row {row}",
+                block + 1
+            );
+            lines.push(sized_line(&text, [48.0, y, 294.0, y + 11.0], 9.7));
+            y += 11.5;
+        }
+        lines.push(sized_line(note, [48.0, y + 3.0, 200.0, y + 12.0], 6.0));
+        y += 30.0;
+    }
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+
+    classify_pages(&mut pages, &[None]);
+
+    assert!(pages[0]
+        .lines
+        .iter()
+        .all(|line| line.region_type != "footnote" && line.note_region_mode.is_empty()));
+}
+
+#[test]
+fn a_running_head_naming_each_page_s_sections_is_furniture() {
+    let mut pages = ["Mooring Lines", "Anchorage", "Pilotage", "Towage"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, heading)| {
+            let mut page = test_page(vec![
+                sized_line("Harbour Act", [48.0, 38.0, 86.0, 47.0], 6.0),
+                sized_line("PART II Berths", [48.0, 42.0, 202.0, 53.0], 6.0),
+                sized_line(heading, [48.0, 51.0, 130.0, 60.0], 6.0),
+                sized_line(
+                    &format!("Sections {}-{}", index * 3 + 1, index * 3 + 3),
+                    [48.0, 58.0, 102.0, 67.0],
+                    6.0,
+                ),
+                sized_line(
+                    "The harbour master of the port sets the rule for",
+                    [48.0, 86.0, 294.0, 97.0],
+                    9.7,
+                ),
+                sized_line(
+                    "the vessels that are at a berth.",
+                    [48.0, 98.0, 200.0, 109.0],
+                    9.7,
+                ),
+            ]);
+            page.index = index;
+            page.number = u32::try_from(index + 1).unwrap();
+            page
+        })
+        .collect::<Vec<_>>();
+
+    mark_repeated_furniture(&mut pages);
+
+    for page in &pages {
+        let regions = page
+            .lines
+            .iter()
+            .map(|line| line.region_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            regions,
+            ["header", "header", "header", "header", "unknown", "unknown"]
+        );
+    }
+}

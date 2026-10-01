@@ -11,10 +11,10 @@ use graph::{
 };
 use legal_pdf_core::model::{
     DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
-    Paragraph, ParagraphAnchor, PdfPairingAudit,
+    Paragraph, ParagraphAnchor, PdfPairingAudit, Span,
 };
 #[cfg(test)]
-use legal_pdf_core::model::{NotePairClaim, NotePairKind, Span};
+use legal_pdf_core::model::{NotePairClaim, NotePairKind};
 use legal_pdf_core::{line_font_size, Anchor, Error, Result};
 use legal_pdf_support::pairing_support::{
     crossref_short_form as crossref_shortform, is_citation_shaped_tail as citation_shaped_tail,
@@ -221,18 +221,16 @@ fn upper_quartile(mut values: Vec<f64>) -> f64 {
     values[(values.len() * 3 / 4).min(values.len() - 1)]
 }
 
-fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_size: f64) -> bool {
-    let spans = || {
-        line.spans
-            .iter()
-            .filter(|span| span.start < prefix.end && span.end > prefix.start)
-    };
-    let label_size = spans()
-        .filter_map(|span| (span.size > 0.0).then_some(span.size))
-        .min_by(f64::total_cmp)
-        .unwrap_or(line_size);
+fn label_spans<'a>(line: &'a Line, prefix: &'a LabelPrefix) -> impl Iterator<Item = &'a Span> {
+    line.spans
+        .iter()
+        .filter(|span| span.start < prefix.end && span.end > prefix.start)
+}
+
+/// A label set above or smaller than the rest of its own line, as a note label is.
+fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64) -> bool {
     let height = line.bbox[3] - line.bbox[1];
-    spans().any(|span| {
+    label_spans(line, prefix).any(|span| {
         span.superscript
             || (line_size > 0.0 && span.size > 0.0 && span.size <= line_size * 0.75)
             || (line_size > 0.0
@@ -240,7 +238,15 @@ fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_
                 && span.size * 1.25 <= line_size
                 && height > 0.0
                 && span.bbox[3] <= line.bbox[3] - 0.25 * height)
-    }) || (label_size > 0.0 && label_size <= body_size * 0.75)
+    })
+}
+
+fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_size: f64) -> bool {
+    let label_size = label_spans(line, prefix)
+        .filter_map(|span| (span.size > 0.0).then_some(span.size))
+        .min_by(f64::total_cmp)
+        .unwrap_or(line_size);
+    label_is_raised(line, prefix, line_size) || (label_size > 0.0 && label_size <= body_size * 0.75)
 }
 
 fn normalize_furniture(text: &str) -> String {
@@ -671,8 +677,45 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     .to_owned();
                 }
             }
+            extend_running_heads(page, &line_sizes, body_size);
         }
     });
+}
+
+/// A running head can be a stack of small-type lines whose lower lines name the current
+/// heading or sections and so change from page to page. A line in the top band set in a
+/// running-head line's type, flush with it and directly above or below it, is part of it.
+fn extend_running_heads(page: &mut Page, line_sizes: &[f64], body_size: f64) {
+    let top_band = page.height * 0.12;
+    let tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
+    loop {
+        let joined: Vec<usize> = (0..page.lines.len())
+            .filter(|index| {
+                let line = &page.lines[*index];
+                let size = line_sizes[*index];
+                line.region_type != "header"
+                    && line.bbox[3] < top_band
+                    && size > 0.0
+                    && size < body_size * 0.90
+                    && page.lines.iter().zip(line_sizes).any(|(head, head_size)| {
+                        let height = (head.bbox[3] - head.bbox[1]).max(line.bbox[3] - line.bbox[1]);
+                        head.region_type == "header"
+                            && head.bbox[3] < top_band
+                            && (head_size - size).abs() <= 0.5
+                            && ((head.bbox[0] - line.bbox[0]).abs() <= tolerance
+                                || (line_center_x(head) - line_center_x(line)).abs() <= tolerance)
+                            && (line.bbox[1] - head.bbox[3]).max(head.bbox[1] - line.bbox[3])
+                                <= height * 0.5
+                    })
+            })
+            .collect();
+        if joined.is_empty() {
+            return;
+        }
+        for index in joined {
+            page.lines[index].region_type = "header".to_owned();
+        }
+    }
 }
 
 fn printed_label(value: &str) -> Option<String> {
@@ -2017,7 +2060,10 @@ fn classify_pages_with_source(
                 && line.bbox[1] >= page.height * 0.91
                 && line.bbox[0] >= page.width * 0.50
                 && !compact_note_line(&line.text);
-            let comma_tail = line.text.chars().nth(prefix.end) == Some(',') && !typographic;
+            // A number followed by a comma is the line's text ("1991, c. 43, s. 4" in a
+            // statute's small-type history note), unless it is raised above its line.
+            let comma_tail = line.text.chars().nth(prefix.end) == Some(',')
+                && !label_is_raised(line, &prefix, line_sizes[index]);
             let below_separator = separator.is_some_and(|cut| line.bbox[1] >= cut - tolerance);
             let suppressed = (line.bbox[1] >= page.height * 0.94
                 && !(below_separator && typographic))
