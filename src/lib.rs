@@ -32,11 +32,15 @@
 pub mod python;
 
 pub mod adobe_korea1;
+mod bidi;
+mod bidi_mirroring;
 pub mod detector;
 pub mod extractor;
+mod form_bbox_repair;
 pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
+mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -66,7 +70,7 @@ pub use markdown::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -127,6 +131,13 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// OCR reason: every text-showing operator on the page leaves nothing to
+/// see — text render mode 3 (invisible), or mode 7 (clip only) with
+/// nothing painted through the clip — while an image covers at least half
+/// of the page: a scan carrying a text layer nobody sees. What that layer
+/// says is not what the page shows, so the page is read from its raster.
+pub const OCR_REASON_INVISIBLE_TEXT_LAYER: &str = "invisible_text_layer";
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -138,6 +149,34 @@ pub struct PageOcrReasons {
     pub page: u32,
     /// Machine-readable OCR reason identifiers.
     pub reasons: Vec<String>,
+}
+
+/// A font whose ToUnicode CMap (or, for a font without one, the embedded
+/// program's own cmap table) had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+///
+/// A CMap written for some of a font's glyphs but not all of them loses the
+/// others' letters from the text. A code without an entry is read from the
+/// mapped codes around it when they spell it out — a CMap mapping code 36
+/// to `A` and code 38 to `C` says code 37 is `B`, for a run of digits or of
+/// letters of one case whose glyph order follows the alphabet — and is a
+/// U+FFFD in the text otherwise, so the loss stays visible. The counts let
+/// a caller weigh text read from such a font: `codes - interpolated -
+/// unmapped` of its codes had an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontCMapGaps {
+    /// The font's `/BaseFont` name, or its resource name when it has none
+    /// or an empty one.
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte
+    /// codes, or the bytes of a single-byte CMap.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around
+    /// them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in
+    /// the text.
+    pub unmapped: u32,
 }
 
 /// High-level PDF processing result.
@@ -155,8 +194,31 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
-    /// Title from PDF metadata (if available).
+    /// The `/Title` of the document information dictionary, decoded as a
+    /// PDF text string (UTF-16 or UTF-8 after a byte order mark,
+    /// PDFDocEncoding otherwise; see [`PdfTypeResult::title`]). `None` when
+    /// the entry is missing or not a string. The entries below follow the
+    /// same decoding and missing-value rule.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application
+    /// the document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`, neither validated
+    /// nor converted.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written, like
+    /// `creation_date`.
+    pub mod_date: Option<String>,
     /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
@@ -164,6 +226,13 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// The fonts whose ToUnicode CMap — or, for a font without one, the
+    /// embedded program's cmap table — lacked an entry for a code the
+    /// document shows through it, with the counts of codes shown, read from
+    /// their neighbours and left as U+FFFD (see [`FontCMapGaps`]). Always
+    /// empty in [`ProcessMode::DetectOnly`], which decodes no text;
+    /// otherwise empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCMapGaps>,
 }
 
 // =========================================================================
@@ -410,6 +479,42 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     })
 }
 
+/// The PDF written back out with the `/BBox` of its Form XObjects repaired
+/// — a zero-area box widened, numerals too large for any parser saturated
+/// — for callers that render the document with their own renderer. Rust
+/// only: the Python, Node.js and WebAssembly bindings do not expose it.
+///
+/// Some producers write `/BBox [0 0 0 0]` on a form XObject that holds a
+/// page's content; taken as the clip it declares, the box hides the form
+/// entirely, and a page drawn through it renders blank. Others write the
+/// box as ±(DBL_MAX / 2) in full, 308-digit numerals no integer parser
+/// holds: the form drops out of the document for one reader and clips to
+/// nothing for another. pdf-inspector repairs both whenever it loads a
+/// document, so its own extraction and the renderer of its OCR pipeline
+/// see the content; a renderer given the original bytes does not, and can
+/// be given these instead.
+///
+/// Returns `Ok(None)` when no form needs the repair, and for an encrypted
+/// document — whether or not it opens without a password — since a plain
+/// serialization would drop its protection; the OCR pipeline renders a
+/// decrypted copy of such a document in memory instead. Otherwise
+/// `Ok(Some(bytes))` holds a plain serialization of the loaded document:
+/// object streams and incremental updates are flattened, and the file's
+/// own repairs — a recovered cross-reference table, a missing end-of-file
+/// marker — are folded in.
+pub fn widen_degenerate_form_bboxes_mem(buffer: &[u8]) -> Result<Option<Vec<u8>>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (mut doc, _page_count, repairs) = match load_document_from_mem_with_repairs(buffer, None) {
+        Ok(loaded) => loaded,
+        Err(PdfError::Encrypted) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !repairs.repaired_forms() || doc.is_encrypted() || doc.encryption_state.is_some() {
+        return Ok(None);
+    }
+    Ok(form_bbox_repair::serialize_for_rendering(&mut doc))
+}
+
 // =========================================================================
 // Per-page markdown extraction
 // =========================================================================
@@ -451,6 +556,11 @@ pub(crate) struct InternalPagesExtraction {
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+    /// The document written back out for the renderer when form XObjects
+    /// were repaired at load (see `form_bbox_repair`); `None` when the
+    /// original bytes render as loaded.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) render_bytes: Option<Vec<u8>>,
 }
 
 /// Extract formatted markdown for pages of a PDF, with layout
@@ -482,16 +592,21 @@ pub fn extract_pages_markdown_mem(
         &MarkdownOptions::default(),
         false,
         false,
+        false,
     )
     .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+/// `render_repairs` asks for the repaired document to be written back out
+/// for the renderer when the loader changed it (see `form_bbox_repair`);
+/// a caller that will not render leaves it off.
 pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
@@ -500,6 +615,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         markdown_options,
         markdown_options.strip_headers_footers,
         true,
+        render_repairs,
     )
 }
 
@@ -510,9 +626,14 @@ fn extract_pages_markdown_mem_impl(
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
+    let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut doc = doc;
+    #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
+    let _ = (repairs, render_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -524,16 +645,16 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let (
-        (all_items, all_rects, all_lines, _all_rules),
-        page_thresholds,
-        gid_pages,
-        _page_rotations,
-    ) = if let Some(required_pages) = required_pages.as_ref() {
-        extractor::extract_positioned_text_for_document_analysis(&doc, &font_cmaps, required_pages)?
-    } else {
-        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-    };
+    let ((all_items, all_rects, all_lines, _all_rules), page_thresholds, gid_pages, _page_rotations, _) =
+        if let Some(required_pages) = required_pages.as_ref() {
+            extractor::extract_positioned_text_for_document_analysis(
+                &doc,
+                &font_cmaps,
+                required_pages,
+            )?
+        } else {
+            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
+        };
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -642,12 +763,18 @@ fn extract_pages_markdown_mem_impl(
         // embedded-font body text elsewhere would otherwise still extract
         // non-empty, non-garbled markdown and miss OCR routing entirely.
         // detect_from_document's Mixed-type per-page routing always sends
-        // these pages to OCR; mirror that here too. Both signals share one
+        // these pages to OCR; mirror that here too. And a page whose every
+        // text-showing operator is invisible under a covering image: the
+        // text layer it extracts describes the raster rather than being
+        // the page's content. All three signals share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        let signals = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or_default();
+        let has_template_image = signals.template_image_needs_ocr;
+        let has_vector_text = signals.has_vector_text;
+        let has_invisible_text_layer = signals.has_invisible_text_layer;
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -679,6 +806,18 @@ fn extract_pages_markdown_mem_impl(
 
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+        // First among a page's reasons, as classification's
+        // `page_ocr_reasons` lists it too, so a page whose whole text layer
+        // is hidden under a scan — a scan whatever its fonts are — gets the
+        // same first reason from both surfaces; the reasons after it keep
+        // this surface's own order.
+        if has_invisible_text_layer {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_INVISIBLE_TEXT_LAYER,
+            );
+        }
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -699,7 +838,8 @@ fn extract_pages_markdown_mem_impl(
             || has_gid
             || is_garbage_text(&md)
             || has_template_image
-            || has_vector_text;
+            || has_vector_text
+            || has_invisible_text_layer;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
@@ -734,6 +874,23 @@ fn extract_pages_markdown_mem_impl(
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
+        // A renderer reading the original bytes would clip a repaired form
+        // to nothing, so the OCR pipeline renders the repaired document.
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        render_bytes: if render_repairs && repairs.repaired_forms() {
+            // A renderer given the original bytes would clip the repaired
+            // forms to nothing again, so a copy that cannot be written is
+            // an error, not a fallback.
+            Some(
+                form_bbox_repair::serialize_for_rendering(&mut doc).ok_or_else(|| {
+                    PdfError::Parse(
+                        "the repaired document could not be written for rendering".to_string(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -842,6 +999,12 @@ mod ocr_header_footer_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            fidelity: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -898,7 +1061,7 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_pages_markdown_mem(&buffer, pages)
 }
 
@@ -972,7 +1135,7 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<Vec<StructureElement>, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
 }
 
@@ -1073,9 +1236,11 @@ pub fn extract_text_in_regions_mem_in_frame(
 
 /// [`extract_text_in_regions_mem_in_frame`] with every option given as a
 /// [`PositionOptions`]: the frame the region rects are read in, and whether
-/// bold is also read from the font's weight class (`bold_from_weight`, which
-/// also keeps runs of different weight apart while the region's lines are
-/// assembled). The default options are [`extract_text_in_regions_mem`].
+/// bold is also read from the font's weight class (`bold_from_weight`: a
+/// weight class of `bold_weight_threshold` or more, 600 by default, is bold,
+/// and a run the weight makes bold is then its own item while the region's
+/// lines are assembled). The default options are
+/// [`extract_text_in_regions_mem`].
 pub fn extract_text_in_regions_mem_with_options(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
@@ -3836,6 +4001,7 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
     // window then emitted them as an orphan ",2,3,2,4,*" line.
     let mut sorted = matched;
     sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
+    let region_rtl = text_utils::is_rtl_text(sorted.iter().map(|i| &i.text));
 
     let y_tolerance = 3.0;
     let mut lines: Vec<extractor::TextLine> = Vec::new();
@@ -3860,7 +4026,7 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Sort items within each line by X position
     for line in &mut lines {
-        text_utils::sort_line_items(&mut line.items);
+        text_utils::sort_line_items(&mut line.items, region_rtl);
     }
 
     lines
@@ -4045,7 +4211,7 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
     path: P,
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
-    let buffer = std::fs::read(&path)?;
+    let buffer = read_file(path.as_ref())?;
     load_document_from_mem_with_password(&buffer, password)
 }
 
@@ -4059,6 +4225,36 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_repairs(buffer, password)
+        .map(|(doc, page_count, _)| (doc, page_count))
+}
+
+/// Repairs applied to a document's objects once it is loaded, beyond the
+/// container repairs the loader tries when a file does not parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LoadRepairs {
+    /// Form XObjects whose zero-area `/BBox` was widened
+    /// (see `form_bbox_repair`).
+    pub(crate) widened_form_bboxes: usize,
+    /// `/BBox` numerals too large for any parser, saturated in the file's
+    /// bytes before it was read (see `overlong_numerals`).
+    pub(crate) saturated_bbox_numerals: usize,
+}
+
+impl LoadRepairs {
+    /// Whether a Form XObject was repaired: a renderer given the original
+    /// bytes would lose it again.
+    pub(crate) fn repaired_forms(&self) -> bool {
+        self.widened_form_bboxes > 0 || self.saturated_bbox_numerals > 0
+    }
+}
+
+/// [`load_document_from_mem_with_password`], also reporting the repairs
+/// applied to the loaded objects.
+pub(crate) fn load_document_from_mem_with_repairs(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
     // Drop anything before the `%PDF-` header. Cross-reference offsets are
     // header-relative in every major reader (mupdf, pdfium, poppler, pdf.js;
     // lopdf slices at `%PDF-` internally as well), so this keeps them exact
@@ -4077,11 +4273,11 @@ pub(crate) fn load_document_from_mem_with_password(
 
     let (empty_document, first_error) = match load_document_bytes(buf, password) {
         Ok(doc) => {
-            let page_count = doc.get_pages().len() as u32;
-            if page_count > 0 {
-                return Ok((doc, page_count));
+            let (doc, saturated) = reload_after_saturating_bbox_numerals(doc, buf, password);
+            if !doc.get_pages().is_empty() {
+                return finish_loaded_document(doc, saturated);
             }
-            (Some(doc), None)
+            (Some((doc, saturated)), None)
         }
         Err(error) => (None, Some(error)),
     };
@@ -4089,7 +4285,9 @@ pub(crate) fn load_document_from_mem_with_password(
         match load_document_bytes(&repaired, password) {
             Ok(doc) if !doc.get_pages().is_empty() => {
                 log::debug!("loaded PDF after repairing malformed container bytes");
-                return finish_loaded_document(doc);
+                let (doc, saturated) =
+                    reload_after_saturating_bbox_numerals(doc, &repaired, password);
+                return finish_loaded_document(doc, saturated);
             }
             Ok(_) => {}
             Err(error) if is_encrypted_lopdf_error(&error) => return Err(error.into()),
@@ -4097,10 +4295,41 @@ pub(crate) fn load_document_from_mem_with_password(
         }
     }
     match (empty_document, first_error) {
-        (Some(doc), _) => finish_loaded_document(doc),
+        (Some((doc, saturated)), _) => finish_loaded_document(doc, saturated),
         (_, Some(error)) => Err(error.into()),
         _ => unreachable!("initial PDF load produced neither a document nor an error"),
     }
+}
+
+/// The document loaded again from `bytes` with the `/BBox` numerals of its
+/// unloaded objects saturated (see `overlong_numerals`), when that brings
+/// objects in — otherwise `doc` as it came — and then with the `/BBox`
+/// arrays its object streams could not yield recovered into it; with the
+/// count of numerals saturated either way.
+fn reload_after_saturating_bbox_numerals(
+    doc: Document,
+    bytes: &[u8],
+    password: Option<&str>,
+) -> (Document, usize) {
+    let (mut doc, count) = match overlong_numerals::saturate_overlong_bbox_numerals(bytes, &doc) {
+        Some((rewritten, count)) => match load_document_bytes(&rewritten, password) {
+            Ok(reloaded) if reloaded.objects.len() > doc.objects.len() => {
+                log::debug!("loaded PDF after saturating {count} /BBox numeral(s) no parser holds");
+                (reloaded, count)
+            }
+            _ => (doc, 0),
+        },
+        None => (doc, 0),
+    };
+    let in_object_streams =
+        overlong_numerals::recover_referenced_bboxes_in_object_streams(&mut doc);
+    if in_object_streams > 0 {
+        log::debug!(
+            "recovered /BBox array(s) from object streams after saturating {in_object_streams} \
+             numeral(s) no parser holds"
+        );
+    }
+    (doc, count + in_object_streams)
 }
 
 /// A loaded document with zero pages is unusable by every caller, and with
@@ -4108,7 +4337,10 @@ pub(crate) fn load_document_from_mem_with_password(
 /// an object stream lopdf skipped for exceeding the bound. Fail the load
 /// either way rather than letting a pageless document masquerade as a
 /// successful parse.
-fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
+fn finish_loaded_document(
+    mut doc: Document,
+    saturated_bbox_numerals: usize,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
     let page_count = doc.get_pages().len() as u32;
     if page_count == 0 {
         return Err(PdfError::Parse(
@@ -4134,18 +4366,28 @@ fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
              resolve as not-found"
         );
     }
-    Ok((doc, page_count))
+    let repairs = LoadRepairs {
+        widened_form_bboxes: form_bbox_repair::widen_degenerate_form_bboxes(&mut doc),
+        saturated_bbox_numerals,
+    };
+    Ok((doc, page_count, repairs))
 }
 
 /// Per-stream decompression budget applied while loading (object streams and
-/// xref streams). Some tagged PDFs pack their structure tree into object
+/// xref streams), and the bound within which the detector reads a font's
+/// ToUnicode CMap (`detector::font_decoder`), object streams are read again
+/// for overlong numerals (`overlong_numerals`), and a CID font's embedded
+/// program is read to tell whether its subset was renumbered
+/// (`tounicode::try_remap_subset_cmap`): none of those streams costs more
+/// than a stream the loader materializes, and changing the bound changes
+/// them all. Some tagged PDFs pack their structure tree into object
 /// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
 /// materializes every object stream eagerly at load, so without a bound one
 /// such document exhausts memory before any of our code runs. lopdf skips an
 /// object stream that would exceed the bound (its objects resolve as
 /// not-found), which the zero-page check in `load_document_from_mem_with_password`
 /// turns into a load error instead of a silently wrong answer.
-const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
 fn bounded_load_options() -> lopdf::LoadOptions {
     lopdf::LoadOptions {
@@ -4401,6 +4643,13 @@ fn process_document(
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
+    let author = detection.author;
+    let subject = detection.subject;
+    let keywords = detection.keywords;
+    let creator = detection.creator;
+    let producer = detection.producer;
+    let creation_date = detection.creation_date;
+    let mod_date = detection.mod_date;
     let confidence = detection.confidence;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
@@ -4414,9 +4663,17 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -4430,9 +4687,17 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -4452,7 +4717,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
+            if let Ok((ref items, _, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4519,12 +4784,14 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        cmap_gaps,
     ) = match extracted {
         Some((
             (items, rects, lines, _rules),
             page_thresholds,
             gid_encoded_pages,
             _page_rotations,
+            cmap_coverage,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
@@ -4650,8 +4917,13 @@ fn process_document(
                 ))
             };
 
+            // A code no CMap could read is an encoding issue whether or not
+            // the Markdown that would show its U+FFFD is generated in this
+            // mode; a gap read from its neighbours is not one.
+            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
             let enc = !ocr_reasons_by_page.is_empty()
                 || text_quality.has_encoding_issues
+                || cmap_unmapped
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -4660,6 +4932,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                font_cmap_gaps(cmap_coverage),
             )
         }
         None => (
@@ -4669,6 +4942,7 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
         ),
     };
 
@@ -4762,17 +5036,41 @@ fn process_document(
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text / garbled) merged
-            // with the markdown-stage garbled detection, deduped per page.
+            // Detector reasons (scanned / no_text / vector_text /
+            // invisible_text_layer / garbled) merged with the
+            // markdown-stage garbled detection, deduped per page.
             let mut merged = detection_ocr_reasons;
             merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
             page_ocr_reasons_vec(merged)
         },
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         confidence,
         layout,
         has_encoding_issues,
+        cmap_gaps,
     })
+}
+
+/// The fonts whose CMap lacked an entry for a code shown through it, with
+/// their counts, from the per-font coverage of an extraction.
+fn font_cmap_gaps(coverage: types::CMapCoverageByFont) -> Vec<FontCMapGaps> {
+    coverage
+        .into_iter()
+        .filter(|(_, stats)| stats.has_gaps())
+        .map(|(font, stats)| FontCMapGaps {
+            font,
+            codes: stats.codes,
+            interpolated: stats.interpolated,
+            unmapped: stats.unmapped,
+        })
+        .collect()
 }
 
 // =========================================================================
@@ -5670,6 +5968,11 @@ mod text_cluster_column_undercount_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -5953,6 +6256,11 @@ mod table_candidate_selection_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -6827,14 +7135,37 @@ pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
     }
 }
 
+/// Attach `path` to an IO error so a missing input is distinguishable from
+/// a missing built-in resource. Relative paths also name the working
+/// directory they were resolved against.
+pub(crate) fn io_error_at(path: &Path, err: std::io::Error) -> PdfError {
+    let location = if path.is_absolute() {
+        path.display().to_string()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        format!("{} (working directory {})", path.display(), cwd.display())
+    } else {
+        path.display().to_string()
+    };
+    PdfError::Io(std::io::Error::new(
+        err.kind(),
+        format!("{location}: {err}"),
+    ))
+}
+
+/// Read a whole file, reporting `path` in the error.
+pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>, PdfError> {
+    std::fs::read(path).map_err(|err| io_error_at(path, err))
+}
+
 /// Validate that a file on disk looks like a PDF.
 ///
 /// Reads only the header search window and delegates to [`validate_pdf_bytes`].
 pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path).map_err(|err| io_error_at(path, err))?;
     let mut buf = [0u8; PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN];
-    let n = file.read(&mut buf)?;
+    let n = file.read(&mut buf).map_err(|err| io_error_at(path, err))?;
     validate_pdf_bytes(&buf[..n])
 }
 
@@ -6842,6 +7173,20 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn missing_file_error_names_the_path() {
+        let err = validate_pdf_file("this-file-does-not-exist.pdf").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("this-file-does-not-exist.pdf"),
+            "missing-file error should name the path, got {msg}"
+        );
+        assert!(
+            msg.contains("working directory"),
+            "relative path should name the working directory, got {msg}"
+        );
+    }
 
     #[test]
     fn pdf_header_offset_finds_header_at_start() {
@@ -6948,6 +7293,11 @@ mod tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -8179,6 +8529,11 @@ mod rotated_run_region_tests {
             is_bold: false,
             is_italic: false,
             font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,

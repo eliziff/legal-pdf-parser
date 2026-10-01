@@ -406,7 +406,7 @@ impl<'a> Expander<'a> {
         let operations = id
             .and_then(|id| self.form_operations.get(&id).cloned())
             .unwrap_or_else(|| {
-                let raw = stream.get_plain_content_with_limit(64 * 1024 * 1024).ok()?;
+                let raw = stream.get_plain_content_with_limit(super::content_decode::MAX_PAGE_CONTENT_BYTES).ok()?;
                 let decoded = super::content_decode::decode_content_bounded(
                     &strip_pdf_comments(&raw),
                     super::content_decode::MAX_PAGE_OPERATIONS,
@@ -1711,5 +1711,207 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
         .unwrap();
         let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["dto", "dto"], "{items:?}");
+    }
+
+    /// `(fill_color, stroke_color, render_mode)` of the item reading `text`.
+    fn paint_of(items: &[TextItem], text: &str) -> (Option<[u8; 3]>, Option<[u8; 3]>, Option<u8>) {
+        let item = find(items, text);
+        (item.fill_color, item.stroke_color, item.render_mode)
+    }
+
+    #[test]
+    fn form_text_reports_the_paint_it_inherits_and_restores_it() {
+        // The form starts with the paint in force where the page invokes it;
+        // what it sets inside its own `q`/`Q` ends there, a nested form
+        // starts with the outer form's paint, and nothing leaks back onto
+        // the page when the form returns.
+        let (doc, page_id) = doc_with_page_and_forms(
+            b"1 0 0 rg 0 0 1 RG 1 Tr q /X1 Do Q BT /F1 12 Tf 72 500 Td (Page) Tj ET",
+            &[
+                b"BT /F1 12 Tf 72 700 Td (Inherited) Tj ET
+                  q 0 1 0 rg 0 Tr BT /F1 12 Tf 72 680 Td (Own) Tj ET /X2 Do Q
+                  BT /F1 12 Tf 72 660 Td (Restored) Tj ET",
+                b"BT /F1 12 Tf 72 640 Td [(Nes) (ted)] TJ ET",
+            ],
+        );
+        let (items, _) = extract_page(&doc, page_id, false);
+        let red = Some([255, 0, 0]);
+        let green = Some([0, 255, 0]);
+        let blue = Some([0, 0, 255]);
+        assert_eq!(paint_of(&items, "Inherited"), (red, blue, Some(1)));
+        assert_eq!(paint_of(&items, "Own"), (green, blue, Some(0)));
+        assert_eq!(paint_of(&items, "Nested"), (green, blue, Some(0)));
+        assert_eq!(paint_of(&items, "Restored"), (red, blue, Some(1)));
+        assert_eq!(paint_of(&items, "Page"), (red, blue, Some(1)));
+    }
+
+    #[test]
+    fn form_reads_a_palette_colour_in_the_space_it_inherits() {
+        // The page selects a palette from its own resources and a colour in
+        // it; the form, whose resources know no such space, starts with that
+        // colour and can pick another entry of the inherited palette.
+        let (mut doc, page_id) = doc_with_page_and_forms(
+            b"/Pal cs 1 sc /X1 Do",
+            &[b"BT /F1 12 Tf 72 700 Td (First) Tj ET 2 sc BT /F1 12 Tf 72 680 Td (Second) Tj ET"],
+        );
+        let palette = Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            2.into(),
+            Object::String(
+                vec![0, 0, 0, 255, 0, 0, 0, 0, 255],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        ]);
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .get_mut(b"Resources")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("ColorSpace", dictionary! { "Pal" => palette });
+        let (items, _) = extract_page(&doc, page_id, false);
+        assert_eq!(paint_of(&items, "First").0, Some([255, 0, 0]));
+        assert_eq!(paint_of(&items, "Second").0, Some([0, 0, 255]));
+    }
+
+    #[test]
+    fn form_items_of_every_show_operator_report_their_paint() {
+        let items = form_items(
+            b"1 0 0 rg 2 Tr BT /F1 12 Tf 12 TL 72 700 Td (Shown) Tj (Quoted) ' 1 0 (Spaced) \" T* [(Ar) (ray)] TJ ET",
+        );
+        for text in ["Shown", "Quoted", "Spaced", "Array"] {
+            assert_eq!(
+                paint_of(&items, text),
+                (Some([255, 0, 0]), Some([0, 0, 0]), Some(2)),
+                "{text}"
+            );
+        }
+    }
+
+
+    /// Tracked display text set as a glyph-per-string `TJ` array inside a
+    /// form is judged over its own tracking, as on the page; positioning
+    /// between whole words reads as before. The form font's space is 0.6
+    /// em, so its word-gap threshold is 240 thousandths.
+    #[test]
+    fn tracked_tj_title_inside_form_stays_one_word() {
+        for (content, expected) in [
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET",
+                "VALLEY",
+            ),
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y) -560 (R) -250 (O) -250 (A) -250 (D)] TJ ET",
+                "VALLEY ROAD",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(The) -258 (quick) -300 (brown)] TJ ET",
+                "The quick brown",
+            ),
+        ] {
+            let items = form_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts.join(" "), expected, "{content}: {items:?}");
+        }
+    }
+
+
+    /// Items of a page whose only content is `q /X1 Do Q`, the form showing
+    /// `form_content` through `F1`, the zero-advance-sign font of
+    /// `content_stream::add_zero_advance_sign_font`.
+    fn form_items_with_zero_advance_signs(form_content: &[u8]) -> Vec<TextItem> {
+        let mut doc = Document::new();
+        let font_id = crate::extractor::content_stream::add_zero_advance_sign_font(&mut doc);
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            },
+            form_content.to_vec(),
+        )));
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"q /X1 Do Q".to_vec(),
+        )));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "X1" => Object::Reference(form_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _, _), _, _, _, _) = extract_page_text_items(
+            &doc,
+            page_id,
+            1,
+            &font_cmaps,
+            false,
+            &mut FontProductCache::new(),
+            &mut FormWalkBudget::new(),
+        )
+        .unwrap();
+        items
+    }
+
+    #[test]
+    fn form_tj_returns_from_signs_placed_behind_the_pen_open_no_word_gap() {
+        // As on the page: a zero-advance sign placed 0.223 em back over
+        // the glyph before it, the pen returned 0.221 em, is no word gap;
+        // a forward offset from the pen's farthest point still is.
+        use crate::extractor::content_stream::SIGNED_WORD;
+
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+        assert!(
+            (items[0].x - 20.0).abs() < 0.01 && (items[0].width - 29.4).abs() < 0.01,
+            "{:?}",
+            items[0]
+        );
+
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -621 <0003>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["\u{1789}\u{17D2}\u{1789} \u{179C}"]);
+
+        // Under `0.5 Tc` the sign is a sign by its glyph, though the
+        // spacing moves the pen for it.
+        let items = form_items_with_zero_advance_signs(
+            b"BT /F1 14 Tf 0.5 Tc 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET",
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [SIGNED_WORD]);
+
+        // Twenty zero-advance glyphs behind the pen are hidden text, not a
+        // sign: the return after them is the word gap it reads as.
+        let hidden = "0002".repeat(20);
+        let items = form_items_with_zero_advance_signs(
+            format!("BT /F1 14 Tf 20 700 Td [<0003> 300 <{hidden}> -300 <0004>] TJ ET").as_bytes(),
+        );
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        let expected = format!("\u{179C}{} \u{178F}\u{17D2}", "\u{1789}".repeat(20));
+        assert_eq!(texts, [expected.as_str()]);
     }
 }
