@@ -1021,6 +1021,9 @@ fn heading_candidates<'a>(
                 && matches!(line.region_type.as_str(), "body" | "heading")
                 && heading_source_eligible(regions, line)
         }) {
+            if continues_prose(page, line) {
+                continue;
+            }
             if let Some(capture) = inline.captures(line.text.trim()) {
                 let value = capture.get(1).unwrap().as_str();
                 let punct = capture.get(2).unwrap().as_str();
@@ -1053,8 +1056,10 @@ fn heading_candidates<'a>(
             let text = page.lines[follower_slot].text.trim();
             let value = capture.get(1).unwrap().as_str();
             let punct = capture.get(2).unwrap().as_str();
+            // "v." alone between two parties' names is the style of cause's versus.
+            let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
-            if heading_text_plausible(text) && !interpretations.is_empty() {
+            if !versus && heading_text_plausible(text) && !interpretations.is_empty() {
                 candidates.push(HeadingCandidate {
                     page_slot,
                     line_slot,
@@ -1066,6 +1071,31 @@ fn heading_candidates<'a>(
         }
     }
     candidates
+}
+
+/// A line set at its paragraph's leading under a line that ends no sentence carries
+/// that sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no enumerator.
+fn continues_prose(page: &Page, line: &Line) -> bool {
+    let height = line.bbox[3] - line.bbox[1];
+    page.lines
+        .iter()
+        .filter(|prior| {
+            prior.region_type == "body"
+                && !prior.exclude_from_body
+                && prior.bbox[3] <= line.bbox[1] + height * 0.25
+                && prior.bbox[0] < line.bbox[2]
+                && line.bbox[0] < prior.bbox[2]
+        })
+        .max_by(|left, right| left.bbox[3].total_cmp(&right.bbox[3]))
+        .is_some_and(|prior| {
+            let text = prior.text.trim_end();
+            height > 0.0
+                && line.bbox[1] - prior.bbox[3] < height * 0.5
+                && !sentence_ended(text)
+                && !text.ends_with([':', '\u{201d}', '"'])
+                && !standalone_enumerator(text)
+                && !inline_enumerator_re().is_match(text)
+        })
 }
 
 fn bold_char_share(line: &Line) -> f64 {

@@ -9,7 +9,7 @@
     {
       "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2014-scc-bhasin-v-hrynew.pdf",
       "source_sha256": "3eed42bcc7dad404dd18201a7281d9555e868cc8ee07bbd6d02ce89467d531ca",
-      "product_sha256": "5fb499be704a77199e0b271b8aeec1de4495749367df3f3314e0fc25a2b98352"
+      "product_sha256": "10e22b51f1a08c9f641aaa9a34b607b893ed522ccbd0fd0b8c9e61322bcfd0f2"
     },
     {
       "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2021-scc-wastech-services.pdf",

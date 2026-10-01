@@ -199,21 +199,27 @@ pub fn parse_heading_ladder<'a>(
             }
         }
         if chosen.is_none() {
+            // A skipped number is the shortest jump that reads it: "C." after "A." is the
+            // third letter, not the Roman hundred.
+            let mut jump: Option<(&'a str, u32, usize, u32)> = None;
             for (family, value, _) in choices {
                 if let Some(index) = stack.iter().rposition(|frame| frame.family == family) {
-                    if *value == 1 {
+                    if *value == 1 && jump.is_none() {
                         stack.truncate(index + 1);
                         stack[index].value = 1;
                         chosen = Some((family, *value, HeadingAction::IllegalRestart, index + 1));
                         break;
                     }
-                    if *value > stack[index].value + 1 {
-                        stack.truncate(index + 1);
-                        stack[index].value = *value;
-                        chosen = Some((family, *value, HeadingAction::JumpForward, index + 1));
-                        break;
+                    let gap = value.saturating_sub(stack[index].value);
+                    if gap > 1 && jump.is_none_or(|(.., shortest)| gap < shortest) {
+                        jump = Some((family, *value, index, gap));
                     }
                 }
+            }
+            if let Some((family, value, index, _)) = jump.filter(|_| chosen.is_none()) {
+                stack.truncate(index + 1);
+                stack[index].value = value;
+                chosen = Some((family, value, HeadingAction::JumpForward, index + 1));
             }
         }
         if chosen.is_none() {
@@ -294,6 +300,17 @@ pub fn parse_heading_ladder<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_letter_is_the_next_letter_not_a_roman_numeral() {
+        let markers = [("I", "."), ("A", "."), ("C", "."), ("II", ".")]
+            .map(|(value, punct)| enumerator_interpretations(value, punct));
+        let ladder = parse_heading_ladder(markers.iter().map(Vec::as_slice));
+        assert_eq!(ladder.status, HeadingLadderStatus::ParsedClean);
+        assert_eq!(ladder.assignments[2].family, "upper_alpha_.");
+        assert_eq!(ladder.assignments[2].action, HeadingAction::JumpForward);
+        assert_eq!(ladder.assignments[3].action, HeadingAction::Increment);
+    }
 
     #[test]
     fn heading_vectors_include_the_full_reporter_inventory() {

@@ -2842,3 +2842,57 @@ fn a_parallel_french_column_is_the_translation_and_gives_no_headings() {
         .count();
     assert_eq!(repealed, 2);
 }
+
+#[test]
+fn a_line_carrying_its_sentence_on_is_no_enumerated_heading() {
+    let mut lines = Vec::new();
+    let mut push =
+        |text: &str, y: f64| lines.push(sized_line(text, [60.0, y, 520.0, y + 11.0], 10.0));
+    push("Tug v.", 50.0);
+    push("v.", 62.0);
+    push("Harbour Board of the Port", 74.0);
+    push("I. Overview", 110.0);
+    push("A. The Tow", 140.0);
+    push(
+        "The tow line parted under a load the tug could bear.",
+        170.0,
+    );
+    push("B. The Mooring", 200.0);
+    push(
+        "The barge was moored where the harbour master said it",
+        230.0,
+    );
+    push("should be (see, for the rule, R. T. Pilot and", 242.0);
+    push("A. B. Navigator On Harbour Practice", 254.0);
+    push("II. Analysis", 284.0);
+    push(
+        "The tow line parted under a load the tug could bear.",
+        314.0,
+    );
+    // The parties' names are set in bold, as a style of cause is.
+    for span in &mut lines[2].spans {
+        span.font = "TimesBold".to_owned();
+    }
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+    let evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    apply_text_fidelity_headings(&mut pages, 10.0, &evidence);
+    let headings = pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.region_type == "heading")
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings,
+        [
+            "I. Overview",
+            "A. The Tow",
+            "B. The Mooring",
+            "II. Analysis"
+        ]
+    );
+}
