@@ -2869,6 +2869,16 @@ fn a_line_carrying_its_sentence_on_is_no_enumerated_heading() {
         "The tow line parted under a load the tug could bear.",
         314.0,
     );
+    // A title whose letter stands apart is short: a number set close under it opens a heading.
+    lines.push(sized_line("III.", [60.0, 344.0, 80.0, 355.0], 10.0));
+    lines.push(sized_line("Remedies", [100.0, 344.0, 200.0, 355.0], 10.0));
+    lines.push(sized_line("1. Costs", [80.0, 357.0, 160.0, 368.0], 10.0));
+    lines.push(sized_line(
+        "The tug pays the costs of the barge owner.",
+        [60.0, 387.0, 520.0, 398.0],
+        10.0,
+    ));
+    lines.push(sized_line("2. Interest", [80.0, 417.0, 180.0, 428.0], 10.0));
     // The parties' names are set in bold, as a style of cause is.
     for span in &mut lines[2].spans {
         span.font = "TimesBold".to_owned();
@@ -2892,7 +2902,11 @@ fn a_line_carrying_its_sentence_on_is_no_enumerated_heading() {
             "I. Overview",
             "A. The Tow",
             "B. The Mooring",
-            "II. Analysis"
+            "II. Analysis",
+            "III.",
+            "Remedies",
+            "1. Costs",
+            "2. Interest"
         ]
     );
 }

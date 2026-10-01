@@ -1073,8 +1073,9 @@ fn heading_candidates<'a>(
     candidates
 }
 
-/// A line set at its paragraph's leading under a line that ends no sentence carries
+/// A line set at its paragraph's leading under a full line that ends no sentence carries
 /// that sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no enumerator.
+/// A title above it stops short of its column's edge.
 fn continues_prose(page: &Page, line: &Line) -> bool {
     let height = line.bbox[3] - line.bbox[1];
     page.lines
@@ -1089,7 +1090,19 @@ fn continues_prose(page: &Page, line: &Line) -> bool {
         .max_by(|left, right| left.bbox[3].total_cmp(&right.bbox[3]))
         .is_some_and(|prior| {
             let text = prior.text.trim_end();
+            let (left, right) = page
+                .lines
+                .iter()
+                .filter(|other| {
+                    other.region_type == "body"
+                        && other.bbox[0] < prior.bbox[2]
+                        && prior.bbox[0] < other.bbox[2]
+                })
+                .fold((prior.bbox[0], prior.bbox[2]), |(left, right), other| {
+                    (left.min(other.bbox[0]), right.max(other.bbox[2]))
+                });
             height > 0.0
+                && prior.bbox[2] >= right - (right - left) * 0.1
                 && line.bbox[1] - prior.bbox[3] < height * 0.5
                 && !sentence_ended(text)
                 && !text.ends_with([':', '\u{201d}', '"'])
