@@ -144,15 +144,23 @@ pub(crate) fn to_toa_text_units_from_parts(
         }
         pages.sort_unstable();
         pages.dedup();
+        let number = note.label.parse::<u32>().ok();
+        // A note with its own mark (an author's "*") keeps the mark, as the
+        // document prints it and as Word's text does: it takes no number.
+        let text = if number.is_some() || note.label.is_empty() || note.body == note.label {
+            note.body.clone()
+        } else {
+            format!("{} {}", note.label, note.body)
+        };
         json!({
             "key": format!("footnote:{ordinal}"),
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
-            "note_number": note.label.parse::<u32>().ok(),
+            "note_number": number,
             "restart_sequence": note.restart_sequence,
             "page_numbers": pages,
-            "text": note.body,
+            "text": text,
             "footnote_refs": [],
         })
     }));
@@ -271,6 +279,19 @@ mod tests {
         let toa = to_toa_text_units(&document).unwrap();
         assert_eq!(toa[0]["text"], "😀");
         assert_eq!(toa[0]["footnote_refs"], json!([[1, 2]]));
+    }
+
+    #[test]
+    fn a_note_with_its_own_mark_keeps_it_and_takes_no_number() {
+        let mut document = document();
+        document.footnotes[0].label = "*".to_owned();
+        document.footnotes[0].body = "The author thanks the archivists.".to_owned();
+
+        let toa = to_toa_text_units(&document).unwrap();
+        assert_eq!(toa[1]["text"], "* The author thanks the archivists.");
+        assert_eq!(toa[1]["note_number"], Value::Null);
+        assert_eq!(toa[2]["text"], "Second note.");
+        assert_eq!(toa[2]["note_number"], 1);
     }
 
     #[test]
