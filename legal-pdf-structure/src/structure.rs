@@ -1500,9 +1500,10 @@ fn wrapped_heading_continuations(
 /// unless the words run on across the break ("... COURT OF APPEAL FOR" / "ALBERTA"), the line
 /// above was full (its next word would not fit within the title's or the page's widest line),
 /// the lines are centred on one axis as a caption is ("IN THE UNITED STATES DISTRICT COURT" /
-/// "FOR THE SOUTHERN DISTRICT OF TEXAS" / "HOUSTON DIVISION"), or the title closes at the line:
-/// what follows is set further down or on another alignment. A date carries on a title only
-/// when the words run on into it ("ORDERS FOR JUNE 18 THROUGH" / "JUNE 29, 2020").
+/// "FOR THE SOUTHERN DISTRICT OF TEXAS" / "HOUSTON DIVISION"), or the title closes at the line
+/// and stands apart: what precedes it and what follows the line are set further off than its
+/// leading or on another alignment. A date carries on a title only when the words run on into
+/// it ("ORDERS FOR JUNE 18 THROUGH" / "JUNE 29, 2020").
 fn continues_capitals_title(
     page: &Page,
     heading_slot: usize,
@@ -1538,12 +1539,6 @@ fn continues_capitals_title(
     let same_type = |candidate: &Line| {
         has_valid_bbox(candidate) && (line_font_size(candidate) - size).abs() <= 0.3
     };
-    let others = || {
-        page.lines
-            .iter()
-            .enumerate()
-            .filter(move |(other, _)| *other != above_slot && *other != slot)
-    };
     let shares_axis = |candidate: &Line| {
         if flush_left {
             (candidate.bbox[0] - above.bbox[0]).abs() <= 3.0
@@ -1556,32 +1551,52 @@ fn continues_capitals_title(
     let full_within = |measure: Option<f64>| {
         measure.is_some_and(|measure| measure >= width(above) - 1.0 && needed > measure)
     };
-    let title_measure = others()
+    // The title's measure is set by its other lines, down to one leading below this one; the
+    // page's by any line but the one above.
+    let leading = line.bbox[1] - above.bbox[1];
+    let title_measure = page
+        .lines
+        .iter()
+        .enumerate()
         .filter(|(other, candidate)| {
             (heading_slot..=heading_slot + 4).contains(other)
+                && *other != above_slot
+                && *other != slot
+                && candidate.bbox[1] <= line.bbox[1] + leading + 2.0
                 && same_type(candidate)
                 && shares_axis(candidate)
         })
         .map(|(_, candidate)| width(candidate))
         .max_by(f64::total_cmp);
-    let page_measure = others()
-        .filter(|(_, candidate)| same_type(candidate))
+    let page_measure = page
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(other, candidate)| *other != above_slot && same_type(candidate))
         .map(|(_, candidate)| width(candidate))
         .max_by(f64::total_cmp);
     if full_within(title_measure) || full_within(page_measure) {
         return true;
     }
-    let Some(below) = page.lines[slot + 1..]
-        .iter()
-        .find(|candidate| has_valid_bbox(candidate) && candidate.bbox[1] >= line.bbox[3] - 1.0)
-    else {
-        return true;
+    // The title closes at this line when it stands apart: what precedes its first line and what
+    // follows this one are set further off than its leading or on another alignment.
+    let apart = |near: &Line, edge: &Line| {
+        (near.bbox[1] - edge.bbox[1]).abs()
+            >= leading + ((edge.bbox[3] - edge.bbox[1]) * 0.5).max(8.0)
+            || (near.bbox[0] - edge.bbox[0]).abs() > 3.0
+                && (near.bbox[2] - edge.bbox[2]).abs() > 3.0
+                && (line_center_x(near) - line_center_x(edge)).abs() > 3.0
     };
-    let leading = line.bbox[1] - above.bbox[1];
-    below.bbox[1] - line.bbox[1] >= leading + ((line.bbox[3] - line.bbox[1]) * 0.5).max(8.0)
-        || (below.bbox[0] - line.bbox[0]).abs() > 3.0
-            && (below.bbox[2] - line.bbox[2]).abs() > 3.0
-            && (line_center_x(below) - line_center_x(line)).abs() > 3.0
+    let first = &page.lines[heading_slot];
+    page.lines[..heading_slot]
+        .iter()
+        .rev()
+        .find(|candidate| has_valid_bbox(candidate) && candidate.bbox[3] <= first.bbox[1] + 1.0)
+        .is_none_or(|preceding| apart(preceding, first))
+        && page.lines[slot + 1..]
+            .iter()
+            .find(|candidate| has_valid_bbox(candidate) && candidate.bbox[1] >= line.bbox[3] - 1.0)
+            .is_none_or(|below| apart(below, line))
 }
 
 /// A word a title's line can break after or open on: an article, a conjunction or a preposition.

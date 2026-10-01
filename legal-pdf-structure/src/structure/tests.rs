@@ -3499,3 +3499,65 @@ fn a_date_under_a_title_is_no_part_of_it_unless_the_title_runs_on_into_it() {
         ]
     );
 }
+
+#[test]
+fn an_address_stacked_under_its_addressee_is_no_wrapped_title() {
+    let mut lines = Vec::new();
+    body_rows(&mut lines, 100.0, 3, 24.0);
+    lines.push(sized_line("TO:", [72.0, 200.0, 96.0, 217.0], 12.0));
+    for (row, text) in [
+        "THE CLERK OF THE HARBOUR TRIBUNAL OF ALDER",
+        "SEAWALL PROMENADE",
+        "PORT ALDER",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = 200.0 + row as f64 * 24.0;
+        let right = 144.0 + text.chars().count() as f64 * 7.6;
+        lines.push(sized_line(text, [144.0, y, right, y + 17.0], 12.0));
+    }
+    lines.push(sized_line("AND TO:", [72.0, 300.0, 125.0, 317.0], 12.0));
+    lines.push(sized_line(
+        "Attorneys for the Harbour Board",
+        [144.0, 300.0, 330.0, 317.0],
+        12.0,
+    ));
+    lines.push(sized_line(
+        "MERIDIAN BAYLISS ATTORNEYS",
+        [144.0, 324.0, 336.0, 341.0],
+        12.0,
+    ));
+
+    assert_eq!(
+        capitals_titles(lines),
+        [
+            "THE CLERK OF THE HARBOUR TRIBUNAL OF ALDER",
+            "SEAWALL PROMENADE",
+            "PORT ALDER",
+            "MERIDIAN BAYLISS ATTORNEYS",
+        ]
+    );
+}
+
+#[test]
+fn a_title_in_capitals_filling_the_page_width_wraps() {
+    let mut lines = Vec::new();
+    body_rows(&mut lines, 100.0, 3, 19.0);
+    lines.push(sized_line(
+        "THE BOARD'S ORDER CLOSES THE INNER HARBOUR TO EVERY SHALLOW",
+        [72.0, 180.0, 528.0, 192.0],
+        12.0,
+    ));
+    lines.push(sized_line(
+        "DRAUGHT VESSEL WITHOUT NOTICE",
+        [72.0, 199.0, 290.0, 211.0],
+        12.0,
+    ));
+    body_rows(&mut lines, 240.0, 3, 19.0);
+
+    assert_eq!(
+        capitals_titles(lines),
+        ["THE BOARD'S ORDER CLOSES THE INNER HARBOUR TO EVERY SHALLOW DRAUGHT VESSEL WITHOUT NOTICE"]
+    );
+}
