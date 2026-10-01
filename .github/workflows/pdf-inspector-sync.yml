@@ -16,6 +16,9 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
     outputs:
       changed: ${{ steps.merge.outputs.changed }}
       parser-sha: ${{ steps.merge.outputs.parser_sha }}
@@ -34,7 +37,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: merge
-        name: Merge upstream into the maintained branch
+        name: Squash upstream onto the maintained branch
         shell: bash
         run: |
           set -euo pipefail
@@ -43,22 +46,51 @@ jobs:
           mapfile -t pinned < <(grep -oE 'branch=pdf-inspector#[0-9a-f]{40}' parser/Cargo.lock | sort -u)
           test "${#pinned[@]}" -eq 1
           pinned_sha="${pinned[0]##*#}"
-          git -C inspector fetch --no-tags https://github.com/firecrawl/pdf-inspector.git main
+          # Upstream objects stay on this runner; only the squashed candidate is bundled.
+          upstream=https://github.com/firecrawl/pdf-inspector.git
+          git -C inspector fetch --no-tags "$upstream" main
           upstream_sha="$(git -C inspector rev-parse FETCH_HEAD)"
+          base_sha="$(sed -n 's/^commit //p' inspector/.upstream-pdf-inspector)"
+          git -C inspector cat-file -e "$base_sha^{commit}" || git -C inspector fetch --no-tags "$upstream" "$base_sha"
           echo "parser_sha=$parser_sha" >> "$GITHUB_OUTPUT"
           echo "previous_sha=$previous_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
           git -C inspector config user.name github-actions[bot]
           git -C inspector config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          bash parser/tools/merge-pdf-inspector.sh inspector "$upstream_sha" parser/docs/pdf-inspector-agent-guide.md
+          report="$RUNNER_TEMP/sync-report.md"
+          if ! bash parser/tools/merge-pdf-inspector.sh inspector "$upstream_sha" parser/docs/pdf-inspector-agent-guide.md "$report"; then
+            if test -s "$report"; then echo "report=true" >> "$GITHUB_OUTPUT"; fi
+            exit 1
+          fi
           candidate_sha="$(git -C inspector rev-parse HEAD)"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           if test "$candidate_sha" = "$pinned_sha"; then
+            echo "Up to date: pdf-inspector ${candidate_sha:0:12} incorporates upstream ${upstream_sha:0:12} and is pinned." >> "$GITHUB_STEP_SUMMARY"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "Gating pdf-inspector ${candidate_sha:0:12} (upstream ${upstream_sha:0:12}); the parser pins ${pinned_sha:0:12}." >> "$GITHUB_STEP_SUMMARY"
           git -C inspector branch -f pdf-inspector-candidate "$candidate_sha"
           git -C inspector bundle create ../pdf-inspector.bundle refs/heads/pdf-inspector-candidate
           echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Report the blocked sync
+        if: failure() && steps.merge.outputs.report == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title='PDF Inspector upstream sync needs resolution'
+          body="$RUNNER_TEMP/issue.md"
+          { echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; echo; echo '```'; cat "$RUNNER_TEMP/sync-report.md"; echo '```'; } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number,title \
+            --jq "map(select(.title == \"$title\"))[0].number // empty")"
+          if test -n "$issue"; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.merge.outputs.changed == 'true'
         with:
@@ -111,37 +143,45 @@ jobs:
           set -euo pipefail
           git -C inspector fetch ../pdf-inspector.bundle refs/heads/pdf-inspector-candidate
           test "$(git -C inspector rev-parse FETCH_HEAD)" = "$CANDIDATE_SHA"
-          test "$(git -C inspector merge-base "$PREVIOUS_SHA" FETCH_HEAD)" = "$PREVIOUS_SHA"
+          # Only single-parent squash commits extend the branch; upstream history never does.
+          if test "$CANDIDATE_SHA" != "$PREVIOUS_SHA"; then
+            test "$(git -C inspector rev-parse "$CANDIDATE_SHA^@")" = "$PREVIOUS_SHA"
+          fi
           git -C inspector push origin FETCH_HEAD:refs/heads/pdf-inspector
       - name: Open and merge the exact parser pin
         working-directory: parser
         shell: bash
         env:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate-sha }}
+          PARSER_SHA: ${{ needs.prepare.outputs.parser-sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # The gate accepted this exact parser revision; a moved branch is regated next run.
+          if test "$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | cut -f1)" != "$PARSER_SHA"; then
+            echo "::notice::$DEFAULT_BRANCH moved after gating; the next sync gates the new combination."
+            exit 0
+          fi
           short_sha="${CANDIDATE_SHA:0:12}"
           branch="automation/pdf-inspector-$short_sha"
           pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json url --jq '.[0].url // empty')"
-          if test -n "$pr"; then
-            gh pr merge --repo "$GITHUB_REPOSITORY" "$pr" --auto --merge --delete-branch
-            exit 0
+          if test -z "$pr"; then
+            cargo update -p pdf-inspector --precise "$CANDIDATE_SHA"
+            mapfile -t pinned < <(grep -oE 'branch=pdf-inspector#[0-9a-f]{40}' Cargo.lock | sort -u)
+            test "${#pinned[@]}" -eq 1
+            test "${pinned[0]}" = "branch=pdf-inspector#$CANDIDATE_SHA"
+            mapfile -t changed < <(git diff --name-only)
+            test "${#changed[@]}" -eq 1
+            test "${changed[0]}" = Cargo.lock
+
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git switch -c "$branch"
+            git add Cargo.lock
+            git commit -m "Pin PDF Inspector to $short_sha"
+            git push origin "HEAD:refs/heads/$branch"
+            pr="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$DEFAULT_BRANCH" --head "$branch" --title "Pin PDF Inspector to $short_sha" --body "Automated upstream sync passed the exact raw-PDF product gate on $PARSER_SHA.")"
           fi
-
-          cargo update -p pdf-inspector --precise "$CANDIDATE_SHA"
-          mapfile -t pinned < <(grep -oE 'branch=pdf-inspector#[0-9a-f]{40}' Cargo.lock | sort -u)
-          test "${#pinned[@]}" -eq 1
-          test "${pinned[0]}" = "branch=pdf-inspector#$CANDIDATE_SHA"
-          mapfile -t changed < <(git diff --name-only)
-          test "${#changed[@]}" -eq 1
-          test "${changed[0]}" = Cargo.lock
-
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git switch -c "$branch"
-          git add Cargo.lock
-          git commit -m "Pin PDF Inspector to $short_sha"
-          git push origin "HEAD:refs/heads/$branch"
-          pr="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${{ github.event.repository.default_branch }}" --head "$branch" --title "Pin PDF Inspector to $short_sha" --body "Automated upstream merge passed the exact raw-PDF product gate.")"
-          gh pr merge --repo "$GITHUB_REPOSITORY" "$pr" --auto --merge --delete-branch
+          gh pr merge --repo "$GITHUB_REPOSITORY" "$pr" --merge --delete-branch
+          echo "Pinned pdf-inspector $short_sha through $pr." >> "$GITHUB_STEP_SUMMARY"
