@@ -991,8 +991,8 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector"
-version = "1.21.0"
-source = "git+https://github.com/eliziff/legal-pdf-parser.git?branch=pdf-inspector#b3ee2a7c1ea968e3d49b11def39d46298bc0989a"
+version = "1.25.2"
+source = "git+https://github.com/eliziff/legal-pdf-parser.git?branch=pdf-inspector#ba6df29633ffa9238fb76161ad169f5bd1b5556e"
 dependencies = [
  "include_dir",
  "log",
@@ -1002,6 +1002,7 @@ dependencies = [
  "regex",
  "thiserror",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-normalization",
 ]
 
