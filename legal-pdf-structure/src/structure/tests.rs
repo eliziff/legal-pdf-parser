@@ -1588,6 +1588,44 @@ fn compact_note_bodies_are_not_repeated_footers() {
 }
 
 #[test]
+fn a_paragraph_number_under_a_running_title_is_not_a_header() {
+    let page = |index: usize, number: usize| {
+        let mut page = test_page(vec![
+            sized_line("Smith v Jones (invented)", [72.0, 28.0, 240.0, 45.0], 14.0),
+            sized_line(&format!("[{number}]"), [72.0, 61.0, 85.0, 74.0], 11.0),
+            sized_line(
+                [
+                    "The harbour master gave notice.",
+                    "The tug waited offshore.",
+                    "Cargo was inspected twice.",
+                    "The pilot boarded at dawn.",
+                ][index],
+                [108.0, 61.0, 330.0, 74.0],
+                11.0,
+            ),
+            sized_line(
+                "The ferry left on time.",
+                [108.0, 101.0, 290.0, 114.0],
+                11.0,
+            ),
+        ]);
+        page.index = index;
+        page.number = u32::try_from(index + 1).unwrap();
+        page.width = 612.0;
+        page.height = 792.0;
+        page
+    };
+    let mut pages = vec![page(0, 4), page(1, 9), page(2, 15), page(3, 21)];
+
+    mark_repeated_furniture(&mut pages);
+
+    for page in &pages {
+        assert_eq!(page.lines[0].region_type, "header");
+        assert_eq!(page.lines[1].region_type, "unknown");
+    }
+}
+
+#[test]
 fn repeated_detached_citation_shortforms_remain_note_lines() {
     let mut pages = (0..4)
         .map(|index| {

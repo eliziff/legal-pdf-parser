@@ -299,6 +299,17 @@ fn standalone_enumerator(text: &str) -> bool {
     standalone_enumerator_re().is_match(text)
 }
 
+/// "[12]" alone on its line; four digits would be a bracketed year.
+fn standalone_paragraph_number(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|number| {
+            (1..=3).contains(&number.trim().len())
+                && number.trim().bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 const FOLIO_MIN_SEQUENCE_PAGES: usize = 4;
 const FOLIO_EDGE_MAX_FRAC: f64 = 0.25;
 const FOLIO_BOTTOM_MIN_FRAC: f64 = 0.92;
@@ -587,13 +598,19 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 })
                 .map(|(index, _)| index)
                 .collect();
+            // A printed paragraph number opening the body under a running title sits
+            // at the same place on every page, like a folio; its text shares its row.
             let attached_enumerators: HashSet<usize> = page
                 .lines
                 .iter()
                 .enumerate()
                 .filter(|(_, label)| {
-                    standalone_enumerator(&label.text)
-                        && page.lines.iter().any(|body| aligned_note_body(label, body))
+                    let paragraph = standalone_paragraph_number(&label.text);
+                    (standalone_enumerator(&label.text) || paragraph)
+                        && page.lines.iter().enumerate().any(|(body_index, body)| {
+                            (!paragraph || !repeated.contains(&(page_slot, body_index)))
+                                && aligned_note_body(label, body)
+                        })
                 })
                 .map(|(index, _)| index)
                 .collect();
