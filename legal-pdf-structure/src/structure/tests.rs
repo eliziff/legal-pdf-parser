@@ -3383,3 +3383,119 @@ fn a_page_number_centred_in_small_type_is_furniture() {
         );
     }
 }
+
+/// The capitals pass on one page whose lines each start as their own block: the headings it
+/// reads, each title's lines joined.
+fn capitals_titles(mut lines: Vec<Line>) -> Vec<String> {
+    mark_source_body(&mut lines);
+    for (index, line) in lines.iter_mut().enumerate() {
+        line.block_index = index + 1;
+    }
+    let mut pages = vec![test_page(lines)];
+    let evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    apply_text_fidelity_headings(&mut pages, 10.0, &evidence);
+    let mut titles: Vec<(usize, String)> = Vec::new();
+    for line in pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.region_type == "heading")
+    {
+        match titles.last_mut() {
+            Some((block, title)) if *block == line.block_index => {
+                title.push(' ');
+                title.push_str(line.text.trim());
+            }
+            _ => titles.push((line.block_index, line.text.trim().to_owned())),
+        }
+    }
+    titles.into_iter().map(|(_, title)| title).collect()
+}
+
+fn body_rows(lines: &mut Vec<Line>, top: f64, rows: usize, leading: f64) {
+    for row in 0..rows {
+        let y = top + row as f64 * leading;
+        lines.push(sized_line(
+            "The harbour board may close a berth to a vessel that has not paid its dues.",
+            [72.0, y, 528.0, y + 12.0],
+            12.0,
+        ));
+    }
+}
+
+#[test]
+fn counsel_names_stacked_under_a_judgment_are_no_wrapped_title() {
+    let mut lines = Vec::new();
+    body_rows(&mut lines, 200.0, 3, 20.0);
+    for (row, (text, left)) in [
+        ("MARGOT ELLESMERE", 418.0),
+        ("TOBIAS KRANTZ", 436.0),
+        ("Counsel for the Harbour Board", 352.0),
+        ("Chambers, Port Alder", 410.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = 320.0 + row as f64 * 20.0;
+        lines.push(sized_line(text, [left, y, 528.0, y + 13.0], 12.0));
+    }
+
+    assert_eq!(
+        capitals_titles(lines),
+        ["MARGOT ELLESMERE", "TOBIAS KRANTZ"]
+    );
+}
+
+#[test]
+fn a_file_stamp_in_capitals_is_no_wrapped_title() {
+    let mut lines = Vec::new();
+    for (row, text) in [
+        "REF 31-K22#",
+        "doc# HBR-004417",
+        "Fully releasable",
+        "ATIP : Yes",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = 80.0 + row as f64 * 11.0;
+        lines.push(sized_line(text, [430.0, y, 490.0, y + 9.0], 9.0));
+    }
+    body_rows(&mut lines, 200.0, 3, 20.0);
+
+    assert_eq!(capitals_titles(lines), ["REF 31-K22#"]);
+}
+
+#[test]
+fn a_date_under_a_title_is_no_part_of_it_unless_the_title_runs_on_into_it() {
+    let mut lines = vec![
+        sized_line(
+            "CLOSING SUBMISSIONS FOR THE HARBOUR BOARD",
+            [160.0, 100.0, 440.0, 115.0],
+            12.0,
+        ),
+        sized_line("14 MARCH 2031", [256.0, 122.0, 344.0, 137.0], 12.0),
+    ];
+    body_rows(&mut lines, 200.0, 3, 20.0);
+    lines.push(sized_line(
+        "ORDERS FOR MAY 2 THROUGH",
+        [215.0, 300.0, 385.0, 312.0],
+        12.0,
+    ));
+    lines.push(sized_line(
+        "MAY 30, 2031",
+        [260.0, 314.0, 340.0, 326.0],
+        12.0,
+    ));
+    body_rows(&mut lines, 360.0, 3, 20.0);
+
+    assert_eq!(
+        capitals_titles(lines),
+        [
+            "CLOSING SUBMISSIONS FOR THE HARBOUR BOARD",
+            "ORDERS FOR MAY 2 THROUGH MAY 30, 2031",
+        ]
+    );
+}
