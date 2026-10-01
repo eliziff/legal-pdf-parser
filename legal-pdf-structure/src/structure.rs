@@ -1062,7 +1062,14 @@ struct HeadingCandidate {
 
 /// A title set apart in bold may name a case by its parties; one in body type may not.
 fn heading_title_plausible(line: &Line, text: &str) -> bool {
-    if has_dot_leader(text) {
+    // A title has a word; "F. R." is a name's initials.
+    let worded = text.split_whitespace().any(|word| {
+        word.chars()
+            .filter(|character| character.is_alphabetic())
+            .count()
+            >= 2
+    });
+    if !worded || has_dot_leader(text) {
         false
     } else if bold_char_share(line) >= 0.60 {
         styled_heading_text_plausible(text)

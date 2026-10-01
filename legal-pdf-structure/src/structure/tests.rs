@@ -3236,3 +3236,19 @@ fn a_history_note_wrapping_its_last_number_is_no_footnote_label() {
         .iter()
         .all(|line| line.region_type != "footnote" && line.note_region_mode.is_empty()));
 }
+
+#[test]
+fn a_name_s_initials_are_no_heading() {
+    let mut lines = Vec::new();
+    let mut y = 50.0;
+    for title in ["A. The Tow", "B. The Mooring", "C. R."] {
+        lines.push(sized_line(title, [60.0, y, 330.0, y + 11.0], 10.0));
+        lines.push(sized_line(
+            "The tow line parted under a load the tug could bear.",
+            [60.0, y + 30.0, 520.0, y + 41.0],
+            10.0,
+        ));
+        y += 70.0;
+    }
+    assert_eq!(heading_texts(lines), ["A. The Tow", "B. The Mooring"]);
+}

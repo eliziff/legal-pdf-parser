@@ -57,6 +57,17 @@ fn title_cased<'a>(words: impl Iterator<Item = &'a str>) -> bool {
     capitalized >= 2 && capitalized as f64 / lettered.len() as f64 >= TITLECASE_MIN_RATIO
 }
 
+fn dated(citation: &str) -> bool {
+    citation
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|digits| {
+            digits.len() == 4
+                && digits
+                    .parse::<u32>()
+                    .is_ok_and(|year| (1700..2100).contains(&year))
+        })
+}
+
 fn titled_around_references(text: &str) -> bool {
     if !text.starts_with(|character: char| character.is_alphabetic() && character.is_uppercase())
         || text.chars().count() > 200
@@ -66,6 +77,7 @@ fn titled_around_references(text: &str) -> bool {
     // Each citation, its style of cause, pinpoints and parentheticals included, is cut out.
     let mut uncited = String::new();
     let mut from = 0;
+    let mut dated_citation = false;
     for citation in legal_citations::extract(text, &legal_citations::Options::default()) {
         let span = &citation.full_span;
         if span.start < from || text.get(span.start..span.end) != Some(span.text.as_str()) {
@@ -74,6 +86,7 @@ fn titled_around_references(text: &str) -> bool {
         if text[..span.start].trim().is_empty() {
             return false;
         }
+        dated_citation |= dated(&span.text);
         uncited.push_str(&text[from..span.start]);
         uncited.push(' ');
         from = span.end;
@@ -102,7 +115,8 @@ fn titled_around_references(text: &str) -> bool {
         words.push(word);
     }
     let prose = prose.join(" ");
-    (from > 0 || counted)
+    // A decision a title names is dated ("2021 ABCA 273"); a bare "1 TO 10" names none.
+    ((from > 0 && dated_citation) || (from == 0 && counted))
         && !has_legal_citation_cue(&prose)
         && !has_citation_signal(&prose)
         && title_cased(words.into_iter())
@@ -441,6 +455,7 @@ mod tests {
             "Mariner, supra note 4 at para 12",
             "See Section 12.4",
             "In these Regulations,",
+            "DOE HARBOUR PILOTS 1 TO 10",
         ] {
             assert!(!heading_text_plausible(citation), "{citation}");
         }
