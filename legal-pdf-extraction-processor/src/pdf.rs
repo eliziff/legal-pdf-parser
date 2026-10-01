@@ -812,12 +812,17 @@ fn line_glyphs(
         };
         let start_byte = source_span.byte_start;
         let end_byte = source_span.byte_end;
+        // A span also owns the separate whitespace items beside its text, which
+        // Word writes as text objects of their own: find only the item's text.
         let target = &assembled.text[start_byte..end_byte];
+        let content = target.trim_start();
+        let lead = target[..target.len() - content.len()].chars().count();
         let item_text = normalize_text(&item.text);
-        let Some(target_byte) = item_text.find(target) else {
+        let Some(target_byte) = item_text.find(content.trim_end()) else {
             continue;
         };
         let skipped = item_text[..target_byte].chars().count();
+        let base = source_span.start + lead;
         let mut local_offset = 0usize;
         for glyph in &fidelity.glyphs {
             let glyph_text = normalize_text(&glyph.text);
@@ -827,11 +832,8 @@ fn line_glyphs(
             if glyph_len == 0 || glyph_text.chars().all(char::is_whitespace) {
                 continue;
             }
-            let start = source_span
-                .start
-                .saturating_add(local_start.saturating_sub(skipped));
-            let end = source_span
-                .start
+            let start = base.saturating_add(local_start.saturating_sub(skipped));
+            let end = base
                 .saturating_add(local_offset.saturating_sub(skipped))
                 .min(source_span.end);
             if start >= end || local_offset <= skipped {
@@ -1499,6 +1501,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             fidelity: None,
@@ -1883,6 +1891,52 @@ mod tests {
         assert_eq!((line.words[1].start, line.words[1].end), (5, 8));
         assert_eq!(line.words[1].bbox[0], 55.0);
         assert_eq!(line.words[1].bbox[2], 85.0);
+    }
+
+    #[test]
+    fn whitespace_written_as_its_own_text_object_keeps_the_line_words() {
+        // Word writes a field's neighbouring space as a separate text object.
+        let item = |text: &str, x: f32, object: u32| {
+            let glyphs = text
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    (
+                        character.to_string(),
+                        index as f32 * 5.0,
+                        index as f32 * 5.0 + 5.0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let glyphs = glyphs
+                .iter()
+                .map(|(text, x0, x1)| (text.as_str(), *x0, *x1))
+                .collect::<Vec<_>>();
+            let mut item = fidelity_item(text, &glyphs);
+            item.x = x;
+            item.width = text.chars().count() as f32 * 5.0;
+            let fidelity = item.fidelity.as_mut().unwrap();
+            fidelity.text_object = object;
+            for glyph in &mut fidelity.glyphs {
+                glyph.bbox[0] += x - 10.0;
+                glyph.bbox[2] += x - 10.0;
+            }
+            item
+        };
+        let mut line = text_line(item("para 12", 10.0, 1));
+        line.items
+            .extend([item(" ", 45.0, 2), item("[Tab 1]", 50.0, 3)]);
+        let line = make_line(line, 0, 1, 1, 100.0).unwrap();
+        assert_eq!(line.text, "para 12 [Tab 1]");
+        let words = line
+            .words
+            .iter()
+            .map(|word| (word.text.as_str(), word.bbox[0]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [("para", 10.0), ("12", 35.0), ("[Tab", 50.0), ("1]", 75.0)]
+        );
     }
 
     #[test]
