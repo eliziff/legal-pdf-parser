@@ -379,6 +379,26 @@ impl PdfDocument {
     pub fn lookup(&self, request: &PdfLookupRequest) -> PdfStructureLookup {
         structure_lookup(self, request)
     }
+
+    /// Every page's text, in page order, as a page lookup returns it: empty where
+    /// the page has no exact text. One read instead of one lookup per page.
+    pub fn page_texts(&self) -> Vec<&str> {
+        let text = ScalarText::new(self.structure.query_text());
+        let nodes = nodes_by_id(self);
+        self.pages
+            .iter()
+            .map(|page| {
+                let exact = nodes
+                    .get(page.id.as_str())
+                    .is_some_and(|node| !rendered_slice(&text, node).is_empty());
+                if exact {
+                    page.evidence_text.as_str()
+                } else {
+                    ""
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Serialize)]
