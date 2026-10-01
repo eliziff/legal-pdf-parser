@@ -44,7 +44,7 @@
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/petition/crtc-legislative-review/ca-bce-inc-an-international-comparison-of-end-to-end-facilities-based-competition-in-telecomm-40941dbae646.pdf",
       "source_sha256": "40941dbae64682c658781dd5ebb49e1dd4ea7c46306e0aa57f2abfcd52a52c85",
-      "product_sha256": "d8a7237abe1e24828a26a0301fdf71d3228b423f7dffb0303a7a34f0d6a5b543"
+      "product_sha256": "f9128f6a959fe332ac8c5e3e38d83730eb8bcf9f9b5367d3c5f7916a98dc9a7a"
     },
     {
       "path": "experiments/legal_pdf_corpus/pdfs/nz/digitalborn/opening_submission/waitangi-tribunal/nz-t-bennion-e-whiley-kudrat-wai-2139-opening-submissions-for-wai-2139-the-mua-poko-lands-res-0950c3b8cd3b.pdf",
@@ -54,17 +54,17 @@
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/presentation/foreign-interference-commission/ca-examples-of-media-diaspora-and-non-governmental-organization-concern-about-foreign-interfe-af11dde972f5.pdf",
       "source_sha256": "af11dde972f508fde9ebb63bbc855202500589f25801d8b4b06977ec757bd858",
-      "product_sha256": "eb99abc9058dce95c44f05ad93d3f11956b3c29095fc971551d5a9c4c4ad1351"
+      "product_sha256": "a4b482b03d0dbe76d5794881c1910ca16e1b544cb7af7411917e0188e5d981f7"
     },
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/legal_submission/cnsc-hearing-documents/ca-cmd-25-m4-8-submission-from-the-manitoba-m-tis-federation-pdf-23-pages-760-kb-0ed0e1e6b3f2.pdf",
       "source_sha256": "0ed0e1e6b3f28fd6c8c3a57647925b873549e528eb70e9d072277bb3f4bd147a",
-      "product_sha256": "d6fe1eabf9e328e0a4aba1bf7adbbae5c9929d86db275bcacbfd630cc59d6b3e"
+      "product_sha256": "8a0a991952b6618216de1b7bed7355ec928b875b58b0754d179dca550980b065"
     },
     {
       "path": "experiments/legal_pdf_corpus/pdfs/ca/digitalborn/risk_assessment/cullen-commission/ca-us-national-money-laundering-risk-assessment-2015-e5293c3f7d29.pdf",
       "source_sha256": "e5293c3f7d294ebe88759effe749f26c52eaa770177a5747efd4201239c816a0",
-      "product_sha256": "7d70cbdee0b52e87f465480f8ee13df7fe52a71c8b6f6b0867c9eb8224a2f538"
+      "product_sha256": "6f05eeb0b54cac02922329b41acd8b2db6b2951b0194df253aa48643be3931f8"
     }
   ],
   "additional_sources": [

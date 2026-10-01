@@ -677,13 +677,23 @@ pub(super) fn native_graph_parts(
     primitives: &PdfPrimitiveEvidence,
 ) -> Result<Vec<StructureNode>> {
     let heading_levels = &primitives.heading_levels;
-    // A passage wholly in a parallel translation says so: a reader of the text's own
-    // structure skips it.
-    let translation = |line_ids: &[String]| {
-        !line_ids.is_empty()
-            && line_ids
-                .iter()
-                .all(|id| primitives.translation_line_ids.contains(id))
+    // A passage wholly in a contents list, or wholly a parallel translation, says so: a
+    // reader of the text's own structure skips it.
+    let role = |line_ids: &[String]| {
+        let all =
+            |test: &dyn Fn(&String) -> bool| !line_ids.is_empty() && line_ids.iter().all(test);
+        if all(&|id| {
+            primitives.contents_line_ids.contains(id)
+                || index
+                    .line(id)
+                    .is_some_and(|line| primitives.contents_pages.contains(&line.page_index))
+        }) {
+            Some("contents")
+        } else if all(&|id| primitives.translation_line_ids.contains(id)) {
+            Some("translation")
+        } else {
+            None
+        }
     };
     const ORIGIN: &str = "legalpdf.pdf-structure.v2";
     let mut nodes = Vec::new();
@@ -741,7 +751,7 @@ pub(super) fn native_graph_parts(
         node.grammar = if heading {
             Some("accepted_heading".to_owned())
         } else {
-            translation(&paragraph.line_ids).then(|| "translation".to_owned())
+            role(&paragraph.line_ids).map(str::to_owned)
         };
         if heading {
             if let Some(level) = paragraph

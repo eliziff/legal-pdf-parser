@@ -1741,7 +1741,11 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
     let heading = |line: &Line| {
         matches!(
             line.text.trim().to_lowercase().as_str(),
-            "contents" | "table of contents" | "table des matières" | "table of provisions"
+            "contents"
+                | "table of contents"
+                | "table des matières"
+                | "table of provisions"
+                | "table analytique"
         )
     };
     let tabular = continuing || page.lines.iter().any(heading) && table.strong();
@@ -1768,6 +1772,14 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
         })
         .collect();
     order.sort_by(|left, right| band_geometry_order(&page.lines[*left], &page.lines[*right]));
+    // A page whose running head names the contents list is that list, row by row.
+    if page
+        .lines
+        .iter()
+        .any(|line| line.region_type == "header" && heading(line))
+    {
+        return (!order.is_empty()).then_some(order);
+    }
     let mut rows = Vec::new();
     let mut wrapped = Vec::new();
     let mut text_lines = 0;

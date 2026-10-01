@@ -2896,3 +2896,23 @@ fn a_line_carrying_its_sentence_on_is_no_enumerated_heading() {
         ]
     );
 }
+
+#[test]
+fn a_page_headed_by_its_contents_list_is_that_list() {
+    let mut lines = vec![test_line(
+        "TABLE OF PROVISIONS",
+        [60.0, 40.0, 200.0, 50.0],
+        vec![],
+    )];
+    lines[0].region_type = "header".to_owned();
+    for (row, text) in ["Harbour Dues", "4", "Dues payable", "5", "Waiver"]
+        .into_iter()
+        .enumerate()
+    {
+        let y = 90.0 + row as f64 * 16.0;
+        lines.push(test_line(text, [60.0, y, 260.0, y + 11.0], vec![]));
+    }
+    let page = test_page(lines);
+    let table = table_evidence(&page.lines, page.width);
+    assert_eq!(contents_rows(&page, &table, false), Some((1..6).collect()));
+}
