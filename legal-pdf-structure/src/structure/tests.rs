@@ -3119,3 +3119,120 @@ fn a_title_standing_above_a_parallel_english_column_is_no_translation() {
         );
     }
 }
+
+#[test]
+fn a_fifth_lower_roman_title_is_a_heading_and_a_style_of_cause_is_not() {
+    let mut lines = Vec::new();
+    let mut y = 50.0;
+    for title in [
+        "i. Overview",
+        "ii. The Tow",
+        "iii. The Mooring",
+        "iv. The Berth",
+        "v. The Rule of the Harbour",
+    ] {
+        lines.push(sized_line(title, [60.0, y, 520.0, y + 11.0], 10.0));
+        lines.push(sized_line(
+            "The tow line parted under a load the tug could bear.",
+            [60.0, y + 30.0, 520.0, y + 41.0],
+            10.0,
+        ));
+        y += 70.0;
+    }
+    lines.push(sized_line(
+        "v. Harbour Pilots Association, 2031 ONCA 412",
+        [60.0, y, 520.0, y + 11.0],
+        10.0,
+    ));
+    let headings = heading_texts(lines);
+    assert!(
+        headings
+            .iter()
+            .any(|text| text == "v. The Rule of the Harbour"),
+        "{headings:?}"
+    );
+    assert!(
+        !headings.iter().any(|text| text.contains("Pilots")),
+        "{headings:?}"
+    );
+}
+
+#[test]
+fn a_numbered_entry_running_into_its_next_line_or_a_leader_is_no_heading() {
+    let mut lines = Vec::new();
+    let mut push = |text: &str, x: f64, y: f64, right: f64| {
+        lines.push(sized_line(text, [x, y, right, y + 11.0], 10.0))
+    };
+    push("I. Overview", 60.0, 50.0, 140.0);
+    push(
+        "The tow line parted under a load the tug could bear, and the barge drifted.",
+        60.0,
+        80.0,
+        520.0,
+    );
+    push("II. Sources", 60.0, 120.0, 140.0);
+    push(
+        "1. Harbour Authority, Pilotage Standards Series, No. 14, Tug and Barge Practice for",
+        60.0,
+        150.0,
+        518.0,
+    );
+    push("Coastal Waters, Halifax, 2031.", 80.0, 162.0, 260.0);
+    push(
+        "2. Port Board, Mooring Guide, Volume II: Berths and Anchorages in the Outer Harbour",
+        60.0,
+        187.0,
+        520.0,
+    );
+    push("and the Inner Basin, Halifax, 2030.", 80.0, 199.0, 280.0);
+    push(
+        "3. Moorings ................................................ 12",
+        60.0,
+        224.0,
+        520.0,
+    );
+    push(
+        "The barge was moored where the harbour master said it was to be moored.",
+        60.0,
+        254.0,
+        520.0,
+    );
+    assert_eq!(heading_texts(lines), ["I. Overview", "II. Sources"]);
+}
+
+#[test]
+fn a_history_note_wrapping_its_last_number_is_no_footnote_label() {
+    let mut lines = Vec::new();
+    let mut y = 80.0;
+    for section in 1..=4 {
+        for row in 0..5 {
+            let text = if row == 0 {
+                format!("{section}  The harbour authority may make rules for row {row}")
+            } else {
+                format!("the vessels and berths of the harbour in row {row}")
+            };
+            lines.push(sized_line(&text, [48.0, y, 294.0, y + 11.0], 9.7));
+            y += 11.5;
+        }
+        lines.push(sized_line(
+            "R.S., 1985, c. H-4, s. 7; R.S., 1985, c. 27 (1st Supp.), s",
+            [48.0, y + 3.0, 261.0, y + 12.0],
+            6.0,
+        ));
+        lines.push(sized_line(
+            &format!("{}.", section + 10),
+            [48.0, y + 10.0, 56.0, y + 19.0],
+            6.0,
+        ));
+        y += 36.0;
+    }
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+
+    classify_pages(&mut pages, &[None]);
+
+    assert!(pages[0]
+        .lines
+        .iter()
+        .all(|line| line.region_type != "footnote" && line.note_region_mode.is_empty()));
+}

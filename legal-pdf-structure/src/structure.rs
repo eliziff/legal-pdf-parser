@@ -250,6 +250,31 @@ fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_
     label_is_raised(line, prefix, line_size) || (label_size > 0.0 && label_size <= body_size * 0.75)
 }
 
+/// Whether the line just above `index`, in its type and at its leading, ends on a counted
+/// enactment's noun ("s", "c", "art") still waiting for its number.
+fn reference_wrapped_onto(lines: &[Line], sizes: &[f64], index: usize) -> bool {
+    let line = &lines[index];
+    let height = line.bbox[3] - line.bbox[1];
+    lines
+        .iter()
+        .zip(sizes)
+        .filter(|(above, size)| {
+            (**size - sizes[index]).abs() <= 0.5
+                && above.bbox[3] <= line.bbox[1] + height * 0.5
+                && line.bbox[1] - above.bbox[3] < height * 0.6
+                && above.bbox[0] < line.bbox[2]
+                && line.bbox[0] < above.bbox[2]
+        })
+        .max_by(|(left, _), (right, _)| left.bbox[3].total_cmp(&right.bbox[3]))
+        .and_then(|(above, _)| above.text.split_whitespace().last())
+        .is_some_and(|word| {
+            matches!(
+                word.trim_end_matches('.'),
+                "c" | "ch" | "s" | "ss" | "art" | "arts"
+            )
+        })
+}
+
 fn normalize_furniture(text: &str) -> String {
     static DIGITS: OnceLock<Regex> = OnceLock::new();
     let text = DIGITS
@@ -1037,7 +1062,9 @@ struct HeadingCandidate {
 
 /// A title set apart in bold may name a case by its parties; one in body type may not.
 fn heading_title_plausible(line: &Line, text: &str) -> bool {
-    if bold_char_share(line) >= 0.60 {
+    if has_dot_leader(text) {
+        false
+    } else if bold_char_share(line) >= 0.60 {
         styled_heading_text_plausible(text)
     } else {
         heading_text_plausible(text)
@@ -1080,9 +1107,14 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                 let punct = capture.get(2).unwrap().as_str();
                 let text = capture.get(3).unwrap().as_str().trim();
                 let interpretations = enumerator_interpretations(value, punct);
-                // A line opening "v. Party, 2016 ONCA 409" carries a style of cause on.
-                let versus = value == "v" && punct == ".";
-                if !versus && heading_title_plausible(line, text) && !interpretations.is_empty() {
+                // A line opening "v. Party, 2016 ONCA 409" carries a style of cause on; a
+                // fifth title ("v. The Rule of Lenity") cites nothing.
+                let versus = value == "v" && punct == "." && has_citation_signal(text);
+                if !versus
+                    && !carries_a_sentence_on(page, line_slot)
+                    && heading_title_plausible(line, text)
+                    && !interpretations.is_empty()
+                {
                     candidates.push(HeadingCandidate {
                         page_slot,
                         line_slot,
@@ -1165,6 +1197,48 @@ fn continues_prose(page: &Page, line: &Line) -> bool {
                 && !standalone_enumerator(text)
                 && !inline_enumerator_re().is_match(text)
         })
+}
+
+/// A long numbered line running the full column whose sentence the next line, at its leading,
+/// finishes ("1. IAEA, Safety Standards Series, Geological Disposal Facilities for" /
+/// "Radioactive Waste, Vienna, 2011.") opens a paragraph or an entry, not a heading.
+fn carries_a_sentence_on(page: &Page, slot: usize) -> bool {
+    let line = &page.lines[slot];
+    let Some(next) = page.lines.get(slot + 1) else {
+        return false;
+    };
+    let height = line.bbox[3] - line.bbox[1];
+    let (left, right) = page
+        .lines
+        .iter()
+        .filter(|other| {
+            other.region_type == "body"
+                && other.bbox[0] < line.bbox[2]
+                && line.bbox[0] < other.bbox[2]
+        })
+        .fold((line.bbox[0], line.bbox[2]), |(left, right), other| {
+            (left.min(other.bbox[0]), right.max(other.bbox[2]))
+        });
+    let text = line.text.trim_end();
+    let following = next.text.trim_end();
+    height > 0.0
+        && text.split_whitespace().count() >= 8
+        && line.bbox[2] >= right - (right - left) * 0.1
+        && !sentence_ended(text)
+        && !text.ends_with(':')
+        && next.region_type == "body"
+        && next.bbox[1] > line.bbox[1]
+        && next.bbox[1] - line.bbox[3] < height * 0.5
+        && sentence_ended(following)
+        && !following.ends_with('?')
+        && !has_citation_signal(&format!("{text} {following}"))
+}
+
+/// A contents entry runs its title into a dot leader ("4. Land Use ........ 12").
+fn has_dot_leader(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\.{4,}|(?:\. ){3,}|\u{2026}").unwrap())
+        .is_match(text)
 }
 
 fn bold_char_share(line: &Line) -> f64 {
@@ -2122,11 +2196,16 @@ fn classify_pages_with_source(
             // statute's small-type history note), unless it is raised above its line.
             let comma_tail = line.text.chars().nth(prefix.end) == Some(',')
                 && !label_is_raised(line, &prefix, line_sizes[index]);
+            // A number opening a line under one that ends on a reference's noun ("... c. 27
+            // (1st Supp.), s" / "13.") is that reference's number, wrapped.
+            let wrapped_reference = !label_is_raised(line, &prefix, line_sizes[index])
+                && reference_wrapped_onto(&page.lines, &line_sizes, index);
             let below_separator = separator.is_some_and(|cut| line.bbox[1] >= cut - tolerance);
             let suppressed = (line.bbox[1] >= page.height * 0.94
                 && !(below_separator && typographic))
                 || bottom_right
                 || comma_tail
+                || wrapped_reference
                 || size > body_size * 1.15;
             if suppressed {
                 suppress.push(index);
