@@ -48,7 +48,7 @@ pub struct PdfDocument {
 }
 
 /// Display-space text geometry retained with the prepared document.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PdfTextPage {
     pub page_number: u32,
@@ -58,7 +58,7 @@ pub struct PdfTextPage {
     pub lines: Vec<PdfTextLine>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PdfTextLine {
     pub id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -67,7 +67,7 @@ pub struct PdfTextLine {
     pub words: Vec<PdfTextWord>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PdfTextWord {
     pub text: String,
     pub rect: [f64; 4],
@@ -334,8 +334,34 @@ impl PdfDocument {
         self.passage_pages = pages;
     }
 
+    /// The pages passages are read from: the extraction witnesses, with a recognized scan's
+    /// lines in place of its empty native page.
     pub fn passage_pages(&self) -> Arc<Vec<PdfTextPage>> {
-        Arc::clone(&self.passage_pages)
+        let recognized = self.recognized_pages();
+        if recognized.iter().all(|page| page.lines.is_empty()) {
+            return Arc::clone(&self.passage_pages);
+        }
+        Arc::new(
+            self.passage_pages
+                .iter()
+                .map(|page| {
+                    match recognized.iter().find(|read| {
+                        read.page_number == page.page_number
+                            && page.lines.is_empty()
+                            && !read.lines.is_empty()
+                    }) {
+                        Some(read) => PdfTextPage {
+                            page_number: page.page_number,
+                            source: read.source.clone(),
+                            width: page.width,
+                            height: page.height,
+                            lines: read.lines.iter().map(recognized_witness_line).collect(),
+                        },
+                        None => page.clone(),
+                    }
+                })
+                .collect(),
+        )
     }
 
     pub fn recognized_pages(&self) -> &[PdfTextPage] {
@@ -398,6 +424,48 @@ impl PdfDocument {
                 }
             })
             .collect()
+    }
+}
+
+/// A recognized line read as a witness: its text in full, and its words in order. A line
+/// recognized without word boxes spaces its words across its own box.
+fn recognized_witness_line(line: &PdfTextLine) -> PdfTextLine {
+    let text = if line.text.is_empty() {
+        line.words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        line.text.clone()
+    };
+    let words = if line.words.is_empty() {
+        let [left, top, right, bottom] = line.rect;
+        let advance = (right - left) / text.chars().count().max(1) as f64;
+        let mut at = 0;
+        text.split(' ')
+            .filter_map(|word| {
+                let start = at;
+                at += word.chars().count() + 1;
+                (!word.is_empty()).then(|| PdfTextWord {
+                    text: word.to_owned(),
+                    rect: [
+                        left + start as f64 * advance,
+                        top,
+                        left + (at - 1) as f64 * advance,
+                        bottom,
+                    ],
+                })
+            })
+            .collect()
+    } else {
+        line.words.clone()
+    };
+    PdfTextLine {
+        id: line.id.clone(),
+        text,
+        rect: line.rect,
+        words,
     }
 }
 
@@ -1359,6 +1427,70 @@ mod tests {
         assert_eq!(page.lines[1].text, "Unclassified source text");
         assert!(page.lines[1].words.is_empty());
         assert_eq!(page.lines[0].words[0].rect, [60.0, 100.0, 120.0, 112.0]);
+    }
+
+    #[test]
+    fn a_recognized_scan_s_lines_are_its_passage_witness() {
+        let mut worded = source_line("worded", "");
+        worded.words.push(legal_pdf_core::model::Word {
+            id: "w1".into(),
+            text: "Tow".into(),
+            bbox: [60.0, 100.0, 90.0, 112.0],
+            start: 0,
+            end: 3,
+        });
+        let mut plain = source_line("plain", "[7] The tug may berth");
+        plain.bbox = [60.0, 120.0, 270.0, 132.0];
+        let pages = vec![Page {
+            id: "page-1".into(),
+            index: 0,
+            number: 1,
+            width: 612.0,
+            height: 792.0,
+            lines: vec![worded, plain],
+            regions: vec![],
+            source: "ocr".into(),
+            text_quality: 1.0,
+            printed_label: None,
+            printed_label_source: None,
+            printed_label_line_id: None,
+        }];
+        let evidence = PdfDocument::passage_evidence(&pages);
+        let mut document = PdfDocument::project(
+            pages,
+            vec![],
+            vec![],
+            structure_graph(vec![]),
+            pdf_summary(),
+        );
+        document.set_passage_evidence(evidence);
+        let witness = document.passage_pages();
+        let lines = &witness[0].lines;
+        assert_eq!(witness[0].source, "ocr");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Tow", "[7] The tug may berth"]
+        );
+        assert_eq!(lines[0].words[0].rect, [60.0, 100.0, 90.0, 112.0]);
+        // Without word boxes, each word takes its share of the line's box.
+        let words = lines[1]
+            .words
+            .iter()
+            .map(|word| (word.text.as_str(), word.rect[0], word.rect[2]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                ("[7]", 60.0, 90.0),
+                ("The", 100.0, 130.0),
+                ("tug", 140.0, 170.0),
+                ("may", 180.0, 210.0),
+                ("berth", 220.0, 270.0),
+            ]
+        );
     }
 
     #[test]
