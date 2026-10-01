@@ -674,8 +674,17 @@ pub(super) fn native_graph_parts(
     index: &PdfTextIndex,
     pages: &[Page],
     paragraphs: &[Paragraph],
-    heading_levels: &HashMap<String, usize>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> Result<Vec<StructureNode>> {
+    let heading_levels = &primitives.heading_levels;
+    // A passage wholly in a parallel translation says so: a reader of the text's own
+    // structure skips it.
+    let translation = |line_ids: &[String]| {
+        !line_ids.is_empty()
+            && line_ids
+                .iter()
+                .all(|id| primitives.translation_line_ids.contains(id))
+    };
     const ORIGIN: &str = "legalpdf.pdf-structure.v2";
     let mut nodes = Vec::new();
     let text = ScalarText::new(index.text());
@@ -729,7 +738,11 @@ pub(super) fn native_graph_parts(
         });
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
-        node.grammar = heading.then(|| "accepted_heading".to_owned());
+        node.grammar = if heading {
+            Some("accepted_heading".to_owned())
+        } else {
+            translation(&paragraph.line_ids).then(|| "translation".to_owned())
+        };
         if heading {
             if let Some(level) = paragraph
                 .line_ids

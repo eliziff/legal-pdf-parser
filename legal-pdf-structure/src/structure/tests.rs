@@ -2773,3 +2773,72 @@ fn accepted_heading_and_separate_marker_terminate_numbered_prose() {
         "1. Ordinary narrative ends here.\n"
     );
 }
+
+fn parallel_page(rows: &[(&str, &str)]) -> Page {
+    let mut lines = Vec::new();
+    for (row, (english, french)) in rows.iter().enumerate() {
+        let y = 80.0 + row as f64 * 14.0;
+        for (text, left) in [(english, 60.0), (french, 320.0)] {
+            if !text.is_empty() {
+                let mut line = sized_line(text, [left, y, left + 220.0, y + 11.0], 10.0);
+                line.block_index = row;
+                lines.push(line);
+            }
+        }
+    }
+    mark_source_body(&mut lines);
+    test_page(lines)
+}
+
+#[test]
+fn a_parallel_french_column_is_the_translation_and_gives_no_headings() {
+    let prose = (
+        "The tug owner says that the barge was not in the way of it.",
+        "Le propriétaire du remorqueur affirme que la barge ne gênait pas",
+    );
+    let mut rows = vec![("I. Overview", "I. Aperçu")];
+    rows.extend([prose; 6]);
+    rows.push(("II. Analysis", "II. Analyse"));
+    rows.extend([prose; 6]);
+    rows.push((
+        "12  [Repealed, 2031, c. 4, s. 2]",
+        "12  [Abrogé, 2031, ch. 4, art. 2]",
+    ));
+    let mut pages = vec![parallel_page(&rows)];
+    let mut evidence = PdfPrimitiveEvidence {
+        source_regions: source_region_contract(&pages),
+        ..Default::default()
+    };
+    classify_pages_with_source(&mut pages, &[None], &mut evidence);
+    let page = &pages[0];
+    let right = |line: &&Line| line.bbox[0] >= 300.0;
+    assert!(page
+        .lines
+        .iter()
+        .filter(right)
+        .all(|line| evidence.translation_line_ids.contains(&line.id)));
+    assert!(!page
+        .lines
+        .iter()
+        .any(|line| !right(&line) && evidence.translation_line_ids.contains(&line.id)));
+    let headings = page
+        .lines
+        .iter()
+        .filter(|line| line.region_type == "heading")
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(headings, ["I. Overview", "II. Analysis"]);
+    // The row read across both columns becomes one region per language.
+    let repealed = page
+        .regions
+        .iter()
+        .filter(|region| {
+            region.line_ids.iter().any(|id| {
+                page.lines
+                    .iter()
+                    .any(|line| &line.id == id && line.text.starts_with("12"))
+            })
+        })
+        .count();
+    assert_eq!(repealed, 2);
+}

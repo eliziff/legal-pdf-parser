@@ -14,7 +14,7 @@
     {
       "path": "benchmarks/legal-generalization-corpus/raw/ca-case-2021-scc-wastech-services.pdf",
       "source_sha256": "fe6909b730a055d6dcbb70ae33b85640d6951680c471a6a670f1dc22610b34ac",
-      "product_sha256": "d72b79e4622fdbe22f92baa840e60bde037ae1f3791f7012600198c42f96fd48"
+      "product_sha256": "5b3b6814b05396b76687cba205a65b865513a3bf7d24b74641bac664aac5bbce"
     },
     {
       "path": "benchmarks/legal-generalization-corpus/raw/us-complaint-2020-sec-honig.pdf",

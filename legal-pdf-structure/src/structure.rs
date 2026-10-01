@@ -55,6 +55,8 @@ struct PdfPrimitiveEvidence {
     source_regions: Option<HashMap<String, String>>,
     contents_pages: HashSet<usize>,
     contents_line_ids: HashSet<String>,
+    /// The French column of a parallel English and French text.
+    translation_line_ids: HashSet<String>,
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
@@ -1015,6 +1017,7 @@ fn heading_candidates<'a>(
         }
         for (line_slot, line) in page.lines.iter().enumerate().filter(|(_, line)| {
             !line.exclude_from_body
+                && !primitives.translation_line_ids.contains(&line.id)
                 && matches!(line.region_type.as_str(), "body" | "heading")
                 && heading_source_eligible(regions, line)
         }) {
@@ -1479,6 +1482,7 @@ fn apply_text_fidelity_headings(
                 .is_some_and(|region| matches!(region.as_str(), "text" | "body"));
             if line.region_type == "body"
                 && source_mutable
+                && !primitives.translation_line_ids.contains(&line.id)
                 && (8..=70).contains(&text.chars().count())
                 && letters >= 4
                 && !text.chars().any(char::is_lowercase)
@@ -1607,6 +1611,12 @@ fn apply_text_fidelity_headings(
             if let Some(level) = decision.level {
                 heading_levels.insert(pages[page_slot].lines[continuation_slot].id.clone(), level);
             }
+        }
+    }
+    // A translation's headings repeat the English column's; the English is read.
+    for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+        if line.region_type == "heading" && primitives.translation_line_ids.contains(&line.id) {
+            line.region_type = "body".to_owned();
         }
     }
     let accepted = pages
@@ -1779,6 +1789,24 @@ fn classify_pages_with_source(
     let mut continuing_table = false;
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
+    let translation = translation_lines(pages);
+    // A row the extractor read across both columns parts into its two languages.
+    for page in pages.iter_mut() {
+        let base = page
+            .lines
+            .iter()
+            .map(|line| line.block_index)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for line in page
+            .lines
+            .iter_mut()
+            .filter(|line| translation.contains(&line.id))
+        {
+            line.block_index += base;
+        }
+    }
     let index_pages = index_pages(pages);
     let table_pages: Vec<_> = pages
         .iter()
@@ -2368,6 +2396,7 @@ fn classify_pages_with_source(
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
             } else if line.text.chars().count() <= 180
+                && !translation.contains(&line.id)
                 && size
                     >= (if article_body_size > 0.0 {
                         article_body_size
@@ -2415,6 +2444,7 @@ fn classify_pages_with_source(
         diagnostics.extend(order_page(page, table_page, &table_notes));
         build_regions(std::slice::from_mut(page));
     }
+    evidence.translation_line_ids = translation;
     let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
     evidence.contents_line_ids.extend(contents_line_ids);
@@ -3025,12 +3055,7 @@ fn derive_prepared(
     legal_pdf_support::profile::measure("derive.crossrefs", || {
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
-    let nodes = native_graph_parts(
-        &resolution.index,
-        pages,
-        &paragraphs,
-        &prepared.primitives.heading_levels,
-    )?;
+    let nodes = native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
     let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         resolve_structure_graph(
             identity.document_id,
