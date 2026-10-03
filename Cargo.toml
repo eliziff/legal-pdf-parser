@@ -13,7 +13,7 @@ resolver = "2"
 [workspace.dependencies]
 legal-citations = { git = "https://github.com/eliziff/common-law-cite.git", rev = "503a85c461bb2da47e65c9c2b9b823150daf7c89" }
 legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "e4df1fd8c74386a201f1dd79f98cc9e91d44a0d5" }
-pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", branch = "pdf-inspector", default-features = false }
+pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", rev = "b2f3585def52d953bb41bfe19638ec35d090b0ee", default-features = false }
 
 [features]
 default = []

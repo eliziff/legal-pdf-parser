@@ -83,11 +83,11 @@ jobs:
 
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'head/Cargo.toml'
           $source = [System.IO.File]::ReadAllText($manifest)
-          $dependency = 'pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", branch = "pdf-inspector", default-features = false }'
-          if (-not $source.Contains($dependency)) { throw "PDF Inspector dependency declaration changed" }
+          $dependency = 'pdf-inspector = \{ git = "https://github.com/eliziff/legal-pdf-parser\.git", rev = "[0-9a-f]{40}", default-features = false \}'
+          if (-not [regex]::IsMatch($source, $dependency)) { throw "PDF Inspector dependency declaration changed" }
           [System.IO.File]::WriteAllText(
             $manifest,
-            $source.Replace($dependency, 'pdf-inspector = { path = "../inspector", default-features = false }')
+            [regex]::Replace($source, $dependency, 'pdf-inspector = { path = "../inspector", default-features = false }')
           )
           cargo update --manifest-path $manifest -p pdf-inspector
           if ($LASTEXITCODE -ne 0) { throw "Candidate lockfile update failed" }
