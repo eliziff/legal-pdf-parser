@@ -49,10 +49,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  guidance-and-scope:
+    runs-on: ubuntu-latest
+    outputs:
+      parser: ${{ steps.scope.outputs.parser }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.parser-ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify fork guidance survives upstream merges
+        run: bash tools/test-merge-pdf-inspector.sh
+      - id: scope
+        name: Reserve source-document preflight for engine inputs
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate-sha }}
+        shell: python
+        run: |
+          import json, os, subprocess
+          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          if os.environ.get('CANDIDATE_SHA'):
+              parser = True
+          else:
+              pr = event.get('pull_request')
+              before = pr['base']['sha'] if pr else event.get('before', '')
+              after = pr['head']['sha'] if pr else event.get('after', '')
+              comparison = before + ('...' if pr else '..') + after
+              diff = subprocess.run(['git', 'diff', '--name-only', '--no-renames', '-z', comparison],
+                                    capture_output=True)
+              paths = diff.stdout.decode().strip('\0').split('\0') if diff.stdout else []
+              parser = diff.returncode != 0 or any(
+                  path and not path.endswith('.md') and not path.startswith('docs/')
+                  and path != 'tools/test-merge-pdf-inspector.sh' for path in paths)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('parser=' + str(parser).lower() + '\n')
+
   source-document-preflight:
+    needs: guidance-and-scope
     if: >-
-      inputs.candidate-sha != '' || github.event_name == 'push' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      needs.guidance-and-scope.outputs.parser == 'true' &&
+      (inputs.candidate-sha != '' || github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -77,9 +115,6 @@ jobs:
           path: head
           ref: ${{ inputs.parser-ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Verify fork guidance survives upstream merges
-        shell: bash
-        run: bash head/tools/test-merge-pdf-inspector.sh
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: inputs.candidate-sha != ''
         with:
