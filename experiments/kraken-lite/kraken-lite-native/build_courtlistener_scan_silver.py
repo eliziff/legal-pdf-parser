@@ -16,7 +16,7 @@ sys.path.insert(0, str(WORKSPACE / "AuthoritiesHelper"))
 from toa_maker import Authority, _download_pdf
 from build_scan_silver import TESSERACT, align_pages, atomic, pagexml
 
-DB = Path(os.environ["LOCALAPPDATA"]) / "OpenLegalProducts/LegalData/providers/courtlistener/courtlistener.sqlite"
+DB = Path(os.environ["LOCALAPPDATA"]) / "OpenLegalData/providers/courtlistener/courtlistener.sqlite"
 
 
 def selected(db, count):

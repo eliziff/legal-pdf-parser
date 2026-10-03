@@ -1,7 +1,7 @@
 [build]
-# One cache for every invocation; leave one logical core free for the laptop.
+# Reuse one cache without monopolizing the workstation.
 target-dir = "target"
-jobs = -1
+jobs = 1
 
 [alias]
 quick = "check --lib --offline --quiet"

@@ -12,7 +12,7 @@ import numpy as np
 
 ROOT = Path(__file__).parent / "court-scan-corpus"
 OUT = Path(__file__).parent / "scan-silver"
-DB = Path.home() / "AppData/Local/OpenLegalProducts/LegalData/providers/a2aj/a2aj-cases-fulltext.sqlite"
+DB = Path.home() / "AppData/Local/OpenLegalData/providers/a2aj/a2aj.sqlite"
 TESSERACT = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 CASES = ("SCC-1970-SCR-638", "SCC-1976-2-SCR-475", "SCC-1977-2-SCR-400", "SCC-1989-2-SCR-778")
 STARTS = {
