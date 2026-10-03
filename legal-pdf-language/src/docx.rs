@@ -1286,7 +1286,102 @@ fn normalize_heading_styles(xml: &str) -> String {
         .into_owned()
 }
 
+fn split_drafting_image_runs(xml: &str) -> Result<String> {
+    let mut reader = NsReader::from_reader(xml.as_bytes());
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    let mut changed = false;
+    loop {
+        let event = reader.read_event()?.into_owned();
+        let is_run = matches!(&event, Event::Start(start)
+            if start.local_name().as_ref() == b"r"
+                && namespace_value(reader.resolver().resolve_element(start.name()).0).as_deref() == Some(W_NS));
+        if matches!(event, Event::Eof) {
+            break;
+        }
+        if !is_run {
+            writer
+                .write_event(event)
+                .map_err(|error| Error::io("word/document.xml", error))?;
+            continue;
+        }
+        let start = event;
+        let mut children = Vec::<(bool, Vec<Event<'static>>)>::new();
+        let mut depth = 0;
+        let mut has_image = false;
+        let mut has_text = false;
+        let end = loop {
+            let event = reader.read_event()?.into_owned();
+            if matches!(event, Event::Eof) {
+                return Err(Error::Message("DOCX has an unclosed run".to_owned()));
+            }
+            if matches!(event, Event::End(_)) && depth == 0 {
+                break event;
+            }
+            if depth == 0 {
+                let mut properties = false;
+                if let Event::Start(child) | Event::Empty(child) = &event {
+                    if namespace_value(reader.resolver().resolve_element(child.name()).0).as_deref()
+                        == Some(W_NS)
+                    {
+                        properties = child.local_name().as_ref() == b"rPr";
+                        has_image |= matches!(child.local_name().as_ref(), b"drawing" | b"pict");
+                        has_text |= child.local_name().as_ref() == b"t";
+                    }
+                }
+                children.push((properties, Vec::new()));
+            }
+            match event {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth -= 1,
+                _ => {}
+            }
+            children.last_mut().expect("run child").1.push(event);
+        };
+        if has_image && has_text {
+            // Pandoc treats a run containing an image as image-only. Give it
+            // separate runs without changing child order or run formatting.
+            changed = true;
+            for (_, content) in children.iter().filter(|(properties, _)| !properties) {
+                writer
+                    .write_event(start.clone())
+                    .map_err(|error| Error::io("word/document.xml", error))?;
+                for event in children
+                    .iter()
+                    .filter(|(properties, _)| *properties)
+                    .flat_map(|(_, events)| events)
+                    .chain(content)
+                {
+                    writer
+                        .write_event(event.clone())
+                        .map_err(|error| Error::io("word/document.xml", error))?;
+                }
+                writer
+                    .write_event(end.clone())
+                    .map_err(|error| Error::io("word/document.xml", error))?;
+            }
+        } else {
+            for event in std::iter::once(start)
+                .chain(children.into_iter().flat_map(|(_, events)| events))
+                .chain(std::iter::once(end))
+            {
+                writer
+                    .write_event(event)
+                    .map_err(|error| Error::io("word/document.xml", error))?;
+            }
+        }
+    }
+    if !changed {
+        return Ok(xml.to_owned());
+    }
+    String::from_utf8(writer.into_inner())
+        .map_err(|error| Error::Message(format!("DOCX XML is not UTF-8: {error}")))
+}
+
 fn drafting_docx_input(bytes: &[u8]) -> Result<Vec<u8>> {
+    static METADATA_STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)(<w:name\b[^>]*w:val=")(Title|Subtitle)(")"#)
+            .expect("literal DOCX metadata style regex")
+    });
     static HEADING_STYLE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"<w:style\b[^>]*\bw:styleId="Heading\d+""#)
             .expect("literal DOCX heading style regex")
@@ -1294,17 +1389,20 @@ fn drafting_docx_input(bytes: &[u8]) -> Result<Vec<u8>> {
     let inspected = read_docx_files(bytes, Some(&["word/document.xml", "word/styles.xml"]))?;
     let document = docx_part(&inspected, "word/document.xml")
         .ok_or_else(|| Error::Message("Drafting mode requires a valid DOCX".to_owned()))?;
-    let stripped = strip_heading_numbering(&document);
+    let stripped = split_drafting_image_runs(&strip_heading_numbering(&document))?;
     let mut changed = stripped != document;
     let styles = docx_part(&inspected, "word/styles.xml");
     let normalized_styles = if let Some(styles) = styles {
-        if HEADING_STYLE.is_match(&styles) {
-            let normalized = normalize_heading_styles(&styles);
-            changed |= normalized != styles;
-            Some(normalized)
+        // Pandoc consumes these style names as metadata and its GFM writer
+        // omits that metadata. Keep their text in the temporary input's body.
+        let readable = METADATA_STYLE.replace_all(&styles, "${1}Readable ${2}${3}");
+        let normalized = if HEADING_STYLE.is_match(&readable) {
+            normalize_heading_styles(&readable)
         } else {
-            None
-        }
+            readable.into_owned()
+        };
+        changed |= normalized != styles;
+        Some(normalized)
     } else {
         None
     };
@@ -1729,4 +1827,90 @@ pub fn analyze_docx_drafting_bytes(
     let markdown = drafting_docx_text(bytes)?;
     legal_structure::analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn drafting_splits_mixed_image_runs_without_losing_order_or_properties() {
+        let properties = "<w:rPr><w:b/><w:color w:val=\"123456\"/></w:rPr>";
+        let content = "<w:t>Before</w:t><w:drawing><picture/></w:drawing><w:t>After</w:t>";
+        let source = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:r>{properties}{content}</w:r></w:document>"#
+        );
+        let expected = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:r>{properties}<w:t>Before</w:t></w:r><w:r>{properties}<w:drawing><picture/></w:drawing></w:r><w:r>{properties}<w:t>After</w:t></w:r></w:document>"#
+        );
+        assert_eq!(split_drafting_image_runs(&source).unwrap(), expected);
+        assert_eq!(split_drafting_image_runs(&expected).unwrap(), expected);
+    }
+
+    #[test]
+    fn drafting_leaves_ordinary_runs_byte_identical_and_refuses_unclosed_runs() {
+        let source = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:r><w:t>Ordinary text</w:t></w:r><w:r><w:pict/></w:r></w:document>"#
+        );
+        assert_eq!(split_drafting_image_runs(&source).unwrap(), source);
+        let broken = format!(r#"<w:document xmlns:w="{W_NS}"><w:r><w:t>Text</w:t>"#);
+        assert!(split_drafting_image_runs(&broken).is_err());
+    }
+
+    #[test]
+    fn drafting_renames_metadata_styles_only_in_the_temporary_package() {
+        let document = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:body><w:p><w:r><w:t>Heading text</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles xmlns:w="{W_NS}"><w:style w:styleId="Title"><w:name w:val="Title"/></w:style><w:style w:styleId="Subtitle"><w:name w:val="Subtitle"/></w:style></w:styles>"#
+        );
+        let source = write_docx_files(&[
+            ("word/document.xml".to_owned(), document.clone().into_bytes()),
+            ("word/styles.xml".to_owned(), styles.clone().into_bytes()),
+        ])
+        .unwrap();
+        let prepared = drafting_docx_input(&source).unwrap();
+        let prepared_files = read_docx_files(&prepared, None).unwrap();
+        let prepared_styles = docx_part(&prepared_files, "word/styles.xml").unwrap();
+        assert!(prepared_styles.contains("w:val=\"Readable Title\""));
+        assert!(prepared_styles.contains("w:val=\"Readable Subtitle\""));
+        assert_eq!(docx_part(&prepared_files, "word/document.xml").unwrap(), document);
+        let original_files = read_docx_files(&source, None).unwrap();
+        assert_eq!(docx_part(&original_files, "word/styles.xml").unwrap(), styles);
+    }
+
+    #[test]
+    fn authority_units_keep_utf16_references_and_word_footnote_order() {
+        let document = format!(
+            r#"<w:document xmlns:w="{W_NS}"><w:body>
+                <w:p/>
+                <w:p><w:r><w:t>A😀</w:t><w:footnoteReference w:id="7"/><w:tab/><w:t>B</w:t></w:r></w:p>
+                <w:p><w:r><w:t>C</w:t><w:footnoteReference w:id="3"/></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let footnotes = format!(
+            r#"<w:footnotes xmlns:w="{W_NS}">
+                <w:footnote w:id="-1"><w:p><w:r><w:t>separator</w:t></w:r></w:p></w:footnote>
+                <w:footnote w:id="3"><w:p><w:r><w:t>First</w:t><w:tab/><w:t>note.</w:t></w:r></w:p></w:footnote>
+                <w:footnote w:id="7"><w:p><w:r><w:t>Second</w:t><w:br/><w:t>note.</w:t></w:r></w:p></w:footnote>
+            </w:footnotes>"#
+        );
+        let bytes = write_docx_files(&[
+            ("word/document.xml".to_owned(), document.into_bytes()),
+            ("word/footnotes.xml".to_owned(), footnotes.into_bytes()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            docx_to_toa_text_units(&bytes).unwrap(),
+            vec![
+                json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"page_numbers":[],"text":"A😀\tB","footnote_refs":[[2,3]]}),
+                json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"page_numbers":[],"text":"C","footnote_refs":[[1,1]]}),
+                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
+                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
+            ]
+        );
+    }
 }
