@@ -19,21 +19,40 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let inputs = [
+    // Fingerprint library build inputs, not CLI tools, documentation or generated outputs.
+    let mut inputs = vec![
         root.join("Cargo.toml"),
         root.join("Cargo.lock"),
         root.join("build.rs"),
-        root.join("data"),
-        root.join("rust"),
-        root.join("legal-pdf-core"),
-        root.join("legal-pdf-extraction"),
-        root.join("legal-pdf-extraction-processor"),
-        root.join("legal-pdf-language"),
-        root.join("legal-pdf-ocr"),
-        root.join("legal-pdf-pairing"),
-        root.join("legal-pdf-structure"),
-        root.join("legal-pdf-support"),
+        root.join("rust/native/tesseract_layout.c"),
     ];
+    for module in [
+        "lib",
+        "contract",
+        "engine",
+        "structure_engine",
+        "supplied_ocr",
+    ] {
+        inputs.push(root.join(format!("rust/src/{module}.rs")));
+    }
+    for name in [
+        "core",
+        "extraction",
+        "extraction-processor",
+        "language",
+        "ocr",
+        "pairing",
+        "structure",
+        "support",
+    ] {
+        let crate_root = root.join(format!("legal-pdf-{name}"));
+        inputs.push(crate_root.join("Cargo.toml"));
+        inputs.push(crate_root.join("src"));
+        let build_script = crate_root.join("build.rs");
+        if build_script.is_file() {
+            inputs.push(build_script);
+        }
+    }
     let mut paths = Vec::new();
     for input in &inputs {
         println!("cargo:rerun-if-changed={}", input.display());
