@@ -1,6 +1,5 @@
 [build]
 # Reuse one cache without monopolizing the workstation.
-target-dir = "target"
 jobs = 1
 
 [alias]
