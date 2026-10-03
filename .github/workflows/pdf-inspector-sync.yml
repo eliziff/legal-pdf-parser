@@ -170,6 +170,8 @@ jobs:
           short_sha="${CANDIDATE_SHA:0:12}"
           previous_sha="${{ needs.prepare.outputs.previous-sha }}"
           sed -i "s/rev = \"$previous_sha\"/rev = \"$CANDIDATE_SHA\"/" Cargo.toml
+          git clone --branch main --single-branch --depth 1 https://github.com/eliziff/common-law-cite.git ../common-law-cite
+          git clone --branch main --single-branch --depth 1 https://github.com/eliziff/legal-structure-parser.git ../legal-structure
           cargo update -p pdf-inspector
           grep -Fq "legal-pdf-parser.git?rev=$CANDIDATE_SHA#$CANDIDATE_SHA" Cargo.lock
           mapfile -t changed < <(git diff --name-only | sort)
