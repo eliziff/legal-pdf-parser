@@ -7,7 +7,7 @@ from pathlib import Path
 import duckdb
 import fitz
 
-PARQUET = Path.home() / 'AppData/Local/OpenLegalProducts/LegalData/providers/a2aj/source/laws/LEGISLATION-FED/train.parquet'
+PARQUET = Path.home() / 'AppData/Local/OpenLegalData/providers/a2aj/source/laws/LEGISLATION-FED/train.parquet'
 OUTPUT = Path('kraken-lite-native/court-scan-corpus')
 
 

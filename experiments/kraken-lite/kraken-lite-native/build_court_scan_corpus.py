@@ -14,7 +14,7 @@ WORKSPACE = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(WORKSPACE / 'AuthoritiesHelper'))
 from toa_maker import Authority, _download_pdf
 
-DB = Path.home() / 'AppData/Local/OpenLegalProducts/LegalData/providers/a2aj/a2aj-cases-fulltext.sqlite'
+DB = Path.home() / 'AppData/Local/OpenLegalData/providers/a2aj/a2aj.sqlite'
 TESSERACT = Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe')
 NS = 'http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15'
 COURTS = ('SCC', 'ONCA', 'BCCA', 'BCSC', 'FCA', 'FC', 'NSCA', 'NSSC')

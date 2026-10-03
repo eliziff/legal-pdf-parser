@@ -6,7 +6,7 @@ import sqlite3
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-DB = Path(os.environ["LOCALAPPDATA"]) / "OpenLegalProducts/LegalData/providers/courtlistener/courtlistener.sqlite"
+DB = Path(os.environ["LOCALAPPDATA"]) / "OpenLegalData/providers/courtlistener/courtlistener.sqlite"
 
 
 def clean(text):

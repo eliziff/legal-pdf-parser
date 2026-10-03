@@ -204,7 +204,7 @@ fn default_cache_dir() -> PathBuf {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        return base.join("OpenLegalProducts/LegalData/apps/legalpdf/cache");
+        return base.join("OpenLegalData/apps/legalpdf/cache");
     }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
