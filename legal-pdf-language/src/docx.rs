@@ -693,7 +693,10 @@ fn authority_text(
                 id.parse()
                     .map_err(|_| Error::Message(format!("Invalid DOCX footnote id {id}")))?,
                 legal_structure::utf16_len(text),
-                matches!(element.attribute(None, "customMarkFollows"), Some("1" | "true" | "on")),
+                matches!(
+                    element.attribute(None, "customMarkFollows"),
+                    Some("1" | "true" | "on")
+                ),
             ));
         }
         return Ok(());
@@ -705,17 +708,33 @@ fn authority_text(
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum FootnoteRestart { Continuous, Section, Page, Unknown }
+enum FootnoteRestart {
+    Continuous,
+    Section,
+    Page,
+    Unknown,
+}
 
 #[derive(Clone, Copy)]
-struct FootnoteNumbering { start: Option<u32>, restart: FootnoteRestart, decimal: bool }
+struct FootnoteNumbering {
+    start: Option<u32>,
+    restart: FootnoteRestart,
+    decimal: bool,
+}
 
 fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> FootnoteNumbering {
-    let Some(properties) = parent.direct_elements().find(|child| child.is(W_NS, "footnotePr")) else {
+    let Some(properties) = parent
+        .direct_elements()
+        .find(|child| child.is(W_NS, "footnotePr"))
+    else {
         return inherited;
     };
-    let value = |name| properties.direct_elements().find(|child| child.is(W_NS, name))
-        .and_then(|child| child.attribute(None, "val"));
+    let value = |name| {
+        properties
+            .direct_elements()
+            .find(|child| child.is(W_NS, name))
+            .and_then(|child| child.attribute(None, "val"))
+    };
     FootnoteNumbering {
         start: value("numStart").map_or(inherited.start, |start| start.parse().ok()),
         restart: match value("numRestart") {
@@ -725,14 +744,22 @@ fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> Foot
             Some(_) => FootnoteRestart::Unknown,
             None => inherited.restart,
         },
-        decimal: value("numFmt").map_or(inherited.decimal,
-            |format| matches!(format, "decimal" | "decimalZero")),
+        decimal: value("numFmt").map_or(inherited.decimal, |format| {
+            matches!(format, "decimal" | "decimalZero")
+        }),
     }
 }
 
 /// Return body paragraphs followed by Word footnotes in citation-review order.
 pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
-    let files = read_docx_files(bytes, Some(&["word/document.xml", "word/footnotes.xml", "word/settings.xml"]))?;
+    let files = read_docx_files(
+        bytes,
+        Some(&[
+            "word/document.xml",
+            "word/footnotes.xml",
+            "word/settings.xml",
+        ]),
+    )?;
     let document = parse_xml(
         file_bytes(&files, "word/document.xml")
             .ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?,
@@ -758,20 +785,41 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         if !text.trim().is_empty() || !references.is_empty() {
             body_units.push((ordinal, text, references, section));
         }
-        if let Some(properties) = paragraph.direct_elements().find(|child| child.is(W_NS, "pPr"))
-            .and_then(|properties| properties.direct_elements().find(|child| child.is(W_NS, "sectPr"))) {
+        if let Some(properties) = paragraph
+            .direct_elements()
+            .find(|child| child.is(W_NS, "pPr"))
+            .and_then(|properties| {
+                properties
+                    .direct_elements()
+                    .find(|child| child.is(W_NS, "sectPr"))
+            })
+        {
             sections.push(Some(properties));
             section += 1;
         }
     }
-    sections.push(body.direct_elements().find(|child| child.is(W_NS, "sectPr")));
-    let defaults = FootnoteNumbering { start: Some(1), restart: FootnoteRestart::Continuous,
-        decimal: true };
-    let settings = file_bytes(&files, "word/settings.xml").map(parse_xml).transpose()?;
-    let global = settings.as_ref().map(|settings| settings.root())
-        .transpose()?.map_or(defaults, |settings| footnote_numbering(settings, defaults));
-    let numbering = sections.iter().map(|properties|
-        properties.map_or(global, |properties| footnote_numbering(properties, global)))
+    sections.push(
+        body.direct_elements()
+            .find(|child| child.is(W_NS, "sectPr")),
+    );
+    let defaults = FootnoteNumbering {
+        start: Some(1),
+        restart: FootnoteRestart::Continuous,
+        decimal: true,
+    };
+    let settings = file_bytes(&files, "word/settings.xml")
+        .map(parse_xml)
+        .transpose()?;
+    let global = settings
+        .as_ref()
+        .map(|settings| settings.root())
+        .transpose()?
+        .map_or(defaults, |settings| footnote_numbering(settings, defaults));
+    let numbering = sections
+        .iter()
+        .map(|properties| {
+            properties.map_or(global, |properties| footnote_numbering(properties, global))
+        })
         .collect::<Vec<_>>();
     let mut note_numbers = HashMap::new();
     let mut seen = HashSet::new();
@@ -780,23 +828,39 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     let mut sequence = 0u32;
     for (_, _, references, section) in &body_units {
         for &(id, _, custom) in references {
-            if !seen.insert(id) { continue; }
+            if !seen.insert(id) {
+                continue;
+            }
             let properties = numbering[*section];
             if previous_section != Some(*section) {
                 if previous_section.is_none() || properties.restart == FootnoteRestart::Section {
-                    if previous_section.is_some() { sequence += 1; }
+                    if previous_section.is_some() {
+                        sequence += 1;
+                    }
                     current = properties.start;
                 }
                 previous_section = Some(*section);
             }
-            let number = if custom || !properties.decimal ||
-                !matches!(properties.restart, FootnoteRestart::Continuous | FootnoteRestart::Section) {
+            let number = if custom
+                || !properties.decimal
+                || !matches!(
+                    properties.restart,
+                    FootnoteRestart::Continuous | FootnoteRestart::Section
+                ) {
                 None
-            } else { current };
+            } else {
+                current
+            };
             note_numbers.insert(id, (number, sequence));
             if !custom {
-                current = if matches!(properties.restart, FootnoteRestart::Page | FootnoteRestart::Unknown) { None }
-                    else { current.and_then(|number| number.checked_add(1)) };
+                current = if matches!(
+                    properties.restart,
+                    FootnoteRestart::Page | FootnoteRestart::Unknown
+                ) {
+                    None
+                } else {
+                    current.and_then(|number| number.checked_add(1))
+                };
             }
         }
     }
@@ -832,29 +896,33 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     }
 
     let mut units = Vec::with_capacity(body_units.len() + footnotes.len());
-    units.extend(body_units.into_iter().map(|(ordinal, text, references, _)| {
-        let references = references
+    units.extend(
+        body_units
             .into_iter()
-            .map(|(id, offset, _)| {
-                serde_json::json!([
-                    footnote_numbers
-                        .get(&id)
-                        .copied()
-                        .map_or(id, |id| id as i64),
-                    offset
-                ])
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "key": format!("body:{ordinal}"),
-            "kind": "body",
-            "ordinal": ordinal,
-            "footnote_id": serde_json::Value::Null,
-            "page_numbers": [],
-            "text": text,
-            "footnote_refs": references,
-        })
-    }));
+            .map(|(ordinal, text, references, _)| {
+                let references = references
+                    .into_iter()
+                    .map(|(id, offset, _)| {
+                        serde_json::json!([
+                            footnote_numbers
+                                .get(&id)
+                                .copied()
+                                .map_or(id, |id| id as i64),
+                            offset
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "key": format!("body:{ordinal}"),
+                    "kind": "body",
+                    "ordinal": ordinal,
+                    "footnote_id": serde_json::Value::Null,
+                    "page_numbers": [],
+                    "text": text,
+                    "footnote_refs": references,
+                })
+            }),
+    );
     units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text)| {
         let (number, sequence) = note_numbers.get(&raw_id).copied().unwrap_or((None, 0));
         serde_json::json!({
@@ -1867,7 +1935,10 @@ mod tests {
             r#"<w:styles xmlns:w="{W_NS}"><w:style w:styleId="Title"><w:name w:val="Title"/></w:style><w:style w:styleId="Subtitle"><w:name w:val="Subtitle"/></w:style></w:styles>"#
         );
         let source = write_docx_files(&[
-            ("word/document.xml".to_owned(), document.clone().into_bytes()),
+            (
+                "word/document.xml".to_owned(),
+                document.clone().into_bytes(),
+            ),
             ("word/styles.xml".to_owned(), styles.clone().into_bytes()),
         ])
         .unwrap();
@@ -1876,9 +1947,15 @@ mod tests {
         let prepared_styles = docx_part(&prepared_files, "word/styles.xml").unwrap();
         assert!(prepared_styles.contains("w:val=\"Readable Title\""));
         assert!(prepared_styles.contains("w:val=\"Readable Subtitle\""));
-        assert_eq!(docx_part(&prepared_files, "word/document.xml").unwrap(), document);
+        assert_eq!(
+            docx_part(&prepared_files, "word/document.xml").unwrap(),
+            document
+        );
         let original_files = read_docx_files(&source, None).unwrap();
-        assert_eq!(docx_part(&original_files, "word/styles.xml").unwrap(), styles);
+        assert_eq!(
+            docx_part(&original_files, "word/styles.xml").unwrap(),
+            styles
+        );
     }
 
     #[test]
@@ -1908,8 +1985,8 @@ mod tests {
             vec![
                 json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"page_numbers":[],"text":"A😀\tB","footnote_refs":[[2,3]]}),
                 json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"page_numbers":[],"text":"C","footnote_refs":[[1,1]]}),
-                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
-                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
+                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"note_number":2,"restart_sequence":0,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
+                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"note_number":1,"restart_sequence":0,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
             ]
         );
     }
