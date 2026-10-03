@@ -11,8 +11,8 @@ default-members = ["."]
 resolver = "2"
 
 [workspace.dependencies]
-legal-citations = { git = "https://github.com/eliziff/common-law-cite.git", rev = "3e970d31bfd8f2fd4fdc38874e4390a24632740c" }
-legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "47e94d7fb2d6f6b0c8dc7f42f72007d0ea10b24e" }
+legal-citations = { path = "../common-law-cite/crates/legal-citations" }
+legal-structure = { path = "../legal-structure" }
 pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", rev = "b2f3585def52d953bb41bfe19638ec35d090b0ee", default-features = false }
 
 [features]
