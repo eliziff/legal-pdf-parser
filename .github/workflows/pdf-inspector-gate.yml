@@ -3,6 +3,18 @@ name: PDF Inspector preflight
 on:
   push:
     branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "legal-pdf-*/**"
+      - "rust/src/**"
+      - "experiments/cache-contract-fidelity/**"
+      - ".github/workflows/pdf-inspector-*.yml"
+      - "AGENTS.md"
+      - "docs/pdf-inspector-agent-guide.md"
+      - "tools/*merge-pdf-inspector.sh"
+      - "tools/check-pdf-source-gold.py"
+      - "tools/pdf-inspector-regression.json"
   pull_request:
     paths:
       - "Cargo.lock"
@@ -31,6 +43,10 @@ on:
 permissions:
   actions: read
   contents: read
+
+concurrency:
+  group: pdf-inspector-preflight-${{ github.ref }}-${{ inputs.candidate-sha }}
+  cancel-in-progress: true
 
 jobs:
   source-document-preflight:
