@@ -1457,7 +1457,12 @@ fn drafting_docx_input(bytes: &[u8]) -> Result<Vec<u8>> {
     let inspected = read_docx_files(bytes, Some(&["word/document.xml", "word/styles.xml"]))?;
     let document = docx_part(&inspected, "word/document.xml")
         .ok_or_else(|| Error::Message("Drafting mode requires a valid DOCX".to_owned()))?;
-    let stripped = split_drafting_image_runs(&strip_heading_numbering(&document))?;
+    let stripped =
+        split_drafting_image_runs(&strip_heading_numbering(&document)).map_err(|error| {
+            Error::Message(format!(
+                "DOCX contains malformed XML in word/document.xml: {error}"
+            ))
+        })?;
     let mut changed = stripped != document;
     let styles = docx_part(&inspected, "word/styles.xml");
     let normalized_styles = if let Some(styles) = styles {
@@ -1923,7 +1928,12 @@ mod tests {
         );
         assert_eq!(split_drafting_image_runs(&source).unwrap(), source);
         let broken = format!(r#"<w:document xmlns:w="{W_NS}"><w:r><w:t>Text</w:t>"#);
-        assert!(split_drafting_image_runs(&broken).is_err());
+        let package =
+            write_docx_files(&[("word/document.xml".to_owned(), broken.into_bytes())]).unwrap();
+        let error = analyze_docx_drafting_bytes(&package, "example-document".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("malformed XML in word/document.xml"));
     }
 
     #[test]
