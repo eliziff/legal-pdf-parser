@@ -1576,6 +1576,15 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
         if token.value.is_some() && line.zone != Zone::Note && heading_shaped(body_stripped) {
             continue;
         }
+        // A number and its period alone on a body line ("4.") is a numbered paragraph's
+        // number, whose words the layout set beside it: never a note's label.
+        if token.value.is_some()
+            && line.zone == Zone::Body
+            && body_stripped.is_empty()
+            && token.post.trim() == "."
+        {
+            continue;
+        }
         if token.value.is_some()
             && token.post.contains(',')
             && line.zone != Zone::Note
