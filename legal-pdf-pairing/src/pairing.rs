@@ -3879,7 +3879,15 @@ fn materialize(
             .map_or(usize::MAX, |value| lines[value.label.line].idx);
         let mut body_lines: Vec<&PairLine<'_>> = lines[label_line.idx..stop.min(lines.len())]
             .iter()
-            .filter(|line| allowed_pages.contains(&line.page) && line.region_type == "footnote")
+            // The label's own line and the lines of its block are the note's, whatever region
+            // the layout called them (a note set as body text or in the footer).
+            .filter(|line| {
+                allowed_pages.contains(&line.page)
+                    && (line.region_type == "footnote"
+                        || line.idx == label_line.idx
+                        || (!label_line.region_id.is_empty()
+                            && line.region_id == label_line.region_id))
+            })
             .collect();
         if !pair.endnote && !label_line.region_id.is_empty() {
             let mut accepted = HashSet::from([label_line.region_id.as_str()]);
