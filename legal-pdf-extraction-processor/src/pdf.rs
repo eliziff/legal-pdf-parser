@@ -1362,6 +1362,7 @@ pub fn assemble_pdf(
     });
     deduplicate_painted_text(&mut items);
     assign_renderer_layout(&mut items);
+    let scanned_pages = scanned_pages(geometries, &items);
     items.retain(|item| matches!(&item.item_type, ItemType::Text));
     // Pages whose text is all an invisible layer behind a scan: the layer is that scan's earlier
     // recognition.
@@ -1455,10 +1456,44 @@ pub fn assemble_pdf(
             embedded_page_labels: Vec::new(),
             pages_needing_ocr: weak_pages.into_iter().collect(),
             ocr_routed_pages: Vec::new(),
+            scanned_pages,
         },
     };
     recognize_pdf(pdf, &mut extracted, ocr, ocr_pages)?;
     Ok(extracted)
+}
+
+/// The pages that are a picture of their text: an image covers at least half of the page and the
+/// page's visible text, laid end to end, would not fill one line across it (a filing stamp, a record
+/// page number, "Page: 17", a heading over a pasted image). A text layer behind the picture is
+/// invisible and does not count. A page of ordinary rendered text, or a tab divider's one line with
+/// no image under it, is never one.
+fn scanned_pages(geometries: &PageGeometryMap, items: &[TextItem]) -> Vec<usize> {
+    let mut covered = HashMap::<u32, f64>::new();
+    let mut written = HashMap::<u32, f64>::new();
+    for item in items {
+        match &item.item_type {
+            // Image rects are in the visible box's own frame, before any page rotation.
+            ItemType::Image => if let Some((_, geometry)) = geometries.get(&item.page) {
+                let area = geometry.raw_width * geometry.raw_height;
+                let span = |start: f32, extent: f32, limit: f64|
+                    (f64::from(start + extent).min(limit) - f64::from(start).max(0.0)).max(0.0);
+                if area > 0.0 {
+                    *covered.entry(item.page).or_default() +=
+                        span(item.x, item.width, geometry.raw_width) * span(item.y, item.height, geometry.raw_height) / area;
+                }
+            },
+            // A run's length is its longer side, whichever way it is turned (a margin stamp).
+            ItemType::Text if item.render_mode != Some(3) && !item.text.trim().is_empty() =>
+                *written.entry(item.page).or_default() += f64::from(item.width.max(item.height)),
+            _ => {}
+        }
+    }
+    geometries.iter()
+        .filter(|(number, (_, geometry))| covered.get(number).is_some_and(|share| *share >= 0.5)
+            && written.get(number).copied().unwrap_or(0.0) < geometry.width)
+        .map(|(number, _)| usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX))
+        .collect()
 }
 
 /// Apply recognition to extracted pages without loading or extracting the PDF again.
