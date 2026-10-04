@@ -14,6 +14,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const MAX_DOCX_SUPRA_BYTES: usize = 25 * 1024 * 1024;
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
 fn file_bytes<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
     files
@@ -667,12 +668,31 @@ fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     file_bytes(files, name).map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// The body's paragraphs in reading order, each with the indices of the elements that lead to it
+/// from the body: a text box's paragraphs (a cover page's) after the paragraph that holds the box,
+/// read once, as Word shows it, not again from its fallback for older readers. Citation review and
+/// the Word operations that mark it number the body's paragraphs alike by this order.
+fn body_paragraphs<'a>(element: &'a XmlElement, path: &mut Vec<usize>, output: &mut Vec<(&'a XmlElement, Vec<usize>)>) {
+    for (index, child) in element.direct_elements().enumerate() {
+        if child.is(W_NS, "del") || child.is(MC_NS, "Fallback") {
+            continue;
+        }
+        path.push(index);
+        if child.is(W_NS, "p") {
+            output.push((child, path.clone()));
+        }
+        body_paragraphs(child, path, output);
+        path.pop();
+    }
+}
+
+/// A paragraph's own text: a text box it holds is read as paragraphs of its own.
 fn authority_text(
     element: &XmlElement,
     text: &mut String,
     references: &mut Vec<(i64, usize, bool)>,
 ) -> Result<()> {
-    if element.is(W_NS, "del") {
+    if element.is(W_NS, "del") || element.is(W_NS, "txbxContent") || element.is(MC_NS, "Fallback") {
         return Ok(());
     }
     if element.is(W_NS, "t") {
@@ -769,21 +789,17 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         .direct_elements()
         .find(|element| element.is(W_NS, "body"))
         .ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
-    let mut elements = Vec::new();
-    walk_elements(body, &mut elements);
+    let mut paragraphs = Vec::new();
+    body_paragraphs(body, &mut Vec::new(), &mut paragraphs);
     let mut body_units = Vec::new();
     let mut sections = Vec::new();
     let mut section = 0;
-    for (ordinal, paragraph) in elements
-        .into_iter()
-        .filter(|element| element.is(W_NS, "p"))
-        .enumerate()
-    {
+    for (ordinal, (paragraph, path)) in paragraphs.into_iter().enumerate() {
         let mut text = String::new();
         let mut references = Vec::new();
         authority_text(paragraph, &mut text, &mut references)?;
         if !text.trim().is_empty() || !references.is_empty() {
-            body_units.push((ordinal, text, references, section));
+            body_units.push((ordinal, text, references, section, path));
         }
         if let Some(properties) = paragraph
             .direct_elements()
@@ -826,7 +842,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     let mut current = global.start;
     let mut previous_section = None;
     let mut sequence = 0u32;
-    for (_, _, references, section) in &body_units {
+    for (_, _, references, section, _) in &body_units {
         for &(id, _, custom) in references {
             if !seen.insert(id) {
                 continue;
@@ -899,7 +915,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     units.extend(
         body_units
             .into_iter()
-            .map(|(ordinal, text, references, _)| {
+            .map(|(ordinal, text, references, _, path)| {
                 let references = references
                     .into_iter()
                     .map(|(id, offset, _)| {
@@ -920,6 +936,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
                     "page_numbers": [],
                     "text": text,
                     "footnote_refs": references,
+                    "path": path,
                 })
             }),
     );
