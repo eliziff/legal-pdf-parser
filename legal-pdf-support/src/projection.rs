@@ -85,6 +85,8 @@ pub struct PdfSummary {
     pub status: String,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
+    #[serde(default)]
+    pub scanned_pages: Vec<usize>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -162,6 +164,7 @@ fn summary(
         status,
         pages_needing_ocr: pdf_metadata.pages_needing_ocr,
         ocr_routed_pages: pdf_metadata.ocr_routed_pages,
+        scanned_pages: pdf_metadata.scanned_pages,
     }
 }
 
@@ -1340,6 +1343,7 @@ mod tests {
             status: "ready".to_owned(),
             pages_needing_ocr: vec![],
             ocr_routed_pages: vec![],
+            scanned_pages: vec![],
         }
     }
 
@@ -1676,6 +1680,7 @@ mod tests {
                 embedded_page_labels: Vec::new(),
                 pages_needing_ocr: vec![],
                 ocr_routed_pages: vec![],
+                scanned_pages: vec![],
             },
             vec![],
             vec![Paragraph {

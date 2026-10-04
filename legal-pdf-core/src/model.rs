@@ -226,6 +226,12 @@ pub struct PdfExtractionMetadata {
     pub embedded_page_labels: Vec<Option<String>>,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
+    /// Pages that are a picture of their text: an image covers at least half of the page, and the
+    /// page's own visible text would not fill one line across it (a page number, a stamp, a
+    /// heading). Their text layer, if any, is invisible. A page of ordinary rendered text is never
+    /// one, however it reads.
+    #[serde(default)]
+    pub scanned_pages: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
