@@ -164,7 +164,65 @@ pub(crate) fn to_toa_text_units_from_parts(
             "footnote_refs": [],
         })
     }));
+    join_split_words(&mut units);
     Ok(units)
+}
+
+/// A word a hyphen splits where no compound is written ("Companies' Cr-editors Arrangement Act",
+/// "Cred-⏎itors") is one word when the document writes it whole elsewhere ("Creditors"): a line
+/// break's hyphen, or a recognizer's, read into the text. The hyphen goes, with a line break after
+/// it; a compound whose second part opens with a capital or a digit ("Non-Renewable", "C-36"),
+/// or that the document never writes whole, keeps it. The note markers' offsets move with the text.
+fn join_split_words(units: &mut [Value]) {
+    let texts = units.iter().filter_map(|unit| unit["text"].as_str()).collect::<Vec<_>>();
+    let mut whole = HashMap::<String, usize>::new();
+    for word in texts.iter().flat_map(|text| text.split(|character: char| !character.is_alphabetic())) {
+        if !word.is_empty() { *whole.entry(word.to_lowercase()).or_default() += 1; }
+    }
+    for unit in units.iter_mut() {
+        let Some(text) = unit["text"].as_str() else { continue };
+        let characters = text.char_indices().collect::<Vec<_>>();
+        let mut removed = Vec::<(usize, usize)>::new(); // (utf16 offset, utf16 units removed)
+        let mut output = String::with_capacity(text.len());
+        let (mut copied, mut utf16, mut at) = (0usize, 0usize, 0usize);
+        while at < characters.len() {
+            let (byte, character) = characters[at];
+            if character != '-' || at == 0 || !characters[at - 1].1.is_alphabetic() { at += 1; continue; }
+            // The word's first part runs back to its start; the second opens after the hyphen
+            // and any line break.
+            let first = characters[..at].iter().rev().take_while(|(_, c)| c.is_alphabetic()).count();
+            let mut next = at + 1;
+            while next < characters.len() && matches!(characters[next].1, ' ' | '\n' | '\r') { next += 1; }
+            let gap = &characters[at + 1..next];
+            let broken = gap.is_empty() || gap.iter().any(|(_, c)| *c == '\n');
+            let second = characters[next..].iter().take_while(|(_, c)| c.is_alphabetic()).count();
+            if !broken || second < 2 || !characters[next].1.is_lowercase()
+                || at >= first + 1 && characters[at - first - 1].1 == '-' {
+                at += 1; continue;
+            }
+            let start_byte = characters[at - first].0;
+            let end_byte = characters.get(next + second).map_or(text.len(), |(b, _)| *b);
+            let joined = text[start_byte..end_byte].chars().filter(|c| c.is_alphabetic()).collect::<String>().to_lowercase();
+            if whole.get(&joined).copied().unwrap_or(0) == 0 { at += 1; continue; }
+            let cut_end = characters[next].0;
+            output.push_str(&text[copied..byte]);
+            utf16 += text[copied..byte].encode_utf16().count();
+            let cut = text[byte..cut_end].encode_utf16().count();
+            removed.push((utf16, cut));
+            copied = cut_end;
+            at = next;
+        }
+        if removed.is_empty() { continue; }
+        output.push_str(&text[copied..]);
+        if let Some(references) = unit["footnote_refs"].as_array_mut() {
+            for reference in references.iter_mut() {
+                let Some(offset) = reference.get(1).and_then(Value::as_u64) else { continue };
+                let shift = removed.iter().filter(|(at, _)| (*at as u64) < offset).map(|(_, cut)| *cut as u64).sum::<u64>();
+                reference[1] = json!(offset - shift);
+            }
+        }
+        unit["text"] = Value::String(output);
+    }
 }
 
 #[cfg(test)]
