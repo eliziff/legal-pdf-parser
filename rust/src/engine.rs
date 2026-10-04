@@ -240,6 +240,17 @@ fn engine_identity() -> &'static Value {
     })
 }
 
+fn document_identity() -> &'static Value {
+    static IDENTITY: OnceLock<Value> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        json!({
+            "document_source_sha256": env!("LEGAL_PDF_DOCUMENT_SHA256"),
+            "extraction_source_sha256": env!("LEGAL_PDF_EXTRACTION_SHA256"),
+            "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
+        })
+    })
+}
+
 fn cache_key(
     source_hash: &str,
     identity: &Value,
@@ -254,8 +265,12 @@ fn cache_key(
         "engine_code": identity,
         "ocr_provider": ocr_provider.map(|provider| provider.0),
         "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
+        "ocr_source_sha256": ocr_provider
+            .filter(|provider| provider.0 != "supplied")
+            .map(|_| env!("LEGAL_PDF_OCR_SHA256")),
         "layout_provider": ppdoc_identity.map(|_| "ppdoc-lite"),
         "layout_provider_identity": ppdoc_identity,
+        "layout_source_sha256": ppdoc_identity.map(|_| env!("LEGAL_PDF_LAYOUT_SHA256")),
         "ocr_pages": ocr_pages,
     });
     serialization_sha256(&value)
@@ -475,7 +490,7 @@ pub(crate) fn parse_pdf(
         }
         return Ok(cached);
     }
-    let identity = engine_identity();
+    let identity = document_identity();
     #[cfg(feature = "ocr")]
     let mut ocr_prepared = profile::measure("provider_identity_ocr", || {
         options.ocr.as_ref().map(OcrProvider::prepare).transpose()
@@ -520,15 +535,14 @@ pub(crate) fn parse_pdf(
         return Ok(None);
     };
     #[cfg(feature = "ocr")]
-    let recognition_key = cache_key(
+    let recognition_key = serialization_sha256(&(
+        "legalpdf.recognition-cache.v1",
         &source_hash,
-        identity,
+        env!("LEGAL_PDF_OCR_SHA256"),
         ocr_identity
             .as_ref()
             .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-        None,
-        None,
-    )?;
+    ))?;
     #[cfg(feature = "ocr")]
     let mut ocr_provider =
         options
@@ -556,7 +570,11 @@ pub(crate) fn parse_pdf(
         Some(provider) => Some(provider as &mut dyn legal_pdf_core::PdfOcrProvider),
         None => selected_ocr,
     };
-    let extraction_key = cache_key(&source_hash, identity, None, None, None)?;
+    let extraction_key = serialization_sha256(&(
+        EXTRACTION_CACHE_SCHEMA,
+        &source_hash,
+        env!("LEGAL_PDF_EXTRACTION_SHA256"),
+    ))?;
     let extraction_path = cache_root.as_ref().map(|root| {
         parse_cache_root(root)
             .join("extractions")

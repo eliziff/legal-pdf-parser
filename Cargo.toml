@@ -7,13 +7,14 @@ description = "Fast local-first structural parsing for legal PDFs"
 
 [workspace]
 members = ["legal-pdf-*"]
+exclude = ["vendor/pdf-inspector"]
 default-members = ["."]
 resolver = "2"
 
 [workspace.dependencies]
 legal-structure = { path = "../legal-structure" }
 legal-structure-model = { path = "../legal-structure/model" }
-pdf-inspector = { git = "https://github.com/eliziff/legal-pdf-parser.git", rev = "b2f3585def52d953bb41bfe19638ec35d090b0ee", default-features = false }
+pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
 default = []

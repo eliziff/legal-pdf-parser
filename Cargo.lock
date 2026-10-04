@@ -1369,7 +1369,6 @@ dependencies = [
 [[package]]
 name = "pdf-inspector"
 version = "1.25.2"
-source = "git+https://github.com/eliziff/legal-pdf-parser.git?rev=b2f3585def52d953bb41bfe19638ec35d090b0ee#b2f3585def52d953bb41bfe19638ec35d090b0ee"
 dependencies = [
  "include_dir",
  "log",
