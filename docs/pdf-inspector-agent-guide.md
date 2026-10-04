@@ -1,5 +1,12 @@
-PDF Inspector in `eliziff/legal-pdf-parser` is validated by `.github/workflows/pdf-inspector-gate.yml` against `experiments/cache-contract-fidelity/manifest.json`, without Firecrawl's private `pdf-evals` repository.
+Firecrawl owns upstream PDF Inspector. Our modifications are maintained once in `vendor/pdf-inspector/`, ordinary files on parser main, consumed through a local Cargo path dependency. The initial source is byte-identical to our previously maintained `b2f3585def52d953bb41bfe19638ec35d090b0ee` patchset; upstream base/version are recorded in `.upstream-pdf-inspector`. Preserve source credit, MIT license and embedded CMaps.
 
-Upstream lands only as one single-parent commit per sync, made by `tools/merge-pdf-inspector.sh` on a detached Inspector checkout; `.upstream-pdf-inspector` records the upstream commit incorporated and is the next merge base. Never merge upstream history into this lineage.
+Edit the vendored source directly and commit in this repository. To incorporate an upstream update, start with a clean vendored tree and run from the parser checkout:
 
-The maintained Inspector lineage is published as immutable `pdf-inspector-<commit>` tags. The parser pins an exact `rev`; automated sync gates the combination before updating `main`, without creating branches.
+```sh
+git fetch --no-tags https://github.com/firecrawl/pdf-inspector.git main
+python tools/sync-pdf-inspector.py FETCH_HEAD
+```
+
+The command applies upstream's delta from the recorded base into our source with Git's three-way merge. Conflicts stop the update; resolve them and record the fetched commit/version in `.upstream-pdf-inspector` before committing. Guidance stays local. Upstream history is not merged into parser history.
+
+One CI gate checks real extraction products and source gold for Inspector library changes. There is no separate update workflow, automatic commit, Inspector publication, tag, bundle or dependency pin bump. A successful merge still needs behavior verification; Git cannot detect semantic incompatibility.

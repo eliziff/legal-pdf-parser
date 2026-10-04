@@ -1,0 +1,3 @@
+PDF Inspector in `eliziff/legal-pdf-parser` is validated by `.github/workflows/pdf-inspector-gate.yml` against `experiments/cache-contract-fidelity/manifest.json`, without Firecrawl's private `pdf-evals` repository.
+
+Maintain our modifications directly in this vendored source; incorporate upstream with `python tools/sync-pdf-inspector.py <fetched-revision>` from the parser checkout. `.upstream-pdf-inspector` records the incorporated upstream commit. Resolve conflicts explicitly and preserve our required behavior; never merge upstream history into parser history. No separate source repository, publication or consumer pin update is required.

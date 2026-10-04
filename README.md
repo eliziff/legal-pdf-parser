@@ -38,6 +38,15 @@ The fixed corpus and runner live in
 - Stable source hashes and pinpoint locators for applications and agent tools.
 - A compressed content-addressed cache for immediate repeat access.
 
+PDF cache identities follow each stage's inputs. Native extraction tracks the
+Inspector, extraction code and page contracts; recognized pages track OCR code,
+provider/model/settings identity, source bytes and requested page geometry.
+Final documents additionally track structure/projection code and the OCR/layout
+stages actually used. Edits to `legal-pdf-language`'s DOCX code preserve PDF cache
+entries; structure or layout edits preserve raw extraction and recognition.
+Existing entries with the old aggregate identity miss once and expire through
+normal bounded cache pruning.
+
 ## Build and use
 
 From this repository's root, with the Rust toolchain installed:
@@ -82,6 +91,13 @@ See [AGENTS.md](AGENTS.md) for build and test commands, and the
 [documentation index](docs/README.md) for benchmark runners and recorded results.
 The published performance figures describe their recorded corpus, hardware and
 revision; they are not measurements of every release.
+
+`python tools/check-cache-provenance.py <build-script-build executable>` checks
+stage invalidation against invented source-file mutations without compiling or
+running a parser. Reuse the build-script executable from the latest ordinary
+build's `target/{debug,release}/build/legal-pdf-parser-*/` directory; Beaver uses
+its canonical `native/legal-structure-node/target/`. Use the executable compiled
+from the candidate's `build.rs`; the check never starts a build itself.
 
 ## Credits and license
 
