@@ -1,3 +1,4 @@
+mod analysis;
 mod asset;
 mod error;
 pub mod model;
@@ -7,6 +8,7 @@ mod ort_backend;
 #[cfg(feature = "ort-runtime")]
 mod ort_runtime;
 mod storage;
+pub use analysis::{install_structure_analysis, structure_analysis};
 pub use asset::provider_asset_sha256;
 pub use error::{Error, Result};
 pub use model::*;

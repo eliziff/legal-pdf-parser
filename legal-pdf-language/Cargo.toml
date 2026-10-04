@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
-legal-structure = { workspace = true, features = ["structure-inference"] }
+legal-structure-model = { workspace = true }
 quick-xml = "0.41"
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
@@ -16,3 +16,7 @@ zip = { version = "=8.2.0", default-features = false, features = ["deflate-flate
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Unit tests run the structure engine, which programs supply at run time.
+[dev-dependencies]
+legal-pdf-core = { path = "../legal-pdf-core", features = ["structure-analysis"] }

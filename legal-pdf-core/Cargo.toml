@@ -9,10 +9,13 @@ default = []
 ort-runtime = ["dep:ort"]
 profiling = []
 allocation-profiling = ["profiling"]
+# Supply this checkout's structure engine by default, for tests and command-line tools.
+structure-analysis = ["dep:legal-structure"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-legal-structure = { workspace = true }
+legal-structure = { workspace = true, features = ["structure-inference"], optional = true }
+legal-structure-model = { workspace = true }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

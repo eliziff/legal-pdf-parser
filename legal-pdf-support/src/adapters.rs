@@ -1,6 +1,6 @@
 use legal_pdf_core::model::{Footnote, LegalDocument, Paragraph};
 use legal_pdf_core::{Error, Result};
-use legal_structure::ScalarText;
+use legal_structure_model::ScalarText;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -112,7 +112,7 @@ pub(crate) fn to_toa_text_units_from_parts(
             })?;
             let segment = &paragraph.text[byte_cursor..byte_start];
             rendered.push_str(segment);
-            clean_length += legal_structure::utf16_len(segment);
+            clean_length += legal_structure_model::utf16_len(segment);
             let internal = internal_by_pair.get(pair_id.as_str()).ok_or_else(|| {
                 Error::Message(format!(
                     "Unknown footnote pair {pair_id} in {}",

@@ -1,4 +1,6 @@
-pub use legal_structure::{Derivation, DocumentStructure, NodeKind, ScalarRange, StructureNode};
+pub use legal_structure_model::{
+    Derivation, DocumentStructure, NodeKind, ScalarRange, StructureNode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;

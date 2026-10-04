@@ -32,7 +32,7 @@ struct PdfInspectorDocument {
 
 #[derive(Serialize)]
 struct PdfInspectorProduct<'a> {
-    structure: &'a legal_structure::DocumentStructure,
+    structure: &'a legal_structure_model::DocumentStructure,
     pages: Vec<PdfStructureLookup>,
 }
 

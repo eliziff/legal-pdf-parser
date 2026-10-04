@@ -24,12 +24,12 @@ use legal_pdf_support::{
     styled_heading_text_plausible, EnumeratorInterpretation, HeadingAction, HeadingFamilyStats,
     HeadingLadderStatus,
 };
-use legal_structure::{
-    normalize_decimal_digit, normalize_note_symbol, resolve_structure_graph, utf16_len,
-    DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
+use legal_structure_model::{
+    normalize_decimal_digit, normalize_note_symbol, utf16_len, DocumentStructure, NodeKind,
+    ResolutionRuleV2, ScalarRange, ScalarText,
 };
 #[cfg(test)]
-use legal_structure::{CandidateGrammar, CandidateObservationV2};
+use legal_structure_model::{CandidateGrammar, CandidateObservationV2};
 use regex::Regex;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -3545,7 +3545,7 @@ fn derive_prepared(
     });
     let nodes = native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
     let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
-        resolve_structure_graph(
+        legal_pdf_core::structure_analysis().resolve_structure_graph(
             identity.document_id,
             "local-pdf".to_owned(),
             resolution.index.text(),

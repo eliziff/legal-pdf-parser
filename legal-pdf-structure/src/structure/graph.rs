@@ -1,11 +1,12 @@
 use super::{arabic_page_number, body_flow_edge, scalar_suffix, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
+use legal_pdf_core::structure_analysis;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_support::protected_citation_spans;
-use legal_structure::{
-    detect_structure_candidate_runs, CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2,
-    Derivation, DiagnosticSeverity, NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange,
-    ScalarText, StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
+use legal_structure_model::{
+    CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity,
+    NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange, ScalarText,
+    StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
 };
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -306,7 +307,7 @@ pub(super) fn index_pages(pages: &[Page]) -> HashSet<usize> {
 impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
-        let mut runs = detect_structure_candidate_runs(index.text());
+        let mut runs = structure_analysis().detect_structure_candidate_runs(index.text());
         let heading_starts = pages
             .iter()
             .flat_map(|page| &page.lines)
