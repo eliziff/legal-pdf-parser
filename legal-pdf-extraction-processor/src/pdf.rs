@@ -1245,6 +1245,21 @@ fn recognition_noise(lines: &[Line]) -> (f64, bool) {
     (if words == 0 { 1.0 } else { noise as f64 / words as f64 }, rejected)
 }
 
+/// How poorly a page reads, for choosing between its text layer and its recognition: the share
+/// of its words that are recognition noise (a reject mark weighing five such words), and the share
+/// of its words of four letters or more that the other reading of the document never writes.
+fn reading_score(lines: &[Line], other: &HashSet<String>) -> f64 {
+    let words = lines.iter().flat_map(|line| line.text.split(|c: char| !c.is_alphabetic()))
+        .filter(|word| word.chars().count() >= 4).collect::<Vec<_>>();
+    let foreign = words.iter().filter(|word| !other.contains(&word.to_lowercase())).count();
+    // A recognizer's reject mark ("2014 ~NSC 4326") is a word it knows it misread.
+    let rejected = lines.iter().flat_map(|line| line.text.split_whitespace())
+        .filter(|word| word.contains('~') && word.chars().any(char::is_alphanumeric)).count();
+    let total = lines.iter().map(|line| line.text.split_whitespace().count()).sum::<usize>().max(1);
+    recognition_noise(lines).0 + 4.0 * rejected as f64 / total as f64
+        + if words.is_empty() { 0.0 } else { foreign as f64 / words.len() as f64 }
+}
+
 /// Whether a page's text reads as recognized prose: no reject mark, and at most one word in ten
 /// is noise.
 fn layer_reads_well(lines: &[Line]) -> bool {
@@ -1481,8 +1496,10 @@ pub fn recognize_pdf(
         let results = legal_pdf_core::profile::measure("extract.ocr", || {
             provider.extract_pages(pdf, &requests)
         })?;
+        // Each page's recognition, read as lines.
+        let mut recognized = Vec::new();
         for result in results {
-            let Some(page) = pages.get_mut(result.page_index) else {
+            let Some(page) = pages.get(result.page_index) else {
                 return Err(Error::Message(format!(
                     "OCR returned an unknown page index: {}",
                     result.page_index
@@ -1494,15 +1511,40 @@ pub fn recognize_pdf(
                 .enumerate()
                 .filter_map(|(index, line)| make_ocr_line(line, page, index + 1))
                 .collect();
-            if !lines.is_empty() {
-                reindex = true;
-                page.lines = lines;
-                page.source = "ocr".to_owned();
-                page.text_quality = 0.5;
-                weak_pages.remove(&result.page_index);
-                if let Some(separator) = result.separator_y {
-                    separators[result.page_index] = Some(separator);
-                }
+            recognized.push((result.page_index, lines, result.separator_y));
+        }
+        // A page that has a text layer of its own keeps it unless its recognition reads measurably
+        // better by the same measure: noise words, and words the other reading never writes
+        // anywhere in the document ("Arangement" where the layer writes "Arrangement" throughout;
+        // "IPJTRODUCTION" where the recognition writes "INTRODUCTION").
+        let vocabulary = |lines: &mut dyn Iterator<Item = &Line>| lines
+            .flat_map(|line| line.text.split(|c: char| !c.is_alphabetic()).filter(|word| !word.is_empty())
+                .map(str::to_lowercase).collect::<Vec<_>>())
+            .collect::<HashSet<_>>();
+        let layer_words = vocabulary(&mut pages.iter().filter(|page| page.source == "native").flat_map(|page| page.lines.iter()));
+        let recognized_words = vocabulary(&mut recognized.iter().flat_map(|(_, lines, _)| lines.iter()));
+        for (page_index, lines, separator_y) in recognized {
+            let page = &mut pages[page_index];
+            if lines.is_empty() {
+                continue;
+            }
+            let layered = page.source == "native" && !page.lines.is_empty();
+            // A reading that holds fewer of the page's words than the other misses the rest of it.
+            let count = |lines: &[Line]| lines.iter().map(|line| line.text.split_whitespace().count()).sum::<usize>() as f64;
+            let (layer_count, recognized_count) = (count(&page.lines), count(&lines));
+            let missing = |own: f64, other: f64| if other > 0.0 { (1.0 - own / other).max(0.0) } else { 0.0 };
+            if layered && reading_score(&page.lines, &recognized_words) + missing(layer_count, recognized_count)
+                <= reading_score(&lines, &layer_words) + missing(recognized_count, layer_count) {
+                weak_pages.remove(&page_index);
+                continue;
+            }
+            reindex = true;
+            page.lines = lines;
+            page.source = "ocr".to_owned();
+            page.text_quality = 0.5;
+            weak_pages.remove(&page_index);
+            if let Some(separator) = separator_y {
+                separators[page_index] = Some(separator);
             }
         }
     }
