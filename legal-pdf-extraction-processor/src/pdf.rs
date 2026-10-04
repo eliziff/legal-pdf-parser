@@ -7,7 +7,7 @@ use pdf_inspector::PdfTypeResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 fn prune_extraction_object(object: &mut Object) {
@@ -1207,6 +1207,51 @@ fn reindex_source_lines(pages: &mut [Page]) {
     }
 }
 
+/// The share of a page's words that are recognition noise, and whether any word carries a
+/// recognizer's reject mark ("~NSC", "~A~K~ROUP~~"). A word is noise when it holds a symbol no
+/// prose writes inside a word, letters between digits or a number running into letters outside an
+/// ordinal ("2Q02", "41ho"; "C-36", "T2P", "2nd" and "1601-06131" are words), three of one letter
+/// in a row, no vowel in three letters or more, or a capital inside lower case.
+fn recognition_noise(lines: &[Line]) -> (f64, bool) {
+    let mut words = 0usize;
+    let mut noise = 0usize;
+    let mut rejected = false;
+    for word in lines.iter().flat_map(|line| line.text.split_whitespace()) {
+        let word = word.trim_matches(|character: char| !character.is_alphanumeric() && character != '~');
+        if word.is_empty() {
+            continue;
+        }
+        words += 1;
+        let characters: Vec<char> = word.chars().collect();
+        let reject = word.contains('~') && characters.iter().any(|character| character.is_alphanumeric());
+        rejected |= reject;
+        let symbol = reject || characters.iter().any(|character| "{}|^`<>\\".contains(*character));
+        let letters = characters.iter().filter(|character| character.is_alphabetic()).count();
+        let digits = characters.iter().filter(|character| character.is_ascii_digit()).count();
+        let mixed = letters > 0 && digits > 0 && (characters.windows(3).any(|three|
+            three[0].is_ascii_digit() && three[1].is_alphabetic() && three[2].is_ascii_digit())
+            || characters.first().is_some_and(char::is_ascii_digit)
+                && characters.last().is_some_and(|last| last.is_alphabetic())
+                && !matches!(word.trim_start_matches(|character: char| character.is_ascii_digit()).to_lowercase().as_str(),
+                    "st" | "nd" | "rd" | "th" | "d" | "e" | "er" | "re" | "s" | "a" | "b" | "c"));
+        let alphabetic = letters == characters.len();
+        let tripled = characters.windows(3).any(|three| three[0] == three[1] && three[1] == three[2] && three[0].is_alphabetic());
+        let voiceless = alphabetic && letters >= 3
+            && !characters.iter().any(|character| "aeiouyAEIOUYéèàÉ".contains(*character));
+        let inner_capital = alphabetic && letters >= 3 && characters.windows(2).enumerate().any(|(at, two)|
+            two[0].is_lowercase() && two[1].is_uppercase() && !(at == 1 && matches!(characters[0], 'M' | 'D' | 'O')));
+        noise += usize::from(symbol || mixed || tripled || voiceless || inner_capital);
+    }
+    (if words == 0 { 1.0 } else { noise as f64 / words as f64 }, rejected)
+}
+
+/// Whether a page's text reads as recognized prose: no reject mark, and at most one word in ten
+/// is noise.
+fn layer_reads_well(lines: &[Line]) -> bool {
+    let (share, rejected) = recognition_noise(lines);
+    !rejected && share <= 0.1
+}
+
 fn text_quality(lines: &[Line]) -> f64 {
     // Python's str.isprintable accepts Unicode L/M/N/P/S plus ASCII space,
     // and rejects every other separator/control/format/private/unassigned
@@ -1303,6 +1348,14 @@ pub fn assemble_pdf(
     deduplicate_painted_text(&mut items);
     assign_renderer_layout(&mut items);
     items.retain(|item| matches!(&item.item_type, ItemType::Text));
+    // Pages whose text is all an invisible layer behind a scan: the layer is that scan's earlier
+    // recognition.
+    let mut shown_pages = HashSet::new();
+    let mut layer_pages = HashSet::new();
+    for item in items.iter().filter(|item| !item.text.trim().is_empty()) {
+        if item.render_mode == Some(3) { layer_pages.insert(item.page); } else { shown_pages.insert(item.page); }
+    }
+    layer_pages.retain(|page| !shown_pages.contains(page));
     for line in group_source_order_lines(items) {
         by_page.entry(line.page).or_default().push(line);
     }
@@ -1327,7 +1380,8 @@ pub fn assemble_pdf(
             }
         }
         let quality = text_quality(&lines);
-        if lines.is_empty() || quality < 0.15 {
+        // A scan's invisible text layer that reads poorly is recognized again.
+        if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) && !layer_reads_well(&lines) {
             weak_pages.insert(page_index);
         }
         source_offset += lines.len();
@@ -1366,6 +1420,14 @@ pub fn assemble_pdf(
 
     for page in &detection.pages_needing_ocr {
         if let Ok(index) = usize::try_from(page.saturating_sub(1)) {
+            // A scan whose invisible text layer was read as its text needs no recognition when
+            // that text reads well: the layer is the scan already recognized. One that reads
+            // poorly, or a page needing recognition for any other reason, is recognized again.
+            let layer_only = layer_pages.contains(page) && detection.ocr_reasons_by_page.get(page).is_some_and(|reasons|
+                reasons.iter().all(|reason| reason == pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER));
+            if layer_only && pages.get(index).is_some_and(|page| !page.lines.is_empty() && layer_reads_well(&page.lines)) {
+                continue;
+            }
             weak_pages.insert(index);
         }
     }
