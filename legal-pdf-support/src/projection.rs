@@ -2,7 +2,7 @@ use legal_pdf_core::model::{
     Derivation, DocumentStructure, Footnote, Line, NodeKind, Page, Paragraph,
     PdfExtractionMetadata, ScalarRange, StructureNode, PARSER_VERSION,
 };
-use legal_structure::{
+use legal_structure_model::{
     document_fingerprint, normalize_compact_numbered_section_locator, utf16_len,
     DocumentFingerprint, ScalarText,
 };
@@ -37,7 +37,7 @@ const LOCATOR_KINDS: [&str; 11] = [
 
 #[derive(Deserialize, Serialize)]
 pub struct PdfDocument {
-    structure: legal_structure::DocumentStructure,
+    structure: legal_structure_model::DocumentStructure,
     pages: Vec<ProjectionPage>,
     footnotes: Vec<ProjectionFootnote>,
     authority_text_units: Vec<Value>,
@@ -368,11 +368,11 @@ impl PdfDocument {
         self.recognized_pages.as_deref().unwrap_or(&[])
     }
 
-    pub fn structure(&self) -> &legal_structure::DocumentStructure {
+    pub fn structure(&self) -> &legal_structure_model::DocumentStructure {
         &self.structure
     }
 
-    pub fn structure_mut(&mut self) -> &mut legal_structure::DocumentStructure {
+    pub fn structure_mut(&mut self) -> &mut legal_structure_model::DocumentStructure {
         &mut self.structure
     }
 

@@ -166,7 +166,7 @@ jobs:
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $gateManifest
           $env:CARGO_TARGET_DIR = $target
 
-          cargo build --manifest-path $headManifest --locked --no-default-features --features pdf --bin legalpdf
+          cargo build --manifest-path $headManifest --locked --no-default-features --features cli --bin legalpdf
           if ($LASTEXITCODE -ne 0) { throw "Candidate legalpdf build failed" }
           & (Join-Path $target debug/legalpdf.exe) _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $headSnapshot
           if ($LASTEXITCODE -ne 0) { throw "Candidate PDF Inspector product gate failed" }

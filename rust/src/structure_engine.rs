@@ -9,7 +9,7 @@ use legal_pdf_structure::{replay, status, validate_document, StructureIdentity, 
 use serde_json::Map;
 
 #[cfg(feature = "pdf")]
-use legal_structure::{DocumentStructure, EngineError};
+use legal_structure_model::{DocumentStructure, EngineError};
 
 #[cfg(feature = "pdf")]
 #[derive(Debug)]

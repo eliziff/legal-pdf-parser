@@ -13,7 +13,7 @@ use legal_pdf_structure::{
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
-use legal_structure::{ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
+use legal_structure_model::{ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -235,7 +235,7 @@ fn engine_identity() -> &'static Value {
             "native_extractor": "pdf-inspector",
             "ocr_renderer": if cfg!(feature = "ocr") { "hayro 0.7.1" } else { "disabled" },
             "engine_source_sha256": env!("LEGAL_PDF_ENGINE_SHA256"),
-            "structure_source_sha256": legal_structure::ENGINE_SOURCE_SHA256,
+            "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
         })
     })
 }
@@ -779,12 +779,12 @@ fn structure_examples(document: &LegalDocument) -> Value {
     let text = ScalarText::new(&document.structure_graph.text);
     let mut examples = BTreeMap::<String, Vec<Value>>::new();
     for kind in [
-        legal_structure::NodeKind::Heading,
-        legal_structure::NodeKind::Section,
-        legal_structure::NodeKind::Paragraph,
-        legal_structure::NodeKind::ListItem,
-        legal_structure::NodeKind::Footnote,
-        legal_structure::NodeKind::Endnote,
+        legal_structure_model::NodeKind::Heading,
+        legal_structure_model::NodeKind::Section,
+        legal_structure_model::NodeKind::Paragraph,
+        legal_structure_model::NodeKind::ListItem,
+        legal_structure_model::NodeKind::Footnote,
+        legal_structure_model::NodeKind::Endnote,
     ] {
         let nodes = document
             .structure_graph
@@ -869,7 +869,7 @@ pub fn corpus_check_cached_extraction(
             .unwrap_or("unknown")
             .to_owned();
         *by_kind.entry(kind).or_default() += 1;
-        if node.kind == legal_structure::NodeKind::Section {
+        if node.kind == legal_structure_model::NodeKind::Section {
             *sections_by_locator_kind
                 .entry(
                     node.locator_kind
@@ -910,7 +910,7 @@ pub fn corpus_check_cached_extraction(
         .nodes
         .iter()
         .filter(|node| {
-            node.kind == legal_structure::NodeKind::Section
+            node.kind == legal_structure_model::NodeKind::Section
                 && node.grammar.as_deref() == Some("accepted_heading")
         })
         .count();

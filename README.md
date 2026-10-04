@@ -43,7 +43,7 @@ The fixed corpus and runner live in
 From this repository's root, with the Rust toolchain installed:
 
 ```sh
-cargo build --release --locked --package legal-pdf-parser --no-default-features --features pdf --bin legalpdf
+cargo build --release --locked --package legal-pdf-parser --no-default-features --features cli --bin legalpdf
 ./target/release/legalpdf --version
 ```
 

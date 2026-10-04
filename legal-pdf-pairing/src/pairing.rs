@@ -6,7 +6,7 @@ use legal_pdf_core::{
 };
 use legal_pdf_support::pairing_support;
 use legal_pdf_support::pairing_support::is_counter_noun as counter_noun;
-use legal_structure::{
+use legal_structure_model::{
     normalize_decimal_digit, normalize_note_symbol, select_numeric_sequence,
     NumericSequenceCandidate, NumericSequencePolicy, ScalarText,
 };

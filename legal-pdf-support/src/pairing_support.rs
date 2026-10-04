@@ -6,15 +6,36 @@ const MAX_COUNTER_VALUE: u32 = 200;
 const MAX_OUTLINE_DEPTH: usize = 4;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
 
-use legal_citations::cues::layout_heading_text_plausible;
-pub use legal_citations::cues::{
-    crossref_short_form, is_citation_shaped_tail, is_counter_noun, reporter_abbreviation_regex,
-};
-pub use legal_citations::cues::{
-    layout_has_citation_cue as has_legal_citation_cue,
-    layout_has_citation_signal as has_citation_signal,
-    layout_is_citation_continuation as is_legal_citation_continuation,
-};
+use legal_pdf_core::structure_analysis;
+
+// The citation grammar's layout cues, as the structure engine supplies them.
+pub fn crossref_short_form(text: &str, byte_start: usize) -> String {
+    structure_analysis().crossref_short_form(text, byte_start)
+}
+
+pub fn is_citation_shaped_tail(text: &str) -> bool {
+    structure_analysis().is_citation_shaped_tail(text)
+}
+
+pub fn is_counter_noun(word: &str) -> bool {
+    structure_analysis().is_counter_noun(word)
+}
+
+pub fn reporter_abbreviation_regex(abbreviation: &str) -> String {
+    structure_analysis().reporter_abbreviation_regex(abbreviation)
+}
+
+pub fn has_legal_citation_cue(text: &str) -> bool {
+    structure_analysis().has_citation_cue(text)
+}
+
+pub fn has_citation_signal(text: &str) -> bool {
+    structure_analysis().has_citation_signal(text)
+}
+
+pub fn is_legal_citation_continuation(text: &str) -> bool {
+    structure_analysis().is_citation_continuation(text)
+}
 
 const TITLECASE_MIN_RATIO: f64 = 0.6;
 
@@ -26,7 +47,8 @@ const TITLECASE_MIN_RATIO: f64 = 0.6;
 pub fn heading_text_plausible(value: &str) -> bool {
     // A title ending in a comma is a sentence's opening ("In these Regulations,").
     !value.trim_end().ends_with(',')
-        && (layout_heading_text_plausible(value) || titled_around_references(value.trim()))
+        && (structure_analysis().heading_text_plausible(value)
+            || titled_around_references(value.trim()))
 }
 
 /// A title set apart in bold can also name a case by its parties ("R. v. Stone and
@@ -42,7 +64,7 @@ pub fn styled_heading_text_plausible(value: &str) -> bool {
                 .rsplit(char::is_whitespace)
                 .next()
                 .is_some_and(|word| word.chars().all(|character| character.is_ascii_digit()))
-            && legal_citations::extract(text, &legal_citations::Options::default()).is_empty()
+            && structure_analysis().citations(text).is_empty()
             && title_cased(text.split_whitespace()))
 }
 
@@ -78,18 +100,18 @@ fn titled_around_references(text: &str) -> bool {
     let mut uncited = String::new();
     let mut from = 0;
     let mut dated_citation = false;
-    for citation in legal_citations::extract(text, &legal_citations::Options::default()) {
-        let span = &citation.full_span;
-        if span.start < from || text.get(span.start..span.end) != Some(span.text.as_str()) {
+    for span in structure_analysis().citations(text) {
+        let (start, end) = (span.range.start, span.range.end);
+        if start < from || text.get(start..end) != Some(span.text.as_str()) {
             continue;
         }
-        if text[..span.start].trim().is_empty() {
+        if text[..start].trim().is_empty() {
             return false;
         }
         dated_citation |= dated(&span.text);
-        uncited.push_str(&text[from..span.start]);
+        uncited.push_str(&text[from..start]);
         uncited.push(' ');
-        from = span.end;
+        from = end;
     }
     uncited.push_str(&text[from..]);
     // A counted provision ("Section 33.1", "Sections 7 and 11(d)") keeps its noun as a
@@ -123,16 +145,7 @@ fn titled_around_references(text: &str) -> bool {
 }
 
 pub fn protected_citation_spans(text: &str) -> Vec<(usize, usize)> {
-    let document = legal_citations::text::ScalarText::new(text);
-    legal_citations::cues::layout_protected_spans(text)
-        .into_iter()
-        .map(|span| {
-            (
-                document.scalar_at_byte(span.start).expect("citation start"),
-                document.scalar_at_byte(span.end).expect("citation end"),
-            )
-        })
-        .collect()
+    structure_analysis().protected_citation_spans(text)
 }
 
 fn roman_to_int(value: &str) -> Option<u32> {

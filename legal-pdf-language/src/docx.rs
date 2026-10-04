@@ -275,7 +275,7 @@ fn normalize_docx_text(text: &str) -> String {
         .replace(['\u{201c}', '\u{201d}'], "\"")
         .replace(['\u{2018}', '\u{2019}'], "'")
         .replace(['\u{00a0}', '\u{2007}', '\u{202f}'], " ");
-    legal_structure::normalize_javascript_whitespace(&text)
+    legal_structure_model::normalize_javascript_whitespace(&text)
 }
 
 fn normalized_docx_paragraph(paragraph: &XmlElement) -> Result<String> {
@@ -311,9 +311,9 @@ static SUPRA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         &[
             r"(?i)supra,?",
-            legal_structure::JS_WHITESPACE_CLASS,
+            legal_structure_model::JS_WHITESPACE_CLASS,
             r"{1,4}(?:note|nn?\.?)",
-            legal_structure::JS_WHITESPACE_CLASS,
+            legal_structure_model::JS_WHITESPACE_CLASS,
             r"{1,4}([0-9]+)",
         ]
         .concat(),
@@ -462,7 +462,7 @@ fn paragraph_text_nodes(
             .find(body.as_str())
             .map_or("", |value| value.as_str());
         let only_text = texts.len() == 1
-            && legal_structure::normalize_javascript_whitespace(
+            && legal_structure_model::normalize_javascript_whitespace(
                 &body.as_str().replacen(properties, "", 1).replacen(
                     texts[0].get(0).unwrap().as_str(),
                     "",
@@ -692,7 +692,7 @@ fn authority_text(
             references.push((
                 id.parse()
                     .map_err(|_| Error::Message(format!("Invalid DOCX footnote id {id}")))?,
-                legal_structure::utf16_len(text),
+                legal_structure_model::utf16_len(text),
                 matches!(
                     element.attribute(None, "customMarkFollows"),
                     Some("1" | "true" | "on")
@@ -1493,7 +1493,7 @@ fn drafting_docx_input(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn clean_process_error(bytes: &[u8]) -> String {
-    legal_structure::normalize_javascript_whitespace(&String::from_utf8_lossy(bytes))
+    legal_structure_model::normalize_javascript_whitespace(&String::from_utf8_lossy(bytes))
         .chars()
         .take(500)
         .collect()
@@ -1594,7 +1594,7 @@ fn clean_drafting_markdown(markdown: String) -> String {
     static EMPTY_LINK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(&format!(
             r"(?m)^\[\]\([^)]*\){}*$",
-            legal_structure::JS_WHITESPACE_CLASS
+            legal_structure_model::JS_WHITESPACE_CLASS
         ))
         .expect("literal empty link regex")
     });
@@ -1610,7 +1610,7 @@ fn clean_drafting_markdown(markdown: String) -> String {
     let markdown = EMPTY_LINK.replace_all(&markdown, "");
     let markdown = UNSAFE_LINK.replace_all(&markdown, "");
     let markdown = ESCAPED_BRACKET.replace_all(&markdown, "$1");
-    legal_structure::trim_javascript_whitespace(&markdown).to_owned()
+    legal_structure_model::trim_javascript_whitespace(&markdown).to_owned()
 }
 
 fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -1645,7 +1645,10 @@ fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
 fn docx_structure_input(
     bytes: &[u8],
     include_tables: bool,
-) -> Result<(Vec<String>, Vec<legal_structure::AuthoritativeTableCell>)> {
+) -> Result<(
+    Vec<String>,
+    Vec<legal_structure_model::AuthoritativeTableCell>,
+)> {
     let xml = docx_document_xml(bytes)?;
     let document = match parse_xml(&xml) {
         Ok(document) => document,
@@ -1681,7 +1684,7 @@ fn docx_structure_input(
     for (index, paragraph) in paragraphs.iter().enumerate() {
         text_length += usize::from(index > 0);
         starts.push(text_length);
-        text_length += legal_structure::utf16_len(paragraph);
+        text_length += legal_structure_model::utf16_len(paragraph);
     }
 
     let mut by_element = canonical_elements
@@ -1693,7 +1696,7 @@ fn docx_structure_input(
                 *paragraph as *const XmlElement,
                 (
                     start,
-                    start + legal_structure::utf16_len(&paragraphs[index]),
+                    start + legal_structure_model::utf16_len(&paragraphs[index]),
                 ),
             )
         })
@@ -1781,12 +1784,12 @@ fn docx_structure_input(
                             .copied()
                             .unwrap_or(paragraphs.len());
                         preceding.checked_sub(1).map_or(0, |index| {
-                            starts[index] + legal_structure::utf16_len(&paragraphs[index])
+                            starts[index] + legal_structure_model::utf16_len(&paragraphs[index])
                         })
                     };
                     let start = contents.first().map_or_else(empty_at, |(start, _)| *start);
                     let end = contents.last().map_or_else(empty_at, |(_, end)| *end);
-                    table_cells.push(legal_structure::AuthoritativeTableCell {
+                    table_cells.push(legal_structure_model::AuthoritativeTableCell {
                         table: table_index + 1,
                         table_name: None,
                         row: row_index + 1,
@@ -1844,9 +1847,10 @@ pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
 pub fn analyze_docx_bytes(
     bytes: &[u8],
     document_id: String,
-) -> Result<legal_structure::DocumentStructure> {
+) -> Result<legal_structure_model::DocumentStructure> {
     let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
-    legal_structure::analyze_docx(document_id, paragraphs, &table_cells)
+    legal_pdf_core::structure_analysis()
+        .analyze_docx(document_id, paragraphs, &table_cells)
         .map_err(|error| Error::Message(error.to_string()))
 }
 
@@ -1896,9 +1900,10 @@ fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
 pub fn analyze_docx_drafting_bytes(
     bytes: &[u8],
     document_id: String,
-) -> Result<legal_structure::DocumentStructure> {
+) -> Result<legal_structure_model::DocumentStructure> {
     let markdown = drafting_docx_text(bytes)?;
-    legal_structure::analyze_instrument(markdown, document_id, &[], true)
+    legal_pdf_core::structure_analysis()
+        .analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
 }
 
