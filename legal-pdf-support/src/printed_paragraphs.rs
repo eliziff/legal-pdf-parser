@@ -121,6 +121,10 @@ pub fn marginal_paragraph_plan<'a>(
     for (page_index, page) in pages.iter().enumerate() {
         let Some(bounds) = body_bounds[page_index] else { continue };
         for line in &page.lines {
+            if let Some(number) = set_apart_number(page, line) {
+                labels.push((number, page_index, line.rect[1]));
+                continue;
+            }
             let text = line.text.trim();
             let text = text.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(text);
             if text.is_empty() || text.len() > 5 || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -157,8 +161,13 @@ pub fn marginal_paragraph_plan<'a>(
             return Some((if hits.is_empty() { Status::NotFound } else { Status::Ambiguous }, HashSet::new()));
         }
         let (_, start_page, start_y) = labels[hits[0]];
-        let Some(&(_, end_page, end_y)) = labels.get(hits[0] + 1).filter(|next| next.0 == number + 1) else {
-            // No witnessed end: do not sweep in end matter or a numbering restart.
+        // The last paragraph ends with its page's body; its end is otherwise unwitnessed, and no end
+        // matter or numbering restart is swept in.
+        let last = hits[0] + 1 == labels.len();
+        let Some((end_page, end_y)) = labels.get(hits[0] + 1).filter(|next| next.0 == number + 1)
+            .map(|next| (next.1, next.2))
+            .or_else(|| last.then(|| body_bounds[start_page].map(|bounds|
+                (start_page, (bounds[3] + 1.0).min(pages[start_page].height * 0.95)))).flatten()) else {
             return Some((Status::Unavailable, HashSet::new()));
         };
         // The first heading below the paragraph's first line, before the next paragraph.
@@ -200,6 +209,19 @@ pub fn marginal_paragraph_plan<'a>(
     Some((Status::Found, selected))
 }
 
+/// A number that opens a line of the body set apart from the text after it by more than a space
+/// ("1      At the conclusion of the hearing", as Westlaw prints a judgment's paragraphs): the
+/// paragraph's printed number, standing bare. A number in running text ("11 of the Act") is
+/// followed by an ordinary space; a page's running head and foot are no body.
+fn set_apart_number(page: &crate::PdfTextPage, line: &crate::PdfTextLine) -> Option<usize> {
+    let [number, next, ..] = line.words.as_slice() else { return None };
+    let height = number.rect[3] - number.rect[1];
+    (number.text.len() <= 4 && number.text.bytes().all(|byte| byte.is_ascii_digit()) && height > 0.0
+        && next.rect[0] - number.rect[2] >= 0.75 * height
+        && line.rect[1] > page.height * 0.05 && line.rect[3] < page.height * 0.95)
+        .then(|| number.text.parse().ok()).flatten()
+}
+
 /// "[12]", "(12)", "12." or "12)": a printed paragraph number; a margin
 /// number may also stand bare.
 fn printed_label_number(text: &str, bare: bool) -> Option<usize> {
@@ -232,7 +254,9 @@ pub fn printed_paragraph_witnessed<'a>(
             let opening = if opening == "[" || opening == "(" {
                 line.words.iter().take(3).map(|word| word.text.as_str()).collect::<String>()
             } else { opening.to_owned() };
-            if let Some(number) = printed_label_number(&opening, false) { missing.remove(&number); }
+            if let Some(number) = printed_label_number(&opening, false).or_else(|| set_apart_number(page, line)) {
+                missing.remove(&number);
+            }
         }
         for word in page.lines.iter().flat_map(|line| &line.words) {
             let Some(number) = printed_label_number(&word.text, true).filter(|n| missing.contains(n)) else { continue };
