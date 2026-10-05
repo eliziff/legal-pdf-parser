@@ -629,12 +629,15 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     .collect(),
             );
             let body_size = if body_size > 0.0 { body_size } else { 10.0 };
+            // A number set in the running head at the same place page after page is a folio, though
+            // the head's title shares its row ("584  r. v. mabior  [2012] 2 S.C.R.").
             let attached_labels: HashSet<usize> = page
                 .lines
                 .iter()
                 .enumerate()
-                .filter(|(_, label)| {
-                    standalone_note_label(label)
+                .filter(|(label_index, label)| {
+                    !(repeated.contains(&(page_slot, *label_index)) && label.bbox[3] < page.height * 0.12)
+                        && standalone_note_label(label)
                         && page.lines.iter().enumerate().any(|(body_index, body)| {
                             !repeated.contains(&(page_slot, body_index))
                                 && aligned_note_body(label, body)
