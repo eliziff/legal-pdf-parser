@@ -117,11 +117,12 @@ pub fn marginal_paragraph_plan<'a>(
             .map(|line| line.rect).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]),
                 a[2].max(b[2]), a[3].max(b[3])])
     }).collect::<Vec<_>>();
+    let fixed = fixed_number_gaps(pages);
     let mut labels = Vec::new();
     for (page_index, page) in pages.iter().enumerate() {
         let Some(bounds) = body_bounds[page_index] else { continue };
         for line in &page.lines {
-            if let Some(number) = set_apart_number(page, line) {
+            if let Some(number) = set_apart_number(page, line, &fixed) {
                 labels.push((number, page_index, line.rect[1]));
                 continue;
             }
@@ -210,16 +211,58 @@ pub fn marginal_paragraph_plan<'a>(
 }
 
 /// A number that opens a line of the body set apart from the text after it by more than a space
-/// ("1      At the conclusion of the hearing", as Westlaw prints a judgment's paragraphs): the
-/// paragraph's printed number, standing bare. A number in running text ("11 of the Act") is
-/// followed by an ordinary space; a page's running head and foot are no body.
-fn set_apart_number(page: &crate::PdfTextPage, line: &crate::PdfTextLine) -> Option<usize> {
+/// ("1      At the conclusion of the hearing", as Westlaw prints a judgment's paragraphs), by the
+/// fixed separation a numbering run keeps (`fixed`), or by more than that and more than the line's
+/// own spaces (Lexis's first paragraph, "1   When Robert King"): the paragraph's printed number,
+/// standing bare. A number in running text ("11 of the Act") is followed by the line's ordinary
+/// space; a page's running head and foot are no body.
+fn set_apart_number(page: &crate::PdfTextPage, line: &crate::PdfTextLine, fixed: &[f64]) -> Option<usize> {
+    let (number, gap) = opening_number(page, line)?;
+    let height = line.words[0].rect[3] - line.words[0].rect[1];
+    let mut spaces = line.words[1..].windows(2).map(|pair| pair[1].rect[0] - pair[0].rect[2])
+        .filter(|space| *space > 0.0).collect::<Vec<_>>();
+    spaces.sort_by(f64::total_cmp);
+    let wider = spaces.len() >= 3 && gap > 1.2 * spaces[spaces.len() * 3 / 4];
+    (gap >= 0.75 * height || fixed.iter().any(|width| (gap - width).abs() <= 0.05 || wider && gap > *width))
+        .then_some(number)
+}
+
+/// A number of up to four digits that opens a body line, and the space after it. A note's number
+/// ("6 Some words that", set smaller than the body) opens no paragraph.
+fn opening_number(page: &crate::PdfTextPage, line: &crate::PdfTextLine) -> Option<(usize, f64)> {
     let [number, next, ..] = line.words.as_slice() else { return None };
     let height = number.rect[3] - number.rect[1];
+    let gap = next.rect[0] - number.rect[2];
     (number.text.len() <= 4 && number.text.bytes().all(|byte| byte.is_ascii_digit()) && height > 0.0
-        && next.rect[0] - number.rect[2] >= 0.75 * height
-        && line.rect[1] > page.height * 0.05 && line.rect[3] < page.height * 0.95)
-        .then(|| number.text.parse().ok()).flatten()
+        && height >= 0.9 * body_height(page)
+        && gap >= 0.3 * height && line.rect[1] > page.height * 0.05 && line.rect[3] < page.height * 0.95)
+        .then(|| number.text.parse().ok().map(|value| (value, gap))).flatten()
+}
+
+/// The height most of a page's lines are set at: its body text's.
+fn body_height(page: &crate::PdfTextPage) -> f64 {
+    let mut heights = page.lines.iter().map(|line| line.rect[3] - line.rect[1])
+        .filter(|height| *height > 0.0).collect::<Vec<_>>();
+    heights.sort_by(f64::total_cmp);
+    heights.get(heights.len() / 2).copied().unwrap_or_default()
+}
+
+/// The separations after a paragraph number that a numbering run keeps unchanged: Lexis sets each
+/// number off by two unstretched spaces ("19  The standard of review") while justification
+/// stretches the line's own. Three numbers in a row, each set off at least that far and two of
+/// them by just that, to a twentieth of a point, make it the run's; running text's numbers take
+/// each line's own stretched space.
+fn fixed_number_gaps<'a>(pages: impl IntoIterator<Item = &'a crate::PdfTextPage>) -> Vec<f64> {
+    let openings = pages.into_iter().flat_map(|page| page.lines.iter()
+        .filter_map(move |line| opening_number(page, line))).collect::<Vec<_>>();
+    let mut fixed = Vec::<f64>::new();
+    for &(_, gap) in &openings {
+        if fixed.iter().any(|width| (gap - width).abs() <= 0.05) { continue; }
+        let run = openings.iter().filter(|(_, other)| *other >= gap - 0.05).collect::<Vec<_>>();
+        if run.windows(3).any(|w| w[0].0 + 1 == w[1].0 && w[1].0 + 1 == w[2].0
+            && w.iter().filter(|(_, other)| (other - gap).abs() <= 0.05).count() >= 2) { fixed.push(gap); }
+    }
+    fixed
 }
 
 /// "[12]", "(12)", "12." or "12)": a printed paragraph number; a margin
@@ -244,6 +287,8 @@ pub fn printed_paragraph_witnessed<'a>(
     let Some((from, to)) = crate::numeric_range("paragraph", locator)
         .or_else(|| crate::parse_ordinal("paragraph", locator).map(|n| (n, n)))
     else { return false };
+    let pages = pages.collect::<Vec<_>>();
+    let fixed = fixed_number_gaps(pages.iter().copied());
     let mut missing = HashSet::from([from, to]);
     for page in pages {
         let lines = page.lines.iter().filter(|line| selected.contains(line.id.as_str()))
@@ -254,7 +299,7 @@ pub fn printed_paragraph_witnessed<'a>(
             let opening = if opening == "[" || opening == "(" {
                 line.words.iter().take(3).map(|word| word.text.as_str()).collect::<String>()
             } else { opening.to_owned() };
-            if let Some(number) = printed_label_number(&opening, false).or_else(|| set_apart_number(page, line)) {
+            if let Some(number) = printed_label_number(&opening, false).or_else(|| set_apart_number(page, line, &fixed)) {
                 missing.remove(&number);
             }
         }
