@@ -1,6 +1,7 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 mod bookmarks;
+mod flash;
 mod graph;
 
 use crate::layout::*;
@@ -3643,6 +3644,9 @@ fn prepare_pages(
     });
     let mut diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
+    });
+    legal_pdf_support::profile::measure("prepare.styled_headings", || {
+        flash::reconcile_styled_headings(pages, &mut primitives)
     });
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         bookmarks::reconcile_bookmarks(pages, outline, &mut primitives)
