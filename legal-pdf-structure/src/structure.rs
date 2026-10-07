@@ -3,6 +3,7 @@
 mod bookmarks;
 mod flash;
 mod graph;
+mod heading_sections;
 
 use crate::layout::*;
 #[cfg(test)]
@@ -3698,7 +3699,16 @@ fn derive_prepared(
     legal_pdf_support::profile::measure("derive.crossrefs", || {
         attach_crossrefs(&mut footnotes, &mut diagnostics)
     });
-    let nodes = native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
+    let mut nodes =
+        native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
+    heading_sections::nest_headings(
+        &mut nodes,
+        &resolution.index,
+        &resolution.runs,
+        &resolution.evidence,
+        pages,
+        &prepared.primitives,
+    );
     let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         legal_pdf_core::structure_analysis().resolve_structure_graph(
             identity.document_id,
@@ -3982,6 +3992,7 @@ pub fn validate_pdf_components(
                 .iter()
                 .any(|line| !known_lines.contains(line.as_str()))
             || (node.kind == NodeKind::Section
+                && node.grammar.as_deref() != Some("heading_section")
                 && (node.locator_kind.as_deref().is_none_or(str::is_empty)
                     || node
                         .proof
