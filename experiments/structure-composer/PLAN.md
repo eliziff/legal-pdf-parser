@@ -5,8 +5,8 @@
 Build one provider-neutral structure-composition operation for two callers:
 
 1. the PDF parser's multimodal repair/salvage pathway; and
-2. a corpus worker that produces reviewable reference candidates for parser evaluation,
-   gold acceptance and later Library retrieval experiments.
+2. a corpus worker that produces corrected manuscripts and structural gold for
+   parser and witness-stack evaluation.
 
 The composer improves the parser's existing structure. It does not ask a model to
 recreate source text, geometry, IDs or every unchanged decision.
@@ -26,7 +26,7 @@ native PDF/OCR structure + witnesses + full-page images
               +----------+-----------+
               |                      |
               v                      v
-      parser repair candidate   reference/gold candidate
+      parser repair candidate   manuscript + structure gold
 ```
 
 The engine owns evidence preparation, request grammar, source-identity validation,
@@ -42,8 +42,12 @@ transport, metering, caching and receipts.
 - `apply`: validate and materialize sparse corrections without altering the baseline;
 - `compose`: repeat a request when validation fails or an absent module is requested.
 
-Page repair receives the target plus r=1 full-page images. Full-document composition
-receives every page and alone enables constituent-document decomposition.
+Page repair receives the target plus r=1 full-page images. The gold runner extends
+the correction grammar with precise text spans, transcription edits, continuations
+and resumptions. One serial gold pass edits a single target page with its r=1
+neighbours and all five annotation contracts. Compact inherited parent IDs carry
+enclosing structure. Code assembles and validates the document before export.
+Runtime parser integration remains separate work.
 
 The layers are deliberately independent:
 
@@ -123,7 +127,7 @@ Feed the existing parser result and its independent witnesses, including:
 - lexical and typographic discontinuities; and
 - page-size, orientation and margin changes.
 
-Use cheap evidence to omit irrelevant response modules. A loaded module is used
+Parser repair can use cheap evidence to omit irrelevant response modules. A loaded module is used
 directly; only absent modules may be requested, and a request repeats the same
 evidence with the expanded grammar.
 
@@ -151,13 +155,15 @@ Parser repair:
 - preserve provider selection at the application boundary; and
 - retain the existing cache, budget and provenance requirements.
 
-Reference composition:
+Gold generation:
 
-- allow targeted-page or whole-document review;
-- retain the baseline, sparse patch, materialized composition, evidence hashes,
+- inspect every page once in an r=1 window and assemble document relationships;
+- constrain correction records and their payloads through Structured Outputs;
+- retain the baseline, final gold with replayable corrections, evidence hashes,
   prompt/schema hashes and provider receipt;
-- label model output `machine_proposed`; and
-- require separate acceptance before treating it as gold.
+- assemble the corrected manuscript and all source-anchored annotation layers;
+- retain digitalborn/OCR settings and simple run provenance; and
+- export deterministic replay and comparison inputs for the witness stack.
 
 ### 5. Corpus iteration gates
 
@@ -187,7 +193,7 @@ The candidate may replace the current multimodal salvage path only when:
 - reviewed table, form, note, quotation, heading and reading-order cases improve over
   the native baseline without profile regressions;
 - full-document composition correctly decomposes reviewed composite records;
-- the same operation produces reusable reference candidates without a parallel
+- the same operation produces reusable structure gold without a parallel
   annotation schema; and
 - provider/runtime configuration remains outside the structure engine.
 
