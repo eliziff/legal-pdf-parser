@@ -284,6 +284,7 @@ fn derive_extracted(
     let mut derived = derive(
         &mut extracted.pages,
         &extracted.separators,
+        &extracted.outline,
         StructureIdentity {
             document_id: document_id.to_owned(),
             source_sha256: source_hash.to_owned(),
@@ -989,6 +990,7 @@ pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) ->
         cached.source_sha256,
         cached.extraction.pages,
         cached.extraction.separators,
+        &cached.extraction.outline,
     )
     .map_err(|error| Error::Message(error.message))?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());

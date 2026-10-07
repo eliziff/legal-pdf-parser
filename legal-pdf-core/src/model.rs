@@ -220,6 +220,16 @@ pub struct PdfPairingAudit {
     pub pairing_summary: Value,
 }
 
+/// One bookmark of the PDF's own outline, in outline order: a navigation hint whose title and
+/// target may be stale. `level` counts from 1 at the outline's top; `page_index` is the target's
+/// physical page, counted from 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdfOutlineEntry {
+    pub title: String,
+    pub level: usize,
+    pub page_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PdfExtractionMetadata {
     #[serde(default)]

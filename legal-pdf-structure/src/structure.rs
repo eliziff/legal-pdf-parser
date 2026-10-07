@@ -1,5 +1,6 @@
 //! Shared structure derivation for aligned page and line evidence.
 
+mod bookmarks;
 mod graph;
 
 use crate::layout::*;
@@ -11,7 +12,7 @@ use graph::{
 };
 use legal_pdf_core::model::{
     DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
-    Paragraph, ParagraphAnchor, PdfPairingAudit, Span,
+    Paragraph, ParagraphAnchor, PdfOutlineEntry, PdfPairingAudit, Span,
 };
 #[cfg(test)]
 use legal_pdf_core::model::{NotePairClaim, NotePairKind};
@@ -3548,7 +3549,11 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
     }
 }
 
-fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Result<PdfPreparation> {
+fn prepare_pages(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+) -> Result<PdfPreparation> {
     if separators.len() != pages.len() {
         return Err(Error::Message(
             "common input must contain one separator value per page".to_owned(),
@@ -3566,6 +3571,9 @@ fn prepare_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Result<PdfPr
     });
     let mut diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
+    });
+    legal_pdf_support::profile::measure("prepare.bookmarks", || {
+        bookmarks::reconcile_bookmarks(pages, outline, &mut primitives)
     });
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
@@ -3641,19 +3649,21 @@ fn derive_prepared(
 pub fn derive(
     pages: &mut [Page],
     separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    let prepared = prepare_pages(pages, separators)?;
+    let prepared = prepare_pages(pages, separators, outline)?;
     derive_prepared(pages, prepared, identity, false)
 }
 
 pub fn replay(
     pages: &mut [Page],
     separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
 ) -> Result<StructureReplay> {
     let _profile = legal_pdf_support::profile::scope("structure_replay");
-    let prepared = prepare_pages(pages, separators)?;
+    let prepared = prepare_pages(pages, separators, outline)?;
     let prepared_pages = pages.to_vec();
     let derived = derive_prepared(pages, prepared, identity, true)?;
     Ok(StructureReplay {

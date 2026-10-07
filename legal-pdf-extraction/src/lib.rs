@@ -19,6 +19,7 @@ pub fn extract_pdf(
             pdf_inspector::extract_fidelity_from_doc(&document)
         })?;
     let embedded_page_labels = processor::embedded_page_labels(&document, page_geometries.len());
+    let outline = processor::embedded_outline(&document);
     drop(document);
     drop((rects, lines));
     let mut extracted = profile::measure("extract.assemble", || {
@@ -33,5 +34,6 @@ pub fn extract_pdf(
         )
     })?;
     extracted.metadata.embedded_page_labels = embedded_page_labels;
+    extracted.outline = outline;
     Ok(extracted)
 }
