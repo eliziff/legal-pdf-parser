@@ -62,6 +62,8 @@ struct PdfPrimitiveEvidence {
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
+    /// Tables drawn with rules, read from each page's painted rules.
+    tables: Vec<crate::tables::PdfTable>,
 }
 
 #[derive(Debug)]
@@ -2310,6 +2312,8 @@ fn classify_pages_with_source(
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    evidence.tables = crate::tables::ruled_tables(pages);
+    let ruled = crate::tables::table_line_ids(&evidence.tables);
     let article_body_size = if evidence.source_regions.is_some() {
         article_body_font_size(pages)
     } else {
@@ -2377,9 +2381,15 @@ fn classify_pages_with_source(
             } else {
                 HashSet::new()
             };
-            let notes = table.table_note_lines(&page.lines, &cells);
+            let mut notes = table.table_note_lines(&page.lines, &cells);
             cells.retain(|index| !notes.contains(index));
-            (is_table, cells, notes)
+            let drawn: Vec<usize> = (0..page.lines.len())
+                .filter(|index| ruled.contains(&page.lines[*index].id))
+                .collect();
+            notes.retain(|index| !ruled.contains(&page.lines[*index].id));
+            let drawn_table = !drawn.is_empty();
+            cells.extend(drawn);
+            (is_table || drawn_table, cells, notes)
         })
         .collect();
 
@@ -2981,6 +2991,7 @@ fn classify_pages_with_source(
             }
         }
         diagnostics.extend(order_page(page, table_page, &table_notes));
+        crate::tables::order_table_lines(page, &evidence.tables);
         build_regions(std::slice::from_mut(page));
     }
     evidence.translation_line_ids = translation;
@@ -2994,6 +3005,7 @@ fn classify_pages_with_source(
         }
     }
     crate::paragraphs::segment_paragraphs(pages);
+    crate::tables::part_cell_paragraphs(pages, &evidence.tables);
     build_regions(pages);
     diagnostics
 }

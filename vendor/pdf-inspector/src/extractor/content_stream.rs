@@ -423,6 +423,8 @@ fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
 type RuleSegment = ((f32, f32), (f32, f32));
 type RuleRect = (f32, f32, f32, f32, [f32; 6]);
 
+/// A thin horizontal or vertical rule between two corners of painted ink,
+/// laid on its center line.
 fn push_rule(rules: &mut Vec<PdfLine>, page: u32, from: (f32, f32), to: (f32, f32)) {
     if (to.1 - from.1).abs() <= 1.5 {
         rules.push(PdfLine {
@@ -430,6 +432,14 @@ fn push_rule(rules: &mut Vec<PdfLine>, page: u32, from: (f32, f32), to: (f32, f3
             y1: (from.1 + to.1) / 2.0,
             x2: to.0,
             y2: (from.1 + to.1) / 2.0,
+            page,
+        });
+    } else if (to.0 - from.0).abs() <= 1.5 {
+        rules.push(PdfLine {
+            x1: (from.0 + to.0) / 2.0,
+            y1: from.1,
+            x2: (from.0 + to.0) / 2.0,
+            y2: to.1,
             page,
         });
     }
@@ -460,13 +470,20 @@ fn paint_rule_strokes(
     }
 }
 
+/// Thin filled shapes are rules; a white fill paints nothing a reader sees.
 fn paint_rule_fills(
     rules: &mut Vec<PdfLine>,
     page: u32,
     segments: &mut Vec<RuleSegment>,
     rectangles: &mut Vec<RuleRect>,
     ctm: &[f32; 6],
+    white: bool,
 ) {
+    if white {
+        segments.clear();
+        rectangles.clear();
+        return;
+    }
     let mut first = 0;
     for end in 1..=segments.len() {
         let path_ends = end == segments.len() || segments[end - 1].1 != segments[end].0;
@@ -3199,6 +3216,7 @@ pub(crate) fn extract_page_text_items_impl(
                     &mut rule_segments,
                     &mut rule_rectangles,
                     &ctm,
+                    fill_is_white,
                 );
                 rule_current = None;
                 rule_start = None;

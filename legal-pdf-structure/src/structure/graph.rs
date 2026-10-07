@@ -806,5 +806,96 @@ pub(super) fn native_graph_parts(
         }
         nodes.push(node);
     }
+    // A table, its rows and their cells, addressed as a word processor's are. A blank
+    // cell is an empty range where its text would stand.
+    for (slot, table) in primitives.tables.iter().enumerate() {
+        let table_id = format!("table:{}", slot + 1);
+        let line_ids: Vec<String> = table.line_ids().into_iter().cloned().collect();
+        let range = index
+            .range_for_line_ids(&line_ids)
+            .ok_or_else(|| Error::Message(format!("{table_id} has no indexed lines")))?;
+        let mut node = StructureNode::new(
+            table_id.clone(),
+            NodeKind::Table,
+            range,
+            ORIGIN,
+            Derivation::Heuristic,
+            None,
+        );
+        node.label = Some(table_id.clone());
+        node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
+        node.line_ids = line_ids;
+        nodes.push(node);
+        let mut cursor = range.start;
+        for (row_slot, row) in table.rows.iter().enumerate() {
+            let row_id = format!("{table_id}/row:{}", row_slot + 1);
+            let cells: Vec<StructureNode> = row
+                .cells
+                .iter()
+                .map(|cell| {
+                    let line_ids = cell.line_ids();
+                    let range = cell
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part.chars {
+                            Some((start, end)) => index.global_range(&part.line_id, start, end),
+                            None => index.line(&part.line_id).map(|line| line.range),
+                        })
+                        .reduce(|left, right| ScalarRange {
+                            start: left.start.min(right.start),
+                            end: left.end.max(right.end),
+                        })
+                        .unwrap_or(ScalarRange {
+                            start: cursor,
+                            end: cursor,
+                        });
+                    cursor = range.end;
+                    let mut node = StructureNode::new(
+                        format!("{row_id}/col:{}", cell.column + 1),
+                        NodeKind::Cell,
+                        range,
+                        ORIGIN,
+                        Derivation::Heuristic,
+                        Some(row_id.clone()),
+                    );
+                    node.label = Some(node.id.clone());
+                    node.row_span = (cell.row_span > 1).then_some(cell.row_span);
+                    node.column_span = (cell.column_span > 1).then_some(cell.column_span);
+                    node.markup_tag = row.header.then(|| "th".to_owned());
+                    node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
+                    node.line_ids = line_ids;
+                    node
+                })
+                .collect();
+            let row_range = ScalarRange {
+                start: cells
+                    .iter()
+                    .map(|cell| cell.range.start)
+                    .min()
+                    .unwrap_or(cursor),
+                end: cells
+                    .iter()
+                    .map(|cell| cell.range.end)
+                    .max()
+                    .unwrap_or(cursor),
+            };
+            let mut node = StructureNode::new(
+                row_id.clone(),
+                NodeKind::Row,
+                row_range,
+                ORIGIN,
+                Derivation::Heuristic,
+                Some(table_id.clone()),
+            );
+            node.label = Some(row_id);
+            node.line_ids = cells
+                .iter()
+                .flat_map(|cell| cell.line_ids.clone())
+                .collect();
+            node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
+            nodes.push(node);
+            nodes.extend(cells);
+        }
+    }
     Ok(nodes)
 }
