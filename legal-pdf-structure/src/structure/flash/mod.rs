@@ -36,7 +36,7 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-fn party_label() -> &'static Regex {
+pub(super) fn party_label() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let role = r"(?:(?:first|second|third|fourth|1st|2nd|3rd|4th)\s+)?(?:named\s+)?(?:applicants?|respondents?|appellants?|appellees?|plaintiffs?|defendants?|petitioners?|claimants?|complainants?|prosecutors?|accused|interven[eo]rs?|(?:notice|third|interested)\s+part(?:y|ies))";
@@ -310,9 +310,21 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
             let quoted = text.starts_with(['"', '\u{201c}', '\u{2018}'])
                 || text.ends_with(".\u{201d}")
                 || text.ends_with("\u{201d}.");
+            // Indented under the running text's margin, off the page's centre: quoted material,
+            // whose headings are the quoted document's, not this one's.
+            let margin = page
+                .blocks
+                .iter()
+                .filter(|&&other| blocks[other].is_body && blocks[other].flash.line_count() >= 2)
+                .map(|&other| blocks[other].flash.rect.left)
+                .fold(f64::INFINITY, f64::min);
+            let indented = margin.is_finite()
+                && flash.rect.left > margin + 1.5 * flash.size
+                && (flash.rect.center_x() - page.width / 2.0).abs() >= 0.05 * page.width;
             eligible[block] &= flash.size >= page.stats.font_size - 0.5
                 && opens
                 && !quoted
+                && !indented
                 && !matches!(ends, Some(',' | ';' | ':'))
                 && !beside
                 && !analysis.has_citation_cue(&text)

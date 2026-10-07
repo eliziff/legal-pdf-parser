@@ -636,7 +636,10 @@ fn section_nodes(document: &PdfDocument) -> Vec<&StructureNode> {
         .structure
         .nodes
         .iter()
-        .filter(|node| node.kind == NodeKind::Section)
+        // A heading's extent is no provision: it has no identifier to look up.
+        .filter(|node| {
+            node.kind == NodeKind::Section && node.grammar.as_deref() != Some("heading_section")
+        })
         .collect()
 }
 
