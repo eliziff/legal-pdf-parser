@@ -2368,8 +2368,6 @@ fn classify_pages_with_source(
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    evidence.tables = crate::tables::ruled_tables(pages);
-    let ruled = crate::tables::table_line_ids(&evidence.tables);
     let article_body_size = if evidence.source_regions.is_some() {
         article_body_font_size(pages)
     } else {
@@ -2381,6 +2379,8 @@ fn classify_pages_with_source(
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
     let translation = translation_lines(pages);
+    evidence.tables = crate::tables::ruled_tables(pages, &translation);
+    let ruled = crate::tables::table_line_ids(&evidence.tables);
     // A row the extractor read across both columns parts into its two languages.
     for page in pages.iter_mut() {
         let base = page
