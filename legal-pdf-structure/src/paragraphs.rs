@@ -226,6 +226,53 @@ fn starts_paragraph(a: &Line, b: &Line, block: &[&Line], after: Option<&Line>) -
     first_line_indent || (fits && !a.text.trim_end().ends_with('-'))
 }
 
+/// Does the next page's first paragraph go on with this page's last one? It does when the
+/// last line ran to the measure, ending no sentence or with the next page going on in
+/// lower case, and the next page starts no indented first line, item or change of type.
+pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
+    let (Some(a), Some(b)) = (previous.last(), next.first()) else {
+        return false;
+    };
+    let text = b.text.trim_start();
+    if bullet_re().is_match(text)
+        || enumerator_re().is_match(text)
+        || marker_only_re().is_match(text)
+    {
+        return false;
+    }
+    let (sa, sb) = (size(a), size(b));
+    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
+        0.35
+    } else {
+        0.12
+    };
+    if (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb)) {
+        return false;
+    }
+    let cw = char_width(a);
+    let left = previous
+        .iter()
+        .map(|line| line.bbox[0])
+        .fold(f64::MAX, f64::min);
+    let next_left = next
+        .iter()
+        .map(|line| line.bbox[0])
+        .fold(f64::MAX, f64::min);
+    // Columns at different places on the two pages, or a first line set in from the next
+    // page's own margin, start something new.
+    if (left - next_left).abs() > 3.0 * cw || (next.len() > 1 && b.bbox[0] > next_left + 1.5 * cw) {
+        return false;
+    }
+    let right = previous
+        .iter()
+        .chain(next)
+        .map(|line| line.bbox[2])
+        .fold(f64::MIN, f64::max);
+    let full = right - a.bbox[2] <= first_word_width(b) + 1.5 * cw;
+    let lower = text.chars().next().is_some_and(char::is_lowercase);
+    full && (!terminal_re().is_match(a.text.trim()) || lower)
+}
+
 fn in_body(line: &Line) -> bool {
     line.region_type == "body" && !line.exclude_from_body && line.note_region_mode.is_empty()
 }

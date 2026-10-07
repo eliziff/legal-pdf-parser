@@ -3084,13 +3084,14 @@ fn join_lines(lines: &[&Line]) -> (String, Vec<Option<(usize, usize)>>) {
 }
 
 fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
-    let mut paragraphs = Vec::new();
+    let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
     for page in pages {
         let line_by_id: HashMap<&str, &Line> = page
             .lines
             .iter()
             .map(|line| (line.id.as_str(), line))
             .collect();
+        let mut first = true;
         for region in &page.regions {
             if !matches!(region.kind.as_str(), "body" | "heading") {
                 continue;
@@ -3101,62 +3102,81 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
                 .filter_map(|id| line_by_id.get(id.as_str()).copied())
                 .filter(|line| !line.exclude_from_body)
                 .collect();
-            let (text, line_offsets) = join_lines(&lines);
-            if text.is_empty() {
+            if lines.is_empty() {
                 continue;
             }
-            let mut events = Vec::new();
-            for (line, offset) in lines.iter().zip(&line_offsets) {
-                let Some((base, _)) = offset else {
+            // A paragraph the page break interrupts goes on as the next page's first.
+            if let Some((_, "body", previous)) = regions.last_mut() {
+                if first
+                    && region.kind == "body"
+                    && crate::paragraphs::continues_onto(previous, &lines)
+                {
+                    previous.extend(lines);
+                    first = false;
                     continue;
-                };
-                for anchor in anchors.get(&line.id).into_iter().flatten() {
-                    events.push((
-                        *base + anchor.start,
-                        *base + anchor.end,
-                        anchor.pair_id.as_str(),
-                        anchor.label.as_str(),
-                    ));
                 }
             }
-            events.sort_by_key(|event| (event.0, event.1));
-            let (rendered, output_anchors) = if events.is_empty() {
-                (text, Vec::new())
-            } else {
-                let coordinates = ScalarText::new(&text);
-                let text_len = coordinates.len();
-                let mut rendered = String::with_capacity(text.len());
-                let mut output_anchors = Vec::with_capacity(events.len());
-                let (mut cursor, mut rendered_len) = (0, 0);
-                for (start, end, pair_id, label) in events {
-                    let start = start.max(cursor).min(text_len);
-                    let end = end.max(start).min(text_len);
-                    rendered.push_str(coordinates.slice(cursor..start).unwrap());
-                    rendered_len += start - cursor;
-                    let offset = rendered_len;
-                    rendered.push_str("⟦FN:");
-                    rendered.push_str(&pair_id);
-                    rendered.push('⟧');
-                    rendered_len += 5 + pair_id.chars().count();
-                    output_anchors.push(ParagraphAnchor {
-                        pair_id: pair_id.to_owned(),
-                        label: label.to_owned(),
-                        offset,
-                    });
-                    cursor = end;
-                }
-                rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
-                (rendered, output_anchors)
-            };
-            paragraphs.push(Paragraph {
-                id: format!("para-{:06}", paragraphs.len() + 1),
-                page_index: page.index,
-                region_type: region.kind.clone(),
-                text: rendered,
-                line_ids: lines.iter().map(|line| line.id.clone()).collect(),
-                anchors: output_anchors,
-            });
+            first = false;
+            regions.push((page, region.kind.as_str(), lines));
         }
+    }
+    let mut paragraphs = Vec::new();
+    for (page, kind, lines) in regions {
+        let (text, line_offsets) = join_lines(&lines);
+        if text.is_empty() {
+            continue;
+        }
+        let mut events = Vec::new();
+        for (line, offset) in lines.iter().zip(&line_offsets) {
+            let Some((base, _)) = offset else {
+                continue;
+            };
+            for anchor in anchors.get(&line.id).into_iter().flatten() {
+                events.push((
+                    *base + anchor.start,
+                    *base + anchor.end,
+                    anchor.pair_id.as_str(),
+                    anchor.label.as_str(),
+                ));
+            }
+        }
+        events.sort_by_key(|event| (event.0, event.1));
+        let (rendered, output_anchors) = if events.is_empty() {
+            (text, Vec::new())
+        } else {
+            let coordinates = ScalarText::new(&text);
+            let text_len = coordinates.len();
+            let mut rendered = String::with_capacity(text.len());
+            let mut output_anchors = Vec::with_capacity(events.len());
+            let (mut cursor, mut rendered_len) = (0, 0);
+            for (start, end, pair_id, label) in events {
+                let start = start.max(cursor).min(text_len);
+                let end = end.max(start).min(text_len);
+                rendered.push_str(coordinates.slice(cursor..start).unwrap());
+                rendered_len += start - cursor;
+                let offset = rendered_len;
+                rendered.push_str("⟦FN:");
+                rendered.push_str(&pair_id);
+                rendered.push('⟧');
+                rendered_len += 5 + pair_id.chars().count();
+                output_anchors.push(ParagraphAnchor {
+                    pair_id: pair_id.to_owned(),
+                    label: label.to_owned(),
+                    offset,
+                });
+                cursor = end;
+            }
+            rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
+            (rendered, output_anchors)
+        };
+        paragraphs.push(Paragraph {
+            id: format!("para-{:06}", paragraphs.len() + 1),
+            page_index: page.index,
+            region_type: kind.to_owned(),
+            text: rendered,
+            line_ids: lines.iter().map(|line| line.id.clone()).collect(),
+            anchors: output_anchors,
+        });
     }
     paragraphs
 }
