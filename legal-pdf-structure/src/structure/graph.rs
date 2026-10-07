@@ -1088,7 +1088,6 @@ pub(super) fn native_graph_parts(
                     node.label = Some(node.id.clone());
                     node.row_span = (cell.row_span > 1).then_some(cell.row_span);
                     node.column_span = (cell.column_span > 1).then_some(cell.column_span);
-                    node.markup_tag = row.header.then(|| "th".to_owned());
                     node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
                     node.line_ids = line_ids;
                     node
