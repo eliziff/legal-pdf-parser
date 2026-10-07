@@ -1,5 +1,7 @@
 use crate::{Error, Result};
-use legal_pdf_core::model::{Diagnostic, Line, Page, PdfExtractionMetadata, Span, Word};
+use legal_pdf_core::model::{
+    Diagnostic, Line, Page, PdfExtractionMetadata, PdfOutlineEntry, Span, Word,
+};
 use legal_pdf_core::{profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
 use lopdf::{Document, Object, ObjectId};
 use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
@@ -1312,6 +1314,8 @@ pub struct ExtractedPdf {
     pub separators: Vec<Option<f64>>,
     pub diagnostics: Vec<Diagnostic>,
     pub metadata: PdfExtractionMetadata,
+    /// The document's own bookmarks, read by `embedded_outline`.
+    pub outline: Vec<PdfOutlineEntry>,
 }
 
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
@@ -1452,6 +1456,7 @@ pub fn assemble_pdf(
         pages,
         separators,
         diagnostics,
+        outline: Vec::new(),
         metadata: PdfExtractionMetadata {
             embedded_page_labels: Vec::new(),
             pages_needing_ocr: weak_pages.into_iter().collect(),
@@ -1508,6 +1513,7 @@ pub fn recognize_pdf(
         separators,
         diagnostics,
         metadata,
+        ..
     } = extracted;
     let mut weak_pages: BTreeSet<usize> = metadata.pages_needing_ocr.iter().copied().collect();
     diagnostics.retain(|diagnostic| diagnostic.code != "OCR_REQUIRED");

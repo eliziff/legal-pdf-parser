@@ -1,7 +1,7 @@
 #[cfg(feature = "pdf")]
 use legal_pdf_core::model::{
-    Diagnostic, Footnote, LegalDocument, Page, Paragraph, PdfPairingAudit, PARSER_VERSION,
-    SCHEMA_VERSION,
+    Diagnostic, Footnote, LegalDocument, Page, Paragraph, PdfOutlineEntry, PdfPairingAudit,
+    PARSER_VERSION, SCHEMA_VERSION,
 };
 #[cfg(feature = "pdf")]
 use legal_pdf_structure::{replay, status, validate_document, StructureIdentity, StructureReplay};
@@ -31,6 +31,7 @@ pub(crate) fn derive_pdf_pages(
     source_sha256: String,
     mut pages: Vec<Page>,
     separators: Vec<Option<f64>>,
+    outline: &[PdfOutlineEntry],
 ) -> Result<PdfReplayProjection, EngineError> {
     if document_id.is_empty() || source_sha256.len() != 64 || pages.len() != separators.len() {
         return Err(EngineError {
@@ -44,6 +45,7 @@ pub(crate) fn derive_pdf_pages(
     } = replay(
         &mut pages,
         &separators,
+        outline,
         StructureIdentity {
             document_id: document_id.clone(),
             source_sha256: source_sha256.clone(),
