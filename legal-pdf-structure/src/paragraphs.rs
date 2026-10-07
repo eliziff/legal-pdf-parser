@@ -95,6 +95,18 @@ fn advance(a: &Line, b: &Line) -> f64 {
     (b.bbox[1] - a.bbox[1]).min(b.bbox[3] - a.bbox[3])
 }
 
+/// Are the two lines set in different sizes? A recognized line's box, its only size
+/// evidence, grows with its ascenders and descenders.
+fn resized(a: &Line, b: &Line) -> bool {
+    let (sa, sb) = (size(a), size(b));
+    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
+        0.35
+    } else {
+        0.12
+    };
+    (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb))
+}
+
 fn size_key(value: f64) -> i64 {
     (value * 2.0).round() as i64
 }
@@ -165,47 +177,45 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     if advance <= 0.3 * height(a).min(height(b)).max(1.0) {
         return true;
     }
-    let (sa, sb) = (size(a), size(b));
-    // A recognized line's box, its only size evidence, grows with its ascenders and descenders.
-    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
-        0.35
-    } else {
-        0.12
-    };
-    if (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb))
-        || advance > 1.4 * pitch.typical(sa.min(sb))
-    {
+    if resized(a, b) || advance > 1.4 * pitch.typical(size(a).min(size(b))) {
         return true;
     }
     matches!((bold_share(a), bold_share(b)), (Some(x), Some(y)) if (x > 0.8 && y < 0.2) || (x < 0.2 && y > 0.8))
 }
 
-/// Does the block set its paragraphs' first lines in? Two lines indented from the
-/// block's margin with the next line back at it show the style.
-fn indents_first_lines(block: &[&Line]) -> bool {
-    let left = block
+/// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
+/// scan's skew does not set lines in.
+fn margin_at(block: &[&Line], slot: usize) -> f64 {
+    block[slot.saturating_sub(3)..(slot + 4).min(block.len())]
         .iter()
         .map(|line| line.bbox[0])
-        .fold(f64::MAX, f64::min);
-    block
-        .windows(2)
-        .filter(|pair| {
-            let cw = char_width(pair[0]);
-            let indent = pair[0].bbox[0] - left;
-            indent > 1.5 * cw && indent <= 12.0 * cw && (pair[1].bbox[0] - left).abs() < 1.5 * cw
+        .fold(f64::MAX, f64::min)
+}
+
+/// Does the block set its paragraphs' first lines in? Two lines indented from the
+/// margin with the next line back at it show the style.
+fn indents_first_lines(block: &[&Line]) -> bool {
+    (1..block.len())
+        .filter(|&slot| {
+            let (line, next) = (block[slot - 1], block[slot]);
+            let left = margin_at(block, slot);
+            let cw = char_width(line);
+            let indent = line.bbox[0] - left;
+            indent > 1.5 * cw && indent <= 12.0 * cw && (next.bbox[0] - left).abs() < 1.5 * cw
         })
         .count()
         >= 2
 }
 
 /// Does `b` begin a new paragraph after `a` inside one visual block? Where first lines
-/// are set in, every line set in begins one and a short line ends none by itself.
+/// are set in from the `margin`, every line set in begins one and a short line ends none
+/// by itself.
 fn starts_paragraph(
     a: &Line,
     b: &Line,
     block: &[&Line],
     after: Option<&Line>,
-    indented: bool,
+    margin: Option<f64>,
 ) -> bool {
     if same_row(a, b) {
         return false;
@@ -248,11 +258,7 @@ fn starts_paragraph(
         && (terminal
             || fits
             || after.is_some_and(|line| (line.bbox[0] - a.bbox[0]).abs() < 1.5 * cw));
-    if indented {
-        let left = block
-            .iter()
-            .map(|line| line.bbox[0])
-            .fold(f64::MAX, f64::min);
+    if let Some(left) = margin {
         return first_line_indent || (!marker && b.bbox[0] > left + 1.5 * cw);
     }
     first_line_indent || (fits && !a.text.trim_end().ends_with('-'))
@@ -272,13 +278,7 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     {
         return false;
     }
-    let (sa, sb) = (size(a), size(b));
-    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
-        0.35
-    } else {
-        0.12
-    };
-    if (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb)) {
+    if resized(a, b) {
         return false;
     }
     let cw = char_width(a);
@@ -343,7 +343,8 @@ pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
                 let indented = indents_first_lines(&block);
                 for j in 1..block.len() {
                     let after = block.get(j + 1).copied();
-                    if starts_paragraph(block[j - 1], block[j], &block, after, indented) {
+                    let margin = indented.then(|| margin_at(&block, j));
+                    if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
                         next += 1;
                     }
                     assigned[start + block_start + j] = Some(next);
