@@ -2942,6 +2942,7 @@ fn classify_pages_with_source(
     evidence.contents_line_ids.extend(contents_line_ids);
     let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
+    crate::paragraphs::segment_paragraphs(pages);
     build_regions(pages);
     diagnostics
 }
