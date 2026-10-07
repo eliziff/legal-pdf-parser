@@ -2987,6 +2987,12 @@ fn classify_pages_with_source(
     evidence.contents_line_ids.extend(contents_line_ids);
     let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
+    // A transcript's line numbers locate its lines; they are no part of its paragraphs.
+    for page in pages.iter_mut() {
+        for slot in graph::line_number_column(page) {
+            page.lines[slot].exclude_from_body = true;
+        }
+    }
     crate::paragraphs::segment_paragraphs(pages);
     build_regions(pages);
     diagnostics

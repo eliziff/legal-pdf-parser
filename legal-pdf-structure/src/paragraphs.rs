@@ -180,8 +180,33 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     matches!((bold_share(a), bold_share(b)), (Some(x), Some(y)) if (x > 0.8 && y < 0.2) || (x < 0.2 && y > 0.8))
 }
 
-/// Does `b` begin a new paragraph after `a` inside one visual block?
-fn starts_paragraph(a: &Line, b: &Line, block: &[&Line], after: Option<&Line>) -> bool {
+/// Does the block set its paragraphs' first lines in? Two lines indented from the
+/// block's margin with the next line back at it show the style.
+fn indents_first_lines(block: &[&Line]) -> bool {
+    let left = block
+        .iter()
+        .map(|line| line.bbox[0])
+        .fold(f64::MAX, f64::min);
+    block
+        .windows(2)
+        .filter(|pair| {
+            let cw = char_width(pair[0]);
+            let indent = pair[0].bbox[0] - left;
+            indent > 1.5 * cw && indent <= 12.0 * cw && (pair[1].bbox[0] - left).abs() < 1.5 * cw
+        })
+        .count()
+        >= 2
+}
+
+/// Does `b` begin a new paragraph after `a` inside one visual block? Where first lines
+/// are set in, every line set in begins one and a short line ends none by itself.
+fn starts_paragraph(
+    a: &Line,
+    b: &Line,
+    block: &[&Line],
+    after: Option<&Line>,
+    indented: bool,
+) -> bool {
     if same_row(a, b) {
         return false;
     }
@@ -223,6 +248,13 @@ fn starts_paragraph(a: &Line, b: &Line, block: &[&Line], after: Option<&Line>) -
         && (terminal
             || fits
             || after.is_some_and(|line| (line.bbox[0] - a.bbox[0]).abs() < 1.5 * cw));
+    if indented {
+        let left = block
+            .iter()
+            .map(|line| line.bbox[0])
+            .fold(f64::MAX, f64::min);
+        return first_line_indent || (!marker && b.bbox[0] > left + 1.5 * cw);
+    }
     first_line_indent || (fits && !a.text.trim_end().ends_with('-'))
 }
 
@@ -308,8 +340,10 @@ pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
                 }
                 let block: Vec<&Line> = run[block_start..k].iter().collect();
                 assigned[start + block_start] = Some(next);
+                let indented = indents_first_lines(&block);
                 for j in 1..block.len() {
-                    if starts_paragraph(block[j - 1], block[j], &block, block.get(j + 1).copied()) {
+                    let after = block.get(j + 1).copied();
+                    if starts_paragraph(block[j - 1], block[j], &block, after, indented) {
                         next += 1;
                     }
                     assigned[start + block_start + j] = Some(next);
