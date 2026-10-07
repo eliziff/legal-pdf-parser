@@ -1577,11 +1577,12 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
             continue;
         }
         // A number and its period alone on a body line ("4.") is a numbered paragraph's
-        // number, whose words the layout set beside it: never a note's label.
+        // number, whose words the layout set beside it: never a note's label. So is a bare
+        // number alone at the body's size ("22"), as Singapore's courts print theirs.
         if token.value.is_some()
             && line.zone == Zone::Body
             && body_stripped.is_empty()
-            && token.post.trim() == "."
+            && (token.post.trim() == "." || (token.post.is_empty() && !line.small_font))
         {
             continue;
         }
