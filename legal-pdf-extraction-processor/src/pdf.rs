@@ -958,6 +958,74 @@ fn begins_with_note_label(text: &str) -> bool {
         .is_none_or(|character| character.is_whitespace() || ".)]},:;-".contains(character))
 }
 
+/// The page's painted rules as regions of kind `rule`, each a horizontal or vertical line
+/// (`bbox` from one end to the other) in page coordinates, collinear pieces joined.
+fn rule_regions(
+    geometry: PageGeometry,
+    page: &Page,
+    rules: &[PdfLine],
+) -> Vec<legal_pdf_core::model::Region> {
+    const JOIN: f64 = 1.0;
+    // (vertical, position across, start along, end along)
+    let mut pieces: Vec<(bool, f64, f64, f64)> = rules
+        .iter()
+        .filter_map(|rule| {
+            let (x1, y1) = transform_point(geometry, f64::from(rule.x1), f64::from(rule.y1));
+            let (x2, y2) = transform_point(geometry, f64::from(rule.x2), f64::from(rule.y2));
+            let (y1, y2) = (geometry.height - y1, geometry.height - y2);
+            let vertical = (x1 - x2).abs() < (y1 - y2).abs();
+            let piece = if vertical {
+                (true, (x1 + x2) / 2.0, y1.min(y2), y1.max(y2))
+            } else {
+                (false, (y1 + y2) / 2.0, x1.min(x2), x1.max(x2))
+            };
+            [piece.1, piece.2, piece.3]
+                .iter()
+                .all(|value| value.is_finite())
+                .then_some(piece)
+        })
+        .collect();
+    pieces.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.total_cmp(&right.1))
+            .then(left.2.total_cmp(&right.2))
+    });
+    let mut joined: Vec<(bool, f64, f64, f64)> = Vec::new();
+    for (vertical, across, start, end) in pieces {
+        let mut group = joined
+            .iter_mut()
+            .rev()
+            .take_while(|prior| prior.0 == vertical && across - prior.1 <= JOIN);
+        if let Some(prior) = group.find(|prior| start <= prior.3 + JOIN && prior.2 <= end + JOIN) {
+            prior.2 = prior.2.min(start);
+            prior.3 = prior.3.max(end);
+        } else {
+            joined.push((vertical, across, start, end));
+        }
+    }
+    joined
+        .into_iter()
+        .filter(|(_, _, start, end)| end - start > JOIN)
+        .enumerate()
+        .map(|(index, (vertical, across, start, end))| {
+            let bbox = if vertical {
+                [across, start, across, end]
+            } else {
+                [start, across, end, across]
+            };
+            legal_pdf_core::model::Region {
+                id: format!("p{:04}-rule{:04}", page.number, index + 1),
+                page_index: page.index,
+                kind: "rule".to_owned(),
+                line_ids: Vec::new(),
+                bbox: bbox.map(round3),
+                reading_order: 0,
+            }
+        })
+        .collect()
+}
+
 fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLine]) -> Option<f64> {
     let candidates: Vec<(f64, f64)> = rules
         .iter()
@@ -1437,6 +1505,13 @@ pub fn assemble_pdf(
             })
             .collect::<Vec<_>>()
     });
+    for ((&number, &(_, geometry)), page) in geometries.iter().zip(&mut pages) {
+        page.regions = rule_regions(
+            geometry,
+            page,
+            rules_by_page.get(&number).map_or(&[], Vec::as_slice),
+        );
+    }
 
     for page in &detection.pages_needing_ocr {
         if let Ok(index) = usize::try_from(page.saturating_sub(1)) {
