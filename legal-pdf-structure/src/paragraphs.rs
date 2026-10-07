@@ -89,6 +89,12 @@ fn same_row(a: &Line, b: &Line) -> bool {
     overlap > 0.5 * height(a).min(height(b))
 }
 
+/// Line advance, read from whichever box edge moved less: a recognized line's top
+/// follows its ascenders and its bottom its descenders.
+fn advance(a: &Line, b: &Line) -> f64 {
+    (b.bbox[1] - a.bbox[1]).min(b.bbox[3] - a.bbox[3])
+}
+
 fn size_key(value: f64) -> i64 {
     (value * 2.0).round() as i64
 }
@@ -107,7 +113,7 @@ impl Pitch {
             if b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0] {
                 continue;
             }
-            let pitch = b.bbox[1] - a.bbox[1];
+            let pitch = advance(a, b);
             if pitch > 0.5 * height(a) && pitch < 3.0 * height(a) {
                 samples
                     .entry(size_key(size(a).min(size(b))))
@@ -155,12 +161,19 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     if b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0] {
         return true;
     }
-    let advance = b.bbox[1] - a.bbox[1];
+    let advance = advance(a, b);
     if advance <= 0.3 * height(a).min(height(b)).max(1.0) {
         return true;
     }
     let (sa, sb) = (size(a), size(b));
-    if (sa - sb).abs() > 1.0_f64.max(0.12 * sa.max(sb)) || advance > 1.4 * pitch.typical(sa.min(sb))
+    // A recognized line's box, its only size evidence, grows with its ascenders and descenders.
+    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
+        0.35
+    } else {
+        0.12
+    };
+    if (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb))
+        || advance > 1.4 * pitch.typical(sa.min(sb))
     {
         return true;
     }
