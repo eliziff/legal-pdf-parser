@@ -1,15 +1,19 @@
-use super::{arabic_page_number, body_flow_edge, scalar_suffix, PdfPrimitiveEvidence};
-use legal_pdf_core::model::{NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
+use super::{
+    arabic_page_number, body_flow_edge, scalar_suffix, sentence_ended, starts_note_or_list,
+    PdfPrimitiveEvidence,
+};
+use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
 use legal_pdf_core::structure_analysis;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_support::protected_citation_spans;
 use legal_structure_model::{
     CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity,
     NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange, ScalarText,
-    StructureCandidateRun, StructureDiagnostic, StructureNode, TextAnchorV2,
+    StructureCandidateRun, StructureDiagnostic, StructureMarkerCandidate, StructureNode,
+    TextAnchorV2,
 };
 use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,35 +323,153 @@ pub(super) fn index_pages(pages: &[Page]) -> HashSet<usize> {
         .collect()
 }
 
+/// A body line that can carry a numbered item's text: not a running head or folio, nor a note.
+fn item_text_line(line: &Line) -> bool {
+    !line.exclude_from_body
+        && line.note_region_mode.is_empty()
+        && !matches!(line.region_type.as_str(), "header" | "footer")
+}
+
+/// Whether a number opening a line is a sentence's words wrapped onto it ("under / Article
+/// 40.4.2°", "made on / 11 August"): the body line before runs the full measure to the
+/// text's right edge and stops short of a sentence's or a clause's end.
+fn wrapped_into(
+    index: &PdfTextIndex,
+    by_line: &HashMap<&str, (&Page, &Line)>,
+    measures: &HashMap<usize, (f64, f64)>,
+    candidate: &StructureMarkerCandidate,
+) -> bool {
+    let before = index.overlapping_lines(ScalarRange {
+        start: 0,
+        end: candidate.marker_range.start,
+    });
+    let Some(prior) = before
+        .iter()
+        .rev()
+        .filter(|indexed| indexed.range.end <= candidate.marker_range.start)
+        .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).map(|(_, line)| *line))
+        .find(|line| item_text_line(line) && !line.text.trim().is_empty())
+    else {
+        return false;
+    };
+    let Some(&(left, right)) = measures.get(&prior.page_index) else {
+        return false;
+    };
+    let text = prior.text.trim_end();
+    let last = text.split_whitespace().last().unwrap_or_default();
+    let height = (prior.bbox[3] - prior.bbox[1]).max(1.0);
+    prior.bbox[0] < right - 0.85 * (right - left)
+        && prior.bbox[2] >= right - 2.0 * height
+        && text.ends_with(|c: char| c.is_alphanumeric())
+        && !matches!(last, "and" | "or")
+}
+
+/// A number alone on its line whose next line is set out left of it is no item's: a folio, a
+/// column of figures.
+fn stands_apart(marker: &Line, next: &Line) -> bool {
+    let below = next.bbox[1] >= marker.bbox[3] - 0.5 * (marker.bbox[3] - marker.bbox[1]);
+    below && next.bbox[0] < marker.bbox[0] - (next.bbox[3] - next.bbox[1])
+}
+
+/// Where a subsection's text ends when its number stands apart from it (see `stands_apart`).
+fn apart_end(
+    index: &PdfTextIndex,
+    by_line: &HashMap<&str, (&Page, &Line)>,
+    candidate: &StructureMarkerCandidate,
+) -> Option<usize> {
+    let (_, marker) = by_line.get(
+        index
+            .line_at(candidate.marker_range.start)?
+            .line_id
+            .as_str(),
+    )?;
+    let (indexed, line) = index
+        .overlapping_lines(candidate.range)
+        .iter()
+        .filter(|indexed| indexed.range.end > candidate.content_start)
+        .filter_map(|indexed| Some((indexed, by_line.get(indexed.line_id.as_str())?.1)))
+        .find(|(_, line)| item_text_line(line) && !line.text.trim().is_empty())?;
+    stands_apart(marker, line).then_some(indexed.range.start)
+}
+
+/// Where a numbered item's text ends by the page's layout, when that is before the next number.
+/// It ends at a heading, at a printed block of its own set apart from the item's margin and
+/// the column its lines wrap to (a centred title, a signature, a cover page), and after a
+/// finished sentence at a block in line with them (a jurat, an unnumbered paragraph). A block
+/// set in at full measure (a quotation), one opening with its own marker, an unfinished
+/// sentence, the text after a quotation and a full line at the top of the next page carry the
+/// item on.
+fn layout_end(
+    index: &PdfTextIndex,
+    by_line: &HashMap<&str, (&Page, &Line)>,
+    measures: &HashMap<usize, (f64, f64)>,
+    candidate: &StructureMarkerCandidate,
+) -> Option<usize> {
+    let (_, marker) = by_line.get(
+        index
+            .line_at(candidate.marker_range.start)?
+            .line_id
+            .as_str(),
+    )?;
+    let (left, _) = measures.get(&marker.page_index)?;
+    let offset = marker.bbox[0] - left;
+    let mut previous: Option<&Line> = None;
+    let mut quoted = false;
+    // Where the item's own lines wrap to, from the page's left edge.
+    let mut hang = None;
+    for indexed in index.overlapping_lines(candidate.range) {
+        if indexed.range.end <= candidate.content_start {
+            continue;
+        }
+        let Some(&(_, line)) = by_line.get(indexed.line_id.as_str()) else {
+            continue;
+        };
+        if line.region_type == "heading" && indexed.range.start > candidate.content_start {
+            return Some(indexed.range.start);
+        }
+        if !item_text_line(line) || line.text.trim().is_empty() {
+            continue;
+        }
+        let Some(prior) = previous.replace(line) else {
+            if stands_apart(marker, line) {
+                return Some(indexed.range.start);
+            }
+            continue;
+        };
+        let new_page = line.page_index != prior.page_index;
+        let Some(&(left, right)) = measures.get(&line.page_index) else {
+            continue;
+        };
+        if !new_page && line.block_index == prior.block_index {
+            if line.bbox[1] >= prior.bbox[3] {
+                hang.get_or_insert(line.bbox[0] - left);
+            }
+            continue;
+        }
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        let margin = left + offset;
+        let full = line.bbox[2] - line.bbox[0] >= 0.6 * (right - left);
+        let text = line.text.trim();
+        if starts_note_or_list(text) || (line.bbox[0] > margin + height && full) {
+            quoted |= line.bbox[0] > margin + height;
+            continue;
+        }
+        let aligned = (line.bbox[0] - margin).abs() <= height
+            || hang.is_some_and(|hang| (line.bbox[0] - left - hang).abs() <= height);
+        let carried =
+            aligned && (!sentence_ended(prior.text.trim()) || (full && (quoted || new_page)));
+        quoted = false;
+        if !carried {
+            return Some(indexed.range.start);
+        }
+    }
+    None
+}
+
 impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let mut runs = structure_analysis().detect_structure_candidate_runs(index.text());
-        let heading_starts = pages
-            .iter()
-            .flat_map(|page| &page.lines)
-            .filter(|line| line.region_type == "heading")
-            .filter_map(|line| {
-                index
-                    .range_for_line_ids(&[line.id.clone()])
-                    .map(|range| range.start)
-            })
-            .collect::<BTreeSet<_>>();
-        for run in &mut runs {
-            if run.grammar != CandidateGrammar::Numeric {
-                continue;
-            }
-            for candidate in &mut run.markers {
-                if let Some(&end) = heading_starts
-                    .range(candidate.content_start..candidate.range.end)
-                    .next()
-                {
-                    candidate.range.end = end;
-                }
-            }
-        }
-        let transcript_line_number_pages = transcript_line_number_pages(pages);
-        let index_pages = index_pages(pages);
         let by_line = pages
             .iter()
             .flat_map(|page| {
@@ -356,6 +478,67 @@ impl PdfResolutionInput {
                     .map(move |line| (line.id.as_str(), (page, line)))
             })
             .collect::<HashMap<_, _>>();
+        let measures = pages
+            .iter()
+            .filter_map(|page| {
+                let body = page.lines.iter().filter(|line| item_text_line(line));
+                let left = body.clone().map(|line| line.bbox[0]).reduce(f64::min)?;
+                let right = body.map(|line| line.bbox[2]).reduce(f64::max)?;
+                Some((page.index, (left, right)))
+            })
+            .collect::<HashMap<_, _>>();
+        // The numbered paragraphs' numbers: a count from 1 set in the body, not the folios.
+        let mut paragraph_starts = runs
+            .iter()
+            .filter(|run| run.grammar == CandidateGrammar::Numeric && run.rooted && run.consecutive)
+            .flat_map(|run| &run.markers)
+            .filter(|candidate| {
+                index
+                    .line_at(candidate.marker_range.start)
+                    .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
+                    .is_some_and(|(_, line)| item_text_line(line))
+            })
+            .map(|candidate| candidate.range.start)
+            .collect::<Vec<_>>();
+        paragraph_starts.sort_unstable();
+        // A list item or a subsection ends where the numbered paragraphs resume. A section's and
+        // its subsections' extent is otherwise their grammar's; a numbered paragraph's or list
+        // item's ends where the layout ends it.
+        let mut ended = HashSet::new();
+        for run in &mut runs {
+            let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
+            for candidate in &mut run.markers {
+                if run.grammar != CandidateGrammar::Numeric
+                    && !(hierarchy && candidate.parent_candidate_id.is_none())
+                {
+                    let next =
+                        paragraph_starts.partition_point(|start| *start <= candidate.range.start);
+                    if let Some(&end) = paragraph_starts
+                        .get(next)
+                        .filter(|end| **end < candidate.range.end)
+                    {
+                        candidate.range.end = end.max(candidate.content_start);
+                    }
+                }
+                if hierarchy {
+                    if let Some(end) = candidate
+                        .parent_candidate_id
+                        .as_ref()
+                        .and_then(|_| apart_end(&index, &by_line, candidate))
+                    {
+                        candidate.range.end = end;
+                        ended.insert(candidate.id.clone());
+                    }
+                    continue;
+                }
+                if let Some(end) = layout_end(&index, &by_line, &measures, candidate) {
+                    candidate.range.end = end;
+                    ended.insert(candidate.id.clone());
+                }
+            }
+        }
+        let transcript_line_number_pages = transcript_line_number_pages(pages);
+        let index_pages = index_pages(pages);
         let mut flow_lines = HashSet::new();
         for page in pages {
             for pair in page.lines.windows(2) {
@@ -457,28 +640,31 @@ impl PdfResolutionInput {
                 let marker_lines = index.overlapping_lines(candidate.marker_range);
                 let mut observations = Vec::new();
 
-                let body_prose = candidate_lines.iter().take(3).any(|indexed| {
-                    let Some((_, line)) = by_line.get(indexed.line_id.as_str()) else {
-                        return false;
-                    };
+                // The words after the marker on the item's first body lines.
+                let body_tails = candidate_lines.iter().take(3).filter_map(|indexed| {
+                    let (_, line) = by_line.get(indexed.line_id.as_str())?;
                     if line.exclude_from_body
                         || !line.note_region_mode.is_empty()
                         || line.region_type != "body"
                     {
-                        return false;
+                        return None;
                     }
                     let start = candidate
                         .content_start
                         .saturating_sub(indexed.range.start)
                         .min(line.text.chars().count());
-                    let tail = scalar_suffix(&line.text, start);
-                    tail.chars()
-                        .filter(|character| character.is_alphabetic())
-                        .count()
-                        >= 8
+                    Some((line, scalar_suffix(&line.text, start)))
+                });
+                let letters = |tail: &str| tail.chars().filter(|c| c.is_alphabetic()).count();
+                let body_prose = body_tails.clone().any(|(line, tail)| {
+                    letters(tail) >= 8
                         && (flow_lines.contains(line.id.as_str())
                             || tail.split_whitespace().take(3).count() == 3)
                 });
+                // A list item may be a few words.
+                let item_words = body_tails
+                    .clone()
+                    .any(|(_, tail)| letters(tail) >= 4 && tail.split_whitespace().count() >= 2);
                 if body_prose {
                     add_observation(&mut observations, CandidateObservationV2::BodyProseFlow);
                 }
@@ -498,7 +684,7 @@ impl PdfResolutionInput {
                 }) {
                     add_observation(&mut observations, CandidateObservationV2::SectionHeading);
                 }
-                if list_candidates.contains(candidate.id.as_str()) && body_prose {
+                if list_candidates.contains(candidate.id.as_str()) && item_words {
                     add_observation(&mut observations, CandidateObservationV2::ListItemLayout);
                 }
                 let marker_is_cross_reference = marker_lines.iter().any(|indexed| {
@@ -521,7 +707,11 @@ impl PdfResolutionInput {
                                 .any(|span| span.start < local.end && local.start < span.end)
                         })
                 });
-                if marker_is_cross_reference {
+                let opening = run.grammar == CandidateGrammar::Hierarchy
+                    && candidate.parent_candidate_id.is_none();
+                if marker_is_cross_reference
+                    || (opening && wrapped_into(&index, &by_line, &measures, candidate))
+                {
                     add_observation(&mut observations, CandidateObservationV2::CrossReference);
                 }
                 let table_or_form = marker_lines.iter().any(|indexed| {
@@ -589,6 +779,43 @@ impl PdfResolutionInput {
                 });
             }
         }
+        // A list ends where the layout ended one of its items, or a numbered paragraph began,
+        // before its next item.
+        let runs = runs
+            .into_iter()
+            .flat_map(|run| {
+                if run.grammar != CandidateGrammar::Enumerator {
+                    return vec![run];
+                }
+                let mut parts = Vec::<StructureCandidateRun>::new();
+                for candidate in run.markers {
+                    let continued = parts.last().is_some_and(|part| {
+                        let prior = part.markers.last().expect("a part has an item");
+                        let between =
+                            paragraph_starts.partition_point(|start| *start <= prior.range.start);
+                        !ended.contains(&prior.id)
+                            && paragraph_starts
+                                .get(between)
+                                .is_none_or(|start| *start >= candidate.range.start)
+                    });
+                    match parts.last_mut() {
+                        Some(part) if continued => {
+                            part.range.end = part.range.end.max(candidate.range.end);
+                            part.markers.push(candidate);
+                        }
+                        _ => parts.push(StructureCandidateRun {
+                            id: format!("{}.{}", run.id, parts.len() + 1),
+                            grammar: run.grammar,
+                            range: candidate.range,
+                            rooted: run.rooted,
+                            consecutive: run.consecutive,
+                            markers: vec![candidate],
+                        }),
+                    }
+                }
+                parts
+            })
+            .collect();
         Self {
             index,
             runs,
