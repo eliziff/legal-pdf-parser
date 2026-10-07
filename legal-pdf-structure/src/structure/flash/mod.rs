@@ -39,9 +39,13 @@ use std::sync::OnceLock;
 pub(super) fn party_label() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        let role = r"(?:(?:first|second|third|fourth|1st|2nd|3rd|4th)\s+)?(?:named\s+)?(?:applicants?|respondents?|appellants?|appellees?|plaintiffs?|defendants?|petitioners?|claimants?|complainants?|prosecutors?|accused|interven[eo]rs?|(?:notice|third|interested)\s+part(?:y|ies))";
+        let ordinal = r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|\d+(?:st|nd|rd|th))";
+        let role = format!(
+            r"(?:{ordinal}(?:\s*(?:,|and|&|to)\s*{ordinal})*\s+)?(?:named\s+)?(?:applicants?|respondents?|appellants?|appellees?|plaintiffs?|defendants?|petitioners?|claimants?|complainants?|prosecutors?|accused|interven[eo]rs?|amic(?:us|i)\s+curiae|(?:notice|third|interested|intervening|affected)\s+(?:part(?:y|ies)|persons?))"
+        );
+        // A label stands on its own line, or past a column gap after the party's name.
         Regex::new(&format!(
-            r"(?i)^[\-\u{{2013}}\u{{2014}}\u{{2015}}\u{{2026}}.\s]*(?:the\s+)?{role}(?:\s*(?:/|,|and|&)\s*(?:the\s+)?{role})*[\s.,:;]*$"
+            r"(?i)(?:^[\-\u{{2013}}\u{{2014}}\u{{2015}}\u{{2026}}.\s]*|\s{{3,}})(?:the\s+)?{role}(?:\s*(?:/|,|and|&|\()\s*(?:the\s+)?{role})*[\s.,:;)]*$"
         ))
         .expect("party label")
     })
