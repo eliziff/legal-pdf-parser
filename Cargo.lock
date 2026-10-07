@@ -1059,6 +1059,7 @@ dependencies = [
  "legal-structure-model",
  "regex",
  "serde_json",
+ "unicode-properties",
 ]
 
 [[package]]
