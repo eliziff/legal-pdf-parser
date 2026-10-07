@@ -177,7 +177,14 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     if advance <= 0.3 * height(a).min(height(b)).max(1.0) {
         return true;
     }
-    if resized(a, b) || advance > 1.4 * pitch.typical(size(a).min(size(b))) {
+    // A typeset page keeps its leading exactly, so a quarter more marks a break; a
+    // recognized line's box wanders more.
+    let gap = if a.spans.is_empty() || b.spans.is_empty() {
+        1.4
+    } else {
+        1.25
+    };
+    if resized(a, b) || advance > gap * pitch.typical(size(a).min(size(b))) {
         return true;
     }
     matches!((bold_share(a), bold_share(b)), (Some(x), Some(y)) if (x > 0.8 && y < 0.2) || (x < 0.2 && y > 0.8))
