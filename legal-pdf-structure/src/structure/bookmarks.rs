@@ -15,7 +15,10 @@
 //! - a bookmark on a contents page holds no other bookmark;
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
-use super::{continues_prose, has_dot_leader, PdfPrimitiveEvidence};
+use super::{
+    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator,
+    PdfPrimitiveEvidence,
+};
 use crate::layout::build_regions;
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use regex::Regex;
@@ -513,17 +516,18 @@ pub(super) fn reconcile_bookmarks(
             let same = |slot: usize, page: &Page| {
                 page.lines[slot].region_type == "heading" && page.lines[slot].block_index == block
             };
+            let numbered = |slot: usize, page: &Page| {
+                let text = page.lines[slot].text.trim();
+                inline_enumerator_re().is_match(text) || standalone_enumerator(text)
+            };
             let mut start = anchor.lines[0];
-            if !levels.contains_key(&page.lines[start].id) {
+            if !numbered(start, page) {
                 while start > 0 && same(start - 1, page) {
                     start -= 1;
                 }
             }
             let mut end = *anchor.lines.last().unwrap();
-            while end + 1 < page.lines.len()
-                && same(end + 1, page)
-                && !levels.contains_key(&page.lines[end + 1].id)
-            {
+            while end + 1 < page.lines.len() && same(end + 1, page) && !numbered(end + 1, page) {
                 end += 1;
             }
             anchor.lines = (start..=end).collect();

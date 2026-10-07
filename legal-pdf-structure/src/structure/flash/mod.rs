@@ -468,6 +468,8 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
         levels[index] = parent.map_or(1, |parent| levels[parent] + 1);
         stack.push(index);
     }
+    // A heading read with a numbered one inside it ("III. Law and Argument" over "A. Approving
+    // Sale") keeps the inner one's ladder step below it, for a later reading that parts them.
     for (candidate, level) in accepted.iter().zip(&levels) {
         let block = &blocks[candidate.block];
         for &slot in &block.line_slots {
@@ -475,7 +477,15 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
             if proposed.contains(&candidate.block) {
                 line.region_type = "heading".to_owned();
             }
-            primitives.heading_levels.insert(line.id.clone(), *level);
+            let step = candidate.level.and_then(|top| {
+                primitives
+                    .heading_levels
+                    .get(&line.id)
+                    .map(|own| own.saturating_sub(top))
+            });
+            primitives
+                .heading_levels
+                .insert(line.id.clone(), level + step.unwrap_or(0));
         }
     }
     build_regions(pages);
