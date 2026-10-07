@@ -218,46 +218,61 @@ pub(super) fn contents_row(text: &str) -> bool {
 
 pub(super) fn contents_leader_re() -> &'static Regex {
     static LEADER: OnceLock<Regex> = OnceLock::new();
-    LEADER.get_or_init(|| Regex::new(r"(?:\. ){3,}|\.{4,}").expect("contents leader regex"))
+    // A leader runs to the line's end or to the locator that ends it: dots inside a line are an
+    // ellipsis. A rule is a leader only before a locator; alone it is a form's blank.
+    LEADER.get_or_init(|| {
+        Regex::new(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
+            .expect("contents leader regex")
+    })
 }
 
 fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
-    const MIN_LINE_NUMBERS: u32 = 15;
     pages
         .iter()
-        .filter_map(|page| {
-            if page.width <= 0.0 {
-                return None;
-            }
-            let mut candidates = page
-                .lines
-                .iter()
-                .filter_map(|line| {
-                    let number = arabic_page_number(&line.text)?;
-                    (number <= 40).then_some((line.bbox[0], number))
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-            let tolerance = page.width * 0.03;
-            let mut best = &candidates[0..0];
-            let mut start = 0;
-            for end in 0..candidates.len() {
-                while candidates[end].0 - candidates[start].0 > tolerance {
-                    start += 1;
-                }
-                if end + 1 - start > best.len() {
-                    best = &candidates[start..=end];
-                }
-            }
-            let values = best
-                .iter()
-                .map(|(_, number)| *number)
-                .collect::<HashSet<_>>();
-            (values.len() >= MIN_LINE_NUMBERS as usize
-                && (1..=MIN_LINE_NUMBERS).all(|number| values.contains(&number)))
-            .then_some(page.index)
-        })
+        .filter(|page| !line_number_column(page).is_empty())
+        .map(|page| page.index)
         .collect()
+}
+
+/// A transcript's printed line numbers: a column of small numbers counting at least
+/// 1 to 15 down the page. Returns the column's line slots, or none.
+pub(super) fn line_number_column(page: &Page) -> Vec<usize> {
+    const MIN_LINE_NUMBERS: u32 = 15;
+    if page.width <= 0.0 {
+        return Vec::new();
+    }
+    let mut candidates = page
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, line)| {
+            let number = arabic_page_number(&line.text)?;
+            (number <= 40).then_some((line.bbox[0], number, slot))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let tolerance = page.width * 0.03;
+    let mut best = &candidates[0..0];
+    let mut start = 0;
+    for end in 0..candidates.len() {
+        while candidates[end].0 - candidates[start].0 > tolerance {
+            start += 1;
+        }
+        if end + 1 - start > best.len() {
+            best = &candidates[start..=end];
+        }
+    }
+    let values = best
+        .iter()
+        .map(|(_, number, _)| *number)
+        .collect::<HashSet<_>>();
+    if values.len() >= MIN_LINE_NUMBERS as usize
+        && (1..=MIN_LINE_NUMBERS).all(|number| values.contains(&number))
+    {
+        best.iter().map(|(_, _, slot)| *slot).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Word-index and concordance pages: short headwords in alphabetical order, each
