@@ -574,9 +574,11 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 if page.width <= 0.0 || page.height <= 0.0 {
                     continue;
                 }
-                let edge = if line.bbox[3] < page.height * 0.12 {
+                // A running head is in the band it starts in, a footer in the one it ends in,
+                // though its type reaches past the band's edge.
+                let edge = if line.bbox[1] < page.height * 0.12 {
                     Some(true)
-                } else if line.bbox[1] > page.height * 0.90 {
+                } else if line.bbox[3] > page.height * 0.90 {
                     Some(false)
                 } else {
                     None
@@ -636,7 +638,7 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 .iter()
                 .enumerate()
                 .filter(|(label_index, label)| {
-                    !(repeated.contains(&(page_slot, *label_index)) && label.bbox[3] < page.height * 0.12)
+                    !(repeated.contains(&(page_slot, *label_index)) && label.bbox[1] < page.height * 0.12)
                         && standalone_note_label(label)
                         && page.lines.iter().enumerate().any(|(body_index, body)| {
                             !repeated.contains(&(page_slot, body_index))
@@ -686,8 +688,8 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 .collect();
             for (index, line) in page.lines.iter_mut().enumerate() {
                 let line_size = line_sizes[index];
-                let at_top = line.bbox[3] < page.height * 0.12;
-                let at_bottom = line.bbox[1] > page.height * 0.90;
+                let at_top = line.bbox[1] < page.height * 0.12;
+                let at_bottom = line.bbox[3] > page.height * 0.90;
                 let page_number_at_top = line.bbox[3] < page.height * 0.14;
                 let compact_note =
                     at_bottom && line_size < body_size * 0.90 && compact_note_line(&line.text);
@@ -716,6 +718,7 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     .to_owned();
                 }
             }
+            mark_print_margins(page);
             extend_running_heads(page, &line_sizes, body_size);
         }
     });
@@ -760,7 +763,7 @@ fn extend_running_heads(page: &mut Page, line_sizes: &[f64], body_size: f64) {
 fn printed_label(value: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)^(?:(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})|-\s*(\d{1,6})\s*-)$").unwrap()
+        Regex::new(r"(?i)^(?:(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d{1,6})?|-\s*(\d{1,6})\s*-)$").unwrap()
     })
     .captures(value.trim())
     .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
@@ -778,9 +781,50 @@ fn printed_label_accepts_symmetric_numeric_folios_only() {
     assert_eq!(printed_label("- 13"), None);
 }
 
+/// A browser or print driver sets the page's address and the time it was printed in the
+/// outer margins, with the page title and "1 of 3" on the same rows. They are furniture on
+/// a single page too, where nothing repeats to show it.
+fn mark_print_margins(page: &mut Page) {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let stamp = RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|\s)(?:https?://|www\.)\S+|(?:^|\s)\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]\.?\s?m\.?)?",
+        )
+        .unwrap()
+    });
+    let band = page.height * 0.06;
+    let edge = |line: &Line| {
+        if line.bbox[1] <= band {
+            Some("header")
+        } else if line.bbox[3] >= page.height - band {
+            Some("footer")
+        } else {
+            None
+        }
+    };
+    let rows: Vec<(&'static str, f64, f64)> = page
+        .lines
+        .iter()
+        .filter(|line| stamp.is_match(line.text.trim()))
+        .filter_map(|line| edge(line).map(|kind| (kind, line.bbox[1], line.bbox[3])))
+        .collect();
+    for line in &mut page.lines {
+        let Some(kind) = edge(line) else { continue };
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        if rows.iter().any(|(row, top, bottom)| {
+            *row == kind && line.bbox[3].min(*bottom) - line.bbox[1].max(*top) > height * 0.5
+        }) {
+            line.region_type = kind.to_owned();
+        }
+    }
+}
+
 fn footer_page_number(value: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^\s*-?\s*(?:page\s+)?[ivxlcdm\d]+\s*-?\s*$").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*-?\s*(?:page\s+)?[ivxlcdm\d]+(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d+)?\s*-?\s*$")
+            .unwrap()
+    })
         .is_match(value.trim())
 }
 
