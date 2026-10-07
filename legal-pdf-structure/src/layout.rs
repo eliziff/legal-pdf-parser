@@ -432,7 +432,7 @@ pub(super) fn column_model(lines: &[Line], page_width: f64) -> ColumnModel {
 }
 
 /// English and French function words counted in some lines: (english, french).
-fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {
+pub(super) fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {
     const ENGLISH: [&str; 24] = [
         "the", "of", "and", "to", "in", "that", "is", "be", "for", "by", "with", "or", "any",
         "which", "shall", "not", "was", "this", "as", "it", "are", "from", "under", "were",
@@ -457,7 +457,7 @@ fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {
 }
 
 /// A column's language from its votes: Some(true) for French, Some(false) for English.
-fn column_language((english, french): (usize, usize), minimum: usize) -> Option<bool> {
+pub(super) fn column_language((english, french): (usize, usize), minimum: usize) -> Option<bool> {
     if french >= minimum && french >= english * 3 {
         Some(true)
     } else if english >= minimum && english >= french * 3 {

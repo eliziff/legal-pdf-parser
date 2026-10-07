@@ -11,6 +11,7 @@
 //! A table the page cuts off goes on at the top of the next page, or under its repeated
 //! caption and head row, when its columns stand where they stood.
 
+use legal_pdf_core::line_font_size;
 use legal_pdf_core::model::{Line, Page};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -834,7 +835,591 @@ fn open_tables(page: &Page, rules: &[Rule], taken: &HashSet<usize>) -> Vec<PdfTa
     tables
 }
 
-fn page_tables(page: &Page) -> Vec<PdfTable> {
+/// Party roles a caption sets beside the names it lists.
+fn party_role(text: &str) -> bool {
+    static ROLE: OnceLock<Regex> = OnceLock::new();
+    ROLE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:applicants?|respondents?|plaintiffs?|defendants?|appellants?|petitioners?|claimants?|interveners?|intervenors?|interested\s+part(?:y|ies)|amic(?:us|i)\s+curiae|accused|complainants?|third\s+part(?:y|ies)|requérante?s?|intimée?s?|demandeur|demanderesse|défendeur|défenderesse|appelante?s?)\b",
+        )
+        .expect("party role regex")
+    })
+    .is_match(text)
+}
+
+/// A list marker or a line number standing alone: "3.", "(b)", "[12]", "iv)", "17".
+fn bare_marker(text: &str) -> bool {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            Regex::new(r"^[\[(]?(?:\d{1,4}|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})(?:\.\d{1,3})*[.)\]]?$")
+                .expect("list marker regex")
+        })
+        .is_match(text.trim())
+}
+
+/// A figure: an amount, a count, a percentage, a year, a range of them.
+fn figure(text: &str) -> bool {
+    let text = text.trim();
+    let digits = text.chars().filter(char::is_ascii_digit).count();
+    digits > 0
+        && digits * 2 >= text.chars().filter(|c| !c.is_whitespace()).count()
+        && text.chars().filter(|c| c.is_alphabetic()).count() <= 1
+}
+
+/// A form's label, set before or above its value: "Lawyer:", "Date: 4 May".
+fn form_label(text: &str) -> bool {
+    static LABEL: OnceLock<Regex> = OnceLock::new();
+    text.trim().ends_with(':')
+        || LABEL
+            .get_or_init(|| {
+                Regex::new(r"^\p{L}[\p{L} .'/&-]{0,25}:(?:\s|$)").expect("form label regex")
+            })
+            .is_match(text.trim())
+}
+
+/// A letterhead's or an address for service's contact details.
+fn contact_detail(text: &str) -> bool {
+    static CONTACT: OnceLock<Regex> = OnceLock::new();
+    CONTACT
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)\b(?:tel|telephone|phone|fax|e-?mail|t[ée]l[ée]copieur|courriel)\b|@|www\.|\bLLP\b",
+            )
+            .expect("contact regex")
+        })
+        .is_match(text)
+}
+
+/// Tables set without rules: rows of text whose columns stand apart by gutters of white
+/// space that run the table's full height, each column's cells aligned on a left, right
+/// or centre edge. Columns of prose side by side are a page's or a bilingual text's
+/// columns, not a table; parties beside their roles are a caption; labels ending in a
+/// colon over their values are a form; numbered lines and items beside their text are a
+/// transcript or a list unless a head row names the columns; a contents list is no table.
+/// What stays has three or more columns, a column of figures or a head row.
+fn aligned_tables(
+    page: &Page,
+    taken: &HashSet<usize>,
+    translation: &HashSet<String>,
+) -> Vec<PdfTable> {
+    let mut heights: Vec<f64> = page
+        .lines
+        .iter()
+        .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
+        .map(|line| line.bbox[3] - line.bbox[1])
+        .filter(|height| *height > 0.0)
+        .collect();
+    // A recognized page's lines are no measure of its white space.
+    if heights.len() < 6 || page.source == "ocr" {
+        return Vec::new();
+    }
+    heights.sort_by(f64::total_cmp);
+    let pitch = heights[heights.len() / 2];
+    let gutter = (0.6 * pitch).max(6.0);
+    // Lines, parted where their words leave a column's gap.
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (index, line) in page.lines.iter().enumerate() {
+        // A watermark's large or turned letters stand over the page's columns; a signing
+        // stamp's tiny print stands beside the signature.
+        if taken.contains(&index)
+            || line.exclude_from_body
+            || line.text.trim().is_empty()
+            || !line.bbox.iter().all(|value| value.is_finite())
+            || line.bbox[3] - line.bbox[1] > 2.5 * pitch
+            || line.bbox[3] - line.bbox[1] < 0.5 * pitch
+        {
+            continue;
+        }
+        let size = line_font_size(line)
+            .max(line.bbox[3] - line.bbox[1])
+            .max(1.0);
+        let words: Vec<_> = line
+            .words
+            .iter()
+            .filter(|word| !word.text.trim().is_empty())
+            .collect();
+        let mut start = 0;
+        for split in 1..=words.len() {
+            if split < words.len() && words[split].bbox[0] - words[split - 1].bbox[2] < 1.2 * size {
+                continue;
+            }
+            if start == 0 && split == words.len() {
+                break;
+            }
+            let part = &words[start..split];
+            pieces.push(Piece {
+                line: index,
+                chars: Some((part[0].start, part[part.len() - 1].end)),
+                bbox: [
+                    part[0].bbox[0],
+                    part.iter()
+                        .map(|word| word.bbox[1])
+                        .fold(f64::INFINITY, f64::min),
+                    part[part.len() - 1].bbox[2],
+                    part.iter()
+                        .map(|word| word.bbox[3])
+                        .fold(f64::NEG_INFINITY, f64::max),
+                ],
+            });
+            start = split;
+        }
+        if start == 0 {
+            pieces.push(Piece {
+                line: index,
+                chars: None,
+                bbox: line.bbox,
+            });
+        }
+    }
+    pieces.sort_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]));
+    // Visual rows.
+    let mut bands: Vec<Vec<Piece>> = Vec::new();
+    let mut floor = f64::NEG_INFINITY;
+    for piece in pieces {
+        let height = piece.bbox[3] - piece.bbox[1];
+        if piece.bbox[1] > floor - 0.5 * height {
+            bands.push(Vec::new());
+            floor = piece.bbox[3];
+        }
+        floor = floor.max(piece.bbox[3]);
+        bands.last_mut().expect("band").push(piece);
+    }
+    let coverage = |band: &[Piece]| {
+        let mut spans: Vec<(f64, f64)> = band
+            .iter()
+            .map(|piece| (piece.bbox[0], piece.bbox[2]))
+            .collect();
+        spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    };
+    let top = |band: &[Piece]| {
+        band.iter()
+            .map(|piece| piece.bbox[1])
+            .fold(f64::INFINITY, f64::min)
+    };
+    let bottom = |band: &[Piece]| {
+        band.iter()
+            .map(|piece| piece.bbox[3])
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    let mut tables = Vec::new();
+    let mut start = 0;
+    while start < bands.len() {
+        let spans = coverage(&bands[start]);
+        let mut gutters: Vec<(f64, f64)> = spans
+            .windows(2)
+            .map(|pair| (pair[0].1, pair[1].0))
+            .filter(|(left, right)| right - left >= gutter)
+            .collect();
+        if gutters.is_empty() {
+            start += 1;
+            continue;
+        }
+        let mut extent = (spans[0].0, spans[spans.len() - 1].1);
+        let mut end = start + 1;
+        while end < bands.len() && top(&bands[end]) - bottom(&bands[end - 1]) <= 2.5 * pitch {
+            let spans = coverage(&bands[end]);
+            let narrowed: Vec<(f64, f64)> = gutters
+                .iter()
+                .flat_map(|(left, right)| {
+                    let mut open = vec![(*left, *right)];
+                    for (start, end) in &spans {
+                        open = open
+                            .into_iter()
+                            .flat_map(|(left, right)| {
+                                if *end <= left || *start >= right {
+                                    vec![(left, right)]
+                                } else {
+                                    vec![(left, *start), (*end, right)]
+                                }
+                            })
+                            .collect();
+                    }
+                    open
+                })
+                .filter(|(left, right)| right - left >= gutter)
+                .collect();
+            if narrowed.is_empty() {
+                break;
+            }
+            gutters = narrowed;
+            extent = (
+                extent.0.min(spans[0].0),
+                extent.1.max(spans[spans.len() - 1].1),
+            );
+            end += 1;
+        }
+        let found =
+            aligned_table(page, &bands[start..end], &gutters, extent, pitch).filter(|table| {
+                !table
+                    .line_ids()
+                    .into_iter()
+                    .any(|id| translation.contains(id))
+            });
+        start = if found.is_some() { end } else { start + 1 };
+        tables.extend(found);
+    }
+    tables
+}
+
+/// The table some visual rows make between the gutters they share, if it passes.
+fn aligned_table(
+    page: &Page,
+    bands: &[Vec<Piece>],
+    gutters: &[(f64, f64)],
+    extent: (f64, f64),
+    pitch: f64,
+) -> Option<PdfTable> {
+    if bands.len() < 3 {
+        return None;
+    }
+    let mut xs = vec![extent.0];
+    xs.extend(gutters.iter().map(|(left, right)| (left + right) / 2.0));
+    xs.push(extent.1);
+    let columns = xs.len() - 1;
+    let column_of = |piece: &Piece| {
+        let middle = (piece.bbox[0] + piece.bbox[2]) / 2.0;
+        xs.partition_point(|x| *x < middle).clamp(1, columns) - 1
+    };
+    // Rows: a band with nothing in the first column, close under a row, wraps that row.
+    let mut rows: Vec<(Vec<Vec<Piece>>, f64)> = Vec::new();
+    for band in bands {
+        let mut cells = vec![Vec::new(); columns];
+        for piece in band {
+            cells[column_of(piece)].push(*piece);
+        }
+        let band_top = band
+            .iter()
+            .map(|piece| piece.bbox[1])
+            .fold(f64::INFINITY, f64::min);
+        let band_bottom = band
+            .iter()
+            .map(|piece| piece.bbox[3])
+            .fold(f64::NEG_INFINITY, f64::max);
+        match rows.last_mut() {
+            Some((row, floor)) if cells[0].is_empty() && band_top - *floor <= 0.6 * pitch => {
+                for (column, pieces) in cells.into_iter().enumerate() {
+                    row[column].extend(pieces);
+                }
+                *floor = band_bottom;
+            }
+            _ => rows.push((cells, band_bottom)),
+        }
+    }
+    let filled = |row: &Vec<Vec<Piece>>| row.iter().filter(|cell| !cell.is_empty()).count();
+    while rows.first().is_some_and(|(row, _)| filled(row) < 2) {
+        rows.remove(0);
+    }
+    while rows.last().is_some_and(|(row, _)| filled(row) < 2) {
+        rows.pop();
+    }
+    let paired = rows.iter().filter(|(row, _)| filled(row) >= 2).count();
+    if paired < 3 || paired * 2 < rows.len() {
+        return None;
+    }
+    let text = |pieces: &[Piece]| {
+        pieces
+            .iter()
+            .map(|piece| {
+                let line = &page.lines[piece.line].text;
+                match piece.chars {
+                    Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
+                    None => line.clone(),
+                }
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+    let column_texts: Vec<Vec<String>> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter(|(row, _)| !row[column].is_empty())
+                .map(|(row, _)| text(&row[column]).trim().to_owned())
+                .collect()
+        })
+        .collect();
+    let share = |texts: &[String], test: &dyn Fn(&str) -> bool| {
+        texts.iter().filter(|text| test(text)).count() as f64 / texts.len().max(1) as f64
+    };
+    // Each column's cells keep one edge or their centre in line.
+    let aligned = (0..columns).all(|column| {
+        let firsts: Vec<[f64; 4]> = rows
+            .iter()
+            .filter_map(|(row, _)| row[column].first().map(|piece| piece.bbox))
+            .collect();
+        if firsts.len() < 2 {
+            return true;
+        }
+        let median = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let left = median(firsts.iter().map(|bbox| bbox[0]).collect());
+        let right = median(firsts.iter().map(|bbox| bbox[2]).collect());
+        let centre = median(
+            firsts
+                .iter()
+                .map(|bbox| (bbox[0] + bbox[2]) / 2.0)
+                .collect(),
+        );
+        let kept = firsts
+            .iter()
+            .filter(|bbox| {
+                (bbox[0] - left).abs() <= 3.0
+                    || (bbox[2] - right).abs() <= 3.0
+                    || ((bbox[0] + bbox[2]) / 2.0 - centre).abs() <= 3.0
+            })
+            .count();
+        kept * 10 >= firsts.len() * 7
+    });
+    let median_length = |texts: &[String]| {
+        let mut lengths: Vec<usize> = texts.iter().map(|text| text.chars().count()).collect();
+        lengths.sort_unstable();
+        lengths.get(lengths.len() / 2).copied().unwrap_or(0)
+    };
+    let long = column_texts
+        .iter()
+        .filter(|texts| median_length(texts) > 30)
+        .count();
+    let lines: Vec<Line> = rows
+        .iter()
+        .flat_map(|(row, _)| row.iter().flatten())
+        .map(|piece| piece.line)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|index| page.lines[index].clone())
+        .collect();
+    let leaders = lines
+        .iter()
+        .filter(|line| contents_leader(&line.text))
+        .count();
+    let caption = column_texts
+        .iter()
+        .any(|texts| share(texts, &party_role) >= 0.4)
+        || column_texts
+            .iter()
+            .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5);
+    let labels = column_texts
+        .iter()
+        .any(|texts| share(texts, &form_label) >= 0.5);
+    let cells: Vec<String> = column_texts.concat();
+    // Bullets or boxes to tick down a column mark a list or a form.
+    // Columns that each repeat one word down every row are a form's choices: Yes, No.
+    let choices = column_texts
+        .iter()
+        .filter(|texts| texts.len() >= 3 && texts.iter().all(|text| *text == texts[0]))
+        .count()
+        >= 2;
+    let ticked = column_texts.iter().any(|texts| {
+        share(texts, &|text| {
+            text.chars().count() == 1 && text.chars().all(|c| "\u{2022}\u{25e6}\u{25aa}\u{25ab}\u{25a0}\u{25a1}\u{25cf}\u{25cb}\u{f0b7}\u{f0a7}-\u{2013}*\u{b7}".contains(c))
+        }) >= 0.7
+    });
+    // A column whose rows carry on one another's sentences, each line set out to the
+    // column's measure, is running text set beside other running text: panels side by
+    // side, or a text and its translation.
+    let flowing = (0..columns).any(|column| {
+        let measure = rows
+            .iter()
+            .flat_map(|(row, _)| &row[column])
+            .map(|piece| piece.bbox[2])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let start = rows
+            .iter()
+            .flat_map(|(row, _)| &row[column])
+            .map(|piece| piece.bbox[0])
+            .fold(f64::INFINITY, f64::min);
+        let pairs: Vec<(&Vec<Piece>, &Vec<Piece>)> = rows
+            .windows(2)
+            .filter(|pair| !pair[0].0[column].is_empty() && !pair[1].0[column].is_empty())
+            .map(|pair| (&pair[0].0[column], &pair[1].0[column]))
+            .collect();
+        let carried = pairs
+            .iter()
+            .filter(|(before, after)| {
+                let full = before
+                    .iter()
+                    .map(|piece| piece.bbox[2])
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    >= measure - 0.15 * (measure - start);
+                let (before, after) = (text(before), text(after));
+                full && !before.trim_end().ends_with(['.', ';', ':', '!', '?'])
+                    && after
+                        .trim_start()
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_lowercase)
+            })
+            .count();
+        pairs.len() >= 2 && carried * 10 >= pairs.len() * 4
+    });
+    let languages: Vec<Option<bool>> = (0..columns)
+        .map(|column| {
+            let column_lines: Vec<&Line> = rows
+                .iter()
+                .flat_map(|(row, _)| &row[column])
+                .map(|piece| &page.lines[piece.line])
+                .collect();
+            crate::layout::column_language(
+                crate::layout::language_votes(column_lines.into_iter()),
+                5,
+            )
+        })
+        .collect();
+    // Neighbouring cells that repeat each other's names and numbers are a text and its
+    // translation, row by row.
+    let parallel = (0..columns - 1).any(|column| {
+        let tokens = |pieces: &[Piece]| -> HashSet<String> {
+            text(pieces)
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| {
+                    token.chars().count() >= 3 || token.chars().any(|c| c.is_ascii_digit())
+                })
+                .map(str::to_lowercase)
+                .collect()
+        };
+        let pairs: Vec<(HashSet<String>, HashSet<String>)> = rows
+            .iter()
+            .filter(|(row, _)| !row[column].is_empty() && !row[column + 1].is_empty())
+            .map(|(row, _)| (tokens(&row[column]), tokens(&row[column + 1])))
+            .filter(|(left, right)| !left.is_empty() && !right.is_empty())
+            .collect();
+        let alike = pairs
+            .iter()
+            .filter(|(left, right)| {
+                left.intersection(right).count() * 5 >= left.union(right).count() * 2
+            })
+            .count();
+        pairs.len() >= 3 && alike * 2 >= pairs.len()
+    });
+    let bilingual =
+        parallel || (languages.contains(&Some(true)) && languages.contains(&Some(false)));
+    let contacts = share(&cells, &contact_detail) >= 0.2;
+    let header = {
+        let (first, _) = &rows[0];
+        let cells: Vec<String> = first
+            .iter()
+            .filter(|cell| !cell.is_empty())
+            .map(|cell| text(cell))
+            .collect();
+        let bold_head = first
+            .iter()
+            .flatten()
+            .all(|piece| bold(&page.lines[piece.line]))
+            && rows[1..]
+                .iter()
+                .flat_map(|(row, _)| row.iter().flatten())
+                .any(|piece| !bold(&page.lines[piece.line]));
+        let labelled = cells.len() >= 2
+            && cells.iter().all(|cell| {
+                let cell = cell.trim();
+                cell.chars().count() <= 30
+                    && cell.chars().any(char::is_alphabetic)
+                    && !bare_marker(cell)
+                    && !cell.ends_with(':')
+            });
+        let numbered = share(&column_texts[0], &bare_marker) >= 0.7;
+        let figures = (1..columns).any(|column| share(&column_texts[column], &figure) >= 0.6);
+        labelled
+            && (bold_head || (first.iter().all(|cell| !cell.is_empty()) && (numbered || figures)))
+    };
+    let sequential = {
+        let numbers: Vec<u32> = column_texts[0]
+            .iter()
+            .filter_map(|text| text.trim().parse::<u32>().ok())
+            .collect();
+        numbers.len() >= 5 && numbers.windows(2).all(|pair| pair[1] == pair[0] + 1)
+    };
+    let figures = (1..columns).any(|column| share(&column_texts[column], &figure) >= 0.6);
+    // Page numbers or entry numbers running up beside titles are a contents list.
+    let ascending = |texts: &[String]| {
+        let numbers: Vec<u32> = texts
+            .iter()
+            .filter_map(|text| text.trim().trim_end_matches('.').parse::<u32>().ok())
+            .collect();
+        numbers.len() >= 3
+            && numbers.len() * 10 >= texts.len() * 7
+            && numbers.windows(2).filter(|pair| pair[0] <= pair[1]).count() * 5
+                >= (numbers.len() - 1) * 4
+    };
+    let listed = !header && (ascending(&column_texts[0]) || ascending(&column_texts[columns - 1]));
+    // Markers beside running text are a list or numbered paragraphs.
+    let itemized = !header
+        && (0..columns - 1).any(|column| {
+            share(&column_texts[column], &bare_marker) >= 0.7
+                && median_length(&column_texts[column + 1]) > 30
+        });
+    if !aligned
+        || listed
+        || itemized
+        || long > 1
+        || leaders >= 2
+        || crate::layout::contents_grid(&lines, page.width)
+        || caption
+        || labels
+        || contacts
+        || ticked
+        || choices
+        || flowing
+        || bilingual
+        || sequential
+        || !(columns >= 3 || figures || header)
+    {
+        return None;
+    }
+    let mut table_rows: Vec<TableRow> = rows
+        .into_iter()
+        .map(|(row, _)| TableRow {
+            header: false,
+            cells: row
+                .into_iter()
+                .enumerate()
+                .map(|(column, pieces)| cell_of(page, column, pieces))
+                .collect(),
+        })
+        .collect();
+    table_rows[0].header = header;
+    // A line parted between cells must run straight on from one cell into the next.
+    let sequence: Vec<&CellPart> = table_rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .flat_map(|cell| &cell.parts)
+        .collect();
+    let mut runs: HashMap<&str, usize> = HashMap::new();
+    for (position, part) in sequence.iter().enumerate() {
+        if position == 0 || sequence[position - 1].line_id != part.line_id {
+            *runs.entry(part.line_id.as_str()).or_default() += 1;
+        }
+    }
+    if runs.values().any(|count| *count > 1) {
+        return None;
+    }
+    let top = bands[0]
+        .iter()
+        .map(|piece| piece.bbox[1])
+        .fold(f64::INFINITY, f64::min);
+    let bottom = bands[bands.len() - 1]
+        .iter()
+        .map(|piece| piece.bbox[3])
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some(PdfTable {
+        rows: table_rows,
+        page_index: page.index,
+        xs,
+        top,
+        bottom,
+    })
+}
+
+fn drawn_tables(page: &Page) -> Vec<PdfTable> {
     let (mut horizontal, mut vertical) = (Vec::new(), Vec::new());
     for region in page.regions.iter().filter(|region| region.kind == "rule") {
         let [x0, y0, x1, y1] = region.bbox;
@@ -905,7 +1490,53 @@ fn page_tables(page: &Page) -> Vec<PdfTable> {
         .filter(|(_, vertical)| vertical.is_empty())
         .flat_map(|(horizontal, _)| horizontal)
         .collect();
-    tables.extend(open_tables(page, &free, &taken));
+    tables.extend(
+        open_tables(page, &free, &taken)
+            .into_iter()
+            .filter(|table| !bilingual_columns(page, table)),
+    );
+    tables
+}
+
+/// Whether one column of a table reads in English and another in French: a text set beside
+/// its translation under shared heads, not a table.
+fn bilingual_columns(page: &Page, table: &PdfTable) -> bool {
+    let by_id: HashMap<&str, &Line> = page
+        .lines
+        .iter()
+        .map(|line| (line.id.as_str(), line))
+        .collect();
+    let mut columns: HashMap<usize, Vec<&Line>> = HashMap::new();
+    for cell in table.rows.iter().flat_map(|row| &row.cells) {
+        columns.entry(cell.column).or_default().extend(
+            cell.line_ids()
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()).copied()),
+        );
+    }
+    let languages: Vec<Option<bool>> = columns
+        .into_values()
+        .map(|lines| {
+            crate::layout::column_language(crate::layout::language_votes(lines.into_iter()), 5)
+        })
+        .collect();
+    languages.contains(&Some(true)) && languages.contains(&Some(false))
+}
+
+fn page_tables(page: &Page, translation: &HashSet<String>) -> Vec<PdfTable> {
+    let mut tables = drawn_tables(page);
+    let lines: HashMap<&str, usize> = page
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| (line.id.as_str(), index))
+        .collect();
+    let taken: HashSet<usize> = tables
+        .iter()
+        .flat_map(PdfTable::line_ids)
+        .map(|id| lines[id.as_str()])
+        .collect();
+    tables.extend(aligned_tables(page, &taken, translation));
     tables.sort_by(|left, right| left.top.total_cmp(&right.top));
     tables
 }
@@ -958,11 +1589,11 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
 
 /// Every ruled table in the document, a table cut off by a page break joined to its
 /// continuation, in reading order.
-pub(crate) fn ruled_tables(pages: &[Page]) -> Vec<PdfTable> {
+pub(crate) fn ruled_tables(pages: &[Page], translation: &HashSet<String>) -> Vec<PdfTable> {
     let mut tables: Vec<PdfTable> = Vec::new();
     let mut previous_last: Option<usize> = None;
     for page in pages {
-        let found = page_tables(page);
+        let found = page_tables(page, translation);
         let empty_band = |from: f64, to: f64| {
             !page.lines.iter().any(|line| {
                 !line.exclude_from_body
@@ -997,7 +1628,17 @@ pub(crate) fn ruled_tables(pages: &[Page]) -> Vec<PdfTable> {
                                 && prior.rows[0].cells.len() == table.rows[0].cells.len()
                                 && row_text(prior, 0) == row_text(&table, 0)))
                 })
-                .and_then(|index| shared_columns(&tables[index].xs, &table.xs));
+                .and_then(|index| {
+                    let prior = &tables[index];
+                    // Columns set by white space alone shift a little from page to page; a
+                    // repeated head row with as many columns keeps them.
+                    shared_columns(&prior.xs, &table.xs).or_else(|| {
+                        (prior.xs.len() == table.xs.len()
+                            && !table.rows.is_empty()
+                            && row_text(prior, 0) == row_text(&table, 0))
+                        .then(|| prior.xs.clone())
+                    })
+                });
             first = false;
             let Some(union) = union else {
                 tables.push(table);
