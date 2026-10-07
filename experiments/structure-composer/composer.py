@@ -321,7 +321,8 @@ def apply(structure, request, response):
             if len(raw_refs) != 1 or body or raw_refs[0] not in request["annotation_aliases"]:
                 raise ValueError("Removal names exactly one existing annotation, with an empty body")
             ident = request["annotation_aliases"][raw_refs[0]]
-            existing = next(a for a in request["annotations"] + request.get("native_nodes", []) if a["id"] == ident)
+            existing = next((a for a in request["annotations"] + request.get("native_nodes", []) if a["id"] == ident), None)
+            if existing is None: raise ValueError("Removal names an annotation that no longer exists")
             if not any(i in targets for i in existing.get("line_ids", [])): raise ValueError("Removal outside TARGET")
             removed.add(ident)
             continue
