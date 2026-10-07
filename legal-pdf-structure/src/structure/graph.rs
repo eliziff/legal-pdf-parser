@@ -416,10 +416,28 @@ impl PdfResolutionInput {
             }
             for candidate in &run.markers {
                 let candidate_lines = index.overlapping_lines(candidate.range);
-                let line_ids = candidate_lines
+                // A running head, folio or print margin inside the range is the page's, not
+                // the item's; an item set wholly in them keeps them, and is excluded as furniture.
+                let running = |line_id: &str| {
+                    by_line.get(line_id).is_some_and(|(_, line)| {
+                        matches!(line.region_type.as_str(), "header" | "footer")
+                    })
+                };
+                let line_ids: Vec<String> = if candidate_lines
                     .iter()
-                    .map(|line| line.line_id.clone())
-                    .collect();
+                    .all(|line| running(&line.line_id))
+                {
+                    candidate_lines
+                        .iter()
+                        .map(|line| line.line_id.clone())
+                        .collect()
+                } else {
+                    candidate_lines
+                        .iter()
+                        .filter(|line| !running(&line.line_id))
+                        .map(|line| line.line_id.clone())
+                        .collect()
+                };
                 let page_indexes = index.page_indexes(candidate.range);
                 let marker_lines = index.overlapping_lines(candidate.marker_range);
                 let mut observations = Vec::new();
