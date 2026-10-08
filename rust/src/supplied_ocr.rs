@@ -89,26 +89,33 @@ impl PdfOcrProvider for &SuppliedOcr {
     ) -> Result<Vec<OcrPageResult>> {
         requests
             .iter()
-            .map(|request| {
-                let page = self
+            .filter_map(|request| {
+                let Some(page) = self
                     .pages
                     .iter()
                     .find(|p| p.page_index == request.page_index)
-                    .ok_or_else(|| {
-                        Error::Message(format!("Missing OCR for page {}", request.page_index + 1))
-                    })?;
+                else {
+                    // Pictures on a page with text of its own are read only where the host
+                    // recognized that page; the page itself needs no recognition.
+                    return (request.regions.is_empty()).then(|| {
+                        Err(Error::Message(format!(
+                            "Missing OCR for page {}",
+                            request.page_index + 1
+                        )))
+                    });
+                };
                 if (page.width - request.width).abs() > 0.5
                     || (page.height - request.height).abs() > 0.5
                 {
-                    return Err(Error::Message(
+                    return Some(Err(Error::Message(
                         "OCR page dimensions do not match the PDF".into(),
-                    ));
+                    )));
                 }
-                Ok(OcrPageResult {
+                Some(Ok(OcrPageResult {
                     page_index: page.page_index,
                     lines: page.lines.clone(),
                     separator_y: None,
-                })
+                }))
             })
             .collect()
     }
