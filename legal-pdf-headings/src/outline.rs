@@ -389,37 +389,48 @@ fn member_of_tree(
 /// The font-distance rule of upstream `should_reject_heading`: a plain heading whose first-line
 /// font style no other candidate shares within 0.9pt stands alone and is no heading, unless it
 /// is in capitals close above the body it heads.
+/// Each candidate's fonts for [`stands_alone`]: the style (font and weight, as a number standing
+/// for its name) and size of each distinct style key among its first line's lettered spans.
+pub(super) fn candidate_fonts(context: &Context<'_>, candidates: &[Candidate]) -> Vec<Vec<(usize, f64)>> {
+    let mut styles = HashMap::new();
+    candidates
+        .iter()
+        .map(|candidate| {
+            let flash = &context.blocks[candidate.block].flash;
+            let mut seen = HashSet::new();
+            let mut entries = Vec::new();
+            if let Some(line) = flash.lines.first() {
+                for span in &line.spans {
+                    if span.stats.letters() == 0 {
+                        continue;
+                    }
+                    if seen.insert(span.style_key()) {
+                        let next = styles.len();
+                        entries.push((*styles.entry(span.font_style()).or_insert(next), span.size));
+                    }
+                }
+            }
+            entries
+        })
+        .collect()
+}
+
 pub(super) fn stands_alone(
     context: &Context<'_>,
     candidates: &[Candidate],
+    fonts: &[Vec<(usize, f64)>],
     index: usize,
     body_below_gap: Option<f64>,
 ) -> bool {
-    let fonts = |candidate: &Candidate| {
-        let flash = &context.blocks[candidate.block].flash;
-        let mut seen = HashSet::new();
-        let mut entries = Vec::new();
-        if let Some(line) = flash.lines.first() {
-            for span in &line.spans {
-                if span.stats.letters() == 0 {
-                    continue;
-                }
-                if seen.insert(span.style_key()) {
-                    entries.push((span.font_style(), span.size));
-                }
-            }
-        }
-        entries
-    };
-    let own = fonts(&candidates[index]);
+    let own = &fonts[index];
     let mut distance = f64::INFINITY;
-    for (other_index, other) in candidates.iter().enumerate() {
+    for (other_index, other) in fonts.iter().enumerate() {
         if other_index == index {
             continue;
         }
-        for (style, size) in fonts(other) {
-            for (own_style, own_size) in &own {
-                if *own_style == style {
+        for &(style, size) in other {
+            for &(own_style, own_size) in own {
+                if own_style == style {
                     distance = distance.min((own_size - size).abs());
                 }
             }
