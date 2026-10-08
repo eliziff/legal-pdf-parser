@@ -96,6 +96,16 @@ pub(super) fn nest_headings(
     if statute {
         return;
     }
+    // The constituents, (start, end, id), which hold the sections that open inside them.
+    let constituents = nodes
+        .iter()
+        .filter(|node| {
+            node.grammar
+                .as_deref()
+                .is_some_and(|grammar| grammar.starts_with(super::constituents::GRAMMAR))
+        })
+        .map(|node| (node.range.start, node.range.end, node.id.clone()))
+        .collect::<Vec<_>>();
     let page_of = pages
         .iter()
         .flat_map(|page| {
@@ -113,6 +123,8 @@ pub(super) fn nest_headings(
                 .any(|line| !line.exclude_from_body && party_label().is_match(line.text.trim()))
         })
         .filter_map(|page| index.page_range(page.index).map(|range| range.start))
+        // and each constituent the PDF carries.
+        .chain(constituents.iter().map(|(start, _, _)| *start))
         .collect::<Vec<_>>();
     let end = index.text().chars().count();
 
@@ -197,7 +209,12 @@ pub(super) fn nest_headings(
             Derivation::Heuristic,
             None,
         );
-        section.parent_id = open.last().map(|(_, id, _)| id.clone());
+        section.parent_id = open.last().map(|(_, id, _)| id.clone()).or_else(|| {
+            constituents
+                .iter()
+                .find(|(from, to, _)| *from <= start && start < *to)
+                .map(|(_, _, id)| id.clone())
+        });
         section.grammar = Some("heading_section".to_owned());
         let mut seen = HashSet::new();
         section.page_indexes = line_ids

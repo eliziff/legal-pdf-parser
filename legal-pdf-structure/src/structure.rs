@@ -1,6 +1,7 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 mod bookmarks;
+mod constituents;
 mod graph;
 mod heading_sections;
 mod quotations;
@@ -3730,6 +3731,7 @@ fn derive_prepared(
     });
     let mut nodes =
         native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
+    nodes.extend(constituents::constituents(&resolution.index, pages));
     heading_sections::nest_headings(
         &mut nodes,
         &resolution.index,
@@ -4022,6 +4024,10 @@ pub fn validate_pdf_components(
                 .any(|line| !known_lines.contains(line.as_str()))
             || (node.kind == NodeKind::Section
                 && node.grammar.as_deref() != Some("heading_section")
+                && !node
+                    .grammar
+                    .as_deref()
+                    .is_some_and(|grammar| grammar.starts_with(constituents::GRAMMAR))
                 && (node.locator_kind.as_deref().is_none_or(str::is_empty)
                     || node
                         .proof
