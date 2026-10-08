@@ -85,6 +85,7 @@ pub(super) fn nest_headings(
                             | CandidateObservationV2::ContentsRow
                             | CandidateObservationV2::IndexRow
                             | CandidateObservationV2::TranscriptLineNumber
+                            | CandidateObservationV2::Quotation
                     )
                 }) && !item.line_ids.iter().any(|id| notes.contains(id.as_str()))
             })
