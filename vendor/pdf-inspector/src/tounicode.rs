@@ -2345,12 +2345,13 @@ fn strip_pua_char(ch: char) -> char {
 /// cmap gives it, and names the glyphs the cmap leaves out.
 pub(crate) fn build_gid_to_unicode(face: &ttf_parser::Face<'_>) -> Option<HashMap<u16, String>> {
     let cmap_chars = cmap_glyph_chars(face);
+    let names = GlyphNames::new(face);
     let mut gid_to_unicode: HashMap<u16, String> = HashMap::new();
     for gid in (0..face.number_of_glyphs()).chain(cmap_chars.keys().copied()) {
         if gid_to_unicode.contains_key(&gid) {
             continue;
         }
-        if let Some(text) = glyph_text(face, &cmap_chars, gid) {
+        if let Some(text) = glyph_text_named(&cmap_chars, gid, || names.name(gid)) {
             gid_to_unicode.insert(gid, text);
         }
     }
@@ -2394,14 +2395,73 @@ pub(crate) fn glyph_text(
     cmap_chars: &HashMap<u16, char>,
     gid: u16,
 ) -> Option<String> {
+    glyph_text_named(cmap_chars, gid, || face.glyph_name(ttf_parser::GlyphId(gid)))
+}
+
+/// [`glyph_text`] with the glyph's name read by `name`, asked only when the
+/// cmap gives no ordinary character.
+fn glyph_text_named<'n>(
+    cmap_chars: &HashMap<u16, char>,
+    gid: u16,
+    name: impl FnOnce() -> Option<&'n str>,
+) -> Option<String> {
     let private_use = |c: char| matches!(c, '\u{E000}'..='\u{F8FF}');
     let from_cmap = cmap_chars.get(&gid).copied();
     if let Some(ch) = from_cmap.filter(|ch| !private_use(*ch)) {
         return Some(ch.to_string());
     }
-    face.glyph_name(ttf_parser::GlyphId(gid))
+    name()
         .and_then(glyph_name_to_string)
         .or_else(|| from_cmap.map(|ch| ch.to_string()))
+}
+
+/// A font's glyph names as [`ttf_parser::Face::glyph_name`] gives them, for
+/// reading every glyph's: a version 2.0 `post` table keeps the font's own
+/// names as a list that each lookup reads from its start, so the list is read
+/// once here and each name taken by its index.
+struct GlyphNames<'f, 'd> {
+    face: &'f ttf_parser::Face<'d>,
+    indexes: Vec<u16>,
+    names: Vec<&'d str>,
+}
+
+impl<'f, 'd> GlyphNames<'f, 'd> {
+    fn new(face: &'f ttf_parser::Face<'d>) -> Self {
+        let (indexes, names) = face
+            .tables()
+            .post
+            .and_then(|post| {
+                let data = face
+                    .raw_face()
+                    .table(ttf_parser::Tag::from_bytes(b"post"))?;
+                if data.get(..4)? != [0, 2, 0, 0] {
+                    return None;
+                }
+                let count = usize::from(u16::from_be_bytes([*data.get(32)?, *data.get(33)?]));
+                let indexes = data
+                    .get(34..34 + 2 * count)?
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect();
+                Some((indexes, post.names().collect()))
+            })
+            .unwrap_or_default();
+        Self { face, indexes, names }
+    }
+
+    /// The glyph's name: one of the font's own by its index, else whatever
+    /// the face gives (a standard Macintosh name, or the CFF table's).
+    fn name(&self, gid: u16) -> Option<&'f str> {
+        const STANDARD_NAMES: usize = 258;
+        match self.indexes.get(usize::from(gid)) {
+            Some(&index) if usize::from(index) >= STANDARD_NAMES => self
+                .names
+                .get(usize::from(index) - STANDARD_NAMES)
+                .copied()
+                .or_else(|| self.face.glyph_name(ttf_parser::GlyphId(gid))),
+            _ => self.face.glyph_name(ttf_parser::GlyphId(gid)),
+        }
+    }
 }
 
 /// Build a ToUnicodeCMap from pdf.js built-in binary CMaps (bcmaps).
