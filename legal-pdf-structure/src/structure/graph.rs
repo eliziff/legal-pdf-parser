@@ -487,30 +487,45 @@ impl PdfResolutionInput {
                 Some((page.index, (left, right)))
             })
             .collect::<HashMap<_, _>>();
-        // The numbered paragraphs' numbers: a count from 1 set in the body, not the folios.
+        let quotations = super::quotations::quoted_lines(pages, primitives);
+        let quoted = |candidate: &StructureMarkerCandidate| {
+            index
+                .line_at(candidate.marker_range.start)
+                .is_some_and(|indexed| quotations.contains(&indexed.line_id))
+        };
+        // The numbered paragraphs' numbers: a count from 1 set in the body, not the folios nor
+        // a quotation's.
         let mut paragraph_starts = runs
             .iter()
             .filter(|run| run.grammar == CandidateGrammar::Numeric && run.rooted && run.consecutive)
             .flat_map(|run| &run.markers)
             .filter(|candidate| {
-                index
-                    .line_at(candidate.marker_range.start)
-                    .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
-                    .is_some_and(|(_, line)| item_text_line(line))
+                !quoted(candidate)
+                    && index
+                        .line_at(candidate.marker_range.start)
+                        .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
+                        .is_some_and(|(_, line)| item_text_line(line))
             })
             .map(|candidate| candidate.range.start)
             .collect::<Vec<_>>();
         paragraph_starts.sort_unstable();
-        // A list item or a subsection ends where the numbered paragraphs resume. A section's and
-        // its subsections' extent is otherwise their grammar's; a numbered paragraph's or list
-        // item's ends where the layout ends it.
+        // A list item or a subsection ends where the numbered paragraphs resume; only a numbered
+        // provision may hold them. A section's and its subsections' extent is otherwise their
+        // grammar's; a numbered paragraph's or list item's ends where the layout ends it.
         let mut ended = HashSet::new();
         for run in &mut runs {
             let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
             for candidate in &mut run.markers {
-                if run.grammar != CandidateGrammar::Numeric
-                    && !(hierarchy && candidate.parent_candidate_id.is_none())
-                {
+                let label = candidate.label.trim_start_matches('(').to_lowercase();
+                let provision = hierarchy
+                    && candidate.parent_candidate_id.is_none()
+                    && (label.starts_with(|character: char| character.is_ascii_digit())
+                        || [
+                            "part", "section", "article", "division", "chapter", "schedule",
+                        ]
+                        .iter()
+                        .any(|word| label.starts_with(word)));
+                if run.grammar != CandidateGrammar::Numeric && !provision {
                     let next =
                         paragraph_starts.partition_point(|start| *start <= candidate.range.start);
                     if let Some(&end) = paragraph_starts
@@ -518,6 +533,20 @@ impl PdfResolutionInput {
                         .filter(|end| **end < candidate.range.end)
                     {
                         candidate.range.end = end.max(candidate.content_start);
+                    }
+                    // Nor does a heading belong to one.
+                    if let Some(heading) = hierarchy
+                        .then(|| index.overlapping_lines(candidate.range))
+                        .into_iter()
+                        .flatten()
+                        .filter(|indexed| indexed.range.start > candidate.content_start)
+                        .find(|indexed| {
+                            by_line
+                                .get(indexed.line_id.as_str())
+                                .is_some_and(|(_, line)| line.region_type == "heading")
+                        })
+                    {
+                        candidate.range.end = heading.range.start;
                     }
                 }
                 if hierarchy {
@@ -770,6 +799,9 @@ impl PdfResolutionInput {
                 });
                 if furniture {
                     add_observation(&mut observations, CandidateObservationV2::Furniture);
+                }
+                if quoted(candidate) {
+                    add_observation(&mut observations, CandidateObservationV2::Quotation);
                 }
                 evidence.push(CandidateEvidenceV2 {
                     candidate_id: candidate.id.clone(),

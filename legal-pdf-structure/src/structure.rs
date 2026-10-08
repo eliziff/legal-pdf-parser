@@ -4,6 +4,7 @@ mod bookmarks;
 mod flash;
 mod graph;
 mod heading_sections;
+mod quotations;
 
 use crate::layout::*;
 #[cfg(test)]
