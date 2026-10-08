@@ -9,10 +9,10 @@
 //! A section stops where a new filing's caption begins: a page carrying party labels opens
 //! another document.
 
-use super::flash::party_label;
 use super::graph::PdfTextIndex;
 use super::PdfPrimitiveEvidence;
 use legal_pdf_core::model::Page;
+use legal_pdf_headings::party_label;
 use legal_structure_model::{
     CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, Derivation, NodeKind,
     ScalarRange, ScalarText, StructureCandidateRun, StructureNode,

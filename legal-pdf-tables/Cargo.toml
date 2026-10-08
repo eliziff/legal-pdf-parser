@@ -1,0 +1,9 @@
+[package]
+name = "legal-pdf-tables"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+regex = "1.11"

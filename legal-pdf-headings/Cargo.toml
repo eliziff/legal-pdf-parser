@@ -1,0 +1,10 @@
+[package]
+name = "legal-pdf-headings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+regex = "1.11"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }

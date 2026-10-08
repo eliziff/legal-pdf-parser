@@ -991,6 +991,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-headings"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "regex",
+ "unicode-properties",
+]
+
+[[package]]
 name = "legal-pdf-language"
 version = "0.1.0"
 dependencies = [
@@ -1054,12 +1063,13 @@ name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-pdf-headings",
  "legal-pdf-pairing",
  "legal-pdf-support",
+ "legal-pdf-tables",
  "legal-structure-model",
  "regex",
  "serde_json",
- "unicode-properties",
 ]
 
 [[package]]
@@ -1077,6 +1087,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "unicode-normalization",
+]
+
+[[package]]
+name = "legal-pdf-tables"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "regex",
 ]
 
 [[package]]
