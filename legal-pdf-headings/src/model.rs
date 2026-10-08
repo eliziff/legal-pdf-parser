@@ -125,6 +125,16 @@ pub(super) fn y_overlaps(a: &Rect, b: &Rect) -> bool {
 /// Tokenizer character categories: 1 number, 2 uppercase, 3 lowercase, 4 other letter, 5 mark,
 /// 6 sentence end, 7 dash/connector, 8 punctuation, 9 math symbol, 10 whitespace, 11 other.
 pub(super) fn char_category(character: char) -> u8 {
+    // ASCII, nearly every character a page carries, from a table read off the general rule once.
+    static ASCII: OnceLock<[u8; 128]> = OnceLock::new();
+    if character.is_ascii() {
+        return ASCII.get_or_init(|| std::array::from_fn(|code| unicode_char_category(char::from(code as u8))))
+            [character as usize];
+    }
+    unicode_char_category(character)
+}
+
+fn unicode_char_category(character: char) -> u8 {
     use GeneralCategory::*;
     let category = character.general_category();
     match category {
