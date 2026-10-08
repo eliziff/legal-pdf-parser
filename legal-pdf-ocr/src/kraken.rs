@@ -10,7 +10,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{render, RenderCache, RenderSettings};
 use image::{imageops, GrayImage, ImageReader, RgbaImage};
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
-use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult};
+use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord};
 use ort::{
     execution_providers::CPUExecutionProvider,
     session::{builder::GraphOptimizationLevel, builder::PrepackedWeights, Session},
@@ -321,8 +321,15 @@ struct PreparedDiagnostics {
     recognition: RecognitionPerformance,
 }
 
+/// A line's recognized text, its confidence and where its words stand on the page.
+struct Recognition {
+    text: String,
+    confidence: f64,
+    words: Vec<OcrWord>,
+}
+
 struct RecognizedBatch {
-    values: Vec<(usize, (String, f64))>,
+    values: Vec<(usize, Recognition)>,
     worker: usize,
     lines: usize,
     tensor_elements: usize,
@@ -359,6 +366,26 @@ impl Codec {
             }
         }
         Ok(Self { labels })
+    }
+
+    /// The text `decode` reads from these labels, piece by piece, with the first and last
+    /// label each piece was read from.
+    fn pieces(&self, labels: &[usize]) -> Vec<(usize, usize, &str)> {
+        let mut pieces = Vec::new();
+        let mut index = 0;
+        while index < labels.len() {
+            let Some((sequence, value)) = self
+                .labels
+                .iter()
+                .find(|(sequence, _)| labels[index..].starts_with(sequence))
+            else {
+                index += 1;
+                continue;
+            };
+            pieces.push((index, index + sequence.len() - 1, value.as_str()));
+            index += sequence.len();
+        }
+        pieces
     }
 
     fn decode(&self, spans: &[(usize, f32)]) -> (String, f64) {
@@ -1063,7 +1090,12 @@ impl KrakenOcr {
                         let lines = prepared
                             .into_iter()
                             .zip(recognized)
-                            .filter_map(|(line, (text, confidence))| {
+                            .filter_map(|(line, recognition)| {
+                                let Recognition {
+                                    text,
+                                    confidence,
+                                    words,
+                                } = recognition;
                                 (!text.trim().is_empty()).then_some(OcrLine {
                                     text,
                                     bbox: [
@@ -1075,7 +1107,7 @@ impl KrakenOcr {
                                     confidence,
                                     baseline: vec![],
                                     boundary: vec![],
-                                    words: vec![],
+                                    words,
                                     region_id: String::new(),
                                     region_type: "unknown".to_owned(),
                                     block_index: 0,
@@ -1199,7 +1231,7 @@ impl KrakenOcr {
         width_bucket: usize,
         input_height: usize,
         pages: &[Vec<PreparedLine>],
-    ) -> Result<(Vec<Vec<(String, f64)>>, RecognitionPerformance)> {
+    ) -> Result<(Vec<Vec<Recognition>>, RecognitionPerformance)> {
         let counts = pages.iter().map(Vec::len).collect::<Vec<_>>();
         let lines = pages.iter().flatten().collect::<Vec<_>>();
         let schedule_started = Instant::now();
@@ -1620,7 +1652,23 @@ fn recognize_batch(
             .map(|(local, &index)| {
                 let length = output_lengths[local].clamp(1, timesteps);
                 let spans = greedy_ids(ids, local, timesteps, length);
-                (index, codec.decode(&spans))
+                let (text, confidence) = codec.decode(&spans);
+                let steps = ids[local * timesteps..local * timesteps + length]
+                    .iter()
+                    .map(|&label| {
+                        usize::try_from(label)
+                            .ok()
+                            .filter(|label| *label > BLANK_LABEL)
+                    });
+                let words = line_words(codec, lines[index], &emissions(steps), length);
+                (
+                    index,
+                    Recognition {
+                        text,
+                        confidence,
+                        words,
+                    },
+                )
             })
             .collect();
         return Ok(RecognizedBatch {
@@ -1665,7 +1713,19 @@ fn recognize_batch(
         .map(|(local, &index)| {
             let length = output_lengths[local].clamp(1, timesteps);
             let spans = greedy_ctc(logits, local, classes, timesteps, length);
-            (index, codec.decode(&spans))
+            let (text, confidence) = codec.decode(&spans);
+            let steps = best_labels(logits, local, classes, timesteps, length)
+                .into_iter()
+                .map(|label| (label != BLANK_LABEL).then_some(label));
+            let words = line_words(codec, lines[index], &emissions(steps), length);
+            (
+                index,
+                Recognition {
+                    text,
+                    confidence,
+                    words,
+                },
+            )
         })
         .collect();
     Ok(RecognizedBatch {
@@ -1709,7 +1769,7 @@ fn recognize_prepared(
         )?
         .values
         {
-            output[index] = value;
+            output[index] = (value.text, value.confidence);
         }
     }
     Ok(output)
@@ -2224,6 +2284,201 @@ fn prepare_pages(
             })
             .collect()
     })
+}
+
+/// Each timestep's most likely label, as `greedy_ctc` reads it.
+fn best_labels(
+    logits: &[f32],
+    batch: usize,
+    classes: usize,
+    timesteps: usize,
+    length: usize,
+) -> Vec<usize> {
+    let offset = batch * classes * timesteps;
+    let mut labels = vec![0; length];
+    let mut maxima = vec![f32::NEG_INFINITY; length];
+    for class in 0..classes {
+        let values = &logits[offset + class * timesteps..offset + class * timesteps + length];
+        for (timestep, &value) in values.iter().enumerate() {
+            if value > maxima[timestep] {
+                maxima[timestep] = value;
+                labels[timestep] = class;
+            }
+        }
+    }
+    labels
+}
+
+/// The labels a greedy CTC reading emits, each with the first and last timestep of its run:
+/// a label is emitted where it differs from the step before, and blanks emit nothing.
+fn emissions(steps: impl Iterator<Item = Option<usize>>) -> Vec<(usize, usize, usize)> {
+    let mut output: Vec<(usize, usize, usize)> = Vec::new();
+    let mut previous: Option<usize> = None;
+    for (timestep, label) in steps.enumerate() {
+        match label {
+            Some(label) if previous == Some(label) => {
+                if let Some(last) = output.last_mut() {
+                    last.2 = timestep;
+                }
+            }
+            Some(label) => output.push((label, timestep, timestep)),
+            None => {}
+        }
+        previous = label;
+    }
+    output
+}
+
+/// Where a recognized line's words stand on the page. The model reads the line image at a
+/// fixed stride, so each emitted character has a column; a CTC reading emits late and
+/// narrow, so a column only says roughly where a space falls. Each space is placed in the
+/// widest gap of the line's ink near its column, each word runs between its spaces' gaps,
+/// drawn in to its own ink, and is mapped back onto the line's box. Offsets count
+/// characters of the decoded text.
+fn line_words(
+    codec: &Codec,
+    line: &PreparedLine,
+    emitted: &[(usize, usize, usize)],
+    length: usize,
+) -> Vec<OcrWord> {
+    let content_width = line.width.saturating_sub(INPUT_PADDING * 2);
+    if emitted.is_empty() || content_width == 0 || length == 0 || line.pixels.is_empty() {
+        return Vec::new();
+    }
+    let rows = line.pixels.len() / content_width;
+    let labels: Vec<usize> = emitted.iter().map(|(label, _, _)| *label).collect();
+    // Each character of the decoded text with the column it was emitted at.
+    let stride = line.width as f64 / length as f64;
+    let mut characters: Vec<(char, f64)> = Vec::new();
+    for (first, last, value) in codec.pieces(&labels) {
+        let step = (emitted[first].1 + emitted[last].2 + 1) as f64 / 2.0;
+        let column = step * stride - INPUT_PADDING as f64;
+        characters.extend(value.chars().map(|character| (character, column)));
+    }
+    let ink: Vec<bool> = (0..content_width)
+        .map(|column| (0..rows).any(|row| line.pixels[row * content_width + column] < 128))
+        .collect();
+    let (Some(first_ink), Some(last_ink)) = (
+        ink.iter().position(|value| *value),
+        ink.iter().rposition(|value| *value),
+    ) else {
+        return Vec::new();
+    };
+    // Runs of blank columns between the line's first and last ink.
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    let mut column = first_ink;
+    while column <= last_ink {
+        if ink[column] {
+            column += 1;
+            continue;
+        }
+        let start = column;
+        while column <= last_ink && !ink[column] {
+            column += 1;
+        }
+        gaps.push((start, column));
+    }
+    let pitch = (last_ink + 1 - first_ink) as f64 / characters.len().max(1) as f64;
+    // Words as character ranges, and between them the spaces' estimated columns.
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index].0.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        let begin = index;
+        while index < characters.len() && !characters[index].0.is_whitespace() {
+            index += 1;
+        }
+        words.push((begin, index));
+    }
+    let estimates: Vec<f64> = words
+        .windows(2)
+        .map(|pair| {
+            let spaces = &characters[pair[0].1..pair[1].0];
+            spaces.iter().map(|(_, column)| *column).sum::<f64>() / spaces.len() as f64
+        })
+        .collect();
+    // How far a space read at `estimate` stands from a gap: nothing when it falls inside.
+    let distance = |gap: &(usize, usize), estimate: f64| {
+        (gap.0 as f64 - estimate)
+            .max(estimate - gap.1 as f64)
+            .max(0.0)
+    };
+    // The spaces fall in the line's widest gaps when those stand where the spaces were read.
+    let mut widest = gaps.clone();
+    widest.sort_by(|left, right| (right.1 - right.0).cmp(&(left.1 - left.0)));
+    widest.truncate(estimates.len());
+    widest.sort_unstable();
+    let mut bounds: Vec<(usize, usize)> = vec![(first_ink, first_ink)];
+    if widest.len() == estimates.len()
+        && widest
+            .iter()
+            .zip(&estimates)
+            .all(|(gap, estimate)| distance(gap, *estimate) <= 3.0 * pitch)
+    {
+        bounds.extend(widest);
+    } else {
+        // Otherwise each space takes the widest gap near where it was read.
+        for estimate in &estimates {
+            let after = bounds.last().map_or(0, |bound| bound.1);
+            let chosen = gaps
+                .iter()
+                .filter(|gap| gap.0 >= after && distance(gap, *estimate) <= 1.5 * pitch)
+                .max_by(|left, right| {
+                    (left.1 - left.0)
+                        .cmp(&(right.1 - right.0))
+                        .then(distance(right, *estimate).total_cmp(&distance(left, *estimate)))
+                })
+                .copied()
+                .unwrap_or_else(|| {
+                    let at = (estimate.round().max(0.0) as usize).clamp(after, last_ink + 1);
+                    (at, at)
+                });
+            bounds.push(chosen);
+        }
+    }
+    bounds.push((last_ink + 1, last_ink + 1));
+    let scale = line.bbox.width() as f64 / content_width as f64;
+    let letter_gap = rows.max(1);
+    words
+        .iter()
+        .enumerate()
+        .map(|(slot, (begin, end))| {
+            let (from, to) = (bounds[slot].1, bounds[slot + 1].0.max(bounds[slot].1));
+            // The word's ink: its largest run of marks and those that follow on within a
+            // letter's gap, leaving out specks across the gutter beside it.
+            let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+            for column in (from..to).filter(|column| ink[*column]) {
+                match runs.last_mut() {
+                    Some(run) if column - run.1 <= letter_gap => {
+                        run.1 = column + 1;
+                        run.2 += 1;
+                    }
+                    _ => runs.push((column, column + 1, 1)),
+                }
+            }
+            let (left, right) = runs
+                .iter()
+                .max_by_key(|run| run.2)
+                .map_or((from, to), |run| (run.0, run.1));
+            OcrWord {
+                text: characters[*begin..*end]
+                    .iter()
+                    .map(|(character, _)| *character)
+                    .collect(),
+                bbox: [
+                    line.bbox.left as f64 + left as f64 * scale,
+                    line.bbox.top as f64,
+                    line.bbox.left as f64 + right as f64 * scale,
+                    line.bbox.bottom as f64,
+                ],
+                start: *begin,
+                end: *end,
+            }
+        })
+        .collect()
 }
 
 fn greedy_ids(ids: &[i64], batch: usize, timesteps: usize, length: usize) -> Vec<(usize, f32)> {

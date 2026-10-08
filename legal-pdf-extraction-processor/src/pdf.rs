@@ -1227,20 +1227,24 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
     let trimmed_end = text.trim_end().len();
     text.truncate(trimmed_end);
     let leading = text.len() - text.trim_start().len();
+    // Word offsets count characters of the recognized text before it was trimmed.
+    let shift = text[..leading].chars().count();
     text.replace_range(..leading, "");
     if text.is_empty() {
         return None;
     }
+    let length = text.chars().count();
     let words = result
         .words
         .into_iter()
+        .filter(|word| word.start >= shift && word.end - shift <= length)
         .enumerate()
         .map(|(index, word)| Word {
             id: format!("p{:04}-l{:04}-w{:03}", page.number, local_index, index + 1),
             text: word.text,
             bbox: word.bbox,
-            start: word.start,
-            end: word.end,
+            start: word.start - shift,
+            end: word.end - shift,
         })
         .collect();
     Some(Line {

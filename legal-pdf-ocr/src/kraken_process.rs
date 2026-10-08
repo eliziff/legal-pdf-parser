@@ -464,8 +464,17 @@ fn runtime_words(text: &str, characters: &[RuntimeCharacter]) -> Vec<OcrWord> {
         glyphs.push((offset, offset + count, bbox));
         offset += count;
     }
-    if reconstructed != text {
+    // The line's text is trimmed; its characters keep the recognizer's outer spaces.
+    let lead = reconstructed
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .count();
+    if reconstructed.trim() != text {
         return Vec::new();
+    }
+    for glyph in &mut glyphs {
+        glyph.0 = glyph.0.saturating_sub(lead);
+        glyph.1 = glyph.1.saturating_sub(lead);
     }
     let mut output = Vec::new();
     let mut start_byte = None;
