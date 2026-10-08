@@ -2753,6 +2753,130 @@ fn repair_missing_refs(
     repair_counts
 }
 
+/// Recognition reads a small raised number as a quotation mark, apostrophe or other
+/// stray glyph ("importance.'", "Act,'=", "Trees\""). Between two paired references,
+/// when the run of labels they skip finds exactly as many such glyphs, in order, glued
+/// to the text before them, those glyphs are the run's references.
+fn repair_glyph_refs(
+    chosen: &mut HashMap<u32, Candidate>,
+    backbone: &[Candidate],
+    lines: &[PairLine<'_>],
+    endnote: bool,
+) -> usize {
+    const GLYPHS: &str = "'’‘\"”“`°=«";
+    let label_lines: HashSet<usize> = backbone.iter().map(|candidate| candidate.line).collect();
+    let mut values: Vec<u32> = backbone
+        .iter()
+        .filter_map(|candidate| candidate.value)
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    let mut repaired = 0;
+    let mut index = 0;
+    while index < values.len() {
+        if chosen.contains_key(&values[index]) {
+            index += 1;
+            continue;
+        }
+        let first = index;
+        while index < values.len() && !chosen.contains_key(&values[index]) {
+            index += 1;
+        }
+        let missing = &values[first..index];
+        let (Some(floor_value), Some(&ceiling_value)) = (
+            first.checked_sub(1).map(|prior| values[prior]),
+            values.get(index),
+        ) else {
+            continue;
+        };
+        if missing.len() > 6
+            || missing
+                .iter()
+                .zip(missing.iter().skip(1))
+                .any(|(left, right)| right - left != 1)
+            || missing[0] != floor_value + 1
+            || ceiling_value != missing[missing.len() - 1] + 1
+        {
+            continue;
+        }
+        let floor = chosen[&floor_value].pos(lines);
+        let ceiling = chosen[&ceiling_value].pos(lines);
+        let mut sites = Vec::new();
+        for line_index in floor.0..=ceiling.0.min(lines.len().saturating_sub(1)) {
+            let line = &lines[line_index];
+            if line.zone != Zone::Body || label_lines.contains(&line_index) {
+                continue;
+            }
+            let text = chars(&line.text);
+            let mut position = 0;
+            while position < text.len() {
+                if !GLYPHS.contains(text[position]) {
+                    position += 1;
+                    continue;
+                }
+                let start = position;
+                while position < text.len()
+                    && position - start < 3
+                    && GLYPHS.contains(text[position])
+                {
+                    position += 1;
+                }
+                let end = position;
+                let before = start.checked_sub(1).map(|at| text[at]);
+                let after = text.get(end).copied();
+                // A lone apostrophe after a letter is elision or a possessive.
+                let glued = before.is_some_and(|character| {
+                    ".,;:)".contains(character)
+                        || (character.is_alphabetic()
+                            && !(end - start == 1 && "'’‘".contains(text[start])))
+                });
+                let site = (line_index, start);
+                if glued && after.is_none_or(char::is_whitespace) && site > floor && site < ceiling
+                {
+                    sites.push((line_index, start, end));
+                }
+            }
+        }
+        if sites.len() != missing.len() {
+            continue;
+        }
+        let label_pages: HashMap<u32, u32> = backbone
+            .iter()
+            .filter_map(|candidate| Some((candidate.value?, lines[candidate.line].page)))
+            .collect();
+        if !endnote
+            && missing
+                .iter()
+                .zip(&sites)
+                .any(|(value, site)| label_pages[value].abs_diff(lines[site.0].page) > 1)
+        {
+            continue;
+        }
+        for (&value, &(line, start, end)) in missing.iter().zip(&sites) {
+            chosen.insert(
+                value,
+                Candidate {
+                    line,
+                    start,
+                    end,
+                    observed: chars_slice(&chars(&lines[line].text), start, end),
+                    value: Some(value),
+                    symbol: String::new(),
+                    form: "glyph",
+                    score: 0.5,
+                    reason: "glyph_sequence_marker",
+                    repaired: true,
+                    repair_kind: "glyph_sequence_repair",
+                    requires_visual_cue: false,
+                    flags: CandidateFlags::default(),
+                },
+            );
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
 fn rekey_same_value_ref_runs(
     chosen: &mut HashMap<u32, Candidate>,
     backbone: &[Candidate],
@@ -3010,6 +3134,12 @@ fn build_pairs<'a>(
         for (kind, count) in rekey_same_value_ref_runs(&mut chosen, segment, pool, &lines, endnote)
         {
             *ref_repair_counts.entry(kind).or_default() += count;
+        }
+        let glyphs = repair_glyph_refs(&mut chosen, segment, &lines, endnote);
+        if glyphs > 0 {
+            *ref_repair_counts
+                .entry("glyph_sequence_repair".to_owned())
+                .or_default() += glyphs;
         }
 
         let paren_count = segment
