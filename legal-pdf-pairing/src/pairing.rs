@@ -28,6 +28,8 @@ const DASHES: &str = "–—-";
 const TERMINAL_PUNCTUATION: &str = ".!?:;”\"'’";
 const REF_PUNCTUATION: &str = ".,;:!?)]}";
 const REF_RIGHT_PUNCTUATION: &str = ".,;:!?)]}…/¬\u{00ad}·";
+// English and French month names, full or abbreviated.
+const MONTH: &str = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|janv(?:ier)?|f[ée]vr(?:ier)?|mars|avr(?:il)?|mai|juin|juil(?:let)?|ao[ûu]t|octobre|novembre|d[ée]c(?:embre)?|septembre)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Zone {
@@ -853,7 +855,7 @@ fn date_day_site(values: &[char], start: usize, end: usize) -> bool {
     static MONTH_AFTER: OnceLock<Regex> = OnceLock::new();
     static COMMA_YEAR: OnceLock<Regex> = OnceLock::new();
     static DAY_LIST: OnceLock<Regex> = OnceLock::new();
-    let month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+    let month = MONTH;
     let prefix = chars_slice(values, 0, start);
     let tail = chars_slice(values, end, values.len());
     MONTH_BEFORE
@@ -930,6 +932,10 @@ fn ref_site_penalty(
                 return None;
             }
         }
+        // Hours and minutes ("2:47"), or chapter and verse.
+        if right == ':' && values.get(end + 1).is_some_and(char::is_ascii_digit) {
+            return None;
+        }
         if right == ','
             && values
                 .get(end + 1..end + 4)
@@ -958,6 +964,15 @@ fn ref_site_penalty(
         penalty += 0.4;
     }
     if left == Some('.') && start >= 2 && values[start - 2].is_ascii_digit() {
+        // A number running on into lower-case words ("rule 4.4 and") is a decimal or
+        // section number; a reference after a sentence's final number starts a sentence.
+        if values[end..]
+            .iter()
+            .find(|value| !value.is_whitespace())
+            .is_some_and(|value| value.is_lowercase())
+        {
+            return None;
+        }
         penalty += 0.8;
     }
     if values[start.saturating_sub(3)..start].contains(&'$') {
@@ -990,12 +1005,25 @@ fn ref_site_penalty(
     if abbreviation_pinpoint(&prefix) {
         return None;
     }
+    // A page number or page count ("page 4", "Page 1 of 3").
+    static PAGE_COUNTER: OnceLock<Regex> = OnceLock::new();
+    if PAGE_COUNTER
+        .get_or_init(|| {
+            Regex::new(r"(?i)(?:^|[^\p{L}])(?:pages?|p\.|pp\.)\s*(?:\d+\s*(?:of|/|de)\s*)?$")
+                .unwrap()
+        })
+        .is_match(&prefix)
+    {
+        return None;
+    }
     if matches!(form, "spaced_eol" | "spaced_mid")
         && counter_noun(&spaced_preceding_word(values, start))
     {
         return None;
     }
-    if form == "spaced_mid" {
+    // A spaced number counts a measure mid-line or at a line's start, and is a date's
+    // day wherever it sits.
+    if matches!(form, "spaced_mid" | "line_start") {
         static MEASURE: OnceLock<Regex> = OnceLock::new();
         if MEASURE
             .get_or_init(|| Regex::new(r"(?i)^[ \t]+(?:years?|days?|months?|weeks?|hours?|minutes?|seconds?|per|percent|p\.c\b|cents?|dollars?|pounds?|shillings?|pence|feet|foot|acres?|miles?|inches?|yards?|tons?|o.?clock)\b").unwrap())
@@ -1003,9 +1031,11 @@ fn ref_site_penalty(
         {
             return None;
         }
-        if date_day_site(values, start, end) {
-            return None;
-        }
+    }
+    if matches!(form, "spaced_mid" | "spaced_eol" | "line_start")
+        && date_day_site(values, start, end)
+    {
+        return None;
     }
     Some(penalty)
 }
@@ -1079,6 +1109,10 @@ fn extract_refs(lines: &[PairLine<'_>]) -> Vec<Candidate> {
     let paren_ref = PAREN_REF.get_or_init(|| Regex::new(r"\(\s*(\d{1,3})\s*\)").unwrap());
     let section_before = SECTION_BEFORE_PAREN
         .get_or_init(|| Regex::new(r"(?i)\b(?:ss?|sub-?ss?|arts?|paras?|cls?)\.?\s*$").unwrap());
+    // A subsection number after the section number opening its line: "2. (1) The ...".
+    static SECTION_NUMBER: OnceLock<Regex> = OnceLock::new();
+    let section_number =
+        SECTION_NUMBER.get_or_init(|| Regex::new(r"^\s*\d{1,4}[A-Za-z]?\.\s*$").unwrap());
     for (line_index, line) in lines.iter().enumerate() {
         if previous_page != Some(line.page) {
             previous_body = None;
@@ -1210,7 +1244,11 @@ fn extract_refs(lines: &[PairLine<'_>]) -> Vec<Candidate> {
             .iter()
             .filter(|(start, end)| (1..=3).contains(&(end - start)))
         {
-            if seen.contains(&(start, end)) || start < label_end {
+            // A note is never numbered with a leading zero ("2023.11.05", "F28.02A").
+            if seen.contains(&(start, end))
+                || start < label_end
+                || (end - start > 1 && line_chars[start] == '0')
+            {
                 continue;
             }
             let value = ascii_number(&line_chars, start, end);
@@ -1349,6 +1387,7 @@ fn extract_refs(lines: &[PairLine<'_>]) -> Vec<Candidate> {
             if start < label_end
                 || (open > 0 && line_chars[open - 1].is_alphanumeric())
                 || section_before.is_match(&char_slice(&line.text, 0, open))
+                || section_number.is_match(&char_slice(&line.text, 0, open))
                 || line.protected(start, end)
             {
                 continue;
@@ -1482,6 +1521,12 @@ fn day_list_date(text: &str) -> bool {
     .is_match(text)
 }
 
+fn month_year_start(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(&format!(r"(?i)^\s*{MONTH}\.?,?\s+\d{{4}}\b")).unwrap())
+        .is_match(text)
+}
+
 fn volume_cite_start(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let Some(found) = RE
@@ -1558,6 +1603,16 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
             continue;
         }
         if token.symbol.is_empty() && token.value.is_none() {
+            continue;
+        }
+        // A decimal ("17.93"), a zero-padded number ("05") or a date ("13 May 2026")
+        // opens the line, not a note's label.
+        if token.value.is_some()
+            && ((token.observed.len() > 1 && token.observed.starts_with('0'))
+                || (token.post.starts_with('.')
+                    && follow.is_some_and(|value| value.is_ascii_digit()))
+                || (token.form == "plain" && month_year_start(&body)))
+        {
             continue;
         }
         if token.form == "plain" && follow.is_some_and(|value| value.is_lowercase()) {
