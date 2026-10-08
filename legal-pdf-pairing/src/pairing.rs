@@ -1641,6 +1641,17 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
         {
             continue;
         }
+        // So is a number and its period opening a body line in the body's own type, its words
+        // running on beside it ("1. SERVICE: Once you have filed"): a note's label sits in the
+        // notes' region or in their smaller type.
+        if token.value.is_some()
+            && line.zone == Zone::Body
+            && !line.small_font
+            && token.post.trim() == "."
+            && !body_stripped.is_empty()
+        {
+            continue;
+        }
         if token.value.is_some()
             && token.post.contains(',')
             && line.zone != Zone::Note
