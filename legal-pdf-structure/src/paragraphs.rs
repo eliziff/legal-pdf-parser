@@ -39,6 +39,12 @@ fn terminal_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?$").unwrap())
 }
 
+/// A sentence end with a note's number after it ("an injunction.1").
+fn noted_terminal_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?\\d{1,3}\\*?$").unwrap())
+}
+
 fn leader_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(\.\s*){4,}\s*\S{1,6}\s*$").unwrap())
@@ -291,8 +297,12 @@ fn starts_paragraph(
         return first_line_indent || (!marker && b.bbox[0] > left + 1.5 * cw);
     }
     // A wrap inside a sentence: a line that ran most of the measure and ended no sentence, with the
-    // next going on in lower case or with the punctuation the wrap left it.
-    let wrapped = !terminal
+    // next going on in lower case or with the punctuation the wrap left it. Only text the page sets
+    // says so; recognition misreads a line's first letter ("chief Judge").
+    let wrapped = !a.spans.is_empty()
+        && !b.spans.is_empty()
+        && !terminal
+        && !noted_terminal_re().is_match(a.text.trim())
         && goes_on(b)
         && width(a) >= 0.6 * block.iter().map(|line| width(line)).fold(0.0, f64::max);
     first_line_indent || (fits && !wrapped && !a.text.trim_end().ends_with('-'))
