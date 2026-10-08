@@ -292,6 +292,9 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     }
     // A new heading is a short block set in the page's own type size or larger, opens with a
     // capital or a number, ends no lead-in, and stands on rows of its own beside no running text.
+    // The citation grammar's answer for each text, read once: a document repeats its running heads
+    // and titles page after page.
+    let mut cited: HashMap<String, bool> = HashMap::new();
     for page in &flash_pages {
         for (position, &block) in page.blocks.iter().enumerate() {
             if !eligible[block] {
@@ -386,8 +389,10 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             eligible[block] = !indented
                 && !runs_on
                 && !beside()
-                && !(analysis.has_citation_cue(&text) && text.chars().any(|c| c.is_ascii_digit()))
-                && !analysis.has_citation_signal(&text)
+                && !*cited.entry(text.clone()).or_insert_with(|| {
+                    (analysis.has_citation_cue(&text) && text.chars().any(|c| c.is_ascii_digit()))
+                        || analysis.has_citation_signal(&text)
+                })
                 && !citation_only(flash);
         }
     }
