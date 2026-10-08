@@ -50,11 +50,12 @@ def source_lines(structure):
     for page in (n for n in structure["nodes"] if n["kind"] == "page"):
         start, end = page["range"]["start"], page["range"]["end"]
         content = text[start * 2:end * 2].decode("utf-16-le").split("\n")
-        if not page["line_ids"] and not content[0]:
+        ids = page.get("line_ids", [])  # a page without lines carries none
+        if not ids and not content[0]:
             continue
-        if len(content) != len(page["line_ids"]):
+        if len(content) != len(ids):
             raise ValueError("Native page source IDs do not match its text range")
-        for ident, line in zip(page["line_ids"], content):
+        for ident, line in zip(ids, content):
             stop = start + len(line.encode("utf-16-le")) // 2
             if ident in result:
                 raise ValueError("Duplicate native line ID")
