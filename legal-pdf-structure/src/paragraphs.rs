@@ -14,9 +14,13 @@ use std::{collections::HashMap, sync::OnceLock};
 const BULLETS: &str = "\u{2022}\u{25cf}\u{25aa}\u{25e6}\u{2023}\u{2043}\u{25a0}\u{25a1}\u{f0b7}\u{f0a7}\u{f0d8}\u{2013}\u{2014}\\-\\*\u{b7}";
 const ENUMERATOR: &str = r"(\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\([ivxlcdm]{1,6}\)|[ivxlcdm]{1,6}\.|\[\d{1,3}\]|\d{1,3}(\.\d{1,3})+\.?)";
 
+/// Bullet glyphs proper, which recognition can run into the item's first word.
+const GLYPHS: &str =
+    "\u{2022}\u{25cf}\u{25aa}\u{25e6}\u{2023}\u{2043}\u{25a0}\u{25a1}\u{f0b7}\u{f0a7}\u{f0d8}";
+
 fn bullet_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&format!(r"^\s*([{BULLETS}]|o)\s+\S")).unwrap())
+    RE.get_or_init(|| Regex::new(&format!(r"^\s*(([{BULLETS}]|o)\s+\S|[{GLYPHS}]\s*\S)")).unwrap())
 }
 
 fn enumerator_re() -> &'static Regex {
@@ -76,11 +80,29 @@ fn bold_share(line: &Line) -> Option<f64> {
 }
 
 fn first_word_width(line: &Line) -> f64 {
-    if let Some(word) = line.words.first() {
+    let text = line.text.trim();
+    // A bullet set or read against the word is no part of the word that would have fitted.
+    let bullet = text.chars().next().is_some_and(|c| GLYPHS.contains(c));
+    let glyph = |w: &str| w.trim().chars().next().is_some_and(|c| GLYPHS.contains(c));
+    let word = line
+        .words
+        .iter()
+        .find(|w| !w.text.trim().chars().all(|c| GLYPHS.contains(c)));
+    if let Some(word) = word.filter(|w| !glyph(&w.text)) {
         return word.bbox[2] - word.bbox[0];
     }
-    let text = line.text.trim();
-    let first = text.split(' ').next().unwrap_or_default().chars().count();
+    let words = if bullet {
+        &text[text.chars().next().map_or(0, char::len_utf8)..]
+    } else {
+        text
+    };
+    let first = words
+        .trim_start()
+        .split(' ')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count();
     width(line) * first as f64 / text.chars().count().max(1) as f64
 }
 
