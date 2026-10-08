@@ -290,7 +290,24 @@ fn starts_paragraph(
     if let Some(left) = margin {
         return first_line_indent || (!marker && b.bbox[0] > left + 1.5 * cw);
     }
-    first_line_indent || (fits && !a.text.trim_end().ends_with('-'))
+    // A wrap inside a sentence: a line that ran most of the measure and ended no sentence, with the
+    // next going on in lower case or with the punctuation the wrap left it.
+    let wrapped = !terminal
+        && goes_on(b)
+        && width(a) >= 0.6 * block.iter().map(|line| width(line)).fold(0.0, f64::max);
+    first_line_indent || (fits && !wrapped && !a.text.trim_end().ends_with('-'))
+}
+
+/// Does the line go on with the sentence a short line before it broke? It does when it opens in
+/// lower case or with the punctuation that ends a word or clause, as a wrap leaves them ("in
+/// Chaoulli" / ". In that case"); an ellipsis may open a paragraph.
+fn goes_on(line: &Line) -> bool {
+    let text = line.text.trim_start();
+    text.chars().next().is_some_and(|c| {
+        c.is_lowercase()
+            || ",;:)]}\u{2019}\u{201d}%".contains(c)
+            || (c == '.' && !text.starts_with("..") && !text.starts_with(". ."))
+    })
 }
 
 /// Does the next page's first paragraph go on with this page's last one? It does when the
