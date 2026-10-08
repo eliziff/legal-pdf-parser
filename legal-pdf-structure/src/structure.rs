@@ -1,7 +1,6 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 mod bookmarks;
-mod flash;
 mod graph;
 mod heading_sections;
 mod quotations;
@@ -66,7 +65,7 @@ struct PdfPrimitiveEvidence {
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
     /// Tables drawn with rules, read from each page's painted rules.
-    tables: Vec<crate::tables::PdfTable>,
+    tables: Vec<legal_pdf_tables::PdfTable>,
 }
 
 #[derive(Debug)]
@@ -2003,7 +2002,8 @@ fn apply_text_fidelity_headings(
         if listed && list_bottom.is_none() {
             continue;
         }
-        for (line_slot, line) in page.lines.iter_mut().enumerate() {
+        let mut lines = Vec::new();
+        for (line_slot, line) in page.lines.iter().enumerate() {
             if listed && list_bottom.is_some_and(|bottom| line.bbox[1] < bottom) {
                 continue;
             }
@@ -2024,9 +2024,16 @@ fn apply_text_fidelity_headings(
                 && !text.ends_with(['.', '?', '!', ';', ':', ','])
                 && heading_text_plausible(text)
             {
-                line.region_type = "heading".to_owned();
-                capitalised.push((page_slot, line_slot));
+                lines.push(line_slot);
             }
+        }
+        // Twenty lines in capitals on one page label a map, a drawing or a table, not sections.
+        if lines.len() >= 20 {
+            continue;
+        }
+        for line_slot in lines {
+            page.lines[line_slot].region_type = "heading".to_owned();
+            capitalised.push((page_slot, line_slot));
         }
     }
 
@@ -2379,9 +2386,12 @@ fn classify_pages_with_source(
     let mut continuing_table = false;
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
-    let translation = translation_lines(pages);
-    evidence.tables = crate::tables::ruled_tables(pages, &translation);
-    let ruled = crate::tables::table_line_ids(&evidence.tables);
+    let translation =
+        legal_pdf_support::profile::measure("classify.translation", || translation_lines(pages));
+    evidence.tables = legal_pdf_support::profile::measure("classify.tables", || {
+        legal_pdf_tables::ruled_tables(pages, &translation, &TableReadings)
+    });
+    let ruled = legal_pdf_tables::table_line_ids(&evidence.tables);
     // A row the extractor read across both columns parts into its two languages.
     for page in pages.iter_mut() {
         let base = page
@@ -3048,7 +3058,7 @@ fn classify_pages_with_source(
             }
         }
         diagnostics.extend(order_page(page, table_page, &table_notes));
-        crate::tables::order_table_lines(page, &evidence.tables);
+        legal_pdf_tables::order_table_lines(page, &evidence.tables);
         build_regions(std::slice::from_mut(page));
     }
     evidence.translation_line_ids = translation;
@@ -3061,8 +3071,10 @@ fn classify_pages_with_source(
             page.lines[slot].exclude_from_body = true;
         }
     }
-    crate::paragraphs::segment_paragraphs(pages);
-    crate::tables::part_cell_paragraphs(pages, &evidence.tables);
+    legal_pdf_support::profile::measure("classify.paragraphs", || {
+        crate::paragraphs::segment_paragraphs(pages);
+        legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
+    });
     build_regions(pages);
     diagnostics
 }
@@ -3648,7 +3660,23 @@ fn prepare_pages(
         classify_pages_with_source(pages, separators, &mut primitives)
     });
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
-        flash::reconcile_styled_headings(pages, &mut primitives)
+        let excluded = |id: &str| {
+            primitives.translation_line_ids.contains(id)
+                || primitives.contents_line_ids.contains(id)
+                || primitives.table_cell_line_ids.contains(id)
+        };
+        let numbered =
+            |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);
+        legal_pdf_headings::reconcile_styled_headings(
+            pages,
+            legal_pdf_headings::HeadingEvidence {
+                levels: &mut primitives.heading_levels,
+                excluded: &excluded,
+                contents_pages: &primitives.contents_pages,
+                numbered: &numbered,
+            },
+        );
+        build_regions(pages);
     });
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         bookmarks::reconcile_bookmarks(pages, outline, &mut primitives)

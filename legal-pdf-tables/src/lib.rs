@@ -17,6 +17,15 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+/// Layout readings the table detector takes from the parser that owns them.
+pub trait TableLayout {
+    /// Do these lines form a contents page's grid of titles and page numbers?
+    fn contents_grid(&self, lines: &[Line], page_width: f64) -> bool;
+    /// The language a column of lines is written in: French, English, or neither clearly
+    /// (`Some(true)`, `Some(false)`, `None`), on at least `minimum` telling words.
+    fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool>;
+}
+
 /// Points within which rule positions coincide and rule ends meet.
 const TOLERANCE: f64 = 2.0;
 /// Share of a cell side the rules must cover to close it.
@@ -25,21 +34,21 @@ const CLOSED: f64 = 0.5;
 /// A line of a cell, or the part of it that stands in the cell when the line runs on
 /// across a column rule into the next cell.
 #[derive(Debug, Clone)]
-pub(crate) struct CellPart {
-    pub(crate) line_id: String,
+pub struct CellPart {
+    pub line_id: String,
     /// Character offsets of the part within its line's text.
-    pub(crate) chars: Option<(usize, usize)>,
+    pub chars: Option<(usize, usize)>,
     text: String,
     bbox: [f64; 4],
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableCell {
-    pub(crate) column: usize,
-    pub(crate) row_span: usize,
-    pub(crate) column_span: usize,
+pub struct TableCell {
+    pub column: usize,
+    pub row_span: usize,
+    pub column_span: usize,
     /// The cell's text in reading order; empty for a blank cell.
-    pub(crate) parts: Vec<CellPart>,
+    pub parts: Vec<CellPart>,
 }
 
 impl TableCell {
@@ -66,7 +75,7 @@ impl TableCell {
         bands
     }
 
-    pub(crate) fn line_ids(&self) -> Vec<String> {
+    pub fn line_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for part in &self.parts {
             if ids.last() != Some(&part.line_id) {
@@ -78,15 +87,15 @@ impl TableCell {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableRow {
-    pub(crate) header: bool,
+pub struct TableRow {
+    pub header: bool,
     /// The cells whose top-left corner is in this row, by column.
-    pub(crate) cells: Vec<TableCell>,
+    pub cells: Vec<TableCell>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PdfTable {
-    pub(crate) rows: Vec<TableRow>,
+pub struct PdfTable {
+    pub rows: Vec<TableRow>,
     page_index: usize,
     xs: Vec<f64>,
     top: f64,
@@ -95,7 +104,7 @@ pub(crate) struct PdfTable {
 
 impl PdfTable {
     /// The table's lines, each once, in reading order.
-    pub(crate) fn line_ids(&self) -> Vec<&String> {
+    pub fn line_ids(&self) -> Vec<&String> {
         let mut seen = HashSet::new();
         self.rows
             .iter()
@@ -425,7 +434,12 @@ fn pieces_of(
 }
 
 /// The table one lattice of rules draws on a page, if it is one.
-fn lattice_table(page: &Page, horizontal: &[Rule], vertical: &[Rule]) -> Option<PdfTable> {
+fn lattice_table(
+    page: &Page,
+    horizontal: &[Rule],
+    vertical: &[Rule],
+    layout: &dyn TableLayout,
+) -> Option<PdfTable> {
     let xs = positions(vertical.iter().map(|rule| rule.at).collect());
     let ys = positions(horizontal.iter().map(|rule| rule.at).collect());
     if xs.len() < 3 || ys.len() < 3 {
@@ -562,7 +576,7 @@ fn lattice_table(page: &Page, horizontal: &[Rule], vertical: &[Rule]) -> Option<
         .count()
         * 2
         >= text_rows.len()
-        || crate::layout::contents_grid(&inside, page.width)
+        || layout.contents_grid(&inside, page.width)
         || text_rows
             .iter()
             .flatten()
@@ -837,12 +851,12 @@ fn open_tables(page: &Page, rules: &[Rule], taken: &HashSet<usize>) -> Vec<PdfTa
 
 /// Party roles a caption sets beside the names it lists.
 fn party_role(text: &str) -> bool {
-    static ROLE: OnceLock<Regex> = OnceLock::new();
+    static ROLE: OnceLock<Words> = OnceLock::new();
     ROLE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:applicants?|respondents?|plaintiffs?|defendants?|appellants?|petitioners?|claimants?|interveners?|intervenors?|interested\s+part(?:y|ies)|amic(?:us|i)\s+curiae|accused|complainants?|third\s+part(?:y|ies)|requérante?s?|intimée?s?|demandeur|demanderesse|défendeur|défenderesse|appelante?s?)\b",
+        Words::new(
+            r"applicants?|respondents?|plaintiffs?|defendants?|appellants?|petitioners?|claimants?|interveners?|intervenors?|interested\s+part(?:y|ies)|amic(?:us|i)\s+curiae|accused|complainants?|third\s+part(?:y|ies)|requérante?s?|intimée?s?|demandeur|demanderesse|défendeur|défenderesse|appelante?s?",
+            None,
         )
-        .expect("party role regex")
     })
     .is_match(text)
 }
@@ -880,15 +894,38 @@ fn form_label(text: &str) -> bool {
 
 /// A letterhead's or an address for service's contact details.
 fn contact_detail(text: &str) -> bool {
-    static CONTACT: OnceLock<Regex> = OnceLock::new();
+    static CONTACT: OnceLock<Words> = OnceLock::new();
     CONTACT
         .get_or_init(|| {
-            Regex::new(
-                r"(?i)\b(?:tel|telephone|phone|fax|e-?mail|t[ée]l[ée]copieur|courriel)\b|@|www\.|\bLLP\b",
+            Words::new(
+                r"tel|telephone|phone|fax|e-?mail|t[ée]l[ée]copieur|courriel|LLP",
+                Some(r"@|www\."),
             )
-            .expect("contact regex")
         })
         .is_match(text)
+}
+
+/// Whole words, in any case, with marks that need no word around them. A word boundary
+/// keeps the regex engine off its fast automaton wherever a text holds a letter outside
+/// ASCII, so the words without boundaries, which it runs fast, first rule out the many
+/// texts holding none of them.
+struct Words {
+    loose: Regex,
+    bounded: Regex,
+}
+
+impl Words {
+    fn new(words: &str, marks: Option<&str>) -> Self {
+        let marks = marks.map(|marks| format!("|{marks}")).unwrap_or_default();
+        Self {
+            loose: Regex::new(&format!(r"(?i)(?:{words}){marks}")).expect("words regex"),
+            bounded: Regex::new(&format!(r"(?i)\b(?:{words})\b{marks}")).expect("words regex"),
+        }
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        self.loose.is_match(text) && self.bounded.is_match(text)
+    }
 }
 
 /// Tables set without rules: rows of text whose columns stand apart by gutters of white
@@ -902,6 +939,7 @@ fn aligned_tables(
     page: &Page,
     taken: &HashSet<usize>,
     translation: &HashSet<String>,
+    layout: &dyn TableLayout,
 ) -> Vec<PdfTable> {
     let mut heights: Vec<f64> = page
         .lines
@@ -985,35 +1023,45 @@ fn aligned_tables(
         floor = floor.max(piece.bbox[3]);
         bands.last_mut().expect("band").push(piece);
     }
-    let coverage = |band: &[Piece]| {
-        let mut spans: Vec<(f64, f64)> = band
-            .iter()
-            .map(|piece| (piece.bbox[0], piece.bbox[2]))
-            .collect();
-        spans.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let mut merged: Vec<(f64, f64)> = Vec::new();
-        for (start, end) in spans {
-            match merged.last_mut() {
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
+    // Each band's covered spans, top and bottom, read once for every run that crosses it.
+    let coverage: Vec<Vec<(f64, f64)>> = bands
+        .iter()
+        .map(|band| {
+            let mut spans: Vec<(f64, f64)> = band
+                .iter()
+                .map(|piece| (piece.bbox[0], piece.bbox[2]))
+                .collect();
+            spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let mut merged: Vec<(f64, f64)> = Vec::new();
+            for (start, end) in spans {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
             }
-        }
-        merged
-    };
-    let top = |band: &[Piece]| {
-        band.iter()
-            .map(|piece| piece.bbox[1])
-            .fold(f64::INFINITY, f64::min)
-    };
-    let bottom = |band: &[Piece]| {
-        band.iter()
-            .map(|piece| piece.bbox[3])
-            .fold(f64::NEG_INFINITY, f64::max)
-    };
+            merged
+        })
+        .collect();
+    let top: Vec<f64> = bands
+        .iter()
+        .map(|band| {
+            band.iter()
+                .map(|piece| piece.bbox[1])
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect();
+    let bottom: Vec<f64> = bands
+        .iter()
+        .map(|band| {
+            band.iter()
+                .map(|piece| piece.bbox[3])
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect();
     let mut tables = Vec::new();
     let mut start = 0;
     while start < bands.len() {
-        let spans = coverage(&bands[start]);
+        let spans = &coverage[start];
         let mut gutters: Vec<(f64, f64)> = spans
             .windows(2)
             .map(|pair| (pair[0].1, pair[1].0))
@@ -1025,13 +1073,13 @@ fn aligned_tables(
         }
         let mut extent = (spans[0].0, spans[spans.len() - 1].1);
         let mut end = start + 1;
-        while end < bands.len() && top(&bands[end]) - bottom(&bands[end - 1]) <= 2.5 * pitch {
-            let spans = coverage(&bands[end]);
+        while end < bands.len() && top[end] - bottom[end - 1] <= 2.5 * pitch {
+            let spans = &coverage[end];
             let narrowed: Vec<(f64, f64)> = gutters
                 .iter()
                 .flat_map(|(left, right)| {
                     let mut open = vec![(*left, *right)];
-                    for (start, end) in &spans {
+                    for (start, end) in spans {
                         open = open
                             .into_iter()
                             .flat_map(|(left, right)| {
@@ -1057,8 +1105,8 @@ fn aligned_tables(
             );
             end += 1;
         }
-        let found =
-            aligned_table(page, &bands[start..end], &gutters, extent, pitch).filter(|table| {
+        let found = aligned_table(page, &bands[start..end], &gutters, extent, pitch, layout)
+            .filter(|table| {
                 !table
                     .line_ids()
                     .into_iter()
@@ -1077,6 +1125,7 @@ fn aligned_table(
     gutters: &[(f64, f64)],
     extent: (f64, f64),
     pitch: f64,
+    layout: &dyn TableLayout,
 ) -> Option<PdfTable> {
     if bands.len() < 3 {
         return None;
@@ -1125,30 +1174,6 @@ fn aligned_table(
     if paired < 3 || paired * 2 < rows.len() {
         return None;
     }
-    let text = |pieces: &[Piece]| {
-        pieces
-            .iter()
-            .map(|piece| {
-                let line = &page.lines[piece.line].text;
-                match piece.chars {
-                    Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
-                    None => line.clone(),
-                }
-            })
-            .collect::<Vec<String>>()
-            .join(" ")
-    };
-    let column_texts: Vec<Vec<String>> = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .filter(|(row, _)| !row[column].is_empty())
-                .map(|(row, _)| text(&row[column]).trim().to_owned())
-                .collect()
-        })
-        .collect();
-    let share = |texts: &[String], test: &dyn Fn(&str) -> bool| {
-        texts.iter().filter(|text| test(text)).count() as f64 / texts.len().max(1) as f64
-    };
     // Each column's cells keep one edge or their centre in line.
     let aligned = (0..columns).all(|column| {
         let firsts: Vec<[f64; 4]> = rows
@@ -1180,6 +1205,34 @@ fn aligned_table(
             .count();
         kept * 10 >= firsts.len() * 7
     });
+    // The rest reads the cells' words.
+    if !aligned {
+        return None;
+    }
+    let text = |pieces: &[Piece]| {
+        pieces
+            .iter()
+            .map(|piece| {
+                let line = &page.lines[piece.line].text;
+                match piece.chars {
+                    Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
+                    None => line.clone(),
+                }
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+    let column_texts: Vec<Vec<String>> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter(|(row, _)| !row[column].is_empty())
+                .map(|(row, _)| text(&row[column]).trim().to_owned())
+                .collect()
+        })
+        .collect();
+    let share = |texts: &[String], test: &dyn Fn(&str) -> bool| {
+        texts.iter().filter(|text| test(text)).count() as f64 / texts.len().max(1) as f64
+    };
     let median_length = |texts: &[String]| {
         let mut lengths: Vec<usize> = texts.iter().map(|text| text.chars().count()).collect();
         lengths.sort_unstable();
@@ -1189,24 +1242,23 @@ fn aligned_table(
         .iter()
         .filter(|texts| median_length(texts) > 30)
         .count();
-    let lines: Vec<Line> = rows
+    let indices: std::collections::BTreeSet<usize> = rows
         .iter()
         .flat_map(|(row, _)| row.iter().flatten())
         .map(|piece| piece.line)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|index| page.lines[index].clone())
         .collect();
-    let leaders = lines
+    let leaders = indices
         .iter()
-        .filter(|line| contents_leader(&line.text))
+        .filter(|index| contents_leader(&page.lines[**index].text))
         .count();
-    let caption = column_texts
-        .iter()
-        .any(|texts| share(texts, &party_role) >= 0.4)
-        || column_texts
+    let caption = || {
+        column_texts
             .iter()
-            .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5);
+            .any(|texts| share(texts, &party_role) >= 0.4)
+    };
+    let bracketed = column_texts
+        .iter()
+        .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5);
     let labels = column_texts
         .iter()
         .any(|texts| share(texts, &form_label) >= 0.5);
@@ -1223,86 +1275,7 @@ fn aligned_table(
             text.chars().count() == 1 && text.chars().all(|c| "\u{2022}\u{25e6}\u{25aa}\u{25ab}\u{25a0}\u{25a1}\u{25cf}\u{25cb}\u{f0b7}\u{f0a7}-\u{2013}*\u{b7}".contains(c))
         }) >= 0.7
     });
-    // A column whose rows carry on one another's sentences, each line set out to the
-    // column's measure, is running text set beside other running text: panels side by
-    // side, or a text and its translation.
-    let flowing = (0..columns).any(|column| {
-        let measure = rows
-            .iter()
-            .flat_map(|(row, _)| &row[column])
-            .map(|piece| piece.bbox[2])
-            .fold(f64::NEG_INFINITY, f64::max);
-        let start = rows
-            .iter()
-            .flat_map(|(row, _)| &row[column])
-            .map(|piece| piece.bbox[0])
-            .fold(f64::INFINITY, f64::min);
-        let pairs: Vec<(&Vec<Piece>, &Vec<Piece>)> = rows
-            .windows(2)
-            .filter(|pair| !pair[0].0[column].is_empty() && !pair[1].0[column].is_empty())
-            .map(|pair| (&pair[0].0[column], &pair[1].0[column]))
-            .collect();
-        let carried = pairs
-            .iter()
-            .filter(|(before, after)| {
-                let full = before
-                    .iter()
-                    .map(|piece| piece.bbox[2])
-                    .fold(f64::NEG_INFINITY, f64::max)
-                    >= measure - 0.15 * (measure - start);
-                let (before, after) = (text(before), text(after));
-                full && !before.trim_end().ends_with(['.', ';', ':', '!', '?'])
-                    && after
-                        .trim_start()
-                        .chars()
-                        .next()
-                        .is_some_and(char::is_lowercase)
-            })
-            .count();
-        pairs.len() >= 2 && carried * 10 >= pairs.len() * 4
-    });
-    let languages: Vec<Option<bool>> = (0..columns)
-        .map(|column| {
-            let column_lines: Vec<&Line> = rows
-                .iter()
-                .flat_map(|(row, _)| &row[column])
-                .map(|piece| &page.lines[piece.line])
-                .collect();
-            crate::layout::column_language(
-                crate::layout::language_votes(column_lines.into_iter()),
-                5,
-            )
-        })
-        .collect();
-    // Neighbouring cells that repeat each other's names and numbers are a text and its
-    // translation, row by row.
-    let parallel = (0..columns - 1).any(|column| {
-        let tokens = |pieces: &[Piece]| -> HashSet<String> {
-            text(pieces)
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|token| {
-                    token.chars().count() >= 3 || token.chars().any(|c| c.is_ascii_digit())
-                })
-                .map(str::to_lowercase)
-                .collect()
-        };
-        let pairs: Vec<(HashSet<String>, HashSet<String>)> = rows
-            .iter()
-            .filter(|(row, _)| !row[column].is_empty() && !row[column + 1].is_empty())
-            .map(|(row, _)| (tokens(&row[column]), tokens(&row[column + 1])))
-            .filter(|(left, right)| !left.is_empty() && !right.is_empty())
-            .collect();
-        let alike = pairs
-            .iter()
-            .filter(|(left, right)| {
-                left.intersection(right).count() * 5 >= left.union(right).count() * 2
-            })
-            .count();
-        pairs.len() >= 3 && alike * 2 >= pairs.len()
-    });
-    let bilingual =
-        parallel || (languages.contains(&Some(true)) && languages.contains(&Some(false)));
-    let contacts = share(&cells, &contact_detail) >= 0.2;
+    let contacts = || share(&cells, &contact_detail) >= 0.2;
     let header = {
         let (first, _) = &rows[0];
         let cells: Vec<String> = first
@@ -1357,22 +1330,103 @@ fn aligned_table(
             share(&column_texts[column], &bare_marker) >= 0.7
                 && median_length(&column_texts[column + 1]) > 30
         });
-    if !aligned
-        || listed
+    if listed
         || itemized
         || long > 1
         || leaders >= 2
-        || crate::layout::contents_grid(&lines, page.width)
-        || caption
+        || bracketed
         || labels
-        || contacts
         || ticked
         || choices
-        || flowing
-        || bilingual
         || sequential
         || !(columns >= 3 || figures || header)
+        || caption()
+        || contacts()
     {
+        return None;
+    }
+    // The costlier readings, for a grid the cheap ones let stand.
+    // A column whose rows carry on one another's sentences, each line set out to the
+    // column's measure, is running text set beside other running text: panels side by
+    // side, or a text and its translation.
+    let flowing = (0..columns).any(|column| {
+        let measure = rows
+            .iter()
+            .flat_map(|(row, _)| &row[column])
+            .map(|piece| piece.bbox[2])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let start = rows
+            .iter()
+            .flat_map(|(row, _)| &row[column])
+            .map(|piece| piece.bbox[0])
+            .fold(f64::INFINITY, f64::min);
+        let pairs: Vec<(&Vec<Piece>, &Vec<Piece>)> = rows
+            .windows(2)
+            .filter(|pair| !pair[0].0[column].is_empty() && !pair[1].0[column].is_empty())
+            .map(|pair| (&pair[0].0[column], &pair[1].0[column]))
+            .collect();
+        let carried = pairs
+            .iter()
+            .filter(|(before, after)| {
+                let full = before
+                    .iter()
+                    .map(|piece| piece.bbox[2])
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    >= measure - 0.15 * (measure - start);
+                let (before, after) = (text(before), text(after));
+                full && !before.trim_end().ends_with(['.', ';', ':', '!', '?'])
+                    && after
+                        .trim_start()
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_lowercase)
+            })
+            .count();
+        pairs.len() >= 2 && carried * 10 >= pairs.len() * 4
+    });
+    let languages: Vec<Option<bool>> = (0..columns)
+        .map(|column| {
+            let column_lines: Vec<&Line> = rows
+                .iter()
+                .flat_map(|(row, _)| &row[column])
+                .map(|piece| &page.lines[piece.line])
+                .collect();
+            layout.column_language(&column_lines, 5)
+        })
+        .collect();
+    // Neighbouring cells that repeat each other's names and numbers are a text and its
+    // translation, row by row.
+    let parallel = (0..columns - 1).any(|column| {
+        let tokens = |pieces: &[Piece]| -> HashSet<String> {
+            text(pieces)
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| {
+                    token.chars().count() >= 3 || token.chars().any(|c| c.is_ascii_digit())
+                })
+                .map(str::to_lowercase)
+                .collect()
+        };
+        let pairs: Vec<(HashSet<String>, HashSet<String>)> = rows
+            .iter()
+            .filter(|(row, _)| !row[column].is_empty() && !row[column + 1].is_empty())
+            .map(|(row, _)| (tokens(&row[column]), tokens(&row[column + 1])))
+            .filter(|(left, right)| !left.is_empty() && !right.is_empty())
+            .collect();
+        let alike = pairs
+            .iter()
+            .filter(|(left, right)| {
+                left.intersection(right).count() * 5 >= left.union(right).count() * 2
+            })
+            .count();
+        pairs.len() >= 3 && alike * 2 >= pairs.len()
+    });
+    let bilingual =
+        parallel || (languages.contains(&Some(true)) && languages.contains(&Some(false)));
+    let lines: Vec<Line> = indices
+        .into_iter()
+        .map(|index| page.lines[index].clone())
+        .collect();
+    if flowing || bilingual || layout.contents_grid(&lines, page.width) {
         return None;
     }
     let mut table_rows: Vec<TableRow> = rows
@@ -1419,7 +1473,7 @@ fn aligned_table(
     })
 }
 
-fn drawn_tables(page: &Page) -> Vec<PdfTable> {
+fn drawn_tables(page: &Page, layout: &dyn TableLayout) -> Vec<PdfTable> {
     let (mut horizontal, mut vertical) = (Vec::new(), Vec::new());
     for region in page.regions.iter().filter(|region| region.kind == "rule") {
         let [x0, y0, x1, y1] = region.bbox;
@@ -1472,7 +1526,7 @@ fn drawn_tables(page: &Page) -> Vec<PdfTable> {
     }
     let mut tables: Vec<PdfTable> = lattices
         .values()
-        .filter_map(|(horizontal, vertical)| lattice_table(page, horizontal, vertical))
+        .filter_map(|(horizontal, vertical)| lattice_table(page, horizontal, vertical, layout))
         .collect();
     let lines: HashMap<&str, usize> = page
         .lines
@@ -1493,14 +1547,14 @@ fn drawn_tables(page: &Page) -> Vec<PdfTable> {
     tables.extend(
         open_tables(page, &free, &taken)
             .into_iter()
-            .filter(|table| !bilingual_columns(page, table)),
+            .filter(|table| !bilingual_columns(page, table, layout)),
     );
     tables
 }
 
 /// Whether one column of a table reads in English and another in French: a text set beside
 /// its translation under shared heads, not a table.
-fn bilingual_columns(page: &Page, table: &PdfTable) -> bool {
+fn bilingual_columns(page: &Page, table: &PdfTable, layout: &dyn TableLayout) -> bool {
     let by_id: HashMap<&str, &Line> = page
         .lines
         .iter()
@@ -1516,15 +1570,17 @@ fn bilingual_columns(page: &Page, table: &PdfTable) -> bool {
     }
     let languages: Vec<Option<bool>> = columns
         .into_values()
-        .map(|lines| {
-            crate::layout::column_language(crate::layout::language_votes(lines.into_iter()), 5)
-        })
+        .map(|lines| layout.column_language(&lines, 5))
         .collect();
     languages.contains(&Some(true)) && languages.contains(&Some(false))
 }
 
-fn page_tables(page: &Page, translation: &HashSet<String>) -> Vec<PdfTable> {
-    let mut tables = drawn_tables(page);
+fn page_tables(
+    page: &Page,
+    translation: &HashSet<String>,
+    layout: &dyn TableLayout,
+) -> Vec<PdfTable> {
+    let mut tables = drawn_tables(page, layout);
     let lines: HashMap<&str, usize> = page
         .lines
         .iter()
@@ -1536,7 +1592,7 @@ fn page_tables(page: &Page, translation: &HashSet<String>) -> Vec<PdfTable> {
         .flat_map(PdfTable::line_ids)
         .map(|id| lines[id.as_str()])
         .collect();
-    tables.extend(aligned_tables(page, &taken, translation));
+    tables.extend(aligned_tables(page, &taken, translation, layout));
     tables.sort_by(|left, right| left.top.total_cmp(&right.top));
     tables
 }
@@ -1589,11 +1645,15 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
 
 /// Every ruled table in the document, a table cut off by a page break joined to its
 /// continuation, in reading order.
-pub(crate) fn ruled_tables(pages: &[Page], translation: &HashSet<String>) -> Vec<PdfTable> {
+pub fn ruled_tables(
+    pages: &[Page],
+    translation: &HashSet<String>,
+    layout: &dyn TableLayout,
+) -> Vec<PdfTable> {
     let mut tables: Vec<PdfTable> = Vec::new();
     let mut previous_last: Option<usize> = None;
     for page in pages {
-        let found = page_tables(page, translation);
+        let found = page_tables(page, translation, layout);
         let empty_band = |from: f64, to: f64| {
             !page.lines.iter().any(|line| {
                 !line.exclude_from_body
@@ -1681,7 +1741,7 @@ pub(crate) fn ruled_tables(pages: &[Page], translation: &HashSet<String>) -> Vec
 
 /// Puts each table's lines on the page in row order, cell by cell, where its first line
 /// stood, and renumbers the page's reading order.
-pub(crate) fn order_table_lines(page: &mut Page, tables: &[PdfTable]) {
+pub fn order_table_lines(page: &mut Page, tables: &[PdfTable]) {
     let keys: HashMap<&str, (usize, usize)> = tables
         .iter()
         .enumerate()
@@ -1732,7 +1792,7 @@ pub(crate) fn order_table_lines(page: &mut Page, tables: &[PdfTable]) {
 
 /// Each cell's text is body text of its own: a paragraph never runs from one cell into
 /// the next, though a cell may hold several.
-pub(crate) fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
+pub fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
     // A line parted between cells reads with the first of them.
     let mut cells: HashMap<&str, usize> = HashMap::new();
     for (cell, value) in tables
@@ -1773,7 +1833,7 @@ pub(crate) fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
 }
 
 /// Line ids of every ruled table's cells.
-pub(crate) fn table_line_ids(tables: &[PdfTable]) -> HashSet<String> {
+pub fn table_line_ids(tables: &[PdfTable]) -> HashSet<String> {
     tables
         .iter()
         .flat_map(PdfTable::line_ids)

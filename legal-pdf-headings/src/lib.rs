@@ -25,18 +25,16 @@ mod model;
 mod outline;
 mod stats;
 
-use super::{inline_enumerator_re, standalone_enumerator, PdfPrimitiveEvidence};
-use crate::layout::build_regions;
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
 use legal_pdf_core::model::Page;
 use legal_pdf_core::structure_analysis;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{body_headings, stands_alone, Candidate, Context};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-pub(super) fn party_label() -> &'static Regex {
+pub fn party_label() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let ordinal = r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|\d+(?:st|nd|rd|th))";
@@ -155,20 +153,36 @@ fn citation_only(block: &FlashBlock) -> bool {
         .map(|line| line.text.trim())
         .collect::<Vec<_>>()
         .join(" ");
-    let citations = structure_analysis().citations(&text);
-    if citations.is_empty() {
+    // The layout reading of citations: the full citator would resolve each one, at a cost
+    // every short block on a page of authorities pays.
+    let spans = structure_analysis().protected_citation_spans(&text);
+    if spans.is_empty() {
         return false;
     }
-    let rest = citations.iter().fold(text.clone(), |rest, citation| {
-        rest.replacen(&citation.text, " ", 1)
-    });
-    rest.chars()
-        .filter(|character| character.is_alphabetic())
+    text.chars()
+        .enumerate()
+        .filter(|(at, character)| {
+            character.is_alphabetic() && !spans.iter().any(|(start, end)| start <= at && at < end)
+        })
         .count()
         < 3
 }
 
-pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
+/// What the structure stage has read that the heading reader needs.
+pub struct HeadingEvidence<'a> {
+    /// Line id to level of every heading accepted so far; the reader adds and removes.
+    pub levels: &'a mut HashMap<String, usize>,
+    /// Lines that can be no heading: a translation, a contents row, a table cell.
+    pub excluded: &'a dyn Fn(&str) -> bool,
+    /// Contents pages, none of whose lines is a heading.
+    pub contents_pages: &'a HashSet<usize>,
+    /// Does a line open with a heading's number ("1.", "(a)", "IV")?
+    pub numbered: &'a dyn Fn(&str) -> bool,
+}
+
+/// Read the headings set apart by type alone and the depth of every heading. Line roles and
+/// `evidence.levels` change; the caller rebuilds the pages' regions.
+pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) {
     // The case caption: lines down to a page's last party label are no headings.
     let mut caption = HashSet::<String>::new();
     for page in pages.iter_mut() {
@@ -183,11 +197,11 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
             caption.insert(line.id.clone());
             if line.region_type == "heading" && model::CharStats::of(&line.text).caps_heavy() {
                 line.region_type = "body".to_owned();
-                primitives.heading_levels.remove(&line.id);
+                evidence.levels.remove(&line.id);
             }
         }
     }
-    join_wrapped_headings(pages, &primitives.heading_levels);
+    join_wrapped_headings(pages, evidence.levels);
 
     let flash_lines = pages
         .iter()
@@ -237,7 +251,6 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
             let lines = &page.lines[slot..end];
             let first = line.text.trim();
             let heading = line.region_type == "heading";
-            let citation = citation_only(&flash);
             blocks.push(Block {
                 flash,
                 page: page_slot,
@@ -245,20 +258,15 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
                 heading,
                 numbered: lines
                     .iter()
-                    .any(|line| primitives.heading_levels.contains_key(&line.id))
-                    || inline_enumerator_re().is_match(first)
-                    || standalone_enumerator(first),
+                    .any(|line| evidence.levels.contains_key(&line.id))
+                    || (evidence.numbered)(first),
                 is_body: false,
             });
             eligible.push(
-                !citation
-                    && lines.iter().all(|line| {
-                        !caption.contains(&line.id)
-                            && !primitives.translation_line_ids.contains(&line.id)
-                            && !primitives.contents_line_ids.contains(&line.id)
-                            && !primitives.table_cell_line_ids.contains(&line.id)
-                    })
-                    && !primitives.contents_pages.contains(&page.index),
+                lines
+                    .iter()
+                    .all(|line| !caption.contains(&line.id) && !(evidence.excluded)(&line.id))
+                    && !evidence.contents_pages.contains(&page.index),
             );
             ids.push(blocks.len() - 1);
             slot = end;
@@ -282,10 +290,13 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
             }
         }
     }
-    // A new heading is set in the page's own type size or larger, opens with a capital or a
-    // number, ends no lead-in, and stands on rows of its own rather than beside running text.
+    // A new heading is a short block set in the page's own type size or larger, opens with a
+    // capital or a number, ends no lead-in, and stands on rows of its own beside no running text.
     for page in &flash_pages {
-        for &block in &page.blocks {
+        for (position, &block) in page.blocks.iter().enumerate() {
+            if !eligible[block] {
+                continue;
+            }
             let flash = &blocks[block].flash;
             let text = flash
                 .lines
@@ -293,6 +304,10 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
                 .map(|line| line.text.trim())
                 .collect::<Vec<_>>()
                 .join(" ");
+            if flash.line_count() > 4 || text.chars().count() > 300 {
+                eligible[block] = false;
+                continue;
+            }
             let opens = text
                 .chars()
                 .find(|character| character.is_alphanumeric())
@@ -303,36 +318,77 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
                 })
                 .chars()
                 .last();
-            let beside = page.blocks.iter().any(|&other| {
-                let rect = &blocks[other].flash.rect;
-                other != block
-                    && blocks[other].is_body
-                    && model::y_overlaps(rect, &flash.rect)
-                    && (rect.right < flash.rect.left || rect.left > flash.rect.right)
-            });
-            let analysis = structure_analysis();
             let quoted = text.starts_with(['"', '\u{201c}', '\u{2018}'])
                 || text.ends_with(".\u{201d}")
                 || text.ends_with("\u{201d}.");
-            // Indented under the running text's margin, off the page's centre: quoted material,
-            // whose headings are the quoted document's, not this one's.
+            // The type and wording tests are cheap; the layout tests below read the whole page.
+            if flash.size < page.stats.font_size - 0.5
+                || !opens
+                || quoted
+                || matches!(ends, Some(',' | ';' | ':'))
+            {
+                eligible[block] = false;
+                continue;
+            }
+            // Running text in the next column is not beside a block set in a column of its own,
+            // one where running text stands above or below it clear of that next column.
+            let column = |rect: &model::Rect| {
+                page.blocks.iter().any(|&own| {
+                    let own = (&blocks[own].flash, blocks[own].is_body);
+                    own.1
+                        && own.0.line_count() >= 2
+                        && !model::y_overlaps(&own.0.rect, &flash.rect)
+                        && own.0.rect.left < flash.rect.right
+                        && flash.rect.left < own.0.rect.right
+                        && (own.0.rect.right < rect.left || own.0.rect.left > rect.right)
+                })
+            };
+            let beside = || {
+                page.blocks.iter().any(|&other| {
+                    let rect = &blocks[other].flash.rect;
+                    other != block
+                        && blocks[other].is_body
+                        && model::y_overlaps(rect, &flash.rect)
+                        && (rect.right < flash.rect.left || rect.left > flash.rect.right)
+                        && !column(rect)
+                })
+            };
+            // Indented under the margin of the running text in its column, off the page's centre:
+            // quoted material, whose headings are the quoted document's, not this one's.
             let margin = page
                 .blocks
                 .iter()
-                .filter(|&&other| blocks[other].is_body && blocks[other].flash.line_count() >= 2)
-                .map(|&other| blocks[other].flash.rect.left)
+                .map(|&other| &blocks[other])
+                .filter(|other| {
+                    other.is_body
+                        && other.flash.line_count() >= 2
+                        && other.flash.rect.left < flash.rect.right
+                        && flash.rect.left < other.flash.rect.right
+                })
+                .map(|other| other.flash.rect.left)
                 .fold(f64::INFINITY, f64::min);
+            // A line whose sentence runs on into the block set close below it is that block's
+            // opening words, set apart in bold, not its heading.
+            let runs_on = page.blocks.get(position + 1).is_some_and(|&next| {
+                let next = &blocks[next].flash;
+                next.lines
+                    .first()
+                    .is_some_and(|line| line.text.trim_start().starts_with(char::is_lowercase))
+                    && flash.rect.bottom - next.rect.top < 0.5 * flash.size
+                    && model::left_aligned(&flash.rect, &next.rect, 2.0)
+            });
             let indented = margin.is_finite()
                 && flash.rect.left > margin + 1.5 * flash.size
                 && (flash.rect.center_x() - page.width / 2.0).abs() >= 0.05 * page.width;
-            eligible[block] &= flash.size >= page.stats.font_size - 0.5
-                && opens
-                && !quoted
-                && !indented
-                && !matches!(ends, Some(',' | ';' | ':'))
-                && !beside
-                && !analysis.has_citation_cue(&text)
-                && !analysis.has_citation_signal(&text);
+            // The citation grammar is costly: it reads only blocks every layout test admits. A
+            // citation carries a number; a cue word alone ("people", "re") names no authority.
+            let analysis = structure_analysis();
+            eligible[block] = !indented
+                && !runs_on
+                && !beside()
+                && !(analysis.has_citation_cue(&text) && text.chars().any(|c| c.is_ascii_digit()))
+                && !analysis.has_citation_signal(&text)
+                && !citation_only(flash);
         }
     }
     let mut positions = vec![0; blocks.len()];
@@ -372,11 +428,7 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
                     level: blocks[block]
                         .line_slots
                         .iter()
-                        .filter_map(|slot| {
-                            primitives
-                                .heading_levels
-                                .get(&pages[page_index].lines[*slot].id)
-                        })
+                        .filter_map(|slot| evidence.levels.get(&pages[page_index].lines[*slot].id))
                         .min()
                         .copied(),
                 });
@@ -452,9 +504,7 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
     for candidate in candidates.iter().filter(|candidate| stray(candidate)) {
         let block = &blocks[candidate.block];
         for &slot in &block.line_slots {
-            primitives
-                .heading_levels
-                .remove(&pages[block.page].lines[slot].id);
+            evidence.levels.remove(&pages[block.page].lines[slot].id);
         }
     }
     let accepted = candidates
@@ -482,17 +532,16 @@ pub(super) fn reconcile_styled_headings(pages: &mut [Page], primitives: &mut Pdf
                 line.region_type = "heading".to_owned();
             }
             let step = candidate.level.and_then(|top| {
-                primitives
-                    .heading_levels
+                evidence
+                    .levels
                     .get(&line.id)
                     .map(|own| own.saturating_sub(top))
             });
-            primitives
-                .heading_levels
+            evidence
+                .levels
                 .insert(line.id.clone(), level + step.unwrap_or(0));
         }
     }
-    build_regions(pages);
 }
 
 // PageIndex license, for the code ported in this module:

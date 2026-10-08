@@ -256,6 +256,19 @@ pub(super) fn has_table_caption(lines: &[Line]) -> bool {
     lines.iter().any(|line| regex.is_match(line.text.trim()))
 }
 
+/// The layout readings this crate lends the table detector.
+pub(super) struct TableReadings;
+
+impl legal_pdf_tables::TableLayout for TableReadings {
+    fn contents_grid(&self, lines: &[Line], page_width: f64) -> bool {
+        contents_grid(lines, page_width)
+    }
+
+    fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool> {
+        column_language(language_votes(lines.iter().copied()), minimum)
+    }
+}
+
 pub(super) fn contents_grid(lines: &[Line], page_width: f64) -> bool {
     if page_width <= 0.0 {
         return false;
