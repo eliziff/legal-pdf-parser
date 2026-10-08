@@ -29,7 +29,7 @@ use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
 use legal_pdf_core::model::Page;
 use legal_pdf_core::structure_analysis;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
-use outline::{body_headings, stands_alone, Candidate, Context};
+use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -483,6 +483,8 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     }
     candidates.sort_by(|left, right| context.order(left.block, right.block));
     let proposed = proposed.into_iter().collect::<HashSet<_>>();
+    // Every candidate's fonts, read once for all the proposed headings they are compared with.
+    let fonts = std::cell::OnceCell::new();
     let rejected = (0..candidates.len())
         .filter(|index| {
             let candidate = &candidates[*index];
@@ -493,7 +495,8 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     block.flash.rect.bottom
                         - blocks[flash_pages[block.page].blocks[slot]].flash.rect.top
                 });
-                stands_alone(&context, &candidates, *index, gap)
+                let fonts = fonts.get_or_init(|| candidate_fonts(&context, &candidates));
+                stands_alone(&context, &candidates, fonts, *index, gap)
             }
         })
         .collect::<HashSet<_>>();
