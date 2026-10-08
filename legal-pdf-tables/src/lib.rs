@@ -1010,6 +1010,18 @@ fn aligned_tables(
             });
         }
     }
+    // Each piece's words, cut from its line once for every run of rows that reads them.
+    let texts: HashMap<(usize, Option<(usize, usize)>), String> = pieces
+        .iter()
+        .map(|piece| {
+            let line = &page.lines[piece.line].text;
+            let text = match piece.chars {
+                Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
+                None => line.clone(),
+            };
+            ((piece.line, piece.chars), text)
+        })
+        .collect();
     pieces.sort_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]));
     // Visual rows.
     let mut bands: Vec<Vec<Piece>> = Vec::new();
@@ -1077,22 +1089,7 @@ fn aligned_tables(
             let spans = &coverage[end];
             let narrowed: Vec<(f64, f64)> = gutters
                 .iter()
-                .flat_map(|(left, right)| {
-                    let mut open = vec![(*left, *right)];
-                    for (start, end) in spans {
-                        open = open
-                            .into_iter()
-                            .flat_map(|(left, right)| {
-                                if *end <= left || *start >= right {
-                                    vec![(left, right)]
-                                } else {
-                                    vec![(left, *start), (*end, right)]
-                                }
-                            })
-                            .collect();
-                    }
-                    open
-                })
+                .flat_map(|&gap| open_parts(gap, spans))
                 .filter(|(left, right)| right - left >= gutter)
                 .collect();
             if narrowed.is_empty() {
@@ -1105,7 +1102,7 @@ fn aligned_tables(
             );
             end += 1;
         }
-        let found = aligned_table(page, &bands[start..end], &gutters, extent, pitch, layout)
+        let found = aligned_table(page, &texts, &bands[start..end], &gutters, extent, pitch, layout)
             .filter(|table| {
                 !table
                     .line_ids()
@@ -1118,9 +1115,28 @@ fn aligned_tables(
     tables
 }
 
+/// What of a gap a band's covered spans leave open, left to right: the gap is cut at each span
+/// that reaches into what is still open of it. The spans are sorted and apart, so each cut leaves
+/// its left part behind every span still to come; a span reaching past an edge leaves a part of
+/// negative width, which only ever splits into more of them and which no gutter's width admits.
+fn open_parts((left, right): (f64, f64), spans: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut parts = Vec::new();
+    let mut open = (left, right);
+    for &(start, end) in spans {
+        if end <= open.0 || start >= open.1 {
+            continue;
+        }
+        parts.push((open.0, start));
+        open = (end, open.1);
+    }
+    parts.push(open);
+    parts
+}
+
 /// The table some visual rows make between the gutters they share, if it passes.
 fn aligned_table(
     page: &Page,
+    texts: &HashMap<(usize, Option<(usize, usize)>), String>,
     bands: &[Vec<Piece>],
     gutters: &[(f64, f64)],
     extent: (f64, f64),
@@ -1212,24 +1228,16 @@ fn aligned_table(
     let text = |pieces: &[Piece]| {
         pieces
             .iter()
-            .map(|piece| {
-                let line = &page.lines[piece.line].text;
-                match piece.chars {
-                    Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
-                    None => line.clone(),
-                }
-            })
-            .collect::<Vec<String>>()
+            .map(|piece| texts[&(piece.line, piece.chars)].as_str())
+            .collect::<Vec<&str>>()
             .join(" ")
     };
-    let column_texts: Vec<Vec<String>> = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .filter(|(row, _)| !row[column].is_empty())
-                .map(|(row, _)| text(&row[column]).trim().to_owned())
-                .collect()
-        })
-        .collect();
+    let column_text = |column: usize| -> Vec<String> {
+        rows.iter()
+            .filter(|(row, _)| !row[column].is_empty())
+            .map(|(row, _)| text(&row[column]).trim().to_owned())
+            .collect()
+    };
     let share = |texts: &[String], test: &dyn Fn(&str) -> bool| {
         texts.iter().filter(|text| test(text)).count() as f64 / texts.len().max(1) as f64
     };
@@ -1238,44 +1246,32 @@ fn aligned_table(
         lengths.sort_unstable();
         lengths.get(lengths.len() / 2).copied().unwrap_or(0)
     };
-    let long = column_texts
-        .iter()
-        .filter(|texts| median_length(texts) > 30)
-        .count();
-    let indices: std::collections::BTreeSet<usize> = rows
-        .iter()
-        .flat_map(|(row, _)| row.iter().flatten())
-        .map(|piece| piece.line)
-        .collect();
-    let leaders = indices
-        .iter()
-        .filter(|index| contents_leader(&page.lines[**index].text))
-        .count();
-    let caption = || {
-        column_texts
+    // A column's share of figures, counted off its pieces' words: the spaces that join a cell's
+    // pieces, and its trimmed ends, are no digit, mark or letter.
+    let figure_share = |column: usize| {
+        let cells: Vec<&Vec<Piece>> = rows
             .iter()
-            .any(|texts| share(texts, &party_role) >= 0.4)
+            .filter(|(row, _)| !row[column].is_empty())
+            .map(|(row, _)| &row[column])
+            .collect();
+        let hits = cells
+            .iter()
+            .filter(|pieces| {
+                let (mut digits, mut marks, mut letters) = (0_usize, 0_usize, 0_usize);
+                for piece in pieces.iter() {
+                    for character in texts[&(piece.line, piece.chars)].chars() {
+                        digits += usize::from(character.is_ascii_digit());
+                        marks += usize::from(!character.is_whitespace());
+                        letters += usize::from(character.is_alphabetic());
+                    }
+                }
+                digits > 0 && digits * 2 >= marks && letters <= 1
+            })
+            .count();
+        hits as f64 / cells.len().max(1) as f64
     };
-    let bracketed = column_texts
-        .iter()
-        .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5);
-    let labels = column_texts
-        .iter()
-        .any(|texts| share(texts, &form_label) >= 0.5);
-    let cells: Vec<String> = column_texts.concat();
-    // Bullets or boxes to tick down a column mark a list or a form.
-    // Columns that each repeat one word down every row are a form's choices: Yes, No.
-    let choices = column_texts
-        .iter()
-        .filter(|texts| texts.len() >= 3 && texts.iter().all(|text| *text == texts[0]))
-        .count()
-        >= 2;
-    let ticked = column_texts.iter().any(|texts| {
-        share(texts, &|text| {
-            text.chars().count() == 1 && text.chars().all(|c| "\u{2022}\u{25e6}\u{25aa}\u{25ab}\u{25a0}\u{25a1}\u{25cf}\u{25cb}\u{f0b7}\u{f0a7}-\u{2013}*\u{b7}".contains(c))
-        }) >= 0.7
-    });
-    let contacts = || share(&cells, &contact_detail) >= 0.2;
+    let figures = (1..columns).any(|column| figure_share(column) >= 0.6);
+    let first_texts = column_text(0);
     let header = {
         let (first, _) = &rows[0];
         let cells: Vec<String> = first
@@ -1299,19 +1295,73 @@ fn aligned_table(
                     && !bare_marker(cell)
                     && !cell.ends_with(':')
             });
-        let numbered = share(&column_texts[0], &bare_marker) >= 0.7;
-        let figures = (1..columns).any(|column| share(&column_texts[column], &figure) >= 0.6);
+        let numbered = share(&first_texts, &bare_marker) >= 0.7;
         labelled
             && (bold_head || (first.iter().all(|cell| !cell.is_empty()) && (numbered || figures)))
     };
-    let sequential = {
+    // Two columns of words with no figures and no header are no table: the readings below, which
+    // read every column's words, are asked only of a grid that passes this.
+    if !(columns >= 3 || figures || header) {
+        return None;
+    }
+    let column_texts: Vec<Vec<String>> = std::iter::once(first_texts)
+        .chain((1..columns).map(column_text))
+        .collect();
+    // Each reading below is asked only if those before it let the grid stand.
+    let long = || {
+        column_texts
+            .iter()
+            .filter(|texts| median_length(texts) > 30)
+            .count()
+    };
+    let indices: std::collections::BTreeSet<usize> = rows
+        .iter()
+        .flat_map(|(row, _)| row.iter().flatten())
+        .map(|piece| piece.line)
+        .collect();
+    let leaders = || {
+        indices
+            .iter()
+            .filter(|index| contents_leader(&page.lines[**index].text))
+            .count()
+    };
+    let caption = || {
+        column_texts
+            .iter()
+            .any(|texts| share(texts, &party_role) >= 0.4)
+    };
+    let bracketed = || {
+        column_texts
+            .iter()
+            .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5)
+    };
+    let labels = || {
+        column_texts
+            .iter()
+            .any(|texts| share(texts, &form_label) >= 0.5)
+    };
+    // Bullets or boxes to tick down a column mark a list or a form.
+    // Columns that each repeat one word down every row are a form's choices: Yes, No.
+    let choices = || {
+        column_texts
+            .iter()
+            .filter(|texts| texts.len() >= 3 && texts.iter().all(|text| *text == texts[0]))
+            .count()
+            >= 2
+    };
+    let ticked = || column_texts.iter().any(|texts| {
+        share(texts, &|text| {
+            text.chars().count() == 1 && text.chars().all(|c| "\u{2022}\u{25e6}\u{25aa}\u{25ab}\u{25a0}\u{25a1}\u{25cf}\u{25cb}\u{f0b7}\u{f0a7}-\u{2013}*\u{b7}".contains(c))
+        }) >= 0.7
+    });
+    let contacts = || share(&column_texts.concat(), &contact_detail) >= 0.2;
+    let sequential = || {
         let numbers: Vec<u32> = column_texts[0]
             .iter()
             .filter_map(|text| text.trim().parse::<u32>().ok())
             .collect();
         numbers.len() >= 5 && numbers.windows(2).all(|pair| pair[1] == pair[0] + 1)
     };
-    let figures = (1..columns).any(|column| share(&column_texts[column], &figure) >= 0.6);
     // Page numbers or entry numbers running up beside titles are a contents list.
     let ascending = |texts: &[String]| {
         let numbers: Vec<u32> = texts
@@ -1323,23 +1373,22 @@ fn aligned_table(
             && numbers.windows(2).filter(|pair| pair[0] <= pair[1]).count() * 5
                 >= (numbers.len() - 1) * 4
     };
-    let listed = !header && (ascending(&column_texts[0]) || ascending(&column_texts[columns - 1]));
+    let listed = || !header && (ascending(&column_texts[0]) || ascending(&column_texts[columns - 1]));
     // Markers beside running text are a list or numbered paragraphs.
-    let itemized = !header
+    let itemized = || !header
         && (0..columns - 1).any(|column| {
             share(&column_texts[column], &bare_marker) >= 0.7
                 && median_length(&column_texts[column + 1]) > 30
         });
-    if listed
-        || itemized
-        || long > 1
-        || leaders >= 2
-        || bracketed
-        || labels
-        || ticked
-        || choices
-        || sequential
-        || !(columns >= 3 || figures || header)
+    if listed()
+        || itemized()
+        || long() > 1
+        || leaders() >= 2
+        || bracketed()
+        || labels()
+        || ticked()
+        || choices()
+        || sequential()
         || caption()
         || contacts()
     {
