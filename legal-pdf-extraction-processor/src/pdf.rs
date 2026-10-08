@@ -1388,6 +1388,10 @@ pub struct ExtractedPdf {
     pub metadata: PdfExtractionMetadata,
     /// The document's own bookmarks, read by `embedded_outline`.
     pub outline: Vec<PdfOutlineEntry>,
+    /// By page index, the pictures on pages with text of their own that may be pictures of text
+    /// the page does not otherwise hold, `[x0, y0, x1, y1]` in points from the page's top-left.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_regions: BTreeMap<usize, Vec<[f64; 4]>>,
 }
 
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
@@ -1439,6 +1443,7 @@ pub fn assemble_pdf(
     deduplicate_painted_text(&mut items);
     assign_renderer_layout(&mut items);
     let scanned_pages = scanned_pages(geometries, &items);
+    let pictures = pictures(geometries, &items);
     items.retain(|item| matches!(&item.item_type, ItemType::Text));
     // Pages whose text is all an invisible layer behind a scan: the layer is that scan's earlier
     // recognition.
@@ -1531,11 +1536,13 @@ pub fn assemble_pdf(
         }
     }
 
+    let image_regions = image_regions(&pages, pictures, &weak_pages);
     let mut extracted = ExtractedPdf {
         pages,
         separators,
         diagnostics,
         outline: Vec::new(),
+        image_regions,
         metadata: PdfExtractionMetadata {
             embedded_page_labels: Vec::new(),
             pages_needing_ocr: weak_pages.into_iter().collect(),
@@ -1580,6 +1587,146 @@ fn scanned_pages(geometries: &PageGeometryMap, items: &[TextItem]) -> Vec<usize>
         .collect()
 }
 
+/// Each page's pictures, `[x0, y0, x1, y1]` in points from the top-left of the page as it is shown.
+fn pictures(geometries: &PageGeometryMap, items: &[TextItem]) -> HashMap<u32, Vec<[f64; 4]>> {
+    let mut pictures = HashMap::<u32, Vec<[f64; 4]>>::new();
+    for item in items.iter().filter(|item| matches!(&item.item_type, ItemType::Image)) {
+        let Some((_, geometry)) = geometries.get(&item.page) else {
+            continue;
+        };
+        // Image rects are in the visible box's own frame, before any page rotation.
+        let frame = PageGeometry { x0: 0.0, y0: 0.0, ..*geometry };
+        let (bbox, visible) =
+            transform_bbox(frame, [item.x, item.y, item.x + item.width, item.y + item.height]);
+        if visible && bbox[2] > bbox[0] && bbox[3] > bbox[1] {
+            let height = geometry.height;
+            pictures.entry(item.page).or_default().push([
+                f64::from(bbox[0]),
+                height - f64::from(bbox[3]),
+                f64::from(bbox[2]),
+                height - f64::from(bbox[1]),
+            ]);
+        }
+    }
+    pictures
+}
+
+/// The pictures on pages with text of their own that may be pictures of text: a quotation, an
+/// extract or a letterhead pasted in as an image. Pictures one under another by less than a line
+/// of the smaller, or side by side by less than a list marker's half-inch indent, are one picture,
+/// as text pasted in line by line is. One is at least an inch wide and a line of small print high,
+/// holds none of the page's own words (text over a background, or a scan's text layer), and is
+/// neither all in the page's top or bottom band, where letterheads, logos and running marks are
+/// drawn, nor drawn in the same place on two other pages (a running mark wherever it is). Pages
+/// recognized whole have none.
+fn image_regions(
+    pages: &[Page],
+    pictures: HashMap<u32, Vec<[f64; 4]>>,
+    recognized: &BTreeSet<usize>,
+) -> BTreeMap<usize, Vec<[f64; 4]>> {
+    const MIN_WIDTH: f64 = 72.0;
+    const MIN_HEIGHT: f64 = 6.0;
+    const INDENT: f64 = 36.0;
+    let inside = |rect: &[f64; 4], bbox: &[f64; 4]| {
+        let (x, y) = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0);
+        rect[0] <= x && x <= rect[2] && rect[1] <= y && y <= rect[3]
+    };
+    let mut joined_by_page = BTreeMap::<usize, Vec<[f64; 4]>>::new();
+    for (number, mut rects) in pictures {
+        let index = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
+        let Some(page) = pages.get(index).filter(|page| !page.lines.is_empty()) else {
+            continue;
+        };
+        if recognized.contains(&index) {
+            continue;
+        }
+        let mut joined = Vec::<[f64; 4]>::new();
+        while let Some(mut rect) = rects.pop() {
+            // Grow the picture by every other one beside or under it until none is.
+            loop {
+                let before = rects.len();
+                rects.retain(|other| {
+                    let line = (rect[3] - rect[1]).min(other[3] - other[1]);
+                    let across = (rect[0].max(other[0]) - rect[2].min(other[2])).max(0.0);
+                    let down = (rect[1].max(other[1]) - rect[3].min(other[3])).max(0.0);
+                    let touches = across <= 1.0 && down <= line || down == 0.0 && across <= INDENT;
+                    if touches {
+                        rect = [
+                            rect[0].min(other[0]),
+                            rect[1].min(other[1]),
+                            rect[2].max(other[2]),
+                            rect[3].max(other[3]),
+                        ];
+                    }
+                    !touches
+                });
+                if rects.len() == before {
+                    break;
+                }
+            }
+            joined.push(rect);
+        }
+        joined.retain(|rect| {
+            rect[2] - rect[0] >= MIN_WIDTH
+                && rect[3] - rect[1] >= MIN_HEIGHT
+                && rect[3] > page.height * 0.12
+                && rect[1] < page.height * 0.90
+                && !page.lines.iter().any(|line| {
+                    if line.words.is_empty() {
+                        inside(rect, &line.bbox)
+                    } else {
+                        line.words.iter().any(|word| inside(rect, &word.bbox))
+                    }
+                })
+        });
+        if !joined.is_empty() {
+            joined.sort_by(|a, b| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0])));
+            joined_by_page.insert(index, joined);
+        }
+    }
+    let same = |a: &[f64; 4], b: &[f64; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 2.0);
+    let elsewhere = |page: usize, rect: &[f64; 4]| {
+        joined_by_page
+            .iter()
+            .filter(|(&other, rects)| other != page && rects.iter().any(|other| same(rect, other)))
+            .count()
+    };
+    joined_by_page
+        .iter()
+        .filter_map(|(&page, rects)| {
+            let rects: Vec<_> = rects.iter().filter(|rect| elsewhere(page, rect) < 2).copied().collect();
+            (!rects.is_empty()).then_some((page, rects))
+        })
+        .collect()
+}
+
+/// Place a picture's recognized lines on its page in reading order: after the nearest of the
+/// page's lines above it in its column (an indented extract is in the column of the heading or
+/// paragraph introducing it; a column gutter is wider), else before the nearest one below it.
+fn place_picture_lines(page: &mut Page, region: &[f64; 4], lines: Vec<Line>) {
+    const GUTTER: f64 = 12.0;
+    let in_column = |line: &Line| line.bbox[0] < region[2] + GUTTER && region[0] - GUTTER < line.bbox[2];
+    let middle = (region[1] + region[3]) / 2.0;
+    let center = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
+    let nearest = |above: bool| {
+        page.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| in_column(line) && (center(line) < middle) == above)
+            .min_by(|(_, a), (_, b)| {
+                let distance = |line: &Line| if above { middle - line.bbox[3] } else { line.bbox[1] - middle };
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|(at, _)| at)
+    };
+    let at = nearest(true)
+        .map(|at| at + 1)
+        .or_else(|| nearest(false))
+        .or_else(|| page.lines.iter().position(|line| center(line) > middle))
+        .unwrap_or(page.lines.len());
+    page.lines.splice(at..at, lines);
+}
+
 /// Apply recognition to extracted pages without loading or extracting the PDF again.
 pub fn recognize_pdf(
     pdf: &[u8],
@@ -1592,6 +1739,7 @@ pub fn recognize_pdf(
         separators,
         diagnostics,
         metadata,
+        image_regions,
         ..
     } = extracted;
     let mut weak_pages: BTreeSet<usize> = metadata.pages_needing_ocr.iter().copied().collect();
@@ -1603,28 +1751,70 @@ pub fn recognize_pdf(
         .collect();
     let mut reindex = false;
     if let Some(provider) = ocr {
-        let requests: Vec<_> = routed_pages
+        // Pages recognized whole, and the pictures on other pages, in page order.
+        let picture_pages: BTreeMap<usize, &Vec<[f64; 4]>> = image_regions
             .iter()
-            .filter_map(|&page_index| {
+            .filter(|(page, _)| {
+                !weak_pages.contains(page) && ocr_pages.is_none_or(|selected| selected.contains(page))
+            })
+            .map(|(&page, regions)| (page, regions))
+            .collect();
+        let mut requests: Vec<_> = routed_pages
+            .iter()
+            .map(|&page_index| (page_index, Vec::new()))
+            .chain(picture_pages.iter().map(|(&page_index, regions)| (page_index, regions.to_vec())))
+            .filter_map(|(page_index, regions)| {
                 pages.get(page_index).map(|page| OcrPageRequest {
                     page_index,
                     width: page.width,
                     height: page.height,
+                    regions,
                 })
             })
             .collect();
+        requests.sort_by_key(|request| request.page_index);
         let results = legal_pdf_core::profile::measure("extract.ocr", || {
             provider.extract_pages(pdf, &requests)
         })?;
         // Each page's recognition, read as lines.
         let mut recognized = Vec::new();
         for result in results {
-            let Some(page) = pages.get(result.page_index) else {
+            let Some(page) = pages.get_mut(result.page_index) else {
                 return Err(Error::Message(format!(
                     "OCR returned an unknown page index: {}",
                     result.page_index
                 )));
             };
+            if let Some(regions) = picture_pages.get(&result.page_index) {
+                let mut lines = result.lines;
+                for region in regions.iter() {
+                    let (inside, rest): (Vec<_>, Vec<_>) = lines.into_iter().partition(|line| {
+                        let x = (line.bbox[0] + line.bbox[2]) / 2.0;
+                        let y = (line.bbox[1] + line.bbox[3]) / 2.0;
+                        region[0] <= x && x <= region[2] && region[1] <= y && y <= region[3]
+                    });
+                    lines = rest;
+                    let first = page.lines.len() + 1;
+                    // A picture's lines join its page when the recognizer is sure of them: at least
+                    // 0.97 over their characters. A picture of type reads at 0.99 and more; a seal's
+                    // lettering, a chart, a signature or a blurred letterhead at 0.95 and less.
+                    let characters = |line: &OcrLine| line.text.trim().chars().count() as f64;
+                    let total = inside.iter().map(characters).sum::<f64>();
+                    let sure = inside.iter().map(|line| characters(line) * line.confidence).sum::<f64>();
+                    if total == 0.0 || sure < 0.97 * total {
+                        continue;
+                    }
+                    let mut read: Vec<_> = inside
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(offset, line)| make_ocr_line(line, page, first + offset))
+                        .collect();
+                    read.sort_by(|a, b| (a.bbox[1] + a.bbox[3]).total_cmp(&(b.bbox[1] + b.bbox[3])));
+                    place_picture_lines(page, region, read);
+                    reindex = true;
+                }
+                continue;
+            }
             let lines: Vec<_> = result
                 .lines
                 .into_iter()
@@ -1641,7 +1831,8 @@ pub fn recognize_pdf(
             .flat_map(|line| line.text.split(|c: char| !c.is_alphabetic()).filter(|word| !word.is_empty())
                 .map(str::to_lowercase).collect::<Vec<_>>())
             .collect::<HashSet<_>>();
-        let layer_words = vocabulary(&mut pages.iter().filter(|page| page.source == "native").flat_map(|page| page.lines.iter()));
+        let layer_words = vocabulary(&mut pages.iter().filter(|page| page.source == "native")
+            .flat_map(|page| page.lines.iter().filter(|line| line.source == "native")));
         let recognized_words = vocabulary(&mut recognized.iter().flat_map(|(_, lines, _)| lines.iter()));
         for (page_index, lines, separator_y) in recognized {
             let page = &mut pages[page_index];

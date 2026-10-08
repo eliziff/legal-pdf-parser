@@ -40,11 +40,15 @@ const fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OcrPageRequest {
     pub page_index: usize,
     pub width: f64,
     pub height: f64,
+    /// The parts of the page to recognize, `[x0, y0, x1, y1]` in points from its top-left
+    /// corner, or none for the whole page. A provider may recognize the whole page instead;
+    /// only its lines inside a part are read.
+    pub regions: Vec<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

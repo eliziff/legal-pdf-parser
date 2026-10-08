@@ -742,7 +742,7 @@ impl KrakenOcr {
             let interpreter = InterpreterSettings::default();
             let settings = pdf_render_settings(self.dpi);
             let rendered = render_pdf_pages(&pdf, &cache, &interpreter, &settings, requests, blla)?;
-            return self.finish_rendered_pdf_pages(rendered, blla);
+            return self.finish_rendered_pdf_pages(requests, rendered, blla);
         }
 
         // Preserve the established OCR batches while extending their producer
@@ -816,6 +816,7 @@ impl KrakenOcr {
                 .join()
                 .map_err(|_| Error::Message("PDF render worker panicked".to_owned()))?;
             finish_recognized_pdf_pages(
+                requests,
                 metadata_receiver.into_iter().flatten().collect(),
                 result?.pages,
             )
@@ -825,6 +826,7 @@ impl KrakenOcr {
     #[cfg(feature = "ocr")]
     fn finish_rendered_pdf_pages(
         &mut self,
+        requests: &[OcrPageRequest],
         rendered: Vec<RenderedPdfPage>,
         blla: bool,
     ) -> Result<Vec<OcrPageResult>> {
@@ -842,7 +844,7 @@ impl KrakenOcr {
                 .collect::<Result<Vec<_>>>()?;
             self.diagnose_rgba_many(&images)?
         };
-        finish_recognized_pdf_pages(metadata, pages)
+        finish_recognized_pdf_pages(requests, metadata, pages)
     }
 
     fn recognize_gray(
@@ -1776,7 +1778,9 @@ fn recognize_prepared(
 }
 
 #[cfg(feature = "ocr")]
-type PdfPageMetadata = (usize, Option<f64>, f64, f64);
+/// A rendered image's page, footnote separator, points per pixel and top-left corner on the
+/// page in points.
+type PdfPageMetadata = (usize, Option<f64>, f64, f64, [f64; 2]);
 #[cfg(feature = "ocr")]
 type RenderedPdfPage = (PdfPageMetadata, RenderedPdfImage);
 
@@ -1834,77 +1838,147 @@ fn render_pdf_pages<'a>(
     requests: &[OcrPageRequest],
     blla: bool,
 ) -> Result<Vec<RenderedPdfPage>> {
-    requests
-        .iter()
-        .map(|request| {
-            let page = pdf.pages().iter().nth(request.page_index).ok_or_else(|| {
-                Error::Message(format!(
-                    "PDF page index is out of range: {}",
-                    request.page_index
-                ))
-            })?;
-            let pixmap = render(page, cache, interpreter, settings);
-            let width = usize::from(pixmap.width());
-            let height = usize::from(pixmap.height());
-            if width == 0 || height == 0 {
-                return Err(Error::Message(format!(
-                    "OCR renderer produced an empty page image for page {}",
-                    request.page_index + 1
-                )));
-            }
+    // White margin around a part of a page, so the layout reads its first and last lines whole.
+    const MARGIN: usize = 16;
+    let mut rendered = Vec::new();
+    for request in requests {
+        let page = pdf.pages().iter().nth(request.page_index).ok_or_else(|| {
+            Error::Message(format!(
+                "PDF page index is out of range: {}",
+                request.page_index
+            ))
+        })?;
+        let pixmap = render(page, cache, interpreter, settings);
+        let width = usize::from(pixmap.width());
+        let height = usize::from(pixmap.height());
+        if width == 0 || height == 0 {
+            return Err(Error::Message(format!(
+                "OCR renderer produced an empty page image for page {}",
+                request.page_index + 1
+            )));
+        }
+        let x_scale = request.width / width as f64;
+        let y_scale = request.height / height as f64;
+        let pixels = pixmap.data_as_u8_slice();
+        if request.regions.is_empty() {
             let metadata = (
                 request.page_index,
                 super::ocr::raster_separator_y(&pixmap, request.height),
-                request.width / width as f64,
-                request.height / height as f64,
+                x_scale,
+                y_scale,
+                [0.0, 0.0],
             );
-            let image = if blla {
-                let pixels = pixmap
-                    .data_as_u8_slice()
-                    .chunks_exact(4)
-                    .map(|pixel| {
-                        ((u32::from(pixel[0]) * 77
-                            + u32::from(pixel[1]) * 150
-                            + u32::from(pixel[2]) * 29)
-                            / 256) as u8
-                    })
-                    .collect();
-                RenderedPdfImage::Gray(
-                    GrayImage::from_raw(width as u32, height as u32, pixels)
-                        .expect("renderer dimensions match its pixel buffer"),
-                )
-            } else {
-                RenderedPdfImage::Rgba(
-                    RgbaImage::from_raw(
-                        width as u32,
-                        height as u32,
-                        pixmap.data_as_u8_slice().to_vec(),
-                    )
-                    .expect("renderer dimensions match its pixel buffer"),
-                )
-            };
-            Ok((metadata, image))
-        })
-        .collect()
+            rendered.push((
+                metadata,
+                rendered_image(pixels.to_vec(), width, height, blla),
+            ));
+            continue;
+        }
+        // Each part of the page is recognized on its own, at the page's resolution.
+        for region in &request.regions {
+            let x0 = ((region[0] / x_scale).floor().max(0.0) as usize).min(width);
+            let y0 = ((region[1] / y_scale).floor().max(0.0) as usize).min(height);
+            let x1 = ((region[2] / x_scale).ceil().max(0.0) as usize).min(width);
+            let y1 = ((region[3] / y_scale).ceil().max(0.0) as usize).min(height);
+            if x1 <= x0 || y1 <= y0 || !dark_print_on_light_ground(pixels, width, [x0, y0, x1, y1])
+            {
+                continue;
+            }
+            let crop_width = x1 - x0 + 2 * MARGIN;
+            let crop_height = y1 - y0 + 2 * MARGIN;
+            let mut crop = vec![255u8; crop_width * crop_height * 4];
+            for row in y0..y1 {
+                let from = (row * width + x0) * 4;
+                let to = ((row - y0 + MARGIN) * crop_width + MARGIN) * 4;
+                crop[to..to + (x1 - x0) * 4].copy_from_slice(&pixels[from..from + (x1 - x0) * 4]);
+            }
+            let metadata = (
+                request.page_index,
+                None,
+                x_scale,
+                y_scale,
+                [
+                    (x0 as f64 - MARGIN as f64) * x_scale,
+                    (y0 as f64 - MARGIN as f64) * y_scale,
+                ],
+            );
+            rendered.push((
+                metadata,
+                rendered_image(crop, crop_width, crop_height, blla),
+            ));
+        }
+    }
+    Ok(rendered)
+}
+
+/// Whether a part of an RGBA page reads as print: mostly light ground, with dark ink on at most a
+/// third of it. A photograph, a dark band or a filled graphic is not recognized.
+#[cfg(feature = "ocr")]
+fn dark_print_on_light_ground(pixels: &[u8], width: usize, [x0, y0, x1, y1]: [usize; 4]) -> bool {
+    let (mut light, mut dark, mut count) = (0usize, 0usize, 0usize);
+    for row in y0..y1 {
+        for pixel in pixels[(row * width + x0) * 4..(row * width + x1) * 4].chunks_exact(4) {
+            let luminance =
+                (u32::from(pixel[0]) * 3 + u32::from(pixel[1]) * 6 + u32::from(pixel[2])) / 10;
+            light += usize::from(luminance >= 235);
+            dark += usize::from(luminance <= 110);
+            count += 1;
+        }
+    }
+    light * 100 >= count * 45 && dark * 500 >= count && dark * 100 <= count * 35
 }
 
 #[cfg(feature = "ocr")]
+fn rendered_image(rgba: Vec<u8>, width: usize, height: usize, blla: bool) -> RenderedPdfImage {
+    if blla {
+        let pixels = rgba
+            .chunks_exact(4)
+            .map(|pixel| {
+                ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29)
+                    / 256) as u8
+            })
+            .collect();
+        RenderedPdfImage::Gray(
+            GrayImage::from_raw(width as u32, height as u32, pixels)
+                .expect("renderer dimensions match its pixel buffer"),
+        )
+    } else {
+        RenderedPdfImage::Rgba(
+            RgbaImage::from_raw(width as u32, height as u32, rgba)
+                .expect("renderer dimensions match its pixel buffer"),
+        )
+    }
+}
+
+/// One result per requested page, in request order: the parts of a page recognized apart are
+/// placed back on it, and a page none of whose parts reads as print has no lines.
+#[cfg(feature = "ocr")]
 fn finish_recognized_pdf_pages(
+    requests: &[OcrPageRequest],
     metadata: Vec<PdfPageMetadata>,
     pages: Vec<KrakenImageDiagnostics>,
 ) -> Result<Vec<OcrPageResult>> {
-    Ok(metadata
-        .into_iter()
-        .zip(pages)
-        .map(|((page_index, separator_y, x_scale, y_scale), mut page)| {
-            scale_lines(&mut page.lines, x_scale, y_scale);
-            OcrPageResult {
-                page_index,
-                lines: page.lines,
-                separator_y,
-            }
+    let mut results: Vec<OcrPageResult> = requests
+        .iter()
+        .map(|request| OcrPageResult {
+            page_index: request.page_index,
+            lines: Vec::new(),
+            separator_y: None,
         })
-        .collect())
+        .collect();
+    let mut at = 0;
+    for ((page_index, separator_y, x_scale, y_scale, origin), mut page) in
+        metadata.into_iter().zip(pages)
+    {
+        scale_lines(&mut page.lines, x_scale, y_scale);
+        translate_lines(&mut page.lines, origin);
+        while results[at].page_index != page_index {
+            at += 1;
+        }
+        results[at].lines.extend(page.lines);
+        results[at].separator_y = results[at].separator_y.or(separator_y);
+    }
+    Ok(results)
 }
 
 fn preparation_window_size(page_count: usize) -> usize {
@@ -1934,6 +2008,27 @@ fn scale_lines(lines: &mut [OcrLine], x_scale: f64, y_scale: f64) {
             word.bbox[1] *= y_scale;
             word.bbox[2] *= x_scale;
             word.bbox[3] *= y_scale;
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn translate_lines(lines: &mut [OcrLine], origin: [f64; 2]) {
+    if origin == [0.0, 0.0] {
+        return;
+    }
+    for line in lines {
+        for bbox in
+            std::iter::once(&mut line.bbox).chain(line.words.iter_mut().map(|word| &mut word.bbox))
+        {
+            bbox[0] += origin[0];
+            bbox[1] += origin[1];
+            bbox[2] += origin[0];
+            bbox[3] += origin[1];
+        }
+        for point in line.baseline.iter_mut().chain(&mut line.boundary) {
+            point[0] += origin[0];
+            point[1] += origin[1];
         }
     }
 }

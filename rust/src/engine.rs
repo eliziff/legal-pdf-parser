@@ -69,6 +69,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 request.page_index,
                 request.width,
                 request.height,
+                &request.regions,
             ))?;
             let path = self
                 .cache_root
@@ -84,7 +85,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 }
                 results.push(cached.page);
             } else {
-                missing.push(*request);
+                missing.push(request.clone());
                 paths.insert(request.page_index, (key, path));
             }
         }
