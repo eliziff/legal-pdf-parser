@@ -456,8 +456,13 @@ fn layout_end(
         }
         let aligned = (line.bbox[0] - margin).abs() <= height
             || hang.is_some_and(|hang| (line.bbox[0] - left - hang).abs() <= height);
-        let carried =
-            aligned && (!sentence_ended(prior.text.trim()) || (full && (quoted || new_page)));
+        // A line stopped well short of the measure with a blank line under it runs on to
+        // nothing: a placeholder, a label, a form's blank.
+        let parted = !new_page
+            && prior.bbox[2] < right - 0.25 * (right - left)
+            && line.bbox[1] - prior.bbox[3] > height;
+        let carried = aligned
+            && ((!sentence_ended(prior.text.trim()) && !parted) || (full && (quoted || new_page)));
         quoted = false;
         if !carried {
             return Some(indexed.range.start);
