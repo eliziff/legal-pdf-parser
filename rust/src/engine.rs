@@ -150,6 +150,16 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         results.sort_by_key(|page| page.page_index);
         Ok(results)
     }
+
+    fn separators(
+        &mut self,
+        pdf: &[u8],
+        requests: &[legal_pdf_core::OcrPageRequest],
+    ) -> Vec<Option<f64>> {
+        profile::measure("extract.raster_separators", || {
+            legal_pdf_ocr::raster_page_separators(pdf, requests)
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]

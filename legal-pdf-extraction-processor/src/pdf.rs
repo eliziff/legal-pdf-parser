@@ -1536,6 +1536,12 @@ pub fn assemble_pdf(
         }
     }
 
+    // A scan whose own words are only a stamp over it is read from its image, whole: a stamp
+    // over a picture of the page makes that picture no picture on a page of text.
+    weak_pages.extend(scanned_pages.iter().copied().filter(|&index| {
+        u32::try_from(index + 1).is_ok_and(|number| !layer_pages.contains(&number))
+            && pages.get(index).is_some_and(|page| !page.lines.is_empty())
+    }));
     let image_regions = image_regions(&pages, pictures, &weak_pages);
     let mut extracted = ExtractedPdf {
         pages,
@@ -1556,9 +1562,10 @@ pub fn assemble_pdf(
 
 /// The pages that are a picture of their text: an image covers at least half of the page and the
 /// page's visible text, laid end to end, would not fill one line across it (a filing stamp, a record
-/// page number, "Page: 17", a heading over a pasted image). A text layer behind the picture is
-/// invisible and does not count. A page of ordinary rendered text, or a tab divider's one line with
-/// no image under it, is never one.
+/// page number, "Page: 17", a heading over a pasted image), or two where the image covers the whole
+/// page (a repository's stamp over each page of a scan: its title, its address, its folio). A text
+/// layer behind the picture is invisible and does not count. A page of ordinary rendered text, or a
+/// tab divider's one line with no image under it, is never one.
 fn scanned_pages(geometries: &PageGeometryMap, items: &[TextItem]) -> Vec<usize> {
     let mut covered = HashMap::<u32, f64>::new();
     let mut written = HashMap::<u32, f64>::new();
@@ -1581,8 +1588,11 @@ fn scanned_pages(geometries: &PageGeometryMap, items: &[TextItem]) -> Vec<usize>
         }
     }
     geometries.iter()
-        .filter(|(number, (_, geometry))| covered.get(number).is_some_and(|share| *share >= 0.5)
-            && written.get(number).copied().unwrap_or(0.0) < geometry.width)
+        .filter(|(number, (_, geometry))| {
+            let share = covered.get(number).copied().unwrap_or(0.0);
+            let written = written.get(number).copied().unwrap_or(0.0);
+            share >= 0.5 && written < geometry.width || share >= 0.9 && written < 2.0 * geometry.width
+        })
         .map(|(number, _)| usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX))
         .collect()
 }
@@ -1856,6 +1866,42 @@ pub fn recognize_pdf(
             weak_pages.remove(&page_index);
             if let Some(separator) = separator_y {
                 separators[page_index] = Some(separator);
+            }
+        }
+        // A scan that keeps its own text layer still prints the rule above its notes in its
+        // image: read the rule there where nothing else found one.
+        let requests: Vec<_> = metadata
+            .scanned_pages
+            .iter()
+            .filter(|&&index| separators.get(index).is_some_and(Option::is_none))
+            .filter_map(|&page_index| {
+                pages.get(page_index).map(|page| OcrPageRequest {
+                    page_index,
+                    width: page.width,
+                    height: page.height,
+                    regions: Vec::new(),
+                })
+            })
+            .collect();
+        if !requests.is_empty() {
+            // The rule is the notes' only where a line below it opens as a note does, with its
+            // number or mark: a signature line or a table's border has none under it.
+            let opens_note = |line: &Line| {
+                let text = line.text.trim_start();
+                let label = text
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || "*†‡§".contains(*c))
+                    .count();
+                (1..=3).contains(&label)
+                    && text.chars().nth(label).is_some_and(|c| c.is_whitespace() || ".)".contains(c))
+            };
+            for (request, separator) in requests.iter().zip(provider.separators(pdf, &requests)) {
+                separators[request.page_index] = separator.filter(|y| {
+                    pages[request.page_index]
+                        .lines
+                        .iter()
+                        .any(|line| line.bbox[1] > *y && opens_note(line))
+                });
             }
         }
     }

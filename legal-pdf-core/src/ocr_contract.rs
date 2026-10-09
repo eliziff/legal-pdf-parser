@@ -64,4 +64,10 @@ pub trait PdfOcrProvider {
         pdf: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>>;
+
+    /// Where the rule printed above each requested page's notes runs, in points from the
+    /// page's top, read from the page's image without recognizing it; none by default.
+    fn separators(&mut self, _pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
+        vec![None; requests.len()]
+    }
 }
