@@ -869,6 +869,11 @@ pub(super) fn map_note_pairs(
     let mut claims = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pair_ids = HashSet::new();
+    let paired = pairs
+        .iter()
+        .filter(|pair| !pair.reference_anchors.is_empty())
+        .count();
+    let unreferenced = pairs.len() - paired;
     for pair in pairs {
         if pair.pair_id.is_empty() || !pair_ids.insert(pair.pair_id.as_str()) {
             return Err(Error::Message(format!(
@@ -930,7 +935,12 @@ pub(super) fn map_note_pairs(
             )));
         }
         let body_range = index.range_for_line_ids(&pair.body_line_ids);
-        if pair.reference_anchors.is_empty()
+        // A note whose label the sequence supports is the document's note even where no
+        // reference to it could be read, among notes whose references mostly were: a form's
+        // numbered fields, a caption's column of section signs or a table's numbered rows pair
+        // with nothing, or with a stray number or two.
+        let label_only = paired >= 2 && unreferenced <= 2 * paired;
+        if (pair.reference_anchors.is_empty() && !label_only)
             || body_range.is_none()
             || body_range.is_some_and(|range| range.start == range.end)
             || label_range.start == label_range.end
