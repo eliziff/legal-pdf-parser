@@ -1214,7 +1214,10 @@ fn extract_refs(lines: &[PairLine<'_>]) -> Vec<Candidate> {
         if stripped.chars().all(|character| character.is_ascii_digit())
             && (1..=3).contains(&stripped.chars().count())
             && line.zone == Zone::Body
-            && (line.bbox[1] + line.bbox[3]) / 2.0 / line.page_height > 0.05
+            // A folio's place at the page's top; a line without a box has none.
+            && !(line.bbox[3] > 0.0
+                && line.page_height > 0.0
+                && (line.bbox[1] + line.bbox[3]) / 2.0 / line.page_height <= 0.05)
         {
             if let Some(value) = numeric_value(stripped) {
                 let start = line
@@ -1663,9 +1666,11 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
         }
         // So is a number and its period opening a body line in the body's own type, its words
         // running on beside it ("1. SERVICE: Once you have filed"): a note's label sits in the
-        // notes' region or in their smaller type.
+        // notes' region or in their smaller type. A line that carries no type, as recognition
+        // reads it, says neither.
         if token.value.is_some()
             && line.zone == Zone::Body
+            && !line.spans.is_empty()
             && !line.small_font
             && token.post.trim() == "."
             && !body_stripped.is_empty()
