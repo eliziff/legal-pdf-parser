@@ -1552,6 +1552,24 @@ fn bracket_year_body(text: &str) -> bool {
         .is_match(text)
 }
 
+/// Whether words stand on the line's own row, on either side: a paragraph's or a form
+/// item's text set beside its number, or a form's line around a blank's number. A note's
+/// label alone on its line has its text below.
+fn words_on_row(lines: &[PairLine<'_>], index: usize) -> bool {
+    let line = &lines[index];
+    let height = line.height();
+    let same_page = |other: &&PairLine<'_>| other.page == line.page;
+    let start = lines[..index].iter().rev().take_while(same_page).count();
+    let end = lines[index..].iter().take_while(same_page).count();
+    height > 0.0
+        && lines[index - start..index + end].iter().any(|other| {
+            let overlap = line.bbox[3].min(other.bbox[3]) - line.bbox[1].max(other.bbox[1]);
+            other.idx != line.idx
+                && overlap > 0.5 * height.min(other.height())
+                && other.text.chars().any(char::is_alphabetic)
+        })
+}
+
 fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> {
     let mut ref_pages: HashMap<u32, HashSet<u32>> = HashMap::new();
     for candidate in refs
@@ -1632,12 +1650,14 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
             continue;
         }
         // A number and its period alone on a body line ("4.") is a numbered paragraph's
-        // number, whose words the layout set beside it: never a note's label. So is a bare
-        // number alone at the body's size ("22"), as Singapore's courts print theirs.
+        // number when the layout set its words beside it on the same row: never a note's
+        // label. So is a bare number at the body's size ("22"), as Singapore's courts print
+        // theirs. A note's label alone on its line, its text below, stays one.
         if token.value.is_some()
             && line.zone == Zone::Body
             && body_stripped.is_empty()
             && (token.post.trim() == "." || (token.post.is_empty() && !line.small_font))
+            && words_on_row(lines, line_index)
         {
             continue;
         }
