@@ -887,6 +887,19 @@ fn ref_site_penalty(
     if form == "sup" {
         return Some(0.0);
     }
+    // A number in a web address ("ubclawreview/vol50/iss2/6", a repository's stamp) is part of it.
+    let word_start = values[..start]
+        .iter()
+        .rposition(|value| value.is_whitespace())
+        .map_or(0, |at| at + 1);
+    let word_end = values[end..]
+        .iter()
+        .position(|value| value.is_whitespace())
+        .map_or(values.len(), |at| end + at);
+    let word = chars_slice(values, word_start, word_end);
+    if word.contains('/') || word.contains("www.") {
+        return None;
+    }
     let left = start
         .checked_sub(1)
         .and_then(|index| values.get(index))
@@ -2789,6 +2802,36 @@ fn repair_missing_refs(
     repair_counts
 }
 
+/// The stray glyphs a line's text could have made of a small raised number: one to three marks
+/// glued to the word or punctuation before them and followed by a space or the line's end
+/// ("importance.'", "Act,'=", "Trees\""). A lone apostrophe after a letter is elision or a
+/// possessive.
+fn glyph_sites(text: &[char]) -> Vec<(usize, usize)> {
+    const GLYPHS: &str = "'’‘\"”“`°=«";
+    let mut sites = Vec::new();
+    let mut position = 0;
+    while position < text.len() {
+        if !GLYPHS.contains(text[position]) {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        while position < text.len() && position - start < 3 && GLYPHS.contains(text[position]) {
+            position += 1;
+        }
+        let end = position;
+        let glued = start.checked_sub(1).map(|at| text[at]).is_some_and(|character| {
+            ".,;:)".contains(character)
+                || (character.is_alphabetic()
+                    && !(end - start == 1 && "'’‘".contains(text[start])))
+        });
+        if glued && text.get(end).is_none_or(|character| character.is_whitespace()) {
+            sites.push((start, end));
+        }
+    }
+    sites
+}
+
 /// Recognition reads a small raised number as a quotation mark, apostrophe or other
 /// stray glyph ("importance.'", "Act,'=", "Trees\""). Between two paired references,
 /// when the run of labels they skip finds exactly as many such glyphs, in order, glued
@@ -2799,7 +2842,6 @@ fn repair_glyph_refs(
     lines: &[PairLine<'_>],
     endnote: bool,
 ) -> usize {
-    const GLYPHS: &str = "'’‘\"”“`°=«";
     let label_lines: HashSet<usize> = backbone.iter().map(|candidate| candidate.line).collect();
     let mut values: Vec<u32> = backbone
         .iter()
@@ -2843,32 +2885,9 @@ fn repair_glyph_refs(
             if line.zone != Zone::Body || label_lines.contains(&line_index) {
                 continue;
             }
-            let text = chars(&line.text);
-            let mut position = 0;
-            while position < text.len() {
-                if !GLYPHS.contains(text[position]) {
-                    position += 1;
-                    continue;
-                }
-                let start = position;
-                while position < text.len()
-                    && position - start < 3
-                    && GLYPHS.contains(text[position])
-                {
-                    position += 1;
-                }
-                let end = position;
-                let before = start.checked_sub(1).map(|at| text[at]);
-                let after = text.get(end).copied();
-                // A lone apostrophe after a letter is elision or a possessive.
-                let glued = before.is_some_and(|character| {
-                    ".,;:)".contains(character)
-                        || (character.is_alphabetic()
-                            && !(end - start == 1 && "'’‘".contains(text[start])))
-                });
+            for (start, end) in glyph_sites(&chars(&line.text)) {
                 let site = (line_index, start);
-                if glued && after.is_none_or(char::is_whitespace) && site > floor && site < ceiling
-                {
+                if site > floor && site < ceiling {
                     sites.push((line_index, start, end));
                 }
             }
@@ -2908,6 +2927,131 @@ fn repair_glyph_refs(
                 },
             );
             repaired += 1;
+        }
+    }
+    repaired
+}
+
+/// A footnote's reference stands on its label's page. On each page, the notes with no reference
+/// fall between the references paired there (or the page's ends); where such a stretch of the
+/// page's text holds exactly as many places a small raised number could have been misread (a
+/// stray glyph, a lone letter glued after punctuation as in "Act.s", or a number no note claimed)
+/// as it lacks references, those places are the references, in order.
+fn repair_page_glyph_refs(
+    chosen: &mut HashMap<u32, Candidate>,
+    backbone: &[Candidate],
+    pool: &[Candidate],
+    lines: &[PairLine<'_>],
+    endnote: bool,
+) -> usize {
+    if endnote {
+        return 0;
+    }
+    let label_lines: HashSet<usize> = backbone.iter().map(|candidate| candidate.line).collect();
+    let mut missing_by_page = BTreeMap::<u32, Vec<u32>>::new();
+    for candidate in backbone {
+        if let Some(value) = candidate.value.filter(|value| !chosen.contains_key(value)) {
+            missing_by_page.entry(lines[candidate.line].page).or_default().push(value);
+        }
+    }
+    let taken: HashSet<(usize, usize)> = chosen
+        .values()
+        .map(|candidate| (candidate.line, candidate.start))
+        .collect();
+    let mut repaired = 0;
+    for (page, mut missing) in missing_by_page {
+        missing.sort_unstable();
+        missing.dedup();
+        let anchors: Vec<(u32, (usize, usize))> = chosen
+            .iter()
+            .filter(|(_, candidate)| lines[candidate.line].page == page)
+            .map(|(value, candidate)| (*value, candidate.pos(lines)))
+            .collect();
+        // The stretch of the page each missing value's reference must stand in.
+        let window = |value: u32| {
+            let floor = anchors
+                .iter()
+                .filter(|(other, _)| *other < value)
+                .max_by_key(|(other, _)| *other)
+                .map(|(_, position)| *position);
+            let ceiling = anchors
+                .iter()
+                .filter(|(other, _)| *other > value)
+                .min_by_key(|(other, _)| *other)
+                .map(|(_, position)| *position);
+            (floor, ceiling)
+        };
+        let mut groups = Vec::<((Option<(usize, usize)>, Option<(usize, usize)>), Vec<u32>)>::new();
+        for value in missing {
+            let bounds = window(value);
+            match groups.last_mut() {
+                Some((prior, values)) if *prior == bounds => values.push(value),
+                _ => groups.push((bounds, vec![value])),
+            }
+        }
+        for ((floor, ceiling), values) in groups {
+            let inside = |position: (usize, usize)| {
+                floor.is_none_or(|bound| position > bound) && ceiling.is_none_or(|bound| position < bound)
+            };
+            let mut sites = Vec::<(usize, usize, usize)>::new();
+            for (line_index, line) in lines.iter().enumerate() {
+                if line.page != page || line.zone != Zone::Body || label_lines.contains(&line_index) {
+                    continue;
+                }
+                let text = chars(&line.text);
+                let mut found = glyph_sites(&text);
+                // A lone letter glued after punctuation and standing before a space.
+                for at in 1..text.len() {
+                    if ".,;:)".contains(text[at - 1])
+                        && text[at].is_alphabetic()
+                        && text.get(at + 1).is_none_or(|next| next.is_whitespace())
+                        && (at < 2 || !text[at - 2].is_whitespace() && text[at - 2].is_alphabetic())
+                    {
+                        found.push((at, at + 1));
+                    }
+                }
+                found.extend(
+                    pool.iter()
+                        .filter(|candidate| {
+                            candidate.line == line_index
+                                && candidate.value.is_some()
+                                && candidate.symbol.is_empty()
+                                && !taken.contains(&(candidate.line, candidate.start))
+                        })
+                        .map(|candidate| (candidate.start, candidate.end)),
+                );
+                for (start, end) in found {
+                    if inside((line.idx, start)) && !taken.contains(&(line_index, start)) {
+                        sites.push((line_index, start, end));
+                    }
+                }
+            }
+            sites.sort_by_key(|(line, start, _)| (lines[*line].idx, *start));
+            sites.dedup_by_key(|(line, start, _)| (*line, *start));
+            if sites.len() != values.len() {
+                continue;
+            }
+            for (value, (line, start, end)) in values.into_iter().zip(sites) {
+                chosen.insert(
+                    value,
+                    Candidate {
+                        line,
+                        start,
+                        end,
+                        observed: chars_slice(&chars(&lines[line].text), start, end),
+                        value: Some(value),
+                        symbol: String::new(),
+                        form: "glyph",
+                        score: 0.5,
+                        reason: "page_glyph_marker",
+                        repaired: true,
+                        repair_kind: "page_glyph_repair",
+                        requires_visual_cue: false,
+                        flags: CandidateFlags::default(),
+                    },
+                );
+                repaired += 1;
+            }
         }
     }
     repaired
@@ -3164,6 +3308,10 @@ fn build_pairs<'a>(
         for (reason, count) in drops {
             *ref_drop_reasons.entry(reason).or_default() += count;
         }
+        // The labels' references read as themselves in a third of the run at least: notes, not
+        // numbered paragraphs, rows or fields that happen to find a number or two.
+        let clean = chosen.values().filter(|candidate| !candidate.repaired).count();
+        let apparatus = clean >= 3 && 3 * clean >= segment.len();
         for (kind, count) in repair_missing_refs(&mut chosen, segment, pool, &lines, endnote) {
             *ref_repair_counts.entry(kind).or_default() += count;
         }
@@ -3176,6 +3324,14 @@ fn build_pairs<'a>(
             *ref_repair_counts
                 .entry("glyph_sequence_repair".to_owned())
                 .or_default() += glyphs;
+        }
+        if apparatus {
+            let glyphs = repair_page_glyph_refs(&mut chosen, segment, pool, &lines, endnote);
+            if glyphs > 0 {
+                *ref_repair_counts
+                    .entry("page_glyph_repair".to_owned())
+                    .or_default() += glyphs;
+            }
         }
 
         let paren_count = segment

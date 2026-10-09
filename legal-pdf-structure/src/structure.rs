@@ -3705,6 +3705,8 @@ fn derive_prepared(
             "derive.text_flow",
             || text_flow_faults(pages),
         ));
+    // Note labels recognition cut short, restored before any text is indexed.
+    legal_pdf_pairing::repair_label_dropouts(pages);
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
