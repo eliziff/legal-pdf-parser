@@ -140,6 +140,10 @@ impl PdfOcrProvider for OcrProvider {
     ) -> Result<Vec<OcrPageResult>> {
         self.extract_pages_inner(pdf, requests)
     }
+
+    fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
+        raster_page_separators(pdf, requests)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -638,6 +642,47 @@ pub(crate) fn tsv_lines(
             })
         })
         .collect()
+}
+
+/// The rule printed above each requested page's notes, read from the page rendered at 150 dpi
+/// and scanned as the recognizers scan their own renders: for a scan whose text layer is kept,
+/// whose image is read for nothing else.
+pub fn raster_page_separators(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
+    #[cfg(feature = "ocr")]
+    {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::vello_cpu::color::palette::css::WHITE;
+        use hayro::{render, RenderCache, RenderSettings};
+
+        let Ok(document) = Pdf::new(pdf.to_vec()) else {
+            return vec![None; requests.len()];
+        };
+        let cache = RenderCache::new();
+        let interpreter = InterpreterSettings::default();
+        let scale = 150.0 / 72.0;
+        let settings = RenderSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+            ..Default::default()
+        };
+        let pages = document.pages();
+        requests
+            .iter()
+            .map(|request| {
+                let page = pages.iter().nth(request.page_index)?;
+                let pixmap = render(page, &cache, &interpreter, &settings);
+                (pixmap.width() > 0 && pixmap.height() > 0)
+                    .then(|| raster_separator_y(&pixmap, request.height))
+                    .flatten()
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        vec![None; requests.len()]
+    }
 }
 
 #[cfg(feature = "ocr")]
