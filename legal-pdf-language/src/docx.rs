@@ -672,7 +672,11 @@ fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
 /// from the body: a text box's paragraphs (a cover page's) after the paragraph that holds the box,
 /// read once, as Word shows it, not again from its fallback for older readers. Citation review and
 /// the Word operations that mark it number the body's paragraphs alike by this order.
-fn body_paragraphs<'a>(element: &'a XmlElement, path: &mut Vec<usize>, output: &mut Vec<(&'a XmlElement, Vec<usize>)>) {
+fn body_paragraphs<'a>(
+    element: &'a XmlElement,
+    path: &mut Vec<usize>,
+    output: &mut Vec<(&'a XmlElement, Vec<usize>)>,
+) {
     for (index, child) in element.direct_elements().enumerate() {
         if child.is(W_NS, "del") || child.is(MC_NS, "Fallback") {
             continue;
@@ -687,16 +691,51 @@ fn body_paragraphs<'a>(element: &'a XmlElement, path: &mut Vec<usize>, output: &
 }
 
 /// A paragraph's own text: a text box it holds is read as paragraphs of its own.
+/// The author's links in a note, as the Python app reads them: a `w:hyperlink`'s relationship target, or a simple
+/// `HYPERLINK` field's, over the text it holds (UTF-16 offsets).
+#[derive(Default)]
+struct AuthorLinks {
+    targets: HashMap<String, String>,
+    target: Option<String>,
+    spans: Vec<(usize, usize, String)>,
+}
+
 fn authority_text(
     element: &XmlElement,
     text: &mut String,
-    references: &mut Vec<(i64, usize, bool)>,
+    references: &mut Vec<(i64, usize, Option<String>)>,
+    links: &mut AuthorLinks,
 ) -> Result<()> {
     if element.is(W_NS, "del") || element.is(W_NS, "txbxContent") || element.is(MC_NS, "Fallback") {
         return Ok(());
     }
     if element.is(W_NS, "t") {
+        let start = legal_structure_model::utf16_len(text);
         text.push_str(&element_text(element)?);
+        if let Some(target) = &links.target {
+            let end = legal_structure_model::utf16_len(text);
+            match links.spans.last_mut() {
+                Some(span) if span.1 == start && &span.2 == target => span.1 = end,
+                _ => links.spans.push((start, end, target.clone())),
+            }
+        }
+        return Ok(());
+    }
+    let target = if element.is(W_NS, "hyperlink") {
+        element
+            .attribute(None, "id")
+            .and_then(|id| links.targets.get(id).cloned())
+    } else if element.is(W_NS, "fldSimple") {
+        element.attribute(None, "instr").and_then(hyperlink_field)
+    } else {
+        None
+    };
+    if target.is_some() {
+        let outer = std::mem::replace(&mut links.target, target);
+        for child in element.direct_elements() {
+            authority_text(child, text, references, links)?;
+        }
+        links.target = outer;
         return Ok(());
     }
     if element.is(W_NS, "tab") {
@@ -716,15 +755,76 @@ fn authority_text(
                 matches!(
                     element.attribute(None, "customMarkFollows"),
                     Some("1" | "true" | "on")
-                ),
+                )
+                .then(String::new),
             ));
         }
         return Ok(());
     }
+    // A custom mark is the text or symbol that follows its reference in the same run.
+    let mut marked = None;
     for child in element.direct_elements() {
-        authority_text(child, text, references)?;
+        let before = references.len();
+        authority_text(child, text, references, links)?;
+        if element.is(W_NS, "r") {
+            if references.len() > before && references[before].2.is_some() {
+                marked = Some(before);
+            } else if let Some(mark) = marked.and_then(|at| references[at].2.as_mut()) {
+                if child.is(W_NS, "t") {
+                    mark.push_str(&element_text(child)?);
+                } else if child.is(W_NS, "sym") {
+                    mark.extend(symbol_char(child));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// The address a `HYPERLINK "…"` field names.
+fn hyperlink_field(instruction: &str) -> Option<String> {
+    let rest = instruction
+        .trim_start()
+        .strip_prefix("HYPERLINK")?
+        .trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|quote| *quote == '"' || *quote == '\'')?;
+    let rest = &rest[1..];
+    Some(rest[..rest.find(quote)?].to_owned()).filter(|target| !target.is_empty())
+}
+
+/// A part's relationship targets by id.
+fn relationship_targets(
+    files: &[(String, Vec<u8>)],
+    name: &str,
+) -> Result<HashMap<String, String>> {
+    let Some(raw) = file_bytes(files, name) else {
+        return Ok(HashMap::new());
+    };
+    let document = parse_xml(raw)?;
+    Ok(document
+        .root()?
+        .direct_elements()
+        .filter(|element| element.local == "Relationship")
+        .filter_map(|element| {
+            Some((
+                element.attribute(None, "Id")?.to_owned(),
+                element.attribute(None, "Target")?.to_owned(),
+            ))
+        })
+        .collect())
+}
+
+/// A `w:sym` character: a symbol font's private-use code (U+F020 to U+F07E) is the ASCII it stands for.
+fn symbol_char(element: &XmlElement) -> Option<char> {
+    let code = u32::from_str_radix(element.attribute(None, "char")?, 16).ok()?;
+    char::from_u32(if (0xF020..=0xF07E).contains(&code) {
+        code - 0xF000
+    } else {
+        code
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -777,6 +877,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         Some(&[
             "word/document.xml",
             "word/footnotes.xml",
+            "word/_rels/footnotes.xml.rels",
             "word/settings.xml",
         ]),
     )?;
@@ -797,7 +898,12 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     for (ordinal, (paragraph, path)) in paragraphs.into_iter().enumerate() {
         let mut text = String::new();
         let mut references = Vec::new();
-        authority_text(paragraph, &mut text, &mut references)?;
+        authority_text(
+            paragraph,
+            &mut text,
+            &mut references,
+            &mut AuthorLinks::default(),
+        )?;
         if !text.trim().is_empty() || !references.is_empty() {
             body_units.push((ordinal, text, references, section, path));
         }
@@ -843,7 +949,8 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     let mut previous_section = None;
     let mut sequence = 0u32;
     for (_, _, references, section, _) in &body_units {
-        for &(id, _, custom) in references {
+        for (id, _, mark) in references {
+            let (id, custom) = (*id, mark.is_some());
             if !seen.insert(id) {
                 continue;
             }
@@ -867,7 +974,14 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
             } else {
                 current
             };
-            note_numbers.insert(id, (number, sequence));
+            note_numbers.insert(
+                id,
+                (
+                    number,
+                    sequence,
+                    mark.clone().filter(|mark| !mark.trim().is_empty()),
+                ),
+            );
             if !custom {
                 current = if matches!(
                     properties.restart,
@@ -884,6 +998,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     let mut footnotes = Vec::new();
     let mut footnote_numbers = HashMap::new();
     if let Some(xml) = file_bytes(&files, "word/footnotes.xml") {
+        let targets = relationship_targets(&files, "word/_rels/footnotes.xml.rels")?;
         let document = parse_xml(xml)?;
         let mut elements = Vec::new();
         walk_elements(document.root()?, &mut elements);
@@ -901,13 +1016,17 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
                 continue;
             }
             let mut text = String::new();
-            authority_text(footnote, &mut text, &mut Vec::new())?;
+            let mut links = AuthorLinks {
+                targets: targets.clone(),
+                ..AuthorLinks::default()
+            };
+            authority_text(footnote, &mut text, &mut Vec::new(), &mut links)?;
             if text.trim().is_empty() {
                 continue;
             }
             let ordinal = footnotes.len() + 1;
             footnote_numbers.insert(raw_id, ordinal);
-            footnotes.push((raw_id, ordinal, text));
+            footnotes.push((raw_id, ordinal, text, links.spans));
         }
     }
 
@@ -940,19 +1059,27 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
                 })
             }),
     );
-    units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text)| {
-        let (number, sequence) = note_numbers.get(&raw_id).copied().unwrap_or((None, 0));
-        serde_json::json!({
+    units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text, links)| {
+        let (number, sequence, mark) = note_numbers
+            .get(&raw_id)
+            .cloned()
+            .unwrap_or((None, 0, None));
+        let mut unit = serde_json::json!({
             "key": format!("footnote:{raw_id}"),
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
             "note_number": number,
+            "note_mark": mark,
             "restart_sequence": sequence,
             "page_numbers": [],
             "text": text,
             "footnote_refs": [],
-        })
+        });
+        if !links.is_empty() {
+            unit["links"] = serde_json::json!(links);
+        }
+        unit
     }));
     Ok(units)
 }
@@ -2017,8 +2144,8 @@ mod tests {
             vec![
                 json!({"key":"body:1","kind":"body","ordinal":1,"footnote_id":null,"page_numbers":[],"text":"A😀\tB","footnote_refs":[[2,3]]}),
                 json!({"key":"body:2","kind":"body","ordinal":2,"footnote_id":null,"page_numbers":[],"text":"C","footnote_refs":[[1,1]]}),
-                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"note_number":2,"restart_sequence":0,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
-                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"note_number":1,"restart_sequence":0,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
+                json!({"key":"footnote:3","kind":"footnote","ordinal":1,"footnote_id":1,"note_number":2,"note_mark":null,"restart_sequence":0,"page_numbers":[],"text":"First\tnote.","footnote_refs":[]}),
+                json!({"key":"footnote:7","kind":"footnote","ordinal":2,"footnote_id":2,"note_number":1,"note_mark":null,"restart_sequence":0,"page_numbers":[],"text":"Second\nnote.","footnote_refs":[]}),
             ]
         );
     }
