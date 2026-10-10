@@ -435,6 +435,37 @@ fn arabic_page_number(value: &str) -> Option<u32> {
         .and_then(|value| value.as_str().parse().ok())
 }
 
+/// The page numbers the document prints at its pages' edges, wherever in the margin it sets them: a
+/// bare number that is its page's lowest line (or highest) is a folio when the number less the
+/// page's place in the document is the same on at least three such pages (or half of a shorter
+/// document's). Returns each folio with whether it heads its page.
+fn edge_folios(pages: &[Page]) -> HashMap<(usize, usize), bool> {
+    let mut by_offset = HashMap::<i64, Vec<(usize, usize, bool)>>::new();
+    for (page_slot, page) in pages.iter().enumerate() {
+        let lines = || page.lines.iter().enumerate().filter(|(_, line)| !line.text.trim().is_empty());
+        let lowest = lines().max_by(|a, b| a.1.bbox[1].total_cmp(&b.1.bbox[1]));
+        let highest = lines().min_by(|a, b| a.1.bbox[1].total_cmp(&b.1.bbox[1]));
+        for (edge, top) in [(lowest, false), (highest, true)] {
+            let Some((line_slot, line)) = edge else {
+                continue;
+            };
+            if let Some(printed) = arabic_page_number(&line.text) {
+                by_offset
+                    .entry(i64::from(printed) - i64::from(page.number))
+                    .or_default()
+                    .push((page_slot, line_slot, top));
+            }
+        }
+    }
+    let needed = 3.min(pages.len().div_ceil(2)).max(2);
+    by_offset
+        .into_values()
+        .filter(|folios| folios.iter().map(|folio| folio.0).collect::<HashSet<_>>().len() >= needed)
+        .flatten()
+        .map(|(page_slot, line_slot, top)| ((page_slot, line_slot), top))
+        .collect()
+}
+
 /// Text-Fidelity's alternating-folio witness. A singleton Arabic number at
 /// each outer bottom edge is furniture only when at least four consecutive
 /// PDF pages carry a +1 printed sequence, alternate sides, and remain aligned
@@ -677,6 +708,7 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
         });
     let sequence_folios =
         legal_pdf_support::profile::measure("furniture.folios", || alternating_folios(pages));
+    let edge_folios = edge_folios(pages);
     legal_pdf_support::profile::measure("furniture.apply", || {
         for (page_slot, page) in pages.iter_mut().enumerate() {
             let line_sizes: Vec<_> = page.lines.iter().map(line_font_size).collect();
@@ -756,6 +788,8 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     at_bottom && line_size < body_size * 0.90 && compact_note_line(&line.text);
                 if sequence_folios.contains(&(page_slot, index)) {
                     line.region_type = "footer".to_owned();
+                } else if let Some(&top) = edge_folios.get(&(page_slot, index)) {
+                    line.region_type = if top { "header" } else { "footer" }.to_owned();
                 } else if repeated.contains(&(page_slot, index))
                     && (at_top || at_bottom)
                     && (line_size >= body_size * 0.75 || normalize_furniture(&line.text) != "#")
