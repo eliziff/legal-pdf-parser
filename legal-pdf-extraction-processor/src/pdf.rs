@@ -1908,6 +1908,39 @@ pub fn recognize_pdf(
                 });
             }
         }
+        // A kept layer's lost note numbers, read again by our recognizer.
+        let requests: Vec<_> = metadata
+            .scanned_pages
+            .iter()
+            .filter_map(|&page_index| {
+                pages
+                    .get(page_index)
+                    .filter(|page| page.source == "native" && !page.lines.is_empty())
+                    .map(|page| OcrPageRequest {
+                        page_index,
+                        width: page.width,
+                        height: page.height,
+                        regions: Vec::new(),
+                    })
+            })
+            .collect();
+        if !requests.is_empty() {
+            for result in provider.extract_pages(pdf, &requests)? {
+                let Some(page) = pages.get_mut(result.page_index) else {
+                    continue;
+                };
+                let recognized: Vec<_> = result
+                    .lines
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| make_ocr_line(line, page, index + 1))
+                    .collect();
+                for line in page.lines.iter_mut().filter(|line| line.source == "native") {
+                    let read = crate::reread::reading_of(line, &recognized);
+                    crate::reread::splice_numbers(line, &read);
+                }
+            }
+        }
     }
     if reindex {
         reindex_source_lines(pages);
