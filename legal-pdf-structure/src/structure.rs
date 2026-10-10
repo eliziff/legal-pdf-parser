@@ -2,6 +2,7 @@
 
 mod bookmarks;
 mod constituents;
+mod contents;
 mod graph;
 mod heading_sections;
 mod note_regions;
@@ -3721,7 +3722,11 @@ fn prepare_pages(
         build_regions(pages);
     });
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
-        bookmarks::reconcile_bookmarks(pages, outline, &mut primitives)
+        // The document's own bookmarks first; where they place nothing, its printed contents list.
+        if !bookmarks::reconcile_bookmarks(pages, outline, &mut primitives) {
+            let listed = contents::contents_outline(pages, &primitives);
+            bookmarks::reconcile_bookmarks(pages, &listed, &mut primitives);
+        }
     });
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
