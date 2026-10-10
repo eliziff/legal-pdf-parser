@@ -1849,7 +1849,11 @@ pub fn recognize_pdf(
             if lines.is_empty() {
                 continue;
             }
-            let layered = page.source == "native" && !page.lines.is_empty();
+            // A scan whose own words are only a stamp over it has no layer to keep: the stamp is
+            // in its image, and the document's other pages give it no vocabulary to be read by.
+            let stamped = metadata.scanned_pages.contains(&page_index)
+                && page.lines.iter().map(|line| line.bbox[2] - line.bbox[0]).sum::<f64>() < 2.0 * page.width;
+            let layered = page.source == "native" && !page.lines.is_empty() && !stamped;
             // A reading that holds fewer of the page's words than the other misses the rest of it.
             let count = |lines: &[Line]| lines.iter().map(|line| line.text.split_whitespace().count()).sum::<usize>() as f64;
             let (layer_count, recognized_count) = (count(&page.lines), count(&lines));
