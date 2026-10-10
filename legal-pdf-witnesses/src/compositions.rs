@@ -73,8 +73,7 @@ pub fn compositions() -> &'static Compositions {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_else(|| SHIPPED.to_owned());
         // What the compositions decide rests on the lexicon's words too.
-        let sha256 = format!("{:x}", Sha256::digest(format!("{text}
-{}", crate::lexicon::lexicon().text).as_bytes()));
+        let sha256 = format!("{:x}", Sha256::digest(format!("{text}\n{}", crate::lexicon::lexicon().text).as_bytes()));
         let parsed: HashMap<String, Sets> = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|value| value.get("decisions").cloned())
