@@ -4,6 +4,7 @@ mod bookmarks;
 mod constituents;
 mod graph;
 mod heading_sections;
+mod note_regions;
 mod quotations;
 
 use crate::layout::*;
@@ -3661,6 +3662,10 @@ fn prepare_pages(
     });
     let mut diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
+    });
+    // Which lines are notes, settled over the whole document before any heading claims them.
+    legal_pdf_support::profile::measure("prepare.note_regions", || {
+        note_regions::correct_note_regions(pages, separators)
     });
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
