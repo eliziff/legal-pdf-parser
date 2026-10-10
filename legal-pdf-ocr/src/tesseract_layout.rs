@@ -166,9 +166,17 @@ impl TesseractLayout {
                     top: top.max(0) as usize,
                     right: right.clamp(0, width) as usize,
                     bottom: bottom.clamp(0, height) as usize,
+                    recovered: false,
                 })
             })
             .collect();
+        let boxes = crate::uncovered::recover_uncovered_lines(
+            pixels,
+            width as usize,
+            height as usize,
+            channels as usize,
+            boxes,
+        );
         Ok(order_footnotes(boxes, width as usize, height as usize)
             .into_iter()
             .map(|bbox| LineBox {
@@ -176,6 +184,7 @@ impl TesseractLayout {
                 top: bbox.top.saturating_sub(6),
                 right: (bbox.right + 11).min(width as usize),
                 bottom: (bbox.bottom + 7).min(height as usize),
+                ..bbox
             })
             .collect())
     }
@@ -332,6 +341,7 @@ mod tests {
             top,
             right: left + 360,
             bottom: top + height,
+            recovered: false,
         };
         let left_body = (0..12)
             .map(|i| line(75, 120 + i * 25, 20))

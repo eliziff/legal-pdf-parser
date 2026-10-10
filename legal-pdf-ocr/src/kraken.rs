@@ -27,6 +27,9 @@ use std::time::Instant;
 // Store padding in the shared batch tensor, not in every prepared line.
 const INPUT_PADDING: usize = 16;
 const BLANK_LABEL: usize = 0;
+/// How sure the recognizer must be of a line the page analysis left out: a number or a word reads
+/// at 0.95 and more; a signature, a seal's lettering or a speckle at less.
+const RECOVERED_CONFIDENCE: f64 = 0.95;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,12 +163,14 @@ fn default_input_height() -> usize {
     48
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct LineBox {
     pub(crate) left: usize,
     pub(crate) top: usize,
     pub(crate) right: usize,
     pub(crate) bottom: usize,
+    /// Ink the page analysis left out, read as a line of its own.
+    pub(crate) recovered: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1098,7 +1103,15 @@ impl KrakenOcr {
                                     confidence,
                                     words,
                                 } = recognition;
-                                (!text.trim().is_empty()).then_some(OcrLine {
+                                // A recovered line is kept only when read surely, as text: a
+                                // lone letter is a seal's or a logo's, a lone digit a folio.
+                                let marks = text.chars().filter(|c| c.is_alphanumeric()).count();
+                                let kept = !text.trim().is_empty()
+                                    && (!line.bbox.recovered
+                                        || confidence >= RECOVERED_CONFIDENCE
+                                            && (marks >= 2
+                                                || marks == 1 && text.chars().any(|c| c.is_ascii_digit())));
+                                kept.then_some(OcrLine {
                                     text,
                                     bbox: [
                                         line.bbox.left as f64,
@@ -2667,6 +2680,7 @@ mod tests {
                     top: 0,
                     right: width,
                     bottom: 1,
+                    ..LineBox::default()
                 },
                 width,
                 pixels: Vec::new(),
@@ -2752,6 +2766,7 @@ mod tests {
                 top: 0,
                 right: width,
                 bottom: 1,
+                ..LineBox::default()
             },
             width,
             pixels: Vec::new(),

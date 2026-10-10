@@ -6,6 +6,8 @@ mod ocr;
 mod separator;
 #[cfg(feature = "kraken")]
 mod tesseract_layout;
+#[cfg(feature = "kraken")]
+mod uncovered;
 
 #[cfg(feature = "kraken")]
 pub use kraken::{
