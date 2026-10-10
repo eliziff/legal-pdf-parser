@@ -3021,6 +3021,8 @@ fn classify_pages_with_source(
                         body_size
                     }) * 1.18
                 && has_word_character(&line.text)
+                // A blank to fill in ("CACR ____", "DATED ____") makes the line a form's field.
+                && !line.text.contains("___")
             {
                 line.region_type = "heading".to_owned();
             } else {
