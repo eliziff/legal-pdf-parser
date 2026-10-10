@@ -11,7 +11,7 @@ import re
 
 VERSION = "legalpdf.structure-composer.v2"
 KINDS = {"prose", "heading", "list_item", "header", "footer", "page_label",
-         "caption", "instruction", "unknown"}
+         "caption", "instruction", "marginal_note", "headnote", "unknown"}
 MODULES = {
     "tables": ('table', 'table body: {"rows":[[["l1"],["l2"]],[["l3"],[]]],"header_rows":[0]}. '
                'Rows contain cells of source IDs; [] is a blank cell. The record anchor is the first cell ID. '
@@ -154,7 +154,7 @@ def schema(request):
               "edit":obj(start=integer,end=integer,text=string),
               "numbering":obj(refs=ref("refs"),role=enum("prose","list_item"),locator_kind=enum("paragraph","section","list_item"),marker=ref("refs"),
                               level={"type":"integer","minimum":1},parent=nullable)}
-        payloads={"block":obj(refs=ref("refs"),role=enum("prose","list_item","header","footer","page_label","caption","instruction")),
+        payloads={"block":obj(refs=ref("refs"),role=enum("prose","list_item","header","footer","page_label","caption","instruction","marginal_note","headnote")),
             "numbered":ref("numbering"),
             **{k:ref("one_ref") for k in ("remove","clear_continue","clear_resume")},
             "heading":obj(refs=ref("refs"),level={"type":"integer","minimum":1},parent=nullable),
@@ -222,10 +222,14 @@ heading and annotation records below have bodies, containing JSON metadata alone
 Use existing source IDs, not text or coordinates. To split/regroup a current block,
 include all its IDs exactly once across the replacement blocks. Separate paragraphs
 remain separate records. Return an empty bounded_text when no changes are needed.
-Block kinds: prose, heading, list_item, header, footer, page_label, caption, instruction, unknown.
+Block kinds: prose, heading, list_item, header, footer, page_label, caption, instruction,
+marginal_note, headnote, unknown.
 For heading only, put {"level":1,"parent":null} inside the record; parent is an enclosing
 heading's first source ID. Correct levels consistently across the supplied context.
 Court captions, party names, table column labels and running titles are not section headings.
+A statute's marginal note (a short gloss printed beside a provision) is marginal_note, and a
+reported case's headnote (its catchwords and summary of the points decided, printed before the
+syllabus or opinion) is headnote; neither is a heading.
 Keep printed template instructions distinct from footnotes and actual case facts.
 Block replacement does not reorder the page; order changes use an order record:
 ⟦l1:order⟧["l1","l2","l3"]⟦/l1⟧ listing every TARGET line once in reading order.
