@@ -132,7 +132,7 @@ fn roman_to_arabic(token: &str) -> String {
 }
 
 /// Lowercased, LaTeX dropped, punctuation stripped, roman numerals as digits.
-fn normalize_title(title: &str) -> String {
+pub(super) fn normalize_title(title: &str) -> String {
     tokens(title)
         .into_iter()
         .map(|token| {
@@ -173,7 +173,7 @@ fn title_template(title: &str) -> String {
 }
 
 /// `difflib.SequenceMatcher(None, a, b).ratio()`.
-fn similarity(a: &str, b: &str) -> f64 {
+pub(super) fn similarity(a: &str, b: &str) -> f64 {
     let a = a.chars().collect::<Vec<_>>();
     let b = b.chars().collect::<Vec<_>>();
     if a.is_empty() && b.is_empty() {
@@ -352,11 +352,11 @@ pub(super) fn reconcile_bookmarks(
     pages: &mut [Page],
     outline: &[PdfOutlineEntry],
     primitives: &mut PdfPrimitiveEvidence,
-) {
+) -> bool {
     let mut entries = validate(outline, pages.len());
     let tier = classify(&entries, pages.len());
     if tier == Tier::Ignore {
-        return;
+        return false;
     }
     let slot_of_page = pages
         .iter()
@@ -503,7 +503,7 @@ pub(super) fn reconcile_bookmarks(
         anchors[index] = Some(anchor);
     }
     if anchors.iter().all(Option::is_none) {
-        return;
+        return false;
     }
 
     // An anchored title is a heading of its own. Within a heading it cuts only where a numbered
@@ -749,6 +749,7 @@ pub(super) fn reconcile_bookmarks(
             };
         }
     }
+    true
 }
 
 // PageIndex license, for the code ported above:
