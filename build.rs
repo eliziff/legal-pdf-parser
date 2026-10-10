@@ -106,8 +106,11 @@ fn stage_inputs(root: &Path, kraken: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-support/src/projection.rs",
         "legal-pdf-support/src/printed_paragraphs.rs",
         "legal-pdf-support/src/pairing_support.rs",
+        "legal-pdf-support/src/underlines.rs",
     ]);
     document.extend(crate_inputs(root, "structure"));
+    document.extend(crate_inputs(root, "witnesses"));
+    document.push(root.join("legal-pdf-witnesses/data"));
     document.extend(crate_inputs(root, "pairing"));
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",

@@ -1,6 +1,6 @@
 use crate::ppdoc_openvino::OpenVinoSession;
 use crate::ppdoc_postprocess::{
-    best_region_index, postprocess_document, scale_detections, RegionDetection,
+    best_region_index, nearest_region_index, postprocess_document, scale_detections, RegionDetection,
 };
 use image::{imageops, ImageReader, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
@@ -761,8 +761,11 @@ impl PPDocLayout {
                 if line.exclude_from_body || line.text.trim().is_empty() {
                     continue;
                 }
-                let Some(region_index) =
-                    best_region_index(line.bbox, &regions_by_page[page_position])
+                let regions = &regions_by_page[page_position];
+                // A line no region covers takes its page's nearest region: one stray line no longer
+                // costs the page every region the model found.
+                let Some(region_index) = best_region_index(line.bbox, regions)
+                    .or_else(|| nearest_region_index(line.bbox, regions))
                 else {
                     unmatched.push(line.id.clone());
                     continue;

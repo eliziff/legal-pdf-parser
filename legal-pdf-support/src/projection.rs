@@ -71,6 +71,8 @@ pub struct PdfTextLine {
 pub struct PdfTextWord {
     pub text: String,
     pub rect: [f64; 4],
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underlined: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -226,6 +228,7 @@ impl PdfDocument {
                             .map(|word| PdfTextWord {
                                 text: word.text.clone(),
                                 rect: word.bbox,
+                                underlined: word.underlined,
                             })
                             .collect(),
                     })
@@ -324,6 +327,7 @@ impl PdfDocument {
                                 .map(|word| PdfTextWord {
                                     text: word.text.clone(),
                                     rect: word.bbox,
+                                    underlined: word.underlined,
                                 })
                                 .collect(),
                         })
@@ -451,6 +455,7 @@ fn recognized_witness_line(line: &PdfTextLine) -> PdfTextLine {
                 let start = at;
                 at += word.chars().count() + 1;
                 (!word.is_empty()).then(|| PdfTextWord {
+                    underlined: false,
                     text: word.to_owned(),
                     rect: [
                         left + start as f64 * advance,
@@ -1422,6 +1427,7 @@ mod tests {
             bbox: [60.0, 100.0, 120.0, 112.0],
             start: 0,
             end: 10,
+            underlined: false,
         });
         let prepared = PdfDocument::project(scanned, vec![], vec![], graph, pdf_summary());
         let restored: PdfDocument =
@@ -1447,6 +1453,7 @@ mod tests {
             bbox: [60.0, 100.0, 90.0, 112.0],
             start: 0,
             end: 3,
+            underlined: false,
         });
         let mut plain = source_line("plain", "[7] The tug may berth");
         plain.bbox = [60.0, 120.0, 270.0, 132.0];

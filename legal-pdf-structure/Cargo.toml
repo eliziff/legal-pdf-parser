@@ -10,6 +10,7 @@ legal-pdf-pairing = { path = "../legal-pdf-pairing" }
 legal-pdf-support = { path = "../legal-pdf-support" }
 legal-pdf-headings = { path = "../legal-pdf-headings" }
 legal-pdf-tables = { path = "../legal-pdf-tables" }
+legal-pdf-witnesses = { path = "../legal-pdf-witnesses" }
 legal-structure-model = { workspace = true }
 regex = "1.11"
 serde_json = "1.0"

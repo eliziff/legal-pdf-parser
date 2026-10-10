@@ -247,6 +247,7 @@ fn engine_identity() -> &'static Value {
             "ocr_renderer": if cfg!(feature = "ocr") { "hayro 0.7.1" } else { "disabled" },
             "engine_source_sha256": env!("LEGAL_PDF_ENGINE_SHA256"),
             "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
+            "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })
 }
@@ -258,6 +259,7 @@ fn document_identity() -> &'static Value {
             "document_source_sha256": env!("LEGAL_PDF_DOCUMENT_SHA256"),
             "extraction_source_sha256": env!("LEGAL_PDF_EXTRACTION_SHA256"),
             "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
+            "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })
 }
@@ -638,6 +640,10 @@ pub(crate) fn parse_pdf(
         selected_ocr,
         options.ocr_pages.as_deref(),
     )?;
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    profile::measure("recognized_underlines", || {
+        legal_pdf_support::mark_recognized_underlines(bytes, &mut extracted.pages)
+    });
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {

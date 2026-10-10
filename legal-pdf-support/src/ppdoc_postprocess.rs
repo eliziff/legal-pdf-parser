@@ -110,6 +110,22 @@ pub(crate) fn postprocess_document(pages: &[Page], regions_by_page: &mut [Vec<Re
     }
 }
 
+/// The region nearest a line's centre, for a line no region covers.
+pub(crate) fn nearest_region_index(line: [f64; 4], regions: &[RegionDetection]) -> Option<usize> {
+    let (x, y) = bbox_center(line);
+    regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| {
+            let [left, top, right, bottom] = region.bbox;
+            let dx = (left - x).max(0.0).max(x - right);
+            let dy = (top - y).max(0.0).max(y - bottom);
+            (index, dx * dx + dy * dy)
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+}
+
 pub(crate) fn best_region_index(line: [f64; 4], regions: &[RegionDetection]) -> Option<usize> {
     let line_area = bbox_area(line);
     if line_area == 0.0 {
