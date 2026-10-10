@@ -493,6 +493,26 @@ impl PdfResolutionInput {
             })
             .collect::<HashMap<_, _>>();
         let quotations = super::quotations::quoted_lines(pages, primitives);
+        // The composed readings of each marker's line, where compositions are in force.
+        let table = legal_pdf_witnesses::witnesses(
+            pages,
+            &legal_pdf_witnesses::Context {
+                quoted: Some(&quotations),
+                table_cells: Some(&primitives.table_cell_line_ids),
+                contents: Some(&primitives.contents_line_ids),
+                translation: Some(&primitives.translation_line_ids),
+                layout: primitives.source_regions.as_ref(),
+            },
+        );
+        legal_pdf_witnesses::dump(&table, "candidates");
+        let rows = table.by_id();
+        let compositions = legal_pdf_witnesses::compositions();
+        let composed = |name: &str, line_id: &str| {
+            compositions
+                .decision(name)
+                .and_then(|decision| rows.get(line_id).and_then(|row| decision.holds(row)))
+                == Some(true)
+        };
         let quoted = |candidate: &StructureMarkerCandidate| {
             index
                 .line_at(candidate.marker_range.start)
@@ -672,6 +692,7 @@ impl PdfResolutionInput {
                 };
                 let page_indexes = index.page_indexes(candidate.range);
                 let marker_lines = index.overlapping_lines(candidate.marker_range);
+                let marker_line = marker_lines.first().map(|indexed| indexed.line_id.as_str()).unwrap_or("");
                 let mut observations = Vec::new();
 
                 // The words after the marker on the item's first body lines.
@@ -807,6 +828,12 @@ impl PdfResolutionInput {
                 }
                 if quoted(candidate) {
                     add_observation(&mut observations, CandidateObservationV2::Quotation);
+                }
+                if composed("numbered_paragraph", marker_line) {
+                    add_observation(&mut observations, CandidateObservationV2::ComposedParagraph);
+                }
+                if composed("list_item", marker_line) {
+                    add_observation(&mut observations, CandidateObservationV2::ComposedListItem);
                 }
                 evidence.push(CandidateEvidenceV2 {
                     candidate_id: candidate.id.clone(),

@@ -1050,6 +1050,7 @@ dependencies = [
  "legal-pdf-ocr",
  "legal-pdf-structure",
  "legal-pdf-support",
+ "legal-pdf-witnesses",
  "legal-structure-model",
  "lopdf",
  "mimalloc",
@@ -1067,6 +1068,7 @@ dependencies = [
  "legal-pdf-pairing",
  "legal-pdf-support",
  "legal-pdf-tables",
+ "legal-pdf-witnesses",
  "legal-structure-model",
  "regex",
  "serde_json",
@@ -1095,6 +1097,17 @@ version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
  "regex",
+]
+
+[[package]]
+name = "legal-pdf-witnesses"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

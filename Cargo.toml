@@ -18,7 +18,7 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
 default = []
-pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
+pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:legal-pdf-witnesses", "dep:serde", "dep:serde_json", "dep:sha2"]
 language = ["dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr", "legal-pdf-ocr/ocr"]
 kraken = ["ocr", "legal-pdf-ocr/kraken"]
@@ -52,6 +52,7 @@ legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
+legal-pdf-witnesses = { path = "legal-pdf-witnesses", optional = true }
 legal-structure-model = { workspace = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }

@@ -15,6 +15,18 @@ pub struct Word {
     pub bbox: [f64; 4],
     pub start: usize,
     pub end: usize,
+    /// A rule is drawn under the word: painted in the PDF, or dark on a recognized page's image.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underlined: bool,
+}
+
+/// Whether a horizontal stroke from `start` to `end` at height `at` underlines a word box: set
+/// from a third of its line's height above the word's bottom to half below, across most of it.
+pub fn underlines(word: [f64; 4], line_height: f64, start: f64, end: f64, at: f64) -> bool {
+    let width = (word[2] - word[0]).max(1.0);
+    at >= word[3] - 0.3 * line_height
+        && at <= word[3] + 0.5 * line_height
+        && end.min(word[2]) - start.max(word[0]) >= 0.6 * width
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -20,11 +20,13 @@
 //!   capitalized title wrapped onto a second line is one heading.
 //! - Numbered and unnumbered headings compare by type, not numbering (see `outline.rs`).
 
+mod composed;
 mod detect;
 mod model;
 mod outline;
 mod stats;
 
+pub use composed::compose_headings;
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
 use legal_pdf_core::model::Page;
 use legal_pdf_core::structure_analysis;

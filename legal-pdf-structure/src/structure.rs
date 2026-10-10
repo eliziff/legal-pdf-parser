@@ -71,6 +71,7 @@ struct PdfPrimitiveEvidence {
     tables: Vec<legal_pdf_tables::PdfTable>,
 }
 
+
 #[derive(Debug)]
 struct PdfPreparation {
     diagnostics: Vec<Diagnostic>,
@@ -3719,6 +3720,24 @@ fn prepare_pages(
                 numbered: &numbered,
             },
         );
+        // The composed heading decision over every line's witnesses, where one is in force.
+        let table = legal_pdf_witnesses::witnesses(
+            pages,
+            &legal_pdf_witnesses::Context {
+                table_cells: Some(&primitives.table_cell_line_ids),
+                contents: Some(&primitives.contents_line_ids),
+                translation: Some(&primitives.translation_line_ids),
+                layout: primitives.source_regions.as_ref(),
+                quoted: None,
+            },
+        );
+        legal_pdf_witnesses::dump(&table, "headings");
+        if let Some(decision) = legal_pdf_witnesses::compositions().decision("heading") {
+            let rows = table.by_id();
+            legal_pdf_headings::compose_headings(pages, &mut primitives.heading_levels, &|id| {
+                rows.get(id).and_then(|row| decision.holds(row))
+            });
+        }
         build_regions(pages);
     });
     legal_pdf_support::profile::measure("prepare.bookmarks", || {

@@ -900,6 +900,7 @@ fn line_words(
                     bbox: union_bbox(std::iter::once(first).chain(boxes)),
                     start,
                     end,
+                    underlined: false,
                 });
             }
         } else if start.is_none() {
@@ -960,6 +961,34 @@ fn begins_with_note_label(text: &str) -> bool {
 
 /// The page's painted rules as regions of kind `rule`, each a horizontal or vertical line
 /// (`bbox` from one end to the other) in page coordinates, collinear pieces joined.
+/// The words a painted horizontal rule underlines.
+fn mark_painted_underlines(page: &mut Page) {
+    let rules = page
+        .regions
+        .iter()
+        .filter(|region| region.kind == "rule")
+        .map(|region| region.bbox)
+        .filter(|[x0, y0, x1, y1]| (y1 - y0).abs() <= 2.0 && (x1 - x0).abs() > 2.0)
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return;
+    }
+    for line in &mut page.lines {
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        for word in &mut line.words {
+            word.underlined = rules.iter().any(|rule| {
+                legal_pdf_core::model::underlines(
+                    word.bbox,
+                    height,
+                    rule[0].min(rule[2]),
+                    rule[0].max(rule[2]),
+                    (rule[1] + rule[3]) / 2.0,
+                )
+            });
+        }
+    }
+}
+
 fn rule_regions(
     geometry: PageGeometry,
     page: &Page,
@@ -1245,6 +1274,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
             bbox: word.bbox,
             start: word.start - shift,
             end: word.end - shift,
+            underlined: false,
         })
         .collect();
     Some(Line {
@@ -1520,6 +1550,7 @@ pub fn assemble_pdf(
             page,
             rules_by_page.get(&number).map_or(&[], Vec::as_slice),
         );
+        mark_painted_underlines(page);
     }
 
     for page in &detection.pages_needing_ocr {
