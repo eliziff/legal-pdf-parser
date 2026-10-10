@@ -839,7 +839,64 @@ enum FootnoteRestart {
 struct FootnoteNumbering {
     start: Option<u32>,
     restart: FootnoteRestart,
-    decimal: bool,
+    format: NoteFormat,
+}
+
+/// How Word prints a footnote's number (`w:numFmt`). Whatever it prints, Word counts its notes, and a
+/// writer refers to a note by that count ("supra note 3" for the note printed ‡).
+#[derive(Clone, Copy, PartialEq)]
+enum NoteFormat {
+    Decimal,
+    Chicago,
+    LowerRoman,
+    UpperRoman,
+    LowerLetter,
+    UpperLetter,
+    Other,
+}
+
+impl NoteFormat {
+    fn of(value: &str) -> Self {
+        match value {
+            "decimal" | "decimalZero" => Self::Decimal,
+            "chicago" => Self::Chicago,
+            "lowerRoman" => Self::LowerRoman,
+            "upperRoman" => Self::UpperRoman,
+            "lowerLetter" => Self::LowerLetter,
+            "upperLetter" => Self::UpperLetter,
+            _ => Self::Other,
+        }
+    }
+
+    /// The mark Word prints for the note it counts as `number`, where it prints no numeral.
+    fn mark(self, number: u32) -> Option<String> {
+        if number == 0 { return None; }
+        let roman = || {
+            let mut left = number;
+            let mut out = String::new();
+            for (value, letters) in [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+                (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+                while left >= value { out.push_str(letters); left -= value; }
+            }
+            out
+        };
+        let letter = || {
+            let index = (number - 1) % 26;
+            char::from(b'a' + index as u8).to_string().repeat(((number - 1) / 26 + 1) as usize)
+        };
+        match self {
+            Self::Decimal | Self::Other => None,
+            Self::Chicago => {
+                let symbols = ['*', '†', '‡', '§'];
+                let index = (number - 1) as usize;
+                Some(symbols[index % 4].to_string().repeat(index / 4 + 1))
+            }
+            Self::LowerRoman => Some(roman()),
+            Self::UpperRoman => Some(roman().to_uppercase()),
+            Self::LowerLetter => Some(letter()),
+            Self::UpperLetter => Some(letter().to_uppercase()),
+        }
+    }
 }
 
 fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> FootnoteNumbering {
@@ -864,9 +921,7 @@ fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> Foot
             Some(_) => FootnoteRestart::Unknown,
             None => inherited.restart,
         },
-        decimal: value("numFmt").map_or(inherited.decimal, |format| {
-            matches!(format, "decimal" | "decimalZero")
-        }),
+        format: value("numFmt").map_or(inherited.format, NoteFormat::of),
     }
 }
 
@@ -927,7 +982,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
     let defaults = FootnoteNumbering {
         start: Some(1),
         restart: FootnoteRestart::Continuous,
-        decimal: true,
+        format: NoteFormat::Decimal,
     };
     let settings = file_bytes(&files, "word/settings.xml")
         .map(parse_xml)
@@ -937,10 +992,14 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         .map(|settings| settings.root())
         .transpose()?
         .map_or(defaults, |settings| footnote_numbering(settings, defaults));
+    // A section prints its notes in the format its own properties name, decimal when they name none: an author
+    // note's chicago section leaves the body's notes decimal, whatever settings.xml mirrors from that first section.
     let numbering = sections
         .iter()
         .map(|properties| {
-            properties.map_or(global, |properties| footnote_numbering(properties, global))
+            properties.map_or(global, |properties| {
+                footnote_numbering(properties, FootnoteNumbering { format: NoteFormat::Decimal, ..global })
+            })
         })
         .collect::<Vec<_>>();
     let mut note_numbers = HashMap::new();
@@ -956,7 +1015,11 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
             }
             let properties = numbering[*section];
             if previous_section != Some(*section) {
-                if previous_section.is_none() || properties.restart == FootnoteRestart::Section {
+                // A section printing another format counts its notes afresh, as writers' "supra note 5" in the body
+                // after a starred author note shows.
+                if previous_section.is_none_or(|previous: usize| numbering[previous].format != properties.format)
+                    || properties.restart == FootnoteRestart::Section
+                {
                     if previous_section.is_some() {
                         sequence += 1;
                     }
@@ -964,8 +1027,9 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
                 }
                 previous_section = Some(*section);
             }
+            // Word counts a note whatever it prints for it: a note printed "‡" or "iii" is the note a
+            // writer's "supra note 3" names, and its printed mark is kept beside the count.
             let number = if custom
-                || !properties.decimal
                 || !matches!(
                     properties.restart,
                     FootnoteRestart::Continuous | FootnoteRestart::Section
@@ -974,14 +1038,12 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
             } else {
                 current
             };
-            note_numbers.insert(
-                id,
-                (
-                    number,
-                    sequence,
-                    mark.clone().filter(|mark| !mark.trim().is_empty()),
-                ),
-            );
+            let printed = if custom {
+                mark.clone().filter(|mark| !mark.trim().is_empty())
+            } else {
+                number.and_then(|number| properties.format.mark(number))
+            };
+            note_numbers.insert(id, (number, sequence, printed));
             if !custom {
                 current = if matches!(
                     properties.restart,
