@@ -8,7 +8,7 @@ use legal_pdf_extraction::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 use legal_pdf_structure::{
-    derive, status, validate_document, validate_pdf_components, StructureIdentity, StructureOutput,
+    status, validate_document, validate_pdf_components, StructureIdentity, StructureOutput,
 };
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
@@ -41,6 +41,16 @@ struct DeferredOcrProvider<'a> {
     cache_root: Option<PathBuf>,
     cache_identity: String,
     progress: RecognitionProgress<'a>,
+    /// The thin strokes each recognized page's render shows, by page.
+    strokes: BTreeMap<usize, Vec<[f64; 4]>>,
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Serialize, Deserialize)]
+struct CachedRaster {
+    key: String,
+    separator: Option<f64>,
+    strokes: Vec<[f64; 4]>,
 }
 
 #[cfg(feature = "ocr")]
@@ -79,6 +89,26 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 .as_ref()
                 .and_then(|path| read_gzip_json::<CachedOcrPage>(path).ok())
                 .filter(|cached| cached.key == key && cached.page.page_index == request.page_index);
+            // LEGALPDF_RECOGNITION_ADOPT: an OCR code change that leaves recognition as it was
+            // (its raster pass, its plumbing) adopts the page's newest earlier reading.
+            let cached = cached.or_else(|| {
+                std::env::var_os("LEGALPDF_RECOGNITION_ADOPT")?;
+                let root = self.cache_root.as_ref()?;
+                let mut earlier = fs::read_dir(root)
+                    .ok()?
+                    .flatten()
+                    .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+                    .collect::<Vec<_>>();
+                earlier.sort_by(|a, b| b.0.cmp(&a.0));
+                let page = earlier.into_iter().find_map(|(_, file)| {
+                    read_gzip_json::<CachedOcrPage>(&file).ok().filter(|cached| cached.page.page_index == request.page_index)
+                })?;
+                let adopted = CachedOcrPage { key: key.clone(), page: page.page };
+                if let Some(path) = &path {
+                    let _ = write_gzip_json(path, &adopted);
+                }
+                Some(adopted)
+            });
             if let Some(cached) = cached {
                 if let Some(path) = &path {
                     touch_cache(path);
@@ -157,7 +187,41 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         requests: &[legal_pdf_core::OcrPageRequest],
     ) -> Vec<Option<f64>> {
         profile::measure("extract.raster_separators", || {
-            legal_pdf_ocr::raster_page_separators(pdf, requests)
+            let root = self.cache_root.as_ref().and_then(|root| root.parent()).map(|parse| parse.join("raster"));
+            let keys = requests
+                .iter()
+                .map(|request| {
+                    serialization_sha256(&("raster-v1", &self.cache_identity, request.page_index, request.width, request.height)).unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            let mut found = keys
+                .iter()
+                .map(|key| {
+                    root.as_ref()
+                        .and_then(|root| read_gzip_json::<CachedRaster>(&root.join(format!("{key}.json.gz"))).ok())
+                        .filter(|cached| &cached.key == key)
+                })
+                .collect::<Vec<_>>();
+            let missing = (0..requests.len()).filter(|&n| found[n].is_none()).collect::<Vec<_>>();
+            if !missing.is_empty() {
+                let wanted = missing.iter().map(|&n| requests[n].clone()).collect::<Vec<_>>();
+                for (&n, (separator, strokes)) in missing.iter().zip(legal_pdf_ocr::raster_page_rules(pdf, &wanted)) {
+                    let cached = CachedRaster { key: keys[n].clone(), separator, strokes };
+                    if let Some(root) = &root {
+                        let _ = write_gzip_json(&root.join(format!("{}.json.gz", keys[n])), &cached);
+                    }
+                    found[n] = Some(cached);
+                }
+            }
+            requests
+                .iter()
+                .zip(found)
+                .map(|(request, cached)| {
+                    let cached = cached.unwrap_or(CachedRaster { key: String::new(), separator: None, strokes: Vec::new() });
+                    self.strokes.insert(request.page_index, cached.strokes);
+                    cached.separator
+                })
+                .collect()
         })
     }
 }
@@ -293,8 +357,14 @@ fn derive_extracted(
     extracted: &mut ExtractedPdf,
     document_id: &str,
     source_hash: &str,
+    cache_root: Option<&Path>,
 ) -> Result<StructureOutput> {
-    let mut derived = derive(
+    // The readers' state, named for their input pages and their code.
+    let reader_cache = cache_root.and_then(|root| {
+        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), &extracted.pages, &extracted.separators)).ok()?;
+        Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
+    });
+    let mut derived = legal_pdf_structure::derive_cached(
         &mut extracted.pages,
         &extracted.separators,
         &extracted.outline,
@@ -302,6 +372,7 @@ fn derive_extracted(
             document_id: document_id.to_owned(),
             source_sha256: source_hash.to_owned(),
         },
+        reader_cache.as_deref(),
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
@@ -319,7 +390,7 @@ fn build_document(
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
-    let derived = derive_extracted(&mut extracted, &document_id, source_hash)?;
+    let derived = derive_extracted(&mut extracted, &document_id, source_hash, None)?;
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), serde_json::to_value(extracted.metadata)?);
     let mut provenance = Map::new();
@@ -572,6 +643,7 @@ pub(crate) fn parse_pdf(
                     .map(|root| parse_cache_root(root).join("recognition")),
                 cache_identity: recognition_key.clone(),
                 progress,
+                strokes: BTreeMap::new(),
             });
     #[cfg(feature = "ocr")]
     let selected_ocr = ocr_provider
@@ -640,10 +712,25 @@ pub(crate) fn parse_pdf(
         selected_ocr,
         options.ocr_pages.as_deref(),
     )?;
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-    profile::measure("recognized_underlines", || {
-        legal_pdf_support::mark_recognized_underlines(bytes, &mut extracted.pages)
-    });
+    #[cfg(feature = "ocr")]
+    if let Some(provider) = ocr_provider.as_mut() {
+        for (page_index, strokes) in std::mem::take(&mut provider.strokes) {
+            if let Some(page) = extracted.pages.get_mut(page_index) {
+                let number = page.number;
+                page.regions.extend(strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
+                    id: format!("p{number:04}-stroke{:04}", n + 1),
+                    page_index,
+                    kind: "rule".to_owned(),
+                    line_ids: Vec::new(),
+                    bbox,
+                    reading_order: 0,
+                }));
+            }
+        }
+    }
+    for page in &mut extracted.pages {
+        legal_pdf_core::model::mark_rule_underlines(page);
+    }
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
@@ -664,7 +751,7 @@ pub(crate) fn parse_pdf(
     }
     let document_id = format!("doc-{}", &source_hash[..20]);
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, &document_id, &source_hash)
+        derive_extracted(&mut extracted, &document_id, &source_hash, cache_root.as_deref())
     })?;
     profile::measure("build.validate_document", || {
         validate_pdf_components(

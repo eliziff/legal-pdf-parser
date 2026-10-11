@@ -6,8 +6,6 @@ mod ppdoc;
 mod ppdoc_openvino;
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 mod ppdoc_postprocess;
-#[cfg(feature = "ppdoc-openvino")]
-mod underlines;
 pub use legal_pdf_core::profile;
 mod printed_paragraphs;
 mod projection;
@@ -19,8 +17,6 @@ pub use pairing_support::{
     protected_citation_spans, styled_heading_text_plausible, EnumeratorInterpretation,
     HeadingAction, HeadingAssignment, HeadingFamilyStats, HeadingLadder, HeadingLadderStatus,
 };
-#[cfg(feature = "ppdoc-openvino")]
-pub use underlines::mark_recognized_underlines;
 #[cfg(any(feature = "ppdoc", feature = "ppdoc-openvino"))]
 pub use ppdoc::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions, PreparedPPDoc};
 pub use printed_paragraphs::{

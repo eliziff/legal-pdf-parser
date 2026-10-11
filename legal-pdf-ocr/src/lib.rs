@@ -16,6 +16,6 @@ pub use kraken::{
 };
 pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
 pub use ocr::{
-    raster_page_separators, OcrOptions, OcrProvider, PreparedOcrProvider, TesseractOcr,
+    raster_page_rules, OcrOptions, RasterRules, OcrProvider, PreparedOcrProvider, TesseractOcr,
     TesseractOptions,
 };

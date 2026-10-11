@@ -20,6 +20,29 @@ pub struct Word {
     pub underlined: bool,
 }
 
+/// Mark the words a horizontal rule on their page underlines: painted in the PDF, or drawn on a
+/// recognized page's image.
+pub fn mark_rule_underlines(page: &mut Page) {
+    let rules = page
+        .regions
+        .iter()
+        .filter(|region| region.kind == "rule")
+        .map(|region| region.bbox)
+        .filter(|[x0, y0, x1, y1]| (y1 - y0).abs() <= 2.0 && (x1 - x0).abs() > 2.0)
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return;
+    }
+    for line in &mut page.lines {
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        for word in &mut line.words {
+            word.underlined = rules.iter().any(|rule| {
+                underlines(word.bbox, height, rule[0].min(rule[2]), rule[0].max(rule[2]), (rule[1] + rule[3]) / 2.0)
+            });
+        }
+    }
+}
+
 /// Whether a horizontal stroke from `start` to `end` at height `at` underlines a word box: set
 /// from a third of its line's height above the word's bottom to half below, across most of it.
 pub fn underlines(word: [f64; 4], line_height: f64, start: f64, end: f64, at: f64) -> bool {
