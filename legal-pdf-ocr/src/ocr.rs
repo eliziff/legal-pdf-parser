@@ -142,7 +142,7 @@ impl PdfOcrProvider for OcrProvider {
     }
 
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
-        raster_page_separators(pdf, requests)
+        raster_page_rules(pdf, requests).into_iter().map(|(separator, _)| separator).collect()
     }
 }
 
@@ -647,7 +647,11 @@ pub(crate) fn tsv_lines(
 /// The rule printed above each requested page's notes, read from the page rendered at 150 dpi
 /// and scanned as the recognizers scan their own renders: for a scan whose text layer is kept,
 /// whose image is read for nothing else.
-pub fn raster_page_separators(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
+/// Each requested page rendered once: the note band's separator rule, and every thin horizontal
+/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read.
+pub type RasterRules = (Option<f64>, Vec<[f64; 4]>);
+
+pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterRules> {
     #[cfg(feature = "ocr")]
     {
         use hayro::hayro_interpret::InterpreterSettings;
@@ -656,7 +660,7 @@ pub fn raster_page_separators(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Op
         use hayro::{render, RenderCache, RenderSettings};
 
         let Ok(document) = Pdf::new(pdf.to_vec()) else {
-            return vec![None; requests.len()];
+            return vec![(None, Vec::new()); requests.len()];
         };
         let cache = RenderCache::new();
         let interpreter = InterpreterSettings::default();
@@ -671,36 +675,88 @@ pub fn raster_page_separators(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Op
         requests
             .iter()
             .map(|request| {
-                let page = pages.iter().nth(request.page_index)?;
+                let Some(page) = pages.iter().nth(request.page_index) else {
+                    return (None, Vec::new());
+                };
                 let pixmap = render(page, &cache, &interpreter, &settings);
-                (pixmap.width() > 0 && pixmap.height() > 0)
-                    .then(|| raster_separator_y(&pixmap, request.height))
-                    .flatten()
+                if pixmap.width() == 0 || pixmap.height() == 0 {
+                    return (None, Vec::new());
+                }
+                let gray = gray_of(&pixmap);
+                let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
+                (
+                    raster_separator_gray(&gray, width, height, request.height),
+                    thin_strokes(&gray, width, height, request.width / width as f64, request.height / height as f64),
+                )
             })
             .collect()
     }
     #[cfg(not(feature = "ocr"))]
     {
-        vec![None; requests.len()]
+        vec![(None, Vec::new()); requests.len()]
     }
 }
 
 #[cfg(feature = "ocr")]
-pub(crate) fn raster_separator_y(
-    pixmap: &hayro::vello_cpu::Pixmap,
-    page_height: f64,
-) -> Option<f64> {
-    let width = usize::from(pixmap.width());
-    let height = usize::from(pixmap.height());
-    let gray = pixmap
+fn gray_of(pixmap: &hayro::vello_cpu::Pixmap) -> Vec<u8> {
+    pixmap
         .data_as_u8_slice()
         .chunks_exact(4)
-        .map(|pixel| {
-            ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29)
-                / 256) as u8
+        .map(|pixel| ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29) / 256) as u8)
+        .collect()
+}
+
+/// Thin horizontal strokes: runs of dark pixels (gaps of two bridged) at least ten pixels long,
+/// at most four rows thick, with light rows three pixels above and below across most of the run.
+#[cfg(feature = "ocr")]
+fn thin_strokes(gray: &[u8], width: usize, height: usize, sx: f64, sy: f64) -> Vec<[f64; 4]> {
+    const DARK: u8 = 110;
+    let dark = |x: usize, y: usize| gray[y * width + x] < DARK;
+    let light_share = |y: usize, a: usize, b: usize| (a..b).filter(|&x| !dark(x, y)).count() * 10 >= (b - a) * 7;
+    let mut strokes: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for y in 3..height.saturating_sub(3) {
+        let mut x = 0;
+        while x < width {
+            if !dark(x, y) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            let mut gap = 0;
+            let mut end = x;
+            while x < width && gap <= 2 {
+                if dark(x, y) { end = x; gap = 0 } else { gap += 1 }
+                x += 1;
+            }
+            if end + 1 - start >= 10 && light_share(y - 3, start, end + 1) && light_share(y + 3, start, end + 1) {
+                // A row just under one already read is the same stroke, thicker.
+                if let Some(last) = strokes.iter_mut().rev().take(64).find(|s| s.3 + 1 == y && s.0 < end && start < s.1) {
+                    last.0 = last.0.min(start); last.1 = last.1.max(end); last.3 = y;
+                } else {
+                    strokes.push((start, end, y, y));
+                }
+            }
+        }
+    }
+    strokes
+        .into_iter()
+        .filter(|s| s.3 - s.2 <= 3)
+        .map(|(a, b, top, bottom)| {
+            let y = (top + bottom) as f64 / 2.0 * sy;
+            [a as f64 * sx, y, (b + 1) as f64 * sx, y]
         })
-        .collect::<Vec<_>>();
-    let record = crate::separator::scan_gray_page(&gray, width, height);
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+pub(crate) fn raster_separator_y(pixmap: &hayro::vello_cpu::Pixmap, page_height: f64) -> Option<f64> {
+    let gray = gray_of(pixmap);
+    raster_separator_gray(&gray, usize::from(pixmap.width()), usize::from(pixmap.height()), page_height)
+}
+
+#[cfg(feature = "ocr")]
+fn raster_separator_gray(gray: &[u8], width: usize, height: usize, page_height: f64) -> Option<f64> {
+    let record = crate::separator::scan_gray_page(gray, width, height);
     if !matches!(record.separator_status, Some("found" | "found_two_column")) {
         return None;
     }

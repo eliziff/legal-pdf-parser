@@ -57,8 +57,11 @@ pub(super) struct LabelPrefix {
     pub(super) end: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct PdfPrimitiveEvidence {
+    /// The unit each counted line opens by the learned unit model, where one is in force.
+    #[serde(default)]
+    unit_kinds: HashMap<String, u8>,
     source_regions: Option<HashMap<String, String>>,
     contents_pages: HashSet<usize>,
     contents_line_ids: HashSet<String>,
@@ -3676,11 +3679,27 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
     }
 }
 
+/// The pages as the readers leave them, before any composed decision: what a document's
+/// compositions never change, cached by its input pages and the readers' code.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReaderState {
+    pages: Vec<Page>,
+    primitives: PdfPrimitiveEvidence,
+    diagnostics: Vec<Diagnostic>,
+}
+
 fn prepare_pages(
     pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
 ) -> Result<PdfPreparation> {
+    let (primitives, diagnostics) = prepare_reader(pages, separators)?;
+    Ok(prepare_composed(pages, outline, primitives, diagnostics))
+}
+
+/// Everything before the composed decisions: furniture, classification, tables, note bands and
+/// the styled heading reader.
+fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
     if separators.len() != pages.len() {
         return Err(Error::Message(
             "common input must contain one separator value per page".to_owned(),
@@ -3720,6 +3739,18 @@ fn prepare_pages(
                 numbered: &numbered,
             },
         );
+    });
+    Ok((primitives, diagnostics))
+}
+
+/// The composed decisions and what rests on them, over the readers' pages.
+fn prepare_composed(
+    pages: &mut [Page],
+    outline: &[PdfOutlineEntry],
+    mut primitives: PdfPrimitiveEvidence,
+    mut diagnostics: Vec<Diagnostic>,
+) -> PdfPreparation {
+    legal_pdf_support::profile::measure("prepare.composed_headings", || {
         // The composed heading decision over every line's witnesses, where one is in force.
         let table = legal_pdf_witnesses::witnesses(
             pages,
@@ -3732,7 +3763,10 @@ fn prepare_pages(
             },
         );
         legal_pdf_witnesses::dump(&table, "headings");
-        if let Some(decision) = legal_pdf_witnesses::compositions().decision("heading") {
+        if let Some(kinds) = legal_pdf_witnesses::unit_kinds(&table) {
+            legal_pdf_headings::compose_headings(pages, &mut primitives.heading_levels, &|id| kinds.get(id).map(|kind| *kind == 1));
+            primitives.unit_kinds = kinds;
+        } else if let Some(decision) = legal_pdf_witnesses::compositions().decision("heading") {
             let rows = table.by_id();
             legal_pdf_headings::compose_headings(pages, &mut primitives.heading_levels, &|id| {
                 rows.get(id).and_then(|row| decision.holds(row))
@@ -3751,10 +3785,10 @@ fn prepare_pages(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
     ));
-    Ok(PdfPreparation {
+    PdfPreparation {
         diagnostics,
         primitives,
-    })
+    }
 }
 
 fn derive_prepared(
@@ -3836,6 +3870,24 @@ fn derive_prepared(
         )
     })
     .map_err(|error| Error::Message(error.to_string()))?;
+    // The outline composed over the whole document, where a parent decision is in force; the pairs
+    // it reads are dumped for the gold's search either way.
+    let mut structure_graph = structure_graph;
+    if legal_pdf_witnesses::parent_model().is_some() || std::env::var_os("LEGALPDF_WITNESS_DUMP").is_some() {
+        let quoted = quotations::quoted_lines(pages, &prepared.primitives);
+        let table = legal_pdf_witnesses::witnesses(
+            pages,
+            &legal_pdf_witnesses::Context {
+                quoted: Some(&quoted),
+                table_cells: Some(&prepared.primitives.table_cell_line_ids),
+                contents: Some(&prepared.primitives.contents_line_ids),
+                translation: Some(&prepared.primitives.translation_line_ids),
+                layout: prepared.primitives.source_regions.as_ref(),
+            },
+        );
+        let pairs = legal_pdf_witnesses::compose_outline(&mut structure_graph, &table, &prepared.primitives.heading_levels);
+        legal_pdf_witnesses::dump_pairs(&pairs);
+    }
     Ok(StructureOutput {
         paragraphs,
         footnotes,
@@ -3851,7 +3903,39 @@ pub fn derive(
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    let prepared = prepare_pages(pages, separators, outline)?;
+    derive_cached(pages, separators, outline, identity, None)
+}
+
+/// `derive`, reading the readers' state from `reader_cache` where it is there (a file named for the
+/// input pages and the readers' code) and writing it there where not: a change to compositions, or
+/// to anything after the readers, reruns only what follows them.
+pub fn derive_cached(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+    identity: StructureIdentity,
+    reader_cache: Option<&std::path::Path>,
+) -> Result<StructureOutput> {
+    let cached = reader_cache
+        .and_then(|path| legal_pdf_core::read_gzip_json::<ReaderState>(path).ok())
+        .filter(|state| state.pages.len() == pages.len());
+    let (primitives, diagnostics) = match cached {
+        Some(state) => {
+            pages.clone_from_slice(&state.pages);
+            (state.primitives, state.diagnostics)
+        }
+        None => {
+            let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || prepare_reader(pages, separators))?;
+            if let Some(path) = reader_cache {
+                let state = ReaderState { pages: pages.to_vec(), primitives, diagnostics };
+                let _ = legal_pdf_core::write_gzip_json(path, &state);
+                (state.primitives, state.diagnostics)
+            } else {
+                (primitives, diagnostics)
+            }
+        }
+    };
+    let prepared = prepare_composed(pages, outline, primitives, diagnostics);
     derive_prepared(pages, prepared, identity, false)
 }
 

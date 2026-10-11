@@ -28,6 +28,10 @@ pub const NAMES: &[&str] = &[
     "style_rank", "style_lines", "body_style", "in_contents",
     // The readers' verdicts so far
     "reader_heading", "quoted", "table_cell", "translation", "layout_title", "layout_list", "layout_known",
+    // The layout model's other labels, and the line's place in its region (the layout model's, or the
+    // readers' where none ran)
+    "layout_text", "layout_quote", "layout_note", "layout_table", "layout_caption", "layout_furniture",
+    "layout_reference", "layout_byline", "layout_formula", "region_first", "region_last", "region_lines",
 ];
 
 pub fn index(name: &str) -> Option<usize> {
@@ -45,6 +49,7 @@ pub struct Context<'a> {
     pub layout: Option<&'a HashMap<String, String>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Row {
     pub page: usize,
     pub slot: usize,
@@ -54,6 +59,7 @@ pub struct Row {
     pub values: Vec<f32>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub rows: Vec<Row>,
 }
@@ -238,6 +244,13 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         .collect::<Vec<_>>();
     let lexicon = crate::lexicon::lexicon();
     let flag = |b: bool| if b { 1.0 } else { 0.0 };
+    let mut region_lines = HashMap::<(usize, &str), usize>::new();
+    for (p, _, l) in &lines {
+        if !l.region_id.is_empty() {
+            *region_lines.entry((*p, l.region_id.as_str())).or_default() += 1;
+        }
+    }
+    let same_region = |o: Option<(usize, usize, &Line)>, p: usize, l: &Line| o.is_some_and(|(q, _, o)| q == p && o.region_id == l.region_id);
     let mut rows = Vec::with_capacity(lines.len());
     for (n, &(p, s, l)) in lines.iter().enumerate() {
         let page = &pages[p];
@@ -329,6 +342,18 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             flag(matches!(layout, Some("paragraph_title" | "doc_title" | "heading"))),
             flag(matches!(layout, Some("list" | "list_item"))),
             flag(layout.is_some()),
+            flag(matches!(layout, Some("text" | "content" | "body" | "abstract" | "vertical_text"))),
+            flag(matches!(layout, Some("block_quote" | "quote"))),
+            flag(matches!(layout, Some("footnote" | "vision_footnote" | "note"))),
+            flag(layout.is_some_and(|label| label.starts_with("table") || label == "form" || label == "key_value_region")),
+            flag(matches!(layout, Some("caption" | "figure_title" | "chart_title" | "table_title"))),
+            flag(matches!(layout, Some("header" | "footer" | "page_header" | "page_footer" | "number" | "header_image" | "footer_image"))),
+            flag(matches!(layout, Some("reference" | "reference_content" | "document_index"))),
+            flag(matches!(layout, Some("byline" | "aside_text"))),
+            flag(matches!(layout, Some("formula" | "formula_number" | "algorithm" | "code"))),
+            flag(!l.region_id.is_empty() && !same_region(prev, p, l)),
+            flag(!l.region_id.is_empty() && !same_region(next, p, l)),
+            region_lines.get(&(p, l.region_id.as_str())).copied().unwrap_or(0) as f32,
         ];
         debug_assert_eq!(values.len(), NAMES.len());
         rows.push(Row { page: page.index, slot: s, id: l.id.clone(), text: text.chars().take(80).collect(), recognized, values });

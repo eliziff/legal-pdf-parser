@@ -508,6 +508,9 @@ impl PdfResolutionInput {
         let rows = table.by_id();
         let compositions = legal_pdf_witnesses::compositions();
         let composed = |name: &str, line_id: &str| {
+            if !primitives.unit_kinds.is_empty() {
+                return primitives.unit_kinds.get(line_id).is_some_and(|kind| legal_pdf_witnesses::UNIT_KINDS[*kind as usize] == name);
+            }
             compositions
                 .decision(name)
                 .and_then(|decision| rows.get(line_id).and_then(|row| decision.holds(row)))
