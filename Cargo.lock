@@ -931,6 +931,7 @@ dependencies = [
  "aho-corasick",
  "chrono",
  "diff-match-patch-rs",
+ "fancy-regex",
  "legal-grammar",
  "num-bigint",
  "regex",
@@ -950,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "fancy-regex",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
 ]
