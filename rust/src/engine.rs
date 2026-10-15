@@ -13,7 +13,7 @@ use legal_pdf_structure::{
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
-use legal_structure_model::{ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
+use legal_structure_model::{DetectionProfile, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -236,6 +236,7 @@ struct CachedExtraction<T = ExtractedPdf> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParseOptions {
+    pub profile: Option<DetectionProfile>,
     pub cache_dir: Option<PathBuf>,
     pub cache_key: Option<String>,
     pub require_cache_write: bool,
@@ -255,6 +256,7 @@ pub(crate) struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
+            profile: None,
             cache_dir: None,
             cache_key: None,
             require_cache_write: false,
@@ -334,6 +336,7 @@ fn cache_key(
     ocr_provider: Option<(&str, &str)>,
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
+    semantic_profile: Option<DetectionProfile>,
 ) -> Result<String> {
     let value = json!({
         "source_sha256": source_hash,
@@ -349,6 +352,7 @@ fn cache_key(
         "layout_provider_identity": ppdoc_identity,
         "layout_source_sha256": ppdoc_identity.map(|_| env!("LEGAL_PDF_LAYOUT_SHA256")),
         "ocr_pages": ocr_pages,
+        "profile": semantic_profile,
     });
     serialization_sha256(&value)
 }
@@ -358,10 +362,11 @@ fn derive_extracted(
     document_id: &str,
     source_hash: &str,
     cache_root: Option<&Path>,
+    semantic_profile: Option<DetectionProfile>,
 ) -> Result<StructureOutput> {
     // The readers' state, named for their input pages and their code.
     let reader_cache = cache_root.and_then(|root| {
-        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), &extracted.pages, &extracted.separators)).ok()?;
+        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), semantic_profile, &extracted.pages, &extracted.separators)).ok()?;
         Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
     });
     let mut derived = legal_pdf_structure::derive_cached(
@@ -371,9 +376,13 @@ fn derive_extracted(
         StructureIdentity {
             document_id: document_id.to_owned(),
             source_sha256: source_hash.to_owned(),
+            profile: semantic_profile,
         },
         reader_cache.as_deref(),
     )?;
+    derived.structure_graph.native_navigation = crate::structure_engine::navigation_witnesses(&extracted.outline);
+    legal_pdf_core::model::attach_structure_tags(&mut derived.structure_graph, &extracted.pages, &extracted.metadata.structure_tags);
+    derived.structure_graph.refresh_revision()?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
 }
@@ -390,7 +399,7 @@ fn build_document(
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
-    let derived = derive_extracted(&mut extracted, &document_id, source_hash, None)?;
+    let derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), serde_json::to_value(extracted.metadata)?);
     let mut provenance = Map::new();
@@ -609,6 +618,7 @@ pub(crate) fn parse_pdf(
             .map(|provider| (provider.0.as_str(), provider.1.as_str())),
         ppdoc_identity.as_deref(),
         options.ocr_pages.as_deref(),
+        options.profile,
     )?;
     if let Some(root) = &cache_root {
         if let Some(cached) = cached_document(root, &key, &source_hash) {
@@ -731,7 +741,6 @@ pub(crate) fn parse_pdf(
     for page in &mut extracted.pages {
         legal_pdf_core::model::mark_rule_underlines(page);
     }
-    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
         options
@@ -750,8 +759,9 @@ pub(crate) fn parse_pdf(
             })?);
     }
     let document_id = format!("doc-{}", &source_hash[..20]);
+    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, &document_id, &source_hash, cache_root.as_deref())
+        derive_extracted(&mut extracted, &document_id, &source_hash, cache_root.as_deref(), options.profile)
     })?;
     profile::measure("build.validate_document", || {
         validate_pdf_components(
@@ -1095,6 +1105,7 @@ pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) ->
         cached.extraction.pages,
         cached.extraction.separators,
         &cached.extraction.outline,
+        None,
     )
     .map_err(|error| Error::Message(error.message))?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());

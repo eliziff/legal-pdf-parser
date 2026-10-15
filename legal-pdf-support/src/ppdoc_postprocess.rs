@@ -1148,6 +1148,7 @@ mod tests {
             detached_references: Vec::new(),
             exclude_from_body: false,
             suppress_footnote_label: false,
+            paragraph_label_candidate: false,
             note_region_mode: String::new(),
             region_id: String::new(),
             region_type: "unknown".to_owned(),

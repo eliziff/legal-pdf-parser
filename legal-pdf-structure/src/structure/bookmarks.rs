@@ -506,6 +506,16 @@ pub(super) fn reconcile_bookmarks(
         return false;
     }
 
+    // Similar headings may guide discovery, but only a title actually present in the body
+    // supplies a confirmed navigation relationship to the attachment predictor.
+    let confirmed = anchors.iter().zip(&entries).map(|(anchor, entry)| {
+        anchor.as_ref().is_some_and(|anchor| {
+            let page = &pages[anchor.page_slot];
+            let found = anchor.lines.iter().map(|&slot| normalize_title(&page.lines[slot].text)).collect::<String>();
+            same_title(&found, &normalize_title(&entry.title), false)
+        })
+    }).collect::<Vec<_>>();
+
     // An anchored title is a heading of its own. Within a heading it cuts only where a numbered
     // heading starts; otherwise it takes the whole heading.
     let levels = &primitives.heading_levels;
@@ -737,6 +747,16 @@ pub(super) fn reconcile_bookmarks(
                     .and_then(|unit| levels_out.get(unit).copied().flatten())
             });
         levels_out.insert(unit, Some(parent.map_or(1, |level| level + 1)));
+    }
+
+    for (index, anchor) in anchors.iter().enumerate().filter(|(index, _)| confirmed[*index]) {
+        let Some(anchor) = anchor else { continue; };
+        let parent = parents[index].iter().rev().find(|&&parent| confirmed[parent])
+            .and_then(|&parent| anchors[parent].as_ref())
+            .map(|parent| pages[parent.page_slot].lines[parent.lines[0]].id.clone());
+        for &slot in &anchor.lines {
+            primitives.navigation_parents.insert(pages[anchor.page_slot].lines[slot].id.clone(), parent.clone());
+        }
     }
 
     build_regions(pages);

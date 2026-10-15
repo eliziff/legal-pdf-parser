@@ -266,6 +266,11 @@ impl<'a> DocumentLines<'a> {
         line.region_type == "body" && !line.exclude_from_body
     }
 
+    fn paragraph_label(&self, (page, line): LineRef) -> bool {
+        let line = &self.pages[page].lines[line];
+        line.paragraph_label_candidate && bare_label(&line.text).is_some()
+    }
+
     fn y_ratio(&self, (page, line): LineRef) -> f64 {
         let page = &self.pages[page];
         let line = &page.lines[line];
@@ -800,6 +805,7 @@ fn font_role_strands(
             .map(|&line| {
                 !lines.text(line).is_empty()
                     && lines.mutable(line)
+                    && !lines.paragraph_label(line)
                     && below(line)
                     && (lines.note_font(line) || bare_label(lines.text(line)).is_some())
             })
@@ -811,6 +817,7 @@ fn font_role_strands(
                 member
                     || (!lines.text(line).is_empty()
                         && lines.mutable(line)
+                        && !lines.paragraph_label(line)
                         && below(line)
                         && marker_match(&folded(lines.text(line))))
             })

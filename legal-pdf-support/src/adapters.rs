@@ -1,4 +1,4 @@
-use legal_pdf_core::model::{Footnote, LegalDocument, Paragraph};
+use legal_pdf_core::model::{DocumentStructure, Footnote, LegalDocument, Paragraph, SourceTextSpan};
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::ScalarText;
 use serde_json::{json, Map, Value};
@@ -73,13 +73,17 @@ pub fn to_alr_payload(document: &LegalDocument) -> Value {
 }
 
 pub fn to_toa_text_units(document: &LegalDocument) -> Result<Vec<Value>> {
-    to_toa_text_units_from_parts(&document.paragraphs, &document.footnotes)
+    to_toa_text_units_from_parts(&document.paragraphs, &document.footnotes, &document.structure_graph)
 }
 
 pub(crate) fn to_toa_text_units_from_parts(
     paragraphs: &[Paragraph],
     footnotes: &[Footnote],
+    structure: &DocumentStructure,
 ) -> Result<Vec<Value>> {
+    let source_fragments: HashMap<_, _> = structure.source_fragments.iter().map(|fragment| (fragment.id.as_str(), fragment)).collect();
+    let mut source_nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id.as_str(), node.id.as_str())).collect();
+    source_nodes.extend(structure.notes.iter().filter_map(|note| note.node_id.as_deref().map(|id| (note.id.as_str(),id))));
     let internal_by_pair: HashMap<&str, usize> = footnotes
         .iter()
         .enumerate()
@@ -92,6 +96,7 @@ pub(crate) fn to_toa_text_units_from_parts(
         anchors.sort_by_key(|anchor| anchor.offset);
         let mut rendered = String::new();
         let mut references = Vec::new();
+        let mut source_spans = Vec::new();
         let mut cursor = 0;
         let mut clean_length = 0;
         for anchor in anchors {
@@ -111,6 +116,7 @@ pub(crate) fn to_toa_text_units_from_parts(
                 Error::Message(format!("Invalid footnote anchor in {}", paragraph.id))
             })?;
             let segment = &paragraph.text[byte_cursor..byte_start];
+            source_spans.extend(paragraph.source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),coordinates.utf16(start),clean_length)));
             rendered.push_str(segment);
             clean_length += legal_structure_model::utf16_len(segment);
             let internal = internal_by_pair.get(pair_id.as_str()).ok_or_else(|| {
@@ -125,9 +131,11 @@ pub(crate) fn to_toa_text_units_from_parts(
         let byte_cursor = coordinates.byte_at_scalar(cursor).ok_or_else(|| {
             Error::Message(format!("Invalid footnote anchor in {}", paragraph.id))
         })?;
+        source_spans.extend(paragraph.source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),legal_structure_model::utf16_len(&paragraph.text),clean_length)));
         rendered.push_str(&paragraph.text[byte_cursor..]);
         units.push(json!({
             "key": format!("body:{ordinal}"),
+            "source": authority_source(structure, &source_fragments, &source_nodes, &paragraph.id, &paragraph.line_ids, &source_spans),
             "kind": "body",
             "ordinal": ordinal,
             "footnote_id": Value::Null,
@@ -152,8 +160,11 @@ pub(crate) fn to_toa_text_units_from_parts(
         } else {
             format!("{} {}", note.label, note.body)
         };
+        let prefix = legal_structure_model::utf16_len(&text) - legal_structure_model::utf16_len(&note.body);
+        let source_spans = note.source_spans.iter().map(|span| {let mut span=span.clone();span.start+=prefix;span.end+=prefix;span}).collect::<Vec<_>>();
         json!({
             "key": format!("footnote:{ordinal}"),
+            "source": authority_source(structure, &source_fragments, &source_nodes, &note.pair_id, &note.body_line_ids, &source_spans),
             "kind": "footnote",
             "ordinal": ordinal,
             "footnote_id": ordinal,
@@ -165,7 +176,46 @@ pub(crate) fn to_toa_text_units_from_parts(
         })
     }));
     join_split_words(&mut units);
+    let source_text=ScalarText::new(&structure.text);
+    for unit in &mut units {
+        let text=ScalarText::new(unit["text"].as_str().unwrap());
+        let mappings=unit["source"]["mappings"].as_array().unwrap();
+        let mut ranges=Vec::new();
+        for mapping in mappings {
+            let start=mapping["start"].as_u64().unwrap() as usize;
+            let end=mapping["end"].as_u64().unwrap() as usize;
+            let source_start=mapping["sourceStart"].as_u64().unwrap() as usize;
+            let source_end=mapping["sourceEnd"].as_u64().unwrap() as usize;
+            if end-start != source_end-source_start || text.slice_utf16(start..end).is_none()
+                || text.slice_utf16(start..end) != source_text.slice_utf16(source_start..source_end) {
+                return Err(Error::Message("Authority text source mapping differs from physical source".into()));
+            }
+            ranges.push(json!({"start":source_start,"end":source_end}));
+        }
+        unit["source"]["ranges"]=Value::Array(ranges);
+    }
     Ok(units)
+}
+
+fn authority_source(structure: &DocumentStructure, fragments: &HashMap<&str, &legal_structure_model::SourceFragment>,
+    nodes: &HashMap<&str,&str>, id: &str, line_ids: &[String], spans: &[SourceTextSpan]) -> Value {
+    let node_ids=nodes.get(id).into_iter().copied().collect::<Vec<_>>();
+    let mappings = spans.iter().filter_map(|span| {
+        let fragment = fragments.get(span.line_id.as_str())?;
+        (span.source_end <= fragment.range.end-fragment.range.start).then(|| json!({
+            "start":span.start,"end":span.end,"sourceStart":fragment.range.start+span.source_start,
+            "sourceEnd":fragment.range.start+span.source_end,"lineId":span.line_id}))
+    }).collect::<Vec<_>>();
+    json!({"documentId":structure.document_id,"textSha256":structure.text_sha256,
+        "coordinateSpace":"source_utf16","nodeIds":node_ids,"lineIds":line_ids,"ranges":[],"mappings":mappings})
+}
+
+fn retain_authority_mapping(mapping: &Value, start: usize, end: usize, removed: &[(usize,usize)]) -> Value {
+    let shift=removed.iter().map(|(at,length)| start.saturating_sub(*at).min(*length)).sum::<usize>();
+    let original=mapping["start"].as_u64().unwrap() as usize;
+    let source=mapping["sourceStart"].as_u64().unwrap() as usize;
+    json!({"start":start-shift,"end":end-shift,"sourceStart":source+start-original,
+        "sourceEnd":source+end-original,"lineId":mapping["lineId"]})
 }
 
 /// A word a hyphen splits where no compound is written ("Companies' Cr-editors Arrangement Act",
@@ -174,51 +224,43 @@ pub(crate) fn to_toa_text_units_from_parts(
 /// it; a compound whose second part opens with a capital or a digit ("Non-Renewable", "C-36"),
 /// or that the document never writes whole, keeps it. The note markers' offsets move with the text.
 fn join_split_words(units: &mut [Value]) {
-    let texts = units.iter().filter_map(|unit| unit["text"].as_str()).collect::<Vec<_>>();
-    let mut whole = HashMap::<String, usize>::new();
-    for word in texts.iter().flat_map(|text| text.split(|character: char| !character.is_alphabetic())) {
-        if !word.is_empty() { *whole.entry(word.to_lowercase()).or_default() += 1; }
-    }
-    for unit in units.iter_mut() {
-        let Some(text) = unit["text"].as_str() else { continue };
-        let characters = text.char_indices().collect::<Vec<_>>();
-        let mut removed = Vec::<(usize, usize)>::new(); // (utf16 offset, utf16 units removed)
-        let mut output = String::with_capacity(text.len());
-        let (mut copied, mut utf16, mut at) = (0usize, 0usize, 0usize);
-        while at < characters.len() {
-            let (byte, character) = characters[at];
-            if character != '-' || at == 0 || !characters[at - 1].1.is_alphabetic() { at += 1; continue; }
-            // The word's first part runs back to its start; the second opens after the hyphen
-            // and any line break.
-            let first = characters[..at].iter().rev().take_while(|(_, c)| c.is_alphabetic()).count();
-            let mut next = at + 1;
-            while next < characters.len() && matches!(characters[next].1, ' ' | '\n' | '\r') { next += 1; }
-            let gap = &characters[at + 1..next];
-            let broken = gap.is_empty() || gap.iter().any(|(_, c)| *c == '\n');
-            let second = characters[next..].iter().take_while(|(_, c)| c.is_alphabetic()).count();
-            if !broken || second < 2 || !characters[next].1.is_lowercase()
-                || at >= first + 1 && characters[at - first - 1].1 == '-' {
-                at += 1; continue;
-            }
-            let start_byte = characters[at - first].0;
-            let end_byte = characters.get(next + second).map_or(text.len(), |(b, _)| *b);
-            let joined = text[start_byte..end_byte].chars().filter(|c| c.is_alphabetic()).collect::<String>().to_lowercase();
-            if whole.get(&joined).copied().unwrap_or(0) == 0 { at += 1; continue; }
-            let cut_end = characters[next].0;
-            output.push_str(&text[copied..byte]);
-            utf16 += text[copied..byte].encode_utf16().count();
-            let cut = text[byte..cut_end].encode_utf16().count();
-            removed.push((utf16, cut));
-            copied = cut_end;
-            at = next;
+    let texts=units.iter().map(|unit|unit["text"].as_str().unwrap()).collect::<Vec<_>>();
+    let edits=legal_pdf_core::text_normalization::split_word_deletions(&texts);
+    for (unit, edits) in units.iter_mut().zip(edits) {
+        if edits.is_empty() { continue; }
+        let text=unit["text"].as_str().unwrap();
+        let coordinates=ScalarText::new(text);
+        let removed=edits.iter().map(|range|(range.start,range.end-range.start)).collect::<Vec<_>>();
+        let mut output=String::with_capacity(text.len());
+        let mut cursor=0;
+        for range in edits {
+            output.push_str(coordinates.slice_utf16(cursor..range.start).unwrap());
+            cursor=range.end;
         }
-        if removed.is_empty() { continue; }
-        output.push_str(&text[copied..]);
+        output.push_str(coordinates.slice_utf16(cursor..legal_structure_model::utf16_len(text)).unwrap());
         if let Some(references) = unit["footnote_refs"].as_array_mut() {
             for reference in references.iter_mut() {
                 let Some(offset) = reference.get(1).and_then(Value::as_u64) else { continue };
-                let shift = removed.iter().filter(|(at, _)| (*at as u64) < offset).map(|(_, cut)| *cut as u64).sum::<u64>();
+                let shift = removed.iter().map(|(at, cut)| offset.saturating_sub(*at as u64).min(*cut as u64)).sum::<u64>();
                 reference[1] = json!(offset - shift);
+            }
+        }
+        if let Some(source) = unit.get_mut("source").and_then(Value::as_object_mut) {
+            if let Some(mappings) = source.get("mappings").and_then(Value::as_array) {
+                let mut retained = Vec::new();
+                for mapping in mappings {
+                    let start=mapping["start"].as_u64().unwrap() as usize;
+                    let end=mapping["end"].as_u64().unwrap() as usize;
+                    let mut cursor=start;
+                    for &(cut, length) in &removed {
+                        if cut >= end { break; }
+                        if cut+length <= cursor { continue; }
+                        if cursor < cut { retained.push(retain_authority_mapping(mapping,cursor,cut,&removed)); }
+                        cursor=cursor.max(cut+length);
+                    }
+                    if cursor < end { retained.push(retain_authority_mapping(mapping,cursor,end,&removed)); }
+                }
+                source.insert("mappings".into(),Value::Array(retained));
             }
         }
         unit["text"] = Value::String(output);

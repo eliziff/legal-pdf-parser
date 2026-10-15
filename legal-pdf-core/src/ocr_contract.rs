@@ -14,6 +14,9 @@ pub struct OcrLine {
     pub text: String,
     pub bbox: [f64; 4],
     pub confidence: f64,
+    /// Recognized from ink omitted by the page segmenter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovered: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub baseline: Vec<[f64; 2]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -26,6 +29,10 @@ pub struct OcrLine {
     pub region_type: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub block_index: usize,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn unknown_region() -> String {

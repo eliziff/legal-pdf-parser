@@ -74,7 +74,7 @@ pub fn compositions() -> &'static Compositions {
         // What the compositions decide rests on the lexicon's words and the outline prior too.
         let sha256 = format!(
             "{:x}",
-            Sha256::digest(format!("{text}\n{}\n{}\n{}", crate::lexicon::lexicon().text, crate::outline::prior().0, crate::model::models_text()).as_bytes())
+            Sha256::digest(format!("{text}\n{}\n{}\n{}", crate::lexicon::lexicon().text, crate::outline::PARENT_SCHEMA, crate::model::models_text()).as_bytes())
         );
         let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
         let parsed: HashMap<String, Sets> = value

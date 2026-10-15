@@ -1,199 +1,172 @@
-# Multimodal structure composer candidate
+# Source-anchored multimodal structure producer
 
-## Objective
+Status: implementation candidate, not an accepted corpus result. The composer uses
+the shared source-span composition contract. Complete runtime calls are wired to
+the shared Rust document projector. The consolidated native build and Python/JavaScript
+syntax checks passed on 2026-10-13; behavioral and performance acceptance remain
+separate gates.
 
-Build one provider-neutral structure-composition operation for two callers:
+## Objective and ownership
 
-1. the PDF parser's multimodal repair/salvage pathway; and
-2. a corpus worker that produces corrected manuscripts and structural gold for
-   parser and witness-stack evaluation.
+Provide one provider-neutral structural producer for runtime quality mode and
+independent corpus authoring. Both callers use the same literal annotation
+operations. The slower producer owns its resulting structure; it may start from
+fast-parser proposals but can reconsider every source block. It is not restricted
+to repairing an already selected heading tree.
 
-The composer improves the parser's existing structure. It does not ask a model to
-recreate source text, geometry, IDs or every unchanged decision.
+The shared Rust structure owner supplies semantic types, literal edit application,
+validation and derived structure. The PDF parser supplies extraction/OCR evidence,
+geometry and page images. The embedding caller supplies provider/model selection,
+image transport, metering, caching and receipts. Gold scheduling, source correction
+and publication remain with the existing gold runner. No additional service or UI
+is required by this contract.
 
-```text
-native PDF/OCR structure + witnesses + full-page images
-                         |
-                         v
-          cheap module selection and bounded request
-                         |
-                         v
-              provider-owned model dispatch
-                         |
-                         v
-       local validation + sparse materialized corrections
-                         |
-              +----------+-----------+
-              |                      |
-              v                      v
-      parser repair candidate   manuscript + structure gold
-```
+The owning design is the workspace's [PDF structure gold roadmap](../../../docs/roadmap/pdf-structure-gold.md).
+The gold runner's [plan](../../../experiments/legal-structure-gold/PLAN.md) owns the
+corpus workflow. These workspace links address sibling first-party owners.
+Court-record enrichment and the form/authority catalogue retain their separate
+owners and taxonomies.
 
-The engine owns evidence preparation, request grammar, source-identity validation,
-composition and replay. The embedding caller owns provider/model choice, image
-transport, metering, caching and receipts.
+## Current implementation
 
-## Current candidate
+The provider-neutral operations in composer.py are:
 
-`composer.py` currently provides four provider-neutral operations:
+- prepare: align native source fragments with page text, geometry and typography,
+  and collect every target block plus addressable enclosing context;
+- prompt and schema: describe sparse source-anchored decisions and enabled modules;
+- apply: decode response aliases, check baseline identity and pass literal edits
+  to the shared Rust applicator;
+- compose: call the embedding dispatch function, retry invalid responses or
+  requested absent modules, and stop after three bounded attempts.
 
-- `prepare`: aligns immutable native line IDs to text, geometry and typography;
-- `prompt` and `schema`: produce a compact bounded correction request;
-- `apply`: validate and materialize sparse corrections without altering the baseline;
-- `compose`: repeat a request when validation fails or an absent module is requested.
+The embedding caller passes the existing native preparation and application
+operations and a required project_structure callback to compose. Complete calls
+project the literal request through the shared Rust owner and return its typed
+structure, evidence, trace and composition state. Baseline node identities identify
+which existing structural nodes are superseded. Native preparation supplies the
+annotation facts and the exact retained-node selection as well as editable blocks;
+unresolved grids remain native evidence. Source annotation continuation and
+quotation-scope views use the shared resolver without requiring a final manuscript.
+Original coordinate-tagged witnesses stay separate from current annotation spans.
+Applied composition also carries surviving native inventory across partial calls.
+Explicit removal follows native parent edges; ambiguous correction spans lose
+addressability while their original evidence remains.
+Python prepares evidence and
+decodes the author response; it does not supply a competing hierarchy classifier.
+The lower-level apply operation accepts the projector optionally for existing gold
+callers, whose final publication remains a separate assembly step.
 
-Page repair receives the target plus r=1 full-page images. The gold runner extends
-the correction grammar with precise text spans, transcription edits, continuations
-and resumptions. One serial gold pass edits a single target page with its r=1
-neighbours and all five annotation contracts. Compact inherited parent IDs carry
-enclosing structure. Code assembles and validates the document before export.
-Runtime parser integration remains separate work.
+### Source and structural facts
 
-The layers are deliberately independent:
+Block references use Unicode-scalar spans inside identified physical source
+fragments. Multiple structural starts may share a line. Native UTF-16 source
+coordinates are converted explicitly at this boundary. Replacement membership
+must cover the affected source characters exactly once; unchanged source remains
+available with its extraction witnesses.
 
-```text
-source line
-  +-- block role: prose / heading / list item / instruction / furniture
-  +-- table membership
-  +-- form-field role
-  +-- note or quotation relationship
-  `-- constituent-document membership
-```
+The eight primary roles are text, heading, caption, instruction, headnote,
+marginal_note, furniture and page_label. Lists retain marker, locator and nesting
+attributes rather than becoming a primary role. A document title is an anchored
+document annotation, not automatically a section heading. Tables, fields, notes,
+quotations and navigation remain independent, potentially overlapping annotation
+layers. Blank and merged cells and exact field/note components survive composition.
 
-This permits, for example, a form field inside a table cell without forcing either
-classification to replace the other.
+Every block supplies a parent source start or explicit null for its scope root.
+Levels and exact extents are derived. Document, quotation and independent reading
+stream ownership keep local locators and numbering separate. Constituent document
+identity is distinct from its source opening: existing annotation aliases or fresh
+response-local document IDs address parents and resumptions, including declarations
+sharing an opening. Do not infer containment from a mandatory single packet root.
 
-## Measured results so far
+Physical source order, logical joins and object continuations are distinct facts.
+Literal separators and manuscript normalization preserve printed source text;
+normalization does not rewrite the extraction witness. A non-text continuation
+need not invent a textual separator. Text seams must be resolved before a complete
+manuscript can be exported.
 
-The current experiment used the three-page High Court of Australia affidavit form
-packet with Luna/high, one Below Normal worker, schema enforcement and complete page
-images.
+### Bounded work and complete coverage
 
-### Target-page composition
+Targets are contiguous physical pages with full-page evidence. The producer
+receives all target blocks, including unmarked text, plus document-wide heading,
+navigation, style and scope context. Enclosing parents, constituent identities,
+reading-stream roots and continuation endpoints remain addressable outside the
+target chunk. Sparse omission preserves existing facts; it does not exclude a block
+from structural reconsideration.
 
-The index page result:
+The gold runner separates source correction from document structure. Source
+correction handles transcription, missing fragments, physical grouping and reading
+order. Structural authoring works on the corrected source; discovered source
+defects return to the source-correction responsibility. Short documents are supplied
+whole; long documents use contiguous chunks with carried enclosing context. A
+separate filtered hierarchy author is retired.
 
-- preserved all 71 document source lines and source text;
-- demoted `DESCRIPTION` from a false section heading;
-- recovered the visible 5-row by 4-column table;
-- represented all 8 visibly blank cells;
-- retained form-field annotations inside populated table cells; and
-- survived a no-op replay without changing the materialized composition.
+An explicit through boundary supports partial assembly. Inherited text seams
+whose target lies beyond that boundary may remain pending. When their target is
+authored, the response must resolve the separator or remove the asserted link.
+Partial products contain composition state rather than a final typed document;
+final assembly rejects unresolved text seams. The default runtime composition
+requests complete assembly through the shared projector.
 
-The first response copied source text into correction records. Local validation
-rejected it, and the second response obeyed the metadata-only contract.
+Modules can be omitted for a bounded runtime request when the caller chooses.
+Only absent modules may be requested in a retry, and a module request carries no
+edits. Gold structural authoring retains complete layer coverage. Source-derived
+gold remains independent of parser scores.
 
-### Full-document composition
+## Historical measurements
 
-The full-document result:
+The earlier repair experiment used a three-page affidavit/form packet with
+Luna/high, one Below Normal worker, schema enforcement and full-page images. These
+measurements describe the old candidate and response contract. They do not validate
+the current eight-role, source-span or shared-projection implementation.
 
-- preserved all 71 source lines and source text;
-- recovered the same 5-by-4 table and 8 blank cells;
-- identified starts for the affidavit, index of exhibits and exhibit certificate;
-- proposed 18 block corrections and 34 annotations.
+The target-page result preserved all 71 source lines and source text, demoted a
+false section heading, recovered a five-row by four-column table and eight blank
+cells, retained field annotations inside populated cells, and survived the recorded
+no-op replay. Its first response copied source text into correction records; local
+validation rejected that response and a second response obeyed the metadata-only
+contract.
 
-It is not an accepted reference result. Semantic review found:
+The full-document result preserved those 71 lines, recovered the same table and
+blank cells, identified three constituent starts, and proposed 18 block corrections
+and 34 annotations. It was not accepted as reference gold. Review found an incorrect
+three-root decomposition, form instructions misclassified as an author note and
+linked to an unrelated heading, and field annotations more exhaustive than the
+repair use case required.
 
-- all three constituents were returned as roots rather than one packet hierarchy;
-- the printed form instructions headed `Notes` were incorrectly classified as an
-  author note and linked to the `INDEX OF EXHIBITS` heading; and
-- form-field annotation remains more exhaustive than a sparse parser-repair call
-  usually needs.
+That historical experiment added a one-root restriction. The current representation
+instead records explicit constituent identity, supplied parents and scope ownership;
+the old restriction is not evidence that every legal packet has one authored root.
+The observed note and constituent errors still need independent current-candidate
+proof. No historical figure here establishes their resolution.
 
-The document validator now requires exactly one root and earlier enclosing parents
-for later constituent documents. The note error remains an observed corpus failure.
+## Remaining work and evidence gates
 
-## Remaining implementation
+1. Establish behavior of the shared Rust projector and its runtime/gold callers
+   when behavioral runs are authorized. Compilation and source review have passed;
+   they do not establish preservation of source/rendered membership, normalization,
+   ownership and unrelated retained layers under real document inputs.
+2. Preserve retained native facts and structure-only metadata through canonical
+   gold packing and reopening. The current package omits that residue even though
+   the projector retains it; carried removal controls are not its factual payload.
+   Then complete independently justified structural authoring under the settled policy,
+   including the selected complete long documents. Keep source defects and
+   unsupported source appearances explicit. Preserve original gold and receipts
+   until an authorized revision is ready; do not regenerate answers from parser
+   output.
+3. Freeze source/template families and duplicate-page membership before final model
+   selection. Keep historical exposure and unknown provenance visible. The root
+   roadmap owns corpus counts, split status and the 48-document expansion.
+4. When authorized, measure native and slower producers against the same independent
+   answers, including digitalborn and OCR modes, rare roles, document/quotation
+   ownership, exact continuations, tables, fields, notes and consumer source lookup.
+   Record model calls, tokens, latency and memory separately from fast-path costs.
+5. Demonstrate end-to-end source fidelity and consumer behavior with the actual
+   candidate implementation. Compilation alone does not establish structural
+   accuracy, browser behavior or performance acceptance.
 
-### 1. Finish the bounded correction contract
-
-- Preserve sparse semantics: omitted structure remains unchanged.
-- Keep basic block bodies empty; allow JSON bodies only for headings and enabled
-  annotation modules.
-- Reject duplicate annotations of the same kind at one anchor.
-- Validate note references against plausible marker-bearing source spans and reject
-  instruction blocks masquerading as notes.
-- Preserve heading promotion, demotion, level and parent corrections globally.
-- Retain exact source-ID partition and source-text identity after every replay.
-
-### 2. Compose witnesses before model dispatch
-
-Feed the existing parser result and its independent witnesses, including:
-
-- current blocks, heading grammar and diagnostics;
-- text, geometry, typography and page canvas;
-- reading order, columns, tables, forms, quotations and notes;
-- printed and physical page-number changes;
-- lexical and typographic discontinuities; and
-- page-size, orientation and margin changes.
-
-Parser repair can use cheap evidence to omit irrelevant response modules. A loaded module is used
-directly; only absent modules may be requested, and a request repeats the same
-evidence with the expanded grammar.
-
-### 3. Complete constituent-document composition
-
-Represent one root plus nested/sibling constituent documents, each with:
-
-- type and source-anchored start;
-- enclosing parent;
-- mechanically derived extent;
-- evidence-backed facets such as title, court, parties, author, date and procedural
-  role; and
-- typed relationships such as attachment, exhibit, schedule or continuation.
-
-Document boundaries must be supported by a chorus of witnesses. Printed-page-number
-restart alone is insufficient. Template placeholders must never create hypothetical
-parties, dates or attachments.
-
-### 4. Connect the two callers
-
-Parser repair:
-
-- route only diagnosed or witness-conflicted scopes by default;
-- apply validated sparse corrections to the parser's structure operation;
-- preserve provider selection at the application boundary; and
-- retain the existing cache, budget and provenance requirements.
-
-Gold generation:
-
-- inspect every page once in an r=1 window and assemble document relationships;
-- constrain correction records and their payloads through Structured Outputs;
-- retain the baseline, final gold with replayable corrections, evidence hashes,
-  prompt/schema hashes and provider receipt;
-- assemble the corrected manuscript and all source-anchored annotation layers;
-- retain digitalborn/OCR settings and simple run provenance; and
-- export deterministic replay and comparison inputs for the witness stack.
-
-### 5. Corpus iteration gates
-
-Do not self-regenerate an expected baseline. Measure against observed corpus failures
-and independently reviewed references.
-
-1. Re-run the affidavit packet after the one-root and note fixes.
-2. Exercise several monodocument profiles: judgments, motions, orders, affidavits,
-   journal articles without paragraph numbering, and form-heavy filings.
-3. Exercise composite records: motion records, exhibit packets, appendices and
-   multi-order bundles.
-4. Compare native baseline, sparse patch and materialized candidate for exact source
-   preservation and reviewed structural correctness.
-5. Expand to the 750 born-digital corpus with one worker only after focused failures
-   stop changing the contract.
-6. Add OCR PDFs when their extracted outputs are available, keeping OCR quality and
-   structural correctness as separate measurements.
-7. Gate any parser-path replacement on the exact parser/structure/Inspector/Beaver
-   combination that produced the accepted corpus result.
-
-## Acceptance criteria
-
-The candidate may replace the current multimodal salvage path only when:
-
-- source identity, text and exact line coverage are mechanically guaranteed;
-- unchanged native structure survives replay byte-for-byte at the composition layer;
-- reviewed table, form, note, quotation, heading and reading-order cases improve over
-  the native baseline without profile regressions;
-- full-document composition correctly decomposes reviewed composite records;
-- the same operation produces reusable structure gold without a parallel
-  annotation schema; and
-- provider/runtime configuration remains outside the structure engine.
-
+The active user instruction prohibits writing or running tests, evaluations,
+benchmarks and acceptance runs. No new model dispatch or private-document
+transmission is authorized by this document. Consequently the behavioral and
+performance gates remain unproven; the historical runs above are not substitutes.
+Do not introduce a release/pin gate, mandatory model cascade or separate hierarchy
+repair stage to satisfy them.

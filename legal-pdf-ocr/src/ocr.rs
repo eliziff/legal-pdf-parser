@@ -626,6 +626,7 @@ pub(crate) fn tsv_lines(
                 })
                 .collect();
             Some(OcrLine {
+                recovered: false,
                 text,
                 bbox,
                 confidence: if confidence_count == 0 {

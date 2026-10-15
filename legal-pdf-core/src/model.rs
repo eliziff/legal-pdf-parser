@@ -1,5 +1,5 @@
 pub use legal_structure_model::{
-    Derivation, DocumentStructure, NodeKind, ScalarRange, StructureNode,
+    Derivation, DocumentStructure, PdfStructureTagWitness, NodeKind, NotePairSupportV2, ScalarRange, StructureNode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -54,6 +54,10 @@ pub fn underlines(word: [f64; 4], line_height: f64, start: f64, end: f64, at: f6
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcid: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_role: Option<String>,
     pub id: String,
     pub text: String,
     pub bbox: [f64; 4],
@@ -81,6 +85,25 @@ pub struct DetachedReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OcrMarkerEvidence {
+    /// A physical association only; this does not classify a paragraph or note.
+    pub body_line_id: Option<String>,
+    pub sequence_line_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OcrEvidence {
+    pub confidence: f64,
+    pub recovered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundary: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<OcrMarkerEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     pub id: String,
     pub page_index: usize,
@@ -96,10 +119,15 @@ pub struct Line {
     pub words: Vec<Word>,
     #[serde(default)]
     pub detached_references: Vec<DetachedReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<OcrEvidence>,
     #[serde(default)]
     pub exclude_from_body: bool,
     #[serde(default)]
     pub suppress_footnote_label: bool,
+    /// A competing paragraph-layout witness; pairing may overturn it.
+    #[serde(default)]
+    pub paragraph_label_candidate: bool,
     #[serde(default)]
     pub note_region_mode: String,
     #[serde(default)]
@@ -108,6 +136,38 @@ pub struct Line {
     pub region_type: String,
     #[serde(default = "native_source")]
     pub source: String,
+}
+
+/// Align actual marked-content tags only through retained source spans and the graph source index.
+pub fn attach_structure_tags(graph: &mut DocumentStructure, pages: &[Page], native: &[PdfStructureTagWitness]) {
+    let mut tags = std::collections::BTreeMap::new();
+    for tag in native {
+        let mut witness = tag.clone(); witness.ranges.clear(); witness.line_ids.clear();
+        tags.insert((tag.page_index, tag.mcid, tag.role.clone()), witness);
+    }
+    let fragments: HashMap<_, _> = graph.source_fragments.iter().map(|fragment|
+        ((fragment.page_index, fragment.id.as_str()), fragment.range)).collect();
+    let source = legal_structure_model::ScalarText::new(&graph.text);
+    for page in pages {
+        for line in &page.lines {
+            let coordinates = legal_structure_model::ScalarText::new(&line.text);
+            for span in &line.spans {
+                let (Some(mcid), Some(role)) = (span.mcid, span.structure_role.as_ref()) else { continue; };
+                let witness = tags.entry((page.index, mcid, role.clone())).or_insert_with(|| PdfStructureTagWitness {
+                    page_index: page.index, mcid, role: role.clone(), ranges: Vec::new(), line_ids: Vec::new(),
+                });
+                let Some(fragment) = fragments.get(&(page.index, line.id.as_str())) else { continue; };
+                if source.slice_utf16(fragment.start..fragment.end) != Some(line.text.as_str())
+                    || coordinates.slice(span.start..span.end) != Some(span.text.as_str()) { continue; }
+                let range = ScalarRange { start: fragment.start + coordinates.utf16(span.start),
+                    end: fragment.start + coordinates.utf16(span.end) };
+                if range.start >= range.end { continue; }
+                witness.ranges.push(range);
+                if witness.line_ids.last() != Some(&line.id) { witness.line_ids.push(line.id.clone()); }
+            }
+        }
+    }
+    graph.structure_tags = tags.into_values().collect();
 }
 
 fn unknown_region() -> String {
@@ -161,8 +221,32 @@ pub struct ParagraphAnchor {
     pub offset: usize,
 }
 
+/// An unchanged UTF-16 run in produced text, anchored to an original physical line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceTextSpan {
+    pub start: usize,
+    pub end: usize,
+    pub line_id: String,
+    pub source_start: usize,
+    pub source_end: usize,
+}
+
+impl SourceTextSpan {
+    /// Retain an exact input slice at a new output position. Insertions have no run.
+    pub fn retain(&self, start: usize, end: usize, output_start: usize) -> Option<Self> {
+        let left = self.start.max(start);
+        let right = self.end.min(end);
+        (left < right).then(|| Self { start: output_start + left - start,
+            end: output_start + right - start, line_id: self.line_id.clone(),
+            source_start: self.source_start + left - self.start,
+            source_end: self.source_start + right - self.start })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paragraph {
+    #[serde(default)]
+    pub source_spans: Vec<SourceTextSpan>,
     pub id: String,
     pub page_index: usize,
     pub region_type: String,
@@ -187,6 +271,8 @@ pub struct FootnoteCrossref {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Footnote {
+    #[serde(default)]
+    pub source_spans: Vec<SourceTextSpan>,
     pub pair_id: String,
     pub label: String,
     pub occurrence: usize,
@@ -267,6 +353,8 @@ pub struct PdfOutlineEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PdfExtractionMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structure_tags: Vec<PdfStructureTagWitness>,
     #[serde(default)]
     pub embedded_page_labels: Vec<Option<String>>,
     pub pages_needing_ocr: Vec<usize>,
@@ -340,6 +428,7 @@ pub struct SourceAnchor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotePairClaim {
     pub pair_id: String,
+    pub support: NotePairSupportV2,
     pub label: String,
     pub kind: NotePairKind,
     pub label_anchor: SourceAnchor,

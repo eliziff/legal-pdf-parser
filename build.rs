@@ -104,10 +104,13 @@ fn stage_inputs(root: &Path, kraken: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-support/Cargo.toml",
         "legal-pdf-support/src/lib.rs",
         "legal-pdf-support/src/projection.rs",
-        "legal-pdf-support/src/printed_paragraphs.rs",
+        "legal-pdf-support/src/adapters.rs",
+        "legal-pdf-core/src/text_normalization.rs",
         "legal-pdf-support/src/pairing_support.rs",
     ]);
     document.extend(crate_inputs(root, "structure"));
+    document.extend(crate_inputs(root, "headings"));
+    document.extend(crate_inputs(root, "tables"));
     document.extend(crate_inputs(root, "witnesses"));
     document.push(root.join("legal-pdf-witnesses/data"));
     document.extend(crate_inputs(root, "pairing"));
@@ -153,12 +156,18 @@ fn main() {
         (enabled("OCR"), "ocr"),
         (pdf, "pairing"),
         (pdf, "structure"),
+        (pdf, "headings"),
+        (pdf, "tables"),
+        (pdf, "witnesses"),
         (pdf, "support"),
     ] {
         if !active {
             continue;
         }
         inputs.extend(crate_inputs(&root, name));
+    }
+    if pdf {
+        inputs.push(root.join("legal-pdf-witnesses/data"));
     }
     let mut features: Vec<_> = env::vars_os()
         .filter_map(|(name, _)| {
@@ -206,10 +215,16 @@ fn main() {
         }
         // The structure stage's readers, before any composed decision: their own code alone, so a
         // change to compositions or to what follows them keeps their cached state.
-        let mut reader = vec![root.join("legal-pdf-core/src/model.rs"), root.join("legal-pdf-core/src/lib.rs")];
+        let mut reader = vec![
+            root.join("legal-pdf-core/src/model.rs"),
+            root.join("legal-pdf-core/src/lib.rs"),
+        ];
         for name in ["structure", "headings", "tables", "pairing", "support"] {
             reader.extend(crate_inputs(&root, name));
         }
-        println!("cargo:rustc-env=LEGAL_PDF_READER_SHA256={}", fingerprint(&root, &reader, &[]));
+        println!(
+            "cargo:rustc-env=LEGAL_PDF_READER_SHA256={}",
+            fingerprint(&root, &reader, &[])
+        );
     }
 }

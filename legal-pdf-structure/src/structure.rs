@@ -4,9 +4,9 @@ mod bookmarks;
 mod constituents;
 mod contents;
 mod graph;
-mod heading_sections;
 mod note_regions;
 mod quotations;
+mod numbered_paragraphs;
 
 use crate::layout::*;
 #[cfg(test)]
@@ -59,9 +59,6 @@ pub(super) struct LabelPrefix {
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct PdfPrimitiveEvidence {
-    /// The unit each counted line opens by the learned unit model, where one is in force.
-    #[serde(default)]
-    unit_kinds: HashMap<String, u8>,
     source_regions: Option<HashMap<String, String>>,
     contents_pages: HashSet<usize>,
     contents_line_ids: HashSet<String>,
@@ -70,6 +67,10 @@ struct PdfPrimitiveEvidence {
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
+    #[serde(default)]
+    navigation_parents: HashMap<String, Option<String>>,
+    #[serde(default)]
+    contents_entries: Vec<contents::ContentsEntry>,
     /// Tables drawn with rules, read from each page's painted rules.
     tables: Vec<legal_pdf_tables::PdfTable>,
 }
@@ -83,6 +84,7 @@ struct PdfPreparation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureIdentity {
+    pub profile: Option<legal_structure_model::DetectionProfile>,
     pub document_id: String,
     pub source_sha256: String,
 }
@@ -312,8 +314,8 @@ fn normalize_furniture(text: &str) -> String {
 /// states.", "of the united sta#es."). A reading joins the commonest repeated reading of
 /// the same edge within a fifth of its characters; position alignment then decides.
 fn join_recognized_readings(
-    candidates: &mut HashMap<(bool, String), Vec<FurnitureHit>>,
-    recognized: &HashSet<(bool, String)>,
+    candidates: &mut HashMap<(u8, String), Vec<FurnitureHit>>,
+    recognized: &HashSet<(u8, String)>,
 ) {
     fn distance(a: &[char], b: &[char]) -> usize {
         let mut row: Vec<usize> = (0..=b.len()).collect();
@@ -328,9 +330,9 @@ fn join_recognized_readings(
         }
         row[b.len()]
     }
-    let mut keys: Vec<&(bool, String)> = recognized.iter().collect();
+    let mut keys: Vec<&(u8, String)> = recognized.iter().collect();
     keys.sort_by(|a, b| candidates[*b].len().cmp(&candidates[*a].len()).then(a.cmp(b)));
-    let mut anchors: Vec<((bool, String), Vec<char>)> = Vec::new();
+    let mut anchors: Vec<((u8, String), Vec<char>)> = Vec::new();
     let mut moves = Vec::new();
     for key in keys {
         let chars: Vec<char> = key.1.chars().collect();
@@ -658,8 +660,25 @@ fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSet<(usize, u
     }
 }
 
+// Rotated running stamps live at the side edges, outside the header/footer bands.
+// Keep each edge separate so repeated body text cannot supply its witnesses.
+fn furniture_edge(line: &Line, width: f64, height: f64) -> Option<u8> {
+    let rotated = line.bbox[3] - line.bbox[1] > 3.0 * (line.bbox[2] - line.bbox[0]);
+    if rotated && line.bbox[2] < width * 0.08 {
+        Some(2)
+    } else if rotated && line.bbox[0] > width * 0.92 {
+        Some(3)
+    } else if line.bbox[1] < height * 0.12 {
+        Some(0)
+    } else if line.bbox[3] > height * 0.90 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 fn mark_repeated_furniture(pages: &mut [Page]) {
-    let mut candidates: HashMap<(bool, String), Vec<FurnitureHit>> = HashMap::new();
+    let mut candidates: HashMap<(u8, String), Vec<FurnitureHit>> = HashMap::new();
     let mut recognized = HashSet::new();
     legal_pdf_support::profile::measure("furniture.candidates", || {
         for (page_slot, page) in pages.iter().enumerate() {
@@ -667,16 +686,7 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 if page.width <= 0.0 || page.height <= 0.0 {
                     continue;
                 }
-                // A running head is in the band it starts in, a footer in the one it ends in,
-                // though its type reaches past the band's edge.
-                let edge = if line.bbox[1] < page.height * 0.12 {
-                    Some(true)
-                } else if line.bbox[3] > page.height * 0.90 {
-                    Some(false)
-                } else {
-                    None
-                };
-                let Some(top) = edge else {
+                let Some(top) = furniture_edge(line, page.width, page.height) else {
                     continue;
                 };
                 let normalized = normalize_furniture(&line.text);
@@ -791,7 +801,11 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                 let page_number_at_top = line.bbox[3] < page.height * 0.14;
                 let compact_note =
                     at_bottom && line_size < body_size * 0.90 && compact_note_line(&line.text);
-                if sequence_folios.contains(&(page_slot, index)) {
+                if repeated.contains(&(page_slot, index))
+                    && furniture_edge(line, page.width, page.height).is_some_and(|edge| edge >= 2)
+                {
+                    line.region_type = "header".to_owned();
+                } else if sequence_folios.contains(&(page_slot, index)) {
                     line.region_type = "footer".to_owned();
                 } else if let Some(&top) = edge_folios.get(&(page_slot, index)) {
                     line.region_type = if top { "header" } else { "footer" }.to_owned();
@@ -2422,6 +2436,7 @@ fn classify_pages_with_source(
     } else {
         0.0
     };
+    let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
     let mut expected_endnote: Option<u32> = None;
     let mut continuing_size: Option<f64> = None;
     let mut continuing_table = false;
@@ -2573,9 +2588,47 @@ fn classify_pages_with_source(
             table_band
                 .is_none_or(|(top, bottom)| *cut < top - tolerance || *cut > bottom + tolerance)
         });
+        // Alignment, typography and a paragraph sequence are positive evidence, not a veto
+        // on the note witnesses. Rules, references, source regions and note continuation win.
+        let paragraph_labels =
+            page.lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    paragraph_candidates.contains(&line.id)
+                        && !table_notes.contains(index)
+                        && !separator.is_some_and(|cut| line.bbox[1] >= cut - tolerance)
+                        && !has_prior_reference(page, line.text.trim(), line.bbox[1])
+                        && !evidence
+                            .source_regions
+                            .as_ref()
+                            .and_then(|regions| regions.get(&line.id))
+                            .is_some_and(|region| region.contains("note"))
+                        && !page.lines.iter().any(|heading| {
+                            heading.bbox[1] < line.bbox[1] && endnote_heading(&heading.text)
+                        })
+                        && !expected_endnote.is_some_and(|expected| {
+                            line.text
+                                .trim()
+                                .parse::<u32>()
+                                .is_ok_and(|number| number >= expected)
+                                && !page.lines.iter().any(|heading| {
+                                    heading.bbox[1] < line.bbox[1]
+                                        && structural_reset_heading(&heading.text)
+                                })
+                        })
+                })
+                .map(|(_, line)| line.id.clone())
+                .collect::<HashSet<_>>();
+        for line in &mut page.lines {
+            line.paragraph_label_candidate = paragraph_labels.contains(&line.id);
+        }
         let mut candidates = Vec::new();
         let mut suppress = Vec::new();
         for (index, line) in page.lines.iter().enumerate() {
+            if line.paragraph_label_candidate {
+                continue;
+            }
             if table_cells.contains(&index) {
                 suppress.push(index);
                 continue;
@@ -3048,6 +3101,9 @@ fn classify_pages_with_source(
                 line.note_region_mode.clear();
             } else if matches!(line.region_type.as_str(), "header" | "footer") {
                 continue;
+            } else if paragraph_labels.contains(&line.id) {
+                line.region_type = "body".to_owned();
+                line.note_region_mode.clear();
             } else if is_note {
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
@@ -3184,14 +3240,12 @@ fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn join_lines(lines: &[&Line]) -> (String, Vec<Option<(usize, usize)>>) {
+fn join_lines(lines: &[&Line]) -> (String, Vec<legal_pdf_core::model::SourceTextSpan>) {
     let mut text = String::new();
-    let mut offsets = Vec::with_capacity(lines.len());
-    let mut scalar_cursor = 0;
+    let mut source_spans: Vec<legal_pdf_core::model::SourceTextSpan> = Vec::new();
     for line in lines {
         let value = line.text.trim();
         if value.is_empty() {
-            offsets.push(None);
             continue;
         }
         if text
@@ -3201,17 +3255,19 @@ fn join_lines(lines: &[&Line]) -> (String, Vec<Option<(usize, usize)>>) {
             && value.chars().next().is_some_and(char::is_lowercase)
         {
             text.pop();
-            scalar_cursor -= 1;
+            if let Some(last) = source_spans.last_mut() { last.end -= 1; last.source_end -= 1; }
+            source_spans.retain(|span| span.start < span.end);
         } else if !text.is_empty() {
             text.push(' ');
-            scalar_cursor += 1;
         }
-        let start = scalar_cursor;
+        let output_start = legal_structure_model::utf16_len(&text);
+        let source_start = legal_structure_model::utf16_len(&line.text[..line.text.len() - line.text.trim_start().len()]);
+        let length = legal_structure_model::utf16_len(value);
+        source_spans.push(legal_pdf_core::model::SourceTextSpan {start:output_start,end:output_start+length,
+            line_id:line.id.clone(),source_start,source_end:source_start+length});
         text.push_str(value);
-        scalar_cursor += value.chars().count();
-        offsets.push(Some((start, scalar_cursor)));
     }
-    (text, offsets)
+    (text, source_spans)
 }
 
 fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
@@ -3253,36 +3309,39 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
     }
     let mut paragraphs = Vec::new();
     for (page, kind, lines) in regions {
-        let (text, line_offsets) = join_lines(&lines);
+        let (text, source_spans) = join_lines(&lines);
         if text.is_empty() {
             continue;
         }
         let mut events = Vec::new();
-        for (line, offset) in lines.iter().zip(&line_offsets) {
-            let Some((base, _)) = offset else {
-                continue;
-            };
+        let joined_coordinates = ScalarText::new(&text);
+        for line in &lines {
+            let coordinates = ScalarText::new(&line.text);
             for anchor in anchors.get(&line.id).into_iter().flatten() {
-                events.push((
-                    *base + anchor.start,
-                    *base + anchor.end,
-                    anchor.pair_id.as_str(),
-                    anchor.label.as_str(),
-                ));
+                let start = coordinates.utf16(anchor.start);
+                let end = coordinates.utf16(anchor.end);
+                let Some(run) = source_spans.iter().find(|span| span.line_id == line.id
+                    && span.source_start <= start && end <= span.source_end) else { continue; };
+                let start = joined_coordinates.scalar_at_utf16(run.start + start - run.source_start).unwrap();
+                let end = joined_coordinates.scalar_at_utf16(run.start + end - run.source_start).unwrap();
+                events.push((start,end,anchor.pair_id.as_str(),anchor.label.as_str()));
             }
         }
         events.sort_by_key(|event| (event.0, event.1));
-        let (rendered, output_anchors) = if events.is_empty() {
-            (text, Vec::new())
+        let (rendered, output_anchors, source_spans) = if events.is_empty() {
+            (text, Vec::new(), source_spans)
         } else {
             let coordinates = ScalarText::new(&text);
             let text_len = coordinates.len();
             let mut rendered = String::with_capacity(text.len());
             let mut output_anchors = Vec::with_capacity(events.len());
+            let mut retained_spans = Vec::new();
             let (mut cursor, mut rendered_len) = (0, 0);
             for (start, end, pair_id, label) in events {
                 let start = start.max(cursor).min(text_len);
                 let end = end.max(start).min(text_len);
+                let output_start = legal_structure_model::utf16_len(&rendered);
+                retained_spans.extend(source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),coordinates.utf16(start),output_start)));
                 rendered.push_str(coordinates.slice(cursor..start).unwrap());
                 rendered_len += start - cursor;
                 let offset = rendered_len;
@@ -3297,10 +3356,13 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
                 });
                 cursor = end;
             }
+            let output_start = legal_structure_model::utf16_len(&rendered);
+            retained_spans.extend(source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),coordinates.utf16(text_len),output_start)));
             rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
-            (rendered, output_anchors)
+            (rendered, output_anchors, retained_spans)
         };
         paragraphs.push(Paragraph {
+            source_spans,
             id: format!("para-{:06}", paragraphs.len() + 1),
             page_index: page.index,
             region_type: kind.to_owned(),
@@ -3715,7 +3777,7 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
     legal_pdf_support::profile::measure("prepare.detached_references", || {
         associate_detached_references(pages, separators)
     });
-    let mut diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
+    let diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
     });
     // Which lines are notes, settled over the whole document before any heading claims them.
@@ -3750,36 +3812,13 @@ fn prepare_composed(
     mut primitives: PdfPrimitiveEvidence,
     mut diagnostics: Vec<Diagnostic>,
 ) -> PdfPreparation {
-    legal_pdf_support::profile::measure("prepare.composed_headings", || {
-        // The composed heading decision over every line's witnesses, where one is in force.
-        let table = legal_pdf_witnesses::witnesses(
-            pages,
-            &legal_pdf_witnesses::Context {
-                table_cells: Some(&primitives.table_cell_line_ids),
-                contents: Some(&primitives.contents_line_ids),
-                translation: Some(&primitives.translation_line_ids),
-                layout: primitives.source_regions.as_ref(),
-                quoted: None,
-            },
-        );
-        legal_pdf_witnesses::dump(&table, "headings");
-        if let Some(kinds) = legal_pdf_witnesses::unit_kinds(&table) {
-            legal_pdf_headings::compose_headings(pages, &mut primitives.heading_levels, &|id| kinds.get(id).map(|kind| *kind == 1));
-            primitives.unit_kinds = kinds;
-        } else if let Some(decision) = legal_pdf_witnesses::compositions().decision("heading") {
-            let rows = table.by_id();
-            legal_pdf_headings::compose_headings(pages, &mut primitives.heading_levels, &|id| {
-                rows.get(id).and_then(|row| decision.holds(row))
-            });
-        }
-        build_regions(pages);
-    });
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks first; where they place nothing, its printed contents list.
+        let listed = contents::contents_outline(pages, &primitives);
         if !bookmarks::reconcile_bookmarks(pages, outline, &mut primitives) {
-            let listed = contents::contents_outline(pages, &primitives);
-            bookmarks::reconcile_bookmarks(pages, &listed, &mut primitives);
+            bookmarks::reconcile_bookmarks(pages, &listed.outline, &mut primitives);
         }
+        primitives.contents_entries = listed.entries;
     });
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
@@ -3807,7 +3846,7 @@ fn derive_prepared(
     // Note labels recognition cut short, restored before any text is indexed.
     legal_pdf_pairing::repair_label_dropouts(pages);
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
-        PdfResolutionInput::from_pages(pages, &prepared.primitives)
+        PdfResolutionInput::from_pages(pages, &prepared.primitives, identity.profile)
     });
     let pairing =
         legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, include_pairing_audit);
@@ -3832,15 +3871,25 @@ fn derive_prepared(
     });
     let mut nodes =
         native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
+    if let Some(proposals) = &resolution.span_proposals {
+        nodes.retain(|node| !matches!(node.kind, NodeKind::Heading | NodeKind::Prose));
+        let text = ScalarText::new(resolution.index.text());
+        for proposal in proposals {
+            let mut node = legal_structure_model::StructureNode::new(proposal.id.clone(),
+                if proposal.role == legal_structure_model::PrimaryRole::Heading { NodeKind::Heading } else { NodeKind::Prose },
+                proposal.range, "legalpdf.span-model.v1", legal_structure_model::Derivation::Model, None);
+            node.role = Some(proposal.role);
+            node.ranges.push(proposal.range);
+            node.line_ids = proposal.line_ids.clone();
+            node.page_indexes = proposal.page_indexes.clone();
+            if node.kind == NodeKind::Heading {
+                node.heading_range = Some(proposal.range);
+                node.label = text.slice(proposal.range.start..proposal.range.end).map(str::to_owned);
+            }
+            nodes.push(node);
+        }
+    }
     nodes.extend(constituents::constituents(&resolution.index, pages));
-    heading_sections::nest_headings(
-        &mut nodes,
-        &resolution.index,
-        &resolution.runs,
-        &resolution.evidence,
-        pages,
-        &prepared.primitives,
-    );
     // The engine's inputs, for the structure gold to replay engine changes without parsing
     // (legal-structure's replay example).
     if let Ok(path) = std::env::var("LEGALPDF_RESOLVER_DUMP") {
@@ -3856,8 +3905,24 @@ fn derive_prepared(
         });
         let _ = std::fs::write(&path, dump.to_string());
     }
-    let structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
-        legal_pdf_core::structure_analysis().resolve_structure_graph(
+    let quoted = resolution.quotation_scopes.keys().cloned().collect::<HashSet<_>>();
+    let mut table = legal_pdf_witnesses::source_witnesses(
+        pages,
+        &legal_pdf_witnesses::Context {
+            quoted: Some(&quoted),
+            table_cells: Some(&prepared.primitives.table_cell_line_ids),
+            contents: Some(&prepared.primitives.contents_line_ids),
+            translation: Some(&prepared.primitives.translation_line_ids),
+            layout: prepared.primitives.source_regions.as_ref(),
+        },
+    );
+    let source_fragments = resolution.index.source_fragments();
+    legal_pdf_witnesses::bind_source_fragments(&mut table, resolution.index.text(), &source_fragments).map_err(Error::Message)?;
+    let document_id = identity.document_id.clone();
+    let profile = identity.profile;
+    let mut scope_error = None;
+    let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
+        legal_pdf_core::structure_analysis().resolve_structure_graph_with_assembler(
             identity.document_id,
             "local-pdf".to_owned(),
             resolution.index.text(),
@@ -3867,27 +3932,47 @@ fn derive_prepared(
             &resolution.evidence,
             &note_pairs,
             graph_diagnostics,
+            &mut |nodes, scope_annotations| {
+                assign_outline_ownership(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
+                let scope_declarations = match legal_pdf_witnesses::infer_scopes(nodes, resolution.index.text(), &document_id, &table, &source_fragments, profile) {
+                    Ok(declarations) => declarations,
+                    Err(error) => { scope_error = Some(error); return; }
+                };
+                if let Err(error) = legal_pdf_witnesses::infer_membership(nodes, resolution.index.text(), &table, &source_fragments, profile) { scope_error = Some(error); return; }
+                let pairs = legal_pdf_witnesses::assemble_outline(nodes, &document_id, resolution.index.text(), &table, &prepared.primitives.navigation_parents, profile);
+                legal_pdf_witnesses::dump_pairs(&pairs);
+                *scope_annotations = legal_pdf_witnesses::scope_annotations(nodes, &document_id, &scope_declarations);
+            },
         )
     })
     .map_err(|error| Error::Message(error.to_string()))?;
-    // The outline composed over the whole document, where a parent decision is in force; the pairs
-    // it reads are dumped for the gold's search either way.
-    let mut structure_graph = structure_graph;
-    if legal_pdf_witnesses::parent_model().is_some() || std::env::var_os("LEGALPDF_WITNESS_DUMP").is_some() {
-        let quoted = quotations::quoted_lines(pages, &prepared.primitives);
-        let table = legal_pdf_witnesses::witnesses(
-            pages,
-            &legal_pdf_witnesses::Context {
-                quoted: Some(&quoted),
-                table_cells: Some(&prepared.primitives.table_cell_line_ids),
-                contents: Some(&prepared.primitives.contents_line_ids),
-                translation: Some(&prepared.primitives.translation_line_ids),
-                layout: prepared.primitives.source_regions.as_ref(),
-            },
-        );
-        let pairs = legal_pdf_witnesses::compose_outline(&mut structure_graph, &table, &prepared.primitives.heading_levels);
-        legal_pdf_witnesses::dump_pairs(&pairs);
+    if let Some(error) = scope_error { return Err(Error::Message(error)); }
+    structure_graph.profile = profile;
+    structure_graph.source_fragments = resolution.index.source_fragments();
+    legal_pdf_core::model::attach_structure_tags(&mut structure_graph, pages, &[]);
+    let fragments: HashMap<_, _> = structure_graph.source_fragments.iter().map(|fragment| (fragment.id.as_str(), fragment.range)).collect();
+    let entries = &prepared.primitives.contents_entries;
+    let ids = entries.iter().enumerate().map(|(index,entry)|
+        format!("pdf-contents:{}:{index}", entry.source_line_ids.first().map(String::as_str).unwrap_or("entry"))).collect::<Vec<_>>();
+    for (index,entry) in entries.iter().enumerate() {
+        let source_ranges = entry.source_line_ids.iter().filter_map(|id| fragments.get(id.as_str()).copied()).collect::<Vec<_>>();
+        let target_ranges = entry.target_line_ids.iter().filter_map(|id| fragments.get(id.as_str()).copied()).collect::<Vec<_>>();
+        let confirmed = !target_ranges.is_empty() && target_ranges.len()==entry.target_line_ids.len()
+            && structure_graph.nodes.iter().any(|node|
+                (node.kind==NodeKind::Heading || node.role==Some(legal_structure_model::PrimaryRole::Heading))
+                    && target_ranges.iter().all(|target| {
+                        let ranges = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
+                        ranges.iter().any(|range| range.start<=target.start && target.end<=range.end)
+                    }));
+        structure_graph.navigation.push(legal_structure_model::NavigationEntry {
+            id:ids[index].clone(), kind:"contents".into(), source_ranges, title_ranges:Vec::new(),
+            source_line_ids:entry.source_line_ids.clone(),
+            target_ranges:if confirmed {target_ranges} else {Vec::new()},
+            target_line_ids:if confirmed {entry.target_line_ids.clone()} else {Vec::new()},
+            parent_id:entry.parent.map(|parent| ids[parent].clone()), witness_id:None,
+        });
     }
+    structure_graph.refresh_revision()?;
     Ok(StructureOutput {
         paragraphs,
         footnotes,
@@ -3895,6 +3980,65 @@ fn derive_prepared(
         pairing_audit,
         structure_graph,
     })
+}
+
+/// Carry observed constituent and quotation identity into the one outline assembler.
+fn assign_outline_ownership(
+    nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
+    quote_ids: &HashMap<String, String>,
+    index: &PdfTextIndex,
+) {
+    use legal_structure_model::{PrimaryRole, StructureOwnership};
+    // Establish exact membership before comparing containers. An envelope may cross
+    // intervening columns, notes, quotations, or constituent documents.
+    for node in nodes.iter_mut() {
+        if node.ranges.is_empty() { node.ranges.push(node.range); }
+        if let Some(marker) = node.marker_range {
+            node.ranges.push(marker);
+        }
+        node.ranges.sort_by_key(|range| (range.start, range.end));
+        let mut merged: Vec<legal_structure_model::ScalarRange> = Vec::new();
+        for range in node.ranges.drain(..) {
+            if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        node.ranges = merged;
+        let mut seen_lines = HashSet::new();
+        node.line_ids = node.ranges.iter().flat_map(|range| index.line_ids(*range))
+            .filter(|id| seen_lines.insert(id.clone())).collect();
+        node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
+        if let (Some(first), Some(last)) = (node.ranges.first(), node.ranges.last()) {
+            node.range.start = first.start;
+            node.range.end = last.end;
+        }
+    }
+    let constituents = nodes.iter().filter(|node| node.grammar.as_deref().is_some_and(|grammar| grammar.starts_with("constituent_")))
+        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
+    let cells = nodes.iter().filter(|node| matches!(node.kind, NodeKind::Cell | NodeKind::Footnote | NodeKind::Endnote))
+        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
+    let contains = |outer: &[legal_structure_model::ScalarRange], inner: &[legal_structure_model::ScalarRange]| {
+        !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
+            range.start <= part.start && part.end <= range.end))
+    };
+    for node in nodes {
+        if node.kind == NodeKind::Heading {
+            node.role = Some(PrimaryRole::Heading);
+            node.heading_range = (node.ranges.len() == 1).then_some(node.range);
+        } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
+            node.role.get_or_insert(PrimaryRole::Text);
+        }
+        if node.ownership.is_some() { continue; }
+        let constituent = constituents.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
+            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end-range.start).sum::<usize>()).map(|(id, _)| id.clone());
+        let quotation = node.line_ids.first().and_then(|id| quote_ids.get(id))
+            .filter(|id| node.line_ids.iter().all(|line| quote_ids.get(line) == Some(*id))).cloned();
+        let stream = cells.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
+            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end-range.start).sum::<usize>()).map(|(id, _)| format!("object:{id}"));
+        node.ownership = Some(StructureOwnership { document_id: constituent.unwrap_or_else(|| document_id.to_owned()), quotation_id: quotation, reading_stream_id: stream });
+    }
 }
 
 pub fn derive(
@@ -3909,6 +4053,28 @@ pub fn derive(
 /// `derive`, reading the readers' state from `reader_cache` where it is there (a file named for the
 /// input pages and the readers' code) and writing it there where not: a change to compositions, or
 /// to anything after the readers, reruns only what follows them.
+/// Reuse the production evidence preparation for fixed corrected-source training packets.
+/// Source geometry and typography remain supplied facts; no gold roles feed this preparation.
+pub fn training_source_evidence(
+    source_pages: &[Page],
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+) -> Result<(Vec<Page>, legal_pdf_witnesses::Table, HashMap<String, Option<String>>)> {
+    let mut pages = source_pages.to_vec();
+    let prepared = prepare_pages(&mut pages, separators, outline)?;
+    infer_note_region_modes(&mut pages);
+    legal_pdf_pairing::repair_label_dropouts(&mut pages);
+    let quoted = quotations::quotation_scopes(&pages, &prepared.primitives).into_keys().collect::<HashSet<_>>();
+    let table = legal_pdf_witnesses::source_witnesses(&pages, &legal_pdf_witnesses::Context {
+        quoted: Some(&quoted),
+        table_cells: Some(&prepared.primitives.table_cell_line_ids),
+        contents: Some(&prepared.primitives.contents_line_ids),
+        translation: Some(&prepared.primitives.translation_line_ids),
+        layout: prepared.primitives.source_regions.as_ref(),
+    });
+    Ok((pages, table, prepared.primitives.navigation_parents))
+}
+
 pub fn derive_cached(
     pages: &mut [Page],
     separators: &[Option<f64>],
@@ -4217,9 +4383,10 @@ pub fn validate_pdf_components(
     }
     for note in &structure_graph.notes {
         let valid_range = |range: ScalarRange| range.start <= range.end && range.end <= text_length;
-        if !node_ids.contains(note.node_id.as_str())
+        if note.node_id.as_deref().is_some_and(|id| !node_ids.contains(id))
             || !valid_range(note.label_range)
             || !valid_range(note.body_range)
+            || note.label_ranges.iter().chain(&note.body_ranges).any(|range| !valid_range(*range))
             || note
                 .primary_reference
                 .is_some_and(|range| !valid_range(range))

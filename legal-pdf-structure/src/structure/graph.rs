@@ -34,6 +34,8 @@ pub struct PdfTextIndex {
 #[derive(Debug)]
 pub(super) struct PdfResolutionInput {
     pub(super) index: PdfTextIndex,
+    pub(super) quotation_scopes: HashMap<String, String>,
+    pub(super) span_proposals: Option<Vec<legal_pdf_witnesses::SpanProposal>>,
     pub(super) runs: Vec<StructureCandidateRun>,
     pub(super) evidence: Vec<CandidateEvidenceV2>,
     pub(super) citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
@@ -99,6 +101,15 @@ impl PdfTextIndex {
         &self.text
     }
 
+    pub(super) fn source_fragments(&self) -> Vec<legal_structure_model::SourceFragment> {
+        let text = ScalarText::new(&self.text);
+        self.lines.iter().map(|line| legal_structure_model::SourceFragment {
+            id: line.line_id.clone(),
+            page_index: line.page_index,
+            range: ScalarRange { start: text.utf16(line.range.start), end: text.utf16(line.range.end) },
+        }).collect()
+    }
+
     pub(super) fn line(&self, line_id: &str) -> Option<&IndexedPdfLine> {
         self.line_slots
             .get(line_id)
@@ -162,7 +173,7 @@ impl PdfTextIndex {
             })
     }
 
-    fn range_for_line_ids<'a>(
+    pub(super) fn range_for_line_ids<'a>(
         &self,
         line_ids: impl IntoIterator<Item = &'a String>,
     ) -> Option<ScalarRange> {
@@ -177,7 +188,7 @@ impl PdfTextIndex {
             })
     }
 
-    fn page_indexes_for_line_ids<'a>(
+    pub(super) fn page_indexes_for_line_ids<'a>(
         &self,
         line_ids: impl IntoIterator<Item = &'a String>,
     ) -> Vec<usize> {
@@ -472,7 +483,7 @@ fn layout_end(
 }
 
 impl PdfResolutionInput {
-    pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
+    pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence, profile: Option<legal_structure_model::DetectionProfile>) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let mut runs = structure_analysis().detect_structure_candidate_runs(index.text());
         let by_line = pages
@@ -483,6 +494,21 @@ impl PdfResolutionInput {
                     .map(move |line| (line.id.as_str(), (page, line)))
             })
             .collect::<HashMap<_, _>>();
+        // OCR keeps an isolated marker and its body as separate physical fragments.
+        // Use the source producer's association without changing its paragraph/note role.
+        for run in &mut runs {
+            for candidate in &mut run.markers {
+                let body = index.line_at(candidate.marker_range.start)
+                    .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
+                    .and_then(|(_, line)| line.ocr.as_ref())
+                    .and_then(|ocr| ocr.marker.as_ref())
+                    .and_then(|marker| marker.body_line_id.as_deref())
+                    .and_then(|id| index.line(id));
+                if let Some(body) = body.filter(|body| candidate.marker_range.end <= body.range.start && body.range.start < candidate.range.end) {
+                    candidate.content_start = body.range.start;
+                }
+            }
+        }
         let measures = pages
             .iter()
             .filter_map(|page| {
@@ -492,25 +518,24 @@ impl PdfResolutionInput {
                 Some((page.index, (left, right)))
             })
             .collect::<HashMap<_, _>>();
-        let quotations = super::quotations::quoted_lines(pages, primitives);
-        // The composed readings of each marker's line, where compositions are in force.
-        let table = legal_pdf_witnesses::witnesses(
-            pages,
-            &legal_pdf_witnesses::Context {
-                quoted: Some(&quotations),
-                table_cells: Some(&primitives.table_cell_line_ids),
-                contents: Some(&primitives.contents_line_ids),
-                translation: Some(&primitives.translation_line_ids),
-                layout: primitives.source_regions.as_ref(),
-            },
-        );
+        let quotation_scopes = super::quotations::quotation_scopes(pages, primitives);
+        let quotations = quotation_scopes.keys().cloned().collect::<HashSet<_>>();
+        let context = legal_pdf_witnesses::Context {
+            quoted: Some(&quotations),
+            table_cells: Some(&primitives.table_cell_line_ids),
+            contents: Some(&primitives.contents_line_ids),
+            translation: Some(&primitives.translation_line_ids),
+            layout: primitives.source_regions.as_ref(),
+        };
+        let source = legal_pdf_witnesses::source_witnesses(pages, &context);
+        let span_proposals = legal_pdf_witnesses::predict_spans(index.text(), pages, &source, &index.source_fragments(), profile)
+            .expect("PDF index supplies exact physical source spans");
+        // Existing composition rules retain their counted-line feature population.
+        let table = legal_pdf_witnesses::witnesses(pages, &context);
         legal_pdf_witnesses::dump(&table, "candidates");
         let rows = table.by_id();
         let compositions = legal_pdf_witnesses::compositions();
         let composed = |name: &str, line_id: &str| {
-            if !primitives.unit_kinds.is_empty() {
-                return primitives.unit_kinds.get(line_id).is_some_and(|kind| legal_pdf_witnesses::UNIT_KINDS[*kind as usize] == name);
-            }
             compositions
                 .decision(name)
                 .and_then(|decision| rows.get(line_id).and_then(|row| decision.holds(row)))
@@ -544,6 +569,11 @@ impl PdfResolutionInput {
         for run in &mut runs {
             let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
             for candidate in &mut run.markers {
+                if let Some(heading) = span_proposals.as_ref().into_iter().flatten()
+                    .filter(|proposal| proposal.role == legal_structure_model::PrimaryRole::Heading && proposal.range.start > candidate.content_start)
+                    .map(|proposal| proposal.range.start).min() {
+                    candidate.range.end = candidate.range.end.min(heading);
+                }
                 let label = candidate.label.trim_start_matches('(').to_lowercase();
                 let provision = hierarchy
                     && candidate.parent_candidate_id.is_none()
@@ -610,16 +640,45 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let citation_spans = by_line
+        let (layout_runs, layout_evidence) =
+            super::numbered_paragraphs::candidates(&index, pages, primitives);
+        runs.extend(layout_runs);
+        let layout_evidence = layout_evidence
             .iter()
-            .map(|(line_id, (_, line))| {
-                (
-                    (*line_id).to_owned(),
-                    protected_citation_spans(&line.text)
-                        .into_iter()
-                        .map(|(start, end)| PdfSourceSpan { start, end })
-                        .collect::<Vec<_>>(),
-                )
+            .map(|item| (item.candidate_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+        // A citation may wrap across source lines. Recognize it once over the
+        // document, then project its protected span back onto every source line.
+        let text = ScalarText::new(index.text());
+        let mut citation_ranges = protected_citation_spans(index.text());
+        citation_ranges.extend(
+            structure_analysis()
+                .citations(index.text())
+                .into_iter()
+                .map(|citation| {
+                    // A preceding note label is not part of a citation's core, even if
+                    // the citation recognizer includes it in the surrounding style.
+                    (
+                        text.scalar_at_byte(citation.core_range.start)
+                            .expect("citation start"),
+                        text.scalar_at_byte(citation.core_range.end)
+                            .expect("citation end"),
+                    )
+                }),
+        );
+        let citation_spans = index
+            .lines
+            .iter()
+            .map(|indexed| {
+                let spans = citation_ranges
+                    .iter()
+                    .filter(|(start, end)| *start < indexed.range.end && indexed.range.start < *end)
+                    .map(|(start, end)| PdfSourceSpan {
+                        start: start.saturating_sub(indexed.range.start),
+                        end: (*end).min(indexed.range.end) - indexed.range.start,
+                    })
+                    .collect::<Vec<_>>();
+                (indexed.line_id.clone(), spans)
             })
             .collect::<BTreeMap<_, _>>();
         let mut evidence = Vec::new();
@@ -697,6 +756,14 @@ impl PdfResolutionInput {
                 let marker_lines = index.overlapping_lines(candidate.marker_range);
                 let marker_line = marker_lines.first().map(|indexed| indexed.line_id.as_str()).unwrap_or("");
                 let mut observations = Vec::new();
+                if let Some(proposal) = span_proposals.as_ref().into_iter().flatten()
+                    .find(|proposal| proposal.range.start <= candidate.marker_range.start && candidate.marker_range.start < proposal.range.end) {
+                    match proposal.role {
+                        legal_structure_model::PrimaryRole::Heading => observations.push(CandidateObservationV2::SectionHeading),
+                        legal_structure_model::PrimaryRole::Furniture | legal_structure_model::PrimaryRole::PageLabel => observations.push(CandidateObservationV2::Furniture),
+                        _ => {}
+                    }
+                }
 
                 // The words after the marker on the item's first body lines.
                 let body_tails = candidate_lines.iter().take(3).filter_map(|indexed| {
@@ -838,10 +905,14 @@ impl PdfResolutionInput {
                 if composed("list_item", marker_line) {
                     add_observation(&mut observations, CandidateObservationV2::ComposedListItem);
                 }
+                let layout = layout_evidence.get(candidate.id.as_str());
+                if let Some(layout) = layout {
+                    observations.extend(layout.observations.iter().copied());
+                }
                 evidence.push(CandidateEvidenceV2 {
                     candidate_id: candidate.id.clone(),
-                    page_indexes,
-                    line_ids,
+                    page_indexes: layout.map_or(page_indexes, |item| item.page_indexes.clone()),
+                    line_ids: layout.map_or(line_ids, |item| item.line_ids.clone()),
                     observations,
                 });
             }
@@ -887,6 +958,8 @@ impl PdfResolutionInput {
             index,
             runs,
             evidence,
+            quotation_scopes,
+            span_proposals,
             citation_spans,
         }
     }
@@ -899,11 +972,6 @@ pub(super) fn map_note_pairs(
     let mut claims = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pair_ids = HashSet::new();
-    let paired = pairs
-        .iter()
-        .filter(|pair| !pair.reference_anchors.is_empty())
-        .count();
-    let unreferenced = pairs.len() - paired;
     for pair in pairs {
         if pair.pair_id.is_empty() || !pair_ids.insert(pair.pair_id.as_str()) {
             return Err(Error::Message(format!(
@@ -969,7 +1037,12 @@ pub(super) fn map_note_pairs(
         // reference to it could be read, among notes whose references mostly were: a form's
         // numbered fields, a caption's column of section signs or a table's numbered rows pair
         // with nothing, or with a stray number or two.
-        let label_only = paired >= 2 && unreferenced <= 2 * paired;
+        let support = &pair.support;
+        let referenced_run = support.sequence_observed_pairs >= 2
+            && support.sequence_labels <= 3 * support.sequence_observed_pairs;
+        let note_region_run = support.sequence_note_labels >= 3
+            && 4 * support.sequence_note_labels >= 3 * support.sequence_labels;
+        let label_only = support.note_region && (referenced_run || note_region_run);
         if (pair.reference_anchors.is_empty() && !label_only)
             || body_range.is_none()
             || body_range.is_some_and(|range| range.start == range.end)
@@ -988,6 +1061,7 @@ pub(super) fn map_note_pairs(
         }
         claims.push(NotePairClaimV2 {
             pair_id: pair.pair_id.clone(),
+            support: pair.support.clone(),
             kind: match pair.kind {
                 NotePairKind::Footnote => NoteKindV2::Footnote,
                 NotePairKind::Endnote => NoteKindV2::Endnote,
@@ -999,6 +1073,7 @@ pub(super) fn map_note_pairs(
             },
             body: NoteBodyV2 {
                 range: body_range.unwrap(),
+                ranges: pair.body_line_ids.iter().filter_map(|id| index.line(id).map(|line| line.range)).collect(),
                 page_indexes: index.page_indexes_for_line_ids(&pair.body_line_ids),
                 line_ids: pair.body_line_ids.clone(),
             },
@@ -1008,13 +1083,25 @@ pub(super) fn map_note_pairs(
     Ok((claims, diagnostics))
 }
 
+fn source_membership(mut ranges: Vec<ScalarRange>) -> Vec<ScalarRange> {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<ScalarRange> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
 pub(super) fn native_graph_parts(
     index: &PdfTextIndex,
     pages: &[Page],
     paragraphs: &[Paragraph],
     primitives: &PdfPrimitiveEvidence,
 ) -> Result<Vec<StructureNode>> {
-    let heading_levels = &primitives.heading_levels;
     // A passage wholly in a contents list, or wholly a parallel translation, says so: a
     // reader of the text's own structure skips it.
     let role = |line_ids: &[String]| {
@@ -1055,7 +1142,6 @@ pub(super) fn native_graph_parts(
         node.line_ids = index.line_ids(range);
         nodes.push(node);
     }
-    let mut heading_stack: Vec<(usize, String)> = Vec::new();
     for paragraph in paragraphs {
         let range = index
             .range_for_line_ids(&paragraph.line_ids)
@@ -1079,11 +1165,11 @@ pub(super) fn native_graph_parts(
             },
             None,
         );
-        node.label = heading.then(|| {
-            text.slice(range.start..range.end)
-                .expect("indexed heading range must be in bounds")
-                .to_owned()
-        });
+        node.ranges = source_membership(paragraph.line_ids.iter()
+            .filter_map(|id| index.line(id).map(|line| line.range)).collect());
+        node.label = heading.then(|| node.ranges.iter().map(|part|
+            text.slice(part.start..part.end).expect("indexed heading part must be in bounds")
+        ).collect::<Vec<_>>().join(" "));
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
         node.grammar = if heading {
@@ -1091,23 +1177,6 @@ pub(super) fn native_graph_parts(
         } else {
             role(&paragraph.line_ids).map(str::to_owned)
         };
-        if heading {
-            if let Some(level) = paragraph
-                .line_ids
-                .iter()
-                .filter_map(|id| heading_levels.get(id))
-                .min()
-            {
-                while heading_stack
-                    .last()
-                    .is_some_and(|(prior, _)| prior >= level)
-                {
-                    heading_stack.pop();
-                }
-                node.parent_id = heading_stack.last().map(|(_, id)| id.clone());
-                heading_stack.push((*level, node.id.clone()));
-            }
-        }
         nodes.push(node);
     }
     // A table, its rows and their cells, addressed as a word processor's are. A blank
@@ -1126,10 +1195,15 @@ pub(super) fn native_graph_parts(
             Derivation::Heuristic,
             None,
         );
+        node.table_number = Some(slot + 1);
+        node.header_rows = Some(table.rows.iter().enumerate()
+            .filter_map(|(index, row)| row.header.then_some(index + 1)).collect());
         node.label = Some(table_id.clone());
         node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
         node.line_ids = line_ids;
+        let table_node_index = nodes.len();
         nodes.push(node);
+        let mut table_ranges = Vec::new();
         let mut cursor = range.start;
         for (row_slot, row) in table.rows.iter().enumerate() {
             let row_id = format!("{table_id}/row:{}", row_slot + 1);
@@ -1138,14 +1212,15 @@ pub(super) fn native_graph_parts(
                 .iter()
                 .map(|cell| {
                     let line_ids = cell.line_ids();
-                    let range = cell
+                    let ranges = source_membership(cell
                         .parts
                         .iter()
                         .filter_map(|part| match part.chars {
                             Some((start, end)) => index.global_range(&part.line_id, start, end),
                             None => index.line(&part.line_id).map(|line| line.range),
                         })
-                        .reduce(|left, right| ScalarRange {
+                        .collect());
+                    let range = ranges.iter().copied().reduce(|left, right| ScalarRange {
                             start: left.start.min(right.start),
                             end: left.end.max(right.end),
                         })
@@ -1162,7 +1237,10 @@ pub(super) fn native_graph_parts(
                         Derivation::Heuristic,
                         Some(row_id.clone()),
                     );
+                    node.ranges = ranges;
                     node.label = Some(node.id.clone());
+                    node.row = Some(row_slot + 1);
+                    node.column = Some(cell.column + 1);
                     node.row_span = (cell.row_span > 1).then_some(cell.row_span);
                     node.column_span = (cell.column_span > 1).then_some(cell.column_span);
                     node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
@@ -1190,6 +1268,9 @@ pub(super) fn native_graph_parts(
                 Derivation::Heuristic,
                 Some(table_id.clone()),
             );
+            node.ranges = source_membership(cells.iter().flat_map(|cell| cell.ranges.iter().copied()).collect());
+            table_ranges.extend(node.ranges.iter().copied());
+            node.row = Some(row_slot + 1);
             node.label = Some(row_id);
             node.line_ids = cells
                 .iter()
@@ -1198,6 +1279,11 @@ pub(super) fn native_graph_parts(
             node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
             nodes.push(node);
             nodes.extend(cells);
+        }
+        let table_node = &mut nodes[table_node_index];
+        table_node.ranges = source_membership(table_ranges);
+        if let (Some(first), Some(last)) = (table_node.ranges.first(), table_node.ranges.last()) {
+            table_node.range = ScalarRange { start: first.start, end: last.end };
         }
     }
     Ok(nodes)

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kraken-lite-runtime"
+version = "0.1.0"
+description = "Dependency-light inference runtime for stock Kraken BLLA geometry and compiled Kraken recognizers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+  "opencv-python-headless>=4.9",
+]
+
+[project.optional-dependencies]
+# Install exactly one ONNX Runtime distribution. The CUDA wheel also contains
+# the CPU provider and is selected automatically when CUDA initializes.
+runtime = ["onnxruntime>=1.20"]
+runtime-cpu = ["onnxruntime>=1.20"]
+runtime-cuda = ["onnxruntime-gpu>=1.20"]
+runtime-directml = ["onnxruntime-directml>=1.20; platform_system == 'Windows'"]
+compiler = [
+  "kraken>=7.0.1,<8",
+  "onnxruntime>=1.20",
+  "onnx>=1.17",
+]
+
+[project.scripts]
+kraken-lite = "kraken_lite.cli:main"
+kraken-lite-compile = "kraken_lite.compiler:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

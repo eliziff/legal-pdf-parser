@@ -1,4 +1,4 @@
-use crate::kraken::{canonical_file, KrakenBackend, KrakenImageDiagnostics, KrakenOptions};
+use crate::kraken::{canonical_file, KrakenBackend, KrakenImageDiagnostics, KrakenOptions, LineBox};
 use image::{GrayImage, ImageFormat};
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use legal_pdf_core::{OcrLine, OcrWord};
@@ -86,6 +86,8 @@ struct RuntimePage {
 
 #[derive(Deserialize)]
 struct RuntimeLine {
+    #[serde(default)]
+    id: String,
     text: String,
     confidence: f64,
     #[serde(default)]
@@ -180,7 +182,7 @@ impl BllaRuntime {
     ) -> Result<Self> {
         let mut command = Command::new(&prepared.python);
         command
-            .args(["-m", "kraken_lite.cli", "serve", "--blla"])
+            .args(["-P", "-m", "kraken_lite.cli", "serve", "--blla"])
             .arg(&prepared.blla.root)
             .arg("--recognizer")
             .arg(&prepared.recognizer.root)
@@ -259,7 +261,7 @@ impl BllaRuntime {
             timeout: Duration::from_secs(options.timeout_seconds),
             request_id: 0,
         };
-        let startup = runtime.request(json!({"op": "ocr_batch", "images": []}))?;
+        let startup = runtime.request(json!({"op": "recognize_lines_batch", "images": [], "pages": []}))?;
         if !startup.as_array().is_some_and(Vec::is_empty) {
             return Err(Error::Message(
                 "Kraken runtime returned an invalid startup response".to_owned(),
@@ -289,12 +291,81 @@ impl BllaRuntime {
                 images.len()
             )));
         }
+        for (page, image) in pages.iter().zip(images) {
+            if page.width != image.width() as usize || page.height != image.height() as usize {
+                return Err(Error::Message("Kraken runtime changed original page dimensions".to_owned()));
+            }
+        }
+        // Retain all segmentation geometry as coverage, including unreadable lines.
+        let candidates = pages.iter().zip(images).map(|(page, image)| {
+            let boxes = page.lines.iter().filter_map(|line| polygon_bbox(&line.boundary))
+                .map(|bbox| clamp_bbox(bbox, image.width() as usize, image.height() as usize))
+                .collect::<Result<Vec<_>>>()?.into_iter().map(|bbox| LineBox {
+                    left: bbox[0].floor() as usize, top: bbox[1].floor() as usize,
+                    right: bbox[2].ceil() as usize, bottom: bbox[3].ceil() as usize,
+                    recovered: false,
+                }).collect();
+            Ok(crate::uncovered::recover_uncovered_lines(
+                image.as_raw(), image.width() as usize, image.height() as usize, 1, boxes,
+            ).into_iter().filter(|line| line.recovered).collect::<Vec<_>>())
+        }).collect::<Result<Vec<_>>>()?;
+        let mut recovered = if candidates.iter().any(|lines| !lines.is_empty()) {
+            let geometry = candidates.iter().map(|lines| {
+                json!({"lines": lines.iter().enumerate().map(|(index, line)| {
+                    // The ink box supplies an estimated horizontal baseline; coordinates
+                    // remain in the original page, never a separately segmented crop.
+                    let baseline = line.bottom as f64 - (line.bottom - line.top) as f64 * 0.2;
+                    json!({"id": format!("recovered-{index}"),
+                        "baseline": [[line.left as f64, baseline], [line.right as f64, baseline]],
+                        "boundary": [[line.left, line.top], [line.right, line.top],
+                                     [line.right, line.bottom], [line.left, line.bottom]]})
+                }).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>();
+            let value = self.request(json!({"op": "recognize_lines_batch",
+                "images": temporary.paths, "pages": geometry}))?;
+            let recovered: Vec<RuntimePage> = serde_json::from_value(value)?;
+            if recovered.len() != images.len() || recovered.iter().zip(&candidates)
+                .any(|(page, lines)| page.lines.len() != lines.len()) {
+                return Err(Error::Message("Kraken supplied-line response cardinality mismatch".to_owned()));
+            }
+            for (page, expected) in recovered.iter().zip(&candidates) {
+                for (index, (line, bbox)) in page.lines.iter().zip(expected).enumerate() {
+                    let boundary = vec![[bbox.left as f64, bbox.top as f64],
+                        [bbox.right as f64, bbox.top as f64], [bbox.right as f64, bbox.bottom as f64],
+                        [bbox.left as f64, bbox.bottom as f64]];
+                    if line.id != format!("recovered-{index}") || line.boundary != boundary {
+                        return Err(Error::Message("Kraken supplied-line identity or geometry changed".to_owned()));
+                    }
+                }
+            }
+            recovered.into_iter().map(Some).collect::<Vec<_>>()
+        } else {
+            (0..images.len()).map(|_| None).collect()
+        };
         let seconds = started.elapsed().as_secs_f64() / images.len() as f64;
-        pages
-            .into_iter()
-            .zip(images)
-            .map(|(page, image)| runtime_page(page, image, seconds))
-            .collect()
+        pages.into_iter().zip(images).zip(recovered.drain(..)).map(|((page, image), extra)| {
+            let mut page = runtime_page(page, image, seconds)?;
+            if let Some(extra) = extra {
+                let extra = runtime_page(extra, image, 0.0)?;
+                for mut line in extra.lines {
+                    if line.confidence < crate::kraken::RECOVERED_CONFIDENCE { continue; }
+                    line.recovered = true;
+                    let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
+                    let beside = page.lines.iter().enumerate()
+                        .filter(|(_, other)| other.bbox[1] <= middle && middle <= other.bbox[3]
+                            && other.bbox[0] >= line.bbox[2])
+                        .min_by(|(_, a), (_, b)| a.bbox[0].total_cmp(&b.bbox[0]))
+                        .map(|(index, _)| index);
+                    let at = beside.or_else(|| page.lines.iter().position(|other| other.bbox[1] > middle))
+                        .unwrap_or(page.lines.len());
+                    page.layout_boxes.insert(at, [line.bbox[0].floor() as usize,
+                        line.bbox[1].floor() as usize, line.bbox[2].ceil() as usize,
+                        line.bbox[3].ceil() as usize]);
+                    page.lines.insert(at, line);
+                }
+            }
+            Ok(page)
+        }).collect()
     }
 
     fn request(&mut self, mut request: Value) -> Result<Value> {
@@ -428,6 +499,7 @@ fn runtime_page(
             bbox[3].ceil() as usize,
         ]);
         lines.push(OcrLine {
+            recovered: false,
             text,
             bbox,
             confidence: if line.confidence.is_finite() {

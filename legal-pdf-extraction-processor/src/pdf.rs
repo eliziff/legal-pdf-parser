@@ -759,6 +759,7 @@ fn line_spans(
             let gap_start = previous_byte_end;
             let gap_end = start_byte;
             if same_renderer_span(&text_line.items[prior_item_index], item)
+                && text_line.items[prior_item_index].mcid == item.mcid
                 && same_source_text_object(&text_line.items[prior_item_index], item)
                 && assembled.text[gap_start..gap_end]
                     .chars()
@@ -774,6 +775,8 @@ fn line_spans(
         }
         let superscript = is_superscript(item, body_size, baseline, assembled.spans.len() > 1);
         let span = Span {
+            mcid: item.mcid,
+            structure_role: None,
             id: format!("{id}-s{:03}", spans.len() + 1),
             text: assembled.text[start_byte..end_byte].to_owned(),
             bbox,
@@ -1153,8 +1156,10 @@ fn make_line(
         spans,
         words,
         detached_references: vec![],
+        ocr: None,
         exclude_from_body: false,
         suppress_footnote_label: false,
+        paragraph_label_candidate: false,
         note_region_mode: String::new(),
         region_id: String::new(),
         region_type: "text".to_owned(),
@@ -1261,8 +1266,16 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
         spans: vec![],
         words,
         detached_references: vec![],
+        ocr: Some(legal_pdf_core::OcrEvidence {
+            confidence: result.confidence,
+            recovered: result.recovered,
+            baseline: result.baseline,
+            boundary: result.boundary,
+            marker: None,
+        }),
         exclude_from_body: false,
         suppress_footnote_label: false,
+        paragraph_label_candidate: false,
         note_region_mode: String::new(),
         region_id: result.region_id,
         region_type: result.region_type,
@@ -1552,6 +1565,7 @@ pub fn assemble_pdf(
         outline: Vec::new(),
         image_regions,
         metadata: PdfExtractionMetadata {
+            structure_tags: Vec::new(),
             embedded_page_labels: Vec::new(),
             pages_needing_ocr: weak_pages.into_iter().collect(),
             ocr_routed_pages: Vec::new(),
@@ -1946,6 +1960,7 @@ pub fn recognize_pdf(
     }
     if reindex {
         reindex_source_lines(pages);
+        legal_pdf_core::associate_ocr_markers(pages);
     }
     let unresolved_pages: Vec<_> = weak_pages.into_iter().collect();
     for &page_index in &unresolved_pages {
