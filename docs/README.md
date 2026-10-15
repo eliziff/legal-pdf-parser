@@ -184,15 +184,11 @@ this replacement.
 
 ## Model-assisted composition
 
-`experiments/structure-composer/composer.py` exposes bounded, provider-neutral
-composition over source evidence. The embedding caller supplies model dispatch
-and the shared preparation, application and projection operations. Complete
-requests return a `DocumentStructure` through `projectStructureComposition`;
-partial chunks return composition state for continuation. The shared Rust owner
-constructs source/rendered coordinates, annotation layers and retained native
-witness mappings. Gold export uses the same projection and adds its artifact
-provenance. Provider selection and image transport remain with the embedding
-caller. No model-run accuracy or latency acceptance is claimed for this path.
+The shared Rust owner applies and projects a source-span composition
+(`applyStructureComposition`, `projectStructureComposition`): it constructs
+source/rendered coordinates, annotation layers and retained native witness
+mappings. Beaver's `experiments/legal-structure-gold/` authors gold through it;
+provider selection and image transport stay with that caller.
 
 Native composition preparation also supplies annotation seeds and exact retained-node
 selection. Annotation continuation and quotation containment use shared source-view
