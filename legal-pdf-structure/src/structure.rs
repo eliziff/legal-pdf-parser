@@ -3801,6 +3801,8 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
                 numbered: &numbered,
             },
         );
+        // Note and heading passes change line roles; regions follow their lines.
+        build_regions(pages);
     });
     Ok((primitives, diagnostics))
 }
@@ -3824,6 +3826,8 @@ fn prepare_composed(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
     ));
+    // Bookmarked headings change line roles; regions follow their lines.
+    build_regions(pages);
     PdfPreparation {
         diagnostics,
         primitives,
