@@ -29,7 +29,7 @@ const INPUT_PADDING: usize = 16;
 const BLANK_LABEL: usize = 0;
 /// How sure the recognizer must be of a line the page analysis left out: a number or a word reads
 /// at 0.95 and more; a signature, a seal's lettering or a speckle at less.
-const RECOVERED_CONFIDENCE: f64 = 0.95;
+pub(crate) const RECOVERED_CONFIDENCE: f64 = 0.95;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1103,15 +1103,11 @@ impl KrakenOcr {
                                     confidence,
                                     words,
                                 } = recognition;
-                                // A recovered line is kept only when read surely, as text: a
-                                // lone letter is a seal's or a logo's, a lone digit a folio.
-                                let marks = text.chars().filter(|c| c.is_alphanumeric()).count();
+                                // Retain confidently read source fragments, including isolated letters and symbols.
                                 let kept = !text.trim().is_empty()
-                                    && (!line.bbox.recovered
-                                        || confidence >= RECOVERED_CONFIDENCE
-                                            && (marks >= 2
-                                                || marks == 1 && text.chars().any(|c| c.is_ascii_digit())));
+                                    && (!line.bbox.recovered || confidence >= RECOVERED_CONFIDENCE);
                                 kept.then_some(OcrLine {
+                                    recovered: line.bbox.recovered,
                                     text,
                                     bbox: [
                                         line.bbox.left as f64,

@@ -1,4 +1,4 @@
-//! Lines Tesseract's page analysis leaves out: a paragraph's number alone in its margin, a page
+//! Lines the page segmenter leaves out: a paragraph's number alone in its margin, a page
 //! number, a stamp's word, taken for noise beside the page's text. Ink no line holds, of a line's
 //! height, is read as a line of its own; the recognizer keeps one only when it is sure of it.
 
@@ -105,10 +105,16 @@ pub(crate) fn recover_uncovered_lines(
     for [left, top, right, bottom, count] in groups {
         let (wide, tall) = (right - left, bottom - top);
         let area = wide * tall;
+        let middle = (top + bottom) / 2;
+        let beside = boxes.iter().enumerate()
+            .filter(|(_, line)| line.top <= middle && middle <= line.bottom
+                && line.left >= right && line.left - right <= line_height * 3)
+            .min_by_key(|(_, line)| line.left)
+            .map(|(index, _)| index);
         // Of a line's height, wide enough to read, neither a solid blot nor at the image's edge.
         if tall * 2 < line_height
             || tall * 10 > line_height * 16
-            || wide * 10 < line_height * 3
+            || wide * 10 < line_height * (if beside.is_some() { 1 } else { 3 })
             || count * 20 < area
             || count * 10 > area * 6
             || left <= 2
@@ -125,13 +131,6 @@ pub(crate) fn recover_uncovered_lines(
             bottom,
             recovered: true,
         };
-        let middle = (top + bottom) / 2;
-        let beside = boxes
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.top <= middle && middle <= line.bottom && line.left >= right)
-            .min_by_key(|(_, line)| line.left)
-            .map(|(index, _)| index);
         let below = || boxes.iter().position(|line| line.top > middle);
         let at = beside.or_else(below).unwrap_or(boxes.len());
         boxes.insert(at, found);

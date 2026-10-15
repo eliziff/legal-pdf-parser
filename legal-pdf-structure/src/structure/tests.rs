@@ -333,6 +333,7 @@ fn typed_note_pairs_keep_every_exact_reference_anchor() {
     let (pairs, diagnostics) = map_note_pairs(
         &index,
         &[NotePairClaim {
+            support: Default::default(),
             pair_id: "pair-1".to_owned(),
             label: "1".to_owned(),
             kind: NotePairKind::Footnote,
@@ -388,6 +389,7 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
     let index = PdfTextIndex::from_pages(&pages);
     let mut pairs = (0..346)
         .map(|number| NotePairClaim {
+            support: Default::default(),
             pair_id: format!("no-body-{number:03}"),
             label: "1".to_owned(),
             kind: NotePairKind::Footnote,
@@ -405,6 +407,7 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
         })
         .collect::<Vec<_>>();
     pairs.push(NotePairClaim {
+        support: Default::default(),
         pair_id: "zero-label".to_owned(),
         label: "1".to_owned(),
         kind: NotePairKind::Footnote,
@@ -421,6 +424,7 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
         body_line_ids: vec!["body".to_owned()],
     });
     pairs.push(NotePairClaim {
+        support: Default::default(),
         pair_id: "zero-reference".to_owned(),
         label: "1".to_owned(),
         kind: NotePairKind::Footnote,
@@ -464,6 +468,7 @@ fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
         detached_references: vec![],
         exclude_from_body: false,
         suppress_footnote_label: false,
+        paragraph_label_candidate: false,
         note_region_mode: String::new(),
         region_id: String::new(),
         region_type: "unknown".to_owned(),
@@ -536,6 +541,7 @@ fn note_order_puts_a_raised_label_before_its_nearby_text() {
             bbox: [39.8, 420.61, 49.8, 426.72],
             start: 0,
             end: marker.chars().count(),
+            underlined: false,
         });
         let body = test_line(
             "Dominique Moran, Carceral Geography",
@@ -559,6 +565,7 @@ fn note_order_puts_a_detached_label_before_a_distant_same_row_fragment() {
         bbox: [95.8, 555.3, 105.9, 562.0],
         start: 0,
         end: 2,
+        underlined: false,
     });
     let body = test_line("of", [411.7, 554.3, 422.3, 566.1], vec![]);
     let mut lines = vec![body, label];
@@ -3560,4 +3567,344 @@ fn a_title_in_capitals_filling_the_page_width_wraps() {
         capitals_titles(lines),
         ["THE BOARD'S ORDER CLOSES THE INNER HARBOUR TO EVERY SHALLOW DRAUGHT VESSEL WITHOUT NOTICE"]
     );
+}
+
+#[test]
+fn repeated_rotated_margin_stamps_preserve_body_and_bottom_notes() {
+    let mut pages = (0..4)
+        .map(|index| {
+            let mut page = test_page(vec![
+                sized_line(
+                    "[7] A canal needs a new footbridge.",
+                    [65.0, 210.0, 510.0, 224.0],
+                    12.0,
+                ),
+                sized_line(
+                    "[8] The engineers proposed a timber deck.",
+                    [65.0, 290.0, 510.0, 304.0],
+                    12.0,
+                ),
+                sized_line(
+                    "[9] Work will begin after the survey.",
+                    [65.0, 370.0, 510.0, 384.0],
+                    12.0,
+                ),
+                sized_line("11 First survey record.", [65.0, 650.0, 310.0, 660.0], 10.0),
+                sized_line(
+                    "12 Second survey record.",
+                    [65.0, 670.0, 310.0, 680.0],
+                    10.0,
+                ),
+                sized_line("13 Third survey record.", [65.0, 690.0, 310.0, 700.0], 10.0),
+                sized_line("2041 ARCHIVE COPY", [580.0, 170.0, 592.0, 310.0], 10.0),
+            ]);
+            page.index = index;
+            page.number = (index + 1) as u32;
+            for line in &mut page.lines {
+                line.id = format!("p{}-{}", index, line.id);
+                line.page_index = index;
+                line.page_number = page.number;
+            }
+            page
+        })
+        .collect::<Vec<_>>();
+    mark_repeated_furniture(&mut pages);
+    classify_pages(&mut pages, &[None; 4]);
+    let paragraphs = build_paragraphs(&pages, &HashMap::new());
+    for page in &pages {
+        for line in &page.lines {
+            if line.text.starts_with('[') {
+                assert_eq!(line.region_type, "body", "{}", line.text);
+                assert!(paragraphs.iter().any(|p| p.line_ids.contains(&line.id)));
+            } else if line.text == "2041 ARCHIVE COPY" {
+                assert_eq!(line.region_type, "header");
+                assert!(!paragraphs.iter().any(|p| p.line_ids.contains(&line.id)));
+            } else {
+                assert_eq!(line.region_type, "footnote", "{}", line.text);
+                assert_eq!(line.note_region_mode, "footnote");
+            }
+        }
+    }
+}
+
+#[test]
+fn side_furniture_requires_rotation_and_repeated_edge_alignment() {
+    let mut pages = (0..4)
+        .map(|index| {
+            let mut page = test_page(vec![
+                sized_line(
+                    "Repeated marginal prose",
+                    [555.0, 200.0, 598.0, 212.0],
+                    10.0,
+                ),
+                sized_line(
+                    "Rotated diagram caption",
+                    [290.0, 200.0, 302.0, 350.0],
+                    10.0,
+                ),
+                sized_line(
+                    "Different edge positions",
+                    [
+                        580.0,
+                        150.0 + index as f64 * 100.0,
+                        592.0,
+                        230.0 + index as f64 * 100.0,
+                    ],
+                    10.0,
+                ),
+                sized_line("Stable left stamp", [8.0, 200.0, 20.0, 350.0], 10.0),
+            ]);
+            page.index = index;
+            page.number = (index + 1) as u32;
+            page
+        })
+        .collect::<Vec<_>>();
+    mark_repeated_furniture(&mut pages);
+    for page in &pages {
+        assert!(page.lines[..3]
+            .iter()
+            .all(|line| line.region_type == "unknown"));
+        assert_eq!(page.lines[3].region_type, "header");
+    }
+}
+
+#[test]
+fn detached_paragraph_numbers_are_body_labels_not_notes() {
+    let mut lines = Vec::new();
+    for (number, top) in [(42, 160.0), (43, 330.0), (44, 500.0)] {
+        lines.push(sized_line(
+            "The archive moved its collection to a larger room.",
+            [75.0, top, 505.0, top + 12.0],
+            12.0,
+        ));
+        lines.push(sized_line(
+            &number.to_string(),
+            [545.0, top, 555.0, top + 9.0],
+            9.0,
+        ));
+    }
+    for (number, top) in [(1, 650.0), (2, 670.0), (3, 690.0)] {
+        lines.push(sized_line(
+            "The catalogue records an earlier loan date.",
+            [85.0, top, 405.0, top + 10.0],
+            9.0,
+        ));
+        lines.push(sized_line(
+            &number.to_string(),
+            [65.0, top, 70.0, top + 9.0],
+            9.0,
+        ));
+    }
+    let mut pages = vec![test_page(lines)];
+    classify_pages(&mut pages, &[Some(635.0)]);
+    note_regions::correct_note_regions(&mut pages, &[Some(635.0)]);
+    for line in &pages[0].lines {
+        if line.text.parse::<usize>().is_ok_and(|number| number >= 42) {
+            assert_eq!(line.region_type, "body");
+            assert!(line.note_region_mode.is_empty());
+        } else if line.bbox[1] >= 635.0 {
+            assert_eq!(line.region_type, "footnote");
+        }
+    }
+}
+
+#[test]
+fn note_witnesses_override_paragraph_like_margin_numbering() {
+    for witness in ["separator", "reference", "source_region", "endnote_heading"] {
+        let mut lines = Vec::new();
+        body_rows(&mut lines, 120.0, 4, 20.0);
+        if witness == "endnote_heading" {
+            lines.push(sized_line("Endnotes", [75.0, 470.0, 180.0, 485.0], 14.0));
+        }
+        for (number, top) in [(5, 520.0), (6, 580.0), (7, 640.0)] {
+            lines.push(sized_line(
+                "The register records a different accession date.",
+                [75.0, top, 505.0, top + 12.0],
+                12.0,
+            ));
+            lines.push(sized_line(
+                &number.to_string(),
+                [545.0, top, 555.0, top + 8.0],
+                8.0,
+            ));
+        }
+        let mut page = test_page(lines);
+        if witness == "reference" {
+            for number in 5..=7 {
+                page.lines[0]
+                    .detached_references
+                    .push(legal_pdf_core::model::DetachedReference {
+                        note_id: number.to_string(),
+                        selected_text: "record".to_owned(),
+                        start_offset: 0,
+                        end_offset: 6,
+                        source_line_id: "body-reference".to_owned(),
+                    });
+            }
+        }
+        let mut evidence = PdfPrimitiveEvidence::default();
+        if witness == "source_region" {
+            evidence.source_regions = Some(
+                page.lines
+                    .iter()
+                    .map(|line| {
+                        (
+                            line.id.clone(),
+                            if line.bbox[1] >= 500.0 {
+                                "footnote"
+                            } else {
+                                "body"
+                            }
+                            .to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        let mut pages = vec![page];
+        let separators = [if witness == "separator" {
+            Some(500.0)
+        } else {
+            None
+        }];
+        classify_pages_with_source(&mut pages, &separators, &mut evidence);
+        note_regions::correct_note_regions(&mut pages, &separators);
+        for line in pages[0]
+            .lines
+            .iter()
+            .filter(|line| line.text.parse::<u32>().is_ok())
+        {
+            assert_eq!(
+                line.region_type, "footnote",
+                "witness={witness}, label={}",
+                line.text
+            );
+            assert!(!line.suppress_footnote_label, "witness={witness}");
+        }
+    }
+}
+
+#[test]
+fn unrelated_note_restart_cannot_license_an_unreferenced_label() {
+    let pages: Vec<Page> = serde_json::from_value(json!([{
+        "id":"page", "index":0, "number":1, "width":600.0, "height":800.0,
+        "lines":[
+            {"id":"ref", "page_index":0, "page_number":1, "source_index":0, "reading_order":0, "block_index":0, "text":"Garden observations¹²", "bbox":[72.0,100.0,500.0,112.0]},
+            {"id":"label", "page_index":0, "page_number":1, "source_index":1, "reading_order":1, "block_index":1, "text":"1 A supporting observation.", "bbox":[72.0,700.0,500.0,712.0]}
+        ], "regions":[]
+    }])).unwrap();
+    let index = PdfTextIndex::from_pages(&pages);
+    let claim = |id: &str, sequence_id: usize, observed: bool, clean: usize| NotePairClaim {
+        pair_id: id.to_owned(),
+        label: "1".to_owned(),
+        kind: NotePairKind::Footnote,
+        support: legal_pdf_core::NotePairSupportV2 {
+            sequence_id,
+            sequence_labels: 3,
+            sequence_observed_pairs: clean,
+            sequence_note_labels: if clean > 0 { 3 } else { 1 },
+            observed_pair: observed,
+            typographic_reference: observed,
+            note_region: true,
+        },
+        label_anchor: legal_pdf_core::SourceAnchor {
+            line_id: "label".to_owned(),
+            start: 0,
+            end: 1,
+        },
+        reference_anchors: if observed {
+            vec![legal_pdf_core::SourceAnchor {
+                line_id: "ref".to_owned(),
+                start: 19,
+                end: 20,
+            }]
+        } else {
+            vec![]
+        },
+        body_line_ids: vec!["label".to_owned()],
+    };
+    let mut unreferenced_run = claim("unreferenced-cohort", 3, false, 0);
+    unreferenced_run.support.sequence_note_labels = 3;
+    let (claims, diagnostics) = map_note_pairs(
+        &index,
+        &[
+            unreferenced_run,
+            claim("observed-a", 1, true, 2),
+            claim("observed-b", 1, true, 2),
+            claim("supported-missing", 1, false, 2),
+            claim("unrelated-missing", 2, false, 0),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|pair| pair.pair_id.as_str())
+            .collect::<Vec<_>>(),
+        ["unreferenced-cohort", "observed-a", "observed-b", "supported-missing"]
+    );
+    assert_eq!(diagnostics.len(), 1);
+}
+
+#[test]
+fn reporter_years_do_not_become_layout_paragraphs() {
+    // Independently invented citation-shaped text; no underlying case is asserted.
+    let mut lines = vec![
+        sized_line(
+            "[1] The garden survey begins with ordinary narrative.",
+            [60.0, 100.0, 500.0, 112.0],
+            11.0,
+        ),
+        sized_line(
+            "[1998] 2 R.C.S. 640; another source discusses cultivation.",
+            [60.0, 130.0, 500.0, 142.0],
+            11.0,
+        ),
+        sized_line("[2004]", [60.0, 145.0, 100.0, 157.0], 11.0),
+        sized_line(
+            "3 R.C.S. 780; the source describes another season.",
+            [60.0, 157.0, 500.0, 169.0],
+            11.0,
+        ),
+        sized_line(
+            "[2] The narrative resumes with a separate observation.",
+            [60.0, 170.0, 500.0, 182.0],
+            11.0,
+        ),
+    ];
+    mark_source_body(&mut lines);
+    let mut pages = vec![test_page(lines)];
+    for line in &mut pages[0].lines {
+        line.region_type = "body".into();
+    }
+    let resolution = PdfResolutionInput::from_pages(&pages, &PdfPrimitiveEvidence::default());
+    let graph = legal_pdf_core::structure_analysis()
+        .resolve_structure_graph(
+            "citation-shape".to_owned(),
+            "fixture".to_owned(),
+            resolution.index.text(),
+            None,
+            Vec::new(),
+            &resolution.runs,
+            &resolution.evidence,
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| node.label.as_deref() == Some("par1998")));
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| node.label.as_deref() == Some("par2004")));
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.label.as_deref() == Some("par1")));
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.label.as_deref() == Some("par2")));
 }

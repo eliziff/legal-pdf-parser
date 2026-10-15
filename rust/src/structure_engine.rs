@@ -32,6 +32,7 @@ pub(crate) fn derive_pdf_pages(
     mut pages: Vec<Page>,
     separators: Vec<Option<f64>>,
     outline: &[PdfOutlineEntry],
+    profile: Option<legal_structure_model::DetectionProfile>,
 ) -> Result<PdfReplayProjection, EngineError> {
     if document_id.is_empty() || source_sha256.len() != 64 || pages.len() != separators.len() {
         return Err(EngineError {
@@ -41,7 +42,7 @@ pub(crate) fn derive_pdf_pages(
     }
     let StructureReplay {
         prepared_pages,
-        derived,
+        mut derived,
     } = replay(
         &mut pages,
         &separators,
@@ -49,12 +50,14 @@ pub(crate) fn derive_pdf_pages(
         StructureIdentity {
             document_id: document_id.clone(),
             source_sha256: source_sha256.clone(),
+            profile,
         },
     )
     .map_err(|error| EngineError {
         code: "invalid_evidence",
         message: error.to_string(),
     })?;
+    derived.structure_graph.native_navigation = navigation_witnesses(outline);
     let pairing_audit = derived
         .pairing_audit
         .expect("replay includes pairing audit");
@@ -89,4 +92,19 @@ pub(crate) fn derive_pdf_pages(
         pairing_audit,
         structure_graph: document.structure_graph,
     })
+}
+
+#[cfg(feature = "pdf")]
+pub(crate) fn navigation_witnesses(outline: &[PdfOutlineEntry]) -> Vec<legal_structure_model::NativeNavigationWitness> {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    outline.iter().enumerate().map(|(index, entry)| {
+        while stack.last().is_some_and(|(level, _)| *level >= entry.level) { stack.pop(); }
+        let id = format!("pdf-bookmark:{index}");
+        let witness = legal_structure_model::NativeNavigationWitness {
+            id: id.clone(), title: entry.title.clone(), page_index: entry.page_index,
+            parent_id: stack.last().map(|(_, id)| id.clone()),
+        };
+        stack.push((entry.level, id));
+        witness
+    }).collect()
 }

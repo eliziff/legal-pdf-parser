@@ -109,6 +109,11 @@ fn item_marker_re() -> &'static Regex {
 
 /// The ids of the body lines set as display quotations.
 pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashSet<String> {
+    quotation_scopes(pages, primitives).into_keys().collect()
+}
+
+/// Keep one identity for the detected block, including its fragments after page furniture.
+pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashMap<String, String> {
     let mut ordered_pages = pages.iter().collect::<Vec<_>>();
     ordered_pages.sort_by_key(|page| page.index);
     let mut rows = Vec::<Row>::new();
@@ -154,7 +159,7 @@ pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) ->
         }
     }
     let Some(widest) = rows.iter().map(Row::width).reduce(f64::max) else {
-        return HashSet::new();
+        return HashMap::new();
     };
     // The body's measure: where its full lines start and end, on each side of a spread.
     let long = rows
@@ -220,7 +225,7 @@ pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) ->
         .max_by_key(|(size, count)| (*count, *size))
         .map(|(size, _)| size as f64 / 2.0)
     else {
-        return HashSet::new();
+        return HashMap::new();
     };
     let (body_italic, _) = typography(margin_rows.iter().copied());
     let full_margin_rows = margin_rows
@@ -250,7 +255,7 @@ pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) ->
         let middle = (row.bbox[1] + row.bbox[3]) / 2.0;
         middle < 0.1 * height || middle > 0.9 * height
     };
-    let mut quoted = HashSet::new();
+    let mut quoted = HashMap::new();
     let mut start = 0;
     while start < rows.len() {
         if !set_in(&rows[start]) {
@@ -292,7 +297,7 @@ pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) ->
                 block
                     .iter()
                     .flat_map(|row| &row.lines)
-                    .map(|line| line.id.clone()),
+                    .map(|line| (line.id.clone(), format!("quotation:{}", block[0].lines[0].id))),
             );
         }
         start = end;

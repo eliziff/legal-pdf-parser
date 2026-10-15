@@ -132,6 +132,7 @@ struct Pair {
     previous_value: Option<u32>,
     next_value: Option<u32>,
     restart_sequence: usize,
+    sequence_labels: usize,
     endnote: bool,
     pair_id: String,
     provenance: String,
@@ -1608,7 +1609,19 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
         let Some(token) = label_token(&line.text) else {
             continue;
         };
-        if line.protected(token.start, token.end) {
+        let paired_note_region = (line.zone == Zone::Note && !line.region_witness_demoted
+            || line.note_column_fit)
+            && token.value.is_some_and(|value| {
+                ref_pages.get(&value).is_some_and(|pages| {
+                    pages.iter().any(|page| {
+                        line.page.abs_diff(*page) <= 1 || line.note_region_mode == "endnote"
+                    })
+                })
+            });
+        // A note such as "1 S.C. 1997, c. 12" can also parse as a reporter
+        // citation beginning with volume 1. Independent reference and note-region
+        // evidence keep both readings alive for the sequence assignment.
+        if line.protected(token.start, token.end) && !paired_note_region {
             continue;
         }
         let scalar = ScalarText::new(&line.text);
@@ -1756,6 +1769,10 @@ fn extract_labels(lines: &[PairLine<'_>], refs: &[Candidate]) -> Vec<Candidate> 
         });
         if ref_supported {
             score += 0.9;
+        }
+        // Paragraph layout is a competing witness, not a veto before pairing.
+        if line.paragraph_label_candidate {
+            score -= 0.9;
         }
         let candidate = Candidate {
             line: line_index,
@@ -3533,6 +3550,8 @@ fn build_pairs<'a>(
                     .get(position + 1)
                     .and_then(|candidate| candidate.value),
                 restart_sequence: segment_index + 1,
+                // Count the whole run, including labels later omitted as unsupported.
+                sequence_labels: backbone.len(),
                 endnote,
                 pair_id: format!("fnv2-pair-LEGALPDF-document-{pair_number:06}"),
                 provenance: if label.repaired && label.repair_kind == "confusable_value_repair" {
@@ -3586,6 +3605,7 @@ fn build_pairs<'a>(
         }
         pairs.push(Pair {
             label: label.clone(),
+            sequence_labels: 1,
             refs: reference.into_iter().collect(),
             primary_ref,
             previous_value: None,
@@ -4232,6 +4252,23 @@ fn materialize(
     let mut diagnostics = Vec::new();
     let mut anchors: HashMap<String, Vec<Anchor>> = HashMap::new();
     let mut pair_claims = Vec::new();
+    let observed_pair =
+        |pair: &Pair| !pair.label.repaired && pair.refs.iter().any(|reference| !reference.repaired);
+    // Count after detached-reference recovery, once per distinct numeric label.
+    // The denominator remains the full pre-filter run saved by the selector.
+    let mut observed_sequences = HashMap::<(usize, bool), usize>::new();
+    let mut note_sequences = HashMap::<(usize, bool), usize>::new();
+    for pair in &pairs {
+        let line = &lines[pair.label.line];
+        if pair.label.value.is_some() && line.zone == Zone::Note && !line.region_witness_demoted {
+            *note_sequences.entry((pair.restart_sequence, pair.endnote)).or_default() += 1;
+        }
+        if pair.label.value.is_some() && observed_pair(pair) {
+            *observed_sequences
+                .entry((pair.restart_sequence, pair.endnote))
+                .or_default() += 1;
+        }
+    }
     for (index, pair) in pairs.iter().enumerate() {
         let label_line = &lines[pair.label.line];
         let next = pairs.get(index + 1);
@@ -4311,6 +4348,8 @@ fn materialize(
             body_lines = bounded;
         }
         let mut parts = Vec::new();
+        let mut source_spans = Vec::new();
+        let mut output_position = 0;
         for line in &body_lines {
             let mut text = line.text.as_str();
             if line.id == label_line.id {
@@ -4326,10 +4365,20 @@ fn materialize(
             if text.is_empty() {
                 continue;
             }
+            if !parts.is_empty() { output_position += 1; }
+            let source_start = legal_structure_model::utf16_len(&line.text[..line.text.len()-text.len()]);
+            let length = legal_structure_model::utf16_len(text);
+            source_spans.push(legal_pdf_core::model::SourceTextSpan {start:output_position,end:output_position+length,
+                line_id:line.id.clone(),source_start,source_end:source_start+length});
+            output_position += length;
             parts.push(text);
         }
         let display = pair.label.note_id();
-        let body = parts.join(" ").trim().to_owned();
+        let joined = parts.join(" ");
+        let leading = legal_structure_model::utf16_len(&joined[..joined.len()-joined.trim_start().len()]);
+        let body = joined.trim().to_owned();
+        let stop = leading + legal_structure_model::utf16_len(&body);
+        source_spans = source_spans.iter().filter_map(|span| span.retain(leading,stop,0)).collect();
         let body = if body.is_empty() {
             display.clone()
         } else {
@@ -4365,6 +4414,7 @@ fn materialize(
             diagnostics.push(diagnostic);
         }
         footnotes.push(Footnote {
+            source_spans,
             pair_id: pair.pair_id.clone(),
             label: display,
             occurrence: *occurrence,
@@ -4391,6 +4441,25 @@ fn materialize(
         });
         pair_claims.push(NotePairClaim {
             pair_id: pair.pair_id.clone(),
+            support: legal_pdf_core::model::NotePairSupportV2 {
+                sequence_id: pair.restart_sequence,
+                sequence_labels: pair.sequence_labels,
+                sequence_observed_pairs: if pair.label.value.is_some() {
+                    observed_sequences.get(&(pair.restart_sequence, pair.endnote)).copied().unwrap_or(0)
+                } else {
+                    usize::from(observed_pair(pair))
+                },
+                sequence_note_labels: if pair.label.value.is_some() {
+                    note_sequences.get(&(pair.restart_sequence, pair.endnote)).copied().unwrap_or(0)
+                } else {
+                    usize::from(label_line.zone == Zone::Note && !label_line.region_witness_demoted)
+                },
+                observed_pair: observed_pair(pair),
+                typographic_reference: pair.refs.iter().any(|reference| {
+                    !reference.repaired && matches!(reference.form, "sup" | "detached" | "symbol")
+                }),
+                note_region: label_line.zone == Zone::Note && !label_line.region_witness_demoted,
+            },
             label: pair.label.note_id(),
             kind: if pair.endnote {
                 NotePairKind::Endnote
@@ -4457,6 +4526,109 @@ mod tests {
     use super::*;
 
     static NO_CITATIONS: BTreeMap<String, Vec<PdfSourceSpan>> = BTreeMap::new();
+
+    #[test]
+    fn paragraph_layout_cannot_veto_a_clean_note_pair() {
+        let page: Page = serde_json::from_value(json!({
+                "id": "page", "index": 0, "number": 1, "width": 600.0, "height": 800.0,
+                "regions": [], "lines": [
+                    {"id":"body", "page_index":0, "page_number":1, "source_index":0,
+                     "reading_order":0, "block_index":0, "text":"The botanical survey recorded a second flowering.¹",
+                     "bbox":[72.0,100.0,500.0,112.0], "region_type":"paragraph"},
+                    {"id":"note", "page_index":0, "page_number":1, "source_index":1,
+                     "reading_order":1, "block_index":1, "text":"1 The field notebook records the observation.",
+                     "bbox":[72.0,700.0,500.0,712.0], "region_type":"footnote",
+                     "note_region_mode":"footnote", "paragraph_label_candidate":true}
+                ]
+            })).unwrap();
+        let result = pair_footnotes(std::slice::from_ref(&page), &NO_CITATIONS, false);
+        assert_eq!(result.pair_claims.len(), 1);
+        let claim = &result.pair_claims[0];
+        assert_eq!(claim.label_anchor.line_id, "note");
+        assert_eq!(claim.reference_anchors[0].line_id, "body");
+        assert!(claim.support.observed_pair);
+        assert_eq!(claim.support.sequence_labels, 1);
+        assert_eq!(claim.support.sequence_observed_pairs, 1);
+        let citation = BTreeMap::from([("note".to_owned(), vec![PdfSourceSpan { start: 0, end: 10 }])]);
+        let supported = pair_footnotes(std::slice::from_ref(&page), &citation, false);
+        assert_eq!(supported.pair_claims.len(), 1, "a citation-shaped label retains independent pairing evidence");
+        let mut excluded = page;
+        excluded.lines[1].suppress_footnote_label = true;
+        assert!(pair_footnotes(&[excluded], &NO_CITATIONS, false)
+            .pair_claims
+            .is_empty());
+    }
+
+    #[test]
+    fn full_document_pairing_distinguishes_parallel_paragraph_and_note_counts() {
+        for endnotes in [false, true] {
+            let superscript = |value: usize| {
+                value
+                    .to_string()
+                    .chars()
+                    .map(|digit| {
+                        ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹']
+                            [digit.to_digit(10).unwrap() as usize]
+                    })
+                    .collect::<String>()
+            };
+            let mut pages = Vec::new();
+            for page_index in 0..if endnotes { 5 } else { 4 } {
+                let mut lines = Vec::new();
+                for value in 1..=12 {
+                    if page_index == (value - 1) / 3 {
+                        lines.push(json!({"id":format!("paragraph-{value}"),
+                                "page_index":page_index, "page_number":page_index+1,
+                                "source_index":lines.len(), "reading_order":lines.len(), "block_index":lines.len(),
+                                "text":format!("[{value}] The garden survey recorded a separate seasonal observation.{}", superscript(value)),
+                                "bbox":[72.0,100.0+(value%3) as f64*40.0,500.0,112.0+(value%3) as f64*40.0], "region_type":"body"}));
+                    }
+                }
+                for value in 1..=12 {
+                    if page_index == if endnotes { 4 } else { (value - 1) / 3 } {
+                        let top = if endnotes {
+                            100.0 + value as f64 * 35.0
+                        } else {
+                            620.0 + (value % 3) as f64 * 35.0
+                        };
+                        lines.push(json!({"id":format!("note-{value}"),
+                                "page_index":page_index, "page_number":page_index+1,
+                                "source_index":lines.len(), "reading_order":lines.len(), "block_index":lines.len(),
+                                "text":format!("{value} Field notebook supporting the seasonal observation."),
+                                "bbox":[72.0,top,500.0,top+10.0], "region_type":"footnote",
+                                "note_region_mode":if endnotes { "endnote" } else { "footnote" }}));
+                    }
+                }
+                pages.push(
+                    serde_json::from_value(json!({"id":format!("page-{page_index}"),
+                        "index":page_index, "number":page_index+1, "width":600.0, "height":800.0,
+                        "lines":lines, "regions":[]}))
+                    .unwrap(),
+                );
+            }
+            let result = pair_footnotes(&pages, &NO_CITATIONS, false);
+            assert_eq!(result.pair_claims.len(), 12, "endnotes={endnotes}");
+            for claim in result.pair_claims {
+                assert_eq!(claim.label_anchor.line_id, format!("note-{}", claim.label));
+                assert_eq!(claim.reference_anchors.len(), 1);
+                assert_eq!(
+                    claim.reference_anchors[0].line_id,
+                    format!("paragraph-{}", claim.label)
+                );
+                assert!(claim.support.observed_pair);
+                assert_eq!(claim.support.sequence_labels, 12);
+                assert_eq!(claim.support.sequence_observed_pairs, 12);
+                assert_eq!(
+                    claim.kind,
+                    if endnotes {
+                        NotePairKind::Endnote
+                    } else {
+                        NotePairKind::Footnote
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn empty_input_keeps_the_oracle_empty_identity() {
@@ -4541,7 +4713,7 @@ mod tests {
         }))
         .unwrap();
 
-        let lines = build_lines(&[page], &NO_CITATIONS);
+        let lines = build_lines(std::slice::from_ref(&page), &NO_CITATIONS);
 
         assert_eq!(
             lines.iter().map(|line| line.idx).collect::<Vec<_>>(),
@@ -4582,7 +4754,7 @@ mod tests {
             "regions": []
         }))
         .unwrap();
-        let lines = build_lines(&[page], &NO_CITATIONS);
+        let lines = build_lines(std::slice::from_ref(&page), &NO_CITATIONS);
         let refs = extract_refs(&lines);
 
         assert_eq!(lines[0].zone, Zone::Body);
@@ -4686,6 +4858,7 @@ mod tests {
             flags: CandidateFlags::default(),
         };
         let pair = |line: usize, value: u32| Pair {
+            sequence_labels: 2,
             label: candidate(line, value),
             refs: Vec::new(),
             primary_ref: None,
@@ -4697,7 +4870,7 @@ mod tests {
             provenance: "test".to_owned(),
         };
 
-        let output = materialize(vec![pair(0, 1), pair(3, 2)], &lines, json!({}));
+        let output = materialize(vec![pair(0, 1), pair(3, 2)], &lines, None);
 
         assert_eq!(
             output.footnotes[0].body_line_ids,
@@ -4799,6 +4972,7 @@ mod tests {
             detached_references: Vec::new(),
             exclude_from_body: false,
             suppress_footnote_label: false,
+            paragraph_label_candidate: false,
             note_region_mode: String::new(),
             region_id: String::new(),
             region_type: "paragraph".to_owned(),

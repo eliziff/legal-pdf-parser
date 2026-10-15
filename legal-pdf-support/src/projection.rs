@@ -1,3 +1,4 @@
+pub use legal_structure_model::parse_ordinal;
 use legal_pdf_core::model::{
     Derivation, DocumentStructure, Footnote, Line, NodeKind, Page, Paragraph,
     PdfExtractionMetadata, ScalarRange, StructureNode, PARSER_VERSION,
@@ -45,6 +46,8 @@ pub struct PdfDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recognized_pages: Option<Vec<PdfTextPage>>,
     passage_pages: Arc<Vec<PdfTextPage>>,
+    #[serde(skip)]
+    printed: OnceLock<PrintedParagraphMap>,
 }
 
 /// Display-space text geometry retained with the prepared document.
@@ -56,6 +59,8 @@ pub struct PdfTextPage {
     pub width: f64,
     pub height: f64,
     pub lines: Vec<PdfTextLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<legal_pdf_core::model::Region>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -65,10 +70,29 @@ pub struct PdfTextLine {
     pub text: String,
     pub rect: [f64; 4],
     pub words: Vec<PdfTextWord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<legal_pdf_core::model::Span>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<legal_pdf_core::model::OcrEvidence>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct PdfTextWord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Line-local Unicode scalar boundaries, matching the physical Word witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inferred_geometry: bool,
     pub text: String,
     pub rect: [f64; 4],
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -183,8 +207,13 @@ impl PdfDocument {
         mut structure: DocumentStructure,
     ) -> legal_pdf_core::Result<Self> {
         let authority_text_units =
-            crate::adapters::to_toa_text_units_from_parts(&paragraphs, &footnotes)?;
-        attach_rendered_text(&paragraphs, &pages, &footnotes, &mut structure);
+            crate::adapters::to_toa_text_units_from_parts(&paragraphs, &footnotes, &structure)?;
+        let joins = attach_manuscript_edits(&paragraphs, &mut structure);
+        attach_source_continuations(&paragraphs, &footnotes, &mut structure);
+        let continuations = structure.continuations.as_deref().unwrap_or_default();
+        structure.joins.extend(joins.into_iter().filter(|(_, required)|
+            required.as_ref().is_none_or(|link| continuations.contains(link))).map(|(join, _)| join));
+        attach_rendered_text(&paragraphs, &pages, &footnotes, &mut structure)?;
         let page_count = pages.len();
         let summary = summary(source_sha256, cache_key, page_count, status, metadata);
         Ok(Self::project(
@@ -211,32 +240,13 @@ impl PdfDocument {
                 source: page.source.clone(),
                 width: page.width,
                 height: page.height,
-                lines: page
-                    .lines
-                    .iter()
-                    .map(|line| PdfTextLine {
-                        id: line.id.clone(),
-                        text: if line.words.is_empty() {
-                            line.text.clone()
-                        } else {
-                            String::new()
-                        },
-                        rect: line.bbox,
-                        words: line
-                            .words
-                            .iter()
-                            .map(|word| PdfTextWord {
-                                text: word.text.clone(),
-                                rect: word.bbox,
-                                underlined: word.underlined,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
+                regions: page.regions.clone(),
+                lines: page.lines.iter().map(physical_text_line).collect(),
             })
             .collect();
         Self {
             passage_pages: Arc::new(Vec::new()),
+            printed: OnceLock::new(),
             recognized_pages: Some(recognized_pages),
             structure,
             pages: pages
@@ -312,33 +322,21 @@ impl PdfDocument {
                     source: page.source.clone(),
                     width: page.width,
                     height: page.height,
-                    // OCR geometry already lives in recognized_pages; do not retain a second copy.
-                    lines: page
-                        .lines
-                        .iter()
-                        .filter(|_| page.source == "native")
-                        .map(|line| PdfTextLine {
-                            id: line.id.clone(),
-                            text: line.text.clone(),
-                            rect: line.bbox,
-                            words: line
-                                .words
-                                .iter()
-                                .map(|word| PdfTextWord {
-                                    text: word.text.clone(),
-                                    rect: word.bbox,
-                                    underlined: word.underlined,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
+                    regions: page.regions.clone(),
+                    lines: page.lines.iter().map(physical_text_line).collect(),
                 })
                 .collect(),
         )
     }
 
     pub fn set_passage_evidence(&mut self, pages: Arc<Vec<PdfTextPage>>) {
-        self.passage_pages = pages;
+        self.printed.take();
+        self.recognized_pages = Some(pages.iter().filter(|page|page.source!="native").cloned().collect());
+        self.passage_pages = Arc::new(pages.iter().map(|page| {
+            let mut evidence=page.clone();
+            if evidence.source!="native" {evidence.lines.clear();evidence.regions.clear();}
+            evidence
+        }).collect());
     }
 
     /// The pages passages are read from: the extraction witnesses, with a recognized scan's
@@ -360,6 +358,7 @@ impl PdfDocument {
                         Some(read) => PdfTextPage {
                             page_number: page.page_number,
                             source: read.source.clone(),
+                            regions: read.regions.clone(),
                             width: page.width,
                             height: page.height,
                             lines: read.lines.iter().map(recognized_witness_line).collect(),
@@ -380,6 +379,7 @@ impl PdfDocument {
     }
 
     pub fn structure_mut(&mut self) -> &mut legal_structure_model::DocumentStructure {
+        self.printed.take();
         &mut self.structure
     }
 
@@ -402,6 +402,7 @@ impl PdfDocument {
             &self.footnotes,
             &self.summary,
             &self.passage_pages,
+            &self.recognized_pages,
         ));
         fingerprint.components.insert("pdf", product.clone());
         fingerprint.result_sha256 =
@@ -411,6 +412,109 @@ impl PdfDocument {
 
     pub fn lookup(&self, request: &PdfLookupRequest) -> PdfStructureLookup {
         structure_lookup(self, request)
+    }
+
+    /// The declared paragraph nodes of this PDF, in reading order.
+    /// Empty where it numbers none: it is then placed by its pages.
+    pub fn printed_paragraphs(&self) -> &[PrintedParagraph] {
+        &self.printed_paragraph_map().paragraphs
+    }
+
+    /// Exact printed membership for geometry, without the text response-size limit.
+    pub fn paragraph_source_ranges(&self, locator: &str) -> (PdfLookupStatus, Vec<ScalarRange>) {
+        let range = numeric_range("paragraph", locator)
+            .or_else(|| parse_ordinal("paragraph", locator).map(|n| (n, n)));
+        let Some((from, to)) = range.filter(|(a, b)| a <= b && b - a < 100) else {
+            return (PdfLookupStatus::Invalid, Vec::new());
+        };
+        match self.paragraph_range(from, to) {
+            Ok(paragraphs) => {
+                let ids = paragraphs.iter().map(|paragraph| paragraph.id.as_str()).collect::<HashSet<_>>();
+                let mut ranges = self.structure.nodes.iter().filter(|node| ids.contains(node.id.as_str()))
+                    .flat_map(|node| if node.ranges.is_empty() { std::slice::from_ref(&node.range) }
+                        else { &node.ranges }).copied().collect();
+                ScalarRange::normalize_union(&mut ranges);
+                (PdfLookupStatus::Found, ranges)
+            }
+            Err(status) => (status, Vec::new()),
+        }
+    }
+
+    fn paragraph_range(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> Result<&[PrintedParagraph], PdfLookupStatus> {
+        let mapping = self.printed_paragraph_map();
+        if mapping.status.is_empty() {
+            return Err(PdfLookupStatus::Unavailable);
+        }
+        for number in from..=to {
+            let status = mapping
+                .status
+                .get(&number)
+                .copied()
+                .unwrap_or(PdfLookupStatus::NotFound);
+            if status != PdfLookupStatus::Found {
+                return Err(status);
+            }
+        }
+        let paragraphs = &mapping.paragraphs;
+        let start = paragraphs
+            .iter()
+            .position(|p| p.number == from)
+            .ok_or(PdfLookupStatus::Unavailable)?;
+        let end = paragraphs
+            .iter()
+            .position(|p| p.number == to)
+            .filter(|end| *end >= start)
+            .ok_or(PdfLookupStatus::Unavailable)?;
+        Ok(&paragraphs[start..=end])
+    }
+
+    fn printed_paragraph_map(&self) -> &PrintedParagraphMap {
+        self.printed.get_or_init(|| self.read_printed_paragraphs())
+    }
+
+    fn read_printed_paragraphs(&self) -> PrintedParagraphMap {
+        let mut status = HashMap::new();
+        let mut paragraphs = Vec::new();
+        for node in self
+            .structure
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Paragraph)
+        {
+            let Some(number) = node
+                .label
+                .as_deref()
+                .and_then(|label| parse_ordinal("paragraph", label))
+            else {
+                continue;
+            };
+            if status.insert(number, PdfLookupStatus::Found).is_some() {
+                status.insert(number, PdfLookupStatus::Ambiguous);
+                continue;
+            }
+            let range = self.structure.query_range(node);
+            paragraphs.push(PrintedParagraph {
+                id: node.id.clone(),
+                number,
+                start: range.start,
+                end: range.end,
+                ranges: self.structure.query_ranges(node).into_owned(),
+                page_numbers: node
+                    .page_indexes
+                    .iter()
+                    .map(|page| (*page + 1) as u32)
+                    .collect(),
+                line_ids: node.line_ids.clone(),
+            });
+        }
+        paragraphs
+            .retain(|paragraph| status.get(&paragraph.number) == Some(&PdfLookupStatus::Found));
+        paragraphs.sort_by_key(|paragraph| (paragraph.start, paragraph.end));
+        PrintedParagraphMap { paragraphs, status }
     }
 
     /// Every page's text, in page order, as a page lookup returns it: empty where
@@ -423,7 +527,7 @@ impl PdfDocument {
             .map(|page| {
                 let exact = nodes
                     .get(page.id.as_str())
-                    .is_some_and(|node| !rendered_slice(&text, node).is_empty());
+                    .is_some_and(|node| !rendered_slice(&text, &self.structure, node).is_empty());
                 if exact {
                     page.evidence_text.as_str()
                 } else {
@@ -431,6 +535,18 @@ impl PdfDocument {
                 }
             })
             .collect()
+    }
+}
+
+fn physical_text_line(line:&Line)->PdfTextLine {
+    PdfTextLine {
+        id:line.id.clone(),text:line.text.clone(),rect:line.bbox,
+        spans:line.spans.clone(),ocr:line.ocr.clone(),region_id:line.region_id.clone(),
+        region_type:line.region_type.clone(),source:line.source.clone(),
+        words:line.words.iter().map(|word|PdfTextWord {
+            id:word.id.clone(),text:word.text.clone(),rect:word.bbox,
+            start:Some(word.start),end:Some(word.end),inferred_geometry:false,underlined:word.underlined,
+        }).collect(),
     }
 }
 
@@ -455,6 +571,7 @@ fn recognized_witness_line(line: &PdfTextLine) -> PdfTextLine {
                 let start = at;
                 at += word.chars().count() + 1;
                 (!word.is_empty()).then(|| PdfTextWord {
+                    id:String::new(),start:Some(start),end:Some(at-1),inferred_geometry:true,
                     underlined: false,
                     text: word.to_owned(),
                     rect: [
@@ -474,7 +591,30 @@ fn recognized_witness_line(line: &PdfTextLine) -> PdfTextLine {
         text,
         rect: line.rect,
         words,
+        spans:line.spans.clone(),ocr:line.ocr.clone(),region_id:line.region_id.clone(),
+        region_type:line.region_type.clone(),source:line.source.clone(),
     }
+}
+
+struct PrintedParagraphMap {
+    paragraphs: Vec<PrintedParagraph>,
+    status: HashMap<usize, PdfLookupStatus>,
+}
+
+/// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number, its span of the
+/// query text in UTF-16 code units, the pages it is on and its native lines.
+/// `ranges` is exact membership; `start` and `end` only position its envelope.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintedParagraph {
+    #[serde(skip)]
+    id: String,
+    pub number: usize,
+    pub start: usize,
+    pub end: usize,
+    pub ranges: Vec<ScalarRange>,
+    pub page_numbers: Vec<u32>,
+    pub line_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -630,10 +770,13 @@ fn join_page_lines(lines: Vec<Line>) -> String {
     output
 }
 
-fn rendered_slice<'a>(text: &ScalarText<'a>, node: &StructureNode) -> &'a str {
-    node.rendered_range
-        .and_then(|range| text.slice_utf16(range.start..range.end))
-        .unwrap_or_default()
+fn range_text(text: &ScalarText<'_>, ranges: &[ScalarRange]) -> String {
+    ranges.iter().filter_map(|range| text.slice_utf16(range.start..range.end))
+        .filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+fn rendered_slice(text: &ScalarText<'_>, document: &DocumentStructure, node: &StructureNode) -> String {
+    range_text(text, &document.query_ranges(node))
 }
 
 fn section_nodes(document: &PdfDocument) -> Vec<&StructureNode> {
@@ -645,18 +788,11 @@ fn section_nodes(document: &PdfDocument) -> Vec<&StructureNode> {
         // to look up.
         .filter(|node| {
             node.kind == NodeKind::Section
-                && node.locator_kind.as_deref().is_some_and(|kind| !kind.is_empty())
+                && node
+                    .locator_kind
+                    .as_deref()
+                    .is_some_and(|kind| !kind.is_empty())
         })
-        .collect()
-}
-
-fn paragraph_nodes<'a>(document: &'a PdfDocument, text: &ScalarText<'_>) -> Vec<&'a StructureNode> {
-    document
-        .structure
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, NodeKind::Prose | NodeKind::Heading))
-        .filter(|node| !rendered_slice(text, node).is_empty())
         .collect()
 }
 
@@ -669,46 +805,36 @@ fn nodes_by_id(document: &PdfDocument) -> HashMap<&str, &StructureNode> {
         .collect()
 }
 
-fn paragraph_unit(
+/// A declared paragraph as a lookup unit, retaining its graph identity.
+fn printed_unit(
     text: &ScalarText<'_>,
-    pages: &HashMap<usize, &ProjectionPage>,
-    paragraph: &StructureNode,
-    number: usize,
+    document: &PdfDocument,
+    paragraph: &PrintedParagraph,
 ) -> PdfLookupUnit {
     let page = paragraph
-        .page_indexes
+        .page_numbers
         .first()
-        .and_then(|page| pages.get(page));
+        .and_then(|number| document.pages.iter().find(|page| page.number == *number));
     PdfLookupUnit {
-        id: if paragraph.id.is_empty() {
-            format!("paragraph-{number}")
-        } else {
-            paragraph.id.clone()
-        },
+        id: paragraph.id.clone(),
         kind: "paragraph",
-        locator: format!("paragraph {number}"),
-        text: rendered_slice(text, paragraph).to_owned(),
-        page_numbers: page.map_or_else(Vec::new, |item| vec![item.number]),
+        locator: format!("paragraph {}", paragraph.number),
+        text: range_text(text, &paragraph.ranges),
+        page_numbers: paragraph.page_numbers.clone(),
         confidence: page.map(|item| item.text_quality.clamp(0.0, 1.0)),
         confidence_basis: if page.is_some() {
             "page_text_quality"
         } else {
             "unavailable"
         },
-        provenance: format!(
-            "legalpdf:{}",
-            match paragraph.kind {
-                NodeKind::Prose => "body",
-                NodeKind::Heading => "heading",
-                _ => "unknown",
-            }
-        ),
+        provenance: "legalpdf:printed".to_owned(),
         proposition: None,
         note: None,
     }
 }
 
 fn page_unit(
+    document: &DocumentStructure,
     text: &ScalarText<'_>,
     nodes: &HashMap<&str, &StructureNode>,
     page: &ProjectionPage,
@@ -716,7 +842,7 @@ fn page_unit(
     let text = nodes
         .get(page.id.as_str())
         .copied()
-        .map(|node| rendered_slice(text, node).to_owned())
+        .map(|node| rendered_slice(text, document, node))
         .unwrap_or_default();
     PdfLookupUnit {
         id: if page.id.is_empty() {
@@ -779,6 +905,7 @@ fn footnote_unit(note: &ProjectionFootnote) -> PdfLookupUnit {
 }
 
 fn section_unit(
+    document: &DocumentStructure,
     text: &ScalarText<'_>,
     pages: &HashMap<usize, &ProjectionPage>,
     section: &StructureNode,
@@ -808,7 +935,7 @@ fn section_unit(
             .unwrap_or(&section.id)
             .trim()
             .to_owned(),
-        text: rendered_slice(text, section).trim().to_owned(),
+        text: rendered_slice(text, document, section).trim().to_owned(),
         page_numbers,
         confidence,
         confidence_basis: if confidence.is_some() {
@@ -827,21 +954,6 @@ fn section_unit(
     }
 }
 
-pub fn parse_ordinal(kind: &str, raw: &str) -> Option<usize> {
-    static PAGE: OnceLock<Regex> = OnceLock::new();
-    static PARAGRAPH: OnceLock<Regex> = OnceLock::new();
-    let value = nfkc_text(raw);
-    let captures = if kind == "page" {
-        PAGE.get_or_init(|| {
-            Regex::new(r"(?i)^#?\s*\[?\s*(?:(?:pages?|pp?\.?)[\s:_=-]*)?0*(\d{1,6})\s*\]?$")
-                .unwrap()
-        })
-        .captures(value.trim())
-    } else {
-        PARAGRAPH.get_or_init(|| Regex::new(r"(?i)^#?\s*(?:(?:paragraphs?|paras?|pars?|¶)\.?\s*)?(?:(?:paragraph|para|par)[\s:_=-]*)?0*(\d{1,6})$" ).unwrap()).captures(value.trim())
-    }?;
-    captures.get(1)?.as_str().parse().ok()
-}
 
 pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
     static RANGE: OnceLock<Regex> = OnceLock::new();
@@ -1070,26 +1182,29 @@ fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest) -> PdfStru
             let text = ScalarText::new(document.structure.query_text());
             let nodes = nodes_by_id(document);
             return finish(document, input, document.pages.len(), start, end, |index| {
-                page_unit(&text, &nodes, &document.pages[index])
+                page_unit(&document.structure, &text, &nodes, &document.pages[index])
             });
         }
-        let text = ScalarText::new(document.structure.query_text());
-        let paragraphs = paragraph_nodes(document, &text);
-        let position = |number: usize| {
-            number
-                .checked_sub(1)
-                .filter(|index| *index < paragraphs.len())
+        if end_number - start_number >= MAX_UNITS {
+            return result(
+                input,
+                PdfLookupStatus::Invalid,
+                Some("Paragraph range exceeds the lookup limit".to_owned()),
+            );
+        }
+        let selected = match document.paragraph_range(start_number, end_number) {
+            Ok(selected) => selected,
+            Err(status) => return result(input, status, None),
         };
-        let (Some(start), Some(end)) = (position(start_number), position(end_number)) else {
-            return result(input, PdfLookupStatus::NotFound, None);
-        };
-        let pages: HashMap<_, _> = document
-            .pages
+        let printed = document.printed_paragraphs();
+        let start = printed
             .iter()
-            .map(|page| (page.index, page))
-            .collect();
-        return finish(document, input, paragraphs.len(), start, end, |index| {
-            paragraph_unit(&text, &pages, paragraphs[index], index + 1)
+            .position(|p| std::ptr::eq(p, &selected[0]))
+            .unwrap();
+        let end = start + selected.len() - 1;
+        let text = ScalarText::new(document.structure.query_text());
+        return finish(document, input, printed.len(), start, end, |index| {
+            printed_unit(&text, document, &printed[index])
         });
     }
     if kind == "footnote" {
@@ -1172,7 +1287,7 @@ fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest) -> PdfStru
         .map(|page| (page.index, page))
         .collect();
     finish(document, input, sections.len(), index, index, |index| {
-        section_unit(&text, &pages, sections[index], index)
+        section_unit(&document.structure, &text, &pages, sections[index], index)
     })
 }
 
@@ -1188,16 +1303,302 @@ fn extend_range(range: Option<ScalarRange>, next: ScalarRange) -> Option<ScalarR
     }))
 }
 
+/// Preserve a native producer's witnessed dehyphenation as a manuscript-only edit.
+fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut DocumentStructure)
+    -> Vec<(legal_structure_model::SourceJoin, Option<legal_structure_model::SourceContinuation>)> {
+    let source = ScalarText::new(&structure.text);
+    let fragments: HashMap<_, _> = structure.source_fragments.iter()
+        .map(|fragment| (fragment.id.as_str(), fragment)).collect();
+    let mut edits = legal_structure_model::ManuscriptEdits::new();
+    let mut joins = Vec::new();
+    let mut diagnostics = Vec::new();
+    for paragraph in paragraphs {
+        let Some(node) = structure.nodes.iter().find(|node| node.id == paragraph.id) else { continue; };
+        let own = if matches!(node.kind, NodeKind::Heading)
+            || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
+            node.heading_range.as_ref().map(std::slice::from_ref)
+        } else { None }.unwrap_or_else(|| {
+            if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }
+        });
+        let output = ScalarText::new(&paragraph.text);
+        for pair in paragraph.source_spans.windows(2) {
+            let left = &pair[0];
+            let right = &pair[1];
+            let discover = || {
+                if left.line_id == right.line_id || output.slice_utf16(left.end..right.start) != Some("") {
+                    return None;
+                }
+                let a = *fragments.get(left.line_id.as_str())?;
+                let b = *fragments.get(right.line_id.as_str())?;
+                for (span, fragment) in [(left, a), (right, b)] {
+                    let start = fragment.range.start.checked_add(span.source_start)?;
+                    let end = fragment.range.start.checked_add(span.source_end)?;
+                    if span.start >= span.end || span.source_start >= span.source_end
+                        || end > fragment.range.end || span.end - span.start != end - start
+                        || !own.iter().any(|range| range.start <= fragment.range.start && fragment.range.end <= range.end)
+                        || output.slice_utf16(span.start..span.end).is_none()
+                        || output.slice_utf16(span.start..span.end) != source.slice_utf16(start..end) {
+                        return None;
+                    }
+                }
+                let original = source.slice_utf16(a.range.start..a.range.end)?;
+                let coordinates = ScalarText::new(original);
+                let omitted_end = left.source_end.checked_add(1)?;
+                let omitted = coordinates.slice_utf16(left.source_end..omitted_end)?;
+                if !matches!(omitted, "-" | "\u{00ad}" | "\u{00ac}")
+                    || omitted_end != a.range.end - a.range.start
+                    || right.source_start != 0
+                    || !output.slice_utf16(right.start..right.end)?.chars().next().is_some_and(char::is_lowercase) {
+                    return None;
+                }
+                let start = coordinates.scalar_at_utf16(left.source_end)?;
+                let end = coordinates.scalar_at_utf16(omitted_end)?;
+                let edit = (start, end, String::new());
+                if structure.manuscript_edits.get(&left.line_id).is_some_and(|existing| !existing.contains(&edit)) {
+                    return None;
+                }
+                {
+                    // No competing leaf ownership or intervening member may change these seed starts.
+                    if a.range.start >= b.range.start || structure.source_fragments.iter().any(|fragment|
+                        a.range.start < fragment.range.start && fragment.range.start < b.range.start
+                        && own.iter().any(|range| range.start < fragment.range.end && fragment.range.start < range.end))
+                        || structure.nodes.iter().any(|other| other.id != node.id
+                            && (other.role.is_some() || matches!(other.kind,
+                                NodeKind::Prose | NodeKind::Paragraph | NodeKind::Section | NodeKind::ListItem
+                                | NodeKind::Heading | NodeKind::Footnote | NodeKind::Endnote))
+                            && (if other.ranges.is_empty() { std::slice::from_ref(&other.range) } else { &other.ranges })
+                                .iter().any(|range| [a.range, b.range].iter().any(|part|
+                                    range.start < part.end && part.start < range.end))) {
+                        return None;
+                    }
+                    if structure.joins.iter().any(|join| join.from == a.range.start
+                        && (join.to != b.range.start || !join.separator.is_empty())) { return None; }
+                }
+                let continuation = if a.page_index != b.page_index {
+                    let first = |page| structure.source_fragments.iter().filter(|fragment| fragment.page_index == page)
+                        .flat_map(|fragment| own.iter().filter_map(move |range| {
+                            let start = range.start.max(fragment.range.start);
+                            (start < range.end.min(fragment.range.end)).then_some(start)
+                        })).min();
+                    Some(legal_structure_model::SourceContinuation {
+                        kind: if node.kind == NodeKind::Heading || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
+                            legal_structure_model::ContinuationKind::Heading
+                        } else { legal_structure_model::ContinuationKind::Paragraph },
+                        from: first(a.page_index)?, to: first(b.page_index)?, separator: Some(String::new()),
+                    })
+                } else { None };
+                Some((a, b, edit, ScalarRange {
+                    start: a.range.start + left.source_end, end: a.range.start + omitted_end,
+                }, continuation))
+            };
+            let Some((a, b, edit, range, continuation)) = discover() else { continue; };
+            if !structure.manuscript_edits.contains_key(&left.line_id) {
+                let line = edits.entry(left.line_id.clone()).or_default();
+                if !line.contains(&edit) { line.push(edit); }
+                diagnostics.push(legal_structure_model::StructureDiagnostic {
+                    code: "native_manuscript_dehyphenation".to_owned(),
+                    severity: legal_structure_model::DiagnosticSeverity::Info,
+                    ranges: vec![range], node_ids: vec![node.id.clone()],
+                });
+            }
+            if !structure.joins.iter().any(|join| join.from == a.range.start)
+                && !joins.iter().any(|(join, _): &(legal_structure_model::SourceJoin, _)| join.from == a.range.start) {
+                joins.push((legal_structure_model::SourceJoin { from: a.range.start,
+                    to: b.range.start, separator: String::new() }, continuation));
+            }
+        }
+    }
+    for line in edits.values_mut() { line.sort_by_key(|edit| (edit.0, edit.1)); }
+    structure.manuscript_edits.extend(edits);
+    structure.diagnostics.extend(diagnostics);
+    joins
+}
+
+/// Retain only fully mapped page seams from a single native logical producer.
+/// Source endpoints name fragment starts; producer run ends only delimit the separator.
+fn attach_source_continuations(
+    paragraphs: &[Paragraph],
+    footnotes: &[Footnote],
+    structure: &mut DocumentStructure,
+) {
+    if structure.continuations.is_some() {
+        return;
+    }
+    let source = ScalarText::new(&structure.text);
+    let fragments: HashMap<_, _> = structure.source_fragments.iter()
+        .map(|fragment| (fragment.id.as_str(), fragment)).collect();
+    let nodes: HashMap<_, _> = structure.nodes.iter()
+        .map(|node| (node.id.as_str(), node)).collect();
+    let links = |node: &StructureNode, produced: &str,
+                 spans: &[legal_pdf_core::model::SourceTextSpan], kind| {
+        let heading = node.kind == NodeKind::Heading
+            || node.role == Some(legal_structure_model::PrimaryRole::Heading);
+        let own = heading.then_some(node.heading_range.as_ref()).flatten()
+            .map(std::slice::from_ref).unwrap_or_else(|| {
+                if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }
+            });
+        let output = ScalarText::new(produced);
+        let mut starts = HashMap::<usize, usize>::new();
+        let mut ends = HashMap::<usize, usize>::new();
+        let mut member_lines = HashSet::new();
+        for fragment in &structure.source_fragments {
+            for range in own {
+                let start = range.start.max(fragment.range.start);
+                let end = range.end.min(fragment.range.end);
+                if start < end {
+                    starts.entry(fragment.page_index).and_modify(|at| *at = (*at).min(start)).or_insert(start);
+                    ends.entry(fragment.page_index).and_modify(|at| *at = (*at).max(end)).or_insert(end);
+                    member_lines.insert(fragment.id.as_str());
+                }
+            }
+        }
+        let mut pages = Vec::<(usize, usize, usize)>::new();
+        let mut mapped_lines = HashSet::new();
+        let mut prior_end = 0;
+        for (index, span) in spans.iter().enumerate() {
+            let fragment = *fragments.get(span.line_id.as_str())?;
+            let start = fragment.range.start.checked_add(span.source_start)?;
+            let end = fragment.range.start.checked_add(span.source_end)?;
+            if span.start < prior_end || span.start >= span.end || span.source_start >= span.source_end
+                || end > fragment.range.end || span.end - span.start != end - start
+                || !own.iter().any(|range| range.start <= start && end <= range.end)
+                || output.slice_utf16(span.start..span.end).is_none()
+                || output.slice_utf16(span.start..span.end) != source.slice_utf16(start..end) {
+                return None;
+            }
+            prior_end = span.end;
+            mapped_lines.insert(span.line_id.as_str());
+            if let Some(last) = pages.last_mut().filter(|last| last.0 == fragment.page_index) {
+                last.2 = index;
+            } else {
+                if pages.iter().any(|page| page.0 == fragment.page_index) { return None; }
+                pages.push((fragment.page_index, index, index));
+            }
+        }
+        // A partial producer map must not split the native object into partial facts.
+        if mapped_lines != member_lines || pages.len() != starts.len() { return None; }
+        let mut result = Vec::new();
+        for pair in pages.windows(2) {
+            let from = *starts.get(&pair[0].0)?;
+            let to = *starts.get(&pair[1].0)?;
+            let left = &spans[pair[0].2];
+            let right = &spans[pair[1].1];
+            let separator = output.slice_utf16(left.end..right.start)?;
+            let left_end = fragments.get(left.line_id.as_str())?.range.start + left.source_end;
+            let right_start = fragments.get(right.line_id.as_str())?.range.start + right.source_start;
+            let suffix = source.slice_utf16(left_end..*ends.get(&pair[0].0)?)?;
+            let prefix = source.slice_utf16(to..right_start)?;
+            let left_fragment = fragments.get(left.line_id.as_str())?;
+            let left_text = ScalarText::new(source.slice_utf16(left_fragment.range.start..left_fragment.range.end)?);
+            let scalar = left_text.scalar_at_utf16(left.source_end)?;
+            let removed_hyphen = suffix.chars().next().is_some_and(|glyph| matches!(glyph, '-' | '\u{00ad}' | '\u{00ac}'))
+                && suffix.chars().count() == 1 && prefix.is_empty()
+                && structure.manuscript_edits.get(&left.line_id).is_some_and(|edits|
+                    edits.iter().any(|(start, end, replacement)| *start == scalar && *end == scalar + 1 && replacement.is_empty()));
+            // Only an explicit matching manuscript edit may remove the printed seam glyph.
+            if from >= to || !separator.chars().all(char::is_whitespace)
+                || !(suffix.chars().all(char::is_whitespace) || removed_hyphen)
+                || !prefix.chars().all(char::is_whitespace) {
+                return None;
+            }
+            result.push(legal_structure_model::SourceContinuation {
+                kind, from, to, separator: Some(separator.to_owned()),
+            });
+        }
+        Some(result)
+    };
+    let mut continuations = Vec::new();
+    for paragraph in paragraphs {
+        if let Some(node) = nodes.get(paragraph.id.as_str()) {
+            let kind = if node.kind == NodeKind::Heading
+                || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
+                legal_structure_model::ContinuationKind::Heading
+            } else { legal_structure_model::ContinuationKind::Paragraph };
+            if let Some(found) = links(node, &paragraph.text, &paragraph.source_spans, kind) {
+                continuations.extend(found);
+            }
+        }
+    }
+    for note in footnotes {
+        let node = structure.notes.iter().find(|entry| entry.id == note.pair_id)
+            .and_then(|entry| entry.node_id.as_deref()).and_then(|id| nodes.get(id));
+        if let Some(node) = node {
+            if let Some(found) = links(node, &note.body, &note.source_spans,
+                legal_structure_model::ContinuationKind::Note) {
+                continuations.extend(found);
+            }
+        }
+    }
+    structure.continuations = Some(continuations);
+}
+
+struct RenderedSourceLine<'a> {
+    source: ScalarRange,
+    target: ScalarRange,
+    text: &'a str,
+    edits: &'a [(usize, usize, String)],
+    trimmed_start: usize,
+    trimmed_end: usize,
+}
+
+impl RenderedSourceLine<'_> {
+    fn boundary(&self, source_offset: usize, end: bool) -> legal_pdf_core::Result<usize> {
+        let original = ScalarText::new(self.text);
+        let local = source_offset - self.source.start;
+        let scalar = original.scalar_at_utf16(local).ok_or_else(||
+            legal_pdf_core::Error::Message("Manuscript membership splits a source character".into()))?;
+        let mut removed = 0;
+        let mut inserted = 0;
+        for (start, stop, replacement) in self.edits {
+            if *start < scalar && scalar < *stop {
+                return Err(legal_pdf_core::Error::Message(
+                    "Manuscript membership splits a normalization edit".into()));
+            }
+            // Boundary insertions belong to the following member, except at the line end.
+            if *stop < scalar || *stop == scalar && (*start < *stop || end && local == utf16_len(self.text)) {
+                removed += original.utf16_at_scalar(*stop).unwrap() - original.utf16_at_scalar(*start).unwrap();
+                inserted += utf16_len(replacement);
+            }
+        }
+        let position = local - removed + inserted;
+        Ok(self.target.start + position.clamp(self.trimmed_start, self.trimmed_end) - self.trimmed_start)
+    }
+}
+
+fn manuscript_line(text: &str, edits: &[(usize, usize, String)]) -> legal_pdf_core::Result<String> {
+    let source = ScalarText::new(text);
+    let mut output = String::new();
+    let mut cursor = 0;
+    let mut prior_start = None;
+    for (start, end, replacement) in edits {
+        if start > end || *start < cursor || prior_start.is_some_and(|prior| *start <= prior) {
+            return Err(legal_pdf_core::Error::Message("Invalid manuscript edit order".into()));
+        }
+        let unchanged = source.slice(cursor..*start).ok_or_else(||
+            legal_pdf_core::Error::Message("Manuscript edit starts outside its source line".into()))?;
+        if source.utf16_at_scalar(*end).is_none() {
+            return Err(legal_pdf_core::Error::Message("Manuscript edit ends outside its source line".into()));
+        }
+        output.push_str(unchanged);
+        output.push_str(replacement);
+        cursor = *end;
+        prior_start = Some(*start);
+    }
+    output.push_str(source.slice_utf16(source.utf16_at_scalar(cursor).unwrap()..source.utf16_len()).unwrap());
+    Ok(output)
+}
+
 fn attach_rendered_text(
     paragraphs: &[Paragraph],
     pages: &[Page],
     footnotes: &[Footnote],
     structure: &mut DocumentStructure,
-) {
+) -> legal_pdf_core::Result<()> {
+    let source = ScalarText::new(&structure.text);
+    let fragments: HashMap<_, _> = structure.source_fragments.iter()
+        .map(|fragment| (fragment.id.as_str(), fragment)).collect();
     let mut text = String::with_capacity(structure.text.len());
-    let mut id_ranges = HashMap::new();
-    let mut line_ranges = HashMap::new();
-    let mut page_ranges: HashMap<usize, ScalarRange> = HashMap::new();
+    let mut mappings = Vec::new();
     let mut owners = HashMap::new();
     for paragraph in paragraphs {
         for line in &paragraph.line_ids {
@@ -1212,89 +1613,92 @@ fn attach_rendered_text(
         }
     }
     let mut position = 0;
+    let mut previous_source_start = None;
     for page in pages {
-        let mut lines: Vec<_> = page
-            .lines
-            .iter()
-            .filter(|line| !line.text.trim().is_empty())
-            .collect();
+        let mut lines: Vec<_> = page.lines.iter().collect();
         lines.sort_by_key(|line| (line.reading_order, line.source_index));
-        // Classification controls organization, never whether source text survives.
-        // Keep reference glyphs in the body and put each page's note text last.
         let mut previous_owner = None;
         for notes in [false, true] {
-            if notes {
-                previous_owner = None;
-            }
+            if notes { previous_owner = None; }
             for line in lines.iter().filter(|line| {
                 (note_lines.contains(line.id.as_str())
-                    || matches!(line.region_type.as_str(), "footnote" | "endnote" | "note"))
-                    == notes
+                    || matches!(line.region_type.as_str(), "footnote" | "endnote" | "note")) == notes
             }) {
-                let owner = owners
-                    .get(line.id.as_str())
-                    .copied()
-                    .unwrap_or(line.id.as_str());
+                if line.text.trim().is_empty() && !structure.manuscript_edits.contains_key(&line.id) { continue; }
+                let fragment = fragments.get(line.id.as_str()).ok_or_else(||
+                    legal_pdf_core::Error::Message(format!("Missing PDF source fragment {}", line.id)))?;
+                if fragment.page_index != page.index
+                    || source.slice_utf16(fragment.range.start..fragment.range.end) != Some(line.text.as_str()) {
+                    return Err(legal_pdf_core::Error::Message(format!("PDF source fragment {} no longer matches its extraction", line.id)));
+                }
+                let edits = structure.manuscript_edits.get(&line.id).map(Vec::as_slice).unwrap_or_default();
+                let normalized = manuscript_line(&line.text, edits)?;
+                let trimmed = normalized.trim();
+                // An empty physical member owns no insertion, matching manuscript span projection.
+                if line.text.is_empty() || trimmed.is_empty() { continue; }
+                let owner = owners.get(line.id.as_str()).copied().unwrap_or(line.id.as_str());
                 if !text.is_empty() {
-                    append(
-                        &mut text,
-                        &mut position,
-                        if previous_owner == Some(owner) {
-                            " "
-                        } else {
-                            "\n\n"
-                        },
-                    );
+                    let separator = structure.joins.iter().find(|join|
+                        Some(join.from) == previous_source_start && join.to == fragment.range.start)
+                        .map(|join| join.separator.as_str())
+                        .unwrap_or(if previous_owner == Some(owner) { " " } else { "\n\n" });
+                    append(&mut text, &mut position, separator);
                 }
                 let start = position;
-                append(&mut text, &mut position, line.text.trim());
-                let range = ScalarRange {
-                    start,
-                    end: position,
-                };
-                line_ranges.insert(line.id.as_str(), range);
-                id_ranges
-                    .entry(owner)
-                    .and_modify(|prior: &mut ScalarRange| prior.end = range.end)
-                    .or_insert(range);
-                page_ranges
-                    .entry(page.index)
-                    .and_modify(|prior| prior.end = range.end)
-                    .or_insert(range);
+                let leading = utf16_len(&normalized[..normalized.len() - normalized.trim_start().len()]);
+                append(&mut text, &mut position, trimmed);
+                mappings.push(RenderedSourceLine { source: fragment.range,
+                    target: ScalarRange { start, end: position }, text: &line.text, edits,
+                    trimmed_start: leading, trimmed_end: leading + utf16_len(trimmed) });
                 previous_owner = Some(owner);
+                previous_source_start = Some(fragment.range.start);
             }
         }
-        if let Some(range) = page_ranges.get(&page.index) {
-            id_ranges.insert(page.id.as_str(), *range);
-        }
     }
-
-    for note in &structure.notes {
-        if let Some(range) = id_ranges.get(note.id.as_str()).copied() {
-            id_ranges.insert(note.node_id.as_str(), range);
+    mappings.sort_by_key(|mapping| mapping.source.start);
+    let rendered = ScalarText::new(&text);
+    let project = |membership: &[ScalarRange]| -> legal_pdf_core::Result<Vec<ScalarRange>> {
+        let mut ranges = Vec::<ScalarRange>::new();
+        for range in membership {
+            let first = mappings.partition_point(|mapping| mapping.source.end <= range.start);
+            for mapping in mappings[first..].iter().take_while(|mapping| mapping.source.start < range.end) {
+                let start = range.start.max(mapping.source.start);
+                let end = range.end.min(mapping.source.end);
+                if start < end {
+                    let part = ScalarRange { start: mapping.boundary(start, false)?,
+                        end: mapping.boundary(end, true)? };
+                    if part.start < part.end { ranges.push(part); }
+                }
+            }
         }
-    }
-    for node in &mut structure.nodes {
-        let source_range = id_ranges.get(node.id.as_str()).copied().or_else(|| {
-            node.line_ids
-                .iter()
-                .filter_map(|id| line_ranges.get(id.as_str()))
-                .copied()
-                .fold(None, extend_range)
-        });
-        node.rendered_range = source_range.or_else(|| {
-            if matches!(node.kind, NodeKind::Prose | NodeKind::Heading) {
-                None
+        ranges.sort_by_key(|range| (range.start, range.end));
+        let mut exact = Vec::<ScalarRange>::new();
+        for range in ranges {
+            if let Some(prior) = exact.last_mut().filter(|prior| range.start <= prior.end
+                || rendered.slice_utf16(prior.end..range.start).is_some_and(|gap| gap.chars().all(char::is_whitespace))) {
+                prior.end = prior.end.max(range.end);
             } else {
-                node.page_indexes
-                    .first()
-                    .and_then(|page| page_ranges.get(page))
-                    .copied()
+                exact.push(range);
             }
-        });
+        }
+        Ok(exact)
+    };
+    for node in &mut structure.nodes {
+        let own = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
+        node.rendered_membership = project(own)?;
+        let membership = if (matches!(node.kind, NodeKind::Heading | NodeKind::Section)
+            || node.role == Some(legal_structure_model::PrimaryRole::Heading)) && !node.extent.is_empty() {
+            node.extent.as_slice()
+        } else { own };
+        let exact = project(membership)?;
+        // An empty mapping stays empty; a first-page or source-envelope fallback would invent membership.
+        node.rendered_range = Some(exact.iter().copied().fold(None, extend_range)
+            .unwrap_or(ScalarRange { start: 0, end: 0 }));
+        node.rendered_ranges = exact;
     }
-    structure.revision = format!("{:x}", Sha256::digest(text.as_bytes()));
     structure.rendered_text = (text != structure.text).then_some(text);
+    structure.refresh_revision()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1586,10 +1990,9 @@ mod tests {
             document.lookup(&PdfLookupRequest::new("page", "")).status,
             PdfLookupStatus::Invalid
         ));
+        // Nothing here is numbered in print: a paragraph is not its block's position.
         let lookup = document.lookup(&PdfLookupRequest::new("paragraph", "par1"));
-        assert!(matches!(lookup.status, PdfLookupStatus::Found));
-        assert_eq!(lookup.units[0].id, "p");
-        assert_eq!(lookup.units[0].text, "text");
+        assert!(matches!(lookup.status, PdfLookupStatus::Unavailable));
         let page = document.lookup(&PdfLookupRequest::new("page", "1"));
         assert!(matches!(page.status, PdfLookupStatus::Found));
         assert_eq!(page.units[0].text, "text");

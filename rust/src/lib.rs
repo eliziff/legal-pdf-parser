@@ -46,3 +46,11 @@ pub use legal_pdf_support::{
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
+
+#[cfg(feature = "pdf")]
+pub use legal_pdf_witnesses::{outline_training_rows, scope_training_rows, scope_opening_training_rows, span_training_rows, OutlineTrainingRows, ScopeTrainingRows, ScopeOpeningTrainingRows, SpanTrainingRows};
+
+#[cfg(feature = "pdf")]
+pub use legal_pdf_structure::training_source_evidence;
+
+pub use legal_pdf_witnesses::{membership_training_rows, MembershipTrainingRows};

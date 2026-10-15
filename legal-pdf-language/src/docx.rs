@@ -1996,6 +1996,13 @@ fn docx_structure_input(
                     let start = contents.first().map_or_else(empty_at, |(start, _)| *start);
                     let end = contents.last().map_or_else(empty_at, |(_, end)| *end);
                     table_cells.push(legal_structure_model::AuthoritativeTableCell {
+                        ranges: if contents.is_empty() {
+                            vec![legal_structure_model::ScalarRange { start, end }]
+                        } else {
+                            contents.iter().map(|(start, end)| legal_structure_model::ScalarRange {
+                                start: *start, end: *end,
+                            }).collect()
+                        },
                         table: table_index + 1,
                         table_name: None,
                         row: row_index + 1,
