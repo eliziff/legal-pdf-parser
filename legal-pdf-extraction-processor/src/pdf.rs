@@ -785,7 +785,9 @@ fn line_spans(
             flags: item.fidelity.as_ref().map_or_else(
                 || if item.is_italic { 2 } else { 0 } | if item.is_bold { 16 } else { 0 },
                 |fidelity| fidelity.flags,
-            ) | u32::from(superscript),
+            ) | u32::from(superscript)
+                // Invisible text is a recognition layer behind a scan, not glyphs as printed.
+                | if item.render_mode == Some(3) { legal_pdf_core::model::INVISIBLE } else { 0 },
             superscript,
             start: source_span.start,
             end: source_span.end,

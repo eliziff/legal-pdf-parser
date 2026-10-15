@@ -52,6 +52,9 @@ pub fn underlines(word: [f64; 4], line_height: f64, start: f64, end: f64, at: f6
         && end.min(word[2]) - start.max(word[0]) >= 0.6 * width
 }
 
+/// Span flag: the text is drawn invisibly, as a scan's recognition layer is.
+pub const INVISIBLE: u32 = 32;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,6 +68,8 @@ pub struct Span {
     pub font: String,
     #[serde(default)]
     pub size: f64,
+    /// PyMuPDF order: superscript 1, italic 2, serif 4, monospaced 8, bold 16; and
+    /// [`INVISIBLE`] for text drawn invisibly (render mode 3), a recognition layer behind a scan.
     #[serde(default)]
     pub flags: u32,
     #[serde(default)]

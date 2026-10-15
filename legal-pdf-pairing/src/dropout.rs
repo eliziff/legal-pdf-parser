@@ -76,6 +76,14 @@ fn chain(pages: &[Page]) -> (Vec<(usize, usize)>, HashSet<usize>, Vec<(usize, u3
     (order, edges, supported)
 }
 
+/// Whether recognition read the line, the only reading that drops or misreads label digits: our
+/// own recognition, or a scan's invisible recognition layer. Printed glyphs are exact.
+fn recognized(pages: &[Page], order: &[(usize, usize)], position: usize) -> bool {
+    let (page, line) = order[position];
+    let line = &pages[page].lines[line];
+    line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0)
+}
+
 /// Whether a line starts where its neighbouring labels start, within a line's height.
 fn aligned(
     pages: &[Page],
@@ -111,7 +119,7 @@ pub fn repair_label_dropouts(pages: &mut [Page]) -> usize {
             continue;
         }
         let expected = (value + 1).to_string();
-        for position in before + 1..after {
+        for position in (before + 1..after).filter(|&position| recognized(pages, &order, position)) {
             let Some(kept) = label().captures(text(position)).map(|c| c[1].to_owned()) else {
                 continue;
             };
@@ -304,7 +312,9 @@ fn repair_label_runs(pages: &mut [Page]) -> usize {
         }
         let lines = (before + 1..after)
             .filter(|position| {
-                !edges.contains(position) && aligned(pages, &order, *position, [before, after])
+                !edges.contains(position)
+                    && recognized(pages, &order, *position)
+                    && aligned(pages, &order, *position, [before, after])
             })
             .filter_map(|position| {
                 let text = text(position);
