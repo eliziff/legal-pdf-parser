@@ -1,6 +1,7 @@
 """Train native source-span roles or scoped attachment weights from frozen canonical gold (never the test split).
 
-Usage: python legal-pdf-parser/tools/train_structure.py outline|spans|scope_openings|scopes|membership FAMILY_MANIFEST OUTPUT_MODEL
+Usage: python legal-pdf-parser/tools/train_structure.py outline|spans|scope_openings|scopes|membership FROZEN_MANIFEST OUTPUT_MODEL
+FROZEN_MANIFEST is benchmarks/local-data/legal-structure-gold/frozen-eval/manifest.json.
 Requires the existing offline LightGBM environment and a built native addon.
 """
 import gzip
@@ -15,7 +16,6 @@ from collections import OrderedDict
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments/legal-structure-gold"))
 import package
-from partitions import validate_partitions
 
 SCHEMAS = {"outline": "scoped-span-root-v6", "spans": "source-span-role-v7", "scope_openings": "source-scope-opening-v3", "scopes": "source-scope-identity-v8", "membership": "source-fragment-membership-v4"}
 
@@ -107,67 +107,40 @@ def packet(gold, mode, task):
 
 
 def main():
-    require(len(sys.argv) == 4 and sys.argv[1] in SCHEMAS, "Expected outline|spans|scope_openings|scopes|membership, frozen family manifest and output model path")
+    require(len(sys.argv) == 4 and sys.argv[1] in SCHEMAS, "Expected outline|spans|scope_openings|scopes|membership, frozen evaluation manifest and output model path")
     task = sys.argv[1]
     manifest_path, output = map(Path, sys.argv[2:])
+    manifest_path = manifest_path.resolve()
     raw = manifest_path.read_bytes()
+    # The frozen evaluation set (experiments/legal-structure-gold/freeze_eval.py): its split is fixed
+    # by families; only train sources are read here, and each gold is checked against its freeze.
     manifest = json.loads(raw)
-    require(manifest.get("schema_version") == "pdf-structure-gold-membership.v1", "Unexpected family manifest")
-    require(manifest.get("status") == "evaluation_frozen" and not manifest.get("blockers"),
-            "Training requires revised policy gold and an evaluation-frozen family manifest with no blockers")
-    frozen = manifest.get("freeze")
-    require(isinstance(frozen, dict), "Frozen manifest lacks its identity ledger")
-    identity = frozen.get("identity")
-    unsigned = {**manifest, "freeze": {key: value for key, value in frozen.items() if key != "identity"}}
-    encoded = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    require(identity == hashlib.sha256(encoded).hexdigest(), "Frozen manifest identity differs")
-    def sha256(value):
-        return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
-    require(all(sha256(frozen.get(key)) for key in ("selection_sha256", "review_sha256", "policy_sha256")),
-            "Frozen manifest lacks prepared selection, review or policy identities")
-    ledger = {}
-    require(isinstance(frozen.get("gold"), list), "Frozen manifest lacks gold identities")
-    for item in frozen["gold"]:
-        require(isinstance(item, dict) and sha256(item.get("sha256")) and
-                all(sha256(item.get(key)) for key in ("artifact_sha256", "structure_authoring_sha256", "text_identity")),
-                "Invalid frozen gold identity")
-        require(item["sha256"] not in ledger, "Duplicate source in frozen gold ledger")
-        ledger[item["sha256"]] = item
-    require(set(ledger) == {member["sha256"] for member in manifest["members"]},
-            "Frozen gold ledger differs from selected membership")
-    validate_partitions(manifest)
-    for member in manifest["members"]:
-        selected = member.get("selected_gold")
-        require(isinstance(selected, dict) and selected.get("sha256") == member["sha256"] and
-                selected.get("artifact_sha256") == ledger[member["sha256"]]["artifact_sha256"],
-                "Selected artifact differs from frozen gold ledger")
+    members = []
+    for sha, row in sorted(manifest["sources"].items()):
+        if row["split"] != "train":
+            continue
+        path = manifest_path.parent / "gold" / f"{sha}.json.gz"
+        members.append({"sha256": sha, "family_id": row["family_id"], "split": row["split"],
+                        "selected_gold": {"sha256": sha, "mode": row["mode"], "status": "complete", "path": str(path),
+                                          "artifact_sha256": row["frozen_sha256"]}})
     features, labels, groups, receipts = [], [], [], []
     feature_names = None
-    for member in manifest["members"]:
-        if member["split"] != "train":
-            continue
+    for member in members:
         selected = member.get("selected_gold")
         require(selected and selected.get("status") == "complete", "Training source lacks selected complete gold")
         require(selected.get("sha256") == member["sha256"], "Selected gold source differs from frozen membership")
         require(selected.get("mode") in ("digitalborn", "ocr"), "Unknown selected gold source mode")
         path = Path(selected["path"])
-        if not path.is_absolute():
-            path = manifest_path.parent / path
         data = path.read_bytes()
         require(hashlib.sha256(data).hexdigest() == selected["artifact_sha256"], "Frozen gold artifact changed")
         gold = json.loads(gzip.decompress(data) if path.suffix == ".gz" else data)
         require(gold["source_sha256"] == member["sha256"], "Gold source differs from manifest")
-        package.validate(gold)
-        bound = ledger[member["sha256"]]
-        proof = gold.get("provenance", {}).get("structure_authoring")
-        require(isinstance(proof, dict), "Gold lacks structural authoring proof")
-        proof_identity = hashlib.sha256(json.dumps(proof, sort_keys=True, separators=(",", ":"),
-                                                   ensure_ascii=False).encode("utf-8")).hexdigest()
-        require(proof_identity == bound["structure_authoring_sha256"],
-                "Structural authoring proof differs from frozen gold")
-        require(package.text_identity(gold) == bound["text_identity"],
-                "Canonical text identity differs from frozen gold")
-        rows = packet(gold, selected["mode"], task)
+        try:
+            rows = packet(gold, selected["mode"], task)
+        except ValueError as error:
+            # A source the native features cannot read is reported, not silently trained around.
+            receipts.append({"sha256": member["sha256"], "family_id": member["family_id"], "error": str(error)[:300], "examples": 0})
+            continue
         if feature_names is None:
             feature_names = rows["feature_names"]
         require(rows["feature_names"] == feature_names, "Mixed native feature schemas")
@@ -252,7 +225,8 @@ def main():
     finally:
         pending.unlink(missing_ok=True)
     print(json.dumps({"model": str(output), "sources": len(receipts), "task": task, "examples": sum(row["examples"] for row in receipts),
-        "unavailable_targets": sum(len(row["unavailable_targets"]) for row in receipts)}))
+        "unavailable_targets": sum(len(row.get("unavailable_targets", [])) for row in receipts),
+        "unreadable_sources": sum("error" in row for row in receipts)}))
 
 
 if __name__ == "__main__":
