@@ -1,4 +1,5 @@
 use crate::kraken_process::{BllaRuntime, PreparedBllaRuntime};
+use crate::orientation::{place_back, turn, Orientation};
 use crate::tesseract_layout::TesseractLayout;
 #[cfg(feature = "ocr")]
 use hayro::hayro_interpret::InterpreterSettings;
@@ -126,6 +127,8 @@ pub struct KrakenOptions {
     pub cpu_arena: bool,
     pub timeout_seconds: u64,
     pub expected_identity: Option<String>,
+    /// The page-orientation classifier; `orientation.onnx` beside the model when not given.
+    pub orientation: Option<PathBuf>,
 }
 
 impl Default for KrakenOptions {
@@ -155,6 +158,7 @@ impl Default for KrakenOptions {
             cpu_arena: true,
             timeout_seconds: 3600,
             expected_identity: None,
+            orientation: None,
         }
     }
 }
@@ -439,6 +443,7 @@ pub struct KrakenOcr {
     width_scale: f32,
     tesseract_layouts: Vec<TesseractLayout>,
     blla: Option<BllaRuntime>,
+    orientation: Option<Orientation>,
     identity: String,
     name: String,
 }
@@ -453,6 +458,7 @@ pub(crate) struct PreparedNativeKraken {
     codec: PathBuf,
     runtime: PathBuf,
     tesseract_library: PathBuf,
+    orientation: Option<PathBuf>,
     device: String,
     workers: usize,
     threads: usize,
@@ -519,13 +525,22 @@ impl KrakenOcr {
         let (workers, threads) =
             recognition_schedule(options.workers, options.threads, options.backend);
         let layout_identity = provider_asset_sha256(&tesseract_library)?;
+        let orientation = match &options.orientation {
+            Some(path) => Some(canonical_file(path, "orientation model")?),
+            None => Some(model.parent().unwrap_or(Path::new(".")).join("orientation.onnx"))
+                .filter(|path| path.is_file()),
+        };
         let identity = format!(
-            "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}",
+            "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}{}",
             options.backend.name(),
             provider_asset_sha256(&model)?,
             provider_asset_sha256(&codec_path)?,
             provider_asset_sha256(&runtime)?,
             options.input_height,
+            match &orientation {
+                Some(path) => format!(":orientation={}", provider_asset_sha256(path)?),
+                None => String::new(),
+            },
         );
         if options
             .expected_identity
@@ -557,6 +572,7 @@ impl KrakenOcr {
             codec: codec_path,
             runtime,
             tesseract_library,
+            orientation,
             device,
             workers,
             threads,
@@ -585,6 +601,7 @@ impl KrakenOcr {
                     width_scale: 1.0,
                     tesseract_layouts: vec![],
                     blla: Some(blla),
+                    orientation: None,
                     identity,
                     name,
                 });
@@ -616,6 +633,7 @@ impl KrakenOcr {
             })
             .collect::<Result<Vec<_>>>()?;
         let codec = Codec::load(&prepared.codec)?;
+        let orientation = prepared.orientation.as_deref().map(Orientation::open).transpose()?;
         Ok(Self {
             sessions,
             codec: Some(codec),
@@ -626,6 +644,7 @@ impl KrakenOcr {
             width_scale: prepared.width_scale,
             tesseract_layouts,
             blla: None,
+            orientation,
             identity: prepared.identity,
             name: prepared.name,
         })
@@ -746,7 +765,8 @@ impl KrakenOcr {
             let cache = RenderCache::new();
             let interpreter = InterpreterSettings::default();
             let settings = pdf_render_settings(self.dpi);
-            let rendered = render_pdf_pages(&pdf, &cache, &interpreter, &settings, requests, blla)?;
+            let rendered = render_pdf_pages(&pdf, &cache, &interpreter, &settings, requests, blla,
+                self.orientation.as_mut())?;
             return self.finish_rendered_pdf_pages(requests, rendered, blla);
         }
 
@@ -761,6 +781,7 @@ impl KrakenOcr {
         let codec = self.codec.as_ref().expect("fast Kraken codec");
         let layouts = &mut self.tesseract_layouts;
         let sessions = &mut self.sessions;
+        let mut orientation = self.orientation.as_mut();
         std::thread::scope(|scope| -> Result<_> {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let (metadata_sender, metadata_receiver) = std::sync::mpsc::channel();
@@ -786,6 +807,7 @@ impl KrakenOcr {
                         &settings,
                         window,
                         false,
+                        orientation.as_deref_mut(),
                     ) {
                         Ok(rendered) => rendered,
                         Err(error) => {
@@ -1787,9 +1809,9 @@ fn recognize_prepared(
 }
 
 #[cfg(feature = "ocr")]
-/// A rendered image's page, footnote separator, points per pixel and top-left corner on the
-/// page in points.
-type PdfPageMetadata = (usize, Option<f64>, f64, f64, [f64; 2]);
+/// A rendered image's page, footnote separator, points per pixel, top-left corner on the page in
+/// points, and the quarter turns counter-clockwise that stood it upright with its drawn size in pixels.
+type PdfPageMetadata = (usize, Option<f64>, f64, f64, [f64; 2], (u8, f64, f64));
 #[cfg(feature = "ocr")]
 type RenderedPdfPage = (PdfPageMetadata, RenderedPdfImage);
 
@@ -1846,6 +1868,7 @@ fn render_pdf_pages<'a>(
     settings: &RenderSettings,
     requests: &[OcrPageRequest],
     blla: bool,
+    mut orientation: Option<&mut Orientation>,
 ) -> Result<Vec<RenderedPdfPage>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
@@ -1870,16 +1893,28 @@ fn render_pdf_pages<'a>(
         let y_scale = request.height / height as f64;
         let pixels = pixmap.data_as_u8_slice();
         if request.regions.is_empty() {
+            let mut page = RgbaImage::from_raw(width as u32, height as u32, pixels.to_vec())
+                .expect("renderer dimensions match its pixel buffer");
+            let turns = match orientation.as_deref_mut() {
+                Some(orientation) => orientation.upright_turns(&page)?,
+                None => 0,
+            };
+            if turns != 0 {
+                page = turn(&page, turns);
+            }
             let metadata = (
                 request.page_index,
-                super::ocr::raster_separator_y(&pixmap, request.height),
+                // A turned page's rule runs across its print, not across the page as drawn.
+                (turns == 0).then(|| super::ocr::raster_separator_y(&pixmap, request.height)).flatten(),
                 x_scale,
                 y_scale,
                 [0.0, 0.0],
+                (turns, width as f64, height as f64),
             );
+            let (turned_width, turned_height) = (page.width() as usize, page.height() as usize);
             rendered.push((
                 metadata,
-                rendered_image(pixels.to_vec(), width, height, blla),
+                rendered_image(page.into_raw(), turned_width, turned_height, blla),
             ));
             continue;
         }
@@ -1910,6 +1945,7 @@ fn render_pdf_pages<'a>(
                     (x0 as f64 - MARGIN as f64) * x_scale,
                     (y0 as f64 - MARGIN as f64) * y_scale,
                 ],
+                (0, 0.0, 0.0),
             );
             rendered.push((
                 metadata,
@@ -1976,9 +2012,10 @@ fn finish_recognized_pdf_pages(
         })
         .collect();
     let mut at = 0;
-    for ((page_index, separator_y, x_scale, y_scale, origin), mut page) in
+    for ((page_index, separator_y, x_scale, y_scale, origin, (turns, width, height)), mut page) in
         metadata.into_iter().zip(pages)
     {
+        place_back(&mut page.lines, turns, width, height);
         scale_lines(&mut page.lines, x_scale, y_scale);
         translate_lines(&mut page.lines, origin);
         while results[at].page_index != page_index {

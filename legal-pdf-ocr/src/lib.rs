@@ -3,6 +3,8 @@ mod kraken;
 #[cfg(feature = "kraken")]
 mod kraken_process;
 mod ocr;
+#[cfg(feature = "kraken")]
+mod orientation;
 mod separator;
 #[cfg(feature = "kraken")]
 mod tesseract_layout;
