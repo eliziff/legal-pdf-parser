@@ -6,7 +6,6 @@ license = "MIT"
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
-legal-pdf-pairing = { path = "../legal-pdf-pairing" }
 legal-pdf-support = { path = "../legal-pdf-support" }
 legal-pdf-headings = { path = "../legal-pdf-headings" }
 legal-pdf-tables = { path = "../legal-pdf-tables" }
