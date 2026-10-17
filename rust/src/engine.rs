@@ -392,7 +392,9 @@ fn build_document(
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
-    let derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
+    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
+    // A parse completes its structure in its projection; this document stops before it.
+    derived.structure_graph.refresh_revision()?;
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), serde_json::to_value(extracted.metadata)?);
     let mut provenance = Map::new();
