@@ -3891,7 +3891,6 @@ fn derive_prepared(
     .map_err(|error| Error::Message(error.to_string()))?;
     structure_graph.profile = identity.profile;
     structure_graph.source_fragments = source_fragments;
-    structure_graph.refresh_revision()?;
     Ok(StructureOutput {
         paragraphs,
         footnotes,
