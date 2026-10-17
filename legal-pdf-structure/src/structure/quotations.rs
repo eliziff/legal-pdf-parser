@@ -12,7 +12,7 @@
 use super::PdfPrimitiveEvidence;
 use legal_pdf_core::model::{Line, Page, Span};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// A row of body text: a line and any lines set beside it on the same row (a marker set apart
@@ -105,11 +105,6 @@ fn closing_re() -> &'static Regex {
 fn item_marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new("^\\s*(?:\\(?\\w{1,4}[.)]|[\u{2022}\u{25cf}-])\\s").unwrap())
-}
-
-/// The ids of the body lines set as display quotations.
-pub(super) fn quoted_lines(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashSet<String> {
-    quotation_scopes(pages, primitives).into_keys().collect()
 }
 
 /// Keep one identity for the detected block, including its fragments after page furniture.

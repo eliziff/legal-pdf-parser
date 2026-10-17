@@ -632,7 +632,7 @@ impl PdfResolutionInput {
             }
         }
         let (layout_runs, layout_evidence) =
-            super::numbered_paragraphs::candidates(&index, pages, primitives);
+            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations);
         runs.extend(layout_runs);
         let layout_evidence = layout_evidence
             .iter()

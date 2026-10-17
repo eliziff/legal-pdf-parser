@@ -514,11 +514,13 @@ fn fixed_number_gaps<'a>(
     fixed
 }
 
-/// Feed printed layout identities into the same resolver as text grammar candidates.
+/// Feed printed layout identities into the same resolver as text grammar candidates. `quoted`
+/// holds the lines set as display quotations.
 pub(super) fn candidates(
     index: &super::graph::PdfTextIndex,
     pages: &[legal_pdf_core::model::Page],
     primitives: &super::PdfPrimitiveEvidence,
+    quoted: &HashSet<String>,
 ) -> (
     Vec<legal_structure_model::StructureCandidateRun>,
     Vec<legal_structure_model::CandidateEvidenceV2>,
@@ -528,7 +530,6 @@ pub(super) fn candidates(
         CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, StructureCandidateRun,
         StructureMarkerCandidate,
     };
-    let quoted = super::quotations::quoted_lines(pages, primitives);
     let eligible = |line: &legal_pdf_core::model::Line| {
         !line.exclude_from_body
             && !matches!(
