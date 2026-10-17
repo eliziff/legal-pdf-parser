@@ -14,6 +14,7 @@ use super::graph::contents_leader_re;
 use super::PdfPrimitiveEvidence;
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Indents within this many points are one tier.
@@ -246,9 +247,40 @@ fn arabic(locator: &str) -> Option<i64> {
 #[derive(Clone)]
 struct Target { slot: usize }
 
+/// The page slot of every run of up to `MAX_WRAPPED_ROWS` lines set outside the contents and its
+/// furniture, by the run's normalized text, each start counted once and in reading order.
+fn titles_by_text(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashMap<String, Vec<usize>> {
+    let mut titles = HashMap::<String, Vec<usize>>::new();
+    for (slot, page) in pages.iter().enumerate() {
+        let norms = page.lines.iter().map(|line| {
+            let outside = !(line.exclude_from_body || matches!(line.region_type.as_str(), "header" | "footer")
+                || primitives.contents_line_ids.contains(&line.id)
+                || primitives.contents_pages.contains(&page.index));
+            outside.then(|| normalize_title(&line.text))
+        }).collect::<Vec<_>>();
+        for start in 0..norms.len() {
+            let mut joined = String::new();
+            let mut read = Vec::<String>::new();
+            for norm in &norms[start..(start + MAX_WRAPPED_ROWS).min(norms.len())] {
+                let Some(norm) = norm else { break };
+                joined.push_str(norm);
+                if !read.contains(&joined) {
+                    read.push(joined.clone());
+                    titles.entry(joined.clone()).or_default().push(slot);
+                }
+            }
+        }
+    }
+    titles
+}
+
 /// Each local contents run uses its own confirmed destinations and pagination relationships.
 pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<PdfOutlineEntry> {
     let listed = listed_entries(pages, primitives);
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    let titles = titles_by_text(pages, primitives);
     let mut result = Vec::new();
     let mut first = 0;
     while first < listed.len() {
@@ -263,25 +295,9 @@ pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence
         let after = entries.iter().map(|entry| entry.page_slot).max().unwrap() + 1;
         let hits = entries.iter().map(|entry| {
             let wanted = normalize_title(&entry.title);
-            let mut hits = Vec::new();
-            if wanted.chars().count() < 3 { return hits; }
-            for (slot,page) in pages.iter().enumerate().skip(after) {
-                for start in 0..page.lines.len() {
-                    let mut joined = String::new();
-                    for end in start..(start + MAX_WRAPPED_ROWS).min(page.lines.len()) {
-                        let line = &page.lines[end];
-                        if line.exclude_from_body || matches!(line.region_type.as_str(), "header" | "footer")
-                            || primitives.contents_line_ids.contains(&line.id)
-                            || primitives.contents_pages.contains(&page.index) { break; }
-                        joined.push_str(&normalize_title(&line.text));
-                        if joined == wanted {
-                            hits.push(Target { slot });
-                            break;
-                        }
-                    }
-                }
-            }
-            hits
+            if wanted.chars().count() < 3 { return Vec::new(); }
+            titles.get(&wanted).map_or_else(Vec::new, |slots| slots.iter()
+                .filter(|slot| **slot >= after).map(|&slot| Target { slot }).collect())
         }).collect::<Vec<_>>();
         // A unique printed title is a confirmed anchor. Offset agreement is local to neighbouring anchors.
         let anchors = hits.iter().enumerate().filter_map(|(i,hits)|

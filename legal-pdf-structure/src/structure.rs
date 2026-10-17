@@ -3795,8 +3795,8 @@ fn prepare_composed(
 ) -> PdfPreparation {
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks first; where they place nothing, its printed contents list.
-        let listed = contents::contents_outline(pages, &primitives);
         if !bookmarks::reconcile_bookmarks(pages, outline, &mut primitives) {
+            let listed = contents::contents_outline(pages, &primitives);
             bookmarks::reconcile_bookmarks(pages, &listed, &mut primitives);
         }
     });
