@@ -267,7 +267,7 @@ fn marginal_paragraph_plan<'a>(
                             let Some((prefix, text)) = line.text.trim().split_once(". ") else {
                                 return false;
                             };
-                            if legal_pdf_support::enumerator_interpretations(prefix, ".").is_empty()
+                            if legal_structure_model::enumerator_interpretations(prefix, ".").is_empty()
                                 || !legal_pdf_support::heading_text_plausible(text)
                             {
                                 return false;

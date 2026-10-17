@@ -1034,17 +1034,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "legal-pdf-pairing"
-version = "0.1.0"
-dependencies = [
- "legal-pdf-core",
- "legal-pdf-support",
- "legal-structure-model",
- "regex",
- "serde_json",
-]
-
-[[package]]
 name = "legal-pdf-parser"
 version = "0.1.0"
 dependencies = [
@@ -1069,7 +1058,6 @@ version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
  "legal-pdf-headings",
- "legal-pdf-pairing",
  "legal-pdf-support",
  "legal-pdf-tables",
  "legal-pdf-witnesses",

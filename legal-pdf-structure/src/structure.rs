@@ -26,13 +26,12 @@ use legal_pdf_support::pairing_support::{
     crossref_short_form as crossref_shortform, is_citation_shaped_tail as citation_shaped_tail,
 };
 use legal_pdf_support::{
-    enumerator_interpretations, has_citation_signal, heading_text_plausible, parse_heading_ladder,
-    styled_heading_text_plausible, EnumeratorInterpretation, HeadingAction, HeadingFamilyStats,
-    HeadingLadderStatus,
+    has_citation_signal, heading_text_plausible, styled_heading_text_plausible,
 };
 use legal_structure_model::{
-    normalize_decimal_digit, normalize_note_symbol, utf16_len, DocumentStructure, NodeKind,
-    ResolutionRuleV2, ScalarRange, ScalarText,
+    enumerator_interpretations, normalize_decimal_digit, normalize_note_symbol,
+    parse_heading_ladder, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
+    HeadingFamilyStats, HeadingLadderStatus, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 #[cfg(test)]
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2};
@@ -3825,12 +3824,13 @@ fn derive_prepared(
             || text_flow_faults(pages),
         ));
     // Note labels recognition cut short, restored before any text is indexed.
-    legal_pdf_pairing::repair_label_dropouts(pages);
+    legal_pdf_core::structure_analysis().repair_label_dropouts(pages);
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
-    let pairing =
-        legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, false);
+    let pairing = legal_pdf_support::profile::measure("derive.pair_footnotes", || {
+        legal_pdf_core::structure_analysis().pair_footnotes(pages, &resolution.citation_spans, false)
+    });
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
