@@ -2,7 +2,6 @@
 mod contract;
 #[cfg(feature = "pdf")]
 mod engine;
-mod structure_engine;
 #[cfg(feature = "pdf")]
 mod supplied_ocr;
 
@@ -19,7 +18,7 @@ pub use contract::{
 pub use engine::RecognitionProgress;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
-pub use engine::{corpus_check_cached_extraction, digest_cached_extraction};
+pub use engine::corpus_check_cached_extraction;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]

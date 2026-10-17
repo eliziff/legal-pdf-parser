@@ -872,15 +872,6 @@ fn bare_marker(text: &str) -> bool {
         .is_match(text.trim())
 }
 
-/// A figure: an amount, a count, a percentage, a year, a range of them.
-fn figure(text: &str) -> bool {
-    let text = text.trim();
-    let digits = text.chars().filter(char::is_ascii_digit).count();
-    digits > 0
-        && digits * 2 >= text.chars().filter(|c| !c.is_whitespace()).count()
-        && text.chars().filter(|c| c.is_alphabetic()).count() <= 1
-}
-
 /// A form's label, set before or above its value: "Lawyer:", "Date: 4 May".
 fn form_label(text: &str) -> bool {
     static LABEL: OnceLock<Regex> = OnceLock::new();

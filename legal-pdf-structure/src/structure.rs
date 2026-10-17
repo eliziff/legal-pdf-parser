@@ -17,7 +17,7 @@ use graph::{
 };
 use legal_pdf_core::model::{
     DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
-    Paragraph, ParagraphAnchor, PdfOutlineEntry, PdfPairingAudit, Span,
+    Paragraph, ParagraphAnchor, PdfOutlineEntry, Span,
 };
 #[cfg(test)]
 use legal_pdf_core::model::{NotePairClaim, NotePairKind};
@@ -91,13 +91,7 @@ pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
-    pub pairing_audit: Option<PdfPairingAudit>,
     pub structure_graph: DocumentStructure,
-}
-
-pub struct StructureReplay {
-    pub prepared_pages: Vec<Page>,
-    pub derived: StructureOutput,
 }
 
 fn normalize_label(value: &str) -> String {
@@ -3746,15 +3740,6 @@ struct ReaderState {
     diagnostics: Vec<Diagnostic>,
 }
 
-fn prepare_pages(
-    pages: &mut [Page],
-    separators: &[Option<f64>],
-    outline: &[PdfOutlineEntry],
-) -> Result<PdfPreparation> {
-    let (primitives, diagnostics) = prepare_reader(pages, separators)?;
-    Ok(prepare_composed(pages, outline, primitives, diagnostics))
-}
-
 /// Everything before the composed decisions: furniture, classification, tables, note bands and
 /// the styled heading reader.
 fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
@@ -3831,7 +3816,6 @@ fn derive_prepared(
     pages: &mut [Page],
     mut prepared: PdfPreparation,
     identity: StructureIdentity,
-    include_pairing_audit: bool,
 ) -> Result<StructureOutput> {
     legal_pdf_support::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
     prepared
@@ -3846,9 +3830,8 @@ fn derive_prepared(
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
     let pairing =
-        legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, include_pairing_audit);
+        legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, false);
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
-    let pairing_audit = pairing.pairing_audit;
     let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
     let mut diagnostics = prepared.diagnostics;
@@ -3884,19 +3867,8 @@ fn derive_prepared(
         });
         let _ = std::fs::write(&path, dump.to_string());
     }
-    let quoted = resolution.quotation_scopes.keys().cloned().collect::<HashSet<_>>();
-    let mut table = legal_pdf_witnesses::source_witnesses(
-        pages,
-        &legal_pdf_witnesses::Context {
-            quoted: Some(&quoted),
-            table_cells: Some(&prepared.primitives.table_cell_line_ids),
-            contents: Some(&prepared.primitives.contents_line_ids),
-            translation: Some(&prepared.primitives.translation_line_ids),
-            layout: prepared.primitives.source_regions.as_ref(),
-        },
-    );
     let source_fragments = resolution.index.source_fragments();
-    legal_pdf_witnesses::bind_source_fragments(&mut table, resolution.index.text(), &source_fragments).map_err(Error::Message)?;
+    let pages: &[Page] = pages;
     let document_id = identity.document_id.clone();
     let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         legal_pdf_core::structure_analysis().resolve_structure_graph_with_assembler(
@@ -3911,7 +3883,8 @@ fn derive_prepared(
             graph_diagnostics,
             &mut |nodes| {
                 let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
-                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), &table, &prepared.primitives.navigation_parents);
+                let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
+                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents);
             },
         )
     })
@@ -3923,7 +3896,6 @@ fn derive_prepared(
         paragraphs,
         footnotes,
         diagnostics,
-        pairing_audit,
         structure_graph,
     })
 }
@@ -4029,23 +4001,7 @@ pub fn derive_cached(
         }
     };
     let prepared = prepare_composed(pages, outline, primitives, diagnostics);
-    derive_prepared(pages, prepared, identity, false)
-}
-
-pub fn replay(
-    pages: &mut [Page],
-    separators: &[Option<f64>],
-    outline: &[PdfOutlineEntry],
-    identity: StructureIdentity,
-) -> Result<StructureReplay> {
-    let _profile = legal_pdf_support::profile::scope("structure_replay");
-    let prepared = prepare_pages(pages, separators, outline)?;
-    let prepared_pages = pages.to_vec();
-    let derived = derive_prepared(pages, prepared, identity, true)?;
-    Ok(StructureReplay {
-        prepared_pages,
-        derived,
-    })
+    derive_prepared(pages, prepared, identity)
 }
 
 pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {

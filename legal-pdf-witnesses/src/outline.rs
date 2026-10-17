@@ -3,8 +3,9 @@
 //! from, other units under the nearest open heading or lead-in, and the printed contents or
 //! bookmarks place a heading where they name its parent.
 
-use crate::witness::{index, node_values, Table};
-use legal_structure_model::{NodeKind, NumberingMarker, ScalarText, StructureNode};
+use crate::witness::{median, size};
+use legal_pdf_core::model::{Line, Page};
+use legal_structure_model::{NodeKind, NumberingMarker, ScalarRange, ScalarText, StructureNode};
 use std::collections::HashMap;
 
 /// Where a unit's outline lives: its document, and the quotation and note or table cell holding it.
@@ -31,28 +32,64 @@ fn outline_unit(node: &StructureNode) -> bool {
         || node.kind == NodeKind::Section && node.marker_range.is_some()
 }
 
+/// The unit's own parts of its text, never the text between them.
+fn membership_text(node: &StructureNode, text: &ScalarText<'_>) -> Option<String> {
+    let ranges = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
+    let ranges = ranges.iter().map(|range| Some(ScalarRange {
+        start: text.utf16_at_scalar(range.start)?,
+        end: text.utf16_at_scalar(range.end)?,
+    })).collect::<Option<Vec<_>>>()?;
+    Some(text.membership_text_utf16(&ranges))
+}
+
+/// The type of the unit's own text on its first line (`source`, that line's place in the text):
+/// its size in hundredths of the body size, and whether most of it is bold and italic.
+fn unit_style(line: &Line, source: ScalarRange, node: &StructureNode, body_size: f64) -> (i32, bool, bool) {
+    let parts = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
+    let ranges = parts.iter().filter_map(|part| {
+        let (start, end) = (part.start.max(source.start), part.end.min(source.end));
+        (start < end).then_some((start - source.start, end - source.start))
+    }).collect::<Vec<_>>();
+    let coordinates = ScalarText::new(&line.text);
+    let (mut weight, mut size, mut bold, mut italic) = (0usize, 0.0f32, 0usize, 0usize);
+    for span in line.spans.iter().filter(|span| span.start < span.end && coordinates.slice(span.start..span.end) == Some(span.text.as_str())) {
+        let count = ranges.iter().map(|(lo, hi)| span.end.min(*hi).saturating_sub(span.start.max(*lo))).sum::<usize>();
+        let share = if body_size > 0.0 { (span.size / body_size) as f32 } else { 0.0 };
+        if count == 0 || share <= 0.0 {
+            continue;
+        }
+        weight += count;
+        size += share * count as f32;
+        bold += usize::from(span.flags & 16 != 0 || span.font.to_lowercase().contains("bold")) * count;
+        italic += usize::from(span.flags & 2 != 0 || span.font.to_lowercase().contains("ital")) * count;
+    }
+    let weight = weight.max(1) as f32;
+    ((size / weight * 100.0).round() as i32, bold as f32 / weight >= 0.5, italic as f32 / weight >= 0.5)
+}
+
 /// Set every outline unit's parent. `contexts` holds each node's context; a parent link between
-/// contexts is dropped, except a row's to its table and a cell's to its row.
+/// contexts is dropped, except a row's to its table and a cell's to its row. `line_range` gives a
+/// page line's place in `text`.
 pub fn assemble_outline(
     nodes: &mut [StructureNode],
     contexts: &[Context],
     text: &str,
-    table: &Table,
+    pages: &[Page],
+    line_range: &dyn Fn(&str) -> Option<ScalarRange>,
     navigation: &HashMap<String, Option<String>>,
 ) {
-    let rows = table.rows.iter().enumerate().map(|(index, row)| (row.id.as_str(), index)).collect::<HashMap<_, _>>();
+    let lines = pages.iter().flat_map(|page| &page.lines).map(|line| (line.id.as_str(), line)).collect::<HashMap<_, _>>();
+    let body_size = median(pages.iter().flat_map(|page| &page.lines).map(size).filter(|size| *size > 0.0).collect());
     let coordinates = ScalarText::new(text);
-    let at = |name: &str| index(name).unwrap();
     let mut units = nodes.iter().enumerate().filter(|(_, node)| outline_unit(node)).map(|(node_index, node)| {
-        let evidence = node.line_ids.first().and_then(|id| rows.get(id.as_str())).map(|&index| &table.rows[index]);
-        let values = node_values(evidence, node, &coordinates);
+        let first = node.line_ids.first().and_then(|id| Some((*lines.get(id.as_str())?, line_range(id)?)));
         Unit {
             node: node_index,
             context: contexts[node_index].clone(),
             marker: None,
-            style: ((values[at("size")] * 100.0).round() as i32, values[at("bold")] >= 0.5, values[at("italic")] >= 0.5),
+            style: first.map_or((0, false, false), |(line, source)| unit_style(line, source, node, body_size)),
             rank: 0.0,
-            lead_in: values[at("end_colon")] >= 0.5,
+            lead_in: membership_text(node, &coordinates).unwrap_or_default().trim().ends_with(':'),
         }
     }).collect::<Vec<_>>();
     units.sort_by_key(|unit| (nodes[unit.node].range.start, nodes[unit.node].range.end, nodes[unit.node].id.clone()));

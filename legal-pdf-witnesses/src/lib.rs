@@ -20,7 +20,7 @@ mod witness;
 
 pub use compositions::{compositions, compositions_sha256, Compositions, Decision};
 pub use outline::{assemble_outline, Context as OutlineContext};
-pub use witness::{bind_source_fragments, source_witnesses, witnesses, Context, Row, Table, NAMES};
+pub use witness::{witnesses, Context, Row, Table, NAMES};
 
 /// Write the table to the dump file `LEGALPDF_WITNESS_DUMP` names, if any, one JSON line per row.
 /// `stage` tells the dumps apart where the witnesses are read more than once.
