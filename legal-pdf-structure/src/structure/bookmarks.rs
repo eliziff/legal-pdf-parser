@@ -171,6 +171,29 @@ fn title_template(title: &str) -> String {
         .collect()
 }
 
+/// An upper bound on `similarity`, as difflib's `real_quick_ratio` and `quick_ratio`: matched
+/// characters can number no more than the shorter string, nor than the characters both hold.
+fn similarity_bound(a: &str, b: &str) -> f64 {
+    let (left, right) = (a.chars().count(), b.chars().count());
+    if left + right == 0 {
+        return 1.0;
+    }
+    if 2.0 * left.min(right) as f64 / ((left + right) as f64) < REPAIR_SIMILARITY {
+        return 0.0;
+    }
+    let mut counts = HashMap::<char, isize>::new();
+    for character in b.chars() {
+        *counts.entry(character).or_default() += 1;
+    }
+    let common = a.chars().filter(|character| {
+        counts.get_mut(character).is_some_and(|count| {
+            *count -= 1;
+            *count >= 0
+        })
+    });
+    2.0 * common.count() as f64 / (left + right) as f64
+}
+
 /// `difflib.SequenceMatcher(None, a, b).ratio()`.
 pub(super) fn similarity(a: &str, b: &str) -> f64 {
     let a = a.chars().collect::<Vec<_>>();
@@ -337,7 +360,8 @@ fn same_title(found: &str, title: &str, heading: bool) -> bool {
     if heading {
         return found.ends_with(title)
             || title.ends_with(found)
-            || similarity(found, title) >= REPAIR_SIMILARITY;
+            || (similarity_bound(found, title) >= REPAIR_SIMILARITY
+                && similarity(found, title) >= REPAIR_SIMILARITY);
     }
     // Body lines carry the title whole, or with a numbering label only one side prints.
     let labelled = |long: &str, short: &str| {
