@@ -19,7 +19,6 @@ use super::{
     continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator,
     PdfPrimitiveEvidence,
 };
-use crate::layout::build_regions;
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -759,7 +758,6 @@ pub(super) fn reconcile_bookmarks(
         }
     }
 
-    build_regions(pages);
     let levels = &mut primitives.heading_levels;
     for (unit, level) in levels_out {
         for line_id in &units[unit].line_ids {

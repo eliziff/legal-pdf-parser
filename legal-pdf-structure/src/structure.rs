@@ -69,8 +69,6 @@ struct PdfPrimitiveEvidence {
     heading_levels: HashMap<String, usize>,
     #[serde(default)]
     navigation_parents: HashMap<String, Option<String>>,
-    #[serde(default)]
-    contents_entries: Vec<contents::ContentsEntry>,
     /// Tables drawn with rules, read from each page's painted rules.
     tables: Vec<legal_pdf_tables::PdfTable>,
 }
@@ -3158,7 +3156,6 @@ fn classify_pages_with_source(
         }
         diagnostics.extend(order_page(page, table_page, &table_notes));
         legal_pdf_tables::order_table_lines(page, &evidence.tables);
-        build_regions(std::slice::from_mut(page));
     }
     evidence.translation_line_ids = translation;
     evidence.contents_line_ids.extend(contents_line_ids);
@@ -3174,7 +3171,6 @@ fn classify_pages_with_source(
         crate::paragraphs::segment_paragraphs(pages);
         legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
     });
-    build_regions(pages);
     diagnostics
 }
 
@@ -3801,8 +3797,6 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
                 numbered: &numbered,
             },
         );
-        // Note and heading passes change line roles; regions follow their lines.
-        build_regions(pages);
     });
     Ok((primitives, diagnostics))
 }
@@ -3818,15 +3812,14 @@ fn prepare_composed(
         // The document's own bookmarks first; where they place nothing, its printed contents list.
         let listed = contents::contents_outline(pages, &primitives);
         if !bookmarks::reconcile_bookmarks(pages, outline, &mut primitives) {
-            bookmarks::reconcile_bookmarks(pages, &listed.outline, &mut primitives);
+            bookmarks::reconcile_bookmarks(pages, &listed, &mut primitives);
         }
-        primitives.contents_entries = listed.entries;
     });
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
     ));
-    // Bookmarked headings change line roles; regions follow their lines.
+    // Regions are a view of the lines' final roles, derived once every reader has run.
     build_regions(pages);
     PdfPreparation {
         diagnostics,
@@ -3850,7 +3843,7 @@ fn derive_prepared(
     // Note labels recognition cut short, restored before any text is indexed.
     legal_pdf_pairing::repair_label_dropouts(pages);
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
-        PdfResolutionInput::from_pages(pages, &prepared.primitives, identity.profile)
+        PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
     let pairing =
         legal_pdf_pairing::pair_footnotes(pages, &resolution.citation_spans, include_pairing_audit);
@@ -3875,24 +3868,6 @@ fn derive_prepared(
     });
     let mut nodes =
         native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
-    if let Some(proposals) = &resolution.span_proposals {
-        nodes.retain(|node| !matches!(node.kind, NodeKind::Heading | NodeKind::Prose));
-        let text = ScalarText::new(resolution.index.text());
-        for proposal in proposals {
-            let mut node = legal_structure_model::StructureNode::new(proposal.id.clone(),
-                if proposal.role == legal_structure_model::PrimaryRole::Heading { NodeKind::Heading } else { NodeKind::Prose },
-                proposal.range, "legalpdf.span-model.v1", legal_structure_model::Derivation::Model, None);
-            node.role = Some(proposal.role);
-            node.ranges.push(proposal.range);
-            node.line_ids = proposal.line_ids.clone();
-            node.page_indexes = proposal.page_indexes.clone();
-            if node.kind == NodeKind::Heading {
-                node.heading_range = Some(proposal.range);
-                node.label = text.slice(proposal.range.start..proposal.range.end).map(str::to_owned);
-            }
-            nodes.push(node);
-        }
-    }
     nodes.extend(constituents::constituents(&resolution.index, pages));
     // The engine's inputs, for the structure gold to replay engine changes without parsing
     // (legal-structure's replay example).
@@ -3923,8 +3898,6 @@ fn derive_prepared(
     let source_fragments = resolution.index.source_fragments();
     legal_pdf_witnesses::bind_source_fragments(&mut table, resolution.index.text(), &source_fragments).map_err(Error::Message)?;
     let document_id = identity.document_id.clone();
-    let profile = identity.profile;
-    let mut scope_error = None;
     let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
         legal_pdf_core::structure_analysis().resolve_structure_graph_with_assembler(
             identity.document_id,
@@ -3936,46 +3909,15 @@ fn derive_prepared(
             &resolution.evidence,
             &note_pairs,
             graph_diagnostics,
-            &mut |nodes, scope_annotations| {
-                assign_outline_ownership(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
-                let scope_declarations = match legal_pdf_witnesses::infer_scopes(nodes, resolution.index.text(), &document_id, &table, &source_fragments, profile) {
-                    Ok(declarations) => declarations,
-                    Err(error) => { scope_error = Some(error); return; }
-                };
-                if let Err(error) = legal_pdf_witnesses::infer_membership(nodes, resolution.index.text(), &table, &source_fragments, profile) { scope_error = Some(error); return; }
-                let pairs = legal_pdf_witnesses::assemble_outline(nodes, &document_id, resolution.index.text(), &table, &prepared.primitives.navigation_parents, profile);
-                legal_pdf_witnesses::dump_pairs(&pairs);
-                *scope_annotations = legal_pdf_witnesses::scope_annotations(nodes, &document_id, &scope_declarations);
+            &mut |nodes| {
+                let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
+                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), &table, &prepared.primitives.navigation_parents);
             },
         )
     })
     .map_err(|error| Error::Message(error.to_string()))?;
-    if let Some(error) = scope_error { return Err(Error::Message(error)); }
-    structure_graph.profile = profile;
-    structure_graph.source_fragments = resolution.index.source_fragments();
-    legal_pdf_core::model::attach_structure_tags(&mut structure_graph, pages, &[]);
-    let fragments: HashMap<_, _> = structure_graph.source_fragments.iter().map(|fragment| (fragment.id.as_str(), fragment.range)).collect();
-    let entries = &prepared.primitives.contents_entries;
-    let ids = entries.iter().enumerate().map(|(index,entry)|
-        format!("pdf-contents:{}:{index}", entry.source_line_ids.first().map(String::as_str).unwrap_or("entry"))).collect::<Vec<_>>();
-    for (index,entry) in entries.iter().enumerate() {
-        let source_ranges = entry.source_line_ids.iter().filter_map(|id| fragments.get(id.as_str()).copied()).collect::<Vec<_>>();
-        let target_ranges = entry.target_line_ids.iter().filter_map(|id| fragments.get(id.as_str()).copied()).collect::<Vec<_>>();
-        let confirmed = !target_ranges.is_empty() && target_ranges.len()==entry.target_line_ids.len()
-            && structure_graph.nodes.iter().any(|node|
-                (node.kind==NodeKind::Heading || node.role==Some(legal_structure_model::PrimaryRole::Heading))
-                    && target_ranges.iter().all(|target| {
-                        let ranges = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
-                        ranges.iter().any(|range| range.start<=target.start && target.end<=range.end)
-                    }));
-        structure_graph.navigation.push(legal_structure_model::NavigationEntry {
-            id:ids[index].clone(), kind:"contents".into(), source_ranges, title_ranges:Vec::new(),
-            source_line_ids:entry.source_line_ids.clone(),
-            target_ranges:if confirmed {target_ranges} else {Vec::new()},
-            target_line_ids:if confirmed {entry.target_line_ids.clone()} else {Vec::new()},
-            parent_id:entry.parent.map(|parent| ids[parent].clone()), witness_id:None,
-        });
-    }
+    structure_graph.profile = identity.profile;
+    structure_graph.source_fragments = source_fragments;
     structure_graph.refresh_revision()?;
     Ok(StructureOutput {
         paragraphs,
@@ -3986,13 +3928,14 @@ fn derive_prepared(
     })
 }
 
-/// Carry observed constituent and quotation identity into the one outline assembler.
-fn assign_outline_ownership(
+/// Settle each node's exact membership and role, and give the context its outline lives in: the
+/// constituent document holding it, and the quotation and note or table cell holding a unit.
+fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
     quote_ids: &HashMap<String, String>,
     index: &PdfTextIndex,
-) {
-    use legal_structure_model::{PrimaryRole, StructureOwnership};
+) -> Vec<legal_pdf_witnesses::OutlineContext> {
+    use legal_structure_model::PrimaryRole;
     // Establish exact membership before comparing containers. An envelope may cross
     // intervening columns, notes, quotations, or constituent documents.
     for node in nodes.iter_mut() {
@@ -4027,22 +3970,24 @@ fn assign_outline_ownership(
         !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
             range.start <= part.start && part.end <= range.end))
     };
-    for node in nodes {
+    nodes.iter_mut().map(|node| {
         if node.kind == NodeKind::Heading {
             node.role = Some(PrimaryRole::Heading);
             node.heading_range = (node.ranges.len() == 1).then_some(node.range);
         } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
             node.role.get_or_insert(PrimaryRole::Text);
         }
-        if node.ownership.is_some() { continue; }
-        let constituent = constituents.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end-range.start).sum::<usize>()).map(|(id, _)| id.clone());
-        let quotation = node.line_ids.first().and_then(|id| quote_ids.get(id))
+        let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| holders.iter()
+            .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
+            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _)| id.clone());
+        // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
+        // belonging to its quotation or note: it names only its document.
+        let unit = node.kind != NodeKind::Page;
+        let quotation = node.line_ids.first().filter(|_| unit).and_then(|id| quote_ids.get(id))
             .filter(|id| node.line_ids.iter().all(|line| quote_ids.get(line) == Some(*id))).cloned();
-        let stream = cells.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end-range.start).sum::<usize>()).map(|(id, _)| format!("object:{id}"));
-        node.ownership = Some(StructureOwnership { document_id: constituent.unwrap_or_else(|| document_id.to_owned()), quotation_id: quotation, reading_stream_id: stream });
-    }
+        let container = smallest(&cells).filter(|_| unit).map(|id| format!("object:{id}"));
+        (smallest(&constituents).unwrap_or_else(|| document_id.to_owned()), quotation, container)
+    }).collect()
 }
 
 pub fn derive(
@@ -4057,28 +4002,6 @@ pub fn derive(
 /// `derive`, reading the readers' state from `reader_cache` where it is there (a file named for the
 /// input pages and the readers' code) and writing it there where not: a change to compositions, or
 /// to anything after the readers, reruns only what follows them.
-/// Reuse the production evidence preparation for fixed corrected-source training packets.
-/// Source geometry and typography remain supplied facts; no gold roles feed this preparation.
-pub fn training_source_evidence(
-    source_pages: &[Page],
-    separators: &[Option<f64>],
-    outline: &[PdfOutlineEntry],
-) -> Result<(Vec<Page>, legal_pdf_witnesses::Table, HashMap<String, Option<String>>)> {
-    let mut pages = source_pages.to_vec();
-    let prepared = prepare_pages(&mut pages, separators, outline)?;
-    infer_note_region_modes(&mut pages);
-    legal_pdf_pairing::repair_label_dropouts(&mut pages);
-    let quoted = quotations::quotation_scopes(&pages, &prepared.primitives).into_keys().collect::<HashSet<_>>();
-    let table = legal_pdf_witnesses::source_witnesses(&pages, &legal_pdf_witnesses::Context {
-        quoted: Some(&quoted),
-        table_cells: Some(&prepared.primitives.table_cell_line_ids),
-        contents: Some(&prepared.primitives.contents_line_ids),
-        translation: Some(&prepared.primitives.translation_line_ids),
-        layout: prepared.primitives.source_regions.as_ref(),
-    });
-    Ok((pages, table, prepared.primitives.navigation_parents))
-}
-
 pub fn derive_cached(
     pages: &mut [Page],
     separators: &[Option<f64>],

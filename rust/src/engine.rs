@@ -380,9 +380,6 @@ fn derive_extracted(
         },
         reader_cache.as_deref(),
     )?;
-    derived.structure_graph.native_navigation = crate::structure_engine::navigation_witnesses(&extracted.outline);
-    legal_pdf_core::model::attach_structure_tags(&mut derived.structure_graph, &extracted.pages, &extracted.metadata.structure_tags);
-    derived.structure_graph.refresh_revision()?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
 }

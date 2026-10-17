@@ -66,7 +66,6 @@ fn family(title: &str) -> &'static str {
 /// A row of the list: its lines read left to right as one text, where it starts, and the locator
 /// set apart at its end, if any.
 struct Row {
-    line_ids: Vec<String>,
     page_slot: usize,
     left: f64,
     title: String,
@@ -93,7 +92,6 @@ fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
         .map(|mut band| {
             band.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
             let left = band[0].bbox[0];
-            let line_ids = band.iter().map(|line| line.id.clone()).collect();
             // A locator alone at the row's right, apart from its title.
             let apart = band.len() > 1
                 && locator_re().is_match(band.last().unwrap().text.trim())
@@ -127,7 +125,6 @@ fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
                 .trim()
                 .to_owned();
             Row {
-                line_ids,
                 page_slot,
                 left,
                 title,
@@ -140,7 +137,6 @@ fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
 /// One entry of the list: its title, the locator it prints, where it starts and on which page of
 /// the list.
 struct Listed {
-    line_ids: Vec<String>,
     title: String,
     locator: String,
     left: f64,
@@ -181,12 +177,9 @@ fn listed_entries(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<List
                         ),
                         None => (row.left, row.title.clone()),
                     };
-                    let line_ids = pending.iter().flat_map(|row| row.line_ids.iter().cloned())
-                        .chain(row.line_ids.iter().cloned()).collect();
                     pending.clear();
                     if title.chars().any(char::is_alphabetic) {
                         entries.push(Listed {
-                            line_ids,
                             title,
                             locator,
                             left,
@@ -250,27 +243,13 @@ fn arabic(locator: &str) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|_| !digits.is_empty())
 }
 
-/// Source contents entries remain evidence even when no destination can be confirmed.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(super) struct ContentsEntry {
-    pub title: String,
-    pub locator: String,
-    pub source_line_ids: Vec<String>,
-    pub target_line_ids: Vec<String>,
-    pub page_index: Option<usize>,
-    pub parent: Option<usize>,
-}
-pub(super) struct ContentsResolution {
-    pub outline: Vec<PdfOutlineEntry>,
-    pub entries: Vec<ContentsEntry>,
-}
 #[derive(Clone)]
-struct Target { slot: usize, line_ids: Vec<String> }
+struct Target { slot: usize }
 
 /// Each local contents run uses its own confirmed destinations and pagination relationships.
-pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> ContentsResolution {
+pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<PdfOutlineEntry> {
     let listed = listed_entries(pages, primitives);
-    let mut result = ContentsResolution { outline: Vec::new(), entries: Vec::new() };
+    let mut result = Vec::new();
     let mut first = 0;
     while first < listed.len() {
         let mut last = first + 1;
@@ -296,7 +275,7 @@ pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence
                             || primitives.contents_pages.contains(&page.index) { break; }
                         joined.push_str(&normalize_title(&line.text));
                         if joined == wanted {
-                            hits.push(Target { slot, line_ids: page.lines[start..=end].iter().map(|line| line.id.clone()).collect() });
+                            hits.push(Target { slot });
                             break;
                         }
                     }
@@ -308,8 +287,6 @@ pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence
         let anchors = hits.iter().enumerate().filter_map(|(i,hits)|
             (hits.len()==1).then(|| (i,hits[0].slot))).collect::<Vec<_>>();
         let levels = levels(entries);
-        let base = result.entries.len();
-        let mut parents: Vec<(usize,usize)> = Vec::new();
         for (i,entry) in entries.iter().enumerate() {
             let before = anchors.iter().rev().find(|(index,_)| *index < i);
             let following = anchors.iter().find(|(index,_)| *index > i);
@@ -330,15 +307,9 @@ pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence
                         pages[hit.slot].index as i64 == printed - 1 + offset)))
                 .collect::<Vec<_>>();
             let target = (candidates.len()==1).then(|| candidates[0]);
-            while parents.last().is_some_and(|(level,_)| *level >= levels[i]) { parents.pop(); }
-            let parent = parents.last().map(|(_,index)| *index);
-            parents.push((levels[i],base+i));
             if let Some(target) = target {
-                result.outline.push(PdfOutlineEntry { title: entry.title.clone(), level: levels[i], page_index: pages[target.slot].index });
+                result.push(PdfOutlineEntry { title: entry.title.clone(), level: levels[i], page_index: pages[target.slot].index });
             }
-            result.entries.push(ContentsEntry { title:entry.title.clone(), locator:entry.locator.clone(),
-                source_line_ids:entry.line_ids.clone(), target_line_ids:target.map(|target| target.line_ids.clone()).unwrap_or_default(),
-                page_index:target.map(|target| pages[target.slot].index), parent });
         }
         first=last;
     }
