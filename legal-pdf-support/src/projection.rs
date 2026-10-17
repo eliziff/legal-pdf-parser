@@ -1312,8 +1312,12 @@ fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut DocumentStr
     let mut edits = legal_structure_model::ManuscriptEdits::new();
     let mut joins = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut node_at = HashMap::<&str, usize>::new();
+    for (index, node) in structure.nodes.iter().enumerate() {
+        node_at.entry(node.id.as_str()).or_insert(index);
+    }
     for paragraph in paragraphs {
-        let Some(node) = structure.nodes.iter().find(|node| node.id == paragraph.id) else { continue; };
+        let Some(node) = node_at.get(paragraph.id.as_str()).map(|&index| &structure.nodes[index]) else { continue; };
         let own = if matches!(node.kind, NodeKind::Heading)
             || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
             node.heading_range.as_ref().map(std::slice::from_ref)
@@ -1429,6 +1433,14 @@ fn attach_source_continuations(
         .map(|fragment| (fragment.id.as_str(), fragment)).collect();
     let nodes: HashMap<_, _> = structure.nodes.iter()
         .map(|node| (node.id.as_str(), node)).collect();
+    // The source lines by where they start, each with the furthest end so far, so a node finds
+    // the lines it overlaps without reading every line.
+    let mut by_start = (0..structure.source_fragments.len()).collect::<Vec<_>>();
+    by_start.sort_by_key(|&slot| structure.source_fragments[slot].range.start);
+    let reach = by_start.iter().scan(0, |end, &slot| {
+        *end = (*end).max(structure.source_fragments[slot].range.end);
+        Some(*end)
+    }).collect::<Vec<_>>();
     let links = |node: &StructureNode, produced: &str,
                  spans: &[legal_pdf_core::model::SourceTextSpan], kind| {
         let heading = node.kind == NodeKind::Heading
@@ -1441,8 +1453,10 @@ fn attach_source_continuations(
         let mut starts = HashMap::<usize, usize>::new();
         let mut ends = HashMap::<usize, usize>::new();
         let mut member_lines = HashSet::new();
-        for fragment in &structure.source_fragments {
-            for range in own {
+        for range in own {
+            let upto = by_start.partition_point(|&slot| structure.source_fragments[slot].range.start < range.end);
+            let from = reach[..upto].partition_point(|end| *end <= range.start);
+            for fragment in by_start[from..upto].iter().map(|&slot| &structure.source_fragments[slot]) {
                 let start = range.start.max(fragment.range.start);
                 let end = range.end.min(fragment.range.end);
                 if start < end {
@@ -1519,8 +1533,12 @@ fn attach_source_continuations(
             }
         }
     }
+    let mut notes = HashMap::<&str, &legal_structure_model::Note>::new();
+    for entry in &structure.notes {
+        notes.entry(entry.id.as_str()).or_insert(entry);
+    }
     for note in footnotes {
-        let node = structure.notes.iter().find(|entry| entry.id == note.pair_id)
+        let node = notes.get(note.pair_id.as_str())
             .and_then(|entry| entry.node_id.as_deref()).and_then(|id| nodes.get(id));
         if let Some(node) = node {
             if let Some(found) = links(node, &note.body, &note.source_spans,
