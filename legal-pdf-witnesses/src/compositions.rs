@@ -71,11 +71,8 @@ pub fn compositions() -> &'static Compositions {
             .ok()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_else(|| SHIPPED.to_owned());
-        // What the compositions decide rests on the lexicon's words and the outline prior too.
-        let sha256 = format!(
-            "{:x}",
-            Sha256::digest(format!("{text}\n{}\n{}\n{}", crate::lexicon::lexicon().text, crate::outline::PARENT_SCHEMA, crate::model::models_text()).as_bytes())
-        );
+        // What the compositions decide rests on the lexicon's words too.
+        let sha256 = format!("{:x}", Sha256::digest(format!("{text}\n{}", crate::lexicon::lexicon().text).as_bytes()));
         let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
         let parsed: HashMap<String, Sets> = value
             .get("decisions")

@@ -35,7 +35,6 @@ pub struct PdfTextIndex {
 pub(super) struct PdfResolutionInput {
     pub(super) index: PdfTextIndex,
     pub(super) quotation_scopes: HashMap<String, String>,
-    pub(super) span_proposals: Option<Vec<legal_pdf_witnesses::SpanProposal>>,
     pub(super) runs: Vec<StructureCandidateRun>,
     pub(super) evidence: Vec<CandidateEvidenceV2>,
     pub(super) citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
@@ -483,7 +482,7 @@ fn layout_end(
 }
 
 impl PdfResolutionInput {
-    pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence, profile: Option<legal_structure_model::DetectionProfile>) -> Self {
+    pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let mut runs = structure_analysis().detect_structure_candidate_runs(index.text());
         let by_line = pages
@@ -527,9 +526,6 @@ impl PdfResolutionInput {
             translation: Some(&primitives.translation_line_ids),
             layout: primitives.source_regions.as_ref(),
         };
-        let source = legal_pdf_witnesses::source_witnesses(pages, &context);
-        let span_proposals = legal_pdf_witnesses::predict_spans(index.text(), pages, &source, &index.source_fragments(), profile)
-            .expect("PDF index supplies exact physical source spans");
         // Existing composition rules retain their counted-line feature population.
         let table = legal_pdf_witnesses::witnesses(pages, &context);
         legal_pdf_witnesses::dump(&table, "candidates");
@@ -569,11 +565,6 @@ impl PdfResolutionInput {
         for run in &mut runs {
             let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
             for candidate in &mut run.markers {
-                if let Some(heading) = span_proposals.as_ref().into_iter().flatten()
-                    .filter(|proposal| proposal.role == legal_structure_model::PrimaryRole::Heading && proposal.range.start > candidate.content_start)
-                    .map(|proposal| proposal.range.start).min() {
-                    candidate.range.end = candidate.range.end.min(heading);
-                }
                 let label = candidate.label.trim_start_matches('(').to_lowercase();
                 let provision = hierarchy
                     && candidate.parent_candidate_id.is_none()
@@ -756,14 +747,6 @@ impl PdfResolutionInput {
                 let marker_lines = index.overlapping_lines(candidate.marker_range);
                 let marker_line = marker_lines.first().map(|indexed| indexed.line_id.as_str()).unwrap_or("");
                 let mut observations = Vec::new();
-                if let Some(proposal) = span_proposals.as_ref().into_iter().flatten()
-                    .find(|proposal| proposal.range.start <= candidate.marker_range.start && candidate.marker_range.start < proposal.range.end) {
-                    match proposal.role {
-                        legal_structure_model::PrimaryRole::Heading => observations.push(CandidateObservationV2::SectionHeading),
-                        legal_structure_model::PrimaryRole::Furniture | legal_structure_model::PrimaryRole::PageLabel => observations.push(CandidateObservationV2::Furniture),
-                        _ => {}
-                    }
-                }
 
                 // The words after the marker on the item's first body lines.
                 let body_tails = candidate_lines.iter().take(3).filter_map(|indexed| {
@@ -959,7 +942,6 @@ impl PdfResolutionInput {
             runs,
             evidence,
             quotation_scopes,
-            span_proposals,
             citation_spans,
         }
     }

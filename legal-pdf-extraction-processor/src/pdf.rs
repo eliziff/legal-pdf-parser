@@ -1567,7 +1567,6 @@ pub fn assemble_pdf(
         outline: Vec::new(),
         image_regions,
         metadata: PdfExtractionMetadata {
-            structure_tags: Vec::new(),
             embedded_page_labels: Vec::new(),
             pages_needing_ocr: weak_pages.into_iter().collect(),
             ocr_routed_pages: Vec::new(),

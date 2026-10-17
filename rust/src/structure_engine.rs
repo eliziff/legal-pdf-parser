@@ -42,7 +42,7 @@ pub(crate) fn derive_pdf_pages(
     }
     let StructureReplay {
         prepared_pages,
-        mut derived,
+        derived,
     } = replay(
         &mut pages,
         &separators,
@@ -57,7 +57,6 @@ pub(crate) fn derive_pdf_pages(
         code: "invalid_evidence",
         message: error.to_string(),
     })?;
-    derived.structure_graph.native_navigation = navigation_witnesses(outline);
     let pairing_audit = derived
         .pairing_audit
         .expect("replay includes pairing audit");
@@ -94,17 +93,3 @@ pub(crate) fn derive_pdf_pages(
     })
 }
 
-#[cfg(feature = "pdf")]
-pub(crate) fn navigation_witnesses(outline: &[PdfOutlineEntry]) -> Vec<legal_structure_model::NativeNavigationWitness> {
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    outline.iter().enumerate().map(|(index, entry)| {
-        while stack.last().is_some_and(|(level, _)| *level >= entry.level) { stack.pop(); }
-        let id = format!("pdf-bookmark:{index}");
-        let witness = legal_structure_model::NativeNavigationWitness {
-            id: id.clone(), title: entry.title.clone(), page_index: entry.page_index,
-            parent_id: stack.last().map(|(_, id)| id.clone()),
-        };
-        stack.push((entry.level, id));
-        witness
-    }).collect()
-}

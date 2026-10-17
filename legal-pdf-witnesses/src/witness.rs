@@ -304,27 +304,6 @@ fn exact_type(values: &mut [f32], row: Option<&Row>, ranges: &[(usize, usize)]) 
     }
 }
 
-pub(crate) fn local_span_values(
-    row: Option<&Row>,
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Vec<f32> {
-    let mut values = span_values(row, text);
-    let opening_end = row.and_then(|row| {
-        row.spans
-            .iter()
-            .filter(|span| span.start <= start && start < span.end)
-            .map(|span| span.end.min(end))
-            .min()
-    });
-    let ranges = opening_end
-        .map(|end| vec![(start, end)])
-        .unwrap_or_default();
-    exact_type(&mut values, row, &ranges);
-    values
-}
-
 pub(crate) fn node_values(
     row: Option<&Row>,
     node: &legal_structure_model::StructureNode,

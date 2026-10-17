@@ -1,5 +1,5 @@
 pub use legal_structure_model::{
-    Derivation, DocumentStructure, PdfStructureTagWitness, NodeKind, NotePairSupportV2, ScalarRange, StructureNode,
+    Derivation, DocumentStructure, NodeKind, NotePairSupportV2, ScalarRange, StructureNode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -141,38 +141,6 @@ pub struct Line {
     pub region_type: String,
     #[serde(default = "native_source")]
     pub source: String,
-}
-
-/// Align actual marked-content tags only through retained source spans and the graph source index.
-pub fn attach_structure_tags(graph: &mut DocumentStructure, pages: &[Page], native: &[PdfStructureTagWitness]) {
-    let mut tags = std::collections::BTreeMap::new();
-    for tag in native {
-        let mut witness = tag.clone(); witness.ranges.clear(); witness.line_ids.clear();
-        tags.insert((tag.page_index, tag.mcid, tag.role.clone()), witness);
-    }
-    let fragments: HashMap<_, _> = graph.source_fragments.iter().map(|fragment|
-        ((fragment.page_index, fragment.id.as_str()), fragment.range)).collect();
-    let source = legal_structure_model::ScalarText::new(&graph.text);
-    for page in pages {
-        for line in &page.lines {
-            let coordinates = legal_structure_model::ScalarText::new(&line.text);
-            for span in &line.spans {
-                let (Some(mcid), Some(role)) = (span.mcid, span.structure_role.as_ref()) else { continue; };
-                let witness = tags.entry((page.index, mcid, role.clone())).or_insert_with(|| PdfStructureTagWitness {
-                    page_index: page.index, mcid, role: role.clone(), ranges: Vec::new(), line_ids: Vec::new(),
-                });
-                let Some(fragment) = fragments.get(&(page.index, line.id.as_str())) else { continue; };
-                if source.slice_utf16(fragment.start..fragment.end) != Some(line.text.as_str())
-                    || coordinates.slice(span.start..span.end) != Some(span.text.as_str()) { continue; }
-                let range = ScalarRange { start: fragment.start + coordinates.utf16(span.start),
-                    end: fragment.start + coordinates.utf16(span.end) };
-                if range.start >= range.end { continue; }
-                witness.ranges.push(range);
-                if witness.line_ids.last() != Some(&line.id) { witness.line_ids.push(line.id.clone()); }
-            }
-        }
-    }
-    graph.structure_tags = tags.into_values().collect();
 }
 
 fn unknown_region() -> String {
@@ -358,8 +326,6 @@ pub struct PdfOutlineEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PdfExtractionMetadata {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub structure_tags: Vec<PdfStructureTagWitness>,
     #[serde(default)]
     pub embedded_page_labels: Vec<Option<String>>,
     pub pages_needing_ocr: Vec<usize>,
