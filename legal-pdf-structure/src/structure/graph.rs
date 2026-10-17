@@ -657,13 +657,32 @@ impl PdfResolutionInput {
                     )
                 }),
         );
+        // Citations by where they start, each with the furthest end so far, so a line finds the
+        // ones overlapping it without reading every citation.
+        let mut by_start = (0..citation_ranges.len()).collect::<Vec<_>>();
+        by_start.sort_by_key(|&slot| citation_ranges[slot].0);
+        let reach = by_start
+            .iter()
+            .scan(0, |end, &slot| {
+                *end = (*end).max(citation_ranges[slot].1);
+                Some(*end)
+            })
+            .collect::<Vec<_>>();
         let citation_spans = index
             .lines
             .iter()
             .map(|indexed| {
-                let spans = citation_ranges
+                let before = by_start.partition_point(|&slot| citation_ranges[slot].0 < indexed.range.end);
+                let reached = reach[..before].partition_point(|end| *end <= indexed.range.start);
+                let mut overlapping = by_start[reached..before]
                     .iter()
-                    .filter(|(start, end)| *start < indexed.range.end && indexed.range.start < *end)
+                    .copied()
+                    .filter(|&slot| indexed.range.start < citation_ranges[slot].1)
+                    .collect::<Vec<_>>();
+                overlapping.sort_unstable();
+                let spans = overlapping
+                    .into_iter()
+                    .map(|slot| &citation_ranges[slot])
                     .map(|(start, end)| PdfSourceSpan {
                         start: start.saturating_sub(indexed.range.start),
                         end: (*end).min(indexed.range.end) - indexed.range.start,
