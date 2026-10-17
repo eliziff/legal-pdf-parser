@@ -1,7 +1,7 @@
 //! Reading a PDF's print: the paragraphs a printed paragraph number addresses, in the body or
 //! in the margin.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // Printed paragraph numbers are addresses, not structural ordinal positions.
 // Split on the actual native lines: a prose node can contain several numbered
@@ -44,20 +44,16 @@ fn own<'l, 'a>(
         .collect()
 }
 
-/// `headings`: the lines of the document's outline headings. A paragraph ends where the next
-/// heading or the next numbered paragraph begins.
+/// `headings`: the lines of the document's outline headings; `labels`: each bracketed label's
+/// number and line. A paragraph ends where the next heading or the next numbered paragraph begins.
 fn printed_paragraph_plan<'a>(
     lines: &[(&'a str, &'a str, u32, [f64; 4])],
+    labels: &[(usize, usize)],
     paragraphs: &[Vec<String>],
     headings: &HashSet<String>,
     locator: &str,
 ) -> Option<(legal_pdf_support::PdfLookupStatus, HashSet<&'a str>)> {
     use legal_pdf_support::PdfLookupStatus as Status;
-    let labels = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (_, text, ..))| Some((bracket_label(text)?, index)))
-        .collect::<Vec<_>>();
     if labels.is_empty() {
         return None;
     }
@@ -164,13 +160,15 @@ fn printed_paragraph_plan<'a>(
 // Classification supplies the eligible body lines; note and furniture lines never enter here.
 // A heading set out to the margin ("Circumstances of the offence") is no part of the body the
 // numbers stand beside, and a paragraph ends where the next heading begins.
+/// `margin`: each page's body bounds and the margin's labels, as `margin_labels` reads them.
 fn marginal_paragraph_plan<'a>(
     pages: &'a [legal_pdf_support::PdfTextPage],
     headings: &HashSet<String>,
+    margin: &MarginLabels,
     locator: &str,
 ) -> Option<(legal_pdf_support::PdfLookupStatus, HashSet<&'a str>)> {
     use legal_pdf_support::PdfLookupStatus as Status;
-    let (body_bounds, labels) = margin_labels(pages, headings);
+    let (body_bounds, labels) = margin;
     // One isolated margin number could be a note. Require a numbering run.
     if !numbering_run(&labels) {
         return None;
@@ -298,13 +296,12 @@ fn marginal_paragraph_plan<'a>(
     Some((Status::Found, selected))
 }
 
+/// Each page's body bounds, and the paragraph numbers in the margin: number, page index, row top.
+type MarginLabels = (Vec<Option<[f64; 4]>>, Vec<(usize, usize, f64)>);
+
 /// Each page's body bounds, and the paragraph numbers standing in the margin or set apart at the
 /// start of a body line, in reading order: each number, its page index and the top of its row.
-#[allow(clippy::type_complexity)]
-fn margin_labels(
-    pages: &[legal_pdf_support::PdfTextPage],
-    headings: &HashSet<String>,
-) -> (Vec<Option<[f64; 4]>>, Vec<(usize, usize, f64)>) {
+fn margin_labels(pages: &[legal_pdf_support::PdfTextPage], headings: &HashSet<String>) -> MarginLabels {
     let body_bounds = pages
         .iter()
         .map(|page| {
@@ -389,17 +386,19 @@ fn bracket_label(text: &str) -> Option<usize> {
 }
 
 /// Enumerate the printed addresses using the same selectors for body and margin numbers.
+/// `labels`: each bracketed label's number and line.
 fn printed_paragraphs<'a>(
     pages: &'a [legal_pdf_support::PdfTextPage],
     lines: &[PrintedLine<'a>],
+    labels: &[(usize, usize)],
     paragraphs: &[Vec<String>],
     headings: &HashSet<String>,
 ) -> Vec<(usize, legal_pdf_support::PdfLookupStatus, HashSet<&'a str>)> {
-    let (_, margin) = margin_labels(pages, headings);
-    let mut numbers = lines
+    let margin = margin_labels(pages, headings);
+    let mut numbers = labels
         .iter()
-        .filter_map(|(_, text, ..)| bracket_label(text))
-        .chain(margin.iter().map(|label| label.0))
+        .map(|label| label.0)
+        .chain(margin.1.iter().map(|label| label.0))
         .collect::<Vec<_>>();
     numbers.sort_unstable();
     numbers.dedup();
@@ -407,8 +406,8 @@ fn printed_paragraphs<'a>(
         .into_iter()
         .filter_map(|number| {
             let locator = number.to_string();
-            let (status, lines) = marginal_paragraph_plan(pages, headings, &locator)
-                .or_else(|| printed_paragraph_plan(lines, paragraphs, headings, &locator))?;
+            let (status, lines) = marginal_paragraph_plan(pages, headings, &margin, &locator)
+                .or_else(|| printed_paragraph_plan(lines, labels, paragraphs, headings, &locator))?;
             Some((number, status, lines))
         })
         .collect()
@@ -597,15 +596,33 @@ pub(super) fn candidates(
         .collect::<Vec<_>>();
     let mut runs = Vec::new();
     let mut evidence = Vec::new();
-    for (number, status, selected) in printed_paragraphs(&pages, &lines, &groups, &headings) {
+    let labels = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, text, ..))| Some((bracket_label(text)?, index)))
+        .collect::<Vec<_>>();
+    let mut slots_of = HashMap::<&str, Vec<usize>>::new();
+    // The lines printing each number, bracketed or bare.
+    let mut printing = HashMap::<usize, Vec<usize>>::new();
+    for (slot, (id, text, ..)) in lines.iter().enumerate() {
+        slots_of.entry(*id).or_default().push(slot);
+        let bracketed = bracket_label(text);
+        let bare = text.trim();
+        let bare = bare.parse::<usize>().ok().filter(|number| number.to_string() == bare && bracketed != Some(*number));
+        for number in bracketed.into_iter().chain(bare) {
+            printing.entry(number).or_default().push(slot);
+        }
+    }
+    for (number, status, selected) in printed_paragraphs(&pages, &lines, &labels, &groups, &headings) {
         let selections = if status == PdfLookupStatus::Found {
             vec![selected]
         } else if status == PdfLookupStatus::Ambiguous {
             // Distinct occurrences remain distinct graph identities; lookup reports ambiguity.
-            lines
+            labels
                 .iter()
-                .filter(|(_, text, ..)| bracket_label(text) == Some(number))
-                .map(|(id, ..)| {
+                .filter(|(label, _)| *label == number)
+                .map(|(_, slot)| &lines[*slot].0)
+                .map(|id| {
                     groups
                         .iter()
                         .find(|group| group.iter().any(|value| value == id))
@@ -617,21 +634,18 @@ pub(super) fn candidates(
             continue;
         };
         for selected in selections {
-            let ids = lines
-                .iter()
-                .filter(|(id, ..)| selected.contains(id))
-                .map(|(id, ..)| (*id).to_owned())
-                .collect::<Vec<_>>();
+            let mut slots = selected.iter().filter_map(|id| slots_of.get(id)).flatten().copied().collect::<Vec<_>>();
+            slots.sort_unstable();
+            let ids = slots.iter().map(|slot| lines[*slot].0.to_owned()).collect::<Vec<_>>();
             let Some(range) = index.range_for_line_ids(&ids) else {
                 continue;
             };
-            let first = lines.iter().find(|(id, ..)| selected.contains(id));
-            let marker = lines.iter().find(|(id, text, page, rect)| {
-                (bracket_label(text) == Some(number) || text.trim() == number.to_string())
-                    && (selected.contains(id)
-                        || first.is_some_and(|(_, _, first_page, first_rect)| {
-                            page == first_page && rect[1] < first_rect[3] && first_rect[1] < rect[3]
-                        }))
+            let first = slots.first().map(|slot| &lines[*slot]);
+            let marker = printing.get(&number).into_iter().flatten().map(|slot| &lines[*slot]).find(|(id, _, page, rect)| {
+                selected.contains(id)
+                    || first.is_some_and(|(_, _, first_page, first_rect)| {
+                        page == first_page && rect[1] < first_rect[3] && first_rect[1] < rect[3]
+                    })
             });
             let Some((marker_id, marker_text, ..)) = marker else {
                 continue;
