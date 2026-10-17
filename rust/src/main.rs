@@ -3,8 +3,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use legalpdf::{
-    derive_pdf_document, digest_cached_extraction, query_pdf_document, Error, PdfLookupRequest,
-    PdfRequest, PdfStructureLookup, Result,
+    derive_pdf_document, query_pdf_document, Error, PdfLookupRequest, PdfRequest,
+    PdfStructureLookup, Result,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,29 +80,6 @@ impl Drop for GateCacheRoot {
 
 fn usage() -> &'static str {
     "usage:\n  legalpdf --version"
-}
-
-fn parity_replay_batch_command(arguments: &[String]) -> Result<i32> {
-    let [manifest] = arguments else {
-        return Err(Error::Message(
-            "_parity-replay-batch requires <manifest.json>".to_owned(),
-        ));
-    };
-    let path = PathBuf::from(manifest);
-    let bytes = std::fs::read(&path).map_err(|source| Error::io(&path, source))?;
-    if bytes.len() > MAX_MANIFEST_BYTES {
-        return Err(Error::Message("replay manifest exceeds 1 MiB".to_owned()));
-    }
-    let jobs: Vec<(PathBuf, String)> = serde_json::from_slice(&bytes)?;
-    for (index, batch) in jobs.chunks(25).enumerate() {
-        for (input, source_name) in batch {
-            let value = digest_cached_extraction(input, source_name.clone())?;
-            println!("{}", serde_json::to_string(&value)?);
-        }
-        let completed = ((index + 1) * 25).min(jobs.len());
-        eprintln!("replayed {completed}/{}", jobs.len());
-    }
-    Ok(0)
 }
 
 fn pdf_inspector_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -275,7 +252,6 @@ fn run() -> Result<i32> {
         .split_first()
         .ok_or_else(|| Error::Message(usage().to_owned()))?;
     match command.as_str() {
-        "_parity-replay-batch" => parity_replay_batch_command(rest),
         "_pdf-inspector-gate" => pdf_inspector_gate_command(rest),
         "--version" | "-V" => {
             println!("legalpdf {}", env!("CARGO_PKG_VERSION"));

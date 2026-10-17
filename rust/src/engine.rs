@@ -1,8 +1,4 @@
-use crate::structure_engine::{derive_pdf_pages, PdfReplayProjection};
-use legal_pdf_core::model::{
-    Diagnostic, Footnote, LegalDocument, Line, Page, Paragraph, Region, Span, Word, PARSER_VERSION,
-    SCHEMA_VERSION,
-};
+use legal_pdf_core::model::{LegalDocument, PARSER_VERSION, SCHEMA_VERSION};
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
@@ -14,12 +10,12 @@ use legal_pdf_support::{profile, PdfDocument};
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use legal_structure_model::{DetectionProfile, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
-use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -800,96 +796,13 @@ pub(crate) fn parse_pdf(
     Ok(Some(parsed))
 }
 
-trait FrozenOrder {
-    fn serialize_frozen<S: Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error>;
-}
-
-struct Frozen<'a, T>(&'a T);
-
-impl<T: FrozenOrder> Serialize for Frozen<'_, T> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.0.serialize_frozen(serializer)
-    }
-}
-
-struct FrozenSlice<'a, T>(&'a [T]);
-
-impl<T: FrozenOrder> Serialize for FrozenSlice<'_, T> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().map(Frozen))
-    }
-}
-
-macro_rules! frozen_fields {
-    ($map:ident $value:ident;) => {};
-    ($map:ident $value:ident; [$field:ident] $($rest:tt)*) => {
-        $map.serialize_entry(stringify!($field), &FrozenSlice(&$value.$field))?;
-        frozen_fields!($map $value; $($rest)*);
-    };
-    ($map:ident $value:ident; $field:ident => $key:literal $($rest:tt)*) => {
-        $map.serialize_entry($key, &$value.$field)?;
-        frozen_fields!($map $value; $($rest)*);
-    };
-    ($map:ident $value:ident; $field:ident $($rest:tt)*) => {
-        $map.serialize_entry(stringify!($field), &$value.$field)?;
-        frozen_fields!($map $value; $($rest)*);
-    };
-}
-
-macro_rules! frozen_type {
-    ($kind:ident: $($fields:tt)*) => {
-        impl FrozenOrder for $kind {
-            fn serialize_frozen<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-                let mut map = serializer.serialize_map(None)?;
-                frozen_fields!(map self; $($fields)*);
-                map.end()
-            }
-        }
-    };
-}
-
-frozen_type!(Word: bbox end id start text);
-frozen_type!(Span: bbox end flags font id size start superscript text);
-frozen_type!(Line: bbox block_index detached_references exclude_from_body id note_region_mode page_index page_number reading_order region_id region_type source source_index [spans] suppress_footnote_label text [words]);
-frozen_type!(Region: bbox id line_ids page_index reading_order kind => "type");
-frozen_type!(Page: height id index [lines] number printed_label printed_label_line_id printed_label_source [regions] source text_quality width);
-frozen_type!(Paragraph: anchors id line_ids page_index region_type text);
-frozen_type!(Footnote: body body_line_ids body_pages confidence crossrefs label occurrence pair_id passage_since_prior_note provenance reference_line_id reference_page restart_sequence sentence_proposition warnings);
-frozen_type!(Diagnostic: code details line_ids message page_index severity);
-struct FrozenReplay<'a>(&'a PdfReplayProjection);
-
-impl Serialize for FrozenReplay<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let value = self.0;
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("derived_pages", &FrozenSlice(&value.derived_pages))?;
-        map.serialize_entry("diagnostics", &FrozenSlice(&value.diagnostics))?;
-        map.serialize_entry("footnotes", &FrozenSlice(&value.footnotes))?;
-        map.serialize_entry("marker_summary", &value.pairing_audit.pairing_summary)?;
-        map.serialize_entry("markers", &value.pairing_audit.markers)?;
-        map.serialize_entry("pairing_summary", &value.pairing_audit.pairing_summary)?;
-        map.serialize_entry("paragraphs", &FrozenSlice(&value.paragraphs))?;
-        map.serialize_entry("prepared_pages", &FrozenSlice(&value.prepared_pages))?;
-        map.serialize_entry("schema_version", "legalpdf.common-input-result.v1")?;
-        map.serialize_entry("source_sha256", &value.source_sha256)?;
-        map.serialize_entry("status", &value.status)?;
-        map.serialize_entry("validation", "ok")?;
-        map.end()
-    }
-}
-
 #[derive(Debug, Default)]
 struct DigestWriter {
-    bytes: u64,
     digest: Sha256,
 }
 
 impl Write for DigestWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.bytes += bytes.len() as u64;
         self.digest.update(bytes);
         Ok(bytes.len())
     }
@@ -1073,52 +986,6 @@ pub fn corpus_check_cached_extraction(
         "product_sha256": serialization_sha256(&document)?,
         "structure": structure,
     }))
-}
-
-#[doc(hidden)]
-pub fn digest_cached_extraction(input: impl AsRef<Path>, source_name: String) -> Result<Value> {
-    let cached: CachedExtraction = read_gzip_json(input.as_ref())?;
-    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
-        || cached.extraction.pages.len() != cached.extraction.separators.len()
-    {
-        return Err(Error::Message("invalid extraction cache".to_owned()));
-    }
-    let input_lines: usize = cached
-        .extraction
-        .pages
-        .iter()
-        .map(|page| page.lines.len())
-        .sum();
-    let document_id = format!(
-        "doc-{}",
-        cached
-            .source_sha256
-            .get(..20)
-            .ok_or_else(|| Error::Message("cached source SHA-256 is invalid".to_owned()))?
-    );
-    let value = derive_pdf_pages(
-        document_id,
-        cached.source_sha256,
-        cached.extraction.pages,
-        cached.extraction.separators,
-        &cached.extraction.outline,
-        None,
-    )
-    .map_err(|error| Error::Message(error.message))?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, DigestWriter::default());
-    let source_sha256 = value.source_sha256.clone();
-    let _ = source_name;
-    let structure = json!({
-        "paragraph_count": value.paragraphs.len(),
-        "paragraphs_sha256": serialization_sha256(&FrozenSlice(&value.paragraphs))?,
-        "graph_sha256": serialization_sha256(&value.structure_graph)?,
-    });
-    serde_json::to_writer_pretty(&mut writer, &FrozenReplay(&value))?;
-    writer.write_all(b"\n").expect("digest writer cannot fail");
-    let writer = writer.into_inner().expect("digest writer cannot fail");
-    Ok(
-        json!({"input_lines": input_lines, "output_bytes": writer.bytes, "output_sha256": format!("{:x}", writer.digest.finalize()), "source_sha256": source_sha256, "structure": structure}),
-    )
 }
 
 #[cfg(test)]

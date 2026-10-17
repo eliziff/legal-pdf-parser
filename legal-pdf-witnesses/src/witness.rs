@@ -2,7 +2,7 @@
 
 use legal_pdf_core::model::{Line, Page};
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// The witnesses, in the order of each row's values. Flags are 1 or 0; measures are ratios to the
@@ -124,23 +124,14 @@ pub struct Context<'a> {
     pub layout: Option<&'a HashMap<String, String>>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Row {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_range: Option<legal_structure_model::ScalarRange>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub spans: Vec<SpanWitness>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub words: Vec<(usize, usize, bool)>,
     pub page: usize,
-    pub slot: usize,
     pub id: String,
     pub text: String,
     pub recognized: bool,
     pub values: Vec<f32>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub rows: Vec<Row>,
 }
@@ -149,251 +140,6 @@ impl Table {
     pub fn by_id(&self) -> HashMap<&str, &Row> {
         self.rows.iter().map(|row| (row.id.as_str(), row)).collect()
     }
-}
-
-/// Feature text uses only the unit's own source membership, never intervening envelope text.
-pub(crate) fn membership_text(
-    node: &legal_structure_model::StructureNode,
-    text: &legal_structure_model::ScalarText<'_>,
-) -> Option<String> {
-    let ranges = if node.ranges.is_empty() {
-        std::slice::from_ref(&node.range)
-    } else {
-        &node.ranges
-    };
-    let ranges = ranges.iter().map(|range| Some(legal_structure_model::ScalarRange {
-        start: text.utf16_at_scalar(range.start)?,
-        end: text.utf16_at_scalar(range.end)?,
-    })).collect::<Option<Vec<_>>>()?;
-    Some(text.membership_text_utf16(&ranges))
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct SpanWitness {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    size: f32,
-    bold: bool,
-    italic: bool,
-    own_font: bool,
-    /// Rank, source-line frequency and body-style membership for this exact type.
-    style: [f32; 3],
-    role: Option<String>,
-}
-
-/// Bind known source IDs to their established coordinates; never find repeated text heuristically.
-pub fn bind_source_fragments(
-    table: &mut Table,
-    text: &str,
-    fragments: &[legal_structure_model::SourceFragment],
-) -> Result<(), String> {
-    let coordinates = legal_structure_model::ScalarText::new(text);
-    let by_id = fragments
-        .iter()
-        .map(|fragment| (fragment.id.as_str(), fragment.range))
-        .collect::<HashMap<_, _>>();
-    for row in &mut table.rows {
-        let range = by_id
-            .get(row.id.as_str())
-            .ok_or("Witness line has no source fragment")?;
-        let start = coordinates
-            .scalar_at_utf16(range.start)
-            .ok_or("Invalid witness fragment start")?;
-        let end = coordinates
-            .scalar_at_utf16(range.end)
-            .ok_or("Invalid witness fragment end")?;
-        if coordinates.slice(start..end) != Some(row.text.as_str()) {
-            return Err("Witness text differs from identified source fragment".into());
-        }
-        row.source_range = Some(legal_structure_model::ScalarRange { start, end });
-    }
-    Ok(())
-}
-
-fn exact_type(values: &mut [f32], row: Option<&Row>, ranges: &[(usize, usize)]) {
-    let mut weight = 0usize;
-    let mut size = 0.0;
-    let mut bold = 0usize;
-    let mut italic = 0usize;
-    let mut own_font = 0usize;
-    let mut style_weight = 0usize;
-    let mut style = [0.0; 3];
-    let mut tags = HashSet::new();
-    let overlap = |start: usize, end: usize| {
-        ranges
-            .iter()
-            .map(|(lo, hi)| end.min(*hi).saturating_sub(start.max(*lo)))
-            .sum::<usize>()
-    };
-    if let Some(row) = row {
-        for span in &row.spans {
-            let count = overlap(span.start, span.end);
-            if count == 0 {
-                continue;
-            }
-            if let Some(role) = span.role.as_deref() {
-                tags.insert(role);
-            }
-            if span.size > 0.0 {
-                style_weight += count;
-                for (sum, value) in style.iter_mut().zip(span.style) { *sum += value * count as f32; }
-                weight += count;
-                size += span.size * count as f32;
-                bold += usize::from(span.bold) * count;
-                italic += usize::from(span.italic) * count;
-                own_font += usize::from(span.own_font) * count;
-            }
-        }
-    }
-    for (name, value) in [
-        ("size", size / weight.max(1) as f32),
-        ("bold", bold as f32 / weight.max(1) as f32),
-        ("italic", italic as f32 / weight.max(1) as f32),
-        ("own_font", own_font as f32 / weight.max(1) as f32),
-        ("style_rank", style[0] / style_weight.max(1) as f32),
-        ("style_lines", style[1] / style_weight.max(1) as f32),
-        ("body_style", style[2] / style_weight.max(1) as f32),
-    ] {
-        values[index(name).unwrap()] = value;
-    }
-    let (mut words, mut underlined) = (0, 0);
-    if let Some(row) = row {
-        for (start, end, marked) in &row.words {
-            let count = overlap(*start, *end);
-            words += count;
-            if *marked {
-                underlined += count;
-            }
-        }
-    }
-    values[index("underlined").unwrap()] = underlined as f32 / words.max(1) as f32;
-    for (name, present) in [
-        ("tag_known", !tags.is_empty()),
-        (
-            "tag_heading",
-            tags.iter()
-                .any(|role| matches!(*role, "H" | "H1" | "H2" | "H3" | "H4" | "H5" | "H6")),
-        ),
-        ("tag_title", tags.contains("Title")),
-        ("tag_paragraph", tags.contains("P")),
-        (
-            "tag_list",
-            tags.iter()
-                .any(|role| matches!(*role, "L" | "LI" | "Lbl" | "LBody")),
-        ),
-        (
-            "tag_table",
-            tags.iter()
-                .any(|role| matches!(*role, "Table" | "TR" | "TH" | "TD")),
-        ),
-        ("tag_note", tags.contains("Note")),
-        (
-            "tag_reference",
-            tags.iter()
-                .any(|role| matches!(*role, "Reference" | "Link")),
-        ),
-        ("tag_caption", tags.contains("Caption")),
-        ("tag_artifact", tags.contains("Artifact")),
-        (
-            "tag_quotation",
-            tags.iter()
-                .any(|role| matches!(*role, "BlockQuote" | "Quote")),
-        ),
-    ] {
-        values[index(name).unwrap()] = if present { 1.0 } else { 0.0 };
-    }
-}
-
-pub(crate) fn node_values(
-    row: Option<&Row>,
-    node: &legal_structure_model::StructureNode,
-    coordinates: &legal_structure_model::ScalarText<'_>,
-) -> Vec<f32> {
-    let mut values = span_values(row, &membership_text(node, coordinates).unwrap_or_default());
-    let ranges = row
-        .and_then(|row| row.source_range)
-        .map(|source| {
-            let parts = if node.ranges.is_empty() {
-                std::slice::from_ref(&node.range)
-            } else {
-                &node.ranges
-            };
-            parts
-                .iter()
-                .filter_map(|part| {
-                    let start = part.start.max(source.start);
-                    let end = part.end.min(source.end);
-                    (start < end).then_some((start - source.start, end - source.start))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    exact_type(&mut values, row, &ranges);
-    values
-}
-
-/// Physical typography stays with the source line; lexical evidence belongs to the exact unit.
-pub(crate) fn span_values(row: Option<&Row>, text: &str) -> Vec<f32> {
-    let mut values = row.map_or_else(|| vec![0.0; NAMES.len()], |row| row.values.clone());
-    let text = text.trim();
-    let flag = |value: bool| if value { 1.0 } else { 0.0 };
-    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
-    let capitals = text.chars().filter(|c| c.is_uppercase()).count();
-    let first = text.chars().next();
-    let end = text.chars().last();
-    for (name, value) in [
-        ("chars", text.chars().count() as f32),
-        ("words", text.split_whitespace().count() as f32),
-        (
-            "caps",
-            if letters > 0 {
-                capitals as f32 / letters as f32
-            } else {
-                0.0
-            },
-        ),
-        ("letters", letters as f32),
-        (
-            "first_upper",
-            flag(first.is_some_and(|c| c.is_uppercase() || c.is_ascii_digit())),
-        ),
-        ("first_lower", flag(first.is_some_and(char::is_lowercase))),
-        ("end_colon", flag(end == Some(':'))),
-        ("end_period", flag(end == Some('.'))),
-        ("end_comma", flag(end == Some(','))),
-        ("end_semicolon", flag(end == Some(';'))),
-        ("end_paren", flag(end == Some(')'))),
-        ("end_dash", flag(end.is_some_and(|c| "-–—".contains(c)))),
-        (
-            "marker_any",
-            flag(families(text).iter().any(|marked| *marked)),
-        ),
-        ("marker_only", flag(bare().is_match(text))),
-    ] {
-        if let Some(at) = index(name) {
-            values[at] = value;
-        }
-    }
-    for (name, marked) in [
-        "m_bullet",
-        "m_paren_num",
-        "m_paren_letter",
-        "m_paren_roman",
-        "m_decimal",
-        "m_num",
-        "m_num_bare",
-        "m_letter",
-        "m_roman",
-        "m_word",
-    ]
-    .into_iter()
-    .zip(families(text))
-    {
-        if let Some(at) = index(name) {
-            values[at] = flag(marked);
-        }
-    }
-    values
 }
 
 fn regex(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
@@ -521,7 +267,7 @@ fn italic(line: &Line) -> bool {
             .all(|span| span.flags & 2 != 0 || span.font.to_lowercase().contains("ital"))
 }
 
-fn size(line: &Line) -> f64 {
+pub(crate) fn size(line: &Line) -> f64 {
     line.spans.iter().map(|span| span.size).fold(0.0, f64::max)
 }
 
@@ -544,7 +290,7 @@ fn underlined(line: &Line) -> f32 {
     }
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
+pub(crate) fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -570,25 +316,14 @@ fn letters_key(text: &str) -> String {
 
 /// Every counted line's witnesses, in reading order.
 pub fn witnesses(pages: &[Page], context: &Context) -> Table {
-    collect_witnesses(pages, context, false)
-}
-
-/// Every physical source line, including lines without a reader classification.
-pub fn source_witnesses(pages: &[Page], context: &Context) -> Table {
-    collect_witnesses(pages, context, true)
-}
-
-fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Table {
-    let eligible = |line: &Line| all_source || counted(line);
     let lines = pages
         .iter()
         .enumerate()
         .flat_map(|(p, page)| {
             page.lines
                 .iter()
-                .enumerate()
-                .filter(|(_, l)| eligible(l))
-                .map(move |(s, l)| (p, s, l))
+                .filter(|l| counted(l))
+                .map(move |l| (p, l))
         })
         .collect::<Vec<_>>();
     if lines.is_empty() {
@@ -597,26 +332,26 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
     let body_size = median(
         lines
             .iter()
-            .map(|(_, _, l)| size(l))
+            .map(|(_, l)| size(l))
             .filter(|s| *s > 0.0)
             .collect(),
     );
     let body_height = median(
         lines
             .iter()
-            .map(|(_, _, l)| l.bbox[3] - l.bbox[1])
+            .map(|(_, l)| l.bbox[3] - l.bbox[1])
             .filter(|h| *h > 0.0)
             .collect(),
     )
     .max(1.0);
     let styled = lines
         .iter()
-        .filter_map(|(_, _, l)| bold(l))
+        .filter_map(|(_, l)| bold(l))
         .collect::<Vec<_>>();
     let bold_share = styled.iter().filter(|b| **b).count() as f32 / styled.len().max(1) as f32;
     let fonts = lines
         .iter()
-        .filter_map(|(_, _, l)| l.spans.first().map(|s| s.font.clone()))
+        .filter_map(|(_, l)| l.spans.first().map(|s| s.font.clone()))
         .fold(HashMap::new(), |mut m, f| {
             *m.entry(f).or_insert(0usize) += 1;
             m
@@ -629,7 +364,7 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
     let page_count = pages.len().max(1) as f32;
     // Text repeated page after page: running heads and titles.
     let mut seen_on = HashMap::<String, HashSet<usize>>::new();
-    for (p, _, l) in &lines {
+    for (p, l) in &lines {
         seen_on.entry(normal(&l.text)).or_default().insert(*p);
     }
     // The style ladder: each style (bold, size step, capitals), ranked by prominence.
@@ -645,7 +380,7 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
         (bold(l) == Some(true), step, caps)
     };
     let mut style_count = HashMap::<(bool, i64, bool), usize>::new();
-    for (_, _, l) in &lines {
+    for (_, l) in &lines {
         *style_count.entry(style(l)).or_default() += 1;
     }
     let mut ranked = style_count.keys().copied().collect::<Vec<_>>();
@@ -661,7 +396,7 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
         .map(|(st, _)| *st);
     // Backbone counts: a marker family spread over a third of the document's pages.
     let mut family_pages = HashMap::<usize, HashSet<usize>>::new();
-    for (p, _, l) in &lines {
+    for (p, l) in &lines {
         if let Some(f) = family(&l.text) {
             family_pages.entry(f).or_default().insert(*p);
         }
@@ -677,8 +412,8 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
         .map(|ids| {
             lines
                 .iter()
-                .filter(|(_, _, l)| ids.contains(&l.id))
-                .map(|(_, _, l)| letters_key(&leader().replace(&l.text, "")))
+                .filter(|(_, l)| ids.contains(&l.id))
+                .map(|(_, l)| letters_key(&leader().replace(&l.text, "")))
                 .filter(|k| k.len() >= 4)
                 .collect::<HashSet<_>>()
         })
@@ -700,13 +435,13 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
             let mut lefts = page
                 .lines
                 .iter()
-                .filter(|l| eligible(l))
+                .filter(|l| counted(l))
                 .map(|l| l.bbox[0])
                 .collect::<Vec<_>>();
             let mut rights = page
                 .lines
                 .iter()
-                .filter(|l| eligible(l))
+                .filter(|l| counted(l))
                 .map(|l| l.bbox[2])
                 .collect::<Vec<_>>();
             if lefts.is_empty() {
@@ -723,16 +458,16 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
     let lexicon = crate::lexicon::lexicon();
     let flag = |b: bool| if b { 1.0 } else { 0.0 };
     let mut region_lines = HashMap::<(usize, &str), usize>::new();
-    for (p, _, l) in &lines {
+    for (p, l) in &lines {
         if !l.region_id.is_empty() {
             *region_lines.entry((*p, l.region_id.as_str())).or_default() += 1;
         }
     }
-    let same_region = |o: Option<(usize, usize, &Line)>, p: usize, l: &Line| {
-        o.is_some_and(|(q, _, o)| q == p && o.region_id == l.region_id)
+    let same_region = |o: Option<(usize, &Line)>, p: usize, l: &Line| {
+        o.is_some_and(|(q, o)| q == p && o.region_id == l.region_id)
     };
     let mut rows = Vec::with_capacity(lines.len());
-    for (n, &(p, s, l)) in lines.iter().enumerate() {
+    for (n, &(p, l)) in lines.iter().enumerate() {
         let page = &pages[p];
         let text = l.text.trim();
         let (left, right) = measures[p];
@@ -740,14 +475,14 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
         let [x0, y0, x1, y1] = l.bbox;
         let prev = n.checked_sub(1).map(|m| lines[m]);
         let next = lines.get(n + 1).copied();
-        let above = prev.filter(|(q, _, _)| *q == p).map(|(_, _, o)| o);
-        let below = next.filter(|(q, _, _)| *q == p).map(|(_, _, o)| o);
+        let above = prev.filter(|(q, _)| *q == p).map(|(_, o)| o);
+        let below = next.filter(|(q, _)| *q == p).map(|(_, o)| o);
         let gap_above = above.map(|o| ((y0 - o.bbox[3]) / body_height) as f32);
         let gap_below = below.map(|o| ((o.bbox[1] - y1) / body_height) as f32);
         let letters = text.chars().filter(|c| c.is_alphabetic()).count();
         let capitals = text.chars().filter(|c| c.is_uppercase()).count();
         let end = text.chars().last().unwrap_or(' ');
-        let prev_text = prev.map_or("", |(_, _, o)| o.text.trim());
+        let prev_text = prev.map_or("", |(_, o)| o.text.trim());
         let prev_end = prev_text.chars().last().unwrap_or(' ');
         let prev_words = prev_text
             .rsplit(|c: char| !c.is_alphabetic())
@@ -766,7 +501,7 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
         let values = vec![
             flag(recognized),
             (page.index + 1) as f32 / page_count,
-            flag(prev.is_none_or(|(q, _, _)| q != p)),
+            flag(prev.is_none_or(|(q, _)| q != p)),
             flag(usual_width > 0.0 && (page.width - usual_width).abs() > 20.0),
             flag(p > 0 && pages[p - 1].source != page.source),
             bold_share,
@@ -788,8 +523,8 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
                 0.0
             },
             underlined(l),
-            flag(prev.is_some_and(|(_, _, o)| bold(o) == Some(true))),
-            flag(next.is_some_and(|(_, _, o)| bold(o) == Some(true))),
+            flag(prev.is_some_and(|(_, o)| bold(o) == Some(true))),
+            flag(next.is_some_and(|(_, o)| bold(o) == Some(true))),
             ((y1 - y0) / body_height) as f32,
             ((x1 - x0) / measure) as f32,
             ((x0 - left) / measure) as f32,
@@ -827,7 +562,7 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
             flag(prev_end == ','),
             flag(prev_end == ';'),
             flag(matches!(prev_end, '-' | '\u{2013}' | '\u{2014}')),
-            flag(next.is_some_and(|(_, _, o)| o.text.trim_start().starts_with(char::is_lowercase))),
+            flag(next.is_some_and(|(_, o)| o.text.trim_start().starts_with(char::is_lowercase))),
             flag(
                 matches!(prev_end, ':' | '-' | '\u{2013}' | '\u{2014}')
                     || prev_words
@@ -922,79 +657,13 @@ fn collect_witnesses(pages: &[Page], context: &Context, all_source: bool) -> Tab
             ),
         ]);
         debug_assert_eq!(values.len(), NAMES.len());
-        let spans = l
-            .spans
-            .iter()
-            .filter(|span| {
-                span.start < span.end
-                    && coordinates.slice(span.start..span.end) == Some(span.text.as_str())
-            })
-            .map(|span| SpanWitness {
-                start: span.start,
-                end: span.end,
-                size: if body_size > 0.0 {
-                    (span.size / body_size) as f32
-                } else {
-                    0.0
-                },
-                bold: span.flags & 16 != 0 || span.font.to_lowercase().contains("bold"),
-                italic: span.flags & 2 != 0 || span.font.to_lowercase().contains("ital"),
-                own_font: span.font != body_font,
-                style: [0.0; 3],
-                role: span.structure_role.clone(),
-            })
-            .collect();
-        let words = l
-            .words
-            .iter()
-            .filter(|word| {
-                word.start < word.end
-                    && coordinates.slice(word.start..word.end) == Some(word.text.as_str())
-            })
-            .map(|word| (word.start, word.end, word.underlined))
-            .collect();
         rows.push(Row {
-            source_range: None,
-            spans,
-            words,
             page: page.index,
-            slot: s,
             id: l.id.clone(),
             text: l.text.clone(),
             recognized,
             values,
         });
     }
-    exact_styles(&mut rows);
     Table { rows }
-}
-
-/// Whole-source style frequencies use aligned spans, so inline headings and body text
-/// on the same physical line do not inherit one another's prominence or frequency.
-fn exact_styles(rows: &mut [Row]) {
-    let key = |span: &SpanWitness| ((span.size * 100.0).round() as i32, span.bold, span.italic);
-    let mut lines = BTreeMap::<_, HashSet<usize>>::new();
-    let mut characters = BTreeMap::<_, usize>::new();
-    for (index, row) in rows.iter().enumerate() {
-        let text = legal_structure_model::ScalarText::new(&row.text);
-        for span in &row.spans {
-            let count = text.slice(span.start..span.end).unwrap_or_default().chars()
-                .filter(|character| !character.is_whitespace()).count();
-            if count == 0 || span.size <= 0.0 { continue; }
-            lines.entry(key(span)).or_default().insert(index);
-            *characters.entry(key(span)).or_default() += count;
-        }
-    }
-    let ranks = characters.keys().rev().enumerate().map(|(rank, style)| (*style, rank))
-        .collect::<BTreeMap<_, _>>();
-    let body = characters.iter().max_by_key(|(style, count)| (**count, **style)).map(|(style, _)| *style);
-    for row in rows {
-        for span in &mut row.spans {
-            if span.size <= 0.0 { span.style = [0.0; 3]; continue; }
-            let style = key(span);
-            span.style = [ranks.get(&style).copied().unwrap_or(0) as f32,
-                lines.get(&style).map_or(0, HashSet::len) as f32,
-                if body == Some(style) { 1.0 } else { 0.0 }];
-        }
-    }
 }

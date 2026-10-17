@@ -94,7 +94,6 @@ fn stage_inputs(root: &Path, kraken: bool) -> [Vec<PathBuf>; 4] {
     let mut document = paths(&[
         "rust/src/contract.rs",
         "rust/src/engine.rs",
-        "rust/src/structure_engine.rs",
         "rust/src/supplied_ocr.rs",
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/lib.rs",
@@ -137,7 +136,6 @@ fn main() {
         root.join("Cargo.toml"),
         root.join("build.rs"),
         root.join("rust/src/lib.rs"),
-        root.join("rust/src/structure_engine.rs"),
     ];
     if pdf {
         inputs.extend(inspector_inputs(&root));

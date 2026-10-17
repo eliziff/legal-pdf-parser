@@ -3,8 +3,6 @@ use flate2::bufread::GzDecoder;
 use flate2::{Compression, GzBuilder};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::ser::Formatter;
-use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -33,17 +31,8 @@ fn temporary_path(path: &Path, attempt: u64) -> Result<PathBuf> {
     )))
 }
 
-#[doc(hidden)]
-pub fn atomic_write_with(
+fn atomic_write_with(
     path: &Path,
-    write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
-) -> Result<()> {
-    atomic_write_with_sync(path, true, write)
-}
-
-fn atomic_write_with_sync(
-    path: &Path,
-    sync: bool,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -75,9 +64,6 @@ fn atomic_write_with_sync(
         let mut writer = BufWriter::new(file);
         write(&mut writer)?;
         io(&temporary, writer.flush())?;
-        if sync {
-            io(&temporary, writer.get_ref().sync_all())?;
-        }
         drop(writer);
         if path.exists() {
             io(path, fs::remove_file(path))?;
@@ -91,59 +77,8 @@ fn atomic_write_with_sync(
     result
 }
 
-#[doc(hidden)]
-pub fn write_json(path: &Path, value: &Value) -> Result<()> {
-    atomic_write_with(path, |writer| {
-        serde_json::to_writer_pretty(&mut *writer, value)?;
-        writer
-            .write_all(b"\n")
-            .map_err(|source| Error::io(path, source))
-    })
-}
-
-struct PythonFormatter;
-
-#[doc(hidden)]
-pub fn python_json(value: &Value) -> Result<String> {
-    let mut bytes = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, PythonFormatter);
-    value.serialize(&mut serializer)?;
-    String::from_utf8(bytes).map_err(|error| Error::Message(format!("JSON is not UTF-8: {error}")))
-}
-
-impl Formatter for PythonFormatter {
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        writer.write_all(b": ")
-    }
-}
-
 pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    atomic_write_with_sync(path, false, |writer| {
+    atomic_write_with(path, |writer| {
         let mut gzip = GzBuilder::new().mtime(0).write(writer, Compression::fast());
         // Batch JSON's tiny token writes before feeding the compressor.
         let mut buffered = BufWriter::new(&mut gzip);
@@ -164,7 +99,7 @@ pub fn read_gzip_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn compressed_cache_is_one_round_trippable_file() {

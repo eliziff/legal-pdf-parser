@@ -2,7 +2,7 @@ use crate::ppdoc_openvino::OpenVinoSession;
 use crate::ppdoc_postprocess::{
     best_region_index, nearest_region_index, postprocess_document, scale_detections, RegionDetection,
 };
-use image::{imageops, ImageReader, RgbImage};
+use image::{imageops, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
 pub use legal_pdf_core::OrtBackend as PPDocBackend;
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
@@ -605,18 +605,6 @@ impl PPDocLayout {
 
     pub fn variant_id(&self) -> &str {
         &self.pack.manifest.variant_id
-    }
-
-    pub fn detect_image(&mut self, path: impl AsRef<Path>) -> Result<Vec<PPDocDetection>> {
-        let path = path.as_ref();
-        let image = ImageReader::open(path)
-            .map_err(|source| Error::io(path, source))?
-            .decode()
-            .map_err(|source| {
-                Error::Message(format!("could not decode {}: {source}", path.display()))
-            })?
-            .into_rgb8();
-        self.detect_rgb(&image)
     }
 
     pub fn detect_rgb(&mut self, image: &RgbImage) -> Result<Vec<PPDocDetection>> {
