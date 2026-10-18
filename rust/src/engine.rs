@@ -907,6 +907,15 @@ pub fn corpus_check_cached_extraction(
         (None, None, None),
         cached.extraction,
     )?;
+    // Each document's nodes, a line each, for reading two engines' graphs side by side.
+    if let Some(directory) = std::env::var_os("LEGALPDF_CORPUS_NODES") {
+        let lines = document.structure_graph.nodes.iter()
+            .map(|node| format!("{} {} {:?} {:?}\n", serde_json::to_value(node.kind).unwrap_or_default(),
+                node.label.as_deref().unwrap_or("_"), node.range, node.parent_id))
+            .collect::<String>();
+        std::fs::write(Path::new(&directory).join(format!("{}.nodes.txt", &source_sha256[..16])), lines)
+            .map_err(|error| Error::Message(error.to_string()))?;
+    }
     let mut by_kind = BTreeMap::<String, usize>::new();
     let mut sections_by_locator_kind = BTreeMap::<String, usize>::new();
     for node in &document.structure_graph.nodes {
