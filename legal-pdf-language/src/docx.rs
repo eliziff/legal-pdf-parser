@@ -2062,7 +2062,7 @@ pub fn analyze_docx_bytes(
     document_id: String,
 ) -> Result<legal_structure_model::DocumentStructure> {
     let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
-    legal_pdf_core::structure_analysis()
+    legal_structure_model::structure_analysis()
         .analyze_docx(document_id, paragraphs, &table_cells)
         .map_err(|error| Error::Message(error.to_string()))
 }
@@ -2115,7 +2115,7 @@ pub fn analyze_docx_drafting_bytes(
     document_id: String,
 ) -> Result<legal_structure_model::DocumentStructure> {
     let markdown = drafting_docx_text(bytes)?;
-    legal_pdf_core::structure_analysis()
+    legal_structure_model::structure_analysis()
         .analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
 }

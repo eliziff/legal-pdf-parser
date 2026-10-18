@@ -1,4 +1,5 @@
-use legal_pdf_core::model::{LegalDocument, PARSER_VERSION, SCHEMA_VERSION};
+use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
+use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
@@ -308,7 +309,7 @@ fn engine_identity() -> &'static Value {
             "native_extractor": "pdf-inspector",
             "ocr_renderer": if cfg!(feature = "ocr") { "hayro 0.7.1" } else { "disabled" },
             "engine_source_sha256": env!("LEGAL_PDF_ENGINE_SHA256"),
-            "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
+            "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
             "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })
@@ -320,7 +321,7 @@ fn document_identity() -> &'static Value {
         json!({
             "document_source_sha256": env!("LEGAL_PDF_DOCUMENT_SHA256"),
             "extraction_source_sha256": env!("LEGAL_PDF_EXTRACTION_SHA256"),
-            "structure_source_sha256": legal_pdf_core::structure_analysis().source_sha256(),
+            "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
             "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })

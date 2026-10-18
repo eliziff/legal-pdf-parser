@@ -16,9 +16,10 @@ use graph::{
     contents_leader_re, index_pages, map_note_pairs, native_graph_parts, PdfResolutionInput,
 };
 use legal_pdf_core::model::{
-    DetachedReference, Diagnostic, Footnote, FootnoteCrossref, LegalDocument, Line, Page,
-    Paragraph, ParagraphAnchor, PdfOutlineEntry, Span,
+    DetachedReference, Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
+    ParagraphAnchor, PdfOutlineEntry, Span,
 };
+use legal_pdf_support::LegalDocument;
 #[cfg(test)]
 use legal_pdf_core::model::{NotePairClaim, NotePairKind};
 use legal_pdf_core::{line_font_size, Anchor, Error, Result};
@@ -3824,12 +3825,12 @@ fn derive_prepared(
             || text_flow_faults(pages),
         ));
     // Note labels recognition cut short, restored before any text is indexed.
-    legal_pdf_core::structure_analysis().repair_label_dropouts(pages);
+    legal_pdf_core::layout_analysis().repair_label_dropouts(pages);
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
     let pairing = legal_pdf_support::profile::measure("derive.pair_footnotes", || {
-        legal_pdf_core::structure_analysis().pair_footnotes(pages, &resolution.citation_spans, false)
+        legal_pdf_core::layout_analysis().pair_footnotes(pages, &resolution.citation_spans, false)
     });
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
@@ -3871,7 +3872,7 @@ fn derive_prepared(
     let pages: &[Page] = pages;
     let document_id = identity.document_id.clone();
     let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
-        legal_pdf_core::structure_analysis().resolve_structure_graph_with_assembler(
+        legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
             identity.document_id,
             "local-pdf".to_owned(),
             resolution.index.text(),

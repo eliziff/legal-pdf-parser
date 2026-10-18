@@ -99,7 +99,7 @@ pub fn assemble_outline(
         styles.entry(unit.context.clone()).or_default().push(unit.style);
         let node = &nodes[unit.node];
         let marker = node.marker_range.and_then(|range| coordinates.slice(range.start..range.end)).or(node.label.as_deref());
-        unit.marker = marker.and_then(|marker| legal_pdf_core::structure_analysis().numbering_marker(marker, previous_marker.get(&unit.context)));
+        unit.marker = marker.and_then(|marker| legal_pdf_core::layout_analysis().numbering_marker(marker, previous_marker.get(&unit.context)));
         if let Some(marker) = &unit.marker {
             previous_marker.insert(unit.context.clone(), marker.clone());
         }

@@ -3878,7 +3878,7 @@ fn reporter_years_do_not_become_layout_paragraphs() {
         line.region_type = "body".into();
     }
     let resolution = PdfResolutionInput::from_pages(&pages, &PdfPrimitiveEvidence::default());
-    let graph = legal_pdf_core::structure_analysis()
+    let graph = legal_structure_model::structure_analysis()
         .resolve_structure_graph(
             "citation-shape".to_owned(),
             "fixture".to_owned(),
