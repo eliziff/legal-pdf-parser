@@ -3,7 +3,7 @@ use super::{
     PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
-use legal_pdf_core::structure_analysis;
+use legal_structure_model::structure_analysis;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_support::protected_citation_spans;
 use legal_structure_model::{

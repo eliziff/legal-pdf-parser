@@ -27,7 +27,7 @@ mod stats;
 
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
 use legal_pdf_core::model::Page;
-use legal_pdf_core::structure_analysis;
+use legal_pdf_core::layout_analysis;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
 use regex::Regex;
@@ -155,7 +155,7 @@ fn citation_only(block: &FlashBlock) -> bool {
         .join(" ");
     // The layout reading of citations: the full citator would resolve each one, at a cost
     // every short block on a page of authorities pays.
-    let spans = structure_analysis().protected_citation_spans(&text);
+    let spans = layout_analysis().protected_citation_spans(&text);
     if spans.is_empty() {
         return false;
     }
@@ -385,7 +385,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 && (flash.rect.center_x() - page.width / 2.0).abs() >= 0.05 * page.width;
             // The citation grammar is costly: it reads only blocks every layout test admits. A
             // citation carries a number; a cue word alone ("people", "re") names no authority.
-            let analysis = structure_analysis();
+            let analysis = layout_analysis();
             eligible[block] = !indented
                 && !runs_on
                 && !beside()

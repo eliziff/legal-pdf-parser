@@ -395,6 +395,7 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn main() {
+    legalpdf::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {

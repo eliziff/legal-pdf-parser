@@ -22,7 +22,14 @@ pub use engine::corpus_check_cached_extraction;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
-pub use legal_pdf_core::{install_structure_analysis, Error, Result};
+pub use legal_pdf_core::{Error, Result};
+
+/// Supplies the structure engine to the parsers: its document reading, and its services on
+/// laid-out text. The first one supplied stays.
+pub fn install_structure_analysis(analysis: &'static dyn legal_structure_model::StructureAnalysis) {
+    legal_structure_model::install_structure_analysis(analysis);
+    legal_pdf_core::install_layout_analysis(analysis);
+}
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
     analyze_docx_bytes, analyze_docx_drafting_bytes, docx_text, docx_to_toa_text_units,

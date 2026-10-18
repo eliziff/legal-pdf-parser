@@ -1,8 +1,8 @@
 pub use legal_structure_model::parse_ordinal;
 use legal_pdf_core::model::{
-    Derivation, DocumentStructure, Footnote, Line, NodeKind, Page, Paragraph,
-    PdfExtractionMetadata, ScalarRange, StructureNode, PARSER_VERSION,
+    Footnote, Line, Page, Paragraph, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
 };
+use legal_structure_model::{Derivation, DocumentStructure, NodeKind, StructureNode};
 use legal_structure_model::{
     document_fingerprint, normalize_compact_numbered_section_locator, utf16_len,
     DocumentFingerprint, ScalarText,
@@ -1722,7 +1722,8 @@ fn attach_rendered_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legal_pdf_core::model::{LegalDocument, ScalarRange, SCHEMA_VERSION};
+    use crate::LegalDocument;
+    use legal_pdf_core::model::{ScalarRange, SCHEMA_VERSION};
     use serde_json::json;
 
     fn structure_graph(nodes: Vec<StructureNode>) -> DocumentStructure {

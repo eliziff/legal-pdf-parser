@@ -266,6 +266,7 @@ fn run() -> Result<i32> {
 }
 
 fn main() {
+    legalpdf::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {

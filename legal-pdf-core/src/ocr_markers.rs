@@ -1,12 +1,12 @@
 //! Physical associations retain both recognized source lines; semantic roles belong downstream.
-use crate::{structure_analysis, OcrMarkerEvidence, Page};
+use crate::{layout_analysis, OcrMarkerEvidence, Page};
 use std::collections::HashMap;
 
 pub fn associate_ocr_markers(pages: &mut [Page]) {
     if !pages.iter().flat_map(|page| &page.lines).any(|line| line.ocr.is_some()) {
         return;
     }
-    let analysis = structure_analysis();
+    let analysis = layout_analysis();
     let mut markers = Vec::new();
     let mut previous = HashMap::new();
     for (page_index, page) in pages.iter().enumerate() {

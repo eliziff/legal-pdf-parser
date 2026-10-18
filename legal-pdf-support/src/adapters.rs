@@ -1,4 +1,6 @@
-use legal_pdf_core::model::{DocumentStructure, Footnote, LegalDocument, Paragraph, SourceTextSpan};
+use crate::LegalDocument;
+use legal_pdf_core::model::{Footnote, Paragraph, SourceTextSpan};
+use legal_structure_model::DocumentStructure;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::ScalarText;
 use serde_json::{json, Map, Value};

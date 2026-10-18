@@ -27,7 +27,7 @@ fn heading_text(text: &str) -> bool {
                 .rsplit(char::is_whitespace)
                 .next()
                 .is_some_and(|word| word.chars().all(|c| c.is_ascii_digit()))
-            && legal_pdf_core::structure_analysis()
+            && legal_pdf_core::layout_analysis()
                 .citations(text)
                 .is_empty())
 }
