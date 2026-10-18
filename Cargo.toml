@@ -41,11 +41,6 @@ name = "legalpdf"
 path = "rust/src/main.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "legalpdf-corpus-check"
-path = "rust/src/bin/legalpdf-corpus-check.rs"
-required-features = ["cli"]
-
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
 legal-pdf-extraction = { path = "legal-pdf-extraction", optional = true }

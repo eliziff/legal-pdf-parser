@@ -2,7 +2,8 @@
 
 Status: passing on the complete cached corpus.
 
-`legalpdf-corpus-check` reads each settled extraction cache and calls the final
+`legalpdf-corpus-check` (a bin of `native/legal-structure-node`, so the build that
+makes the addon makes it) reads each settled extraction cache and calls the final
 production document builder once. It uses a bounded three-worker standard
 library pool, writes one atomic compact receipt per completed document, retains
 those receipts when interrupted, and reports live document, page, error, and
