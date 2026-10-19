@@ -15,20 +15,18 @@ characters), on a Ryzen 5 2600X desktop with an RTX 3080 Ti:
 
 | Native OCR configuration | Pages/s | Character error rate |
 | --- | ---: | ---: |
-| Balanced, CPU | **8.27** | **2.546%** |
-| Balanced, automatic (DirectML GPU) | **11.00** | **2.548%** |
-| Quality, automatic (DirectML GPU) | **10.90** | **2.258%** |
+| Balanced, CPU | **8.28** | **2.546%** |
+| Balanced, automatic (DirectML GPU) | **13.73** | **2.548%** |
+| Quality, automatic (DirectML GPU) | **12.10** | **2.258%** |
 
 These are medians of three warm passes, including native PDF rendering, line
 detection, crop preparation and recognition. CLI startup, structure analysis and
 application cache writes are excluded. Automatic selection checks provider
-availability and hardware capabilities. Fresh-process startup
-took **0.77 seconds on GPU** and **0.24 seconds on CPU**, down from 9.49 and 3.48.
-The first-page command finished in **1.64 seconds on GPU** and **0.71 on CPU**;
-the full 55-page document took **5.79 seconds including GPU startup**, down from
-14.40. CPU and GPU text, confidence and geometry match the frozen outputs exactly.
-An i3-1315U laptop with 12 GB RAM selected CPU with 0.32–0.83 seconds of startup;
-its latest warm throughput was 3.90 pages/s under the current background load.
+availability and hardware capabilities. Fresh-process initialization took
+**0.80 seconds on GPU** and **0.24 seconds on CPU**. The first full 55-page
+document took **5.00 seconds including GPU initialization**. CPU and GPU text,
+confidence and geometry match the frozen outputs exactly. Rendering uses spare
+CPU capacity with a shared parsed PDF and bounded page windows.
 The full Beaver preparation path also performs structure analysis and writes
 application caches. Overlapping its existing separator scan with OCR raised
 Balanced from 5.34 to 6.44 pages/s on DirectML and from 4.97 to 5.77 on CPU in
@@ -103,7 +101,7 @@ model manifest as the browser package. Extreme trades accuracy for speed.
 
 The Windows x64 executable, models and CPU/DirectML libraries are distributed as
 `legal-ocr-runtime-windows-x64.zip` in the
-[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.1).
+[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.2).
 Extract the archive and run `legalocr input.pdf --output recognized.json`.
 The executable finds its packaged assets beside itself.
 

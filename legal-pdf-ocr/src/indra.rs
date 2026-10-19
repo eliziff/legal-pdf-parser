@@ -725,6 +725,12 @@ impl IndraOcr {
         }
         // Separate bounded stages keep rendering from stalling detection and GPU recognition.
         let window_size = preparation_window_size(requests.len());
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let occupied = self.plan.workers * self.plan.threads + self.plan.layout_workers;
+        let render_workers = available
+            .saturating_sub(occupied + 1)
+            .clamp(1, 4)
+            .min(window_size);
         let width_scale = self.width_scale;
         let input_height = self.input_height;
         let batch_size = self.batch_size;
@@ -739,41 +745,78 @@ impl IndraOcr {
         let codec = self.codec.as_ref().expect("fast Indra codec");
         let layouts = &mut self.layouts;
         let sessions = &mut self.sessions;
-        let mut orientation = self.orientation.as_mut();
+        let orientation = self.orientation.as_mut();
         let (pages, performance) = std::thread::scope(|scope| -> Result<_> {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let (metadata_sender, metadata_receiver) = std::sync::mpsc::channel();
             let (render_sender, render_receiver) = std::sync::mpsc::sync_channel(1);
             let renderer = scope.spawn(move || {
-                let result = Pdf::new(bytes.to_vec()).map_err(|error| {
-                    Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
-                });
-                let pdf = match result {
+                let orientation = orientation.map(std::sync::Mutex::new);
+                let pdf = match Pdf::new(bytes.to_vec()) {
                     Ok(pdf) => pdf,
                     Err(error) => {
-                        let _ = render_sender.send(Err(error));
+                        let _ = render_sender.send(Err(Error::Message(format!(
+                            "OCR renderer could not open PDF: {error:?}"
+                        ))));
                         return;
                     }
                 };
-                let cache = RenderCache::new();
-                let interpreter = InterpreterSettings::default();
-                let settings = pdf_render_settings(dpi);
-                for window in requests.chunks(window_size) {
-                    let start = Instant::now();
-                    let rendered = render_pdf_pages(
-                        &pdf,
-                        &cache,
-                        &interpreter,
-                        &settings,
-                        window,
-                        orientation.as_deref_mut(),
-                    );
-                    let failed = rendered.is_err();
-                    let value = rendered.map(|pages| (pages, start.elapsed().as_secs_f64()));
-                    if render_sender.send(value).is_err() || failed {
-                        break;
+                std::thread::scope(|render_scope| {
+                    let mut queues = Vec::new();
+                    for worker in 0..render_workers {
+                        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+                        queues.push(receiver);
+                        let orientation = orientation.as_ref();
+                        let pdf = &pdf;
+                        render_scope.spawn(move || {
+                            // Share the parsed PDF; Hayro's render caches stay local to each worker.
+                            let cache = RenderCache::new();
+                            let interpreter = InterpreterSettings::default();
+                            let settings = pdf_render_settings(dpi);
+                            for window in requests.chunks(window_size) {
+                                let start = worker * window.len() / render_workers;
+                                let end = (worker + 1) * window.len() / render_workers;
+                                let started = Instant::now();
+                                let rendered = render_pdf_pages(
+                                    pdf,
+                                    &cache,
+                                    &interpreter,
+                                    &settings,
+                                    &window[start..end],
+                                    orientation,
+                                );
+                                let failed = rendered.is_err();
+                                let value =
+                                    rendered.map(|pages| (pages, started.elapsed().as_secs_f64()));
+                                if sender.send(value).is_err() || failed {
+                                    break;
+                                }
+                            }
+                        });
                     }
-                }
+                    for _ in requests.chunks(window_size) {
+                        let value = (|| -> Result<_> {
+                            let (mut pages, mut seconds) = (Vec::new(), 0.0_f64);
+                            for queue in &queues {
+                                let (part, elapsed) = queue.recv().map_err(|_| {
+                                    Error::Message(
+                                        "PDF render worker stopped before returning its pages"
+                                            .into(),
+                                    )
+                                })??;
+                                pages.extend(part);
+                                seconds = seconds.max(elapsed);
+                            }
+                            Ok((pages, seconds))
+                        })();
+                        let failed = value.is_err();
+                        if render_sender.send(value).is_err() || failed {
+                            break;
+                        }
+                    }
+                    // Closing every rendezvous queue also unblocks workers if a downstream stage fails.
+                    drop(queues);
+                });
             });
             let preparer = scope.spawn(move || {
                 for value in render_receiver {
@@ -1818,7 +1861,7 @@ fn render_pdf_pages<'a>(
     interpreter: &InterpreterSettings,
     settings: &RenderSettings,
     requests: &[OcrPageRequest],
-    mut orientation: Option<&mut Orientation>,
+    orientation: Option<&std::sync::Mutex<&mut Orientation>>,
 ) -> Result<Vec<RenderedPdfPage>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
@@ -1845,8 +1888,11 @@ fn render_pdf_pages<'a>(
         if request.regions.is_empty() {
             let mut page = RgbaImage::from_raw(width as u32, height as u32, pixels.to_vec())
                 .expect("renderer dimensions match its pixel buffer");
-            let turns = match orientation.as_deref_mut() {
-                Some(orientation) => orientation.upright_turns(&page)?,
+            let turns = match orientation {
+                Some(orientation) => orientation
+                    .lock()
+                    .map_err(|_| Error::Message("OCR orientation lock poisoned".into()))?
+                    .upright_turns(&page)?,
                 None => 0,
             };
             if turns != 0 {
