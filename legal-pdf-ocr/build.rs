@@ -1,12 +1,12 @@
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 use std::path::PathBuf;
 
 fn main() {
-    #[cfg(feature = "kraken")]
+    #[cfg(feature = "indra")]
     build_layout_shim();
 }
 
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 fn build_layout_shim() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest

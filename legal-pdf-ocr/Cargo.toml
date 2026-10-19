@@ -5,10 +5,15 @@ edition = "2021"
 license = "MIT"
 build = "build.rs"
 
+[[bin]]
+name = "legalocr"
+path = "src/bin/legalocr.rs"
+required-features = ["indra"]
+
 [features]
 default = []
 ocr = ["dep:hayro"]
-kraken = ["ocr", "dep:cc", "dep:image", "dep:libloading", "dep:ort", "legal-pdf-core/ort-runtime"]
+indra = ["ocr", "dep:cc", "dep:image", "dep:libloading", "dep:ort", "legal-pdf-core/ort-runtime"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }

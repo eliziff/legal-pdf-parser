@@ -7,15 +7,32 @@ order and source witnesses, with content-addressed reuse of completed work.
 
 ## Performance
 
-| OCR profile | Core i3 laptop | RTX 3080 Ti desktop | Character error rate |
-| --- | ---: | ---: | ---: |
-| Quality | 2.18 pages/s | **6.26 pages/s** | **2.57%** |
-| Turbo | 2.50 pages/s | **6.59 pages/s** | 3.14% |
-| Native Tesseract 5.4 | **2.76 pages/s** | — | 3.83% |
+Native OCR now uses the five-tier Indra model pack shared with
+[Legal Browser OCR](https://github.com/eliziff/legal-browser-ocr). Its browser
+README records browser CPU comparisons. The native command has also been measured
+on the same 55-page image-only PDF and human transcripts (145,475 normalized
+characters), on a Ryzen 5 2600X desktop with an RTX 3080 Ti:
 
-These are end-to-end results on a sample of 153 scanned legal pages.
-The full reproducible receipt is in
-[`experiments/kraken-lite/cpu-benchmark/RESULTS.md`](experiments/kraken-lite/cpu-benchmark/RESULTS.md).
+| Native OCR configuration | Pages/s | Character error rate |
+| --- | ---: | ---: |
+| Balanced, CPU | **8.22** | **2.546%** |
+| Balanced, automatic (DirectML GPU) | **10.92** | **2.548%** |
+| Quality, automatic (DirectML GPU) | **10.73** | **2.258%** |
+
+These are medians of three warm passes, including native PDF rendering, line
+detection, crop preparation and recognition. Calibration, CLI startup, structure
+analysis and application cache writes are excluded. Automatic startup took
+9.5–10 seconds on this desktop. An i3-1315U laptop with 12 GB RAM selected CPU
+rather than its slower GPU: 4.31 pages/s on its first Balanced pass, after 36.7
+seconds of startup.
+The automatic choice and worker counts are measured on the installed machine.
+The full Beaver preparation path also performs structure analysis and writes
+application caches. Overlapping its existing separator scan with OCR raised
+Balanced from 5.34 to 6.44 pages/s on DirectML and from 4.97 to 5.77 on CPU in
+paired single warm passes, preserving recognized text and word geometry exactly.
+The same examined test partition was used for browser experiments; this is not a
+new holdout or hand-corrected geometry evaluation. Historical Kraken measurements
+remain in the original experiment receipts.
 
 Digital-born PDFs avoid OCR:
 
@@ -65,14 +82,56 @@ No features are enabled by default. [Cargo.toml](Cargo.toml) defines the profile
 | Profile | Capability |
 | --- | --- |
 | `pdf` | Native PDF extraction, structure and queries; no OCR or layout models |
-| `kraken` | PDF plus Kraken OCR |
+| `indra` | PDF plus native Indra OCR |
 | `ppdoc-openvino` / `ppdoc-full` | PDF with the corresponding layout runtime |
-| `full` | Language support, Kraken OCR and the full layout profile |
+| `full` | Language support, Indra OCR and the full layout profile |
 
 Enabling a feature does not provide its separately licensed model/runtime pack.
 A source-only build needs these assets to run OCR. Browser OCR
 and its single-file HTML application live in
 [Legal Browser OCR](https://github.com/eliziff/legal-browser-ocr), not this crate.
+
+## Native OCR runtime
+
+The `legal-pdf-ocr` crate runs directly in Rust, shared by the PDF parser and the
+standalone `legalocr` command. It requires no browser, Node.js or Python for
+inference. Quality, Balanced (default), Fast, Turbo and Extreme use the same
+model manifest as the browser package. Extreme trades accuracy for speed.
+
+The Windows x64 executable, models and CPU/DirectML libraries are distributed as
+`legal-ocr-runtime-windows-x64.zip` in the
+[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.0).
+Extract the archive and run `legalocr input.pdf --output recognized.json`.
+The executable finds its packaged assets beside itself.
+
+On Windows x64, install the released model pack and official ONNX Runtime 1.22
+DirectML binaries (which also include CPU execution):
+
+```sh
+python tools/install_ocr_runtime.py
+python tools/build_ocr_runtime.py
+legalocr input.pdf --model-pack runtime/indra --runtime runtime/onnx/onnxruntime.dll --output recognized.json
+```
+
+Pass `--models PATH` for a downloaded `legal-ocr-models.tar.gz`. Other platforms
+can use `--models-only` with their own compatible CPU/CUDA ORT library. The
+optional orientation classifier is installed with the existing helper:
+`tools/install_model.ps1 -Model doc-orientation -OutputDir runtime/indra`.
+
+An omitted backend calibrates available CPU/GPU providers against invented
+bitmap pages, including detection, crop preparation, recognition and transfer.
+The bounded search sizes recognition/layout pools and batches to the machine's
+available CPU capacity and measured throughput. Choices are held in memory for
+the process; they do not create a persistent application cache. Driver shader
+compilation can exceed the search's five-second per-provider window.
+
+`--backend cpu|directml|cuda`, `--workers`, `--threads`, `--layout-workers`,
+`--batch-size` and `--width-bucket` override automatic choices. JSON output
+records the selected plan, exact model/runtime identity, startup and processing
+time. Parser JSON uses `ocr: {provider: "indra", settings: {model_pack: "...",
+runtime: "..."}}`; omit `settings.backend` for automatic selection. Native
+orientation, word geometry, partial-page regions and bounded page streaming are
+retained. Tesseract layout remains an explicit alternative to learned detection.
 
 ## Structure and queries
 
@@ -101,9 +160,11 @@ from the candidate's `build.rs`; the check never starts a build itself.
 
 ## Credits and license
 
-Recognition uses a legal-domain fine-tune of
-[CATMuS Print Small](https://zenodo.org/records/10602357), trained with
-[Kraken](https://kraken.re/) and the [CATMuS project](https://huggingface.co/CATMuS).
+Recognition and learned line detection derive from
+[Indra](https://github.com/datalab-to/indra), using fine-tuned/pruned recognition
+weights. The model pack carries the original modified OpenRAIL model terms,
+source revision, modification notice and checksums. These weights have separate
+use restrictions; the application license does not replace them.
 The PDF extraction backbone is the MIT-licensed `pdf-inspector`.
 
 [MIT](LICENSE). Third-party components and model assets retain their own licenses

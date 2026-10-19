@@ -34,7 +34,7 @@ def main():
             path.write_bytes(b"original")
         environment = {key: value for key, value in os.environ.items() if not key.startswith("CARGO_FEATURE_")}
         environment.update(CARGO_MANIFEST_DIR=str(root), CARGO_FEATURE_PDF="1",
-                           CARGO_FEATURE_OCR="1", CARGO_FEATURE_KRAKEN="1", CARGO_FEATURE_PPDOC_FULL="1")
+                           CARGO_FEATURE_OCR="1", CARGO_FEATURE_INDRA="1", CARGO_FEATURE_PPDOC_FULL="1")
 
         def hashes():
             output = subprocess.run([str(executable)], env=environment, capture_output=True,

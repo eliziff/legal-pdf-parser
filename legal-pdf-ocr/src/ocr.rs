@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub enum OcrOptions {
     Tesseract(TesseractOptions),
-    #[cfg(feature = "kraken")]
-    Kraken(crate::kraken::KrakenOptions),
+    #[cfg(feature = "indra")]
+    Indra(crate::indra::IndraOptions),
 }
 
 impl From<TesseractOptions> for OcrOptions {
@@ -23,17 +23,17 @@ impl From<TesseractOptions> for OcrOptions {
     }
 }
 
-#[cfg(feature = "kraken")]
-impl From<crate::kraken::KrakenOptions> for OcrOptions {
-    fn from(options: crate::kraken::KrakenOptions) -> Self {
-        Self::Kraken(options)
+#[cfg(feature = "indra")]
+impl From<crate::indra::IndraOptions> for OcrOptions {
+    fn from(options: crate::indra::IndraOptions) -> Self {
+        Self::Indra(options)
     }
 }
 
 pub enum OcrProvider {
     Tesseract(TesseractOcr),
-    #[cfg(feature = "kraken")]
-    Kraken(crate::kraken::KrakenOcr),
+    #[cfg(feature = "indra")]
+    Indra(crate::indra::IndraOcr),
 }
 
 pub struct PreparedOcrProvider {
@@ -42,8 +42,8 @@ pub struct PreparedOcrProvider {
 
 enum PreparedProvider {
     Tesseract(PreparedTesseract),
-    #[cfg(feature = "kraken")]
-    Kraken(crate::kraken::PreparedKraken),
+    #[cfg(feature = "indra")]
+    Indra(crate::indra::PreparedIndra),
 }
 
 impl OcrProvider {
@@ -59,11 +59,11 @@ impl OcrProvider {
                     provider: PreparedProvider::Tesseract(provider),
                 })
             }
-            #[cfg(feature = "kraken")]
-            OcrOptions::Kraken(options) => {
-                let provider = crate::kraken::KrakenOcr::prepare(options)?;
+            #[cfg(feature = "indra")]
+            OcrOptions::Indra(options) => {
+                let provider = crate::indra::IndraOcr::prepare(options)?;
                 Ok(PreparedOcrProvider {
-                    provider: PreparedProvider::Kraken(provider),
+                    provider: PreparedProvider::Indra(provider),
                 })
             }
         }
@@ -74,11 +74,11 @@ impl OcrProvider {
             (OcrOptions::Tesseract(options), PreparedProvider::Tesseract(prepared)) => Ok(
                 Self::Tesseract(TesseractOcr::from_prepared(options, prepared)),
             ),
-            #[cfg(feature = "kraken")]
-            (OcrOptions::Kraken(options), PreparedProvider::Kraken(prepared)) => {
-                crate::kraken::KrakenOcr::from_prepared(options, prepared).map(Self::Kraken)
+            #[cfg(feature = "indra")]
+            (OcrOptions::Indra(options), PreparedProvider::Indra(prepared)) => {
+                crate::indra::IndraOcr::from_prepared(options, prepared).map(Self::Indra)
             }
-            #[cfg(feature = "kraken")]
+            #[cfg(feature = "indra")]
             _ => Err(Error::Message(
                 "OCR options changed after identity preparation".to_owned(),
             )),
@@ -88,16 +88,16 @@ impl OcrProvider {
     pub fn identity(&self) -> &str {
         match self {
             Self::Tesseract(provider) => provider.identity(),
-            #[cfg(feature = "kraken")]
-            Self::Kraken(provider) => provider.identity(),
+            #[cfg(feature = "indra")]
+            Self::Indra(provider) => provider.identity(),
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
             Self::Tesseract(provider) => provider.name(),
-            #[cfg(feature = "kraken")]
-            Self::Kraken(provider) => provider.name(),
+            #[cfg(feature = "indra")]
+            Self::Indra(provider) => provider.name(),
         }
     }
 
@@ -108,8 +108,8 @@ impl OcrProvider {
     ) -> Result<Vec<OcrPageResult>> {
         match self {
             Self::Tesseract(provider) => provider.extract_pages(pdf, requests),
-            #[cfg(feature = "kraken")]
-            Self::Kraken(provider) => provider.extract_pages(pdf, requests),
+            #[cfg(feature = "indra")]
+            Self::Indra(provider) => provider.extract_pages(pdf, requests),
         }
     }
 }
@@ -118,16 +118,16 @@ impl PreparedOcrProvider {
     pub fn identity(&self) -> &str {
         match &self.provider {
             PreparedProvider::Tesseract(provider) => &provider.identity,
-            #[cfg(feature = "kraken")]
-            PreparedProvider::Kraken(provider) => provider.identity(),
+            #[cfg(feature = "indra")]
+            PreparedProvider::Indra(provider) => provider.identity(),
         }
     }
 
     pub fn name(&self) -> &str {
         match &self.provider {
             PreparedProvider::Tesseract(provider) => &provider.name,
-            #[cfg(feature = "kraken")]
-            PreparedProvider::Kraken(provider) => provider.name(),
+            #[cfg(feature = "indra")]
+            PreparedProvider::Indra(provider) => provider.name(),
         }
     }
 }

@@ -15,7 +15,7 @@ $sources = @{
     Notice = Join-Path $PSScriptRoot 'model_manifests/heron-int8.NOTICE.md'
     NoticeFile = 'NOTICE.md'
   }
-  # The page-orientation classifier the Kraken recognizer reads beside its model (runtime/kraken).
+  # Shared page-orientation classifier for native OCR model packs.
   'doc-orientation' = @{
     Url = 'https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx/resolve/7330ab7039123e46af2dc03154b9969aa412c61d/inference.onnx'
     Sha256 = 'af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92'

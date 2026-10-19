@@ -36,10 +36,10 @@ pub use legal_pdf_language::{
     fix_docx_supra_cross_references, has_docx_supra_references, DocxSupraCleanup,
     MAX_DOCX_SUPRA_BYTES,
 };
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 pub use legal_pdf_ocr::{
-    KrakenBackend, KrakenBatchDiagnostics, KrakenBatchPerformance, KrakenImageDiagnostics,
-    KrakenLayout, KrakenOcr, KrakenOptions, KrakenTier,
+    IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics,
+    IndraLayout, IndraOcr, IndraOptions, IndraTier,
 };
 #[cfg(feature = "ocr")]
 pub use legal_pdf_ocr::{
