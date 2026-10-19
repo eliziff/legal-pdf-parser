@@ -2,7 +2,7 @@
 //! number, a stamp's word, taken for noise beside the page's text. Ink no line holds, of a line's
 //! height, is read as a line of its own; the recognizer keeps one only when it is sure of it.
 
-use crate::kraken::LineBox;
+use crate::indra::LineBox;
 
 /// The page's lines with the uncovered lines added, each placed before the line it stands beside
 /// or after the line above it.

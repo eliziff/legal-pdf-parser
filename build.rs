@@ -69,7 +69,7 @@ fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
 
 // Raw extraction and OCR pages do not depend on DOCX, structure inference or
 // document projection. Their hashes follow the code and contracts they use.
-fn stage_inputs(root: &Path, kraken: bool) -> [Vec<PathBuf>; 4] {
+fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     let paths = |names: &[&str]| names.iter().map(|name| root.join(name)).collect::<Vec<_>>();
     let mut extraction = paths(&[
         "legal-pdf-core/Cargo.toml",
@@ -88,7 +88,7 @@ fn stage_inputs(root: &Path, kraken: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-core/src/ort_runtime.rs",
     ]);
     recognition.extend(crate_inputs(root, "ocr"));
-    if kraken {
+    if indra {
         recognition.push(root.join("rust/native/tesseract_layout.c"));
     }
     let mut document = paths(&[
@@ -143,7 +143,7 @@ fn main() {
             inputs.push(root.join(format!("rust/src/{module}.rs")));
         }
     }
-    if enabled("KRAKEN") {
+    if enabled("INDRA") {
         inputs.push(root.join("rust/native/tesseract_layout.c"));
     }
     for (active, name) in [
@@ -187,7 +187,7 @@ fn main() {
                 enabled("OCR"),
                 features
                     .iter()
-                    .filter(|name| ["OCR", "KRAKEN"].contains(&name.as_str()))
+                    .filter(|name| ["OCR", "INDRA"].contains(&name.as_str()))
                     .cloned()
                     .collect(),
             ),
@@ -203,7 +203,7 @@ fn main() {
             ),
         ]
         .into_iter()
-        .zip(stage_inputs(&root, enabled("KRAKEN")))
+        .zip(stage_inputs(&root, enabled("INDRA")))
         {
             let inputs = if active { inputs } else { vec![] };
             println!(

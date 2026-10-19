@@ -1,6 +1,6 @@
 use crate::engine::{parse_pdf, ParseOptions};
-#[cfg(feature = "kraken")]
-use crate::KrakenOptions;
+#[cfg(feature = "indra")]
+use crate::IndraOptions;
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use crate::PPDocOptions;
 use crate::{Error, PdfLookupRequest, PdfStructureLookup, Result};
@@ -58,15 +58,15 @@ enum OcrRequest {
         #[serde(default)]
         settings: TesseractOptions,
     },
-    #[cfg(feature = "kraken")]
-    #[serde(rename = "kraken-lite")]
-    Kraken {
+    #[cfg(feature = "indra")]
+    #[serde(rename = "indra")]
+    Indra {
         #[serde(default)]
-        settings: KrakenOptions,
+        settings: IndraOptions,
     },
-    #[cfg(not(feature = "kraken"))]
-    #[serde(rename = "kraken-lite")]
-    Kraken {
+    #[cfg(not(feature = "indra"))]
+    #[serde(rename = "indra")]
+    Indra {
         #[serde(rename = "settings", default = "ignored_any")]
         _settings: serde::de::IgnoredAny,
     },
@@ -83,7 +83,7 @@ enum LayoutRequest {
     },
 }
 
-#[cfg(all(feature = "ocr", not(feature = "kraken")))]
+#[cfg(all(feature = "ocr", not(feature = "indra")))]
 fn ignored_any() -> serde::de::IgnoredAny {
     serde::de::IgnoredAny
 }
@@ -152,12 +152,12 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     if let Some(request) = &request.ocr {
         options.ocr = match request {
             OcrRequest::Tesseract { settings } => Some(OcrOptions::Tesseract(settings.clone())),
-            #[cfg(feature = "kraken")]
-            OcrRequest::Kraken { settings } => Some(OcrOptions::Kraken(settings.clone())),
-            #[cfg(not(feature = "kraken"))]
-            OcrRequest::Kraken { .. } => {
+            #[cfg(feature = "indra")]
+            OcrRequest::Indra { settings } => Some(OcrOptions::Indra(settings.clone())),
+            #[cfg(not(feature = "indra"))]
+            OcrRequest::Indra { .. } => {
                 return Err(Error::Message(
-                    "kraken-lite requires a legalpdf binary built with the kraken feature"
+                    "indra requires a legalpdf binary built with the indra feature"
                         .to_owned(),
                 ));
             }

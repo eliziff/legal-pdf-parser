@@ -1,6 +1,7 @@
-use crate::kraken_process::{BllaRuntime, PreparedBllaRuntime};
+use crate::calibration::{self, RuntimePlan};
+use crate::line_detector::LineDetector;
+use crate::model_pack::ModelPack;
 use crate::orientation::{place_back, turn, Orientation};
-use crate::tesseract_layout::TesseractLayout;
 #[cfg(feature = "ocr")]
 use hayro::hayro_interpret::InterpreterSettings;
 #[cfg(feature = "ocr")]
@@ -13,12 +14,19 @@ use image::{imageops, GrayImage, ImageReader, RgbaImage};
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord};
 use ort::{
-    execution_providers::CPUExecutionProvider,
-    session::{builder::GraphOptimizationLevel, builder::PrepackedWeights, Session},
+    execution_providers::{
+        cuda::CuDNNConvAlgorithmSearch, CPUExecutionProvider, CUDAExecutionProvider,
+    },
+    session::{
+        builder::GraphOptimizationLevel,
+        builder::PrepackedWeights,
+        run_options::{OutputSelector, RunOptions},
+        Session,
+    },
     value::TensorRef,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -26,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // Store padding in the shared batch tensor, not in every prepared line.
-const INPUT_PADDING: usize = 16;
+const INPUT_PADDING: usize = 0;
 const BLANK_LABEL: usize = 0;
 /// How sure the recognizer must be of a line the page analysis left out: a number or a word reads
 /// at 0.95 and more; a signature, a seal's lettering or a speckle at less.
@@ -34,137 +42,110 @@ pub(crate) const RECOVERED_CONFIDENCE: f64 = 0.95;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum KrakenLayout {
+pub enum IndraLayout {
     #[default]
+    Indra,
     Tesseract,
-    Blla,
 }
 
-impl KrakenLayout {
+impl IndraLayout {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "indra" => Some(Self::Indra),
             "tesseract" => Some(Self::Tesseract),
-            "blla" => Some(Self::Blla),
             _ => None,
         }
     }
-
     fn name(self) -> &'static str {
         match self {
+            Self::Indra => "indra",
             Self::Tesseract => "tesseract",
-            Self::Blla => "blla",
         }
     }
 }
 
-pub use legal_pdf_core::OrtBackend as KrakenBackend;
+pub use legal_pdf_core::OrtBackend as IndraBackend;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum KrakenTier {
-    #[default]
+pub enum IndraTier {
     Quality,
+    #[default]
     Balanced,
+    Fast,
     Turbo,
     Extreme,
 }
-
-impl KrakenTier {
+impl IndraTier {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
+            "fast" => Some(Self::Fast),
             "turbo" => Some(Self::Turbo),
             "extreme" => Some(Self::Extreme),
             _ => None,
         }
     }
-
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Quality => "quality",
             Self::Balanced => "balanced",
+            Self::Fast => "fast",
             Self::Turbo => "turbo",
             Self::Extreme => "extreme",
-        }
-    }
-
-    fn width_scale(self) -> f32 {
-        match self {
-            Self::Quality => 1.0,
-            Self::Balanced => 0.85,
-            Self::Turbo => 0.76,
-            Self::Extreme => 0.70,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct KrakenOptions {
-    pub model: Option<PathBuf>,
-    pub codec: Option<PathBuf>,
+pub struct IndraOptions {
+    pub model_pack: Option<PathBuf>,
     pub runtime: Option<PathBuf>,
-    pub runtime_wheel: Option<PathBuf>,
-    pub python: Option<PathBuf>,
-    pub blla_pack: Option<PathBuf>,
-    pub recognizer_pack: Option<PathBuf>,
     pub tesseract_library: Option<PathBuf>,
     pub dpi: u16,
     pub threads: usize,
     pub workers: usize,
     pub layout_workers: usize,
     pub batch_size: usize,
-    pub runtime_batch_size: usize,
     pub width_bucket: usize,
     #[serde(skip, default = "default_input_height")]
     pub input_height: usize,
-    pub width_scale: Option<f32>,
-    pub tier: KrakenTier,
-    pub layout: KrakenLayout,
-    pub backend: KrakenBackend,
+    pub tier: IndraTier,
+    pub layout: IndraLayout,
+    /// Omitted selects a measured CPU/GPU plan on this machine.
+    pub backend: Option<IndraBackend>,
     pub device: Option<String>,
     pub cpu_arena: bool,
-    pub timeout_seconds: u64,
     pub expected_identity: Option<String>,
-    /// The page-orientation classifier; `orientation.onnx` beside the model when not given.
     pub orientation: Option<PathBuf>,
 }
-
-impl Default for KrakenOptions {
+impl Default for IndraOptions {
     fn default() -> Self {
         Self {
-            model: None,
-            codec: None,
+            model_pack: None,
             runtime: None,
-            runtime_wheel: None,
-            python: None,
-            blla_pack: None,
-            recognizer_pack: None,
             tesseract_library: None,
-            dpi: 200,
+            dpi: 144,
             threads: 0,
             workers: 0,
             layout_workers: 0,
             batch_size: 0,
-            runtime_batch_size: 0,
             width_bucket: 0,
-            input_height: default_input_height(),
-            width_scale: None,
-            tier: KrakenTier::Quality,
-            layout: KrakenLayout::Tesseract,
-            backend: KrakenBackend::Cpu,
+            input_height: 32,
+            tier: IndraTier::Balanced,
+            layout: IndraLayout::Indra,
+            backend: None,
             device: None,
             cpu_arena: true,
-            timeout_seconds: 3600,
             expected_identity: None,
             orientation: None,
         }
     }
 }
-
 fn default_input_height() -> usize {
-    48
+    32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,7 +159,7 @@ pub(crate) struct LineBox {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct KrakenImageDiagnostics {
+pub struct IndraImageDiagnostics {
     pub lines: Vec<OcrLine>,
     pub layout_boxes: Vec<[usize; 4]>,
     pub layout_seconds: f64,
@@ -186,7 +167,7 @@ pub struct KrakenImageDiagnostics {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct KrakenBatchPerformance {
+pub struct IndraBatchPerformance {
     pub detailed: bool,
     pub pages: usize,
     pub input_pixels: usize,
@@ -194,6 +175,7 @@ pub struct KrakenBatchPerformance {
     pub prepared_lines: usize,
     pub output_lines: usize,
     pub layout_seconds: f64,
+    pub render_seconds: f64,
     pub line_prepare_seconds: f64,
     pub schedule_seconds: f64,
     pub recognition_wall_seconds: f64,
@@ -223,13 +205,13 @@ pub struct KrakenBatchPerformance {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct KrakenBatchDiagnostics {
-    pub pages: Vec<KrakenImageDiagnostics>,
-    pub performance: KrakenBatchPerformance,
+pub struct IndraBatchDiagnostics {
+    pub pages: Vec<IndraImageDiagnostics>,
+    pub performance: IndraBatchPerformance,
 }
 
 impl LineBox {
-    fn width(self) -> usize {
+    pub(crate) fn width(self) -> usize {
         self.right.saturating_sub(self.left)
     }
 
@@ -240,8 +222,11 @@ impl LineBox {
 
 struct PreparedLine {
     bbox: LineBox,
+    confidence_required: bool,
     width: usize,
     pixels: Vec<u8>,
+    pixel_x_origin: f64,
+    pixel_x_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +254,7 @@ impl PagePixels<'_> {
         }
     }
 
-    fn layout(self, engine: &mut TesseractLayout) -> Result<Vec<LineBox>> {
+    fn layout(self, engine: &mut LineDetector) -> Result<Vec<LineBox>> {
         match self {
             Self::Gray(image) => engine.lines(image),
             Self::Rgba {
@@ -320,7 +305,7 @@ struct PreparedWindow {
 }
 
 struct PreparedDiagnostics {
-    pages: Vec<KrakenImageDiagnostics>,
+    pages: Vec<IndraImageDiagnostics>,
     layout_seconds: f64,
     line_prepare_seconds: f64,
     layout_box_count: usize,
@@ -350,7 +335,7 @@ struct RecognizedBatch {
 }
 
 struct Codec {
-    labels: Vec<(Vec<usize>, String)>,
+    labels: BTreeMap<usize, Vec<(Vec<usize>, String)>>,
 }
 
 impl Codec {
@@ -359,7 +344,7 @@ impl Codec {
         let mapping: BTreeMap<String, Vec<usize>> = serde_json::from_reader(BufReader::new(file))?;
         if mapping.is_empty() || mapping.values().any(Vec::is_empty) {
             return Err(Error::Message(
-                "Kraken codec is empty or malformed".to_owned(),
+                "Indra codec is empty or malformed".to_owned(),
             ));
         }
         let mut labels = mapping
@@ -371,10 +356,17 @@ impl Codec {
             if labels.iter().enumerate().any(|(other, (candidate, _))| {
                 index != other && prefix.len() <= candidate.len() && candidate.starts_with(prefix)
             }) {
-                return Err(Error::Message("Kraken codec is not prefix-free".to_owned()));
+                return Err(Error::Message("Indra codec is not prefix-free".to_owned()));
             }
         }
-        Ok(Self { labels })
+        let mut grouped: BTreeMap<usize, Vec<(Vec<usize>, String)>> = BTreeMap::new();
+        for (sequence, text) in labels {
+            grouped
+                .entry(sequence[0])
+                .or_default()
+                .push((sequence, text));
+        }
+        Ok(Self { labels: grouped })
     }
 
     /// The text `decode` reads from these labels, piece by piece, with the first and last
@@ -385,7 +377,9 @@ impl Codec {
         while index < labels.len() {
             let Some((sequence, value)) = self
                 .labels
-                .iter()
+                .get(&labels[index])
+                .into_iter()
+                .flatten()
                 .find(|(sequence, _)| labels[index..].starts_with(sequence))
             else {
                 index += 1;
@@ -406,7 +400,9 @@ impl Codec {
         while index < spans.len() {
             let Some((sequence, value)) = self
                 .labels
-                .iter()
+                .get(&labels[index])
+                .into_iter()
+                .flatten()
                 .find(|(sequence, _)| labels[index..].starts_with(sequence))
             else {
                 index += 1;
@@ -433,7 +429,7 @@ impl Codec {
     }
 }
 
-pub struct KrakenOcr {
+pub struct IndraOcr {
     sessions: Vec<Session>,
     codec: Option<Codec>,
     dpi: u16,
@@ -441,213 +437,171 @@ pub struct KrakenOcr {
     width_bucket: usize,
     input_height: usize,
     width_scale: f32,
-    tesseract_layouts: Vec<TesseractLayout>,
-    blla: Option<BllaRuntime>,
+    layouts: Vec<LineDetector>,
+    plan: RuntimePlan,
+    last_performance: Option<IndraBatchPerformance>,
     orientation: Option<Orientation>,
     identity: String,
     name: String,
 }
 
-pub(crate) enum PreparedKraken {
-    Blla(PreparedBllaRuntime),
-    Native(PreparedNativeKraken),
+pub(crate) struct PreparedIndra {
+    pub(crate) pack: ModelPack,
+    pub(crate) runtime: PathBuf,
+    pub(crate) tesseract_library: Option<PathBuf>,
+    pub(crate) device: String,
+    pub(crate) plan: RuntimePlan,
+    pub(crate) identity: String,
+    pub(crate) name: String,
 }
-
-pub(crate) struct PreparedNativeKraken {
-    model: PathBuf,
-    codec: PathBuf,
-    runtime: PathBuf,
-    tesseract_library: PathBuf,
-    orientation: Option<PathBuf>,
-    device: String,
-    workers: usize,
-    threads: usize,
-    layout_workers: usize,
-    batch_size: usize,
-    width_bucket: usize,
-    width_scale: f32,
-    identity: String,
-    name: String,
-}
-
-impl PreparedKraken {
+impl PreparedIndra {
     pub(crate) fn identity(&self) -> &str {
-        match self {
-            Self::Blla(prepared) => prepared.identity(),
-            Self::Native(prepared) => &prepared.identity,
-        }
+        &self.identity
     }
-
     pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::Blla(prepared) => prepared.name(),
-            Self::Native(prepared) => &prepared.name,
-        }
+        &self.name
     }
 }
-
-impl KrakenOcr {
-    pub fn new(options: &KrakenOptions) -> Result<Self> {
+impl IndraOcr {
+    pub fn new(options: &IndraOptions) -> Result<Self> {
         Self::from_prepared(options, Self::prepare(options)?)
     }
-
-    pub(crate) fn prepare(options: &KrakenOptions) -> Result<PreparedKraken> {
+    pub(crate) fn prepare(options: &IndraOptions) -> Result<PreparedIndra> {
         validate_options(options)?;
-        if options.layout == KrakenLayout::Blla {
-            return BllaRuntime::prepare(options).map(PreparedKraken::Blla);
-        }
-        let device = options
-            .backend
-            .normalized_device(options.device.as_deref())?;
-        let layout_workers = effective_layout_workers(options.layout_workers, options.backend);
-        let (batch_size, width_bucket) =
-            effective_recognition_batch(options.batch_size, options.width_bucket, options.backend);
-        let model = required_path(&options.model, "LEGALPDF_KRAKEN_MODEL", "Kraken model")?;
-        let codec = options
-            .codec
-            .clone()
-            .or_else(|| std::env::var_os("LEGALPDF_KRAKEN_CODEC").map(PathBuf::from))
-            .unwrap_or_else(|| model.parent().unwrap_or(Path::new(".")).join("codec.json"));
-        let runtime = required_path(
-            &options.runtime,
-            "LEGALPDF_ONNXRUNTIME",
+        let root = required_path(
+            &options.model_pack,
+            "LEGALPDF_INDRA_MODEL_PACK",
+            "Indra model pack",
+        )?;
+        let runtime = canonical_file(
+            &required_path(
+                &options.runtime,
+                "LEGALPDF_ONNXRUNTIME",
+                "ONNX Runtime library",
+            )?,
             "ONNX Runtime library",
         )?;
-        let model = canonical_file(&model, "Kraken model")?;
-        let codec_path = canonical_file(&codec, "Kraken codec")?;
-        let runtime = canonical_file(&runtime, "ONNX Runtime library")?;
-        let tesseract_library = required_path(
-            &options.tesseract_library,
-            "LEGALPDF_TESSERACT_LIBRARY",
-            "Tesseract layout library",
-        )
-        .and_then(|path| canonical_file(&path, "Tesseract layout library"))?;
-        let (workers, threads) =
-            recognition_schedule(options.workers, options.threads, options.backend);
-        let layout_identity = provider_asset_sha256(&tesseract_library)?;
-        let orientation = match &options.orientation {
-            Some(path) => Some(canonical_file(path, "orientation model")?),
-            None => Some(model.parent().unwrap_or(Path::new(".")).join("orientation.onnx"))
-                .filter(|path| path.is_file()),
-        };
-        let identity = format!(
-            "kraken-lite-rust-v2:backend={}:device={device}:model={}:codec={}:runtime={}:layout={layout_identity}:height={}{}",
-            options.backend.name(),
-            provider_asset_sha256(&model)?,
-            provider_asset_sha256(&codec_path)?,
-            provider_asset_sha256(&runtime)?,
-            options.input_height,
-            match &orientation {
-                Some(path) => format!(":orientation={}", provider_asset_sha256(path)?),
-                None => String::new(),
-            },
-        );
+        legal_pdf_core::init_ort_runtime(&runtime, None)?;
+        let plan = calibration::select(options, &root, &runtime)?;
+        let prepared = Self::prepare_plan(options, &root, runtime, plan)?;
         if options
             .expected_identity
             .as_deref()
-            .is_some_and(|expected| expected != identity)
+            .is_some_and(|expected| expected != prepared.identity)
         {
-            return Err(Error::Message(format!(
-                "Kraken identity changed before OCR began: expected {}, found {identity}",
-                options.expected_identity.as_deref().unwrap_or_default()
-            )));
+            return Err(Error::Message(
+                "Indra identity changed before OCR began".into(),
+            ));
         }
-        let width_scale = options
-            .width_scale
-            .unwrap_or_else(|| options.tier.width_scale());
-        let name = format!(
-            "{identity}:tier={}:dpi={}:batch={}:bucket={}:scale={width_scale:.3}:layout={}:workers={workers}:threads={}:layout-workers={}:ort-global-threads={}:cpu-arena={}",
-            options.tier.name(),
-            options.dpi,
-            batch_size,
-            width_bucket,
-            options.layout.name(),
-            threads,
-            layout_workers,
-            if uses_global_pool(options) { workers } else { 0 },
-            options.cpu_arena,
-        );
-        Ok(PreparedKraken::Native(PreparedNativeKraken {
-            model,
-            codec: codec_path,
+        Ok(prepared)
+    }
+    pub(crate) fn prepare_plan(
+        options: &IndraOptions,
+        root: &Path,
+        runtime: PathBuf,
+        plan: RuntimePlan,
+    ) -> Result<PreparedIndra> {
+        let device = plan.backend.normalized_device(options.device.as_deref())?;
+        let mut pack = ModelPack::open(root, options.tier, plan.backend)?;
+        if let Some(path) = &options.orientation {
+            pack.orientation = Some(canonical_file(path, "orientation model")?);
+        }
+        let tesseract_library = if options.layout == IndraLayout::Tesseract {
+            Some(canonical_file(
+                &required_path(
+                    &options.tesseract_library,
+                    "LEGALPDF_TESSERACT_LIBRARY",
+                    "Tesseract layout library",
+                )?,
+                "Tesseract layout library",
+            )?)
+        } else {
+            None
+        };
+        let layout_identity =
+            provider_asset_sha256(tesseract_library.as_deref().unwrap_or(&pack.detector))?;
+        let identity=format!("indra-native-v1:backend={}:device={device}:model={}:codec={}:runtime={}:layout={}:layout-model={layout_identity}:side={}:orientation={}:tier={}:dpi={}:batch={}:bucket={}:workers={}:threads={}:layout-workers={}:cpu-arena={}",
+            plan.backend.name(),provider_asset_sha256(&pack.model)?,provider_asset_sha256(&pack.codec)?,provider_asset_sha256(&runtime)?,options.layout.name(),pack.detector_side,
+            pack.orientation.as_deref().map(provider_asset_sha256).transpose()?.unwrap_or_default(),
+            options.tier.name(),options.dpi,plan.batch_size,plan.width_bucket,plan.workers,plan.threads,plan.layout_workers,options.cpu_arena);
+        Ok(PreparedIndra {
+            pack,
             runtime,
             tesseract_library,
-            orientation,
             device,
-            workers,
-            threads,
-            layout_workers,
-            batch_size,
-            width_bucket,
-            width_scale,
+            plan,
+            name: identity.clone(),
             identity,
-            name,
-        }))
+        })
     }
-
-    pub(crate) fn from_prepared(options: &KrakenOptions, prepared: PreparedKraken) -> Result<Self> {
-        let prepared = match prepared {
-            PreparedKraken::Blla(prepared) => {
-                let identity = prepared.identity().to_owned();
-                let name = prepared.name().to_owned();
-                let blla = BllaRuntime::from_prepared(options, prepared)?;
-                return Ok(Self {
-                    sessions: vec![],
-                    codec: None,
-                    dpi: options.dpi,
-                    batch_size: options.batch_size,
-                    width_bucket: options.width_bucket,
-                    input_height: options.input_height,
-                    width_scale: 1.0,
-                    tesseract_layouts: vec![],
-                    blla: Some(blla),
-                    orientation: None,
-                    identity,
-                    name,
-                });
-            }
-            PreparedKraken::Native(prepared) => prepared,
-        };
-        let automatic_cpu =
-            options.backend == KrakenBackend::Cpu && options.workers == 0 && options.threads == 0;
-        let environment_global_threads = legal_pdf_core::init_ort_runtime(
-            &prepared.runtime,
-            automatic_cpu.then_some(prepared.workers),
-        )?;
-        let independent_pool = environment_global_threads.is_some() && !uses_global_pool(options);
-        let tesseract_layouts = (0..prepared.layout_workers)
-            .map(|_| TesseractLayout::new(&prepared.tesseract_library, options.dpi))
+    pub(crate) fn from_prepared(options: &IndraOptions, prepared: PreparedIndra) -> Result<Self> {
+        if options
+            .expected_identity
+            .as_deref()
+            .is_some_and(|expected| expected != prepared.identity)
+        {
+            return Err(Error::Message(
+                "Indra identity changed before OCR began".to_owned(),
+            ));
+        }
+        let independent_pool = legal_pdf_core::init_ort_runtime(&prepared.runtime, None)?.is_some();
+        let layouts = (0..prepared.plan.layout_workers)
+            .map(|_| {
+                if let Some(path) = &prepared.tesseract_library {
+                    LineDetector::tesseract(path, options.dpi)
+                } else {
+                    LineDetector::indra(
+                        &prepared.pack.detector,
+                        prepared.pack.detector_side,
+                        prepared.plan.backend,
+                        &prepared.device,
+                        independent_pool,
+                    )
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
-        let prepacked_weights = PrepackedWeights::new();
-        let sessions = (0..prepared.workers)
+        let weights = PrepackedWeights::new();
+        let sessions = (0..prepared.plan.workers)
             .map(|_| {
                 open_session(
-                    &prepared.model,
-                    prepared.threads,
-                    options.backend,
+                    &prepared.pack.model,
+                    prepared.plan.threads,
+                    prepared.plan.backend,
                     &prepared.device,
                     options.cpu_arena,
-                    &prepacked_weights,
+                    &weights,
                     independent_pool,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let codec = Codec::load(&prepared.codec)?;
-        let orientation = prepared.orientation.as_deref().map(Orientation::open).transpose()?;
+        let codec = Codec::load(&prepared.pack.codec)?;
+        let orientation = prepared
+            .pack
+            .orientation
+            .as_deref()
+            .map(Orientation::open)
+            .transpose()?;
         Ok(Self {
             sessions,
             codec: Some(codec),
             dpi: options.dpi,
-            batch_size: prepared.batch_size,
-            width_bucket: prepared.width_bucket,
-            input_height: options.input_height,
-            width_scale: prepared.width_scale,
-            tesseract_layouts,
-            blla: None,
+            batch_size: prepared.plan.batch_size,
+            width_bucket: prepared.plan.width_bucket,
+            input_height: 32,
+            width_scale: 1.0,
+            layouts,
             orientation,
+            plan: prepared.plan,
+            last_performance: None,
             identity: prepared.identity,
             name: prepared.name,
         })
+    }
+    pub fn last_performance(&self) -> Option<&IndraBatchPerformance> {
+        self.last_performance.as_ref()
+    }
+    pub fn configuration(&self) -> &RuntimePlan {
+        &self.plan
     }
 
     pub fn identity(&self) -> &str {
@@ -677,33 +631,28 @@ impl KrakenOcr {
     pub fn recognize_gray_image_diagnostics(
         &mut self,
         image: &GrayImage,
-    ) -> Result<KrakenImageDiagnostics> {
+    ) -> Result<IndraImageDiagnostics> {
         self.diagnose_gray(image, 1.0, 1.0)
     }
 
     pub fn recognize_gray_images_diagnostics(
         &mut self,
         images: &[GrayImage],
-    ) -> Result<Vec<KrakenImageDiagnostics>> {
+    ) -> Result<Vec<IndraImageDiagnostics>> {
         self.diagnose_gray_many(images)
     }
 
     pub fn recognize_rgba_images_diagnostics(
         &mut self,
         images: &[RgbaImage],
-    ) -> Result<Vec<KrakenImageDiagnostics>> {
+    ) -> Result<Vec<IndraImageDiagnostics>> {
         self.diagnose_rgba_many(images)
     }
 
     pub fn recognize_rgba_images_profile(
         &mut self,
         images: &[RgbaImage],
-    ) -> Result<KrakenBatchDiagnostics> {
-        if self.blla.is_some() {
-            return Err(Error::Message(
-                "direct RGBA pages require Tesseract layout".to_owned(),
-            ));
-        }
+    ) -> Result<IndraBatchDiagnostics> {
         let pages = images
             .iter()
             .map(|image| PagePixels::Rgba {
@@ -718,17 +667,13 @@ impl KrakenOcr {
     pub fn recognize_gray_images_profile(
         &mut self,
         images: &[GrayImage],
-    ) -> Result<KrakenBatchDiagnostics> {
+    ) -> Result<IndraBatchDiagnostics> {
         self.diagnose_gray_many_profile(images)
     }
 
     pub fn warmup_gray_image(&mut self, image: &GrayImage) -> Result<()> {
-        if let Some(blla) = &mut self.blla {
-            let _ = blla.recognize(std::slice::from_ref(image))?;
-            return Ok(());
-        }
-        let boxes = self.tesseract_layouts[0].lines(image)?;
-        for layout in &mut self.tesseract_layouts[1..] {
+        let boxes = self.layouts[0].lines(image)?;
+        for layout in &mut self.layouts[1..] {
             let _ = layout.lines(image)?;
         }
         let lines = boxes
@@ -738,7 +683,7 @@ impl KrakenOcr {
         for session in &mut self.sessions {
             let _ = recognize_prepared(
                 session,
-                self.codec.as_ref().expect("fast Kraken codec"),
+                self.codec.as_ref().expect("fast Indra codec"),
                 &lines,
                 self.batch_size,
                 self.width_bucket,
@@ -749,50 +694,45 @@ impl KrakenOcr {
     }
 
     #[cfg(feature = "ocr")]
-    pub(crate) fn extract_pages(
+    pub fn extract_pages(
         &mut self,
         bytes: &[u8],
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
+        let document_started = Instant::now();
+        self.last_performance = Some(IndraBatchPerformance::default());
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let blla = self.blla.is_some();
-        if blla || requests.len() < 24 {
-            let pdf = Pdf::new(bytes.to_vec()).map_err(|error| {
-                Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
-            })?;
-            let cache = RenderCache::new();
-            let interpreter = InterpreterSettings::default();
-            let settings = pdf_render_settings(self.dpi);
-            let rendered = render_pdf_pages(&pdf, &cache, &interpreter, &settings, requests, blla,
-                self.orientation.as_mut())?;
-            return self.finish_rendered_pdf_pages(requests, rendered, blla);
-        }
-
-        // Preserve the established OCR batches while extending their producer
-        // upstream to render only the next bounded page window.
+        // Separate bounded stages keep rendering from stalling detection and GPU recognition.
         let window_size = preparation_window_size(requests.len());
         let width_scale = self.width_scale;
         let input_height = self.input_height;
         let batch_size = self.batch_size;
         let width_bucket = self.width_bucket;
         let dpi = self.dpi;
-        let codec = self.codec.as_ref().expect("fast Kraken codec");
-        let layouts = &mut self.tesseract_layouts;
+        // Picture regions use real confidence to distinguish print from seals and chart lettering.
+        let confidence_pages = requests
+            .iter()
+            .filter(|request| !request.regions.is_empty())
+            .map(|request| request.page_index)
+            .collect::<BTreeSet<_>>();
+        let codec = self.codec.as_ref().expect("fast Indra codec");
+        let layouts = &mut self.layouts;
         let sessions = &mut self.sessions;
         let mut orientation = self.orientation.as_mut();
-        std::thread::scope(|scope| -> Result<_> {
+        let (pages, performance) = std::thread::scope(|scope| -> Result<_> {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let (metadata_sender, metadata_receiver) = std::sync::mpsc::channel();
-            let producer = scope.spawn(move || {
+            let (render_sender, render_receiver) = std::sync::mpsc::sync_channel(1);
+            let renderer = scope.spawn(move || {
                 let result = Pdf::new(bytes.to_vec()).map_err(|error| {
                     Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
                 });
                 let pdf = match result {
                     Ok(pdf) => pdf,
                     Err(error) => {
-                        let _ = sender.send(Err(error));
+                        let _ = render_sender.send(Err(error));
                         return;
                     }
                 };
@@ -800,29 +740,61 @@ impl KrakenOcr {
                 let interpreter = InterpreterSettings::default();
                 let settings = pdf_render_settings(dpi);
                 for window in requests.chunks(window_size) {
-                    let rendered = match render_pdf_pages(
+                    let start = Instant::now();
+                    let rendered = render_pdf_pages(
                         &pdf,
                         &cache,
                         &interpreter,
                         &settings,
                         window,
-                        false,
                         orientation.as_deref_mut(),
-                    ) {
-                        Ok(rendered) => rendered,
+                    );
+                    let failed = rendered.is_err();
+                    let value = rendered.map(|pages| (pages, start.elapsed().as_secs_f64()));
+                    if render_sender.send(value).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            let preparer = scope.spawn(move || {
+                for value in render_receiver {
+                    let (rendered, render_seconds) = match value {
+                        Ok(value) => value,
                         Err(error) => {
                             let _ = sender.send(Err(error));
                             break;
                         }
                     };
                     let (metadata, page_images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
+                    let input_pixels = page_images
+                        .iter()
+                        .map(|image| image.width() as usize * image.height() as usize)
+                        .sum::<usize>();
                     let images = page_images
                         .iter()
-                        .map(RenderedPdfImage::as_page_pixels)
+                        .map(|image| PagePixels::Rgba {
+                            pixels: image.as_raw(),
+                            width: image.width(),
+                            height: image.height(),
+                        })
                         .collect::<Vec<_>>();
-                    let value = Self::prepare_window(layouts, &images, width_scale, input_height);
+                    let mut value =
+                        Self::prepare_window(layouts, &images, width_scale, input_height);
+                    if let Ok(window) = value.as_mut() {
+                        for (metadata, lines) in metadata.iter().zip(&mut window.prepared) {
+                            if confidence_pages.contains(&metadata.0) {
+                                for line in lines {
+                                    line.confidence_required = true;
+                                }
+                            }
+                        }
+                    }
                     let failed = value.is_err();
-                    if !failed && metadata_sender.send(metadata).is_err() {
+                    if !failed
+                        && metadata_sender
+                            .send((metadata, render_seconds, input_pixels))
+                            .is_err()
+                    {
                         break;
                     }
                     if sender.send(value).is_err() || failed {
@@ -839,39 +811,30 @@ impl KrakenOcr {
                 input_height,
                 requests.len(),
             );
-            producer
+            renderer
                 .join()
-                .map_err(|_| Error::Message("PDF render worker panicked".to_owned()))?;
-            finish_recognized_pdf_pages(
-                requests,
-                metadata_receiver.into_iter().flatten().collect(),
-                result?.pages,
-            )
-        })
-    }
-
-    #[cfg(feature = "ocr")]
-    fn finish_rendered_pdf_pages(
-        &mut self,
-        requests: &[OcrPageRequest],
-        rendered: Vec<RenderedPdfPage>,
-        blla: bool,
-    ) -> Result<Vec<OcrPageResult>> {
-        let (metadata, images): (Vec<_>, Vec<_>) = rendered.into_iter().unzip();
-        let pages = if blla {
-            let images = images
-                .into_iter()
-                .map(RenderedPdfImage::into_gray)
-                .collect::<Result<Vec<_>>>()?;
-            self.diagnose_gray_many(&images)?
-        } else {
-            let images = images
-                .into_iter()
-                .map(RenderedPdfImage::into_rgba)
-                .collect::<Result<Vec<_>>>()?;
-            self.diagnose_rgba_many(&images)?
-        };
-        finish_recognized_pdf_pages(requests, metadata, pages)
+                .map_err(|_| Error::Message("PDF render worker panicked".into()))?;
+            preparer
+                .join()
+                .map_err(|_| Error::Message("PDF preparation worker panicked".into()))?;
+            let mut metadata = Vec::new();
+            let (mut render_seconds, mut input_pixels) = (0.0, 0);
+            for (window, seconds, pixels) in metadata_receiver {
+                metadata.extend(window);
+                render_seconds += seconds;
+                input_pixels += pixels;
+            }
+            let diagnostics = finish_diagnostics(
+                result?,
+                input_pixels,
+                document_started.elapsed().as_secs_f64(),
+                render_seconds,
+            );
+            let pages = finish_recognized_pdf_pages(requests, metadata, diagnostics.pages)?;
+            Ok((pages, diagnostics.performance))
+        })?;
+        self.last_performance = Some(performance);
+        Ok(pages)
     }
 
     fn recognize_gray(
@@ -888,7 +851,7 @@ impl KrakenOcr {
         image: &GrayImage,
         x_scale: f64,
         y_scale: f64,
-    ) -> Result<KrakenImageDiagnostics> {
+    ) -> Result<IndraImageDiagnostics> {
         let mut page = self
             .diagnose_gray_many(std::slice::from_ref(image))?
             .pop()
@@ -897,49 +860,25 @@ impl KrakenOcr {
         Ok(page)
     }
 
-    fn diagnose_gray_many(&mut self, images: &[GrayImage]) -> Result<Vec<KrakenImageDiagnostics>> {
+    fn diagnose_gray_many(&mut self, images: &[GrayImage]) -> Result<Vec<IndraImageDiagnostics>> {
         Ok(self.diagnose_gray_many_profile(images)?.pages)
     }
 
     fn diagnose_gray_many_profile(
         &mut self,
         images: &[GrayImage],
-    ) -> Result<KrakenBatchDiagnostics> {
+    ) -> Result<IndraBatchDiagnostics> {
         if images.is_empty() {
-            return Ok(KrakenBatchDiagnostics {
+            return Ok(IndraBatchDiagnostics {
                 pages: Vec::new(),
-                performance: KrakenBatchPerformance::default(),
+                performance: IndraBatchPerformance::default(),
             });
-        }
-        if let Some(blla) = &mut self.blla {
-            let started = Instant::now();
-            let pages = blla.recognize(images)?;
-            let performance = KrakenBatchPerformance {
-                pages: pages.len(),
-                input_pixels: images
-                    .iter()
-                    .map(|image| image.width() as usize * image.height() as usize)
-                    .sum(),
-                layout_boxes: pages.iter().map(|page| page.layout_boxes.len()).sum(),
-                prepared_lines: pages.iter().map(|page| page.layout_boxes.len()).sum(),
-                output_lines: pages.iter().map(|page| page.lines.len()).sum(),
-                layout_seconds: pages.iter().map(|page| page.layout_seconds).sum(),
-                recognition_wall_seconds: pages.iter().map(|page| page.recognition_seconds).sum(),
-                total_seconds: started.elapsed().as_secs_f64(),
-                ..KrakenBatchPerformance::default()
-            };
-            return Ok(KrakenBatchDiagnostics { pages, performance });
         }
         let pages = images.iter().map(PagePixels::Gray).collect::<Vec<_>>();
         self.diagnose_pages_profile(&pages)
     }
 
-    fn diagnose_rgba_many(&mut self, images: &[RgbaImage]) -> Result<Vec<KrakenImageDiagnostics>> {
-        if self.blla.is_some() {
-            return Err(Error::Message(
-                "direct RGBA pages require Tesseract layout".to_owned(),
-            ));
-        }
+    fn diagnose_rgba_many(&mut self, images: &[RgbaImage]) -> Result<Vec<IndraImageDiagnostics>> {
         let pages = images
             .iter()
             .map(|image| PagePixels::Rgba {
@@ -954,11 +893,11 @@ impl KrakenOcr {
     fn diagnose_pages_profile(
         &mut self,
         images: &[PagePixels<'_>],
-    ) -> Result<KrakenBatchDiagnostics> {
+    ) -> Result<IndraBatchDiagnostics> {
         if images.is_empty() {
-            return Ok(KrakenBatchDiagnostics {
+            return Ok(IndraBatchDiagnostics {
                 pages: Vec::new(),
-                performance: KrakenBatchPerformance::default(),
+                performance: IndraBatchPerformance::default(),
             });
         }
         let total_started = Instant::now();
@@ -967,13 +906,17 @@ impl KrakenOcr {
             .map(|image| image.width() as usize * image.height() as usize)
             .sum();
         // Balance bounded windows so overlap never leaves a one-page tail.
-        let window_size = preparation_window_size(images.len());
+        let window_size = if images.len() <= 4 {
+            images.len()
+        } else {
+            preparation_window_size(images.len())
+        };
         let width_scale = self.width_scale;
         let input_height = self.input_height;
         let batch_size = self.batch_size;
         let width_bucket = self.width_bucket;
-        let codec = self.codec.as_ref().expect("fast Kraken codec");
-        let layouts = &mut self.tesseract_layouts;
+        let codec = self.codec.as_ref().expect("fast Indra codec");
+        let layouts = &mut self.layouts;
         let sessions = &mut self.sessions;
         let prepared = std::thread::scope(|scope| -> Result<_> {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -997,70 +940,15 @@ impl KrakenOcr {
             );
             producer
                 .join()
-                .map_err(|_| Error::Message("Kraken preparation worker panicked".to_owned()))?;
+                .map_err(|_| Error::Message("Indra preparation worker panicked".to_owned()))?;
             result
         })?;
-        let PreparedDiagnostics {
-            mut pages,
-            layout_seconds,
-            line_prepare_seconds,
-            layout_box_count,
-            total_lines,
-            prepared_bytes,
-            output_assembly_seconds,
-            recognition,
-        } = prepared;
-        let total_seconds = total_started.elapsed().as_secs_f64();
-        // Receipts report additive per-page time. Preserve real layout work and assign
-        // overlapped preparation/recognition only the remaining wall time.
-        let reported_recognition = (total_seconds - layout_seconds).max(0.0);
-        let measured_recognition = pages
-            .iter()
-            .map(|page| page.recognition_seconds)
-            .sum::<f64>();
-        if measured_recognition > 0.0 {
-            let scale = reported_recognition / measured_recognition;
-            for page in &mut pages {
-                page.recognition_seconds *= scale;
-            }
-        }
-        let output_lines = pages.iter().map(|page| page.lines.len()).sum();
-        let performance = KrakenBatchPerformance {
-            detailed: true,
-            pages: pages.len(),
+        Ok(finish_diagnostics(
+            prepared,
             input_pixels,
-            layout_boxes: layout_box_count,
-            prepared_lines: total_lines,
-            output_lines,
-            layout_seconds,
-            line_prepare_seconds,
-            schedule_seconds: recognition.schedule_seconds,
-            recognition_wall_seconds: recognition.wall_seconds,
-            output_assembly_seconds,
-            total_seconds,
-            recognition_workers: recognition.workers,
-            batches: recognition.batches,
-            batch_fill_ratio: recognition.batch_fill_ratio,
-            tensor_fill_ratio: recognition.tensor_fill_ratio,
-            line_width_p50: recognition.line_width_p50,
-            line_width_p95: recognition.line_width_p95,
-            line_width_max: recognition.line_width_max,
-            batch_lines_p50: recognition.batch_lines_p50,
-            batch_lines_p95: recognition.batch_lines_p95,
-            batch_lines_max: recognition.batch_lines_max,
-            batch_seconds_p50: recognition.batch_seconds_p50,
-            batch_seconds_p95: recognition.batch_seconds_p95,
-            batch_seconds_max: recognition.batch_seconds_max,
-            worker_busy_seconds_min: recognition.worker_busy_seconds_min,
-            worker_busy_seconds_max: recognition.worker_busy_seconds_max,
-            worker_busy_seconds_sum: recognition.worker_busy_seconds_sum,
-            pack_seconds_sum: recognition.pack_seconds_sum,
-            inference_seconds_sum: recognition.inference_seconds_sum,
-            decode_seconds_sum: recognition.decode_seconds_sum,
-            prepared_bytes,
-            peak_tensor_bytes: recognition.peak_tensor_bytes,
-        };
-        Ok(KrakenBatchDiagnostics { pages, performance })
+            total_started.elapsed().as_secs_f64(),
+            0.0,
+        ))
     }
 
     fn recognize_prepared_windows(
@@ -1147,7 +1035,7 @@ impl KrakenOcr {
                                 })
                             })
                             .collect();
-                        KrakenImageDiagnostics {
+                        IndraImageDiagnostics {
                             lines,
                             layout_boxes,
                             layout_seconds: window.layout_seconds / page_count as f64,
@@ -1174,7 +1062,7 @@ impl KrakenOcr {
     }
 
     fn layout_boxes_many(
-        layouts: &mut [TesseractLayout],
+        layouts: &mut [LineDetector],
         images: &[PagePixels<'_>],
     ) -> Result<Vec<Vec<LineBox>>> {
         let workers = images.len().min(layouts.len());
@@ -1231,7 +1119,7 @@ impl KrakenOcr {
     }
 
     fn prepare_window(
-        layouts: &mut [TesseractLayout],
+        layouts: &mut [LineDetector],
         images: &[PagePixels<'_>],
         width_scale: f32,
         input_height: usize,
@@ -1341,7 +1229,7 @@ impl KrakenOcr {
             for handle in handles {
                 handle
                     .join()
-                    .map_err(|_| Error::Message("Kraken recognition worker panicked".to_owned()))?;
+                    .map_err(|_| Error::Message("Indra recognition worker panicked".to_owned()))?;
             }
             if let Some(error) = failure {
                 return Err(error);
@@ -1349,7 +1237,7 @@ impl KrakenOcr {
             let mut output = output
                 .into_iter()
                 .map(|value| {
-                    value.ok_or_else(|| Error::Message("Kraken worker returned no line".to_owned()))
+                    value.ok_or_else(|| Error::Message("Indra worker returned no line".to_owned()))
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter();
@@ -1371,6 +1259,75 @@ impl KrakenOcr {
             ))
         })
     }
+}
+
+fn finish_diagnostics(
+    prepared: PreparedDiagnostics,
+    input_pixels: usize,
+    total_seconds: f64,
+    render_seconds: f64,
+) -> IndraBatchDiagnostics {
+    let PreparedDiagnostics {
+        mut pages,
+        layout_seconds,
+        line_prepare_seconds,
+        layout_box_count,
+        total_lines,
+        prepared_bytes,
+        output_assembly_seconds,
+        recognition,
+    } = prepared;
+    // Receipts report additive per-page time. Preserve real layout work and assign
+    // overlapped preparation/recognition only the remaining wall time.
+    let reported_recognition = (total_seconds - layout_seconds).max(0.0);
+    let measured_recognition = pages
+        .iter()
+        .map(|page| page.recognition_seconds)
+        .sum::<f64>();
+    if measured_recognition > 0.0 {
+        let scale = reported_recognition / measured_recognition;
+        for page in &mut pages {
+            page.recognition_seconds *= scale;
+        }
+    }
+    let output_lines = pages.iter().map(|page| page.lines.len()).sum();
+    let performance = IndraBatchPerformance {
+        detailed: true,
+        pages: pages.len(),
+        input_pixels,
+        layout_boxes: layout_box_count,
+        prepared_lines: total_lines,
+        output_lines,
+        layout_seconds,
+        render_seconds,
+        line_prepare_seconds,
+        schedule_seconds: recognition.schedule_seconds,
+        recognition_wall_seconds: recognition.wall_seconds,
+        output_assembly_seconds,
+        total_seconds,
+        recognition_workers: recognition.workers,
+        batches: recognition.batches,
+        batch_fill_ratio: recognition.batch_fill_ratio,
+        tensor_fill_ratio: recognition.tensor_fill_ratio,
+        line_width_p50: recognition.line_width_p50,
+        line_width_p95: recognition.line_width_p95,
+        line_width_max: recognition.line_width_max,
+        batch_lines_p50: recognition.batch_lines_p50,
+        batch_lines_p95: recognition.batch_lines_p95,
+        batch_lines_max: recognition.batch_lines_max,
+        batch_seconds_p50: recognition.batch_seconds_p50,
+        batch_seconds_p95: recognition.batch_seconds_p95,
+        batch_seconds_max: recognition.batch_seconds_max,
+        worker_busy_seconds_min: recognition.worker_busy_seconds_min,
+        worker_busy_seconds_max: recognition.worker_busy_seconds_max,
+        worker_busy_seconds_sum: recognition.worker_busy_seconds_sum,
+        pack_seconds_sum: recognition.pack_seconds_sum,
+        inference_seconds_sum: recognition.inference_seconds_sum,
+        decode_seconds_sum: recognition.decode_seconds_sum,
+        prepared_bytes,
+        peak_tensor_bytes: recognition.peak_tensor_bytes,
+    };
+    IndraBatchDiagnostics { pages, performance }
 }
 
 fn recognition_jobs(
@@ -1608,7 +1565,9 @@ fn recognize_batch(
         .iter()
         .map(|&index| lines[index].width)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .div_ceil(8)
+        * 8;
     pixels.resize(batch.len() * input_height * maximum, 0.0);
     pixels.fill(0.0);
     lengths.clear();
@@ -1634,16 +1593,27 @@ fn recognize_batch(
         TensorRef::from_array_view(([batch.len()], lengths.as_slice())).map_err(ort_error)?;
     let pack_seconds = pack_started.elapsed().as_secs_f64();
     let inference_started = Instant::now();
+    let use_ids = !batch
+        .iter()
+        .any(|&index| lines[index].bbox.recovered || lines[index].confidence_required);
+    let run_options = RunOptions::new().map_err(ort_error)?.with_outputs(
+        OutputSelector::no_default()
+            .with(if use_ids { "class_ids" } else { "logits" })
+            .with("lengths"),
+    );
     let outputs = session
-        .run(ort::inputs![
-            "image" => image,
-            "sequence_lengths" => sequence_lengths,
-        ])
+        .run_with_options(
+            ort::inputs![
+                "image" => image,
+                "widths" => sequence_lengths,
+            ],
+            &run_options,
+        )
         .map_err(ort_error)?;
     let inference_seconds = inference_started.elapsed().as_secs_f64();
     let decode_started = Instant::now();
     let (length_shape, output_lengths) =
-        if let Ok((shape, values)) = outputs["output_lengths"].try_extract_tensor::<i64>() {
+        if let Ok((shape, values)) = outputs["lengths"].try_extract_tensor::<i64>() {
             (
                 shape.iter().copied().collect::<Vec<_>>(),
                 values
@@ -1652,7 +1622,7 @@ fn recognize_batch(
                     .collect::<Vec<_>>(),
             )
         } else {
-            let (shape, values) = outputs["output_lengths"]
+            let (shape, values) = outputs["lengths"]
                 .try_extract_tensor::<i32>()
                 .map_err(ort_error)?;
             (
@@ -1669,16 +1639,15 @@ fn recognize_batch(
             .iter()
             .map(|value| *value as usize)
             .collect::<Vec<_>>();
-        if dimensions.len() != 3
+        if dimensions.len() != 2
             || dimensions[0] != batch.len()
-            || dimensions[1] != 1
             || length_shape.first().copied() != Some(batch.len() as i64)
         {
             return Err(Error::Message(format!(
-                "Kraken model returned unexpected class shapes {dimensions:?} and {length_shape:?}"
+                "Indra model returned unexpected class shapes {dimensions:?} and {length_shape:?}"
             )));
         }
-        let timesteps = dimensions[2];
+        let timesteps = dimensions[1];
         let values = batch
             .iter()
             .enumerate()
@@ -1720,26 +1689,23 @@ fn recognize_batch(
         });
     }
     let logits = outputs.get("logits").ok_or_else(|| {
-        Error::Message("Kraken model returned neither logits nor class_ids".to_owned())
+        Error::Message("Indra model returned neither logits nor class_ids".to_owned())
     })?;
     let (shape, logits) = logits.try_extract_tensor::<f32>().map_err(ort_error)?;
     let dimensions = shape
         .iter()
         .map(|value| *value as usize)
         .collect::<Vec<_>>();
-    if dimensions.len() < 3
+    if dimensions.len() != 3
         || dimensions[0] != batch.len()
-        || dimensions[2..dimensions.len() - 1]
-            .iter()
-            .any(|&value| value != 1)
         || length_shape.first().copied() != Some(batch.len() as i64)
     {
         return Err(Error::Message(format!(
-            "Kraken model returned unexpected shapes {dimensions:?} and {length_shape:?}"
+            "Indra model returned unexpected shapes {dimensions:?} and {length_shape:?}"
         )));
     }
-    let classes = dimensions[1];
-    let timesteps = *dimensions.last().unwrap_or(&0);
+    let classes = dimensions[2];
+    let timesteps = dimensions[1];
     let values = batch
         .iter()
         .enumerate()
@@ -1813,41 +1779,7 @@ fn recognize_prepared(
 /// points, and the quarter turns counter-clockwise that stood it upright with its drawn size in pixels.
 type PdfPageMetadata = (usize, Option<f64>, f64, f64, [f64; 2], (u8, f64, f64));
 #[cfg(feature = "ocr")]
-type RenderedPdfPage = (PdfPageMetadata, RenderedPdfImage);
-
-#[cfg(feature = "ocr")]
-enum RenderedPdfImage {
-    Gray(GrayImage),
-    Rgba(RgbaImage),
-}
-
-#[cfg(feature = "ocr")]
-impl RenderedPdfImage {
-    fn as_page_pixels(&self) -> PagePixels<'_> {
-        match self {
-            Self::Gray(image) => PagePixels::Gray(image),
-            Self::Rgba(image) => PagePixels::Rgba {
-                pixels: image.as_raw(),
-                width: image.width(),
-                height: image.height(),
-            },
-        }
-    }
-
-    fn into_gray(self) -> Result<GrayImage> {
-        match self {
-            Self::Gray(image) => Ok(image),
-            Self::Rgba(_) => Err(Error::Message("expected a grayscale OCR page".to_owned())),
-        }
-    }
-
-    fn into_rgba(self) -> Result<RgbaImage> {
-        match self {
-            Self::Rgba(image) => Ok(image),
-            Self::Gray(_) => Err(Error::Message("expected an RGBA OCR page".to_owned())),
-        }
-    }
-}
+type RenderedPdfPage = (PdfPageMetadata, RgbaImage);
 
 #[cfg(feature = "ocr")]
 fn pdf_render_settings(dpi: u16) -> RenderSettings {
@@ -1867,7 +1799,6 @@ fn render_pdf_pages<'a>(
     interpreter: &InterpreterSettings,
     settings: &RenderSettings,
     requests: &[OcrPageRequest],
-    blla: bool,
     mut orientation: Option<&mut Orientation>,
 ) -> Result<Vec<RenderedPdfPage>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
@@ -1905,7 +1836,9 @@ fn render_pdf_pages<'a>(
             let metadata = (
                 request.page_index,
                 // A turned page's rule runs across its print, not across the page as drawn.
-                (turns == 0).then(|| super::ocr::raster_separator_y(&pixmap, request.height)).flatten(),
+                (turns == 0)
+                    .then(|| super::ocr::raster_separator_y(&pixmap, request.height))
+                    .flatten(),
                 x_scale,
                 y_scale,
                 [0.0, 0.0],
@@ -1914,7 +1847,7 @@ fn render_pdf_pages<'a>(
             let (turned_width, turned_height) = (page.width() as usize, page.height() as usize);
             rendered.push((
                 metadata,
-                rendered_image(page.into_raw(), turned_width, turned_height, blla),
+                rendered_image(page.into_raw(), turned_width, turned_height),
             ));
             continue;
         }
@@ -1947,10 +1880,7 @@ fn render_pdf_pages<'a>(
                 ],
                 (0, 0.0, 0.0),
             );
-            rendered.push((
-                metadata,
-                rendered_image(crop, crop_width, crop_height, blla),
-            ));
+            rendered.push((metadata, rendered_image(crop, crop_width, crop_height)));
         }
     }
     Ok(rendered)
@@ -1974,25 +1904,9 @@ fn dark_print_on_light_ground(pixels: &[u8], width: usize, [x0, y0, x1, y1]: [us
 }
 
 #[cfg(feature = "ocr")]
-fn rendered_image(rgba: Vec<u8>, width: usize, height: usize, blla: bool) -> RenderedPdfImage {
-    if blla {
-        let pixels = rgba
-            .chunks_exact(4)
-            .map(|pixel| {
-                ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29)
-                    / 256) as u8
-            })
-            .collect();
-        RenderedPdfImage::Gray(
-            GrayImage::from_raw(width as u32, height as u32, pixels)
-                .expect("renderer dimensions match its pixel buffer"),
-        )
-    } else {
-        RenderedPdfImage::Rgba(
-            RgbaImage::from_raw(width as u32, height as u32, rgba)
-                .expect("renderer dimensions match its pixel buffer"),
-        )
-    }
+fn rendered_image(rgba: Vec<u8>, width: usize, height: usize) -> RgbaImage {
+    RgbaImage::from_raw(width as u32, height as u32, rgba)
+        .expect("renderer dimensions match its pixel buffer")
 }
 
 /// One result per requested page, in request order: the parts of a page recognized apart are
@@ -2001,7 +1915,7 @@ fn rendered_image(rgba: Vec<u8>, width: usize, height: usize, blla: bool) -> Ren
 fn finish_recognized_pdf_pages(
     requests: &[OcrPageRequest],
     metadata: Vec<PdfPageMetadata>,
-    pages: Vec<KrakenImageDiagnostics>,
+    pages: Vec<IndraImageDiagnostics>,
 ) -> Result<Vec<OcrPageResult>> {
     let mut results: Vec<OcrPageResult> = requests
         .iter()
@@ -2028,11 +1942,7 @@ fn finish_recognized_pdf_pages(
 }
 
 fn preparation_window_size(page_count: usize) -> usize {
-    if page_count < 24 {
-        page_count
-    } else {
-        page_count.div_ceil(page_count.div_ceil(32).max(2))
-    }
+    page_count.div_ceil(page_count.div_ceil(4).max(2)).max(1)
 }
 
 fn scale_lines(lines: &mut [OcrLine], x_scale: f64, y_scale: f64) {
@@ -2079,84 +1989,10 @@ fn translate_lines(lines: &mut [OcrLine], origin: [f64; 2]) {
     }
 }
 
-fn effective_layout_workers(requested: usize, backend: KrakenBackend) -> usize {
-    if requested > 0 {
-        return requested;
-    }
-    let available = std::thread::available_parallelism().map_or(1, |value| value.get());
-    if backend == KrakenBackend::Cpu {
-        available.div_ceil(2).min(8)
-    } else {
-        available.min(16)
-    }
-}
-
-fn effective_recognition_batch(
-    requested_batch: usize,
-    requested_bucket: usize,
-    backend: KrakenBackend,
-) -> (usize, usize) {
-    let accelerated = backend != KrakenBackend::Cpu;
-    (
-        if requested_batch == 0 {
-            if accelerated {
-                64
-            } else {
-                32
-            }
-        } else {
-            requested_batch
-        },
-        if requested_bucket == 0 {
-            if accelerated {
-                128
-            } else {
-                24
-            }
-        } else {
-            requested_bucket
-        },
-    )
-}
-
-fn recognition_schedule(
-    requested_workers: usize,
-    requested_threads: usize,
-    backend: KrakenBackend,
-) -> (usize, usize) {
-    if backend != KrakenBackend::Cpu {
-        return (requested_workers.max(1), requested_threads.max(1));
-    }
-    let available = std::thread::available_parallelism().map_or(1, |value| value.get());
-    let automatic_threads = if requested_threads == 0 {
-        available.min(2)
-    } else {
-        requested_threads
-    };
-    let workers = if requested_workers == 0 {
-        (available / automatic_threads).max(1)
-    } else {
-        requested_workers
-    };
-    let threads = if requested_threads == 0 {
-        (available / workers).clamp(1, 2)
-    } else {
-        automatic_threads
-    };
-    (workers, threads)
-}
-
-fn uses_global_pool(options: &KrakenOptions) -> bool {
-    options.backend == KrakenBackend::Cpu
-        && options.workers == 0
-        && options.threads == 0
-        && options.tier != KrakenTier::Quality
-}
-
-fn open_session(
+pub(crate) fn open_session(
     model: &Path,
     threads: usize,
-    backend: KrakenBackend,
+    backend: IndraBackend,
     device: &str,
     cpu_arena: bool,
     prepacked_weights: &PrepackedWeights,
@@ -2174,20 +2010,30 @@ fn open_session(
     if independent_pool {
         builder = builder.with_independent_thread_pool().map_err(ort_error)?;
     }
-    if backend == KrakenBackend::DirectMl {
+    if backend == IndraBackend::DirectMl {
         builder = builder
             .with_memory_pattern(false)
             .and_then(|builder| builder.with_parallel_execution(false))
             .map_err(ort_error)?;
     }
-    if backend == KrakenBackend::Cpu && !cpu_arena {
+    if backend == IndraBackend::Cpu && !cpu_arena {
         builder = builder
             .with_execution_providers(vec![CPUExecutionProvider::default()
                 .with_arena_allocator(false)
                 .build()])
             .map_err(ort_error)?;
     }
-    let providers = backend.providers(device);
+    // Avoid an exhaustive cuDNN search for every changing OCR line width.
+    let providers = if backend == IndraBackend::Cuda {
+        vec![CUDAExecutionProvider::default()
+            .with_device_id(device.parse().expect("normalized device"))
+            .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Heuristic)
+            .with_tf32(true)
+            .build()
+            .error_on_failure()]
+    } else {
+        backend.providers(device)
+    };
     if !providers.is_empty() {
         builder = builder
             .with_execution_providers(providers)
@@ -2196,66 +2042,36 @@ fn open_session(
     builder.commit_from_file(model).map_err(ort_error)
 }
 
-fn validate_options(options: &KrakenOptions) -> Result<()> {
-    if options.backend != KrakenBackend::Cpu && !options.cpu_arena {
-        return Err(Error::Message(
-            "Kraken low-memory mode only applies to the CPU backend".to_owned(),
-        ));
-    }
-    if !(72..=600).contains(&options.dpi) {
-        return Err(Error::Message(
-            "OCR DPI must be between 72 and 600".to_owned(),
-        ));
-    }
-    if options.batch_size > 256
-        || options.runtime_batch_size > 256
+fn validate_options(options: &IndraOptions) -> Result<()> {
+    if !(72..=600).contains(&options.dpi)
+        || options.input_height != 32
+        || options.batch_size > 256
         || options.width_bucket > 1024
-        || !(32..=256).contains(&options.input_height)
-        || options.layout_workers > 16
         || options.workers > 16
+        || options.layout_workers > 16
         || options.threads > 16
     {
         return Err(Error::Message(
-            "Kraken batch, bucket, and worker counts are outside their supported bounds".to_owned(),
+            "Indra DPI, height, batch or worker counts are outside supported bounds".to_owned(),
         ));
     }
-    if !(1..=86_400).contains(&options.timeout_seconds) {
-        return Err(Error::Message(
-            "Kraken timeout must be between 1 and 86400 seconds".to_owned(),
-        ));
-    }
-    let has_blla_assets = options.runtime_wheel.is_some()
-        || options.python.is_some()
-        || options.blla_pack.is_some()
-        || options.recognizer_pack.is_some();
-    if options.layout == KrakenLayout::Tesseract && has_blla_assets {
-        return Err(Error::Message(
-            "Kraken BLLA runtime options require --kraken-layout blla".to_owned(),
-        ));
-    }
-    if options.layout == KrakenLayout::Blla
-        && (options.model.is_some()
-            || options.codec.is_some()
-            || options.runtime.is_some()
-            || options.tesseract_library.is_some()
-            || options.width_scale.is_some())
+    if options
+        .backend
+        .is_some_and(|backend| backend != IndraBackend::Cpu)
+        && !options.cpu_arena
     {
         return Err(Error::Message(
-            "Kraken native Tesseract-layout options cannot be combined with BLLA orchestration"
-                .to_owned(),
+            "Indra low-memory mode requires the CPU backend".to_owned(),
         ));
     }
-    let width_scale = options
-        .width_scale
-        .unwrap_or_else(|| options.tier.width_scale());
-    if !(0.5..=1.25).contains(&width_scale) || !width_scale.is_finite() {
+    if options.device.is_some() && options.backend.is_none() {
         return Err(Error::Message(
-            "Kraken width scale must be between 0.5 and 1.25".to_owned(),
+            "an explicit device requires an explicit backend".to_owned(),
         ));
     }
-    options
-        .backend
-        .normalized_device(options.device.as_deref())?;
+    if let Some(backend) = options.backend {
+        backend.normalized_device(options.device.as_deref())?;
+    }
     Ok(())
 }
 
@@ -2281,8 +2097,8 @@ pub(crate) fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|source| Error::io(path, source))
 }
 
-fn ort_error(error: ort::Error) -> Error {
-    Error::Message(format!("Kraken ONNX inference failed: {error}"))
+pub(crate) fn ort_error(error: ort::Error) -> Error {
+    Error::Message(format!("Indra ONNX inference failed: {error}"))
 }
 
 fn prepare_line(
@@ -2300,22 +2116,63 @@ fn prepare_line(
         bbox.top as u32,
         bbox.width() as u32,
         bbox.height() as u32,
+    )
+    .to_image();
+    prepare_crop(crop, bbox, width_scale, input_height)
+}
+
+fn prepare_crop(
+    crop: GrayImage,
+    bbox: LineBox,
+    width_scale: f32,
+    input_height: usize,
+) -> Option<PreparedLine> {
+    let (mut x0, mut y0, mut x1, mut y1) = (crop.width(), crop.height(), 0, 0);
+    for (x, y, pixel) in crop.enumerate_pixels() {
+        if pixel[0] < 220 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    let (px, py) = if x1 > x0 {
+        (
+            ((y1 - y0) as f64 * 0.3).ceil() as u32,
+            ((y1 - y0) as f64 * 0.2).ceil() as u32,
+        )
+    } else {
+        x0 = 0;
+        y0 = 0;
+        x1 = crop.width();
+        y1 = crop.height();
+        (0, 0)
+    };
+    let padded_width = x1 - x0 + 2 * px;
+    let padded_height = y1 - y0 + 2 * py;
+    let mut padded = GrayImage::from_pixel(padded_width, padded_height, image::Luma([255]));
+    imageops::replace(
+        &mut padded,
+        &imageops::crop_imm(&crop, x0, y0, x1 - x0, y1 - y0).to_image(),
+        i64::from(px),
+        i64::from(py),
     );
-    let content_width = ((bbox.width() as f32 * input_height as f32 / bbox.height() as f32)
-        * width_scale)
+    let width = (padded_width as f32 * input_height as f32 / padded_height as f32 * width_scale)
         .round()
-        .max(1.0) as usize;
+        .clamp(8.0, 4096.0) as usize;
     let resized = imageops::resize(
-        &*crop,
-        content_width as u32,
+        &padded,
+        width as u32,
         input_height as u32,
-        imageops::FilterType::Lanczos3,
+        imageops::FilterType::Triangle,
     );
-    let width = content_width + INPUT_PADDING * 2;
     Some(PreparedLine {
         bbox,
+        confidence_required: false,
         width,
         pixels: resized.into_raw(),
+        pixel_x_origin: bbox.left as f64 + x0 as f64 - px as f64,
+        pixel_x_scale: padded_width as f64 / width as f64,
     })
 }
 
@@ -2340,21 +2197,7 @@ fn prepare_rgba_line(
                 ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3) as u8;
         }
     }
-    let content_width = ((bbox.width() as f32 * input_height as f32 / bbox.height() as f32)
-        * width_scale)
-        .round()
-        .max(1.0) as usize;
-    let resized = imageops::resize(
-        &gray,
-        content_width as u32,
-        input_height as u32,
-        imageops::FilterType::Lanczos3,
-    );
-    Some(PreparedLine {
-        bbox,
-        width: content_width + INPUT_PADDING * 2,
-        pixels: resized.into_raw(),
-    })
+    prepare_crop(gray, bbox, width_scale, input_height)
 }
 
 fn prepare_page_line(
@@ -2435,19 +2278,21 @@ fn best_labels(
     timesteps: usize,
     length: usize,
 ) -> Vec<usize> {
-    let offset = batch * classes * timesteps;
-    let mut labels = vec![0; length];
-    let mut maxima = vec![f32::NEG_INFINITY; length];
-    for class in 0..classes {
-        let values = &logits[offset + class * timesteps..offset + class * timesteps + length];
-        for (timestep, &value) in values.iter().enumerate() {
-            if value > maxima[timestep] {
-                maxima[timestep] = value;
-                labels[timestep] = class;
-            }
-        }
-    }
-    labels
+    logits[batch * timesteps * classes..][..length * classes]
+        .chunks_exact(classes)
+        .map(|step| {
+            step.iter()
+                .enumerate()
+                .fold((0, f32::NEG_INFINITY), |best, (label, &value)| {
+                    if value > best.1 {
+                        (label, value)
+                    } else {
+                        best
+                    }
+                })
+                .0
+        })
+        .collect()
 }
 
 /// The labels a greedy CTC reading emits, each with the first and last timestep of its run:
@@ -2581,7 +2426,7 @@ fn line_words(
         }
     }
     bounds.push((last_ink + 1, last_ink + 1));
-    let scale = line.bbox.width() as f64 / content_width as f64;
+    let scale = line.pixel_x_scale;
     let letter_gap = rows.max(1);
     words
         .iter()
@@ -2610,9 +2455,9 @@ fn line_words(
                     .map(|(character, _)| *character)
                     .collect(),
                 bbox: [
-                    line.bbox.left as f64 + left as f64 * scale,
+                    line.pixel_x_origin + left as f64 * scale,
                     line.bbox.top as f64,
-                    line.bbox.left as f64 + right as f64 * scale,
+                    line.pixel_x_origin + right as f64 * scale,
                     line.bbox.bottom as f64,
                 ],
                 start: *begin,
@@ -2641,27 +2486,16 @@ fn greedy_ctc(
     timesteps: usize,
     length: usize,
 ) -> Vec<(usize, f32)> {
-    let offset = batch * classes * timesteps;
-    let mut labels = vec![0; length];
-    let mut maxima = vec![f32::NEG_INFINITY; length];
-    for class in 0..classes {
-        let values = &logits[offset + class * timesteps..offset + class * timesteps + length];
-        for (timestep, &value) in values.iter().enumerate() {
-            if value > maxima[timestep] {
-                maxima[timestep] = value;
-                labels[timestep] = class;
-            }
-        }
-    }
-    let mut denominators = vec![0.0_f32; length];
-    for class in 0..classes {
-        let values = &logits[offset + class * timesteps..offset + class * timesteps + length];
-        for (timestep, &value) in values.iter().enumerate() {
-            if labels[timestep] != BLANK_LABEL {
-                denominators[timestep] += (value - maxima[timestep]).exp();
-            }
-        }
-    }
+    let labels = best_labels(logits, batch, classes, timesteps, length);
+    let denominators = logits[batch * timesteps * classes..][..length * classes]
+        .chunks_exact(classes)
+        .zip(&labels)
+        .map(|(step, &label)| {
+            step.iter()
+                .map(|&value| (value - step[label]).exp())
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut previous = usize::MAX;
     for (timestep, &label) in labels.iter().enumerate() {
@@ -2683,17 +2517,74 @@ fn greedy_ctc(
 mod tests {
     use super::*;
 
-    const TEST_INPUT_HEIGHT: usize = 48;
+    #[test]
+    #[ignore = "requires local model/runtime and the independently invented Lite OCR fixture"]
+    fn partial_page_regions_return_real_character_confidence() {
+        let backend = std::env::var("LEGALPDF_OCR_TEST_BACKEND").unwrap_or_else(|_| "cpu".into());
+        let options = IndraOptions {
+            model_pack: Some(
+                std::env::var_os("LEGALPDF_OCR_TEST_MODEL_PACK")
+                    .expect("set model pack")
+                    .into(),
+            ),
+            runtime: Some(
+                std::env::var_os("LEGALPDF_OCR_TEST_RUNTIME")
+                    .expect("set runtime")
+                    .into(),
+            ),
+            backend: Some(IndraBackend::parse(&backend).expect("unknown test backend")),
+            workers: 1,
+            threads: 1,
+            layout_workers: 1,
+            batch_size: 16,
+            width_bucket: 24,
+            ..Default::default()
+        };
+        let bytes = std::fs::read(
+            std::env::var_os("LEGALPDF_OCR_TEST_PDF").expect("set invented fixture PDF"),
+        )
+        .unwrap();
+        let mut engine = IndraOcr::new(&options).unwrap();
+        let pages = engine
+            .extract_pages(
+                &bytes,
+                &[OcrPageRequest {
+                    page_index: 0,
+                    width: 612.0,
+                    height: 792.0,
+                    regions: vec![[0.0, 30.0, 612.0, 65.0]],
+                }],
+            )
+            .unwrap();
+        let line = pages[0]
+            .lines
+            .iter()
+            .find(|line| {
+                !line.recovered && line.text.contains("Northlake") && line.text.contains("Society")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the cropped printed title must be read: {:?}",
+                    pages[0].lines
+                )
+            });
+        assert!(
+            line.confidence > 0.0 && line.confidence < 1.0,
+            "region confidence must come from logits, not compact IDs"
+        );
+    }
+
+    const TEST_INPUT_HEIGHT: usize = 32;
 
     #[test]
-    fn kraken_options_fail_closed_without_assets() {
-        let options = KrakenOptions::default();
-        assert!(KrakenOcr::new(&options).is_err());
+    fn indra_options_fail_closed_without_assets() {
+        let options = IndraOptions::default();
+        assert!(IndraOcr::new(&options).is_err());
     }
 
     #[test]
     fn ctc_collapses_repeats_but_not_blank_separated_labels() {
-        let logits = [0.0, 0.0, 5.0, 5.0, 0.0, 5.0, 5.0, 0.0, 0.0, 5.0];
+        let logits = [0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0, 0.0, 0.0, 5.0];
         let spans = greedy_ctc(&logits, 0, 2, 5, 5);
         assert_eq!(spans.iter().map(|span| span.0).collect::<Vec<_>>(), [1, 1]);
         let expected = 1.0 / (1.0 + (-5.0_f32).exp());
@@ -2708,6 +2599,7 @@ mod tests {
         let lines = [23, 24, 25, 47, 48]
             .into_iter()
             .map(|width| PreparedLine {
+                confidence_required: false,
                 bbox: LineBox {
                     left: 0,
                     top: 0,
@@ -2717,6 +2609,8 @@ mod tests {
                 },
                 width,
                 pixels: Vec::new(),
+                pixel_x_origin: 0.0,
+                pixel_x_scale: 1.0,
             })
             .collect::<Vec<_>>();
         let lines = lines.iter().collect::<Vec<_>>();
@@ -2738,62 +2632,9 @@ mod tests {
     }
 
     #[test]
-    fn recognition_schedule_uses_the_measured_cpu_shape_without_oversubscribing() {
-        let available = std::thread::available_parallelism().map_or(1, |value| value.get());
-        let expected_workers = (available / 2).max(1);
-        let expected_threads = (available / expected_workers).clamp(1, 2);
-        assert_eq!(
-            recognition_schedule(0, 0, KrakenBackend::Cpu),
-            (expected_workers, expected_threads)
-        );
-        assert_eq!(recognition_schedule(7, 0, KrakenBackend::Cpu).0, 7);
-        assert_eq!(recognition_schedule(0, 0, KrakenBackend::Cuda), (1, 1));
-        assert_eq!(recognition_schedule(4, 2, KrakenBackend::Cuda), (4, 2));
-    }
-
-    #[test]
-    fn layout_workers_use_spare_cpu_capacity_around_the_selected_backend() {
-        let available = std::thread::available_parallelism().map_or(1, |value| value.get());
-        assert_eq!(
-            effective_layout_workers(0, KrakenBackend::Cpu),
-            available.div_ceil(2).min(8)
-        );
-        assert_eq!(
-            effective_layout_workers(0, KrakenBackend::Cuda),
-            available.min(16)
-        );
-        assert_eq!(effective_layout_workers(3, KrakenBackend::Cuda), 3);
-    }
-
-    #[test]
-    fn recognition_batch_defaults_match_the_selected_backend() {
-        assert_eq!(
-            effective_recognition_batch(0, 0, KrakenBackend::Cpu),
-            (32, 24)
-        );
-        assert_eq!(
-            effective_recognition_batch(0, 0, KrakenBackend::Cuda),
-            (64, 128)
-        );
-        assert_eq!(
-            effective_recognition_batch(16, 48, KrakenBackend::Cuda),
-            (16, 48)
-        );
-    }
-
-    #[test]
-    fn shared_pool_is_reserved_for_automatic_speed_tiers() {
-        let options = KrakenOptions::default();
-        assert!(!uses_global_pool(&options));
-        options.tier = KrakenTier::Balanced;
-        assert!(uses_global_pool(&options));
-        options.workers = 4;
-        assert!(!uses_global_pool(&options));
-    }
-
-    #[test]
     fn recognition_profile_accounts_for_batch_padding_and_worker_balance() {
         let prepared = [100, 120, 200].map(|width| PreparedLine {
+            confidence_required: false,
             bbox: LineBox {
                 left: 0,
                 top: 0,
@@ -2803,6 +2644,8 @@ mod tests {
             },
             width,
             pixels: Vec::new(),
+            pixel_x_origin: 0.0,
+            pixel_x_scale: 1.0,
         });
         let lines = prepared.iter().collect::<Vec<_>>();
         let batches = [
@@ -2848,24 +2691,24 @@ mod tests {
 
     #[test]
     fn backends_parse_and_normalize_devices_fail_closed() {
-        assert_eq!(KrakenBackend::parse("cpu"), Some(KrakenBackend::Cpu));
+        assert_eq!(IndraBackend::parse("cpu"), Some(IndraBackend::Cpu));
         assert_eq!(
-            KrakenBackend::parse("tensorrt"),
-            Some(KrakenBackend::TensorRt)
+            IndraBackend::parse("tensorrt"),
+            Some(IndraBackend::TensorRt)
         );
-        assert_eq!(KrakenBackend::parse("auto"), None);
-        assert_eq!(KrakenBackend::Cuda.normalized_device(None).unwrap(), "0");
+        assert_eq!(IndraBackend::parse("auto"), None);
+        assert_eq!(IndraBackend::Cuda.normalized_device(None).unwrap(), "0");
         assert_eq!(
-            KrakenBackend::OpenVino
+            IndraBackend::OpenVino
                 .normalized_device(Some("GPU.1"))
                 .unwrap(),
             "GPU.1"
         );
-        assert!(KrakenBackend::Cpu.normalized_device(Some("0")).is_err());
-        assert!(KrakenBackend::DirectMl
+        assert!(IndraBackend::Cpu.normalized_device(Some("0")).is_err());
+        assert!(IndraBackend::DirectMl
             .normalized_device(Some("-1"))
             .is_err());
-        let options = KrakenOptions::default();
-        assert!(validate_options(&options).is_err());
+        let options = IndraOptions::default();
+        assert!(validate_options(&options).is_ok());
     }
 }

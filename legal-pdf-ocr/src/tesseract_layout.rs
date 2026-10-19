@@ -1,4 +1,4 @@
-use crate::kraken::LineBox;
+use crate::indra::LineBox;
 use image::GrayImage;
 use legal_pdf_core::{Error, Result};
 use libloading::Library;
@@ -290,7 +290,7 @@ fn footer_start(mut lines: Vec<LineBox>, page_height: usize) -> Option<usize> {
 }
 
 // Tesseract's order is retained except for its known two-column footnote behavior.
-fn order_footnotes(boxes: Vec<LineBox>, page_width: usize, page_height: usize) -> Vec<LineBox> {
+pub(crate) fn order_footnotes(boxes: Vec<LineBox>, page_width: usize, page_height: usize) -> Vec<LineBox> {
     if boxes.len() < 16 {
         return boxes;
     }

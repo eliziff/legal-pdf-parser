@@ -58,6 +58,37 @@ struct CachedOcrPage {
 }
 
 #[cfg(feature = "ocr")]
+fn cached_rasters(
+    root: Option<&Path>,
+    identity: &str,
+    pdf: &[u8],
+    requests: &[legal_pdf_core::OcrPageRequest],
+) -> Vec<CachedRaster> {
+    let keys = requests.iter().map(|request| {
+        serialization_sha256(&("raster-v1", identity, request.page_index, request.width, request.height))
+            .unwrap_or_default()
+    }).collect::<Vec<_>>();
+    let mut found = keys.iter().map(|key| {
+        root.and_then(|root| read_gzip_json::<CachedRaster>(&root.join(format!("{key}.json.gz"))).ok())
+            .filter(|cached| &cached.key == key)
+    }).collect::<Vec<_>>();
+    let missing = (0..requests.len()).filter(|&n| found[n].is_none()).collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let wanted = missing.iter().map(|&n| requests[n].clone()).collect::<Vec<_>>();
+        for (&n, (separator, strokes)) in missing.iter().zip(legal_pdf_ocr::raster_page_rules(pdf, &wanted)) {
+            let cached = CachedRaster { key: keys[n].clone(), separator, strokes };
+            if let Some(root) = root {
+                let _ = write_gzip_json(&root.join(format!("{}.json.gz", keys[n])), &cached);
+            }
+            found[n] = Some(cached);
+        }
+    }
+    found.into_iter().map(|cached| cached.unwrap_or(CachedRaster {
+        key: String::new(), separator: None, strokes: Vec::new(),
+    })).collect()
+}
+
+#[cfg(feature = "ocr")]
 impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
     fn extract_pages(
         &mut self,
@@ -144,31 +175,44 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
             rest = after;
             size = (size * 2).min(16);
         }
-        for window in windows {
-            let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
-                self.runtime.as_mut().expect("OCR runtime initialized"),
-                pdf,
-                window,
-            )?;
-            for page in recognized {
-                let Some((key, path)) = paths.remove(&page.page_index) else {
-                    return Err(Error::Message(
-                        "OCR returned an unexpected or repeated page".to_owned(),
-                    ));
-                };
-                if let Some(path) = path {
-                    write_gzip_json(
-                        &path,
-                        &CachedOcrPage {
-                            key,
-                            page: page.clone(),
-                        },
-                    )?;
+        let raster_root = self.cache_root.as_deref().and_then(Path::parent).map(|root| root.join("raster"));
+        let raster_requests = missing.iter().filter(|request| request.regions.is_empty()).cloned().collect::<Vec<_>>();
+        let raster_identity = self.cache_identity.clone();
+        std::thread::scope(|scope| -> Result<()> {
+            // Keep the exact 150 dpi scanner, overlapping its existing cache fill with recognition.
+            let raster = raster_root.map(|root| scope.spawn(move || {
+                cached_rasters(Some(&root), &raster_identity, pdf, &raster_requests)
+            }));
+            for window in windows {
+                let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
+                    self.runtime.as_mut().expect("OCR runtime initialized"),
+                    pdf,
+                    window,
+                )?;
+                for page in recognized {
+                    let Some((key, path)) = paths.remove(&page.page_index) else {
+                        return Err(Error::Message(
+                            "OCR returned an unexpected or repeated page".to_owned(),
+                        ));
+                    };
+                    if let Some(path) = path {
+                        write_gzip_json(
+                            &path,
+                            &CachedOcrPage {
+                                key,
+                                page: page.clone(),
+                            },
+                        )?;
+                    }
+                    results.push(page);
                 }
-                results.push(page);
+                report(results.len());
             }
-            report(results.len());
-        }
+            if let Some(raster) = raster {
+                raster.join().map_err(|_| Error::Message("raster scan worker panicked".to_owned()))?;
+            }
+            Ok(())
+        })?;
         if !paths.is_empty() {
             return Err(Error::Message(
                 "OCR did not return every requested page".to_owned(),
@@ -185,36 +229,11 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
     ) -> Vec<Option<f64>> {
         profile::measure("extract.raster_separators", || {
             let root = self.cache_root.as_ref().and_then(|root| root.parent()).map(|parse| parse.join("raster"));
-            let keys = requests
-                .iter()
-                .map(|request| {
-                    serialization_sha256(&("raster-v1", &self.cache_identity, request.page_index, request.width, request.height)).unwrap_or_default()
-                })
-                .collect::<Vec<_>>();
-            let mut found = keys
-                .iter()
-                .map(|key| {
-                    root.as_ref()
-                        .and_then(|root| read_gzip_json::<CachedRaster>(&root.join(format!("{key}.json.gz"))).ok())
-                        .filter(|cached| &cached.key == key)
-                })
-                .collect::<Vec<_>>();
-            let missing = (0..requests.len()).filter(|&n| found[n].is_none()).collect::<Vec<_>>();
-            if !missing.is_empty() {
-                let wanted = missing.iter().map(|&n| requests[n].clone()).collect::<Vec<_>>();
-                for (&n, (separator, strokes)) in missing.iter().zip(legal_pdf_ocr::raster_page_rules(pdf, &wanted)) {
-                    let cached = CachedRaster { key: keys[n].clone(), separator, strokes };
-                    if let Some(root) = &root {
-                        let _ = write_gzip_json(&root.join(format!("{}.json.gz", keys[n])), &cached);
-                    }
-                    found[n] = Some(cached);
-                }
-            }
+            let found = cached_rasters(root.as_deref(), &self.cache_identity, pdf, requests);
             requests
                 .iter()
                 .zip(found)
                 .map(|(request, cached)| {
-                    let cached = cached.unwrap_or(CachedRaster { key: String::new(), separator: None, strokes: Vec::new() });
                     self.strokes.insert(request.page_index, cached.strokes);
                     cached.separator
                 })

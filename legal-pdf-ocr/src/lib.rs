@@ -1,23 +1,29 @@
-#[cfg(feature = "kraken")]
-mod kraken;
-#[cfg(feature = "kraken")]
-mod kraken_process;
+#[cfg(feature = "indra")]
+mod calibration;
+#[cfg(feature = "indra")]
+mod indra;
+#[cfg(feature = "indra")]
+mod line_detector;
+#[cfg(feature = "indra")]
+mod model_pack;
 mod ocr;
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 mod orientation;
 mod separator;
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 mod tesseract_layout;
-#[cfg(feature = "kraken")]
+#[cfg(feature = "indra")]
 mod uncovered;
 
-#[cfg(feature = "kraken")]
-pub use kraken::{
-    KrakenBackend, KrakenBatchDiagnostics, KrakenBatchPerformance, KrakenImageDiagnostics,
-    KrakenLayout, KrakenOcr, KrakenOptions, KrakenTier,
+#[cfg(feature = "indra")]
+pub use calibration::RuntimePlan as IndraRuntimePlan;
+#[cfg(feature = "indra")]
+pub use indra::{
+    IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics, IndraLayout,
+    IndraOcr, IndraOptions, IndraTier,
 };
 pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
 pub use ocr::{
-    raster_page_rules, OcrOptions, RasterRules, OcrProvider, PreparedOcrProvider, TesseractOcr,
+    raster_page_rules, OcrOptions, OcrProvider, PreparedOcrProvider, RasterRules, TesseractOcr,
     TesseractOptions,
 };
