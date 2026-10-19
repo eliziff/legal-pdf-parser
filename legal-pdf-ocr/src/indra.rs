@@ -1,7 +1,7 @@
-use crate::calibration::{self, RuntimePlan};
 use crate::line_detector::LineDetector;
 use crate::model_pack::ModelPack;
 use crate::orientation::{place_back, turn, Orientation};
+use crate::planning::{self, RuntimePlan};
 #[cfg(feature = "ocr")]
 use hayro::hayro_interpret::InterpreterSettings;
 #[cfg(feature = "ocr")]
@@ -114,7 +114,7 @@ pub struct IndraOptions {
     pub input_height: usize,
     pub tier: IndraTier,
     pub layout: IndraLayout,
-    /// Omitted selects a measured CPU/GPU plan on this machine.
+    /// Omitted selects a CPU/GPU plan from this machine's capabilities.
     pub backend: Option<IndraBackend>,
     pub device: Option<String>,
     pub cpu_arena: bool,
@@ -449,8 +449,8 @@ pub(crate) struct PreparedIndra {
     pub(crate) pack: ModelPack,
     pub(crate) runtime: PathBuf,
     pub(crate) tesseract_library: Option<PathBuf>,
-    pub(crate) device: String,
     pub(crate) plan: RuntimePlan,
+    pub(crate) ready: Option<Box<IndraOcr>>,
     pub(crate) identity: String,
     pub(crate) name: String,
 }
@@ -482,8 +482,7 @@ impl IndraOcr {
             "ONNX Runtime library",
         )?;
         legal_pdf_core::init_ort_runtime(&runtime, None)?;
-        let plan = calibration::select(options, &root, &runtime)?;
-        let prepared = Self::prepare_plan(options, &root, runtime, plan)?;
+        let prepared = planning::prepare(options, &root, &runtime)?;
         if options
             .expected_identity
             .as_deref()
@@ -501,7 +500,7 @@ impl IndraOcr {
         runtime: PathBuf,
         plan: RuntimePlan,
     ) -> Result<PreparedIndra> {
-        let device = plan.backend.normalized_device(options.device.as_deref())?;
+        let device = &plan.device;
         let mut pack = ModelPack::open(root, options.tier, plan.backend)?;
         if let Some(path) = &options.orientation {
             pack.orientation = Some(canonical_file(path, "orientation model")?);
@@ -528,13 +527,16 @@ impl IndraOcr {
             pack,
             runtime,
             tesseract_library,
-            device,
             plan,
+            ready: None,
             name: identity.clone(),
             identity,
         })
     }
-    pub(crate) fn from_prepared(options: &IndraOptions, prepared: PreparedIndra) -> Result<Self> {
+    pub(crate) fn from_prepared(
+        options: &IndraOptions,
+        mut prepared: PreparedIndra,
+    ) -> Result<Self> {
         if options
             .expected_identity
             .as_deref()
@@ -544,36 +546,53 @@ impl IndraOcr {
                 "Indra identity changed before OCR began".to_owned(),
             ));
         }
+        if let Some(ready) = prepared.ready.take() {
+            return Ok(*ready);
+        }
+        Self::open_prepared(options, &prepared)
+    }
+    pub(crate) fn open_prepared(options: &IndraOptions, prepared: &PreparedIndra) -> Result<Self> {
         let independent_pool = legal_pdf_core::init_ort_runtime(&prepared.runtime, None)?.is_some();
-        let layouts = (0..prepared.plan.layout_workers)
-            .map(|_| {
-                if let Some(path) = &prepared.tesseract_library {
-                    LineDetector::tesseract(path, options.dpi)
-                } else {
-                    LineDetector::indra(
-                        &prepared.pack.detector,
-                        prepared.pack.detector_side,
+        let (plan, pack, tesseract_library) =
+            (&prepared.plan, &prepared.pack, &prepared.tesseract_library);
+        let (layouts, sessions) = std::thread::scope(|scope| -> Result<_> {
+            // Independent model pools can initialize together; recognition weights stay shared.
+            let layouts = scope.spawn(|| {
+                (0..plan.layout_workers)
+                    .map(|_| {
+                        if let Some(path) = tesseract_library {
+                            LineDetector::tesseract(path, options.dpi)
+                        } else {
+                            LineDetector::indra(
+                                &pack.detector,
+                                pack.detector_side,
+                                plan.backend,
+                                &plan.device,
+                                independent_pool,
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+            let weights = PrepackedWeights::new();
+            let sessions = (0..prepared.plan.workers)
+                .map(|_| {
+                    open_session(
+                        &prepared.pack.model,
+                        prepared.plan.threads,
                         prepared.plan.backend,
-                        &prepared.device,
+                        &prepared.plan.device,
+                        options.cpu_arena,
+                        &weights,
                         independent_pool,
                     )
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let weights = PrepackedWeights::new();
-        let sessions = (0..prepared.plan.workers)
-            .map(|_| {
-                open_session(
-                    &prepared.pack.model,
-                    prepared.plan.threads,
-                    prepared.plan.backend,
-                    &prepared.device,
-                    options.cpu_arena,
-                    &weights,
-                    independent_pool,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                })
+                .collect::<Result<Vec<_>>>();
+            let layouts = layouts
+                .join()
+                .map_err(|_| Error::Message("layout initialization worker panicked".into()))??;
+            Ok((layouts, sessions?))
+        })?;
         let codec = Codec::load(&prepared.pack.codec)?;
         let orientation = prepared
             .pack
@@ -591,10 +610,10 @@ impl IndraOcr {
             width_scale: 1.0,
             layouts,
             orientation,
-            plan: prepared.plan,
+            plan: prepared.plan.clone(),
             last_performance: None,
-            identity: prepared.identity,
-            name: prepared.name,
+            identity: prepared.identity.clone(),
+            name: prepared.name.clone(),
         })
     }
     pub fn last_performance(&self) -> Option<&IndraBatchPerformance> {

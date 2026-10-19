@@ -84,7 +84,7 @@ def main():
     notices, sources = crate_notices(owner)
     sysroot = Path(command(owner, "rustc", "--print", "sysroot").strip())
     rust_notices = (sysroot / "share/doc/rust/COPYRIGHT-library.html").read_text(encoding="utf-8")
-    details = {"version": manifest["version"], "source": "https://github.com/eliziff/legal-pdf-parser",
+    details = {"model_pack_version": manifest["version"], "source": "https://github.com/eliziff/legal-pdf-parser",
                "revision": command(owner, "git", "rev-parse", "HEAD").strip(),
                "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()},
                "native_runtime_notices": "runtime/onnx/notices.json", "rust_dependencies": notices,
@@ -93,8 +93,8 @@ def main():
     files["runtime-manifest.json"] = (json.dumps(details, indent=2) + "\n").encode()
     files["README.txt"] = ("Run legalocr INPUT.pdf --output recognized.json.\n"
         "Quality tiers: --tier quality|balanced|fast|turbo|extreme (Balanced is default).\n"
-        "CPU/GPU and worker counts are selected on this machine; use --backend cpu|directml to override.\n"
-        "The first automatic selection has a startup cost; repeated documents share calibration in an embedding process.\n"
+        "Supported GPU providers use CPU fallback; worker limits follow this machine's CPU capacity.\n"
+        "Use --backend cpu|directml to override.\n"
         "Point LEGALPDF_ENGINE_ROOT at this folder to use these assets in a native parser host.\n"
         "See runtime/indra/manifest.json for the original Indra model terms, use restrictions and notices.\n"
         "See runtime-manifest.json for source identity, checksums and third-party notices.\n").encode()
