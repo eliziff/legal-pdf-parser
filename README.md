@@ -15,17 +15,20 @@ characters), on a Ryzen 5 2600X desktop with an RTX 3080 Ti:
 
 | Native OCR configuration | Pages/s | Character error rate |
 | --- | ---: | ---: |
-| Balanced, CPU | **8.22** | **2.546%** |
-| Balanced, automatic (DirectML GPU) | **10.92** | **2.548%** |
-| Quality, automatic (DirectML GPU) | **10.73** | **2.258%** |
+| Balanced, CPU | **8.27** | **2.546%** |
+| Balanced, automatic (DirectML GPU) | **11.00** | **2.548%** |
+| Quality, automatic (DirectML GPU) | **10.90** | **2.258%** |
 
 These are medians of three warm passes, including native PDF rendering, line
-detection, crop preparation and recognition. Calibration, CLI startup, structure
-analysis and application cache writes are excluded. Automatic startup took
-9.5–10 seconds on this desktop. An i3-1315U laptop with 12 GB RAM selected CPU
-rather than its slower GPU: 4.31 pages/s on its first Balanced pass, after 36.7
-seconds of startup.
-The automatic choice and worker counts are measured on the installed machine.
+detection, crop preparation and recognition. CLI startup, structure analysis and
+application cache writes are excluded. Automatic selection checks provider
+availability and hardware capabilities. Fresh-process startup
+took **0.77 seconds on GPU** and **0.24 seconds on CPU**, down from 9.49 and 3.48.
+The first-page command finished in **1.64 seconds on GPU** and **0.71 on CPU**;
+the full 55-page document took **5.79 seconds including GPU startup**, down from
+14.40. CPU and GPU text, confidence and geometry match the frozen outputs exactly.
+An i3-1315U laptop with 12 GB RAM selected CPU with 0.32–0.83 seconds of startup;
+its latest warm throughput was 3.90 pages/s under the current background load.
 The full Beaver preparation path also performs structure analysis and writes
 application caches. Overlapping its existing separator scan with OCR raised
 Balanced from 5.34 to 6.44 pages/s on DirectML and from 4.97 to 5.77 on CPU in
@@ -100,7 +103,7 @@ model manifest as the browser package. Extreme trades accuracy for speed.
 
 The Windows x64 executable, models and CPU/DirectML libraries are distributed as
 `legal-ocr-runtime-windows-x64.zip` in the
-[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.0).
+[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.1).
 Extract the archive and run `legalocr input.pdf --output recognized.json`.
 The executable finds its packaged assets beside itself.
 
@@ -118,12 +121,12 @@ can use `--models-only` with their own compatible CPU/CUDA ORT library. The
 optional orientation classifier is installed with the existing helper:
 `tools/install_model.ps1 -Model doc-orientation -OutputDir runtime/indra`.
 
-An omitted backend calibrates available CPU/GPU providers against invented
-bitmap pages, including detection, crop preparation, recognition and transfer.
-The bounded search sizes recognition/layout pools and batches to the machine's
-available CPU capacity and measured throughput. Choices are held in memory for
-the process; they do not create a persistent application cache. Driver shader
-compilation can exceed the search's five-second per-provider window.
+An omitted backend uses supported GPU providers with CPU fallback. On Windows,
+DirectML uses the operating system's high-performance adapter order, retaining
+CPU as the default for integrated and FP16-emulating adapters. Worker limits
+follow available CPU capacity. Detector and recognizer pools initialize together,
+and successfully opened GPU sessions are retained.
+Explicit backend/device and worker settings override these defaults.
 
 `--backend cpu|directml|cuda`, `--workers`, `--threads`, `--layout-workers`,
 `--batch-size` and `--width-bucket` override automatic choices. JSON output

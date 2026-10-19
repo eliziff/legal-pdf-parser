@@ -18,4 +18,15 @@ fn build_layout_shim() {
         .file(source)
         .warnings(true)
         .compile("legalpdf_tesseract_layout");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let source = root.join("rust/native/gpu_adapter.cpp");
+        println!("cargo:rerun-if-changed={}", source.display());
+        cc::Build::new()
+            .cpp(true)
+            .file(source)
+            .warnings(true)
+            .compile("legalpdf_gpu_adapter");
+        println!("cargo:rustc-link-lib=dxgi");
+        println!("cargo:rustc-link-lib=d3d12");
+    }
 }
