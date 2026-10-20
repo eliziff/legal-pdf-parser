@@ -50,21 +50,46 @@ def crate_notices(owner):
     return notices, first_party
 
 
+def load_base_runtime(path):
+    with zipfile.ZipFile(path) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+        if len(files) != len(archive.namelist()):
+            raise ValueError("duplicate native runtime archive entries")
+    details = json.loads(files.pop("runtime-manifest.json"))
+    files.pop("README.txt")
+    if set(files) != set(details["files"]):
+        raise ValueError("native runtime archive inventory changed")
+    for name, data in files.items():
+        spec = details["files"][name]
+        if len(data) != spec["bytes"] or hashlib.sha256(data).hexdigest() != spec["sha256"]:
+            raise ValueError(f"native runtime archive asset changed: {name}")
+    details["base_runtime_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files, details
+
+
 def main():
     owner = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--binary", type=Path)
+    source.add_argument("--base-runtime", type=Path, help="Refresh models in a verified existing runtime, preserving its binary provenance")
     parser.add_argument("--models", type=Path, default=owner / "runtime/indra")
     parser.add_argument("--runtime", type=Path, default=owner / "runtime/onnx")
     parser.add_argument("--output", type=Path, default=owner / "dist/legal-ocr-runtime-windows-x64.zip")
     args = parser.parse_args()
-    if command(owner, "git", "status", "--porcelain").strip():
-        raise ValueError("commit the validated native runtime source before packaging")
-    binary = args.binary.read_bytes()
-    if any(prefix.encode() in binary for prefix in {str(Path.home()), Path.home().as_posix()}):
-        raise ValueError("binary contains machine paths; rebuild with tools/build_ocr_runtime.py")
+    if args.base_runtime:
+        files, details = load_base_runtime(args.base_runtime)
+        files = {name: data for name, data in files.items() if not name.startswith("runtime/indra/") or
+                 name in {"runtime/indra/orientation.onnx", "runtime/indra/orientation.NOTICE.md"}}
+    else:
+        if command(owner, "git", "status", "--porcelain").strip():
+            raise ValueError("commit the validated native runtime source before packaging")
+        binary = args.binary.read_bytes()
+        if any(prefix.encode() in binary for prefix in {str(Path.home()), Path.home().as_posix()}):
+            raise ValueError("binary contains machine paths; rebuild with tools/build_ocr_runtime.py")
+        files = {"legalocr.exe": binary}
     manifest = json.loads((args.models / "manifest.json").read_text(encoding="utf-8"))
-    files = {"legalocr.exe": binary, "runtime/indra/manifest.json": (args.models / "manifest.json").read_bytes()}
+    files["runtime/indra/manifest.json"] = (args.models / "manifest.json").read_bytes()
     for name, spec in manifest["assets"].items():
         data = destination(args.models, name).read_bytes()
         if len(data) != spec["bytes"] or hashlib.sha256(data).hexdigest() != spec["sha256"]:
@@ -73,23 +98,26 @@ def main():
     for name in ["orientation.onnx", "orientation.NOTICE.md"]:
         if (args.models / name).is_file():
             files["runtime/indra/" + name] = (args.models / name).read_bytes()
-    for name in ["onnxruntime.dll", "onnxruntime_providers_shared.dll", "DirectML.dll"]:
-        files["runtime/onnx/" + name] = (args.runtime / name).read_bytes()
-    runtime_notices = args.runtime / "notices.json"
-    if not runtime_notices.exists():
-        runtime_notices = args.runtime / "source.json"
-    runtime = runtime_notices.read_bytes()
-    json.loads(runtime)
-    files["runtime/onnx/notices.json"] = runtime
-    notices, sources = crate_notices(owner)
-    sysroot = Path(command(owner, "rustc", "--print", "sysroot").strip())
-    rust_notices = (sysroot / "share/doc/rust/COPYRIGHT-library.html").read_text(encoding="utf-8")
-    details = {"model_pack_version": manifest["version"], "source": "https://github.com/eliziff/legal-pdf-parser",
-               "revision": command(owner, "git", "rev-parse", "HEAD").strip(),
-               "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()},
-               "native_runtime_notices": "runtime/onnx/notices.json", "rust_dependencies": notices,
-               "rust_library_notices": rust_notices, "first_party_sources": sources,
-               "application_license": (owner / "LICENSE").read_text(encoding="utf-8")}
+    if not args.base_runtime:
+        for name in ["onnxruntime.dll", "onnxruntime_providers_shared.dll", "DirectML.dll"]:
+            files["runtime/onnx/" + name] = (args.runtime / name).read_bytes()
+        runtime_notices = args.runtime / "notices.json"
+        if not runtime_notices.exists():
+            runtime_notices = args.runtime / "source.json"
+        runtime = runtime_notices.read_bytes()
+        json.loads(runtime)
+        files["runtime/onnx/notices.json"] = runtime
+        notices, sources = crate_notices(owner)
+        sysroot = Path(command(owner, "rustc", "--print", "sysroot").strip())
+        rust_notices = (sysroot / "share/doc/rust/COPYRIGHT-library.html").read_text(encoding="utf-8")
+        details = {"source": "https://github.com/eliziff/legal-pdf-parser",
+                   "revision": command(owner, "git", "rev-parse", "HEAD").strip(),
+                   "native_runtime_notices": "runtime/onnx/notices.json", "rust_dependencies": notices,
+                   "rust_library_notices": rust_notices, "first_party_sources": sources,
+                   "application_license": (owner / "LICENSE").read_text(encoding="utf-8")}
+    details["model_pack_version"] = manifest["version"]
+    details["model_manifest_sha256"] = hashlib.sha256(files["runtime/indra/manifest.json"]).hexdigest()
+    details["files"] = {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()}
     files["runtime-manifest.json"] = (json.dumps(details, indent=2) + "\n").encode()
     files["README.txt"] = ("Run legalocr INPUT.pdf --output recognized.json.\n"
         "Quality tiers: --tier quality|balanced|fast|turbo|extreme (Balanced is default).\n"
