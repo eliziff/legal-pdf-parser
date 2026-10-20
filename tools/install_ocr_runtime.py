@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import tarfile
 import urllib.request
 import zipfile
@@ -13,8 +14,18 @@ ORT_URL = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.direc
 ORT_SHA = "29f9872d786236b79aa83f94482f3a17c14297e4833768d6d0ed4883ee732e60"
 DML_URL = "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg"
 DML_SHA = "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
-MODELS_URL = "https://github.com/eliziff/legal-browser-ocr/releases/download/v0.2.0/legal-ocr-models.tar.gz"
-MODELS_SHA = "b5a97370cf28e500870af634aaaf7d04b2249cbe0cdd6f4c1a4247f691949118"
+RELEASE_API = "https://api.github.com/repos/eliziff/legal-browser-ocr/releases/latest"
+
+
+def released_models(release):
+    asset = next((asset for asset in release.get("assets", [])
+                  if asset.get("name") == "legal-ocr-models.tar.gz"), None)
+    if not asset or not re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest", "")):
+        raise ValueError("latest Browser OCR release has no verified model archive")
+    url = asset.get("browser_download_url", "")
+    if not url.startswith("https://github.com/eliziff/legal-browser-ocr/releases/download/"):
+        raise ValueError("model archive is not a Browser OCR release asset")
+    return url, asset["digest"].removeprefix("sha256:")
 
 
 def read_source(source):
@@ -38,8 +49,11 @@ def destination(root, relative):
 
 
 def write_asset(path, data, force):
-    if path.exists() and path.read_bytes() != data and not force:
-        raise ValueError(f"refusing to replace {path}; pass --force")
+    if path.exists():
+        if path.read_bytes() == data:
+            return
+        if not force:
+            raise ValueError(f"refusing to replace {path}; pass --force")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
@@ -101,7 +115,7 @@ def install_windows_runtime(root, force=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", default=MODELS_URL)
+    parser.add_argument("--models", help="local or explicit model archive; defaults to the latest Browser OCR release")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "runtime/indra")
     parser.add_argument("--runtime-output", type=Path)
     parser.add_argument("--models-only", action="store_true", help="use an existing platform ONNX Runtime installation")
@@ -109,8 +123,9 @@ def main():
     args = parser.parse_args()
     if not args.models_only and (platform.system() != "Windows" or platform.machine().lower() not in ("amd64", "x86_64")):
         parser.error("automatic runtime installation currently supports Windows x64; use --models-only with your platform's CPU/CUDA ORT library")
-    models = read_source(args.models)
-    if args.models == MODELS_URL and hashlib.sha256(models).hexdigest() != MODELS_SHA:
+    source, expected = (args.models, None) if args.models else released_models(json.loads(read_source(RELEASE_API)))
+    models = read_source(source)
+    if expected and hashlib.sha256(models).hexdigest() != expected:
         raise ValueError("released model archive checksum mismatch")
     install_models(models, args.output.resolve(), args.force)
     if not args.models_only:

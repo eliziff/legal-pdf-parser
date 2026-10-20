@@ -101,7 +101,7 @@ model manifest as the browser package. Extreme trades accuracy for speed.
 
 The Windows x64 executable, models and CPU/DirectML libraries are distributed as
 `legal-ocr-runtime-windows-x64.zip` in the
-[shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/tag/v0.2.2).
+[latest shared OCR release](https://github.com/eliziff/legal-browser-ocr/releases/latest).
 Extract the archive and run `legalocr input.pdf --output recognized.json`.
 The executable finds its packaged assets beside itself.
 
@@ -114,7 +114,8 @@ python tools/build_ocr_runtime.py
 legalocr input.pdf --model-pack runtime/indra --runtime runtime/onnx/onnxruntime.dll --output recognized.json
 ```
 
-Pass `--models PATH` for a downloaded `legal-ocr-models.tar.gz`. Other platforms
+The installer resolves the latest shared OCR release and verifies its archive digest
+and model inventory. Pass `--models PATH` for a downloaded `legal-ocr-models.tar.gz`. Other platforms
 can use `--models-only` with their own compatible CPU/CUDA ORT library. The
 optional orientation classifier is installed with the existing helper:
 `tools/install_model.ps1 -Model doc-orientation -OutputDir runtime/indra`.
