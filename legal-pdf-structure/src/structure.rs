@@ -3769,10 +3769,9 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
     });
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
-            primitives.translation_line_ids.contains(id)
-                || primitives.contents_line_ids.contains(id)
-                || primitives.table_cell_line_ids.contains(id)
+            primitives.contents_line_ids.contains(id) || primitives.table_cell_line_ids.contains(id)
         };
+        let translation = |id: &str| primitives.translation_line_ids.contains(id);
         let numbered =
             |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);
         legal_pdf_headings::reconcile_styled_headings(
@@ -3780,6 +3779,7 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
             legal_pdf_headings::HeadingEvidence {
                 levels: &mut primitives.heading_levels,
                 excluded: &excluded,
+                translation: &translation,
                 contents_pages: &primitives.contents_pages,
                 numbered: &numbered,
             },
@@ -3885,7 +3885,8 @@ fn derive_prepared(
             &note_pairs,
             graph_diagnostics,
             &mut |nodes| {
-                let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
+                let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index,
+                    &prepared.primitives.translation_line_ids);
                 let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
                 legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents, &prepared.primitives.heading_levels);
             },
@@ -3903,11 +3904,13 @@ fn derive_prepared(
 }
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the
-/// constituent document holding it, and the quotation and note or table cell holding a unit.
+/// constituent document holding it, and the quotation and note or table cell holding a unit. A
+/// parallel translation's units keep an outline of their own beside the text's.
 fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
     quote_ids: &HashMap<String, String>,
     index: &PdfTextIndex,
+    translation: &HashSet<String>,
 ) -> Vec<legal_pdf_witnesses::OutlineContext> {
     use legal_structure_model::PrimaryRole;
     // Establish exact membership before comparing containers. An envelope may cross
@@ -3959,7 +3962,9 @@ fn outline_contexts(
         let unit = node.kind != NodeKind::Page;
         let quotation = node.line_ids.first().filter(|_| unit).and_then(|id| quote_ids.get(id))
             .filter(|id| node.line_ids.iter().all(|line| quote_ids.get(line) == Some(*id))).cloned();
-        let container = smallest(&cells).filter(|_| unit).map(|id| format!("object:{id}"));
+        let translated = unit && !node.line_ids.is_empty() && node.line_ids.iter().all(|id| translation.contains(id));
+        let container = smallest(&cells).filter(|_| unit).map(|id| format!("object:{id}"))
+            .or_else(|| translated.then(|| "translation".to_owned()));
         (smallest(&constituents).unwrap_or_else(|| document_id.to_owned()), quotation, container)
     }).collect()
 }

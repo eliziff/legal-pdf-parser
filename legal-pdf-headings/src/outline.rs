@@ -12,7 +12,7 @@ use super::model::y_overlaps;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Upstream types kept here: 0 plain, 1 numbered, 11 introduction keyword.
+/// Upstream types kept here: 0 plain, 1 numbered, 11 introduction keyword; 12 set apart by type.
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub(super) block: usize,

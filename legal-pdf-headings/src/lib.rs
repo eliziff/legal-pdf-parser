@@ -145,6 +145,20 @@ fn introduction(block: &FlashBlock) -> bool {
         || (tokens.len() == words.len() + 1 && matches!(tokens[words.len()].kind, 3 | 4 | 5))
 }
 
+/// A block set apart by its type alone, as the structure gold reads the units that open a
+/// section: bold all through, unless it is mostly punctuation, or mostly figures with more than
+/// a short line after it; or in capitals.
+fn set_apart_by_type(block: &FlashBlock, next: Option<&FlashBlock>) -> bool {
+    let stats = &block.stats;
+    let total = f64::from(stats.total.max(1));
+    if block.bold >= 0.95 {
+        let figures = f64::from(stats.counts[1]) / total > 0.41;
+        return f64::from(stats.punctuation()) / total <= 0.58
+            && (!figures || next.is_none_or(|next| next.lines.first().is_none_or(|line| line.char_count() <= 62)));
+    }
+    stats.letters() > 0 && f64::from(stats.counts[2]) >= 0.78 * f64::from(stats.letters())
+}
+
 /// A line that is a citation and little else ("[2026] SGCA 26") names a case, not a section.
 fn citation_only(block: &FlashBlock) -> bool {
     let text = block
@@ -172,8 +186,10 @@ fn citation_only(block: &FlashBlock) -> bool {
 pub struct HeadingEvidence<'a> {
     /// Line id to level of every heading accepted so far; the reader adds and removes.
     pub levels: &'a mut HashMap<String, usize>,
-    /// Lines that can be no heading: a translation, a contents row, a table cell.
+    /// Lines that can be no heading: a contents row, a table cell.
     pub excluded: &'a dyn Fn(&str) -> bool,
+    /// Lines of a parallel translation, whose headings form a ladder of their own beside the text's.
+    pub translation: &'a dyn Fn(&str) -> bool,
     /// Contents pages, none of whose lines is a heading.
     pub contents_pages: &'a HashSet<usize>,
     /// Does a line open with a heading's number ("1.", "(a)", "IV")?
@@ -261,6 +277,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     .any(|line| evidence.levels.contains_key(&line.id))
                     || (evidence.numbered)(first),
                 is_body: false,
+                translation: lines.iter().all(|line| (evidence.translation)(&line.id)),
             });
             eligible.push(
                 lines
@@ -451,6 +468,8 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 Some(11)
             } else if scan.candidate(position) {
                 Some(0)
+            } else if set_apart_by_type(&blocks[block].flash, page.blocks.get(position + 1).map(|&next| &blocks[next].flash)) {
+                Some(12)
             } else {
                 None
             };
@@ -463,10 +482,13 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 });
             }
         }
-        // A page proposing twenty headings is a table or a list.
-        if found.len() < 20 {
-            proposed.extend(found.iter().map(|candidate| candidate.block));
-            candidates.extend(found);
+        // A page proposing twenty headings in one language is a table or a list.
+        for translation in [false, true] {
+            let own: Vec<Candidate> = found.iter().filter(|c| blocks[c.block].translation == translation).cloned().collect();
+            if own.len() < 20 {
+                proposed.extend(own.iter().map(|candidate| candidate.block));
+                candidates.extend(own);
+            }
         }
     }
     let context = Context {
@@ -507,7 +529,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .collect::<HashSet<_>>();
     // A heading of a few stray characters ("l ¦ I") holds no section.
     let stray = |candidate: &Candidate| {
-        candidate.kind == 0 && blocks[candidate.block].flash.stats.info_weight() <= 3.0
+        matches!(candidate.kind, 0 | 12) && blocks[candidate.block].flash.stats.info_weight() <= 3.0
     };
     for candidate in candidates.iter().filter(|candidate| stray(candidate)) {
         let block = &blocks[candidate.block];
@@ -522,11 +544,12 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .map(|(_, candidate)| candidate.clone())
         .collect::<Vec<_>>();
 
-    // Levels: each heading under the nearest earlier one that may hold it.
-    let mut stack = Vec::<usize>::new();
+    // Levels: each heading under the nearest earlier one of its own language that may hold it.
+    let mut stacks = [Vec::<usize>::new(), Vec::<usize>::new()];
     let mut levels = vec![0usize; accepted.len()];
     for index in 0..accepted.len() {
-        let parent = context.parent(&mut stack, &accepted, &accepted[index]);
+        let stack = &mut stacks[usize::from(blocks[accepted[index].block].translation)];
+        let parent = context.parent(stack, &accepted, &accepted[index]);
         levels[index] = parent.map_or(1, |parent| levels[parent] + 1);
         stack.push(index);
     }
