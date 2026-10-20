@@ -3174,7 +3174,9 @@ fn classify_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnos
         source_regions: source_region_contract(pages),
         ..PdfPrimitiveEvidence::default()
     };
-    classify_pages_with_source(pages, separators, &mut evidence)
+    let diagnostics = classify_pages_with_source(pages, separators, &mut evidence);
+    build_regions(pages);
+    diagnostics
 }
 
 fn assign_printed_page_labels(pages: &mut [Page]) -> Vec<Diagnostic> {
@@ -3885,7 +3887,7 @@ fn derive_prepared(
             &mut |nodes| {
                 let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index);
                 let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
-                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents);
+                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents, &prepared.primitives.heading_levels);
             },
         )
     })

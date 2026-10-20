@@ -81,6 +81,7 @@ fn pdf_text_index_preserves_exact_lines_and_scalar_offsets() {
 
 #[test]
 fn pdf_adapter_maps_raw_numeric_candidates_to_exact_line_ids_once() {
+    legal_structure_model::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     let pages: Vec<Page> = serde_json::from_value(json!([{
         "id": "page-1",
         "index": 0,
@@ -142,6 +143,7 @@ fn pdf_adapter_maps_raw_numeric_candidates_to_exact_line_ids_once() {
 
 #[test]
 fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
+    legal_structure_model::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     assert!(contents_row("1.1 Background ........ 3"));
     assert!(!contents_row("1.1 Background and application"));
 
@@ -455,6 +457,7 @@ fn incomplete_pairer_products_abstain_without_losing_the_footnote_product() {
 
 fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
     Line {
+        ocr: None,
         id: String::new(),
         page_index: 0,
         page_number: 1,
@@ -481,6 +484,8 @@ fn sized_line(text: &str, bbox: [f64; 4], size: f64) -> Line {
         text,
         bbox,
         vec![Span {
+            mcid: None,
+            structure_role: None,
             id: String::new(),
             text: text.to_owned(),
             bbox,
@@ -1547,6 +1552,8 @@ fn compact_note_bodies_are_not_repeated_footers() {
     let page = |index: usize, label: usize| {
         let mut body = test_line("Body prose", [72.0, 100.0, 300.0, 110.0], vec![]);
         body.spans.push(Span {
+            mcid: None,
+            structure_role: None,
             id: String::new(),
             text: body.text.clone(),
             bbox: body.bbox,
@@ -1560,6 +1567,8 @@ fn compact_note_bodies_are_not_repeated_footers() {
         let text = format!("{label}. Ibid at {label}.");
         let mut note = test_line(&text, [72.0, 730.0, 170.0, 737.0], vec![]);
         note.spans.push(Span {
+            mcid: None,
+            structure_role: None,
             id: String::new(),
             text: note.text.clone(),
             bbox: note.bbox,
@@ -2000,6 +2009,8 @@ fn detached_reference_fits_the_word_gap_not_the_note_margin() {
         [335.0, 93.9, 396.0, 103.9],
         vec![
             Span {
+                mcid: None,
+                structure_role: None,
                 id: "left".to_owned(),
                 text: "higher.".to_owned(),
                 bbox: [335.0, 93.9, 366.6, 103.9],
@@ -2011,6 +2022,8 @@ fn detached_reference_fits_the_word_gap_not_the_note_margin() {
                 end: 7,
             },
             Span {
+                mcid: None,
+                structure_role: None,
                 id: "right".to_owned(),
                 text: "They".to_owned(),
                 bbox: [377.8, 93.9, 396.0, 103.9],
@@ -2240,6 +2253,8 @@ fn a_single_lower_note_is_backed_by_its_superscript_reference() {
         10.0,
     );
     body.spans.push(Span {
+        mcid: None,
+        structure_role: None,
         id: String::new(),
         text: "21".to_owned(),
         bbox: [400.0, 116.0, 410.0, 124.0],
@@ -2296,6 +2311,8 @@ fn two_reference_backed_margin_notes_do_not_cut_through_main_prose() {
         .collect();
     for (line, label) in lines.iter_mut().take(2).zip(["39", "40"]) {
         line.spans.push(Span {
+            mcid: None,
+            structure_role: None,
             id: String::new(),
             text: label.to_owned(),
             bbox: [400.0, line.bbox[1] - 4.0, 410.0, line.bbox[1] + 4.0],
@@ -2734,6 +2751,7 @@ fn crossref_shortform_uses_python_word_boundaries_at_join_controls() {
 
 #[test]
 fn accepted_heading_and_separate_marker_terminate_numbered_prose() {
+    legal_structure_model::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     let mut lines = vec![
         sized_line(
             "1. Ordinary narrative ends here.",
@@ -2817,6 +2835,7 @@ fn a_parallel_french_column_is_the_translation_and_gives_no_headings() {
         ..Default::default()
     };
     classify_pages_with_source(&mut pages, &[None], &mut evidence);
+    build_regions(&mut pages);
     let page = &pages[0];
     let right = |line: &&Line| line.bbox[0] >= 300.0;
     assert!(page
@@ -3841,13 +3860,19 @@ fn unrelated_note_restart_cannot_license_an_unreferenced_label() {
             .iter()
             .map(|pair| pair.pair_id.as_str())
             .collect::<Vec<_>>(),
-        ["unreferenced-cohort", "observed-a", "observed-b", "supported-missing"]
+        [
+            "unreferenced-cohort",
+            "observed-a",
+            "observed-b",
+            "supported-missing"
+        ]
     );
     assert_eq!(diagnostics.len(), 1);
 }
 
 #[test]
 fn reporter_years_do_not_become_layout_paragraphs() {
+    legal_structure_model::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
     // Independently invented citation-shaped text; no underlying case is asserted.
     let mut lines = vec![
         sized_line(

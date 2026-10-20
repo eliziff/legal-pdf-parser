@@ -17,6 +17,7 @@ struct Unit {
     marker: Option<NumberingMarker>,
     style: (i32, bool, bool),
     rank: f32,
+    level: Option<usize>,
     lead_in: bool,
 }
 
@@ -77,6 +78,7 @@ pub fn assemble_outline(
     pages: &[Page],
     line_range: &dyn Fn(&str) -> Option<ScalarRange>,
     navigation: &HashMap<String, Option<String>>,
+    heading_levels: &HashMap<String, usize>,
 ) {
     let lines = pages.iter().flat_map(|page| &page.lines).map(|line| (line.id.as_str(), line)).collect::<HashMap<_, _>>();
     let body_size = median(pages.iter().flat_map(|page| &page.lines).map(size).filter(|size| *size > 0.0).collect());
@@ -89,6 +91,7 @@ pub fn assemble_outline(
             marker: None,
             style: first.map_or((0, false, false), |(line, source)| unit_style(line, source, node, body_size)),
             rank: 0.0,
+            level: node.line_ids.iter().find_map(|id| heading_levels.get(id).copied()),
             lead_in: membership_text(node, &coordinates).unwrap_or_default().trim().ends_with(':'),
         }
     }).collect::<Vec<_>>();
@@ -130,7 +133,11 @@ pub fn assemble_outline(
         let mut parent = stack.iter().rposition(|&candidate| {
             let parent = &units[candidate];
             if heading(node) {
-                return heading(&nodes[parent.node]) && parent.rank < unit.rank;
+                return heading(&nodes[parent.node])
+                    && match (parent.level, unit.level) {
+                        (Some(parent), Some(child)) => parent < child,
+                        _ => parent.rank < unit.rank,
+                    };
             }
             if let (Some(marker), Some(other)) = (&unit.marker, &parent.marker) {
                 if marker.family == other.family && marker.prefix == other.prefix {
@@ -185,5 +192,76 @@ pub fn assemble_outline(
         if !grid && parent.is_none_or(|parent| contexts[parent] != contexts[position]) {
             nodes[position].parent_id = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legal_structure_model::Derivation;
+
+    #[test]
+    fn heading_ladder_survives_equal_type_and_respects_document_context() {
+        let titles = [
+            "Harbour handbook",
+            "Navigation",
+            "Read the tide chart.",
+            "Equipment",
+            "Inspect the compass.",
+            "Island handbook",
+            "Check the forecast.",
+            "A separate enclosure.",
+        ];
+        let text = titles.join("\n");
+        let mut offset = 0;
+        let mut nodes = titles
+            .iter()
+            .enumerate()
+            .map(|(n, title)| {
+                let range = ScalarRange {
+                    start: offset,
+                    end: offset + title.chars().count(),
+                };
+                offset = range.end + 1;
+                let mut node = StructureNode::new(
+                    format!("unit{n}"),
+                    if [0, 1, 3, 5].contains(&n) {
+                        NodeKind::Heading
+                    } else {
+                        NodeKind::Prose
+                    },
+                    range,
+                    "invented-outline",
+                    Derivation::Native,
+                    None,
+                );
+                node.line_ids = vec![format!("line{n}")];
+                node
+            })
+            .collect::<Vec<_>>();
+        let mut contexts = vec![("document".into(), None, None); nodes.len()];
+        contexts[7].0 = "enclosure".into();
+        let levels = [(0, 1), (1, 2), (3, 2), (5, 1)]
+            .into_iter()
+            .map(|(n, level)| (format!("line{n}"), level))
+            .collect();
+        assemble_outline(
+            &mut nodes, &contexts, &text, &[], &|_| None, &HashMap::new(), &levels,
+        );
+        let parents = nodes
+            .iter()
+            .map(|node| node.parent_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(parents, [
+            None, Some("unit0"), Some("unit1"), Some("unit0"),
+            Some("unit3"), None, Some("unit5"), None,
+        ]);
+
+        let navigation = HashMap::from([("line3".into(), None)]);
+        assemble_outline(
+            &mut nodes, &contexts, &text, &[], &|_| None, &navigation, &levels,
+        );
+        assert_eq!(nodes[3].parent_id, None);
+        assert_eq!(nodes[4].parent_id.as_deref(), Some("unit3"));
     }
 }
