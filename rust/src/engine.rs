@@ -509,13 +509,16 @@ impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
 }
 
 /// The structure gold's inputs: a cached extraction with the cached readings of its pages
-/// recognized into it, as the structure stage receives them.
+/// recognized into it, as the structure stage receives them. `fresh` extracts the PDF again with
+/// this build, which must read the very lines the cached extraction holds, so the gold's lines stay
+/// its lines while their evidence (spans, type, marks) comes from the current extraction.
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
 pub fn gold_structure_inputs(
     pdf: &[u8],
     extraction: &Path,
     readings: &[PathBuf],
+    fresh: bool,
 ) -> Result<ExtractedPdf> {
     let cached: CachedExtraction = read_gzip_json(extraction)?;
     let source_hash = format!("{:x}", Sha256::digest(pdf));
@@ -536,7 +539,17 @@ pub fn gold_structure_inputs(
             return Err(Error::Message(format!("Two cached readings of one page: {}", path.display())));
         }
     }
-    let mut extracted = cached.extraction;
+    let mut extracted = if fresh {
+        let current = extract_pdf(pdf, None, None)?;
+        let lines = |e: &ExtractedPdf| e.pages.iter()
+            .flat_map(|page| page.lines.iter().map(|line| (line.id.clone(), line.text.clone()))).collect::<Vec<_>>();
+        if lines(&current) != lines(&cached.extraction) {
+            return Err(Error::Message("the current extraction reads other lines than the cached one".to_owned()));
+        }
+        current
+    } else {
+        cached.extraction
+    };
     recognize_pdf(pdf, &mut extracted, Some(&mut pinned as &mut dyn legal_pdf_core::PdfOcrProvider), None)?;
     finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.strokes));
     Ok(extracted)
