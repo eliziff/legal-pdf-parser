@@ -148,6 +148,10 @@ pub fn assemble_outline(
                 if marker.prefix.starts_with(&components) {
                     return true;
                 }
+                // A newly opened count nests like the shared text parser's numbering stack.
+                if marker.ordinal == 1 && marker.prefix.is_empty() && marker.family != other.family {
+                    return true;
+                }
             }
             heading(&nodes[parent.node]) || parent.lead_in
         }).map(|index| stack[index]);
@@ -199,6 +203,93 @@ pub fn assemble_outline(
 mod tests {
     use super::*;
     use legal_structure_model::Derivation;
+
+    #[test]
+    fn new_numbering_families_nest_and_close_at_siblings_and_headings() {
+        legal_structure_model::install_structure_analysis(legal_pdf_core::CHECKOUT_ENGINE);
+        let entries = [
+            ("Field kit", None),
+            ("4. Carry a flask.", Some("4.")),
+            ("(a) Use a blue cap.", Some("(a)")),
+            ("(i) Check the seal.", Some("(i)")),
+            ("(ii) Fill the flask.", Some("(ii)")),
+            ("(b) Label the bottle.", Some("(b)")),
+            ("5. Pack the pouch.", Some("5.")),
+            ("(a) Keep it dry.", Some("(a)")),
+            ("Shelter", None),
+            ("(a) Choose a level site.", Some("(a)")),
+            ("7. Check the pegs.", Some("7.")),
+            ("(d) Count the spare pegs.", Some("(d)")),
+            ("(a) A separate enclosure.", Some("(a)")),
+        ];
+        let text = entries
+            .iter()
+            .map(|(text, _)| *text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut offset = 0;
+        let mut nodes = entries
+            .iter()
+            .enumerate()
+            .map(|(n, (text, marker))| {
+                let range = ScalarRange {
+                    start: offset,
+                    end: offset + text.chars().count(),
+                };
+                offset = range.end + 1;
+                let mut node = StructureNode::new(
+                    format!("unit{n}"),
+                    if marker.is_none() {
+                        NodeKind::Heading
+                    } else {
+                        NodeKind::ListItem
+                    },
+                    range,
+                    "invented-numbering",
+                    Derivation::Native,
+                    None,
+                );
+                node.marker_range = marker.map(|marker| ScalarRange {
+                    start: range.start,
+                    end: range.start + marker.chars().count(),
+                });
+                node
+            })
+            .collect::<Vec<_>>();
+        let mut contexts = vec![("document".into(), None, None); nodes.len()];
+        contexts[12].0 = "enclosure".into();
+        assemble_outline(
+            &mut nodes,
+            &contexts,
+            &text,
+            &[],
+            &|_| None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let parents = nodes
+            .iter()
+            .map(|node| node.parent_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            [
+                None,
+                Some("unit0"),
+                Some("unit1"),
+                Some("unit2"),
+                Some("unit2"),
+                Some("unit1"),
+                Some("unit0"),
+                Some("unit6"),
+                None,
+                Some("unit8"),
+                Some("unit8"),
+                Some("unit8"),
+                None,
+            ]
+        );
+    }
 
     #[test]
     fn heading_ladder_survives_equal_type_and_respects_document_context() {
