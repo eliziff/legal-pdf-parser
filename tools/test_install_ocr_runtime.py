@@ -5,10 +5,19 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
-from install_ocr_runtime import destination, install_models
+from install_ocr_runtime import destination, install_models, released_models
 
 
 class InstallationTests(unittest.TestCase):
+    def test_latest_release_requires_a_named_digest_verified_owner_asset(self):
+        url = "https://github.com/eliziff/legal-browser-ocr/releases/download/v9.8.7/legal-ocr-models.tar.gz"
+        asset = {"name": "legal-ocr-models.tar.gz", "browser_download_url": url, "digest": "sha256:" + "a" * 64}
+        self.assertEqual(released_models({"assets": [asset]}), (url, "a" * 64))
+        for value in ({"assets": []}, {"assets": [{**asset, "digest": ""}]},
+                      {"assets": [{**asset, "browser_download_url": "https://example.test/archive.tar.gz"}]}):
+            with self.assertRaises(ValueError):
+                released_models(value)
+
     def test_archive_must_match_inventory_and_checksums(self):
         asset = b"independently invented model bytes"
         manifest = {"recognizer": "indra", "input_height": 32, "assets": {
