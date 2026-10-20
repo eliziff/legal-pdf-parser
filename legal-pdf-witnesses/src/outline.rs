@@ -181,6 +181,29 @@ pub fn assemble_outline(
         }
         stack.push(position);
     }
+    // A section that opens with its first subsection ("19.013 (1) In this section…") holds the
+    // section's later subsections, their marginal notes with them: the units after it under the
+    // same parent, up to the next numbered section.
+    let opens_section = |position: usize| {
+        let text = membership_text(&nodes[units[position].node], &coordinates).unwrap_or_default();
+        let mut words = text.split_whitespace();
+        let number = words.next().is_some_and(|word| word.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())));
+        (number, number && words.next() == Some("(1)"))
+    };
+    for position in 0..units.len() {
+        if heading(&nodes[units[position].node]) || !opens_section(position).1 {
+            continue;
+        }
+        for later in position + 1..units.len() {
+            if units[later].context != units[position].context || chosen[later] != chosen[position] {
+                continue;
+            }
+            if opens_section(later).0 {
+                break;
+            }
+            chosen[later] = Some(position);
+        }
+    }
     for (position, unit) in units.iter().enumerate() {
         nodes[unit.node].parent_id = chosen[position].map(|parent| nodes[units[parent].node].id.clone());
     }
