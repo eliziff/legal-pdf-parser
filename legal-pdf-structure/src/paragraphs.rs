@@ -196,7 +196,16 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
         let text = a.text.trim();
         let marker = marker_only_re().is_match(&a.text)
             || (text.chars().count() <= 4 && !text.contains(' '));
-        return !(marker && b.bbox[0] >= a.bbox[2] - 1.0);
+        if !marker
+            && (bullet_re().is_match(&b.text)
+                || enumerator_re().is_match(&b.text)
+                || marker_only_re().is_match(&b.text))
+        {
+            return true;
+        }
+        // The extractor uses MuPDF's 0.8-em inter-run spacing for one printed line.
+        let adjacent = b.bbox[0] - a.bbox[2] <= 0.8 * size(a).max(size(b));
+        return !(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent));
     }
     if b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0] {
         return true;
@@ -414,6 +423,99 @@ pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
             if let Some(block) = block {
                 line.block_index = block;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn same_row_fragments_join_without_losing_paragraph_or_column_boundaries() {
+        let cases = [
+            (
+                true,
+                vec![
+                    ("The kestrel circled", [50.0, 100.0, 180.0, 112.0]),
+                    ("above the cliffs.", [188.0, 100.0, 300.0, 112.0]),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    (
+                        "The harbour lamps remained lit.",
+                        [50.0, 100.0, 450.0, 110.0],
+                    ),
+                    (
+                        "A separate indented paragraph begins here.",
+                        [85.0, 114.0, 460.0, 124.0],
+                    ),
+                    (
+                        "and its next line returns to the margin.",
+                        [50.0, 128.0, 500.0, 138.0],
+                    ),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    (
+                        "The crew checked the equipment.",
+                        [50.0, 100.0, 450.0, 110.0],
+                    ),
+                    ("• Inspect the brass compass.", [50.0, 114.0, 450.0, 124.0]),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    ("The left column ends here", [50.0, 100.0, 250.0, 110.0]),
+                    ("the right column starts here", [350.0, 114.0, 550.0, 124.0]),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    ("A separate column ends here", [50.0, 100.0, 250.0, 112.0]),
+                    ("another column starts here", [350.0, 100.0, 550.0, 112.0]),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    ("A field precedes an item", [50.0, 100.0, 200.0, 112.0]),
+                    ("2. Inspect the harness.", [208.0, 100.0, 350.0, 112.0]),
+                ],
+            ),
+        ];
+        for (joined, rows) in cases {
+            let lines: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .map(|(n, (text, bbox))| {
+                    json!({
+                        "id": format!("line{n}"), "page_index": 0, "page_number": 1,
+                        "source_index": n, "reading_order": n, "block_index": 0,
+                        "text": text, "bbox": bbox, "region_type": "body", "source": "ocr"
+                    })
+                })
+                .collect();
+            let mut pages: Vec<Page> = serde_json::from_value(json!([{
+                "id": "page", "index": 0, "number": 1, "width": 600.0, "height": 800.0,
+                "lines": lines, "regions": [], "source": "ocr"
+            }]))
+            .unwrap();
+            segment_paragraphs(&mut pages);
+            assert_eq!(
+                pages[0].lines[0].block_index == pages[0].lines[1].block_index,
+                joined,
+                "{} / {}",
+                rows[0].0,
+                rows[1].0,
+            );
         }
     }
 }
