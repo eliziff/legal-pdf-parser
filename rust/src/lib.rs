@@ -18,7 +18,13 @@ pub use contract::{
 pub use engine::RecognitionProgress;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
-pub use engine::corpus_check_cached_extraction;
+pub use engine::{corpus_check_cached_extraction, gold_structure_document};
+#[cfg(feature = "ocr")]
+#[doc(hidden)]
+pub use engine::gold_structure_inputs;
+#[cfg(feature = "pdf")]
+#[doc(hidden)]
+pub use legal_pdf_extraction::ExtractedPdf;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]

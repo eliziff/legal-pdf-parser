@@ -400,6 +400,159 @@ fn derive_extracted(
     Ok(derived)
 }
 
+/// Recognized pages made ready for the readers: the strokes each recognized page's image shows,
+/// as rule regions, and the words a rule underlines.
+fn finish_recognition(pages: &mut [legal_pdf_core::model::Page], strokes: BTreeMap<usize, Vec<[f64; 4]>>) {
+    for (page_index, strokes) in strokes {
+        if let Some(page) = pages.get_mut(page_index) {
+            let number = page.number;
+            page.regions.extend(strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
+                id: format!("p{number:04}-stroke{:04}", n + 1),
+                page_index,
+                kind: "rule".to_owned(),
+                line_ids: Vec::new(),
+                bbox,
+                reading_order: 0,
+            }));
+        }
+    }
+    for page in pages {
+        legal_pdf_core::model::mark_rule_underlines(page);
+    }
+}
+
+/// A recognized extraction's structure, checked and projected as the document consumers read;
+/// `pages`, where given, receives the pages as the structure stage left them.
+fn derive_document(
+    mut extracted: ExtractedPdf,
+    source_hash: &str,
+    key: &str,
+    cache_root: Option<&Path>,
+    semantic_profile: Option<DetectionProfile>,
+    pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
+) -> Result<PdfDocument> {
+    let document_id = format!("doc-{}", &source_hash[..20]);
+    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
+    let derived = profile::measure("derive_document", || {
+        derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile)
+    })?;
+    profile::measure("build.validate_document", || {
+        validate_pdf_components(
+            &document_id,
+            source_hash,
+            &extracted.pages,
+            &derived.paragraphs,
+            &derived.footnotes,
+            &derived.structure_graph,
+        )
+    })?;
+    let document_status = status(&extracted.diagnostics, &extracted.pages);
+    if let Some(pages) = pages {
+        pages.clone_from(&extracted.pages);
+    }
+    let mut parsed = profile::measure("project_document", || {
+        PdfDocument::from_parts(
+            source_hash,
+            key,
+            document_status,
+            extracted.metadata,
+            extracted.pages,
+            derived.paragraphs,
+            derived.footnotes,
+            derived.structure_graph,
+        )
+    })?;
+    parsed.set_passage_evidence(passage_pages);
+    Ok(parsed)
+}
+
+/// Recognition pinned to the readings an earlier parse cached, page by page, so the structure
+/// gold replays the structure stage over the very lines its gold was authored on. The rules on
+/// each page's image are read again, as a parse reads them.
+#[cfg(feature = "ocr")]
+struct PinnedRecognition {
+    pages: BTreeMap<usize, legal_pdf_core::OcrPageResult>,
+    strokes: BTreeMap<usize, Vec<[f64; 4]>>,
+}
+
+#[cfg(feature = "ocr")]
+impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
+    fn extract_pages(
+        &mut self,
+        _pdf: &[u8],
+        requests: &[legal_pdf_core::OcrPageRequest],
+    ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
+        requests
+            .iter()
+            .map(|request| {
+                self.pages.get(&request.page_index).cloned().ok_or_else(|| {
+                    Error::Message(format!("No cached reading of page {}", request.page_index + 1))
+                })
+            })
+            .collect()
+    }
+
+    fn separators(
+        &mut self,
+        pdf: &[u8],
+        requests: &[legal_pdf_core::OcrPageRequest],
+    ) -> Vec<Option<f64>> {
+        legal_pdf_ocr::raster_page_rules(pdf, requests)
+            .into_iter()
+            .zip(requests)
+            .map(|((separator, strokes), request)| {
+                self.strokes.insert(request.page_index, strokes);
+                separator
+            })
+            .collect()
+    }
+}
+
+/// The structure gold's inputs: a cached extraction with the cached readings of its pages
+/// recognized into it, as the structure stage receives them.
+#[cfg(feature = "ocr")]
+#[doc(hidden)]
+pub fn gold_structure_inputs(
+    pdf: &[u8],
+    extraction: &Path,
+    readings: &[PathBuf],
+) -> Result<ExtractedPdf> {
+    let cached: CachedExtraction = read_gzip_json(extraction)?;
+    let source_hash = format!("{:x}", Sha256::digest(pdf));
+    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
+        || cached.source_sha256 != source_hash
+        || cached.extraction.pages.len() != cached.extraction.separators.len()
+    {
+        return Err(Error::Message("invalid extraction cache".to_owned()));
+    }
+    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), strokes: BTreeMap::new() };
+    for path in readings {
+        #[derive(Deserialize)]
+        struct Reading {
+            page: legal_pdf_core::OcrPageResult,
+        }
+        let reading: Reading = read_gzip_json(path)?;
+        if pinned.pages.insert(reading.page.page_index, reading.page).is_some() {
+            return Err(Error::Message(format!("Two cached readings of one page: {}", path.display())));
+        }
+    }
+    let mut extracted = cached.extraction;
+    recognize_pdf(pdf, &mut extracted, Some(&mut pinned as &mut dyn legal_pdf_core::PdfOcrProvider), None)?;
+    finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.strokes));
+    Ok(extracted)
+}
+
+/// The structure gold's replay: a recognized extraction through the structure stage, uncached;
+/// `pages`, where given, receives the pages as the structure stage left them.
+#[doc(hidden)]
+pub fn gold_structure_document(
+    extracted: ExtractedPdf,
+    source_hash: &str,
+    pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
+) -> Result<PdfDocument> {
+    derive_document(extracted, source_hash, "structure-gold", None, None, pages)
+}
+
 fn build_document(
     source_name: String,
     source_hash: &str,
@@ -738,24 +891,13 @@ pub(crate) fn parse_pdf(
         options.ocr_pages.as_deref(),
     )?;
     #[cfg(feature = "ocr")]
-    if let Some(provider) = ocr_provider.as_mut() {
-        for (page_index, strokes) in std::mem::take(&mut provider.strokes) {
-            if let Some(page) = extracted.pages.get_mut(page_index) {
-                let number = page.number;
-                page.regions.extend(strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
-                    id: format!("p{number:04}-stroke{:04}", n + 1),
-                    page_index,
-                    kind: "rule".to_owned(),
-                    line_ids: Vec::new(),
-                    bbox,
-                    reading_order: 0,
-                }));
-            }
-        }
-    }
-    for page in &mut extracted.pages {
-        legal_pdf_core::model::mark_rule_underlines(page);
-    }
+    let strokes = ocr_provider
+        .as_mut()
+        .map(|provider| std::mem::take(&mut provider.strokes))
+        .unwrap_or_default();
+    #[cfg(not(feature = "ocr"))]
+    let strokes = BTreeMap::new();
+    finish_recognition(&mut extracted.pages, strokes);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
         options
@@ -773,35 +915,7 @@ pub(crate) fn parse_pdf(
                 provider.annotate_pdf(bytes, &mut extracted.pages)
             })?);
     }
-    let document_id = format!("doc-{}", &source_hash[..20]);
-    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
-    let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, &document_id, &source_hash, cache_root.as_deref(), options.profile)
-    })?;
-    profile::measure("build.validate_document", || {
-        validate_pdf_components(
-            &document_id,
-            &source_hash,
-            &extracted.pages,
-            &derived.paragraphs,
-            &derived.footnotes,
-            &derived.structure_graph,
-        )
-    })?;
-    let document_status = status(&extracted.diagnostics, &extracted.pages);
-    let mut parsed = profile::measure("project_document", || {
-        PdfDocument::from_parts(
-            &source_hash,
-            &key,
-            document_status,
-            extracted.metadata,
-            extracted.pages,
-            derived.paragraphs,
-            derived.footnotes,
-            derived.structure_graph,
-        )
-    })?;
-    parsed.set_passage_evidence(passage_pages);
+    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, None)?;
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
         let cache_path = parse_cache_root(root)
