@@ -22,6 +22,8 @@ pub(super) struct Block {
     pub(super) heading: bool,
     pub(super) numbered: bool,
     pub(super) is_body: bool,
+    /// Wholly in a parallel translation, whose headings form a ladder of their own.
+    pub(super) translation: bool,
 }
 
 impl Block {
