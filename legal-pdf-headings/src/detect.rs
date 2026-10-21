@@ -23,6 +23,8 @@ pub(super) struct Block {
     /// A numbering marker is present; the ladder need not have accepted it as a heading.
     pub(super) numbered: bool,
     pub(super) is_body: bool,
+    /// Parallel text has its own heading sequence.
+    pub(super) translation: bool,
 }
 
 impl Block {

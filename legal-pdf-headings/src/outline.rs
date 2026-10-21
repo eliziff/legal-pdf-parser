@@ -12,7 +12,7 @@ use super::model::y_overlaps;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Upstream types: 0 plain, 1 numbered, 11 introduction keyword; 2 is an explicit PDF Hn.
+/// Upstream types: 0 plain, 1 numbered, 11 introduction; 2 is a PDF Hn, 12 set apart by type.
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub(super) block: usize,
