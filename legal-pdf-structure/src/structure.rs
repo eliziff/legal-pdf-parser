@@ -1,6 +1,7 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 mod bookmarks;
+mod captions;
 mod constituents;
 mod contents;
 mod graph;
@@ -2906,7 +2907,6 @@ fn classify_document_pages(
         legal_pdf_tables::order_table_lines(page, &tables);
     }
     evidence.tables.extend(tables);
-    evidence.translation_line_ids.extend(translation);
     // Keep page-wide contents evidence precise when two documents share a physical page.
     contents_line_ids.extend(
         pages
@@ -2918,6 +2918,10 @@ fn classify_document_pages(
     );
     evidence.contents_line_ids.extend(contents_line_ids);
     evidence.contents_pages.extend(contents_pages);
+    constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
+        captions::classify(document, evidence);
+    });
+    evidence.translation_line_ids.extend(translation);
     diagnostics
 }
 
@@ -3784,7 +3788,7 @@ fn build_paragraphs_with_context(
             .collect();
         let mut seen = HashSet::new();
         for region in &page.regions {
-            if !matches!(region.kind.as_str(), "body" | "heading") {
+            if !matches!(region.kind.as_str(), "body" | "heading" | "caption") {
                 continue;
             }
             let lines: Vec<&Line> = region

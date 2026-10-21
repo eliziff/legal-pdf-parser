@@ -64,7 +64,7 @@ fn header_field(text: &str) -> Option<String> {
 }
 
 /// A page headed by its own title as another document: "SCHEDULE", "ANNEX B".
-fn appended_title(text: &str) -> Option<&'static str> {
+pub(super) fn appended_title(text: &str) -> Option<&'static str> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let captures = RE
         .get_or_init(|| {

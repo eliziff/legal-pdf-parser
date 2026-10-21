@@ -1453,6 +1453,7 @@ pub(super) fn native_graph_parts(
                 Error::Message(format!("paragraph {} has no indexed lines", paragraph.id))
             })?;
         let heading = paragraph.region_type == "heading";
+        let caption = paragraph.region_type == "caption";
         let mut node = StructureNode::new(
             paragraph.id.clone(),
             if heading {
@@ -1462,13 +1463,16 @@ pub(super) fn native_graph_parts(
             },
             range,
             ORIGIN,
-            if heading {
+            if heading || caption {
                 Derivation::Heuristic
             } else {
                 Derivation::Native
             },
             None,
         );
+        if caption {
+            node.role = Some(legal_structure_model::PrimaryRole::Caption);
+        }
         node.ranges = source_membership(paragraph.line_ids.iter()
             .filter_map(|id| index.line(id).map(|line| line.range)).collect());
         node.label = heading.then(|| node.ranges.iter().map(|part|
