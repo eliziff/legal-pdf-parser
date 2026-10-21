@@ -161,7 +161,7 @@ fn introduction(block: &FlashBlock) -> bool {
         || (tokens.len() == words.len() + 1 && matches!(tokens[words.len()].kind, 3 | 4 | 5))
 }
 
-/// Bold or capitals can set a title apart without a change in font size.
+/// Bold or capitals can set a title apart even below the body text's size.
 fn set_apart_by_type(block: &FlashBlock, next: Option<&FlashBlock>) -> bool {
     let stats = &block.stats;
     let total = f64::from(stats.total.max(1));
@@ -418,8 +418,24 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             let quoted = text.starts_with(['"', '\u{201c}', '\u{2018}'])
                 || text.ends_with(".\u{201d}")
                 || text.ends_with("\u{201d}.");
+            // Printed provisions can use smaller bold titles immediately above their number.
+            let provision_title = type_candidates[block]
+                && flash.bold >= 0.95
+                && next.is_some_and(|next| {
+                    next.rect.top < flash.rect.top
+                        && flash.rect.bottom - next.rect.top < flash.size
+                        && next.rect.left < flash.rect.right
+                        && flash.rect.left < next.rect.right
+                        && next.lines.first().is_some_and(|line| {
+                            line.text
+                                .trim_start()
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_digit())
+                        })
+                });
             // The type and wording tests are cheap; the layout tests below read the whole page.
-            if flash.size < stats.font_size - 0.5
+            if (flash.size < stats.font_size - 0.5 && !provision_title)
                 || !opens
                 || quoted
                 || matches!(ends, Some(',' | ';'))
