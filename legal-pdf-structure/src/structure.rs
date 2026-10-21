@@ -1210,7 +1210,7 @@ fn heading_source_eligible(regions: &HashMap<String, String>, line: &Line) -> bo
     regions.get(&line.id).is_some_and(|region| {
         matches!(
             region.as_str(),
-            "text" | "body" | "paragraph_title" | "heading"
+            "text" | "body" | "paragraph_title" | "doc_title" | "heading"
         )
     })
 }
@@ -1584,7 +1584,7 @@ fn wrapped_heading_continuations(
         let continues = !structural.contains(&(page_slot, slot))
             && matches!(
                 source_regions.get(&continuation.id).map(String::as_str),
-                Some("text" | "body" | "paragraph_title" | "heading" | "block_quote")
+                Some("text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote")
             )
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
@@ -1933,7 +1933,9 @@ fn demote_false_headings(
             }
             if !source_regions
                 .get(&page.lines[line_slot].id)
-                .is_some_and(|region| matches!(region.as_str(), "paragraph_title" | "heading"))
+                .is_some_and(|region| {
+                    matches!(region.as_str(), "paragraph_title" | "doc_title" | "heading")
+                })
             {
                 continue;
             }
@@ -3093,6 +3095,17 @@ fn classify_pages_with_source(
                 line.note_region_mode.clear();
             } else if matches!(line.region_type.as_str(), "header" | "footer") {
                 continue;
+            } else if evidence
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(&line.id))
+                .is_some_and(|region| {
+                    matches!(region.as_str(), "paragraph_title" | "doc_title" | "heading")
+                })
+            {
+                // Recognition carries no font spans; preserve the layout detector's heading evidence.
+                line.region_type = "heading".to_owned();
+                line.note_region_mode.clear();
             } else if paragraph_labels.contains(&line.id) {
                 line.region_type = "body".to_owned();
                 line.note_region_mode.clear();

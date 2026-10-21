@@ -805,7 +805,7 @@ impl PdfResolutionInput {
                                     .as_ref()
                                     .and_then(|regions| regions.get(&line.id))
                                     .is_some_and(|region| {
-                                        matches!(region.as_str(), "heading" | "paragraph_title")
+                                        matches!(region.as_str(), "heading" | "paragraph_title" | "doc_title")
                                     })
                         })
                 }) {
