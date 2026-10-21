@@ -216,7 +216,18 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     let page_stats = pages
         .iter()
         .zip(&flash_lines)
-        .map(|(page, lines)| stats::page_stats(lines, page.width))
+        .map(|(page, lines)| {
+            // Notes, tables and furniture must not define the document's body typography.
+            let text = page.lines.iter().zip(lines).filter(|(line, _)| {
+                !line.exclude_from_body
+                    && line.note_region_mode.is_empty()
+                    && matches!(line.region_type.as_str(), "body" | "heading")
+                    && !caption.contains(&line.id)
+                    && !(evidence.excluded)(&line.id)
+                    && !evidence.contents_pages.contains(&page.index)
+            });
+            stats::page_stats(text.map(|(_, line)| line), page.width)
+        })
         .collect::<Vec<_>>();
     let doc = stats::doc_stats(&page_stats);
 
