@@ -81,8 +81,15 @@ fn join_wrapped_headings(
                 && counted[page_slot][slot]
                 && translation(&prior.id) == translation(&line.id)
                 && prior.block_index != line.block_index
-                && style(prior).is_some()
-                && style(prior) == style(line)
+                && match (style(prior), style(line)) {
+                    (Some(left), Some(right)) => left == right,
+                    // Recognized headings have glyph heights in place of native font spans.
+                    (None, None) => {
+                        height > 0.0
+                            && (line.bbox[3] - line.bbox[1] - height).abs() <= 0.05 * height
+                    }
+                    _ => false,
+                }
                 && tagged_levels.get(&prior.id) == tagged_levels.get(&line.id)
                 && model::CharStats::of(&prior.text).caps_heavy()
                 && model::CharStats::of(&line.text).caps_heavy()
