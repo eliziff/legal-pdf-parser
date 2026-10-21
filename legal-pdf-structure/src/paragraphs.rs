@@ -336,6 +336,9 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     let (Some(a), Some(b)) = (previous.last(), next.first()) else {
         return false;
     };
+    if a.page_index.checked_add(1) != Some(b.page_index) {
+        return false;
+    }
     let text = b.text.trim_start();
     if bullet_re().is_match(text)
         || enumerator_re().is_match(text)
