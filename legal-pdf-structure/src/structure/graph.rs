@@ -780,6 +780,7 @@ impl PdfResolutionInput {
         let quotation_scopes = super::quotations::quotation_scopes(pages, primitives);
         let quotations = quotation_scopes.keys().cloned().collect::<HashSet<_>>();
         let context = legal_pdf_witnesses::Context {
+            documents: Some(&primitives.document_line_ids),
             quoted: Some(&quotations),
             table_cells: Some(&primitives.table_cell_line_ids),
             contents: Some(&primitives.contents_line_ids),
