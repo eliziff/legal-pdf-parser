@@ -160,12 +160,15 @@ pub(super) struct DocStats {
     /// 80th percentile of per-page median span coverage.
     pub(super) upper_fill: f64,
     pub(super) body_font_size: f64,
+    /// Median line advance relative to native font size or recognized glyph height.
+    pub(super) body_line_leading: f64,
 }
 
 pub(super) fn doc_stats<'a>(pages: impl IntoIterator<Item = &'a PageStats>) -> DocStats {
     let mut widths = Vec::new();
     let mut fills = Vec::new();
     let mut sizes = Vec::new();
+    let mut leading = Vec::new();
     for stats in pages {
         if stats.line_count == 0 || stats.total_weight <= 0.0 {
             continue;
@@ -174,10 +177,14 @@ pub(super) fn doc_stats<'a>(pages: impl IntoIterator<Item = &'a PageStats>) -> D
         widths.push((stats.line_width, per_page));
         fills.push((stats.fill, per_page));
         sizes.push((stats.font_size, per_page));
+        if stats.line_gap.is_finite() && stats.font_size > 0.0 {
+            leading.push((stats.line_gap / stats.font_size, per_page));
+        }
     }
     DocStats {
         line_width: weighted_percentile(widths, 50.0),
         upper_fill: weighted_percentile(fills, 80.0),
         body_font_size: weighted_percentile(sizes, 50.0),
+        body_line_leading: weighted_percentile(leading, 50.0),
     }
 }

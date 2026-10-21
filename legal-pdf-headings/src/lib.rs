@@ -50,15 +50,22 @@ pub fn party_label() -> &'static Regex {
     })
 }
 
-/// A capitalized heading wrapped onto the next line keeps one block: the same type, set at the
+/// A heading wrapped onto the next line keeps one block: the same type, set at the
 /// line's leading, the first line ending no sentence and the second opening no numbered heading.
 fn join_wrapped_headings(
     pages: &mut [Page],
-    levels: &HashMap<String, usize>,
+    flash_lines: &[Vec<FlashLine>],
+    doc: &[stats::DocStats; 2],
+    starts: &HashSet<String>,
     tagged_levels: &HashMap<String, usize>,
-    counted: &[Vec<bool>],
+    available: &[Vec<bool>],
     translation: &dyn Fn(&str) -> bool,
-) {
+) -> Vec<(usize, usize, usize)> {
+    let mut joined_lines = Vec::new();
+    let parenthetical = |text: &str| {
+        let text = text.trim();
+        text.starts_with('(') && text.ends_with(')')
+    };
     let style = |line: &legal_pdf_core::model::Line| {
         line.spans.first().map(|span| {
             (
@@ -71,14 +78,24 @@ fn join_wrapped_headings(
     for (page_slot, page) in pages.iter_mut().enumerate() {
         for slot in 1..page.lines.len() {
             let (prior, line) = (&page.lines[slot - 1], &page.lines[slot]);
-            let height = prior.bbox[3] - prior.bbox[1];
-            let gap = line.bbox[1] - prior.bbox[3];
-            let centered =
-                ((prior.bbox[0] + prior.bbox[2]) - (line.bbox[0] + line.bbox[2])).abs() / 2.0 < 2.0;
+            let (above, below) = (
+                &flash_lines[page_slot][slot - 1],
+                &flash_lines[page_slot][slot],
+            );
+            let height = above.rect.height();
+            let gap = above.rect.bottom - below.rect.top;
+            let advance = above.rect.top - below.rect.top;
+            let leading = doc[usize::from(prior.spans.is_empty())].body_line_leading;
+            let max_advance = above.size
+                * if leading.is_finite() && leading > 0.0 {
+                    1.25 * leading
+                } else {
+                    1.5
+                };
             let joined = prior.region_type == "heading"
                 && line.region_type == "heading"
-                && counted[page_slot][slot - 1]
-                && counted[page_slot][slot]
+                && available[page_slot][slot - 1]
+                && available[page_slot][slot]
                 && translation(&prior.id) == translation(&line.id)
                 && prior.block_index != line.block_index
                 && match (style(prior), style(line)) {
@@ -91,24 +108,25 @@ fn join_wrapped_headings(
                     _ => false,
                 }
                 && tagged_levels.get(&prior.id) == tagged_levels.get(&line.id)
-                && model::CharStats::of(&prior.text).caps_heavy()
-                && model::CharStats::of(&line.text).caps_heavy()
+                && (above.stats.caps_heavy() == below.stats.caps_heavy()
+                    || parenthetical(&line.text))
+                && (!parenthetical(&prior.text) || parenthetical(&line.text))
                 && !prior.text.trim_end().ends_with(['.', '?', '!', ':', ';'])
-                && !levels.contains_key(&line.id)
+                && !starts.contains(&line.id)
+                && advance > 0.0
+                && advance <= max_advance
                 && gap >= -1.0
                 && gap < height
-                && (centered || (prior.bbox[0] - line.bbox[0]).abs() < 2.0);
+                && (model::center_aligned(&above.rect, &below.rect, 2.0)
+                    || model::left_aligned(&above.rect, &below.rect, 2.0));
             if joined {
-                let (from, to) = (line.block_index, prior.block_index);
-                for later in page.lines[slot..]
-                    .iter_mut()
-                    .take_while(|later| later.block_index == from)
-                {
-                    later.block_index = to;
-                }
+                let to = prior.block_index;
+                page.lines[slot].block_index = to;
+                joined_lines.push((page_slot, slot, slot - 1));
             }
         }
     }
+    joined_lines
 }
 
 /// The introduction section names upstream's `introduction_dict` lists.
@@ -256,8 +274,8 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             }
         }
     }
-    // Every typography reader uses the same population, including its neighbors and style seeds.
-    let counted = pages
+    // Source exclusions constrain grouping and typography alike.
+    let available = pages
         .iter()
         .map(|page| {
             page.lines
@@ -266,21 +284,30 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     !line.exclude_from_body
                         && line.note_region_mode.is_empty()
                         && matches!(line.region_type.as_str(), "body" | "heading")
-                        && !caption.contains(&line.id)
                         && !(evidence.excluded)(&line.id)
                         && !evidence.contents_pages.contains(&page.index)
                 })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    join_wrapped_headings(
-        pages,
-        evidence.levels,
-        &tagged_levels,
-        &counted,
-        evidence.translation,
-    );
-
+    // Existing headings can wrap inside a caption without training the typography profile.
+    let counted = pages
+        .iter()
+        .zip(&available)
+        .map(|(page, available)| {
+            page.lines
+                .iter()
+                .zip(available)
+                .map(|(line, &keep)| keep && !caption.contains(&line.id))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let starts = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .filter(|line| evidence.levels.contains_key(&line.id) || (evidence.numbered)(&line.text))
+        .map(|line| line.id.clone())
+        .collect::<HashSet<_>>();
     let flash_lines = pages
         .iter()
         .map(|page| {
@@ -307,6 +334,15 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         })
         .collect::<Vec<_>>();
     let doc = [0, 1].map(|kind| stats::doc_stats(page_stats.iter().map(|page| &page[kind])));
+    join_wrapped_headings(
+        pages,
+        &flash_lines,
+        &doc,
+        &starts,
+        &tagged_levels,
+        &available,
+        evidence.translation,
+    );
 
     // Blocks: runs of body or heading lines sharing a block, as regions group them.
     let mut blocks = Vec::<Block>::new();
@@ -707,6 +743,22 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             prior_level = Some(own_level);
             line.block_index = block_index;
             evidence.levels.insert(line.id.clone(), own_level);
+        }
+    }
+    // Style classification can reveal more wrapped lines. The resulting block has one level.
+    for (page, line, prior) in join_wrapped_headings(
+        pages,
+        &flash_lines,
+        &doc,
+        &starts,
+        &tagged_levels,
+        &available,
+        evidence.translation,
+    ) {
+        if let Some(level) = evidence.levels.get(&pages[page].lines[prior].id).copied() {
+            evidence
+                .levels
+                .insert(pages[page].lines[line].id.clone(), level);
         }
     }
 }
