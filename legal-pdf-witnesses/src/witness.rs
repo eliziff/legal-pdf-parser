@@ -216,6 +216,18 @@ const LEAD_WORDS: &[&str] = &[
     "whether",
 ];
 
+/// Wording or punctuation that can introduce a list; it needs marker and layout evidence too.
+pub fn list_lead_in(text: &str) -> bool {
+    let text = text.trim_end();
+    matches!(
+        text.chars().last(),
+        Some(':' | '-' | '\u{2013}' | '\u{2014}')
+    ) || text
+        .rsplit(|c: char| !c.is_alphabetic())
+        .find(|word| !word.is_empty())
+        .is_some_and(|word| LEAD_WORDS.contains(&word.to_lowercase().as_str()))
+}
+
 fn families(text: &str) -> [bool; 10] {
     [
         bullet().is_match(text),
@@ -484,12 +496,6 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         let end = text.chars().last().unwrap_or(' ');
         let prev_text = prev.map_or("", |(_, o)| o.text.trim());
         let prev_end = prev_text.chars().last().unwrap_or(' ');
-        let prev_words = prev_text
-            .rsplit(|c: char| !c.is_alphabetic())
-            .filter(|w| !w.is_empty())
-            .take(1)
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
         let marks = families(text);
         let own = style(l);
         let recognized = page.source != "native" || l.spans.is_empty();
@@ -563,12 +569,7 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             flag(prev_end == ';'),
             flag(matches!(prev_end, '-' | '\u{2013}' | '\u{2014}')),
             flag(next.is_some_and(|(_, o)| o.text.trim_start().starts_with(char::is_lowercase))),
-            flag(
-                matches!(prev_end, ':' | '-' | '\u{2013}' | '\u{2014}')
-                    || prev_words
-                        .first()
-                        .is_some_and(|w| LEAD_WORDS.contains(&w.as_str())),
-            ),
+            flag(list_lead_in(prev_text)),
             flag(court().is_match(text)),
             flag(address().is_match(text)),
             flag(party().is_match(text)),

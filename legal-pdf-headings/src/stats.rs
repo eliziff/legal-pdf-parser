@@ -80,7 +80,10 @@ fn dominant(order: &[String], weights: &HashMap<String, f64>) -> String {
     best
 }
 
-pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
+pub(super) fn page_stats<'a>(
+    lines: impl IntoIterator<Item = &'a FlashLine>,
+    page_width: f64,
+) -> PageStats {
     let mut gaps = Vec::new();
     let mut widths = Vec::new();
     let mut fills = Vec::new();
@@ -90,8 +93,8 @@ pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
     let mut total = 0.0;
     let mut valid = 0;
     let bucket = page_width / 20.0;
-    let mut buckets: Vec<Option<usize>> = vec![None; 21];
-    for (index, line) in lines.iter().enumerate() {
+    let mut buckets: Vec<Option<&FlashLine>> = vec![None; 21];
+    for line in lines {
         if line.skew > 1.0 {
             continue;
         }
@@ -125,18 +128,18 @@ pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
         let mut best_gap = f64::INFINITY;
         let mut best_prior = None;
         for slot in first..last {
-            let prior = buckets[slot].replace(index);
+            let prior = buckets[slot].replace(line);
             let Some(prior) = prior else {
                 continue;
             };
-            let gap = lines[prior].rect.bottom.max(line.rect.top) - line.rect.bottom;
+            let gap = prior.rect.bottom.max(line.rect.top) - line.rect.bottom;
             if gap < best_gap {
                 best_gap = gap;
                 best_prior = Some(prior);
             }
         }
         if let Some(prior) = best_prior.filter(|_| best_gap < f64::INFINITY) {
-            gaps.push((best_gap, lines[prior].stats.info_weight() * line_weight));
+            gaps.push((best_gap, prior.stats.info_weight() * line_weight));
         }
     }
     PageStats {

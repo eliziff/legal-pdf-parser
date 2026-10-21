@@ -11,7 +11,10 @@
 //! ladder, the layout prior over every page whose notes end their band, and the bridge from one
 //! page's unfinished note to the next page's band.
 
-use legal_pdf_core::{line_font_size, model::Page};
+use legal_pdf_core::{
+    line_font_size,
+    model::{Line, Page},
+};
 use legal_pdf_support::protected_citation_spans;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -225,7 +228,8 @@ struct DocumentLines<'a> {
     pages: &'a [Page],
     /// Each page's lines in reading order: (page slot, line slots).
     order: Vec<(usize, Vec<usize>)>,
-    note_size: Option<f64>,
+    /// Native font sizes and recognized glyph heights are distinct measurements.
+    note_sizes: [Option<f64>; 2],
 }
 
 impl<'a> DocumentLines<'a> {
@@ -243,7 +247,7 @@ impl<'a> DocumentLines<'a> {
         Self {
             pages,
             order,
-            note_size: note_font_size(pages),
+            note_sizes: note_type_sizes(pages),
         }
     }
 
@@ -282,38 +286,50 @@ impl<'a> DocumentLines<'a> {
     }
 
     /// The line set in the document's note type.
-    fn note_font(&self, (page, line): LineRef) -> bool {
-        let size = line_font_size(&self.pages[page].lines[line]);
-        self.note_size
+    fn matches_note_type(&self, (page, line): LineRef) -> bool {
+        let line = &self.pages[page].lines[line];
+        let size = note_text_size(line);
+        self.note_sizes[usize::from(line.spans.is_empty())]
             .is_some_and(|note| size > 0.0 && (size - note).abs() <= 0.6)
     }
 }
 
-/// The document's note type: the size most of its note lines are set in, where it is smaller than
-/// its body's. Fitted over the whole document, never a page.
-fn note_font_size(pages: &[Page]) -> Option<f64> {
-    let mut notes = Vec::new();
-    let mut body = Vec::new();
+fn note_text_size(line: &Line) -> f64 {
+    if line.spans.is_empty() {
+        line.bbox[3] - line.bbox[1]
+    } else {
+        line_font_size(line)
+    }
+}
+
+/// The document's note type, smaller than its body's. Learn font sizes and recognized glyph
+/// heights separately over the whole document, never borrowing one measurement for the other.
+fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
+    let mut notes = [Vec::new(), Vec::new()];
+    let mut body = [Vec::new(), Vec::new()];
     for line in pages.iter().flat_map(|page| &page.lines) {
-        let size = line_font_size(line);
+        let size = note_text_size(line);
         if size <= 0.0 {
             continue;
         }
+        let source = usize::from(line.spans.is_empty());
         if line.region_type.contains("note") {
-            notes.push(size);
+            notes[source].push(size);
         } else if line.region_type == "body" {
-            body.push(size);
+            body[source].push(size);
         }
-    }
-    if notes.len() < 3 || body.is_empty() {
-        return None;
     }
     let median = |values: &mut Vec<f64>| {
         values.sort_by(f64::total_cmp);
         values[values.len() / 2]
     };
-    let (note, body) = (median(&mut notes), median(&mut body));
-    (note < body - 0.5).then_some(note)
+    std::array::from_fn(|source| {
+        if notes[source].len() < 3 || body[source].is_empty() {
+            return None;
+        }
+        let (note, body) = (median(&mut notes[source]), median(&mut body[source]));
+        (note < body - 0.5).then_some(note)
+    })
 }
 
 /// Settle which lines are notes over the whole document. Returns how many lines changed.
@@ -735,7 +751,7 @@ fn font_role_strands(
     reserved: &HashSet<LineRef>,
     band: &BandFindings,
 ) -> Vec<LineRef> {
-    if lines.note_size.is_none() {
+    if lines.note_sizes.iter().all(Option::is_none) {
         return Vec::new();
     }
     let promoted = band
@@ -807,7 +823,7 @@ fn font_role_strands(
                     && lines.mutable(line)
                     && !lines.paragraph_label(line)
                     && below(line)
-                    && (lines.note_font(line) || bare_label(lines.text(line)).is_some())
+                    && (lines.matches_note_type(line) || bare_label(lines.text(line)).is_some())
             })
             .collect::<Vec<_>>();
         let mut expanded = refs
@@ -850,7 +866,7 @@ fn font_role_strands(
                     position += 1;
                 }
                 let run = &refs[start..position];
-                if !run.iter().any(|line| lines.note_font(*line)) {
+                if !run.iter().any(|line| lines.matches_note_type(*line)) {
                     continue;
                 }
                 let bottom_terminal = refs[position..].iter().all(|line| {
@@ -896,7 +912,7 @@ fn font_role_strands(
                 } else {
                     match head {
                         Some(None) => run.iter().any(|line| {
-                            lines.note_font(*line)
+                            lines.matches_note_type(*line)
                                 && lines.text(*line).chars().any(char::is_alphabetic)
                         }),
                         Some(Some(label)) => {

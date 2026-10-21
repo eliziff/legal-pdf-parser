@@ -481,6 +481,120 @@ fn layout_end(
     None
 }
 
+/// A list's lead-in belongs to its sibling sequence, including siblings on later pages.
+fn sentence_list_items<'a>(
+    index: &PdfTextIndex,
+    text: &ScalarText<'_>,
+    by_line: &HashMap<&str, (&Page, &Line)>,
+    measures: &HashMap<usize, (f64, f64)>,
+    run: &'a StructureCandidateRun,
+    ended: &HashSet<String>,
+    primitives: &PdfPrimitiveEvidence,
+) -> HashSet<&'a str> {
+    let mut listed = HashSet::new();
+    if !run.consecutive {
+        return listed;
+    }
+    let body = |line: &Line| {
+        line.region_type == "body"
+            && item_text_line(line)
+            && !primitives.table_cell_line_ids.contains(&line.id)
+            && !primitives.contents_line_ids.contains(&line.id)
+            && !primitives.contents_pages.contains(&line.page_index)
+            && !primitives.translation_line_ids.contains(&line.id)
+    };
+    let source = |candidate: &StructureMarkerCandidate| {
+        index
+            .line_at(candidate.content_start)
+            .or_else(|| index.line_at(candidate.marker_range.start))
+            .and_then(|indexed| by_line.get(indexed.line_id.as_str()).copied())
+            .filter(|(_, line)| body(line))
+    };
+    let mut siblings = BTreeMap::<_, Vec<_>>::new();
+    for candidate in &run.markers {
+        siblings
+            .entry((candidate.parent_candidate_id.as_deref(), candidate.level))
+            .or_default()
+            .push(candidate);
+    }
+    for siblings in siblings.values() {
+        let mut active = false;
+        for pair in siblings.windows(2) {
+            let (prior, next) = (pair[0], pair[1]);
+            let connected = !ended.contains(&prior.id)
+                && prior.range.end >= next.marker_range.start
+                && !prior.label.starts_with('[')
+                && !next.label.starts_with('[')
+                && source(prior).zip(source(next)).is_some_and(
+                    |((page, line), (next_page, next_line))| {
+                        let left = measures.get(&page.index).map_or(0.0, |m| m.0);
+                        let next_left = measures.get(&next_page.index).map_or(0.0, |m| m.0);
+                        (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
+                            <= page.width.max(next_page.width).max(1.0) * 0.008
+                    },
+                );
+            if !connected {
+                active = false;
+                continue;
+            }
+            if !active {
+                let Some(marker) = index.line_at(prior.marker_range.start) else {
+                    continue;
+                };
+                let prefix = text
+                    .slice(marker.range.start..prior.marker_range.start)
+                    .unwrap_or("");
+                let lead_in = if prefix.chars().any(char::is_alphabetic) {
+                    Some(prefix)
+                } else {
+                    index.lines[..index.line_slots[&marker.line_id]]
+                        .iter()
+                        .rev()
+                        .filter_map(|indexed| by_line.get(indexed.line_id.as_str()))
+                        .find(|(_, line)| item_text_line(line) && !line.text.trim().is_empty())
+                        .filter(|(_, line)| body(line))
+                        .map(|(_, line)| line.text.as_str())
+                };
+                let range = ScalarRange {
+                    start: prior.content_start,
+                    end: prior.range.end.min(next.marker_range.start),
+                };
+                let mut words = index.overlapping_lines(range).iter().filter_map(|indexed| {
+                    let (_, line) = by_line.get(indexed.line_id.as_str())?;
+                    body(line)
+                        .then(|| {
+                            text.slice(
+                                range.start.max(indexed.range.start)
+                                    ..range.end.min(indexed.range.end),
+                            )
+                            .unwrap_or("")
+                            .trim()
+                        })
+                        .filter(|tail| !tail.is_empty())
+                });
+                let first = words.next().unwrap_or("");
+                let last = words.next_back().unwrap_or(first);
+                let clause = first.starts_with(char::is_lowercase)
+                    || last.ends_with([',', ';'])
+                    || last.split_whitespace().next_back().is_some_and(|word| {
+                        matches!(
+                            word.trim_matches(|c: char| !c.is_alphabetic())
+                                .to_lowercase()
+                                .as_str(),
+                            "and" | "or"
+                        )
+                    });
+                active = clause && lead_in.is_some_and(legal_pdf_witnesses::list_lead_in);
+            }
+            if active {
+                listed.insert(prior.id.as_str());
+                listed.insert(next.id.as_str());
+            }
+        }
+    }
+    listed
+}
+
 impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
@@ -693,6 +807,8 @@ impl PdfResolutionInput {
             .collect::<BTreeMap<_, _>>();
         let mut evidence = Vec::new();
         for run in &runs {
+            let sentence_items =
+                sentence_list_items(&index, &text, &by_line, &measures, run, &ended, primitives);
             let mut list_candidates = HashSet::new();
             if !matches!(run.grammar, CandidateGrammar::Numeric) {
                 let marker_sources = run
@@ -720,7 +836,10 @@ impl PdfResolutionInput {
                             .iter()
                             .zip(&marker_sources)
                             .any(|(sibling, sibling_source)| {
-                                if sibling.id == candidate.id || sibling.level != candidate.level {
+                                if sibling.id == candidate.id
+                                    || sibling.level != candidate.level
+                                    || sibling.parent_candidate_id != candidate.parent_candidate_id
+                                {
                                     return false;
                                 }
                                 let Some((sibling_page, sibling_line)) = *sibling_source else {
@@ -813,6 +932,9 @@ impl PdfResolutionInput {
                 }
                 if list_candidates.contains(candidate.id.as_str()) && item_words {
                     add_observation(&mut observations, CandidateObservationV2::ListItemLayout);
+                }
+                if sentence_items.contains(candidate.id.as_str()) {
+                    add_observation(&mut observations, CandidateObservationV2::ListItemSyntax);
                 }
                 let marker_is_cross_reference = marker_lines.iter().any(|indexed| {
                     let local = ScalarRange {
