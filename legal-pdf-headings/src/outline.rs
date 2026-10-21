@@ -12,18 +12,18 @@ use super::model::y_overlaps;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Upstream types kept here: 0 plain, 1 numbered, 11 introduction keyword.
+/// Upstream types: 0 plain, 1 numbered, 11 introduction keyword; 2 is an explicit PDF Hn.
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub(super) block: usize,
     pub(super) kind: u8,
-    /// The native ladder's level for a numbered heading; upstream's numbering length.
+    /// The numbering ladder's level or an explicit PDF Hn level.
     pub(super) level: Option<usize>,
 }
 
 impl Candidate {
     fn numbered(&self) -> bool {
-        self.level.is_some()
+        self.kind == 1 && self.level.is_some()
     }
 }
 
@@ -47,7 +47,7 @@ impl Context<'_> {
     /// unnumbered heading above any numbered one; legal numbering marks parts and sections at
     /// every depth, so type decides between a numbered and an unnumbered heading instead.
     pub(super) fn compare(&self, a: &Candidate, b: &Candidate) -> i8 {
-        if a.kind == 1 && b.kind == 1 {
+        if a.kind == b.kind && matches!(a.kind, 1 | 2) {
             return match (a.level, b.level) {
                 (Some(left), Some(right)) if left == right => 0,
                 (Some(left), Some(right)) if left < right => 1,

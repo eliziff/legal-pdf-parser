@@ -4,6 +4,62 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: &str = "legalpdf.document.v4";
 pub const PARSER_VERSION: &str = "0.3.1";
 
+/// A standard PDF heading role: H, or Hn for a positive level.
+pub fn is_heading_role(role: &str) -> bool {
+    role == "H"
+        || role.strip_prefix('H').is_some_and(|level| {
+            !level.starts_with('0')
+                && level.bytes().all(|byte| byte.is_ascii_digit())
+                && level.parse::<usize>().is_ok_and(|level| level > 0)
+        })
+}
+
+/// Heading labels from a layout provider or the PDF's own structure tree.
+pub fn is_heading_region(region: &str) -> bool {
+    matches!(region, "heading" | "paragraph_title" | "doc_title") || is_heading_role(region)
+}
+
+/// The heading role covering a whole source line. Mixed roles, gaps containing text and
+/// unanchored spans cannot turn a run-in heading into a heading for the entire paragraph.
+pub fn tagged_heading<'a>(
+    line: &'a Line,
+    role: impl Fn(&'a Span) -> Option<&'a str>,
+) -> Option<&'a str> {
+    let spans = line
+        .spans
+        .iter()
+        .filter(|span| !span.text.trim().is_empty());
+    let heading = role(spans.clone().next()?)?;
+    if !is_heading_role(heading) {
+        return None;
+    }
+    let mut spans = spans.collect::<Vec<_>>();
+    spans.sort_unstable_by_key(|span| (span.start, span.end));
+    let bytes = line
+        .text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(line.text.len()))
+        .collect::<Vec<_>>();
+    let mut covered = 0;
+    for span in spans {
+        if role(span) != Some(heading) || span.start >= span.end {
+            return None;
+        }
+        let (start, end) = (*bytes.get(span.start)?, *bytes.get(span.end)?);
+        if line.text.get(start..end)? != span.text
+            || (span.start > covered && !line.text[bytes[covered]..start].trim().is_empty())
+        {
+            return None;
+        }
+        covered = covered.max(span.end);
+    }
+    line.text[bytes[covered]..]
+        .trim()
+        .is_empty()
+        .then_some(heading)
+}
+
 /// Mark the words a horizontal rule on their page underlines: painted in the PDF, or drawn on a
 /// recognized page's image.
 pub fn mark_rule_underlines(page: &mut Page) {
