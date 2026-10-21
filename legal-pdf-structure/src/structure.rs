@@ -2386,7 +2386,7 @@ fn apply_text_fidelity_headings(
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
         if !target_is_heading {
-            if !decision.ladder_clean
+            if (!decision.ladder_clean && !decision.coherent_family)
                 || !decision.text_plausible
                 || matches!(
                     decision.action,
@@ -2687,11 +2687,16 @@ fn classify_pages_with_source(
     };
     evidence.document_line_ids = documents;
     let mut heading_levels = HashMap::new();
+    let document_contexts = evidence.document_line_ids.clone();
+    let translation_context = evidence.translation_line_ids.clone();
     constituents::within_document_contexts(
         pages,
-        &evidence.document_line_ids,
-        &evidence.translation_line_ids,
-        |document| heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence)),
+        &document_contexts,
+        &translation_context,
+        |document| {
+            demote_prose_heading_tags(document, evidence);
+            heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence));
+        },
     );
     evidence.heading_levels = heading_levels;
     evidence.font_heading_candidates = HashSet::new();
@@ -2862,6 +2867,95 @@ fn classify_document_pages(
     evidence.contents_line_ids.extend(contents_line_ids);
     evidence.contents_pages.extend(contents_pages);
     diagnostics
+}
+
+/// A mislabelled PDF paragraph style can tag every line of ordinary prose as Hn.
+fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) {
+    let Some(regions) = evidence.source_regions.as_ref() else {
+        return;
+    };
+    let style = |span: &legal_pdf_core::Span| {
+        (
+            span.font.clone(),
+            (span.size * 10.0).round() as i64,
+            span.flags & 18,
+        )
+    };
+    let mut rejected = HashSet::new();
+    let mut prose_styles = HashMap::<String, HashSet<_>>::new();
+    for page in pages.iter() {
+        let assigned = crate::paragraphs::paragraph_indices(page, |line| {
+            !line.exclude_from_body
+                && !heading_line_excluded(evidence, &line.id)
+                && regions
+                    .get(&line.id)
+                    .is_some_and(|role| legal_pdf_core::is_heading_role(role))
+        });
+        let mut paragraphs = HashMap::<(usize, &str), Vec<&Line>>::new();
+        for (line, paragraph) in page.lines.iter().zip(assigned) {
+            if let Some(paragraph) = paragraph {
+                paragraphs
+                    .entry((paragraph, regions[&line.id].as_str()))
+                    .or_default()
+                    .push(line);
+            }
+        }
+        for lines in paragraphs.values() {
+            let text = lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.chars().count() > MAX_FONT_HEADING_CHARS
+                && sentence_ended(&text)
+                && !text.ends_with('?')
+                && titlecase_ratio(&text) < 0.45
+            {
+                rejected.extend(lines.iter().map(|line| line.id.clone()));
+                let mut fonts = HashMap::<_, usize>::new();
+                for span in lines.iter().flat_map(|line| &line.spans) {
+                    *fonts.entry(style(span)).or_default() += span.text.chars().count();
+                }
+                let total: usize = fonts.values().sum();
+                if let Some((font, mass)) = fonts.into_iter().max_by_key(|(_, mass)| *mass) {
+                    if mass * 5 >= total * 3 {
+                        prose_styles
+                            .entry(regions[&lines[0].id].clone())
+                            .or_default()
+                            .insert(font);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(regions) = evidence.source_regions.as_mut() {
+        for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+            if line.exclude_from_body || line.region_type != "heading" {
+                continue;
+            }
+            let styles = regions
+                .get(&line.id)
+                .and_then(|role| prose_styles.get(role));
+            if styles.is_none() && !rejected.contains(&line.id) {
+                continue;
+            }
+            let total: usize = line
+                .spans
+                .iter()
+                .map(|span| span.text.chars().count())
+                .sum();
+            let prose: usize = line
+                .spans
+                .iter()
+                .filter(|span| styles.is_some_and(|styles| styles.contains(&style(span))))
+                .map(|span| span.text.chars().count())
+                .sum();
+            if rejected.contains(&line.id) || total > 0 && prose * 5 >= total * 3 {
+                regions.insert(line.id.clone(), "body".to_owned());
+                line.region_type = "body".to_owned();
+            }
+        }
+    }
 }
 
 fn classify_line_roles(
