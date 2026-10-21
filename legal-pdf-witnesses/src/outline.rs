@@ -185,6 +185,36 @@ pub fn assemble_outline(
         }
         stack.push(position);
     }
+    // A section and its first subsection can share one unit. Later subsections and their
+    // marginal notes belong to that unit until a heading or the next numbered section.
+    // Keep one open section per context, including each side of a parallel text.
+    let mut sections = HashMap::<Context, (usize, Option<usize>)>::new();
+    for (position, unit) in units.iter().enumerate() {
+        if heading(&nodes[unit.node]) {
+            sections.remove(&unit.context);
+            continue;
+        }
+        let own = membership_text(&nodes[unit.node], &coordinates).unwrap_or_default();
+        let mut words = own.split_whitespace();
+        let number = words
+            .next()
+            .and_then(|word| legal_pdf_core::layout_analysis().numbering_marker(word, None))
+            .is_some_and(|marker| {
+                marker.family.split_once(':').is_some_and(|(wrap, count)| {
+                    matches!(wrap, "" | ".") && count.split('.').all(|part| part == "1")
+                })
+            });
+        if number {
+            sections.remove(&unit.context);
+            if words.next() == Some("(1)") {
+                sections.insert(unit.context.clone(), (position, chosen[position]));
+            }
+        } else if let Some(&(section, parent)) = sections.get(&unit.context) {
+            if chosen[position] == parent {
+                chosen[position] = Some(section);
+            }
+        }
+    }
     for (position, unit) in units.iter().enumerate() {
         nodes[unit.node].parent_id = chosen[position].map(|parent| nodes[units[parent].node].id.clone());
     }
