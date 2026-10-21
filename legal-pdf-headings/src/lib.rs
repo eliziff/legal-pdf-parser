@@ -624,10 +624,24 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         };
         stack.push(index);
     }
-    // A heading read with a numbered one inside it ("III. Law and Argument" over "A. Approving
-    // Sale") keeps the inner one's ladder step below it, for a later reading that parts them.
+    // Region assembly groups lines by their block. Give each accepted heading and each inner
+    // ladder step its own block, retaining wrapped lines at one level together.
+    let mut next_blocks = pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| line.block_index)
+                .max()
+                .unwrap_or(0)
+                + 1
+        })
+        .collect::<Vec<_>>();
     for (candidate, level) in accepted.iter().zip(&levels) {
         let block = &blocks[candidate.block];
+        let mut block_index = next_blocks[block.page];
+        next_blocks[block.page] += 1;
+        let mut prior_level = None;
         for &slot in &block.line_slots {
             let line = &mut pages[block.page].lines[slot];
             if proposed.contains(&candidate.block) {
@@ -642,9 +656,14 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                         .get(&line.id)
                         .map(|own| own.saturating_sub(top))
                 });
-            evidence
-                .levels
-                .insert(line.id.clone(), level.saturating_add(step.unwrap_or(0)));
+            let own_level = level.saturating_add(step.unwrap_or(0));
+            if prior_level.is_some_and(|prior| prior != own_level) {
+                block_index = next_blocks[block.page];
+                next_blocks[block.page] += 1;
+            }
+            prior_level = Some(own_level);
+            line.block_index = block_index;
+            evidence.levels.insert(line.id.clone(), own_level);
         }
     }
 }

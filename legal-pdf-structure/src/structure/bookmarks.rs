@@ -13,6 +13,7 @@
 //! frame entry they fall under. Deliberate legal adaptations, apart from line anchoring:
 //! - a `Tab N` / `Exhibit N` set is package navigation, not an enumeration to ignore;
 //! - a bookmark on a contents page holds no other bookmark;
+//! - parallel translations keep separate title anchors and bookmark frames;
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use super::{
@@ -435,7 +436,7 @@ pub(super) fn reconcile_bookmarks(
     };
     let mut claimed = HashSet::<(usize, usize)>::new();
     let mut anchors = vec![None::<Anchor>; entries.len()];
-    let mut last = None::<(usize, usize)>;
+    let mut last = [None::<(usize, usize)>; 2];
     for (index, entry) in entries.iter().enumerate() {
         let title = normalize_title(&entry.title);
         let Some(&target) = slot_of_page.get(&(entry.page - 1)) else {
@@ -458,7 +459,15 @@ pub(super) fn reconcile_bookmarks(
                         let mut joined = String::new();
                         let mut heading = true;
                         for end in start..(start + MAX_TITLE_LINES).min(page.lines.len()) {
-                            if claimed.contains(&(page_slot, end)) || !eligible(page, end) {
+                            if claimed.contains(&(page_slot, end))
+                                || !eligible(page, end)
+                                || primitives
+                                    .translation_line_ids
+                                    .contains(&page.lines[end].id)
+                                    != primitives
+                                        .translation_line_ids
+                                        .contains(&page.lines[start].id)
+                            {
                                 return None;
                             }
                             joined.push_str(&norms[page_slot][end]);
@@ -486,7 +495,12 @@ pub(super) fn reconcile_bookmarks(
             continue;
         };
         let position = (anchor.page_slot, anchor.lines[0]);
-        if last.is_some_and(|last| position <= last) {
+        let side = usize::from(
+            primitives
+                .translation_line_ids
+                .contains(&pages[anchor.page_slot].lines[anchor.lines[0]].id),
+        );
+        if last[side].is_some_and(|last| position <= last) {
             continue;
         }
         if !anchor.existing {
@@ -520,13 +534,27 @@ pub(super) fn reconcile_bookmarks(
                 continue;
             }
         }
-        last = Some(position);
+        last[side] = Some(position);
         claimed.extend(anchor.lines.iter().map(|slot| (anchor.page_slot, *slot)));
         anchors[index] = Some(anchor);
     }
     if anchors.iter().all(Option::is_none) {
         return false;
     }
+    // A confirmed title places its bookmark in one parallel sequence. Unanchored entries
+    // retain the primary frame; they supply no authority over a translated heading.
+    let entry_sides = anchors
+        .iter()
+        .map(|anchor| {
+            anchor.as_ref().map_or(0, |anchor| {
+                usize::from(
+                    primitives
+                        .translation_line_ids
+                        .contains(&pages[anchor.page_slot].lines[anchor.lines[0]].id),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
 
     // Similar headings may guide discovery, but only a title actually present in the body
     // supplies a confirmed navigation relationship to the attachment predictor.
@@ -546,7 +574,16 @@ pub(super) fn reconcile_bookmarks(
         let block = page.lines[anchor.lines[0]].block_index;
         if anchor.existing {
             let same = |slot: usize, page: &Page| {
-                page.lines[slot].region_type == "heading" && page.lines[slot].block_index == block
+                page.lines[slot].region_type == "heading"
+                    && page.lines[slot].block_index == block
+                    && primitives
+                        .translation_line_ids
+                        .contains(&page.lines[slot].id)
+                        == primitives
+                            .translation_line_ids
+                            .contains(&page.lines[anchor.lines[0]].id)
+                    && levels.get(&page.lines[slot].id)
+                        == levels.get(&page.lines[anchor.lines[0]].id)
             };
             let numbered = |slot: usize, page: &Page| {
                 let text = page.lines[slot].text.trim();
@@ -584,6 +621,7 @@ pub(super) fn reconcile_bookmarks(
         line_ids: Vec<String>,
         text: String,
         level: Option<usize>,
+        translation: bool,
     }
     let mut units = Vec::<Unit>::new();
     let mut unit_at = HashMap::<(usize, usize), usize>::new();
@@ -594,13 +632,19 @@ pub(super) fn reconcile_bookmarks(
             }
             let continues = slot > 0
                 && page.lines[slot - 1].region_type == "heading"
-                && page.lines[slot - 1].block_index == line.block_index;
+                && page.lines[slot - 1].block_index == line.block_index
+                && primitives
+                    .translation_line_ids
+                    .contains(&page.lines[slot - 1].id)
+                    == primitives.translation_line_ids.contains(&line.id)
+                && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
             if !continues {
                 units.push(Unit {
                     position: (page_slot, slot),
                     line_ids: Vec::new(),
                     text: String::new(),
                     level: None,
+                    translation: primitives.translation_line_ids.contains(&line.id),
                 });
             }
             let unit = units.last_mut().expect("unit");
@@ -634,11 +678,12 @@ pub(super) fn reconcile_bookmarks(
     let mut frame_units = HashMap::<usize, usize>::new();
     let mut levels_out = HashMap::<usize, Option<usize>>::new();
     {
-        let mut stack = Vec::<usize>::new();
+        let mut stacks = [Vec::<usize>::new(), Vec::<usize>::new()];
         for (index, entry) in entries.iter().enumerate() {
             let Some(unit) = entry_unit[index].filter(|_| framed(entry)) else {
                 continue;
             };
+            let stack = &mut stacks[entry_sides[index]];
             while stack.last().is_some_and(|level| *level >= entry.level) {
                 stack.pop();
             }
@@ -656,11 +701,12 @@ pub(super) fn reconcile_bookmarks(
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
     let parents = {
-        let mut stack = Vec::<usize>::new();
+        let mut stacks = [Vec::<usize>::new(), Vec::<usize>::new()];
         entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
+                let stack = &mut stacks[entry_sides[index]];
                 while stack
                     .last()
                     .is_some_and(|prior| entries[*prior].level >= entry.level)
@@ -696,24 +742,30 @@ pub(super) fn reconcile_bookmarks(
     let detected = (0..units.len())
         .filter(|unit| !levels_out.contains_key(unit) && !promoted.contains(unit))
         .collect::<Vec<_>>();
-    let mut title_counts = HashMap::<String, usize>::new();
+    let mut title_counts = HashMap::<(bool, String), usize>::new();
     for unit in &detected {
         *title_counts
-            .entry(normalize_title(&units[*unit].text))
+            .entry((
+                units[*unit].translation,
+                normalize_title(&units[*unit].text),
+            ))
             .or_default() += 1;
     }
     let mut groups = HashMap::<usize, Vec<usize>>::new();
     for unit in detected {
-        let norm = normalize_title(&units[unit].text);
+        let key = (units[unit].translation, normalize_title(&units[unit].text));
         if tier == Tier::Full
-            && (!norm.is_empty() && title_counts[&norm] >= BACKFILL_DUP_MIN
+            && (!key.1.is_empty() && title_counts[&key] >= BACKFILL_DUP_MIN
                 || units[unit].text.chars().count() > BACKFILL_MAX_TITLE)
         {
             levels_out.insert(unit, None);
             continue;
         }
         let mut active = None;
-        for (index, opens) in &frame {
+        for (index, opens) in frame
+            .iter()
+            .filter(|(index, _)| entry_sides[*index] == usize::from(units[unit].translation))
+        {
             if *opens > units[unit].position {
                 break;
             }
@@ -763,6 +815,9 @@ pub(super) fn reconcile_bookmarks(
                 // Else the chapter whose pages it falls in.
                 frame
                     .iter()
+                    .filter(|(index, _)| {
+                        entry_sides[*index] == usize::from(units[unit].translation)
+                    })
                     .take_while(|(_, opens)| opens.0 <= units[unit].position.0)
                     .last()
                     .and_then(|(chapter, _)| frame_units.get(chapter))
@@ -784,6 +839,14 @@ pub(super) fn reconcile_bookmarks(
     let levels = &mut primitives.heading_levels;
     for (unit, level) in levels_out {
         for line_id in &units[unit].line_ids {
+            if primitives
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(line_id))
+                .is_some_and(|role| role != "H" && legal_pdf_core::is_heading_role(role))
+            {
+                continue;
+            }
             match level {
                 Some(level) => levels.insert(line_id.clone(), level),
                 None => levels.remove(line_id),
