@@ -6,8 +6,9 @@
 //! `build_doc_heading_candidates` / `detect_body_headings` → the outline stack. The port reads
 //! native lines and regions instead of Flash's own lines and blocks; each submodule names the
 //! upstream functions it ports. Deliberate adaptations:
-//! - Numbered headings come from the native ladder, which also supplies their depth; Flash's
-//!   numbered, labeled, chapter and caption detectors are not ported.
+//! - The native ladder supplies numbered headings and their depth; unresolved numbered blocks
+//!   can still be read by typography. Flash's numbered, labeled, chapter and caption detectors
+//!   are not ported.
 //! - The keyword tables are not ported except the introduction keywords: the section and
 //!   abstract tables index academic and medical papers.
 //! - A heading the native rules already accepted is kept; only new candidates face the
@@ -176,7 +177,7 @@ pub struct HeadingEvidence<'a> {
     pub excluded: &'a dyn Fn(&str) -> bool,
     /// Contents pages, none of whose lines is a heading.
     pub contents_pages: &'a HashSet<usize>,
-    /// Does a line open with a heading's number ("1.", "(a)", "IV")?
+    /// Does a line open with a heading-like number ("1.", "(a)", "IV")? This is no role decision.
     pub numbered: &'a dyn Fn(&str) -> bool,
 }
 
