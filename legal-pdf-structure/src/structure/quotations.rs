@@ -183,7 +183,10 @@ fn closing_re() -> &'static Regex {
 
 fn item_marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new("^\\s*(?:\\(?\\w{1,4}[.)]|[\u{2022}\u{25cf}-])\\s").unwrap())
+    RE.get_or_init(|| {
+        Regex::new("^\\s*(?:\\(?\\w{1,4}[.)]|\\(?[A-Za-z]\\.\\d+[.)]|[\u{2022}\u{25cf}-])\\s")
+            .unwrap()
+    })
 }
 
 /// Keep one identity for the detected block, including its fragments after page furniture.

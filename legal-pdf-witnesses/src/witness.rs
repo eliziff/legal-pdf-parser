@@ -162,12 +162,12 @@ pattern!(
     r"^\s*[•·▪◦‣●○■□➢✓\u{f0b7}\u{f0a7}\u{f0d8}\u{f076}*–-]\s"
 );
 pattern!(paren_num, r"^\s*\(\d{1,3}\)");
-pattern!(paren_letter, r"^\s*\([a-z]{1,2}\)");
+pattern!(paren_letter, r"^\s*\((?:[a-z]{1,2}|[A-Za-z]\.\d+)\)");
 pattern!(paren_roman, r"^\s*\((?:[ivx]{1,5})\)");
 pattern!(decimal, r"^\s*\d{1,3}(?:\.\d{1,3})+\.?\s");
 pattern!(num, r"^\s*\d{1,3}[.)]\s");
 pattern!(num_bare, r"^\s*\d{1,3}\s+[A-Z]");
-pattern!(letter, r"^\s*[a-zA-Z][.)]\s");
+pattern!(letter, r"^\s*[a-zA-Z](?:\.\d+)?[.)]\s");
 pattern!(roman, r"^\s*[IVXivx]{1,5}[.)]\s");
 pattern!(
     word_marker,
@@ -175,7 +175,7 @@ pattern!(
 );
 pattern!(
     bare,
-    r"^\s*(\(?[0-9]{1,3}[.)]?|\(?[ivxlcIVXLC]{1,6}[.)]|\(?[A-Za-z][.)]|\([a-zA-Z0-9]{1,4}\)|[•·▪◦‣\-–*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$"
+    r"^\s*(\(?[0-9]{1,3}[.)]?|\(?[ivxlcIVXLC]{1,6}[.)]|\(?[A-Za-z](?:\.\d+)?[.)]|\((?:[a-zA-Z0-9]{1,4}|[A-Za-z]\.\d+)\)|[•·▪◦‣\-–*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$"
 );
 pattern!(
     court,
@@ -216,6 +216,11 @@ const LEAD_WORDS: &[&str] = &[
     "to",
     "that",
     "whether",
+    "may",
+    "shall",
+    "must",
+    "peut",
+    "doit",
 ];
 
 /// Wording or punctuation that can introduce a list; it needs marker and layout evidence too.

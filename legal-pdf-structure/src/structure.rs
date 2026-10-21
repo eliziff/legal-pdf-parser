@@ -414,8 +414,10 @@ fn compact_note_line(text: &str) -> bool {
 fn standalone_enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$")
-            .unwrap()
+        Regex::new(
+            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$",
+        )
+        .unwrap()
     })
 }
 
@@ -423,7 +425,7 @@ fn inline_enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
+            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
         )
         .unwrap()
     })

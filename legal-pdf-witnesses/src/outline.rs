@@ -3,7 +3,7 @@
 //! from, other units under the nearest open heading or lead-in, and the printed contents or
 //! bookmarks place a heading where they name its parent.
 
-use crate::witness::{median, size};
+use crate::witness::{list_lead_in, median, size};
 use legal_pdf_core::model::{Line, Page};
 use legal_structure_model::{NodeKind, NumberingMarker, ScalarRange, ScalarText, StructureNode};
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ struct Unit {
     rank: f32,
     level: Option<usize>,
     lead_in: bool,
+    list_intro: bool,
 }
 
 fn heading(node: &StructureNode) -> bool {
@@ -171,22 +172,35 @@ pub fn assemble_outline(
                 .filter_map(source)
                 .find(|(_, range)| node.content_start.is_none_or(|start| start < range.end))
                 .or_else(|| node.line_ids.first().and_then(source));
+            let own = membership_text(node, &coordinates).unwrap_or_default();
+            let style = first.map_or((0, false, false), |(line, source)| {
+                unit_style(line, source, node, body_sizes[&contexts[node_index]])
+            });
+            let numbered = own.split_whitespace().next()
+                .and_then(|word| legal_pdf_core::layout_analysis().numbering_marker(word, None))
+                .is_some_and(|marker| {
+                    marker.family.split_once(':')
+                        .is_some_and(|(_, count)| count.split('.').all(|part| part == "1"))
+                });
+            let tail = own.trim_end_matches(|c: char| {
+                c.is_whitespace() || "\"')]}\u{201d}\u{2019}".contains(c)
+            });
+            let list_intro = node.role == Some(legal_structure_model::PrimaryRole::Text)
+                && node.kind != NodeKind::ListItem
+                && !tail.ends_with(['.', ';', '?', '!'])
+                && (list_lead_in(&own) || style.1 || numbered);
             Unit {
                 node: node_index,
                 context: contexts[node_index].clone(),
                 marker: None,
-                style: first.map_or((0, false, false), |(line, source)| {
-                    unit_style(line, source, node, body_sizes[&contexts[node_index]])
-                }),
+                style,
                 rank: 0.0,
                 level: node
                     .line_ids
                     .iter()
                     .find_map(|id| heading_levels.get(id).copied()),
-                lead_in: membership_text(node, &coordinates)
-                    .unwrap_or_default()
-                    .trim()
-                    .ends_with(':'),
+                lead_in: own.trim_end().ends_with(':'),
+                list_intro,
             }
         })
         .collect::<Vec<_>>();
@@ -272,6 +286,7 @@ pub fn assemble_outline(
         nodes[quote].parent_id = Some(nodes[units[owner].node].id.clone());
         // The quotation consumes this lead-in; later prose resumes in the enclosing outline.
         units[owner].lead_in = false;
+        units[owner].list_intro = false;
     }
     let quote_positions = nodes
         .iter()
@@ -318,6 +333,10 @@ pub fn assemble_outline(
                 }
             }
             heading(&nodes[parent.node]) || parent.lead_in
+                || node.kind == NodeKind::ListItem && parent.list_intro
+                    && unit.marker.as_ref().is_some_and(|marker| {
+                        marker.ordinal == 1 && marker.prefix.is_empty()
+                    })
         }).map(|index| stack[index]);
         // A sibling closes itself and its descendants while retaining its enclosing ancestors.
         if let Some(sibling) = unit.marker.as_ref().and_then(|marker| stack.iter().rev().find(|&&candidate|
