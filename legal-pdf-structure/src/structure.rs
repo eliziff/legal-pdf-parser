@@ -4367,7 +4367,7 @@ fn derive_prepared(
                     &document_id,
                     &resolution.quotation_scopes,
                     &resolution.index,
-                    &prepared.primitives.translation_line_ids,
+                    &prepared.primitives,
                 );
                 let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
                 legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents, &prepared.primitives.heading_levels);
@@ -4391,9 +4391,10 @@ fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
     quote_ids: &HashMap<String, String>,
     index: &PdfTextIndex,
-    translation: &HashSet<String>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> Vec<legal_pdf_witnesses::OutlineContext> {
     use legal_structure_model::PrimaryRole;
+    let translation = &primitives.translation_line_ids;
     // Establish exact membership before comparing containers. An envelope may cross
     // intervening columns, notes, quotations, or constituent documents.
     for node in nodes.iter_mut() {
@@ -4411,6 +4412,49 @@ fn outline_contexts(
             }
         }
         node.ranges = merged;
+        // Keep owned source fragments when the envelope spans intervening columns.
+        if node.kind != NodeKind::Page && !node.line_ids.is_empty() {
+            let mut source = node
+                .line_ids
+                .iter()
+                .filter_map(|id| index.line(id).map(|line| line.range))
+                .collect::<Vec<_>>();
+            if let Some(marker) = node.marker_range {
+                let ids = index.line_ids(marker);
+                if let Some(first) = ids.first() {
+                    let context = primitives.document_context(first);
+                    source.extend(
+                        ids.iter()
+                            .filter(|id| primitives.document_context(id) == context)
+                            .filter_map(|id| index.line(id))
+                            .map(|line| ScalarRange {
+                                start: marker.start.max(line.range.start),
+                                end: marker.end.min(line.range.end),
+                            })
+                            .filter(|part| part.start < part.end),
+                    );
+                }
+            }
+            let source = graph::source_membership(source);
+            let mut owned = Vec::new();
+            let mut at = 0;
+            for range in &node.ranges {
+                while at < source.len() && source[at].end <= range.start {
+                    at += 1;
+                }
+                for part in source[at..]
+                    .iter()
+                    .take_while(|part| part.start < range.end)
+                {
+                    let start = range.start.max(part.start);
+                    let end = range.end.min(part.end);
+                    if start < end {
+                        owned.push(ScalarRange { start, end });
+                    }
+                }
+            }
+            node.ranges = owned;
+        }
         let mut seen_lines = HashSet::new();
         node.line_ids = node.ranges.iter().flat_map(|range| index.line_ids(*range))
             .filter(|id| seen_lines.insert(id.clone())).collect();
@@ -4418,6 +4462,11 @@ fn outline_contexts(
         if let (Some(first), Some(last)) = (node.ranges.first(), node.ranges.last()) {
             node.range.start = first.start;
             node.range.end = last.end;
+        }
+        if let Some(start) = &mut node.content_start {
+            if let Some(part) = node.ranges.iter().find(|part| *start < part.end) {
+                *start = (*start).max(part.start);
+            }
         }
     }
     let constituents = nodes.iter().filter(|node| node.grammar.as_deref().is_some_and(|grammar| grammar.starts_with("constituent_")))
