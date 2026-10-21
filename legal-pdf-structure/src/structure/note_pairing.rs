@@ -10,6 +10,12 @@ pub(super) fn pair_notes(
     citations: &BTreeMap<String, Vec<PdfSourceSpan>>,
     index: &PdfTextIndex,
 ) -> PairingOutput {
+    // A heading can carry references, but its opening number is not a note label.
+    for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+        if line.region_type == "heading" {
+            line.suppress_footnote_label = true;
+        }
+    }
     let analysis = legal_pdf_core::layout_analysis();
     if primitives.document_line_ids.is_empty() && primitives.translation_line_ids.is_empty() {
         return analysis.pair_footnotes(pages, citations, false);

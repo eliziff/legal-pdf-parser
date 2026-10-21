@@ -1342,11 +1342,7 @@ pub(super) fn map_note_pairs(
         // numbered fields, a caption's column of section signs or a table's numbered rows pair
         // with nothing, or with a stray number or two.
         let support = &pair.support;
-        let referenced_run = support.sequence_observed_pairs >= 2
-            && support.sequence_labels <= 3 * support.sequence_observed_pairs;
-        let note_region_run = support.sequence_note_labels >= 3
-            && 4 * support.sequence_note_labels >= 3 * support.sequence_labels;
-        let label_only = support.note_region && (referenced_run || note_region_run);
+        let label_only = support.supports_label_only();
         if (pair.reference_anchors.is_empty() && !label_only)
             || body_range.is_none()
             || body_range.is_some_and(|range| range.start == range.end)
