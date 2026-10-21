@@ -9,10 +9,10 @@
 //! "provides:"). A quotation runs on over a page break, and holds its own numbered paragraphs
 //! and lists.
 
-use super::PdfPrimitiveEvidence;
+use super::{DocumentContext, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page, Span};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 /// A row of body text: a line and any lines set beside it on the same row (a marker set apart
@@ -111,7 +111,12 @@ fn item_marker_re() -> &'static Regex {
 pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashMap<String, String> {
     let mut ordered_pages = pages.iter().collect::<Vec<_>>();
     ordered_pages.sort_by_key(|page| page.index);
-    let mut rows = Vec::<Row>::new();
+    #[derive(Default)]
+    struct Reading<'a> {
+        pages: Vec<&'a Page>,
+        rows: Vec<Row<'a>>,
+    }
+    let mut readings = BTreeMap::<DocumentContext, Reading>::new();
     for page in &ordered_pages {
         let mut lines = page
             .lines
@@ -121,6 +126,9 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
                     && line.note_region_mode.is_empty()
                     && !matches!(line.region_type.as_str(), "header" | "footer" | "heading")
                     && !primitives.table_cell_line_ids.contains(&line.id)
+                    && !primitives.table_note_line_ids.contains(&line.id)
+                    && !primitives.contents_line_ids.contains(&line.id)
+                    && !primitives.contents_pages.contains(&page.index)
                     && !line.text.trim().is_empty()
             })
             .collect::<Vec<_>>();
@@ -130,8 +138,18 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
                 .then_with(|| left.id.cmp(&right.id))
         });
         for line in lines {
+            let reading = readings
+                .entry(primitives.document_context(&line.id))
+                .or_default();
+            if reading
+                .pages
+                .last()
+                .is_none_or(|prior| prior.index != page.index)
+            {
+                reading.pages.push(page);
+            }
             let height = (line.bbox[3] - line.bbox[1]).max(1.0);
-            match rows.last_mut() {
+            match reading.rows.last_mut() {
                 Some(row)
                     if row.page_index == page.index
                         && row.bbox[3].min(line.bbox[3]) - row.bbox[1].max(line.bbox[1])
@@ -145,7 +163,7 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
                         row.bbox[3].max(line.bbox[3]),
                     ];
                 }
-                _ => rows.push(Row {
+                _ => reading.rows.push(Row {
                     lines: vec![line],
                     page_index: page.index,
                     bbox: line.bbox,
@@ -153,6 +171,13 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
             }
         }
     }
+    readings
+        .into_values()
+        .flat_map(|reading| quotation_rows(&reading.rows, &reading.pages))
+        .collect()
+}
+
+fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> HashMap<String, String> {
     let Some(widest) = rows.iter().map(Row::width).reduce(f64::max) else {
         return HashMap::new();
     };
@@ -264,9 +289,12 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
             while next < rows.len() && !set_in(&rows[next]) && edge(&rows[next]) {
                 next += 1;
             }
+            let prior_page = rows[end - 1].page_index;
             if next < rows.len()
                 && set_in(&rows[next])
-                && (next == end || rows[next].page_index != rows[end - 1].page_index)
+                && (rows[next].page_index == prior_page
+                    || prior_page.checked_add(1) == Some(rows[next].page_index))
+                && (next == end || rows[next].page_index != prior_page)
             {
                 block.push(&rows[next]);
                 end = next + 1;
@@ -277,6 +305,10 @@ pub(super) fn quotation_scopes(pages: &[Page], primitives: &PdfPrimitiveEvidence
         let introduction = start
             .checked_sub(1)
             .map(|before| &rows[before])
+            .filter(|row| {
+                row.page_index == rows[start].page_index
+                    || row.page_index.checked_add(1) == Some(rows[start].page_index)
+            })
             .filter(|row| row.bbox[0] <= measure(row).0 + 3.0 * body_size)
             .map(Row::text)
             .filter(|text| text.chars().any(char::is_lowercase));
