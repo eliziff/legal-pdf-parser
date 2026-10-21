@@ -1179,31 +1179,40 @@ fn article_body_font_size(pages: &[Page]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Region-dependent Text-Fidelity lanes are fail-closed. A complete set of
-/// non-unknown line labels may come from PPDoc or any MLLM; consumers depend
-/// on the region contract, not the provider identity. The snapshot survives
-/// the engine's later ordering and normalized-label passes.
+/// Source labels survive ordering and classification. Unknown labels carry no evidence;
+/// they must not erase the known labels of other lines. Ambiguous identities invalidate the map.
 fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
     let mut regions = HashMap::new();
+    let mut ids = HashSet::new();
     for line in pages
         .iter()
         .flat_map(|page| &page.lines)
         .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
     {
-        let region = line.region_type.trim().to_ascii_lowercase();
-        if line.id.is_empty()
-            || matches!(region.as_str(), "" | "unknown" | "unknown_region")
-            || regions.insert(line.id.clone(), region).is_some()
-        {
+        if line.id.is_empty() || !ids.insert(line.id.as_str()) {
             return None;
+        }
+        let region = line.region_type.trim().to_ascii_lowercase();
+        if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {
+            regions.insert(line.id.clone(), region);
         }
     }
     (!regions.is_empty()).then_some(regions)
 }
 
+fn source_regions_cover_pages(pages: &[Page], regions: Option<&HashMap<String, String>>) -> bool {
+    regions.is_some_and(|regions| {
+        pages
+            .iter()
+            .flat_map(|page| &page.lines)
+            .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
+            .all(|line| regions.contains_key(&line.id))
+    })
+}
+
 #[cfg(test)]
 fn source_regions_available(pages: &[Page]) -> bool {
-    source_region_contract(pages).is_some()
+    source_regions_cover_pages(pages, source_region_contract(pages).as_ref())
 }
 
 fn heading_line_excluded(primitives: &PdfPrimitiveEvidence, id: &str) -> bool {
@@ -1216,14 +1225,16 @@ fn heading_line_excluded(primitives: &PdfPrimitiveEvidence, id: &str) -> bool {
 fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
     !heading_line_excluded(primitives, &line.id)
         // Source labels constrain inference when available; they are not required to read a heading.
-        && primitives.source_regions.as_ref().is_none_or(|regions| {
-            regions.get(&line.id).is_some_and(|region| {
+        && primitives
+            .source_regions
+            .as_ref()
+            .and_then(|regions| regions.get(&line.id))
+            .is_none_or(|region| {
                 matches!(
                     region.as_str(),
                     "text" | "body" | "paragraph_title" | "doc_title" | "heading"
                 )
             })
-        })
 }
 
 struct HeadingCandidate {
@@ -1599,12 +1610,16 @@ fn wrapped_heading_continuations(
         let continues = !structural.contains(&(page_slot, slot))
             && !continuation.exclude_from_body
             && !heading_line_excluded(primitives, &continuation.id)
-            && primitives.source_regions.as_ref().is_none_or(|regions| {
-                matches!(
-                    regions.get(&continuation.id).map(String::as_str),
-                    Some("text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote")
-                )
-            })
+            && primitives
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(&continuation.id))
+                .is_none_or(|region| {
+                    matches!(
+                        region.as_str(),
+                        "text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote"
+                    )
+                })
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
             // A title's line opens on a word; a caption's bracket column (")", "§") is no title.
@@ -1649,12 +1664,11 @@ fn wrapped_heading_continuations(
             following.region_type == "body"
                 && !following.exclude_from_body
                 && !heading_line_excluded(primitives, &following.id)
-                && primitives.source_regions.as_ref().is_none_or(|regions| {
-                    matches!(
-                        regions.get(&following.id).map(String::as_str),
-                        Some("text" | "body")
-                    )
-                })
+                && primitives
+                    .source_regions
+                    .as_ref()
+                    .and_then(|regions| regions.get(&following.id))
+                    .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
                 && has_valid_bbox(following)
                 && (following.bbox[1] - line.bbox[1]
                     >= line.bbox[1] - above.bbox[1]
@@ -2439,7 +2453,7 @@ fn classify_pages_with_source(
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let article_body_size = if evidence.source_regions.is_some() {
+    let article_body_size = if source_regions_cover_pages(pages, evidence.source_regions.as_ref()) {
         article_body_font_size(pages)
     } else {
         0.0
@@ -3117,8 +3131,7 @@ fn classify_pages_with_source(
                     .map(String::as_str)
                     .unwrap_or(line.region_type.as_str()),
                 "paragraph_title" | "doc_title" | "heading"
-            )
-            {
+            ) {
                 // Recognition carries no font spans; preserve the layout detector's heading evidence.
                 line.region_type = "heading".to_owned();
                 line.note_region_mode.clear();
