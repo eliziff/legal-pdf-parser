@@ -20,8 +20,8 @@ pub fn extract_pdf(
         })?;
     let embedded_page_labels = processor::embedded_page_labels(&document, page_geometries.len());
     let outline = processor::embedded_outline(&document);
-    // Keep the direct inline role and the enclosing heading's role as separate evidence.
-    let (roles, heading_roles) = pdf_inspector::structure_tree::StructTree::from_doc(&document)
+    // Keep direct inline roles and enclosing heading/list-item roles as separate evidence.
+    let (roles, block_roles) = pdf_inspector::structure_tree::StructTree::from_doc(&document)
         .map(|tree| {
             use pdf_inspector::structure_tree::StructRole;
             use std::collections::HashMap;
@@ -42,8 +42,8 @@ pub fn extract_pdf(
                     })
                 })
                 .collect::<HashMap<_, _>>();
-            let mut headings = HashMap::<_, Option<String>>::new();
-            let mut stack = Vec::<Option<String>>::new();
+            let mut blocks = HashMap::<_, (Option<String>, Option<&'static str>)>::new();
+            let mut stack = Vec::<(Option<String>, Option<&'static str>)>::new();
             for element in tree.flatten() {
                 stack.truncate(element.depth);
                 let heading = if legal_pdf_core::is_heading_role(element.role.name()) {
@@ -52,25 +52,45 @@ pub fn extract_pdf(
                     element.role,
                     StructRole::Span | StructRole::Link | StructRole::Annot | StructRole::NonStruct
                 ) {
-                    stack.last().cloned().flatten()
+                    stack.last().and_then(|prior| prior.0.clone())
+                } else {
+                    None
+                };
+                let list = if element.role == StructRole::LI {
+                    Some("LI")
+                } else if matches!(
+                    element.role,
+                    StructRole::Lbl
+                        | StructRole::LBody
+                        | StructRole::P
+                        | StructRole::Div
+                        | StructRole::Span
+                        | StructRole::Link
+                        | StructRole::Annot
+                        | StructRole::NonStruct
+                ) {
+                    stack.last().and_then(|prior| prior.1)
                 } else {
                     None
                 };
                 for content in element.content_refs {
                     if let Some(page) = content.page_id.and_then(|id| page_numbers.get(&id)) {
-                        headings
+                        blocks
                             .entry((page.saturating_sub(1) as usize, content.mcid))
                             .and_modify(|prior| {
-                                if prior != &heading {
-                                    *prior = None;
+                                if prior.0 != heading {
+                                    prior.0 = None;
+                                }
+                                if prior.1 != list {
+                                    prior.1 = None;
                                 }
                             })
-                            .or_insert_with(|| heading.clone());
+                            .or_insert_with(|| (heading.clone(), list));
                     }
                 }
-                stack.push(heading);
+                stack.push((heading, list));
             }
-            (roles, headings)
+            (roles, blocks)
         })
         .unwrap_or_default();
     drop(document);
@@ -91,14 +111,35 @@ pub fn extract_pdf(
     for page in &mut extracted.pages {
         for line in &mut page.lines {
             for span in &mut line.spans {
-                span.structure_role = span.mcid.and_then(|mcid| roles.get(&(page.index, mcid)).cloned());
+                span.structure_role = span.mcid.and_then(|mcid| {
+                    let key = (page.index, mcid);
+                    let role = roles.get(&key)?;
+                    // Conflicting enclosing claims cannot reappear through the direct role.
+                    let valid = if legal_pdf_core::is_heading_role(role) {
+                        block_roles.get(&key).and_then(|roles| roles.0.as_deref())
+                            == Some(role.as_str())
+                    } else if role == "LI" {
+                        block_roles.get(&key).and_then(|roles| roles.1) == Some("LI")
+                    } else {
+                        true
+                    };
+                    valid.then(|| role.clone())
+                });
             }
             if let Some(role) = legal_pdf_core::tagged_heading(line, |span| {
                 span.mcid
-                    .and_then(|mcid| heading_roles.get(&(page.index, mcid)))
-                    .and_then(Option::as_deref)
+                    .and_then(|mcid| block_roles.get(&(page.index, mcid)))
+                    .and_then(|roles| roles.0.as_deref())
             }) {
                 line.region_type = role.to_owned();
+            } else if legal_pdf_core::tagged_line_role(line, |span| {
+                span.mcid
+                    .and_then(|mcid| block_roles.get(&(page.index, mcid)))
+                    .and_then(|roles| roles.1)
+            })
+            .is_some()
+            {
+                line.region_type = "LI".to_owned();
             }
         }
     }

@@ -954,6 +954,20 @@ impl PdfResolutionInput {
                 (indexed.line_id.clone(), spans)
             })
             .collect::<BTreeMap<_, _>>();
+        let source_role = |id: &str| {
+            let (_, line) = by_line.get(id)?;
+            if line.exclude_from_body
+                || !line.note_region_mode.is_empty()
+                || line.region_type != "body"
+            {
+                return None;
+            }
+            primitives
+                .source_regions
+                .as_ref()?
+                .get(id)
+                .map(String::as_str)
+        };
         let mut evidence = Vec::new();
         for run in &runs {
             let sentence_items =
@@ -1083,6 +1097,13 @@ impl PdfResolutionInput {
                         })
                 }) {
                     add_observation(&mut observations, CandidateObservationV2::SectionHeading);
+                }
+                if !marker_lines.is_empty()
+                    && marker_lines
+                        .iter()
+                        .all(|line| source_role(&line.line_id) == Some("LI"))
+                {
+                    add_observation(&mut observations, CandidateObservationV2::SourceListItem);
                 }
                 if list_candidates.contains(candidate.id.as_str()) && item_words {
                     add_observation(&mut observations, CandidateObservationV2::ListItemLayout);

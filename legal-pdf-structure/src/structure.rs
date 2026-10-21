@@ -1214,11 +1214,19 @@ fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
         }
         let source = line.region_type.trim();
         let tag = matches!(source, "text" | "body" | "" | "unknown" | "unknown_region")
-            .then(|| legal_pdf_core::tagged_heading(line, |span| span.structure_role.as_deref()))
+            .then(|| {
+                legal_pdf_core::tagged_heading(line, |span| span.structure_role.as_deref()).or_else(
+                    || {
+                        legal_pdf_core::tagged_line_role(line, |span| {
+                            span.structure_role.as_deref().filter(|role| *role == "LI")
+                        })
+                    },
+                )
+            })
             .flatten();
         let region = match tag {
             Some(tag) => tag.to_owned(),
-            None if legal_pdf_core::is_heading_role(source) => source.to_owned(),
+            None if legal_pdf_core::is_heading_role(source) || source == "LI" => source.to_owned(),
             None => source.to_ascii_lowercase(),
         };
         if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {

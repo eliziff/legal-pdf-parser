@@ -749,7 +749,7 @@ impl PPDocLayout {
                 if line.exclude_from_body || line.text.trim().is_empty() {
                     continue;
                 }
-                if legal_pdf_core::is_heading_role(&line.region_type) {
+                if legal_pdf_core::is_heading_role(&line.region_type) || line.region_type == "LI" {
                     continue;
                 }
                 let regions = &regions_by_page[page_position];

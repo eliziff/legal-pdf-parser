@@ -220,6 +220,12 @@ pub struct HeadingEvidence<'a> {
 /// Read the headings set apart by type alone and the depth of every heading. Line roles and
 /// `evidence.levels` change; the caller rebuilds the pages' regions.
 pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) {
+    let native_list = |id: &str| {
+        evidence
+            .source_regions
+            .and_then(|regions| regions.get(id))
+            .is_some_and(|role| role == "LI")
+    };
     let tagged_levels = evidence
         .source_regions
         .into_iter()
@@ -384,7 +390,13 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 .map(|line| line.text.trim())
                 .collect::<Vec<_>>()
                 .join(" ");
-            if flash.line_count() > 4 || text.chars().count() > 300 {
+            if flash.line_count() > 4
+                || text.chars().count() > 300
+                || blocks[block]
+                    .line_slots
+                    .iter()
+                    .any(|&slot| native_list(&pages[blocks[block].page].lines[slot].id))
+            {
                 eligible[block] = false;
                 continue;
             }
