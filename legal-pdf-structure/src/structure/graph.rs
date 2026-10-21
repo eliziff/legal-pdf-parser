@@ -529,8 +529,10 @@ fn sentence_list_items<'a>(
                     |((page, line), (next_page, next_line))| {
                         let left = measures.get(&page.index).map_or(0.0, |m| m.0);
                         let next_left = measures.get(&next_page.index).map_or(0.0, |m| m.0);
-                        (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
-                            <= page.width.max(next_page.width).max(1.0) * 0.008
+                        primitives.heading_context(&line.id)
+                            == primitives.heading_context(&next_line.id)
+                            && (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
+                                <= page.width.max(next_page.width).max(1.0) * 0.008
                     },
                 );
             if !connected {
@@ -552,7 +554,11 @@ fn sentence_list_items<'a>(
                         .rev()
                         .filter_map(|indexed| by_line.get(indexed.line_id.as_str()))
                         .find(|(_, line)| item_text_line(line) && !line.text.trim().is_empty())
-                        .filter(|(_, line)| body(line))
+                        .filter(|(_, line)| {
+                            body(line)
+                                && primitives.heading_context(&line.id)
+                                    == primitives.heading_context(&marker.line_id)
+                        })
                         .map(|(_, line)| line.text.as_str())
                 };
                 let range = ScalarRange {
