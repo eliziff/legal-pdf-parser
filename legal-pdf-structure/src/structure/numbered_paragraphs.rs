@@ -1,7 +1,7 @@
 //! Reading a PDF's print: the paragraphs a printed paragraph number addresses, in the body or
 //! in the margin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // Printed paragraph numbers are addresses, not structural ordinal positions.
 // Split on the actual native lines: a prose node can contain several numbered
@@ -524,11 +524,7 @@ pub(super) fn candidates(
     Vec<legal_structure_model::StructureCandidateRun>,
     Vec<legal_structure_model::CandidateEvidenceV2>,
 ) {
-    use legal_pdf_support::{PdfLookupStatus, PdfTextLine, PdfTextPage, PdfTextWord};
-    use legal_structure_model::{
-        CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, StructureCandidateRun,
-        StructureMarkerCandidate,
-    };
+    use legal_pdf_support::{PdfTextLine, PdfTextPage, PdfTextWord};
     let eligible = |line: &legal_pdf_core::model::Line| {
         !line.exclude_from_body
             && !matches!(
@@ -544,7 +540,7 @@ pub(super) fn candidates(
         .map(|page| PdfTextPage {
             page_number: page.number,
             source: page.source.clone(),
-            regions: page.regions.clone(),
+            regions: Vec::new(),
             width: page.width,
             height: page.height,
             lines: page
@@ -577,10 +573,78 @@ pub(super) fn candidates(
         .filter(|paragraph| paragraph.region_type == "heading")
         .flat_map(|paragraph| paragraph.line_ids.iter().cloned())
         .collect::<HashSet<_>>();
-    let groups = paragraphs
-        .iter()
-        .map(|paragraph| paragraph.line_ids.clone())
-        .collect::<Vec<_>>();
+    let mut groups = BTreeMap::<super::DocumentContext, Vec<Vec<String>>>::new();
+    for paragraph in paragraphs {
+        let mut local = BTreeMap::<super::DocumentContext, Vec<String>>::new();
+        for id in paragraph.line_ids {
+            local
+                .entry(primitives.document_context(&id))
+                .or_default()
+                .push(id);
+        }
+        for (context, lines) in local {
+            groups.entry(context).or_default().push(lines);
+        }
+    }
+    let mut readings = BTreeMap::<super::DocumentContext, (usize, Vec<PdfTextPage>)>::new();
+    for (slot, page) in pages.into_iter().enumerate() {
+        let mut local = BTreeMap::<super::DocumentContext, Vec<PdfTextLine>>::new();
+        for line in page.lines {
+            local
+                .entry(primitives.document_context(&line.id))
+                .or_default()
+                .push(line);
+        }
+        for (context, lines) in local {
+            let (previous, reading) = readings
+                .entry(context)
+                .or_insert_with(|| (slot, Vec::new()));
+            // Omitted pages must not let a printed paragraph bridge unrelated or empty material.
+            if !reading.is_empty() {
+                reading.extend(pages_original[*previous + 1..slot].iter().map(|page| {
+                    PdfTextPage {
+                        page_number: page.number,
+                        source: page.source.clone(),
+                        regions: Vec::new(),
+                        width: page.width,
+                        height: page.height,
+                        lines: Vec::new(),
+                    }
+                }));
+            }
+            reading.push(PdfTextPage {
+                page_number: page.page_number,
+                source: page.source.clone(),
+                regions: Vec::new(),
+                width: page.width,
+                height: page.height,
+                lines,
+            });
+            *previous = slot;
+        }
+    }
+    let mut runs = Vec::new();
+    let mut evidence = Vec::new();
+    for (context, (_, pages)) in readings {
+        let groups = groups.remove(&context).unwrap_or_default();
+        append_candidates(index, &pages, &groups, &headings, &mut runs, &mut evidence);
+    }
+    (runs, evidence)
+}
+
+fn append_candidates(
+    index: &super::graph::PdfTextIndex,
+    pages: &[legal_pdf_support::PdfTextPage],
+    groups: &[Vec<String>],
+    headings: &HashSet<String>,
+    runs: &mut Vec<legal_structure_model::StructureCandidateRun>,
+    evidence: &mut Vec<legal_structure_model::CandidateEvidenceV2>,
+) {
+    use legal_pdf_support::PdfLookupStatus;
+    use legal_structure_model::{
+        CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, StructureCandidateRun,
+        StructureMarkerCandidate,
+    };
     let lines = pages
         .iter()
         .flat_map(|page| {
@@ -594,8 +658,6 @@ pub(super) fn candidates(
             })
         })
         .collect::<Vec<_>>();
-    let mut runs = Vec::new();
-    let mut evidence = Vec::new();
     let labels = lines
         .iter()
         .enumerate()
@@ -613,7 +675,7 @@ pub(super) fn candidates(
             printing.entry(number).or_default().push(slot);
         }
     }
-    for (number, status, selected) in printed_paragraphs(&pages, &lines, &labels, &groups, &headings) {
+    for (number, status, selected) in printed_paragraphs(pages, &lines, &labels, groups, headings) {
         let selections = if status == PdfLookupStatus::Found {
             vec![selected]
         } else if status == PdfLookupStatus::Ambiguous {
@@ -702,7 +764,6 @@ pub(super) fn candidates(
             });
         }
     }
-    (runs, evidence)
 }
 
 /// Detached paragraph labels share a body row and a numbering sequence, not a note band.
