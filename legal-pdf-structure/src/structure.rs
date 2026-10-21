@@ -51,6 +51,7 @@ const HARD_DIAGNOSTICS: &[&str] = &[
 ];
 pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 const MAX_FONT_HEADING_CHARS: usize = 180;
+const FONT_HEADING_SIZE_RATIO: f64 = 1.18;
 
 /// Constituent document and parallel sequence; the PDF's primary text is (0, false).
 pub(super) type DocumentContext = (usize, bool);
@@ -2195,12 +2196,33 @@ fn apply_text_fidelity_headings(
 ) -> HashMap<String, usize> {
     let body_sizes = heading_body_sizes(pages, body_size, primitives);
     for (page, body_size) in pages.iter_mut().zip(&body_sizes) {
+        let listed_top = page
+            .lines
+            .iter()
+            .filter(|line| primitives.contents_line_ids.contains(&line.id))
+            .map(|line| line.bbox[1])
+            .min_by(f64::total_cmp);
         for line in &mut page.lines {
+            if matches!(line.region_type.as_str(), "body" | "heading")
+                && primitives.contents_line_ids.contains(&line.id)
+            {
+                line.region_type = "body".to_owned();
+                continue;
+            }
+            if line.region_type == "body"
+                && !line.exclude_from_body
+                && contents_heading(&line.text)
+                && listed_top.is_some_and(|top| line.bbox[3] <= top)
+                && heading_source_eligible(primitives, line)
+            {
+                line.region_type = "heading".to_owned();
+            }
             if line.region_type == "body"
                 && !line.exclude_from_body
                 && line.note_region_mode.is_empty()
                 && primitives.font_heading_candidates.contains(&line.id)
-                && line_font_size(line) >= body_size * 1.18
+                && heading_source_eligible(primitives, line)
+                && line_font_size(line) >= body_size * FONT_HEADING_SIZE_RATIO
             {
                 line.region_type = "heading".to_owned();
             }
@@ -2520,27 +2542,24 @@ fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
     })
 }
 
-/// The rows of a contents list on a page that is not wholly a contents grid: the
-/// contents heading and the entries contiguous with it, where an entry is a
-/// leader-dotted title ending in a locator or, under a heading or on a
-/// continuation page, a row of the page's dense table. Titles wrapped between
-/// entries and locators split onto their own line belong to the list; lines
-/// before the list and the body heading or paragraph after it stay body.
+fn contents_heading(text: &str) -> bool {
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "contents"
+            | "table of contents"
+            | "table des matières"
+            | "table of provisions"
+            | "table analytique"
+    )
+}
+
+/// Contents entries include their split markers and locators, with the title kept outside.
 fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option<Vec<usize>> {
     const MIN_ENTRIES: usize = 5;
     const MAX_WRAPPED: usize = 6;
     let leader = contents_leader_re();
-    let heading = |line: &Line| {
-        matches!(
-            line.text.trim().to_lowercase().as_str(),
-            "contents"
-                | "table of contents"
-                | "table des matières"
-                | "table of provisions"
-                | "table analytique"
-        )
-    };
-    let tabular = continuing || page.lines.iter().any(heading) && table.strong();
+    let heading = |line: &Line| contents_heading(&line.text);
+    let tabular = table.contents || continuing || page.lines.iter().any(heading) && table.strong();
     let entry = |index: usize| {
         let line = &page.lines[index];
         leader.is_match(&line.text)
@@ -2555,7 +2574,7 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
                 .chars()
                 .all(|c| c.is_ascii_digit() || c == '.' || c.is_whitespace())
     };
-    let mut order: Vec<usize> = (0..page.lines.len())
+    let slots: Vec<usize> = (0..page.lines.len())
         .filter(|index| {
             let line = &page.lines[*index];
             has_valid_bbox(line)
@@ -2563,14 +2582,31 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
                 && !matches!(line.region_type.as_str(), "header" | "footer")
         })
         .collect();
-    order.sort_by(|left, right| band_geometry_order(&page.lines[*left], &page.lines[*right]));
+    let by_id = slots
+        .iter()
+        .map(|&slot| (page.lines[slot].id.as_str(), slot))
+        .collect::<HashMap<_, _>>();
+    let lines = slots
+        .iter()
+        .map(|&slot| &page.lines[slot])
+        .collect::<Vec<_>>();
+    let order = contents::row_bands(&lines)
+        .into_iter()
+        .flatten()
+        .map(|line| by_id[line.id.as_str()])
+        .collect::<Vec<_>>();
     // A page whose running head names the contents list is that list, row by row.
     if page
         .lines
         .iter()
         .any(|line| line.region_type == "header" && heading(line))
     {
-        return (!order.is_empty()).then_some(order);
+        return (!order.is_empty()).then(|| {
+            order
+                .into_iter()
+                .filter(|&index| !heading(&page.lines[index]))
+                .collect()
+        });
     }
     let mut rows = Vec::new();
     let mut wrapped = Vec::new();
@@ -2581,7 +2617,12 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
             if continuing && position > 1 {
                 return None;
             }
-            if heading(&page.lines[index]) || entry(index) {
+            let opens_entry = !contents::family(&page.lines[index].text).is_empty()
+                && order[position + 1..]
+                    .iter()
+                    .take(MAX_WRAPPED)
+                    .any(|&next| entry(next));
+            if heading(&page.lines[index]) || entry(index) || opens_entry {
                 rows.push(index);
                 entries = usize::from(entry(index));
             }
@@ -2604,7 +2645,11 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
             }
         }
     }
-    (entries >= MIN_ENTRIES).then_some(rows)
+    (entries >= MIN_ENTRIES || table.contents).then(|| {
+        rows.into_iter()
+            .filter(|&index| !heading(&page.lines[index]))
+            .collect()
+    })
 }
 
 fn classify_pages_with_source(
@@ -2695,6 +2740,7 @@ fn classify_pages_with_source(
         &translation_context,
         |document| {
             demote_prose_heading_tags(document, evidence);
+            contents::retain_headings(document, evidence);
             heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence));
         },
     );
@@ -2711,7 +2757,10 @@ fn classify_pages_with_source(
             pages,
             &evidence.document_line_ids,
             &evidence.translation_line_ids,
-            crate::paragraphs::segment_paragraphs,
+            |document| {
+                crate::paragraphs::segment_paragraphs(document);
+                contents::group_rows(document, evidence);
+            },
         );
         legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
     });
@@ -2766,7 +2815,7 @@ fn classify_document_pages(
             let continuation = continuing_table;
             let table = table_evidence(&page.lines, page.width);
             let caption = has_table_caption(&page.lines);
-            let rows = (!table.contents && !index_pages.contains(&page.index))
+            let rows = (!index_pages.contains(&page.index))
                 .then(|| {
                     let continuing =
                         continuing_contents && !caption && table.continuation_on_page(page.height);
