@@ -112,7 +112,20 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
             let mut lines = sheet
                 .lines
                 .iter()
-                .filter(|line| line.note_region_mode.is_empty() && !line.exclude_from_body)
+                .filter(|line| {
+                    line.note_region_mode.is_empty()
+                        && !line.exclude_from_body
+                        && !matches!(
+                            line.region_type.to_ascii_lowercase().as_str(),
+                            "header"
+                                | "footer"
+                                | "footnote"
+                                | "endnote"
+                                | "table"
+                                | "table_cell"
+                                | "contents"
+                        )
+                })
                 .collect::<Vec<_>>();
             lines.sort_by(|left, right| {
                 left.reading_order
@@ -272,7 +285,13 @@ pub(super) fn within_document_contexts(
                     width: page.width,
                     height: page.height,
                     lines: Vec::new(),
-                    regions: Vec::new(),
+                    // Initial classification also needs the page's painted table rules.
+                    regions: page
+                        .regions
+                        .iter()
+                        .filter(|region| region.kind == "rule")
+                        .cloned()
+                        .collect(),
                     source: page.source.clone(),
                     text_quality: page.text_quality,
                     printed_label: page.printed_label.clone(),
@@ -303,9 +322,11 @@ pub(super) fn within_document_contexts(
         let mut blocks = HashMap::new();
         page.lines = lines
             .into_iter()
-            .map(|(_, context, mut line)| {
+            .enumerate()
+            .map(|(slot, (_, context, mut line))| {
                 let next = blocks.len();
                 line.block_index = *blocks.entry((context, line.block_index)).or_insert(next);
+                line.reading_order = slot + 1;
                 line
             })
             .collect();
