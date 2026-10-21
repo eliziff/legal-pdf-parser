@@ -170,7 +170,7 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
                 end += 1;
             }
             if (mark || (fields.contains("from") && fields.len() >= 3)) && opened {
-                starts.push((line, "email"));
+                starts.push((slot, "email"));
             }
             opened |= body[slot..end].iter().any(|(line, ..)| content(line));
             slot = end;
@@ -193,9 +193,9 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
         if let Some(kind) = kind.filter(|_| opened) {
             // An exhibit's certificate under a caption of its own opens at the caption.
             let first = if kind == "exhibit" && captioned {
-                body[page_first].0
+                page_first
             } else {
-                line
+                slot
             };
             starts.push((first, kind));
         }
@@ -203,10 +203,13 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
         opened |= content(line);
         slot += 1;
     }
+    // A certificate can backdate its opening to a caption already claimed by another mark.
+    starts.sort_by_key(|(slot, _)| *slot);
+    starts.dedup_by_key(|(slot, _)| *slot);
     starts
         .into_iter()
-        .map(|(line, kind)| Start {
-            line_id: line.id.clone(),
+        .map(|(slot, kind)| Start {
+            line_id: body[slot].0.id.clone(),
             kind: kind.to_owned(),
         })
         .collect()
