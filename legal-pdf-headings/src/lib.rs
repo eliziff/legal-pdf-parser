@@ -288,14 +288,19 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .iter()
         .enumerate()
         .map(|(page_slot, page)| {
-            let text = flash_lines[page_slot]
-                .iter()
-                .zip(&counted[page_slot])
-                .filter_map(|(line, &keep)| keep.then_some(line));
-            stats::page_stats(text, page.width)
+            [false, true].map(|fontless| {
+                let text = flash_lines[page_slot]
+                    .iter()
+                    .zip(&counted[page_slot])
+                    .zip(&page.lines)
+                    .filter_map(|((line, &keep), source)| {
+                        (keep && source.spans.is_empty() == fontless).then_some(line)
+                    });
+                stats::page_stats(text, page.width)
+            })
         })
         .collect::<Vec<_>>();
-    let doc = stats::doc_stats(&page_stats);
+    let doc = [0, 1].map(|kind| stats::doc_stats(page_stats.iter().map(|page| &page[kind])));
 
     // Blocks: runs of body or heading lines sharing a block, as regions group them.
     let mut blocks = Vec::<Block>::new();
@@ -313,6 +318,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             while end < page.lines.len()
                 && page.lines[end].region_type == line.region_type
                 && page.lines[end].block_index == line.block_index
+                && page.lines[end].spans.is_empty() == line.spans.is_empty()
                 && counted[page_slot][end]
                 && (evidence.translation)(&page.lines[end].id) == (evidence.translation)(&line.id)
                 && tagged_levels.get(&page.lines[end].id) == tagged_levels.get(&line.id)
@@ -337,6 +343,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     || (evidence.numbered)(first),
                 is_body: false,
                 translation: (evidence.translation)(&line.id),
+                fontless: line.spans.is_empty(),
             });
             ids.push(blocks.len() - 1);
             slot = end;
@@ -346,16 +353,15 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             height: page.height,
             stats: page_stats[page_slot].clone(),
             blocks: ids,
-            body_styles: HashSet::new(),
+            body_styles: std::array::from_fn(|_| HashSet::new()),
         });
     }
     for page in &mut flash_pages {
         for &block in &page.blocks {
-            let body =
-                !blocks[block].heading && is_body_paragraph(&doc, page, &blocks[block].flash);
+            let body = !blocks[block].heading && is_body_paragraph(&doc, page, &blocks[block]);
             blocks[block].is_body = body;
             if body {
-                page.body_styles
+                page.body_styles[usize::from(blocks[block].fontless)]
                     .insert(blocks[block].flash.dominant_style().to_owned());
             }
         }
@@ -371,6 +377,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     for page in &flash_pages {
         for (position, &block) in page.blocks.iter().enumerate() {
             let flash = &blocks[block].flash;
+            let stats = page.stats(blocks[block].fontless);
             let text = flash
                 .lines
                 .iter()
@@ -400,7 +407,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 || text.ends_with(".\u{201d}")
                 || text.ends_with("\u{201d}.");
             // The type and wording tests are cheap; the layout tests below read the whole page.
-            if flash.size < page.stats.font_size - 0.5
+            if flash.size < stats.font_size - 0.5
                 || !opens
                 || quoted
                 || matches!(ends, Some(',' | ';'))
@@ -565,6 +572,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         }
     }
     let context = Context {
+        doc: &doc,
         blocks: &blocks,
         pages: &flash_pages,
         positions: &positions,

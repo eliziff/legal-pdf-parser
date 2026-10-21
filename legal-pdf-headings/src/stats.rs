@@ -162,7 +162,7 @@ pub(super) struct DocStats {
     pub(super) body_font_size: f64,
 }
 
-pub(super) fn doc_stats(pages: &[PageStats]) -> DocStats {
+pub(super) fn doc_stats<'a>(pages: impl IntoIterator<Item = &'a PageStats>) -> DocStats {
     let mut widths = Vec::new();
     let mut fills = Vec::new();
     let mut sizes = Vec::new();
