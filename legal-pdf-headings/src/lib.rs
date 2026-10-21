@@ -15,7 +15,8 @@
 //!   font-distance rejection.
 //! - Native line boxes rise to the font's ascent; Flash's glyph boxes stop near the capitals.
 //! - A new heading is in the page's own type size or larger, opens with a capital or a number,
-//!   is no quotation, citation or lead-in, and does not sit beside running text.
+//!   and does not sit beside running text. Inside a quotation, a bold provision label or an
+//!   italic title above contrasting prose can structure that passage.
 //! - Lines above the last party label on a page (`APPLICANT`, `— Respondent`) are the case
 //!   caption, never headings; a heading of a few stray characters holds no section; a
 //!   capitalized title wrapped onto a second line is one heading.
@@ -196,6 +197,27 @@ fn set_apart_by_type(block: &FlashBlock, next: Option<&FlashBlock>) -> bool {
     stats.letters() > 0 && f64::from(stats.counts[2]) >= 0.78 * f64::from(stats.letters())
 }
 
+/// A provision label consists of its legal prefix and numbering, without running words.
+fn provision_label(text: &str) -> bool {
+    let Some((prefix, rest)) = text.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let analysis = layout_analysis();
+    let word = prefix.trim_end_matches('.').to_ascii_lowercase();
+    if !(matches!(word.as_str(), "s" | "ss") || analysis.is_counter_noun(&word))
+        || !analysis.has_citation_cue(prefix)
+    {
+        return false;
+    }
+    let mut parts = rest
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
+        .filter(|part| !part.is_empty());
+    parts.next().is_some_and(|first| {
+        first.starts_with(|c: char| c.is_ascii_digit())
+            && analysis.numbering_marker(first, None).is_some()
+    }) && parts.all(|part| analysis.numbering_marker(part, None).is_some())
+}
+
 /// A line that is a citation and little else ("[2026] SGCA 26") names a case, not a section.
 fn citation_only(block: &FlashBlock) -> bool {
     let text = block
@@ -221,6 +243,8 @@ fn citation_only(block: &FlashBlock) -> bool {
 
 /// What the structure stage has read that the heading reader needs.
 pub struct HeadingEvidence<'a> {
+    /// This reading belongs to a quotation, whose labels and titles structure only that passage.
+    pub quotation: bool,
     /// Line id to level of every heading accepted so far; the reader adds and removes.
     pub levels: &'a mut HashMap<String, usize>,
     /// Lines that can be no heading: a contents row, a table cell.
@@ -440,11 +464,21 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 .iter()
                 .find(|&&next| blocks[next].translation == blocks[block].translation)
                 .map(|&next| &blocks[next].flash);
-            type_candidates[block] = set_apart_by_type(flash, next);
-            let opens = text
-                .chars()
-                .find(|character| character.is_alphanumeric())
-                .is_some_and(|character| character.is_uppercase() || character.is_numeric());
+            let provision = evidence.quotation
+                && flash.bold >= 0.95
+                && next.is_some_and(|next| next.bold < 0.5)
+                && provision_label(&text);
+            let italic_title = evidence.quotation
+                && flash.italic >= 0.95
+                && flash.line_count() <= 2
+                && !text.trim_end().ends_with(['.', ',', ';', '?', '!'])
+                && next.is_some_and(|next| next.italic < 0.5 && next.line_count() >= 2);
+            type_candidates[block] = provision || italic_title || set_apart_by_type(flash, next);
+            let opens = provision
+                || text
+                    .chars()
+                    .find(|character| character.is_alphanumeric())
+                    .is_some_and(|character| character.is_uppercase() || character.is_numeric());
             let ends = text
                 .trim_end_matches(|character: char| {
                     character.is_whitespace() || "\"')]\u{201d}\u{2019}".contains(character)
@@ -536,11 +570,12 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             eligible[block] = !indented
                 && !runs_on
                 && !beside()
-                && !*cited.entry(text.clone()).or_insert_with(|| {
-                    (analysis.has_citation_cue(&text) && text.chars().any(|c| c.is_ascii_digit()))
-                        || analysis.has_citation_signal(&text)
-                })
-                && !citation_only(flash);
+                && (provision
+                    || (!*cited.entry(text.clone()).or_insert_with(|| {
+                        (analysis.has_citation_cue(&text)
+                            && text.chars().any(|c| c.is_ascii_digit()))
+                            || analysis.has_citation_signal(&text)
+                    }) && !citation_only(flash)));
         }
     }
     let mut positions = vec![0; blocks.len()];

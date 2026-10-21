@@ -507,7 +507,7 @@ fn opens_with_heading(block: &[&Row<'_>]) -> bool {
 }
 
 /// Whether a block of rows set in from the body's margin is a display quotation; `introduction`
-/// is the text of the body row before it.
+/// is the complete body paragraph before it.
 fn quotation(
     block: &[&Row],
     introduction: Option<&Introduction>,
@@ -605,7 +605,48 @@ fn quotation(
                     prefix.trim().is_empty() || prefix.trim().eq_ignore_ascii_case("at")
                 })
         });
-        if heading && (introduced || announced) || announced && cited || heading && cited && located
+        // An inline title after the colon can introduce the provision named just before it.
+        let inline_title = introduction.is_some_and(|intro| {
+            let Some((lead, title)) = intro.text.rsplit_once(':') else {
+                return false;
+            };
+            let title = title.trim();
+            if !title.starts_with(char::is_uppercase)
+                || title.chars().count() > super::MAX_FONT_HEADING_CHARS
+                || title.ends_with(['.', ',', ';', ':', '?', '!'])
+                || layout_analysis().has_citation_cue(title)
+                || layout_analysis().has_citation_signal(title)
+            {
+                return false;
+            }
+            let Some(marker) = first
+                .split_whitespace()
+                .next()
+                .and_then(|word| layout_analysis().numbering_marker(word, None))
+            else {
+                return false;
+            };
+            layout_analysis()
+                .protected_citation_spans(lead)
+                .iter()
+                .any(|(start, end)| {
+                    let citation = lead
+                        .chars()
+                        .skip(*start)
+                        .take(end - start)
+                        .collect::<String>();
+                    citation.split_whitespace().any(|word| {
+                        layout_analysis()
+                            .numbering_marker(word.trim_end_matches([',', ';']), None)
+                            .as_ref()
+                            == Some(&marker)
+                    })
+                })
+        });
+        if heading && (introduced || announced)
+            || announced && cited
+            || heading && cited && located
+            || inline_title
         {
             return true;
         }
