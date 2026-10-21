@@ -577,7 +577,7 @@ pub(super) fn candidates(
     let mut groups = BTreeMap::<super::DocumentContext, Vec<Vec<String>>>::new();
     for paragraph in paragraphs {
         groups
-            .entry(primitives.document_context(&paragraph.line_ids[0]))
+            .entry(primitives.reading_context(&paragraph.line_ids[0]))
             .or_default()
             .push(paragraph.line_ids);
     }
@@ -586,7 +586,7 @@ pub(super) fn candidates(
         let mut local = BTreeMap::<super::DocumentContext, Vec<PdfTextLine>>::new();
         for line in page.lines {
             local
-                .entry(primitives.document_context(&line.id))
+                .entry(primitives.reading_context(&line.id))
                 .or_default()
                 .push(line);
         }

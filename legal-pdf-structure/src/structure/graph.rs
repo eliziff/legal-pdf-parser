@@ -36,7 +36,6 @@ pub struct PdfTextIndex {
 #[derive(Debug)]
 pub(super) struct PdfResolutionInput {
     pub(super) index: PdfTextIndex,
-    pub(super) quotation_scopes: HashMap<String, String>,
     pub(super) runs: Vec<StructureCandidateRun>,
     pub(super) evidence: Vec<CandidateEvidenceV2>,
     pub(super) citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
@@ -352,7 +351,7 @@ fn wrapped_into(
         .filter(|indexed| indexed.range.end <= candidate.marker_range.start)
         .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).map(|(_, line)| *line))
         .find(|line| {
-            primitives.document_context(&line.id) == context
+            primitives.reading_context(&line.id) == context
                 && item_text_line(line)
                 && !line.text.trim().is_empty()
         })
@@ -391,13 +390,13 @@ fn apart_end(
             .line_id
             .as_str(),
     )?;
-    let context = primitives.document_context(&marker.id);
+    let context = primitives.reading_context(&marker.id);
     let (indexed, line) = index
         .overlapping_lines(candidate.range)
         .iter()
         .filter(|indexed| {
             indexed.range.end > candidate.content_start
-                && primitives.document_context(&indexed.line_id) == context
+                && primitives.reading_context(&indexed.line_id) == context
         })
         .filter_map(|indexed| Some((indexed, by_line.get(indexed.line_id.as_str())?.1)))
         .find(|(_, line)| item_text_line(line) && !line.text.trim().is_empty())?;
@@ -424,7 +423,7 @@ fn layout_end(
             .line_id
             .as_str(),
     )?;
-    let context = primitives.document_context(&marker.id);
+    let context = primitives.reading_context(&marker.id);
     let (left, _) = measures.get(&(context, marker.page_index))?;
     let offset = marker.bbox[0] - left;
     let mut previous: Option<&Line> = None;
@@ -432,7 +431,7 @@ fn layout_end(
     // Where the item's own lines wrap to, from the page's left edge.
     let mut hang = None;
     for indexed in index.overlapping_lines(candidate.range) {
-        if primitives.document_context(&indexed.line_id) != context {
+        if primitives.reading_context(&indexed.line_id) != context {
             continue;
         }
         if indexed.range.end <= candidate.content_start {
@@ -518,7 +517,7 @@ fn sentence_list_items<'a>(
                 end: candidate.range.end,
             })
             .iter()
-            .filter(|indexed| primitives.document_context(&indexed.line_id) == context)
+            .filter(|indexed| primitives.reading_context(&indexed.line_id) == context)
             .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).copied())
             .find(|(_, line)| body(line) && !line.text.trim().is_empty())
             .or_else(|| {
@@ -546,13 +545,13 @@ fn sentence_list_items<'a>(
                 && source(prior).zip(source(next)).is_some_and(
                     |((page, line), (next_page, next_line))| {
                         let left = measures
-                            .get(&(primitives.document_context(&line.id), page.index))
+                            .get(&(primitives.reading_context(&line.id), page.index))
                             .map_or(0.0, |m| m.0);
                         let next_left = measures
-                            .get(&(primitives.document_context(&next_line.id), next_page.index))
+                            .get(&(primitives.reading_context(&next_line.id), next_page.index))
                             .map_or(0.0, |m| m.0);
-                        primitives.document_context(&line.id)
-                            == primitives.document_context(&next_line.id)
+                        primitives.reading_context(&line.id)
+                            == primitives.reading_context(&next_line.id)
                             && (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
                                 <= page.width.max(next_page.width).max(1.0) * 0.008
                     },
@@ -578,8 +577,8 @@ fn sentence_list_items<'a>(
                         .find(|(_, line)| {
                             body(line)
                                 && !line.text.trim().is_empty()
-                                && primitives.document_context(&line.id)
-                                    == primitives.document_context(&marker.line_id)
+                                && primitives.reading_context(&line.id)
+                                    == primitives.reading_context(&marker.line_id)
                         })
                         .map(|(_, line)| line.text.as_str())
                 };
@@ -590,8 +589,8 @@ fn sentence_list_items<'a>(
                 let mut words = index.overlapping_lines(range).iter().filter_map(|indexed| {
                     let (_, line) = by_line.get(indexed.line_id.as_str())?;
                     (body(line)
-                        && primitives.document_context(&line.id)
-                            == primitives.document_context(&marker.line_id))
+                        && primitives.reading_context(&line.id)
+                            == primitives.reading_context(&marker.line_id))
                     .then(|| {
                         text.slice(
                             range.start.max(indexed.range.start)..range.end.min(indexed.range.end),
@@ -629,9 +628,9 @@ fn context_at(
     primitives: &PdfPrimitiveEvidence,
     at: usize,
 ) -> DocumentContext {
-    index.line_at(at).map_or((0, false), |line| {
-        primitives.document_context(&line.line_id)
-    })
+    index
+        .line_at(at)
+        .map_or((0, false), |line| primitives.reading_context(&line.line_id))
 }
 
 fn read_candidates(
@@ -692,13 +691,13 @@ fn read_candidates(
                 }),
         );
     };
-    if primitives.document_line_ids.is_empty() && primitives.translation_line_ids.is_empty() {
+    if primitives.reading_lines().is_empty() && primitives.translation_line_ids.is_empty() {
         read(text, 0, (0, false), None);
     } else {
         let mut readings = BTreeMap::<DocumentContext, Vec<&IndexedPdfLine>>::new();
         for line in &index.lines {
             readings
-                .entry(primitives.document_context(&line.line_id))
+                .entry(primitives.reading_context(&line.line_id))
                 .or_default()
                 .push(line);
         }
@@ -760,7 +759,7 @@ impl PdfResolutionInput {
                 if let Some(body) = body.filter(|body| {
                     candidate.marker_range.end <= body.range.start
                         && body.range.start < candidate.range.end
-                        && primitives.document_context(&body.line_id)
+                        && primitives.reading_context(&body.line_id)
                             == context_at(&index, primitives, candidate.marker_range.start)
                 }) {
                     candidate.content_start = body.range.start;
@@ -771,17 +770,17 @@ impl PdfResolutionInput {
         for page in pages {
             for line in page.lines.iter().filter(|line| item_text_line(line)) {
                 let bounds = measures
-                    .entry((primitives.document_context(&line.id), page.index))
+                    .entry((primitives.reading_context(&line.id), page.index))
                     .or_insert((line.bbox[0], line.bbox[2]));
                 bounds.0 = bounds.0.min(line.bbox[0]);
                 bounds.1 = bounds.1.max(line.bbox[2]);
             }
         }
-        let quotation_scopes = super::quotations::quotation_scopes(pages, primitives);
-        let quotations = quotation_scopes.keys().cloned().collect::<HashSet<_>>();
+        // Every run owns its reading context; quoted text is not foreign to its own run.
+        let quotations = HashSet::new();
         let context = legal_pdf_witnesses::Context {
-            documents: Some(&primitives.document_line_ids),
-            quoted: Some(&quotations),
+            documents: Some(primitives.reading_lines()),
+            quoted: None,
             table_cells: Some(&primitives.table_cell_line_ids),
             contents: Some(&primitives.contents_line_ids),
             translation: Some(&primitives.translation_line_ids),
@@ -798,24 +797,17 @@ impl PdfResolutionInput {
                 .and_then(|decision| rows.get(line_id).and_then(|row| decision.holds(row)))
                 == Some(true)
         };
-        let quoted = |candidate: &StructureMarkerCandidate| {
-            index
-                .line_at(candidate.marker_range.start)
-                .is_some_and(|indexed| quotations.contains(&indexed.line_id))
-        };
-        // The numbered paragraphs' numbers: a count from 1 set in the body, not the folios nor
-        // a quotation's.
+        // Each reading's numbered paragraphs keep a count separate from enclosing text.
         let mut paragraph_starts = BTreeMap::<DocumentContext, Vec<usize>>::new();
         for candidate in runs
             .iter()
             .filter(|run| run.grammar == CandidateGrammar::Numeric && run.rooted && run.consecutive)
             .flat_map(|run| &run.markers)
             .filter(|candidate| {
-                !quoted(candidate)
-                    && index
-                        .line_at(candidate.marker_range.start)
-                        .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
-                        .is_some_and(|(_, line)| item_text_line(line))
+                index
+                    .line_at(candidate.marker_range.start)
+                    .and_then(|indexed| by_line.get(indexed.line_id.as_str()))
+                    .is_some_and(|(_, line)| item_text_line(line))
             })
         {
             paragraph_starts
@@ -862,7 +854,7 @@ impl PdfResolutionInput {
                         .flatten()
                         .filter(|indexed| {
                             indexed.range.start > candidate.content_start
-                                && primitives.document_context(&indexed.line_id) == context
+                                && primitives.reading_context(&indexed.line_id) == context
                         })
                         .find(|indexed| {
                             by_line
@@ -899,8 +891,8 @@ impl PdfResolutionInput {
                     !line.exclude_from_body
                         && line.note_region_mode.is_empty()
                         && line.region_type == "body"
-                }) && primitives.document_context(&pair[0].id)
-                    == primitives.document_context(&pair[1].id)
+                }) && primitives.reading_context(&pair[0].id)
+                    == primitives.reading_context(&pair[1].id)
                     && body_flow_edge(&pair[0], &pair[1])
                 {
                     flow_lines.insert(pair[0].id.as_str());
@@ -938,7 +930,7 @@ impl PdfResolutionInput {
                     .iter()
                     .copied()
                     .filter(|&slot| {
-                        citation_ranges[slot].0 == primitives.document_context(&indexed.line_id)
+                        citation_ranges[slot].0 == primitives.reading_context(&indexed.line_id)
                             && indexed.range.start < citation_ranges[slot].2
                     })
                     .collect::<Vec<_>>();
@@ -1025,7 +1017,7 @@ impl PdfResolutionInput {
                 let candidate_lines = index
                     .overlapping_lines(candidate.range)
                     .iter()
-                    .filter(|line| primitives.document_context(&line.line_id) == context)
+                    .filter(|line| primitives.reading_context(&line.line_id) == context)
                     .collect::<Vec<_>>();
                 // A running head, folio or print margin inside the range is the page's, not
                 // the item's; an item set wholly in them keeps them, and is excluded as furniture.
@@ -1051,7 +1043,7 @@ impl PdfResolutionInput {
                 let marker_lines = index
                     .overlapping_lines(candidate.marker_range)
                     .iter()
-                    .filter(|line| primitives.document_context(&line.line_id) == context)
+                    .filter(|line| primitives.reading_context(&line.line_id) == context)
                     .collect::<Vec<_>>();
                 let marker_line = marker_lines.first().map(|indexed| indexed.line_id.as_str()).unwrap_or("");
                 let mut observations = Vec::new();
@@ -1195,9 +1187,6 @@ impl PdfResolutionInput {
                 if furniture {
                     add_observation(&mut observations, CandidateObservationV2::Furniture);
                 }
-                if quoted(candidate) {
-                    add_observation(&mut observations, CandidateObservationV2::Quotation);
-                }
                 if composed("numbered_paragraph", marker_line) {
                     add_observation(&mut observations, CandidateObservationV2::ComposedParagraph);
                 }
@@ -1263,7 +1252,6 @@ impl PdfResolutionInput {
             index,
             runs,
             evidence,
-            quotation_scopes,
             citation_spans,
         }
     }
@@ -1589,6 +1577,46 @@ pub(super) fn native_graph_parts(
         if let (Some(first), Some(last)) = (table_node.ranges.first(), table_node.ranges.last()) {
             table_node.range = ScalarRange { start: first.start, end: last.end };
         }
+    }
+    let mut quoted = BTreeMap::<&str, Vec<String>>::new();
+    for line in &index.lines {
+        let mut scope = primitives
+            .quotations
+            .scopes
+            .get(&line.line_id)
+            .map(String::as_str);
+        while let Some(id) = scope {
+            quoted.entry(id).or_default().push(line.line_id.clone());
+            scope = primitives
+                .quotations
+                .introductions
+                .get(id)
+                .and_then(|intro| primitives.quotations.scopes.get(intro))
+                .map(String::as_str);
+        }
+    }
+    for (id, line_ids) in quoted {
+        let range = index
+            .range_for_line_ids(&line_ids)
+            .ok_or_else(|| Error::Message(format!("quotation {id} has no indexed lines")))?;
+        let mut node = StructureNode::new(
+            id.to_owned(),
+            NodeKind::Quote,
+            range,
+            ORIGIN,
+            Derivation::Heuristic,
+            None,
+        );
+        node.ranges = source_membership(
+            line_ids
+                .iter()
+                .filter_map(|id| index.line(id).map(|line| line.range))
+                .collect(),
+        );
+        node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
+        node.line_ids = line_ids;
+        node.grammar = Some("display_quotation".to_owned());
+        nodes.push(node);
     }
     Ok(nodes)
 }

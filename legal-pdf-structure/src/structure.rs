@@ -54,7 +54,7 @@ pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 const MAX_FONT_HEADING_CHARS: usize = 180;
 const FONT_HEADING_SIZE_RATIO: f64 = 1.18;
 
-/// Constituent document and parallel sequence; the PDF's primary text is (0, false).
+/// A document or embedded reading and its parallel sequence; primary text is (0, false).
 pub(super) type DocumentContext = (usize, bool);
 
 #[derive(Debug, Clone)]
@@ -80,6 +80,10 @@ struct PdfPrimitiveEvidence {
     constituent_starts: Vec<constituents::Start>,
     document_line_ids: HashMap<String, usize>,
     #[serde(default)]
+    quotations: quotations::Reading,
+    #[serde(default)]
+    reading_line_ids: HashMap<String, usize>,
+    #[serde(default)]
     navigation_parents: HashMap<String, Option<String>>,
     /// Tables drawn with rules, read from each page's painted rules.
     tables: Vec<legal_pdf_tables::PdfTable>,
@@ -89,6 +93,21 @@ impl PdfPrimitiveEvidence {
     fn document_context(&self, id: &str) -> DocumentContext {
         (
             self.document_line_ids.get(id).copied().unwrap_or(0),
+            self.translation_line_ids.contains(id),
+        )
+    }
+
+    fn reading_lines(&self) -> &HashMap<String, usize> {
+        if self.reading_line_ids.is_empty() {
+            &self.document_line_ids
+        } else {
+            &self.reading_line_ids
+        }
+    }
+
+    fn reading_context(&self, id: &str) -> DocumentContext {
+        (
+            self.reading_lines().get(id).copied().unwrap_or(0),
             self.translation_line_ids.contains(id),
         )
     }
@@ -3777,7 +3796,7 @@ fn build_paragraphs_with_context(
     anchors: &HashMap<String, Vec<Anchor>>,
     primitives: &PdfPrimitiveEvidence,
 ) -> Vec<Paragraph> {
-    let context = |id: &str| primitives.document_context(id);
+    let context = |id: &str| primitives.reading_context(id);
     let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
     let mut tails = HashMap::<DocumentContext, usize>::new();
     for page in pages {
@@ -4376,6 +4395,8 @@ fn prepare_reader(
         );
         changed
     });
+    primitives.quotations = quotations::read(pages, &primitives);
+    primitives.reading_line_ids = quotations::reading_lines(pages, &primitives);
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
             primitives.contents_line_ids.contains(id)
@@ -4387,7 +4408,7 @@ fn prepare_reader(
         let translation = |id: &str| primitives.translation_line_ids.contains(id);
         constituents::within_document_contexts(
             pages,
-            &primitives.document_line_ids,
+            &primitives.reading_line_ids,
             &primitives.translation_line_ids,
             |document| {
                 legal_pdf_headings::reconcile_styled_headings(
@@ -4513,31 +4534,46 @@ fn derive_prepared(
     let source_fragments = resolution.index.source_fragments();
     let pages: &[Page] = pages;
     let document_id = identity.document_id.clone();
-    let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
-        legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
-            identity.document_id,
-            "local-pdf".to_owned(),
-            resolution.index.text(),
-            Some(identity.source_sha256),
-            nodes,
-            &resolution.runs,
-            &resolution.evidence,
-            &note_pairs,
-            graph_diagnostics,
-            &mut |nodes| {
-                let contexts = outline_contexts(
-                    nodes,
-                    &document_id,
-                    &resolution.quotation_scopes,
-                    &resolution.index,
-                    &prepared.primitives,
-                );
-                let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
-                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents, &prepared.primitives.heading_levels);
-            },
-        )
-    })
-    .map_err(|error| Error::Message(error.to_string()))?;
+    let mut structure_graph =
+        legal_pdf_support::profile::measure("derive.structure_graph", || {
+            legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
+                identity.document_id,
+                "local-pdf".to_owned(),
+                resolution.index.text(),
+                Some(identity.source_sha256),
+                nodes,
+                &resolution.runs,
+                &resolution.evidence,
+                &note_pairs,
+                graph_diagnostics,
+                &mut |nodes| {
+                    let contexts = outline_contexts(
+                        nodes,
+                        &document_id,
+                        &prepared.primitives.quotations,
+                        &resolution.index,
+                        &prepared.primitives,
+                    );
+                    let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
+                    let mut parents = prepared.primitives.navigation_parents.clone();
+                    parents.extend(
+                        prepared.primitives.quotations.introductions.iter().map(
+                            |(quote, introduction)| (quote.clone(), Some(introduction.clone())),
+                        ),
+                    );
+                    legal_pdf_witnesses::assemble_outline(
+                        nodes,
+                        &contexts,
+                        resolution.index.text(),
+                        pages,
+                        &line_range,
+                        &parents,
+                        &prepared.primitives.heading_levels,
+                    );
+                },
+            )
+        })
+        .map_err(|error| Error::Message(error.to_string()))?;
     structure_graph.profile = identity.profile;
     structure_graph.source_fragments = source_fragments;
     Ok(StructureOutput {
@@ -4552,7 +4588,7 @@ fn derive_prepared(
 /// constituent document holding it, and its quotation, note, table cell or parallel text.
 fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
-    quote_ids: &HashMap<String, String>,
+    quotes: &quotations::Reading,
     index: &PdfTextIndex,
     primitives: &PdfPrimitiveEvidence,
 ) -> Vec<legal_pdf_witnesses::OutlineContext> {
@@ -4585,10 +4621,10 @@ fn outline_contexts(
             if let Some(marker) = node.marker_range {
                 let ids = index.line_ids(marker);
                 if let Some(first) = ids.first() {
-                    let context = primitives.document_context(first);
+                    let context = primitives.reading_context(first);
                     source.extend(
                         ids.iter()
-                            .filter(|id| primitives.document_context(id) == context)
+                            .filter(|id| primitives.reading_context(id) == context)
                             .filter_map(|id| index.line(id))
                             .map(|line| ScalarRange {
                                 start: marker.start.max(line.range.start),
@@ -4640,30 +4676,65 @@ fn outline_contexts(
         !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
             range.start <= part.start && part.end <= range.end))
     };
-    nodes.iter_mut().map(|node| {
-        if node.kind == NodeKind::Heading {
-            node.role = Some(PrimaryRole::Heading);
-            node.heading_range = (node.ranges.len() == 1).then_some(node.range);
-        } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
-            node.role.get_or_insert(PrimaryRole::Text);
-        }
-        let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| holders.iter()
-            .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _)| id.clone());
-        // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
-        // belonging to its quotation or note: it names only its document.
-        let unit = node.kind != NodeKind::Page;
-        let quotation = node.line_ids.first().filter(|_| unit).and_then(|id| quote_ids.get(id))
-            .filter(|id| node.line_ids.iter().all(|line| quote_ids.get(line) == Some(*id))).cloned();
-        let translated = unit
-            && !node.line_ids.is_empty()
-            && node.line_ids.iter().all(|id| translation.contains(id));
-        let container = smallest(&cells)
-            .filter(|_| unit)
-            .map(|id| format!("object:{id}"))
-            .or_else(|| translated.then(|| "translation".to_owned()));
-        (smallest(&constituents).unwrap_or_else(|| document_id.to_owned()), quotation, container)
-    }).collect()
+    nodes
+        .iter_mut()
+        .map(|node| {
+            if node.kind == NodeKind::Heading {
+                node.role = Some(PrimaryRole::Heading);
+                node.heading_range = (node.ranges.len() == 1).then_some(node.range);
+            } else if matches!(
+                node.kind,
+                NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose
+            ) {
+                node.role.get_or_insert(PrimaryRole::Text);
+            }
+            let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| {
+                holders
+                    .iter()
+                    .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
+                    .min_by_key(|(_, ranges)| {
+                        ranges
+                            .iter()
+                            .map(|range| range.end - range.start)
+                            .sum::<usize>()
+                    })
+                    .map(|(id, _)| id.clone())
+            };
+            // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
+            // belonging to its quotation or note: it names only its document.
+            let unit = node.kind != NodeKind::Page;
+            let quotation = if node.kind == NodeKind::Quote {
+                quotes
+                    .introductions
+                    .get(&node.id)
+                    .and_then(|id| quotes.scopes.get(id))
+                    .cloned()
+            } else {
+                node.line_ids
+                    .first()
+                    .filter(|_| unit)
+                    .and_then(|id| quotes.scopes.get(id))
+                    .filter(|id| {
+                        node.line_ids
+                            .iter()
+                            .all(|line| quotes.scopes.get(line) == Some(*id))
+                    })
+                    .cloned()
+            };
+            let translated = unit
+                && !node.line_ids.is_empty()
+                && node.line_ids.iter().all(|id| translation.contains(id));
+            let container = smallest(&cells)
+                .filter(|_| unit)
+                .map(|id| format!("object:{id}"))
+                .or_else(|| translated.then(|| "translation".to_owned()));
+            (
+                smallest(&constituents).unwrap_or_else(|| document_id.to_owned()),
+                quotation,
+                container,
+            )
+        })
+        .collect()
 }
 
 pub fn derive(

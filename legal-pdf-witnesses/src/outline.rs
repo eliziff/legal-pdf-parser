@@ -105,8 +105,8 @@ fn unit_style(
 }
 
 /// Set every outline unit's parent. `contexts` holds each node's context; a parent link between
-/// contexts is dropped, except a row's to its table and a cell's to its row. `line_range` gives a
-/// page line's place in `text`.
+/// contexts is dropped, except table ownership and a quotation's local roots. `navigation` also
+/// names each quotation's introducing source line. `line_range` gives a page line's place in `text`.
 pub fn assemble_outline(
     nodes: &mut [StructureNode],
     contexts: &[Context],
@@ -216,6 +216,69 @@ pub fn assemble_outline(
     for unit in &mut units {
         unit.rank = styles[&unit.context].iter().position(|style| style == &unit.style).unwrap_or(0) as f32;
     }
+    let mut introducers = HashMap::<&str, Vec<usize>>::new();
+    for node in nodes.iter().filter(|node| node.kind == NodeKind::Quote) {
+        if let Some(Some(line)) = navigation.get(&node.id) {
+            introducers.entry(line).or_default();
+        }
+    }
+    for (position, unit) in units.iter().enumerate() {
+        for id in &nodes[unit.node].line_ids {
+            if let Some(owners) = introducers.get_mut(id.as_str()) {
+                owners.push(position);
+            }
+        }
+    }
+    let quote_owners = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NodeKind::Quote)
+        .filter_map(|(position, node)| {
+            let line = navigation.get(&node.id)?.as_deref()?;
+            let owner = introducers
+                .get(line)?
+                .iter()
+                .copied()
+                .filter(|&owner| {
+                    units[owner].context == contexts[position]
+                        && nodes[units[owner].node].range.start < node.range.start
+                })
+                .min_by_key(|&owner| {
+                    let node = &nodes[units[owner].node];
+                    let parts = if node.ranges.is_empty() {
+                        std::slice::from_ref(&node.range)
+                    } else {
+                        &node.ranges
+                    };
+                    let size = parts
+                        .iter()
+                        .map(|part| part.end - part.start)
+                        .sum::<usize>();
+                    let priority = if node.role.is_some() {
+                        0
+                    } else if node.kind == NodeKind::Heading {
+                        1
+                    } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem) {
+                        2
+                    } else {
+                        3
+                    };
+                    (size, priority, owner)
+                })?;
+            Some((position, owner))
+        })
+        .collect::<Vec<_>>();
+    for (quote, owner) in quote_owners {
+        nodes[quote].parent_id = Some(nodes[units[owner].node].id.clone());
+        // The quotation consumes this lead-in; later prose resumes in the enclosing outline.
+        units[owner].lead_in = false;
+    }
+    let quote_positions = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NodeKind::Quote)
+        .map(|(position, node)| (node.id.clone(), position))
+        .collect::<HashMap<_, _>>();
     let mut heading_targets = HashMap::<&str, Option<usize>>::new();
     for (position, unit) in units.iter().enumerate().filter(|(_, unit)| heading(&nodes[unit.node])) {
         heading_targets.insert(nodes[unit.node].id.as_str(), Some(position));
@@ -317,14 +380,43 @@ pub fn assemble_outline(
         }
     }
     for (position, unit) in units.iter().enumerate() {
-        nodes[unit.node].parent_id = chosen[position].map(|parent| nodes[units[parent].node].id.clone());
+        let parent = chosen[position]
+            .map(|parent| units[parent].node)
+            .or_else(|| {
+                let quote = unit
+                    .context
+                    .1
+                    .as_ref()
+                    .and_then(|id| quote_positions.get(id))
+                    .copied()?;
+                (contexts[quote].0 == unit.context.0 && contexts[quote].2 == unit.context.2)
+                    .then_some(quote)
+            });
+        nodes[unit.node].parent_id = parent.map(|parent| nodes[parent].id.clone());
     }
     let positions = nodes.iter().enumerate().map(|(position, node)| (node.id.clone(), position)).collect::<HashMap<_, _>>();
     for position in 0..nodes.len() {
-        let Some(parent) = nodes[position].parent_id.as_ref().map(|id| positions.get(id).copied()) else { continue };
-        let grid = parent.is_some_and(|parent| matches!((nodes[position].kind, nodes[parent].kind),
-            (NodeKind::Cell, NodeKind::Row) | (NodeKind::Row, NodeKind::Table)));
-        if !grid && parent.is_none_or(|parent| contexts[parent] != contexts[position]) {
+        let Some(parent) = nodes[position]
+            .parent_id
+            .as_ref()
+            .map(|id| positions.get(id).copied())
+        else {
+            continue;
+        };
+        let grid = parent.is_some_and(|parent| {
+            matches!(
+                (nodes[position].kind, nodes[parent].kind),
+                (NodeKind::Cell, NodeKind::Row) | (NodeKind::Row, NodeKind::Table)
+            )
+        });
+        let quotation = parent.is_some_and(|parent| {
+            nodes[parent].kind == NodeKind::Quote
+                && contexts[position].1.as_deref() == Some(nodes[parent].id.as_str())
+                && contexts[position].0 == contexts[parent].0
+                && contexts[position].2 == contexts[parent].2
+        });
+        if !grid && !quotation && parent.is_none_or(|parent| contexts[parent] != contexts[position])
+        {
             nodes[position].parent_id = None;
         }
     }

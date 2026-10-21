@@ -478,6 +478,7 @@ pub(super) fn reconcile_bookmarks(
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
             && !primitives.contents_line_ids.contains(&line.id)
+            && !primitives.quotations.scopes.contains_key(&line.id)
             && !has_dot_leader(&line.text)
     };
     let mut claimed = HashSet::<(usize, usize)>::new();
@@ -658,14 +659,15 @@ pub(super) fn reconcile_bookmarks(
     let mut unit_at = HashMap::<(usize, usize), usize>::new();
     for (page_slot, page) in pages.iter().enumerate() {
         for (slot, line) in page.lines.iter().enumerate() {
-            if line.region_type != "heading" {
+            if line.region_type != "heading" || primitives.quotations.scopes.contains_key(&line.id)
+            {
                 continue;
             }
             let continues = slot > 0
                 && page.lines[slot - 1].region_type == "heading"
                 && page.lines[slot - 1].block_index == line.block_index
-                && primitives.document_context(&page.lines[slot - 1].id)
-                    == primitives.document_context(&line.id)
+                && primitives.reading_context(&page.lines[slot - 1].id)
+                    == primitives.reading_context(&line.id)
                 && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
             if !continues {
                 units.push(Unit {
