@@ -48,24 +48,52 @@ fn italic(span: &Span) -> bool {
     span.flags & 2 != 0 || font.contains("italic") || font.contains("oblique")
 }
 
-/// The share of the rows' visible characters set in italics, and their mean type size, from the
-/// rows' spans.
-fn typography<'a>(rows: impl IntoIterator<Item = &'a Row<'a>>) -> (f64, f64) {
-    let (mut characters, mut italics, mut size) = (0.0, 0.0, 0.0);
-    for span in rows.into_iter().flat_map(Row::spans) {
-        let count = span.text.trim().chars().count() as f64;
-        if span.size > 0.0 {
-            characters += count;
-            size += count * span.size;
-            if italic(span) {
-                italics += count;
-            }
+struct Typography {
+    font: f64,
+    glyph: f64,
+    italic: f64,
+}
+
+impl Typography {
+    fn size(&self, row: &Row) -> f64 {
+        if row
+            .spans()
+            .any(|span| span.size > 0.0 && !span.text.trim().is_empty())
+        {
+            self.font
+        } else {
+            self.glyph
         }
     }
-    if characters == 0.0 {
-        (0.0, 0.0)
-    } else {
-        (italics / characters, size / characters)
+}
+
+/// Native font sizes and recognized glyph heights keep separate character-weighted means.
+fn typography<'a>(rows: impl IntoIterator<Item = &'a Row<'a>>) -> Typography {
+    let (mut characters, mut italics, mut size) = (0.0, 0.0, 0.0);
+    let (mut glyph_characters, mut height) = (0.0, 0.0);
+    for line in rows.into_iter().flat_map(|row| &row.lines) {
+        let mut native = false;
+        for span in &line.spans {
+            let count = span.text.trim().chars().count() as f64;
+            if span.size > 0.0 && count > 0.0 {
+                native = true;
+                characters += count;
+                size += count * span.size;
+                if italic(span) {
+                    italics += count;
+                }
+            }
+        }
+        if !native && line.bbox[3] > line.bbox[1] {
+            let count = line.text.trim().chars().count() as f64;
+            glyph_characters += count;
+            height += count * (line.bbox[3] - line.bbox[1]);
+        }
+    }
+    Typography {
+        font: size / characters.max(1.0),
+        glyph: height / glyph_characters.max(1.0),
+        italic: italics / characters.max(1.0),
     }
 }
 
@@ -73,7 +101,7 @@ fn defined_term_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            "^.[^\u{201d}\"\u{2019}]{1,60}[\u{201d}\"\u{2019}]\\s*,?\\s*(?:means|includes|has|refers|shall|is|are)\\b",
+            "^.[^\u{201d}\"\u{2019}\u{bb}]{1,60}[\u{201d}\"\u{2019}\u{bb}]\\s*,?\\s*(?:means|includes|has|refers|shall|is|are)\\b",
         )
         .unwrap()
     })
@@ -97,8 +125,10 @@ fn announcement_re() -> &'static Regex {
 fn closing_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new("[\u{201d}\"\u{2019}]\\s*[.,;:]?\\s*(?:\\[[^\\]]*\\]|\\([^)]*\\))?\\s*[.,;:]?$")
-            .unwrap()
+        Regex::new(
+            "[\u{201d}\"\u{2019}\u{bb}]\\s*[.,;:]?\\s*(?:\\[[^\\]]*\\]|\\([^)]*\\))?\\s*[.,;:]?$",
+        )
+        .unwrap()
     })
 }
 
@@ -240,14 +270,38 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> HashMap<String, 
                 span.text.trim().chars().count();
         }
     }
-    let Some(body_size) = sizes
-        .into_iter()
-        .max_by_key(|(size, count)| (*count, *size))
-        .map(|(size, _)| size as f64 / 2.0)
-    else {
-        return HashMap::new();
+    let mut glyph_sizes = HashMap::<i64, usize>::new();
+    for line in margin_rows
+        .iter()
+        .flat_map(|row| &row.lines)
+        .filter(|line| {
+            !line
+                .spans
+                .iter()
+                .any(|span| span.size > 0.0 && !span.text.trim().is_empty())
+        })
+    {
+        let height = line.bbox[3] - line.bbox[1];
+        if height > 0.0 {
+            *glyph_sizes
+                .entry((height * 2.0).round() as i64)
+                .or_default() += line.text.trim().chars().count();
+        }
+    }
+    let mode = |sizes: HashMap<i64, usize>| {
+        sizes
+            .into_iter()
+            .max_by_key(|(size, count)| (*count, *size))
+            .map_or(0.0, |(size, _)| size as f64 / 2.0)
     };
-    let (body_italic, _) = typography(margin_rows.iter().copied());
+    let body = Typography {
+        font: mode(sizes),
+        glyph: mode(glyph_sizes),
+        italic: typography(margin_rows.iter().copied()).italic,
+    };
+    if body.font <= 0.0 && body.glyph <= 0.0 {
+        return HashMap::new();
+    }
     let full_margin_rows = margin_rows
         .iter()
         .filter(|row| {
@@ -259,11 +313,14 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> HashMap<String, 
         && 10
             * full_margin_rows
                 .iter()
-                .filter(|row| (row.bbox[2] - measure(row).1).abs() <= 0.5 * body_size)
+                .filter(|row| (row.bbox[2] - measure(row).1).abs() <= 0.5 * body.size(row))
                 .count()
             >= 6 * full_margin_rows.len();
 
-    let set_in = |row: &Row| row.bbox[0] - measure(row).0 >= 1.5 * body_size;
+    let set_in = |row: &Row| {
+        let size = body.size(row);
+        size > 0.0 && row.bbox[0] - measure(row).0 >= 1.5 * size
+    };
     // A running head or folio the page's furniture left in the body sits in its top or bottom
     // tenth; a block set in on both sides of it goes on over the page break.
     let heights = ordered_pages
@@ -309,17 +366,10 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> HashMap<String, 
                 row.page_index == rows[start].page_index
                     || row.page_index.checked_add(1) == Some(rows[start].page_index)
             })
-            .filter(|row| row.bbox[0] <= measure(row).0 + 3.0 * body_size)
+            .filter(|row| row.bbox[0] <= measure(row).0 + 3.0 * body.size(row))
             .map(Row::text)
             .filter(|text| text.chars().any(char::is_lowercase));
-        if quotation(
-            &block,
-            introduction.as_deref(),
-            body_size,
-            body_italic,
-            justified,
-            &measure,
-        ) {
+        if quotation(&block, introduction.as_deref(), &body, justified, &measure) {
             quoted.extend(
                 block
                     .iter()
@@ -337,8 +387,7 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> HashMap<String, 
 fn quotation(
     block: &[&Row],
     introduction: Option<&str>,
-    body_size: f64,
-    body_italic: f64,
+    body: &Typography,
     justified: bool,
     measure: &dyn Fn(&Row) -> (f64, f64),
 ) -> bool {
@@ -355,10 +404,12 @@ fn quotation(
     let centred = block.len() >= 3
         && 3 * block
             .iter()
-            .filter(|row| ((row.bbox[0] + row.bbox[2]) / 2.0 - centre).abs() <= 0.5 * body_size)
+            .filter(|row| {
+                ((row.bbox[0] + row.bbox[2]) / 2.0 - centre).abs() <= 0.5 * body.size(row)
+            })
             .count()
             >= 2 * block.len()
-        && spread > body_size;
+        && spread > body.size(block[0]);
     if centred
         || block.iter().any(|row| {
             let (left, right) = measure(row);
@@ -367,9 +418,11 @@ fn quotation(
     {
         return false;
     }
-    let (italics, size) = typography(block.iter().copied());
-    let contrast = (italics >= 0.6 && body_italic < 0.25)
-        || (size >= 0.6 * body_size && size <= body_size - 0.75);
+    let kind = typography(block.iter().copied());
+    let contrast = (kind.italic >= 0.6 && body.italic < 0.25)
+        || [(kind.font, body.font), (kind.glyph, body.glyph)]
+            .into_iter()
+            .any(|(size, body)| body > 0.0 && size >= 0.6 * body && size <= body - 0.75);
     // The opening mark may follow the quoted text's own first number ("1. “An order ...").
     let first = block[0].text();
     let first = item_marker_re()
@@ -419,7 +472,7 @@ fn quotation(
     }
     let short = block
         .iter()
-        .all(|row| measure(row).1 - row.bbox[2] >= 1.5 * body_size);
+        .all(|row| measure(row).1 - row.bbox[2] >= 1.5 * body.size(row));
     let wide = block[..block.len() - 1]
         .iter()
         .filter(|row| {
@@ -443,7 +496,7 @@ fn quotation(
                 .and_then(|line| line.words.first())
                 .map_or(0.0, |word| word.bbox[2] - word.bbox[0]);
             first_word > 0.0
-                && pair[0].bbox[2] + first_word + 0.5 * body_size <= measure(&pair[0]).1
+                && pair[0].bbox[2] + first_word + 0.5 * body.size(pair[0]) <= measure(&pair[0]).1
         })
         .count();
     short && wide >= 2 && (justified || (fitted >= 2 && 2 * fitted >= wraps.len()))
