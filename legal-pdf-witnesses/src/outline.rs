@@ -11,6 +11,13 @@ use std::collections::HashMap;
 /// Where a unit's outline lives: its document, quotation, and note, table cell or parallel text.
 pub type Context = (String, Option<String>, Option<String>);
 
+// Native font sizes and recognized glyph heights need separate baselines.
+#[derive(Clone, Copy)]
+struct BodySizes {
+    font: f64,
+    glyph: f64,
+}
+
 struct Unit {
     node: usize,
     context: Context,
@@ -45,27 +52,56 @@ fn membership_text(node: &StructureNode, text: &ScalarText<'_>) -> Option<String
 
 /// The type of the unit's own text on its first line (`source`, that line's place in the text):
 /// its size in hundredths of the body size, and whether most of it is bold and italic.
-fn unit_style(line: &Line, source: ScalarRange, node: &StructureNode, body_size: f64) -> (i32, bool, bool) {
-    let parts = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
-    let ranges = parts.iter().filter_map(|part| {
-        let (start, end) = (part.start.max(source.start), part.end.min(source.end));
-        (start < end).then_some((start - source.start, end - source.start))
-    }).collect::<Vec<_>>();
+fn unit_style(
+    line: &Line,
+    source: ScalarRange,
+    node: &StructureNode,
+    body: BodySizes,
+) -> (i32, bool, bool) {
+    let parts = if node.ranges.is_empty() {
+        std::slice::from_ref(&node.range)
+    } else {
+        &node.ranges
+    };
+    let ranges = parts
+        .iter()
+        .filter_map(|part| {
+            let (start, end) = (part.start.max(source.start), part.end.min(source.end));
+            (start < end).then_some((start - source.start, end - source.start))
+        })
+        .collect::<Vec<_>>();
     let coordinates = ScalarText::new(&line.text);
-    let (mut weight, mut size, mut bold, mut italic) = (0usize, 0.0f32, 0usize, 0usize);
-    for span in line.spans.iter().filter(|span| span.start < span.end && coordinates.slice(span.start..span.end) == Some(span.text.as_str())) {
-        let count = ranges.iter().map(|(lo, hi)| span.end.min(*hi).saturating_sub(span.start.max(*lo))).sum::<usize>();
-        let share = if body_size > 0.0 { (span.size / body_size) as f32 } else { 0.0 };
+    let (mut weight, mut relative_size, mut bold, mut italic) = (0usize, 0.0f32, 0usize, 0usize);
+    for span in line.spans.iter().filter(|span| {
+        span.start < span.end && coordinates.slice(span.start..span.end) == Some(span.text.as_str())
+    }) {
+        let count = ranges
+            .iter()
+            .map(|(lo, hi)| span.end.min(*hi).saturating_sub(span.start.max(*lo)))
+            .sum::<usize>();
+        let share = if body.font > 0.0 {
+            (span.size / body.font) as f32
+        } else {
+            0.0
+        };
         if count == 0 || share <= 0.0 {
             continue;
         }
         weight += count;
-        size += share * count as f32;
+        relative_size += share * count as f32;
         bold += usize::from(span.flags & 16 != 0 || span.font.to_lowercase().contains("bold")) * count;
         italic += usize::from(span.flags & 2 != 0 || span.font.to_lowercase().contains("ital")) * count;
     }
+    if weight == 0 && size(line) <= 0.0 && !ranges.is_empty() && body.glyph > 0.0 {
+        let ratio = (line.bbox[3] - line.bbox[1]) / body.glyph;
+        return ((ratio * 100.0).round() as i32, false, false);
+    }
     let weight = weight.max(1) as f32;
-    ((size / weight * 100.0).round() as i32, bold as f32 / weight >= 0.5, italic as f32 / weight >= 0.5)
+    (
+        (relative_size / weight * 100.0).round() as i32,
+        bold as f32 / weight >= 0.5,
+        italic as f32 / weight >= 0.5,
+    )
 }
 
 /// Set every outline unit's parent. `contexts` holds each node's context; a parent link between
@@ -80,22 +116,87 @@ pub fn assemble_outline(
     navigation: &HashMap<String, Option<String>>,
     heading_levels: &HashMap<String, usize>,
 ) {
-    let lines = pages.iter().flat_map(|page| &page.lines).map(|line| (line.id.as_str(), line)).collect::<HashMap<_, _>>();
-    let body_size = median(pages.iter().flat_map(|page| &page.lines).map(size).filter(|size| *size > 0.0).collect());
-    let coordinates = ScalarText::new(text);
-    let mut units = nodes.iter().enumerate().filter(|(_, node)| outline_unit(node)).map(|(node_index, node)| {
-        let first = node.line_ids.first().and_then(|id| Some((*lines.get(id.as_str())?, line_range(id)?)));
-        Unit {
-            node: node_index,
-            context: contexts[node_index].clone(),
-            marker: None,
-            style: first.map_or((0, false, false), |(line, source)| unit_style(line, source, node, body_size)),
-            rank: 0.0,
-            level: node.line_ids.iter().find_map(|id| heading_levels.get(id).copied()),
-            lead_in: membership_text(node, &coordinates).unwrap_or_default().trim().ends_with(':'),
+    let lines = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .map(|line| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut type_lines = HashMap::<Context, HashMap<&str, (f64, f64)>>::new();
+    for (node, context) in nodes
+        .iter()
+        .zip(contexts)
+        .filter(|(node, _)| outline_unit(node))
+    {
+        let own = type_lines.entry(context.clone()).or_default();
+        for id in &node.line_ids {
+            if let Some(line) = lines.get(id.as_str()) {
+                own.entry(id)
+                    .or_insert_with(|| (size(line), line.bbox[3] - line.bbox[1]));
+            }
         }
-    }).collect::<Vec<_>>();
-    units.sort_by_key(|unit| (nodes[unit.node].range.start, nodes[unit.node].range.end, nodes[unit.node].id.clone()));
+    }
+    let body_sizes = type_lines
+        .into_iter()
+        .map(|(context, lines)| {
+            let body = BodySizes {
+                font: median(
+                    lines
+                        .values()
+                        .map(|(font, _)| *font)
+                        .filter(|font| *font > 0.0)
+                        .collect(),
+                ),
+                glyph: median(
+                    lines
+                        .values()
+                        .filter(|(font, _)| *font <= 0.0)
+                        .map(|(_, glyph)| *glyph)
+                        .filter(|glyph| *glyph > 0.0)
+                        .collect(),
+                ),
+            };
+            (context, body)
+        })
+        .collect::<HashMap<_, _>>();
+    let coordinates = ScalarText::new(text);
+    let mut units = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| outline_unit(node))
+        .map(|(node_index, node)| {
+            let source = |id: &String| Some((*lines.get(id.as_str())?, line_range(id)?));
+            let first = node
+                .line_ids
+                .iter()
+                .filter_map(source)
+                .find(|(_, range)| node.content_start.is_none_or(|start| start < range.end))
+                .or_else(|| node.line_ids.first().and_then(source));
+            Unit {
+                node: node_index,
+                context: contexts[node_index].clone(),
+                marker: None,
+                style: first.map_or((0, false, false), |(line, source)| {
+                    unit_style(line, source, node, body_sizes[&contexts[node_index]])
+                }),
+                rank: 0.0,
+                level: node
+                    .line_ids
+                    .iter()
+                    .find_map(|id| heading_levels.get(id).copied()),
+                lead_in: membership_text(node, &coordinates)
+                    .unwrap_or_default()
+                    .trim()
+                    .ends_with(':'),
+            }
+        })
+        .collect::<Vec<_>>();
+    units.sort_by_key(|unit| {
+        (
+            nodes[unit.node].range.start,
+            nodes[unit.node].range.end,
+            nodes[unit.node].id.clone(),
+        )
+    });
     let mut styles = HashMap::<Context, Vec<(i32, bool, bool)>>::new();
     let mut previous_marker = HashMap::<Context, NumberingMarker>::new();
     for unit in &mut units {
