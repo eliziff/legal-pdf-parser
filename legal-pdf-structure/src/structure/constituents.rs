@@ -14,13 +14,19 @@ use legal_pdf_core::model::{Line, Page};
 use legal_pdf_headings::party_label;
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 const ORIGIN: &str = "legalpdf.pdf-structure.v2";
 
 /// The grammar of a constituent's section; its kind follows ("constituent_exhibit").
 pub(super) const GRAMMAR: &str = "constituent_";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct Start {
+    pub(super) line_id: String,
+    kind: String,
+}
 
 fn exhibit_cover() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -95,7 +101,7 @@ fn content(line: &Line) -> bool {
             >= 3
 }
 
-pub(super) fn constituents(index: &PdfTextIndex, pages: &[Page]) -> Vec<StructureNode> {
+pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
     let mut ordered = pages.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|page| page.index);
     // Each body line, with its page and its place on that page.
@@ -184,9 +190,136 @@ pub(super) fn constituents(index: &PdfTextIndex, pages: &[Page]) -> Vec<Structur
         opened |= content(line);
         slot += 1;
     }
-    let starts = starts
+    starts
         .into_iter()
-        .filter_map(|(line, kind)| Some((index.line(&line.id)?.range.start, kind)))
+        .map(|(line, kind)| Start {
+            line_id: line.id.clone(),
+            kind: kind.to_owned(),
+        })
+        .collect()
+}
+
+/// The same lexical openings scope inference and the final constituent nodes.
+pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String, usize> {
+    if starts.is_empty() {
+        return HashMap::new();
+    }
+    let starts = starts
+        .iter()
+        .enumerate()
+        .map(|(slot, start)| (start.line_id.as_str(), slot + 1))
+        .collect::<HashMap<_, _>>();
+    let mut ordered = pages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|page| page.index);
+    let mut document = 0;
+    let mut documents = HashMap::new();
+    for page in ordered {
+        let mut lines = page.lines.iter().collect::<Vec<_>>();
+        lines.sort_by(|left, right| {
+            left.reading_order
+                .cmp(&right.reading_order)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for line in lines {
+            if let Some(&start) = starts.get(line.id.as_str()) {
+                document = start;
+            }
+            if document != 0 {
+                documents.insert(line.id.clone(), document);
+            }
+        }
+    }
+    documents
+}
+
+/// Run the existing heading readers on logical documents, including each parallel sequence.
+/// Lines move into page views and back; their text, ids, anchors and physical positions stay put.
+pub(super) fn within_heading_contexts(
+    pages: &mut [Page],
+    documents: &HashMap<String, usize>,
+    translation: &HashSet<String>,
+    mut read: impl FnMut(&mut [Page]),
+) {
+    if translation.is_empty() && documents.is_empty() {
+        read(pages);
+        return;
+    }
+    #[derive(Default)]
+    struct Reading {
+        pages: Vec<Page>,
+        positions: Vec<(usize, Vec<usize>)>,
+    }
+    let mut readings = BTreeMap::<(usize, bool), Reading>::new();
+    let mut ordered = (0..pages.len()).collect::<Vec<_>>();
+    ordered.sort_by_key(|&slot| pages[slot].index);
+    for page_slot in ordered {
+        let page = &mut pages[page_slot];
+        for (slot, line) in std::mem::take(&mut page.lines).into_iter().enumerate() {
+            let context = (
+                documents.get(&line.id).copied().unwrap_or(0),
+                translation.contains(&line.id),
+            );
+            let reading = readings.entry(context).or_default();
+            if reading
+                .positions
+                .last()
+                .is_none_or(|(prior, _)| *prior != page_slot)
+            {
+                reading.pages.push(Page {
+                    id: page.id.clone(),
+                    index: page.index,
+                    number: page.number,
+                    width: page.width,
+                    height: page.height,
+                    lines: Vec::new(),
+                    regions: Vec::new(),
+                    source: page.source.clone(),
+                    text_quality: page.text_quality,
+                    printed_label: page.printed_label.clone(),
+                    printed_label_source: page.printed_label_source.clone(),
+                    printed_label_line_id: page.printed_label_line_id.clone(),
+                });
+                reading.positions.push((page_slot, Vec::new()));
+            }
+            reading.pages.last_mut().unwrap().lines.push(line);
+            reading.positions.last_mut().unwrap().1.push(slot);
+        }
+    }
+    let mut restored = (0..pages.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (context, mut reading) in readings {
+        read(&mut reading.pages);
+        for (page, (page_slot, slots)) in reading.pages.into_iter().zip(reading.positions) {
+            restored[page_slot].extend(
+                page.lines
+                    .into_iter()
+                    .zip(slots)
+                    .map(|(line, slot)| (slot, context, line)),
+            );
+        }
+    }
+    for (page, mut lines) in pages.iter_mut().zip(restored) {
+        lines.sort_by_key(|(slot, _, _)| *slot);
+        // Block ids are page-local. Separate readers must not produce colliding groups.
+        let mut blocks = HashMap::new();
+        page.lines = lines
+            .into_iter()
+            .map(|(_, context, mut line)| {
+                let next = blocks.len();
+                line.block_index = *blocks.entry((context, line.block_index)).or_insert(next);
+                line
+            })
+            .collect();
+    }
+}
+
+pub(super) fn constituents(
+    index: &PdfTextIndex,
+    pages: &[Page],
+    starts: &[Start],
+) -> Vec<StructureNode> {
+    let starts = starts
+        .iter()
+        .filter_map(|start| Some((index.line(&start.line_id)?.range.start, start.kind.as_str())))
         .collect::<Vec<_>>();
     let end = index.text().chars().count();
     let page_of = pages
