@@ -232,9 +232,9 @@ pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String
     documents
 }
 
-/// Run the existing heading readers on logical documents, including each parallel sequence.
+/// Run the existing readers on logical documents, including each parallel sequence.
 /// Lines move into page views and back; their text, ids, anchors and physical positions stay put.
-pub(super) fn within_heading_contexts(
+pub(super) fn within_document_contexts(
     pages: &mut [Page],
     documents: &HashMap<String, usize>,
     translation: &HashSet<String>,

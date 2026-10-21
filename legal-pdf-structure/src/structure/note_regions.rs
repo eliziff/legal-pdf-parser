@@ -259,12 +259,14 @@ impl<'a> DocumentLines<'a> {
         &self.pages[page].lines[line].region_type
     }
 
-    fn is_note(&self, line: LineRef) -> bool {
-        self.region(line).contains("note")
+    fn is_note(&self, (page, line): LineRef) -> bool {
+        let line = &self.pages[page].lines[line];
+        !line.exclude_from_body && line.region_type.contains("note")
     }
 
     /// A line whose label may still change: a body line, not a heading, a running head, a folio,
-    /// a table's cell or a line the page leaves out.
+    /// a table's cell or a line the page leaves out. The caller supplies table and contents
+    /// exclusions through the existing source-exclusion flag for this reading.
     fn mutable(&self, (page, line): LineRef) -> bool {
         let line = &self.pages[page].lines[line];
         line.region_type == "body" && !line.exclude_from_body
@@ -308,6 +310,9 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
     let mut notes = [Vec::new(), Vec::new()];
     let mut body = [Vec::new(), Vec::new()];
     for line in pages.iter().flat_map(|page| &page.lines) {
+        if line.exclude_from_body {
+            continue;
+        }
         let size = note_text_size(line);
         if size <= 0.0 {
             continue;
@@ -332,7 +337,8 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
     })
 }
 
-/// Settle which lines are notes over the whole document. Returns how many lines changed.
+/// Settle one logical document's notes, with separators aligned to these page slots.
+/// Returns how many lines changed.
 pub(super) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>]) -> usize {
     let claims = {
         let lines = DocumentLines::new(pages);
@@ -359,6 +365,7 @@ pub(super) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>
         let line = &mut pages[page].lines[line];
         if line.region_type != region {
             line.region_type = region.to_owned();
+            line.note_region_mode = region.to_owned();
             changed += 1;
         }
     }
@@ -393,7 +400,16 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
                 continue;
             }
             let text = lines.text(line);
-            if position < first_note || text.is_empty() || !lines.mutable(line) {
+            if position < first_note || text.is_empty() {
+                continue;
+            }
+            if !lines.mutable(line) {
+                last_text.clear();
+                last_anchor = false;
+                last_number = None;
+                continue;
+            }
+            if last_text.is_empty() {
                 continue;
             }
             let fold = folded(text);
@@ -416,6 +432,7 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             if bare && !bare_claim {
                 last_text.clear();
                 last_anchor = false;
+                last_number = None;
                 continue;
             }
             let anchored_continuation = continuation && (sandwiched || citation || last_anchor);
@@ -423,6 +440,7 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             if !(marker || anchored_continuation || anchored_citation || bare_claim) {
                 last_text.clear();
                 last_anchor = false;
+                last_number = None;
                 continue;
             }
             claims.push(line);
