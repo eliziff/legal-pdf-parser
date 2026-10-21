@@ -8,7 +8,7 @@ use legal_pdf_core::model::{Line, Page};
 use legal_structure_model::{NodeKind, NumberingMarker, ScalarRange, ScalarText, StructureNode};
 use std::collections::HashMap;
 
-/// Where a unit's outline lives: its document, and the quotation and note or table cell holding it.
+/// Where a unit's outline lives: its document, quotation, and note, table cell or parallel text.
 pub type Context = (String, Option<String>, Option<String>);
 
 struct Unit {
