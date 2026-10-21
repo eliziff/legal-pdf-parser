@@ -374,51 +374,61 @@ fn in_body(line: &Line) -> bool {
     line.region_type == "body" && !line.exclude_from_body && line.note_region_mode.is_empty()
 }
 
+/// Read paragraph boundaries without changing source block indices. Classification can use
+/// the same geometry before assigning roles that the final paragraph reader uses afterward.
+pub(crate) fn paragraph_indices(
+    page: &Page,
+    counted: impl Fn(&Line) -> bool,
+) -> Vec<Option<usize>> {
+    let mut next = page
+        .lines
+        .iter()
+        .map(|line| line.block_index)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let body: Vec<&Line> = page.lines.iter().filter(|line| counted(line)).collect();
+    let pitch = Pitch::of(&body);
+    let mut assigned = vec![None; page.lines.len()];
+    let mut start = 0;
+    while start < page.lines.len() {
+        if !counted(&page.lines[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < page.lines.len() && counted(&page.lines[end]) {
+            end += 1;
+        }
+        let run = &page.lines[start..end];
+        let mut block_start = 0;
+        for k in 1..=run.len() {
+            if k < run.len() && !starts_block(&run[k - 1], &run[k], &pitch) {
+                continue;
+            }
+            let block: Vec<&Line> = run[block_start..k].iter().collect();
+            assigned[start + block_start] = Some(next);
+            let indented = indents_first_lines(&block);
+            for j in 1..block.len() {
+                let after = block.get(j + 1).copied();
+                let margin = indented.then(|| margin_at(&block, j));
+                if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                    next += 1;
+                }
+                assigned[start + block_start + j] = Some(next);
+            }
+            next += 1;
+            block_start = k;
+        }
+        start = end;
+    }
+    assigned
+}
+
 /// Give each printed paragraph of body text its own block index.
 pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
     for page in pages {
-        let mut next = page
-            .lines
-            .iter()
-            .map(|line| line.block_index)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let body: Vec<&Line> = page.lines.iter().filter(|line| in_body(line)).collect();
-        let pitch = Pitch::of(&body);
-        let mut assigned = vec![None; page.lines.len()];
-        let mut start = 0;
-        while start < page.lines.len() {
-            if !in_body(&page.lines[start]) {
-                start += 1;
-                continue;
-            }
-            let mut end = start + 1;
-            while end < page.lines.len() && in_body(&page.lines[end]) {
-                end += 1;
-            }
-            let run = &page.lines[start..end];
-            let mut block_start = 0;
-            for k in 1..=run.len() {
-                if k < run.len() && !starts_block(&run[k - 1], &run[k], &pitch) {
-                    continue;
-                }
-                let block: Vec<&Line> = run[block_start..k].iter().collect();
-                assigned[start + block_start] = Some(next);
-                let indented = indents_first_lines(&block);
-                for j in 1..block.len() {
-                    let after = block.get(j + 1).copied();
-                    let margin = indented.then(|| margin_at(&block, j));
-                    if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
-                        next += 1;
-                    }
-                    assigned[start + block_start + j] = Some(next);
-                }
-                next += 1;
-                block_start = k;
-            }
-            start = end;
-        }
+        let assigned = paragraph_indices(page, in_body);
         for (line, block) in page.lines.iter_mut().zip(assigned) {
             if let Some(block) = block {
                 line.block_index = block;
