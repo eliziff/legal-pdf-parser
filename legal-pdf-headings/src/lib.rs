@@ -88,7 +88,7 @@ fn join_wrapped_headings(
             let leading = doc[usize::from(prior.spans.is_empty())].body_line_leading;
             let max_advance = above.size
                 * if leading.is_finite() && leading > 0.0 {
-                    1.25 * leading
+                    (1.25 * leading).max(1.5)
                 } else {
                     1.5
                 };

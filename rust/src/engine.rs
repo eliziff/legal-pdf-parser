@@ -380,7 +380,7 @@ fn derive_extracted(
     cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
 ) -> Result<StructureOutput> {
-    // Reader state depends on both its local code and the supplied engine's layout services.
+    // Reader state depends on source pages, navigation hints and the engine's layout services.
     let reader_cache = cache_root.and_then(|root| {
         let key = serialization_sha256(&(
             env!("LEGAL_PDF_READER_SHA256"),
@@ -388,6 +388,7 @@ fn derive_extracted(
             semantic_profile,
             &extracted.pages,
             &extracted.separators,
+            &extracted.outline,
         ))
         .ok()?;
         Some(

@@ -283,6 +283,30 @@ fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
     kept
 }
 
+/// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
+pub(super) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+    let entries = validate(outline, pages)
+        .into_iter()
+        .filter_map(|entry| {
+            let words = tokens(&entry.title);
+            let unit = words.first()?;
+            let counter = words.get(1)?;
+            (PACKAGE_UNITS.contains(&unit.as_str())
+                && (label_remainder().is_match(counter) || is_roman(counter)))
+            .then(|| (entry.page - 1, entry.level, unit.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut families = HashMap::<(&str, usize), HashSet<usize>>::new();
+    for (page, level, unit) in &entries {
+        families.entry((unit, *level)).or_default().insert(*page);
+    }
+    entries
+        .iter()
+        .filter(|(page, level, unit)| *page > 0 && families[&(unit.as_str(), *level)].len() > 1)
+        .map(|(page, _, unit)| (*page, unit.clone()))
+        .collect()
+}
+
 fn restack(entries: &mut [Entry]) {
     let mut stack = Vec::<usize>::new();
     for entry in entries {

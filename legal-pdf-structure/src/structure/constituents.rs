@@ -9,8 +9,8 @@
 //! page break, a numbering restart or a change of type alone opens none. A constituent carries
 //! no label: it is never a pinpoint's target.
 
-use super::graph::PdfTextIndex;
-use legal_pdf_core::model::{Line, Page};
+use super::{arabic_page_number, bookmarks, graph::PdfTextIndex};
+use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_headings::party_label;
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use regex::Regex;
@@ -215,7 +215,79 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
         .collect()
 }
 
-/// The same lexical openings scope inference and the final constituent nodes.
+/// Package bookmarks supply opening pages before the readers calibrate each document.
+pub(super) fn bookmarked_starts(pages: &[Page], outline: &[PdfOutlineEntry]) -> Vec<Start> {
+    let by_index = pages
+        .iter()
+        .map(|page| (page.index, page))
+        .collect::<HashMap<_, _>>();
+    bookmarks::package_targets(outline, pages.len())
+        .into_iter()
+        .filter_map(|(page, kind)| {
+            let line = by_index
+                .get(&page)?
+                .lines
+                .iter()
+                .filter(|line| {
+                    !line.exclude_from_body
+                        && line.note_region_mode.is_empty()
+                        && !matches!(
+                            line.region_type.as_str(),
+                            "header" | "footer" | "footnote" | "endnote"
+                        )
+                        && line.text.chars().any(char::is_alphabetic)
+                })
+                .min_by(|a, b| {
+                    a.reading_order
+                        .cmp(&b.reading_order)
+                        .then_with(|| a.id.cmp(&b.id))
+                })?;
+            Some(Start {
+                line_id: line.id.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// A visible opening wins over a bookmark, including an exhibit's preceding certificate page.
+pub(super) fn reconcile_starts(pages: &[Page], bookmarked: &mut Vec<Start>) {
+    let mut lexical = starts(pages);
+    if bookmarked.is_empty() {
+        *bookmarked = lexical;
+        return;
+    }
+    let positions = pages
+        .iter()
+        .flat_map(|page| {
+            page.lines
+                .iter()
+                .map(move |line| (line.id.as_str(), (page.index, line.reading_order)))
+        })
+        .collect::<HashMap<_, _>>();
+    let lexical_pages = lexical
+        .iter()
+        .map(|start| positions[start.line_id.as_str()].0)
+        .collect::<HashSet<_>>();
+    let certificates = lexical
+        .iter()
+        .filter(|start| start.kind == "exhibit")
+        .map(|start| positions[start.line_id.as_str()].0)
+        .collect::<HashSet<_>>();
+    lexical.extend(std::mem::take(bookmarked).into_iter().filter(|start| {
+        let page = positions[start.line_id.as_str()].0;
+        !lexical_pages.contains(&page)
+            && !(start.kind == "exhibit"
+                && page
+                    .checked_sub(1)
+                    .is_some_and(|prior| certificates.contains(&prior)))
+    }));
+    lexical.sort_by_key(|start| positions[start.line_id.as_str()]);
+    lexical.dedup_by(|a, b| a.line_id == b.line_id);
+    *bookmarked = lexical;
+}
+
+/// The same openings scope inference and the final constituent nodes.
 pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String, usize> {
     if starts.is_empty() {
         return HashMap::new();
@@ -236,6 +308,20 @@ pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String
                 .cmp(&right.reading_order)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        // A footer painted before the opening still belongs to the document on this page.
+        if let Some(first) = lines
+            .iter()
+            .position(|line| starts.contains_key(line.id.as_str()))
+        {
+            if lines[..first].iter().all(|line| {
+                line.exclude_from_body
+                    || matches!(line.region_type.as_str(), "header" | "footer")
+                    || (arabic_page_number(&line.text).is_some()
+                        && (line.bbox[3] < page.height * 0.15 || line.bbox[1] > page.height * 0.85))
+            }) {
+                document = starts[lines[first].id.as_str()];
+            }
+        }
         for line in lines {
             if let Some(&start) = starts.get(line.id.as_str()) {
                 document = start;

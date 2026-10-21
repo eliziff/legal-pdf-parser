@@ -2673,7 +2673,7 @@ fn classify_pages_with_source(
     legal_pdf_support::profile::measure("prepare.detached_references", || {
         associate_detached_references(pages, separators)
     });
-    evidence.constituent_starts = constituents::starts(pages);
+    constituents::reconcile_starts(pages, &mut evidence.constituent_starts);
     let documents = constituents::document_lines(pages, &evidence.constituent_starts);
     let diagnostics = if documents.is_empty() {
         drop(source);
@@ -4305,13 +4305,18 @@ struct ReaderState {
 
 /// Everything before the composed decisions: furniture, classification, tables, note bands and
 /// the styled heading reader.
-fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
+fn prepare_reader(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
     if separators.len() != pages.len() {
         return Err(Error::Message(
             "common input must contain one separator value per page".to_owned(),
         ));
     }
     let mut primitives = PdfPrimitiveEvidence {
+        constituent_starts: constituents::bookmarked_starts(pages, outline),
         source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
             source_region_contract(pages)
         }),
@@ -4682,7 +4687,9 @@ pub fn derive_cached(
             (state.primitives, state.diagnostics)
         }
         None => {
-            let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || prepare_reader(pages, separators))?;
+            let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || {
+                prepare_reader(pages, separators, outline)
+            })?;
             if let Some(path) = reader_cache {
                 let state = ReaderState { pages: pages.to_vec(), primitives, diagnostics };
                 let _ = legal_pdf_core::write_gzip_json(path, &state);
