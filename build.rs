@@ -113,7 +113,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     document.extend(crate_inputs(root, "tables"));
     document.extend(crate_inputs(root, "witnesses"));
     document.push(root.join("legal-pdf-witnesses/data"));
-    document.extend(crate_inputs(root, "pairing"));
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",
@@ -154,7 +153,6 @@ fn main() {
         (pdf, "extraction-processor"),
         (enabled("LANGUAGE"), "language"),
         (enabled("OCR"), "ocr"),
-        (pdf, "pairing"),
         (pdf, "structure"),
         (pdf, "headings"),
         (pdf, "tables"),
@@ -213,13 +211,13 @@ fn main() {
                 fingerprint(&root, &inputs, &stage_features)
             );
         }
-        // The structure stage's readers, before any composed decision: their own code alone, so a
-        // change to compositions or to what follows them keeps their cached state.
+        // Reader implementation inputs; derive_extracted also keys their shared engine service.
+        // Witness compositions remain outside this cache.
         let mut reader = vec![
             root.join("legal-pdf-core/src/model.rs"),
             root.join("legal-pdf-core/src/lib.rs"),
         ];
-        for name in ["structure", "headings", "tables", "pairing", "support"] {
+        for name in ["structure", "headings", "tables", "support"] {
             reader.extend(crate_inputs(&root, name));
         }
         println!(

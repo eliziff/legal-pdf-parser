@@ -4521,8 +4521,8 @@ pub fn derive(
 }
 
 /// `derive`, reading the readers' state from `reader_cache` where it is there (a file named for the
-/// input pages and the readers' code) and writing it there where not: a change to compositions, or
-/// to anything after the readers, reruns only what follows them.
+/// input pages and reader dependencies) and writing it there where not. Composed decisions run
+/// after restoring the cached state.
 pub fn derive_cached(
     pages: &mut [Page],
     separators: &[Option<f64>],
