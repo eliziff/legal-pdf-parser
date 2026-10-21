@@ -4414,6 +4414,10 @@ fn prepare_reader(
                 legal_pdf_headings::reconcile_styled_headings(
                     document,
                     legal_pdf_headings::HeadingEvidence {
+                        quotation: document
+                            .iter()
+                            .flat_map(|page| &page.lines)
+                            .any(|line| primitives.quotations.scopes.contains_key(&line.id)),
                         levels: &mut primitives.heading_levels,
                         excluded: &excluded,
                         translation: &translation,
