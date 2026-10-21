@@ -1192,7 +1192,15 @@ fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
         if line.id.is_empty() || !ids.insert(line.id.as_str()) {
             return None;
         }
-        let region = line.region_type.trim().to_ascii_lowercase();
+        let source = line.region_type.trim();
+        let tag = matches!(source, "text" | "body" | "" | "unknown" | "unknown_region")
+            .then(|| legal_pdf_core::tagged_heading(line, |span| span.structure_role.as_deref()))
+            .flatten();
+        let region = match tag {
+            Some(tag) => tag.to_owned(),
+            None if legal_pdf_core::is_heading_role(source) => source.to_owned(),
+            None => source.to_ascii_lowercase(),
+        };
         if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {
             regions.insert(line.id.clone(), region);
         }
@@ -1230,10 +1238,8 @@ fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bo
             .as_ref()
             .and_then(|regions| regions.get(&line.id))
             .is_none_or(|region| {
-                matches!(
-                    region.as_str(),
-                    "text" | "body" | "paragraph_title" | "doc_title" | "heading"
-                )
+                matches!(region.as_str(), "text" | "body")
+                    || legal_pdf_core::is_heading_region(region)
             })
 }
 
@@ -1592,6 +1598,13 @@ fn wrapped_heading_continuations(
     let mut wrapped = Vec::new();
     let mut previous_slot = heading_slot;
     let mut previous = heading;
+    let native_role = |line: &Line| {
+        primitives
+            .source_regions
+            .as_ref()
+            .and_then(|regions| regions.get(&line.id))
+            .filter(|role| legal_pdf_core::is_heading_role(role))
+    };
     for slot in heading_slot + 1..page.lines.len().min(heading_slot + 1 + MAX_WRAPPED_LINES) {
         let continuation = &page.lines[slot];
         let continuation_text = continuation.text.trim();
@@ -1608,6 +1621,7 @@ fn wrapped_heading_continuations(
             heading.spans.is_empty() && continuation.spans.is_empty()
         };
         let continues = !structural.contains(&(page_slot, slot))
+            && native_role(heading) == native_role(continuation)
             && !continuation.exclude_from_body
             && !heading_line_excluded(primitives, &continuation.id)
             && primitives
@@ -1615,10 +1629,8 @@ fn wrapped_heading_continuations(
                 .as_ref()
                 .and_then(|regions| regions.get(&continuation.id))
                 .is_none_or(|region| {
-                    matches!(
-                        region.as_str(),
-                        "text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote"
-                    )
+                    matches!(region.as_str(), "text" | "body" | "block_quote")
+                        || legal_pdf_core::is_heading_region(region)
                 })
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
@@ -1964,6 +1976,12 @@ fn demote_false_headings(
     for (page_slot, page) in pages.iter_mut().enumerate() {
         for line_slot in 0..page.lines.len() {
             if page.lines[line_slot].region_type != "heading" {
+                continue;
+            }
+            if source_regions
+                .get(&page.lines[line_slot].id)
+                .is_some_and(|region| legal_pdf_core::is_heading_role(region))
+            {
                 continue;
             }
             if !source_regions
@@ -3123,16 +3141,15 @@ fn classify_pages_with_source(
                 line.note_region_mode.clear();
             } else if matches!(line.region_type.as_str(), "header" | "footer") {
                 continue;
-            } else if matches!(
+            } else if legal_pdf_core::is_heading_region(
                 evidence
                     .source_regions
                     .as_ref()
                     .and_then(|regions| regions.get(&line.id))
                     .map(String::as_str)
                     .unwrap_or(line.region_type.as_str()),
-                "paragraph_title" | "doc_title" | "heading"
             ) {
-                // Recognition carries no font spans; preserve the layout detector's heading evidence.
+                // Source roles survive the font-size fallback, including recognized and tagged text.
                 line.region_type = "heading".to_owned();
                 line.note_region_mode.clear();
             } else if paragraph_labels.contains(&line.id) {
@@ -3825,6 +3842,7 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
                 excluded: &excluded,
                 contents_pages: &primitives.contents_pages,
                 numbered: &numbered,
+                source_regions: primitives.source_regions.as_ref(),
             },
         );
     });

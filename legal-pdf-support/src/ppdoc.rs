@@ -749,6 +749,9 @@ impl PPDocLayout {
                 if line.exclude_from_body || line.text.trim().is_empty() {
                     continue;
                 }
+                if legal_pdf_core::is_heading_role(&line.region_type) {
+                    continue;
+                }
                 let regions = &regions_by_page[page_position];
                 // A line no region covers takes its page's nearest region: one stray line no longer
                 // costs the page every region the model found.

@@ -52,7 +52,11 @@ pub fn party_label() -> &'static Regex {
 
 /// A capitalized heading wrapped onto the next line keeps one block: the same type, set at the
 /// line's leading, the first line ending no sentence and the second opening no numbered heading.
-fn join_wrapped_headings(pages: &mut [Page], levels: &std::collections::HashMap<String, usize>) {
+fn join_wrapped_headings(
+    pages: &mut [Page],
+    levels: &HashMap<String, usize>,
+    tagged_levels: &HashMap<String, usize>,
+) {
     let style = |line: &legal_pdf_core::model::Line| {
         line.spans.first().map(|span| {
             (
@@ -76,6 +80,7 @@ fn join_wrapped_headings(pages: &mut [Page], levels: &std::collections::HashMap<
                 && !line.exclude_from_body
                 && style(prior).is_some()
                 && style(prior) == style(line)
+                && tagged_levels.get(&prior.id) == tagged_levels.get(&line.id)
                 && model::CharStats::of(&prior.text).caps_heavy()
                 && model::CharStats::of(&line.text).caps_heavy()
                 && !prior.text.trim_end().ends_with(['.', '?', '!', ':', ';'])
@@ -179,11 +184,25 @@ pub struct HeadingEvidence<'a> {
     pub contents_pages: &'a HashSet<usize>,
     /// Does a line open with a heading-like number ("1.", "(a)", "IV")? This is no role decision.
     pub numbered: &'a dyn Fn(&str) -> bool,
+    /// Original source roles retain explicit PDF Hn levels after local classification.
+    pub source_regions: Option<&'a HashMap<String, String>>,
 }
 
 /// Read the headings set apart by type alone and the depth of every heading. Line roles and
 /// `evidence.levels` change; the caller rebuilds the pages' regions.
 pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) {
+    let tagged_levels = evidence
+        .source_regions
+        .into_iter()
+        .flatten()
+        .filter(|(_, role)| legal_pdf_core::is_heading_role(role))
+        .filter_map(|(id, role)| {
+            role.strip_prefix('H')?
+                .parse()
+                .ok()
+                .map(|level| (id.clone(), level))
+        })
+        .collect::<HashMap<String, usize>>();
     // The case caption: lines down to a page's last party label are no headings.
     let mut caption = HashSet::<String>::new();
     for page in pages.iter_mut() {
@@ -202,7 +221,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             }
         }
     }
-    join_wrapped_headings(pages, evidence.levels);
+    join_wrapped_headings(pages, evidence.levels, &tagged_levels);
 
     let flash_lines = pages
         .iter()
@@ -253,6 +272,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 && page.lines[end].block_index == line.block_index
                 && !page.lines[end].exclude_from_body
                 && page.lines[end].note_region_mode.is_empty()
+                && tagged_levels.get(&page.lines[end].id) == tagged_levels.get(&line.id)
             {
                 end += 1;
             }
@@ -439,15 +459,30 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         let mut found = Vec::new();
         for (position, &block) in page.blocks.iter().enumerate() {
             if blocks[block].heading {
+                let tagged_level = blocks[block]
+                    .line_slots
+                    .first()
+                    .and_then(|slot| tagged_levels.get(&pages[page_index].lines[*slot].id))
+                    .copied();
                 candidates.push(Candidate {
                     block,
-                    kind: if blocks[block].numbered { 1 } else { 0 },
-                    level: blocks[block]
-                        .line_slots
-                        .iter()
-                        .filter_map(|slot| evidence.levels.get(&pages[page_index].lines[*slot].id))
-                        .min()
-                        .copied(),
+                    kind: if tagged_level.is_some() {
+                        2
+                    } else if blocks[block].numbered {
+                        1
+                    } else {
+                        0
+                    },
+                    level: tagged_level.or_else(|| {
+                        blocks[block]
+                            .line_slots
+                            .iter()
+                            .filter_map(|slot| {
+                                evidence.levels.get(&pages[page_index].lines[*slot].id)
+                            })
+                            .min()
+                            .copied()
+                    }),
                 });
                 continue;
             }
@@ -539,7 +574,12 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     let mut levels = vec![0usize; accepted.len()];
     for index in 0..accepted.len() {
         let parent = context.parent(&mut stack, &accepted, &accepted[index]);
-        levels[index] = parent.map_or(1, |parent| levels[parent] + 1);
+        let inferred = parent.map_or(1, |parent| levels[parent].saturating_add(1));
+        levels[index] = if accepted[index].kind == 2 {
+            accepted[index].level.unwrap_or(inferred)
+        } else {
+            inferred
+        };
         stack.push(index);
     }
     // A heading read with a numbered one inside it ("III. Law and Argument" over "A. Approving
@@ -551,15 +591,18 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             if proposed.contains(&candidate.block) {
                 line.region_type = "heading".to_owned();
             }
-            let step = candidate.level.and_then(|top| {
-                evidence
-                    .levels
-                    .get(&line.id)
-                    .map(|own| own.saturating_sub(top))
-            });
+            let step = (candidate.kind != 2)
+                .then_some(candidate.level)
+                .flatten()
+                .and_then(|top| {
+                    evidence
+                        .levels
+                        .get(&line.id)
+                        .map(|own| own.saturating_sub(top))
+                });
             evidence
                 .levels
-                .insert(line.id.clone(), level + step.unwrap_or(0));
+                .insert(line.id.clone(), level.saturating_add(step.unwrap_or(0)));
         }
     }
 }

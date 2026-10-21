@@ -923,9 +923,7 @@ impl PdfResolutionInput {
                                     .source_regions
                                     .as_ref()
                                     .and_then(|regions| regions.get(&line.id))
-                                    .is_some_and(|region| {
-                                        matches!(region.as_str(), "heading" | "paragraph_title" | "doc_title")
-                                    })
+                                    .is_some_and(|region| legal_pdf_core::is_heading_region(region))
                         })
                 }) {
                     add_observation(&mut observations, CandidateObservationV2::SectionHeading);

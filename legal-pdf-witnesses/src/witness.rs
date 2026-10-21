@@ -120,7 +120,7 @@ pub struct Context<'a> {
     pub table_cells: Option<&'a HashSet<String>>,
     pub contents: Option<&'a HashSet<String>>,
     pub translation: Option<&'a HashSet<String>>,
-    /// A layout model's label for each line, where one ran.
+    /// Original line roles from a layout provider or the native PDF structure tree.
     pub layout: Option<&'a HashMap<String, String>>,
 }
 
@@ -630,10 +630,12 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             .filter_map(|span| span.structure_role.as_deref())
             .collect::<std::collections::HashSet<_>>();
         values.extend([
-            flag(!tags.is_empty()),
+            flag(!tags.is_empty() || layout.is_some_and(legal_pdf_core::is_heading_role)),
             flag(
-                tags.iter()
-                    .any(|role| matches!(*role, "H" | "H1" | "H2" | "H3" | "H4" | "H5" | "H6")),
+                layout.is_some_and(legal_pdf_core::is_heading_role)
+                    || tags
+                        .iter()
+                        .any(|role| legal_pdf_core::is_heading_role(role)),
             ),
             flag(tags.contains("Title")),
             flag(tags.contains("P")),
