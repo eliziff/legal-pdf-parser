@@ -2606,6 +2606,81 @@ fn classify_pages_with_source(
     separators: &[Option<f64>],
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
+    evidence.constituent_starts = constituents::starts(pages);
+    let documents = constituents::document_lines(pages, &evidence.constituent_starts);
+    let diagnostics = if documents.is_empty() {
+        classify_document_pages(pages, separators, &HashSet::new(), evidence)
+    } else {
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        let shared_pages = pages
+            .iter()
+            .filter(|page| {
+                let mut contexts = page
+                    .lines
+                    .iter()
+                    .map(|line| documents.get(&line.id).copied().unwrap_or(0));
+                contexts
+                    .next()
+                    .is_some_and(|first| contexts.any(|context| context != first))
+            })
+            .map(|page| page.index)
+            .collect::<HashSet<_>>();
+        let mut diagnostics = Vec::new();
+        constituents::within_document_contexts(pages, &documents, &HashSet::new(), |document| {
+            let separators = document
+                .iter()
+                .map(|page| separators_by_page[&page.index])
+                .collect::<Vec<_>>();
+            diagnostics.extend(classify_document_pages(
+                document,
+                &separators,
+                &shared_pages,
+                evidence,
+            ));
+        });
+        evidence
+            .contents_pages
+            .retain(|page| !shared_pages.contains(page));
+        diagnostics
+    };
+    evidence.document_line_ids = documents;
+    let mut heading_levels = HashMap::new();
+    constituents::within_document_contexts(
+        pages,
+        &evidence.document_line_ids,
+        &evidence.translation_line_ids,
+        |document| heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence)),
+    );
+    evidence.heading_levels = heading_levels;
+    evidence.font_heading_candidates = HashSet::new();
+    // A transcript's line numbers locate its lines; they are no part of its paragraphs.
+    for page in pages.iter_mut() {
+        for slot in graph::line_number_column(page) {
+            page.lines[slot].exclude_from_body = true;
+        }
+    }
+    legal_pdf_support::profile::measure("classify.paragraphs", || {
+        constituents::within_document_contexts(
+            pages,
+            &evidence.document_line_ids,
+            &evidence.translation_line_ids,
+            crate::paragraphs::segment_paragraphs,
+        );
+        legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
+    });
+    diagnostics
+}
+
+fn classify_document_pages(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    shared_pages: &HashSet<usize>,
+    evidence: &mut PdfPrimitiveEvidence,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
     let mut expected_endnote: Option<u32> = None;
@@ -2613,12 +2688,13 @@ fn classify_pages_with_source(
     let mut continuing_table = false;
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
+    let mut contents_pages = HashSet::new();
     let translation =
         legal_pdf_support::profile::measure("classify.translation", || translation_lines(pages));
-    evidence.tables = legal_pdf_support::profile::measure("classify.tables", || {
+    let tables = legal_pdf_support::profile::measure("classify.tables", || {
         legal_pdf_tables::ruled_tables(pages, &translation, &TableReadings)
     });
-    let ruled = legal_pdf_tables::table_line_ids(&evidence.tables);
+    let ruled = legal_pdf_tables::table_line_ids(&tables);
     // A row the extractor read across both columns parts into its two languages.
     for page in pages.iter_mut() {
         let base = page
@@ -2637,10 +2713,16 @@ fn classify_pages_with_source(
         }
     }
     let index_pages = index_pages(pages);
+    let mut previous_page: Option<usize> = None;
     let table_pages: Vec<_> = pages
         .iter()
         .zip(separators.iter().copied())
         .map(|(page, separator)| {
+            if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
+                continuing_table = false;
+                continuing_contents = false;
+            }
+            previous_page = Some(page.index);
             let continuation = continuing_table;
             let table = table_evidence(&page.lines, page.width);
             let caption = has_table_caption(&page.lines);
@@ -2661,9 +2743,7 @@ fn classify_pages_with_source(
                     .flatten()
                     .map(|index| page.lines[index].id.clone()),
             );
-            evidence
-                .contents_pages
-                .extend(table.contents.then_some(page.index));
+            contents_pages.extend(table.contents.then_some(page.index));
             let is_table = caption
                 || strong_table_evidence(&table, &page.lines)
                 || continuation && table.continuation_on_page(page.height);
@@ -2702,7 +2782,17 @@ fn classify_pages_with_source(
         );
     }
 
-    for (page, (table_page, table_cells, table_notes)) in pages.iter_mut().zip(table_pages) {
+    previous_page = None;
+    for ((page, (table_page, table_cells, table_notes)), separator) in pages
+        .iter_mut()
+        .zip(table_pages)
+        .zip(separators.iter().copied())
+    {
+        if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
+            expected_endnote = None;
+            continuing_size = None;
+        }
+        previous_page = Some(page.index);
         let line_sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
         let body_size = median(
             page.lines
@@ -2755,7 +2845,7 @@ fn classify_pages_with_source(
                 }),
             )
         });
-        let separator = separators.get(page.index).copied().flatten().filter(|cut| {
+        let separator = separator.filter(|cut| {
             table_band
                 .is_none_or(|(top, bottom)| *cut < top - tolerance || *cut > bottom + tolerance)
         });
@@ -3149,7 +3239,7 @@ fn classify_pages_with_source(
             .collect();
         let selected_size = (!selected_sizes.is_empty()).then(|| median(selected_sizes));
         let separator_starts_small_text = separator.is_some_and(|cut| {
-            !evidence.contents_pages.contains(&page.index)
+            !contents_pages.contains(&page.index)
                 && page
                     .lines
                     .iter()
@@ -3333,36 +3423,21 @@ fn classify_pages_with_source(
             }
         }
         diagnostics.extend(order_page(page, table_page, &table_notes));
-        legal_pdf_tables::order_table_lines(page, &evidence.tables);
+        legal_pdf_tables::order_table_lines(page, &tables);
     }
-    evidence.translation_line_ids = translation;
-    evidence.contents_line_ids.extend(contents_line_ids);
-    evidence.constituent_starts = constituents::starts(pages);
-    evidence.document_line_ids = constituents::document_lines(pages, &evidence.constituent_starts);
-    let mut heading_levels = HashMap::new();
-    constituents::within_document_contexts(
-        pages,
-        &evidence.document_line_ids,
-        &evidence.translation_line_ids,
-        |document| heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence)),
+    evidence.tables.extend(tables);
+    evidence.translation_line_ids.extend(translation);
+    // Keep page-wide contents evidence precise when two documents share a physical page.
+    contents_line_ids.extend(
+        pages
+            .iter()
+            .filter(|page| {
+                shared_pages.contains(&page.index) && contents_pages.contains(&page.index)
+            })
+            .flat_map(|page| page.lines.iter().map(|line| line.id.clone())),
     );
-    evidence.heading_levels = heading_levels;
-    evidence.font_heading_candidates = HashSet::new();
-    // A transcript's line numbers locate its lines; they are no part of its paragraphs.
-    for page in pages.iter_mut() {
-        for slot in graph::line_number_column(page) {
-            page.lines[slot].exclude_from_body = true;
-        }
-    }
-    legal_pdf_support::profile::measure("classify.paragraphs", || {
-        constituents::within_document_contexts(
-            pages,
-            &evidence.document_line_ids,
-            &evidence.translation_line_ids,
-            crate::paragraphs::segment_paragraphs,
-        );
-        legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
-    });
+    evidence.contents_line_ids.extend(contents_line_ids);
+    evidence.contents_pages.extend(contents_pages);
     diagnostics
 }
 
