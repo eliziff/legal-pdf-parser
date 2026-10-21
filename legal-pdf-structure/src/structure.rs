@@ -1014,7 +1014,7 @@ fn detached_reference_target(
 }
 
 fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>]) {
-    for page in pages {
+    for (page, separator) in pages.iter_mut().zip(separators) {
         let body_size = median(
             page.lines
                 .iter()
@@ -1027,11 +1027,7 @@ fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>])
                 .collect(),
         );
         let body_size = if body_size > 0.0 { body_size } else { 10.0 };
-        let note_cut = separators
-            .get(page.index)
-            .copied()
-            .flatten()
-            .unwrap_or(page.height * 0.88);
+        let note_cut = separator.unwrap_or(page.height * 0.88);
         // The oracle consumes accepted markers one at a time. Preserve that
         // mutation order so a consumed row cannot become a later host.
         for marker_index in 0..page.lines.len() {
@@ -1039,10 +1035,12 @@ fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>])
                 continue;
             };
             let size = line_font_size(&page.lines[marker_index]);
-            if matches!(
-                page.lines[marker_index].region_type.as_str(),
-                "header" | "footer"
-            ) || !(0.0 < size && size <= body_size * 0.75)
+            if page.lines[marker_index].exclude_from_body
+                || matches!(
+                    page.lines[marker_index].region_type.as_str(),
+                    "header" | "footer"
+                )
+                || !(0.0 < size && size <= body_size * 0.75)
                 || page.lines[marker_index].bbox[1] >= note_cut
             {
                 continue;
@@ -2606,11 +2604,37 @@ fn classify_pages_with_source(
     separators: &[Option<f64>],
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
+    // Discover openings with the existing furniture/reference filters before calibrating each document.
+    let source = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .map(|line| {
+            (
+                line.region_type.clone(),
+                line.exclude_from_body,
+                line.detached_references.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
+    legal_pdf_support::profile::measure("prepare.detached_references", || {
+        associate_detached_references(pages, separators)
+    });
     evidence.constituent_starts = constituents::starts(pages);
     let documents = constituents::document_lines(pages, &evidence.constituent_starts);
     let diagnostics = if documents.is_empty() {
+        drop(source);
         classify_document_pages(pages, separators, &HashSet::new(), evidence)
     } else {
+        for (line, (region, excluded, references)) in pages
+            .iter_mut()
+            .flat_map(|page| &mut page.lines)
+            .zip(source)
+        {
+            line.region_type = region;
+            line.exclude_from_body = excluded;
+            line.detached_references.truncate(references);
+        }
         let separators_by_page = pages
             .iter()
             .zip(separators)
@@ -2635,6 +2659,12 @@ fn classify_pages_with_source(
                 .iter()
                 .map(|page| separators_by_page[&page.index])
                 .collect::<Vec<_>>();
+            legal_pdf_support::profile::measure("prepare.furniture", || {
+                mark_repeated_furniture(document)
+            });
+            legal_pdf_support::profile::measure("prepare.detached_references", || {
+                associate_detached_references(document, &separators)
+            });
             diagnostics.extend(classify_document_pages(
                 document,
                 &separators,
@@ -4073,10 +4103,6 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
         }),
         ..PdfPrimitiveEvidence::default()
     };
-    legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
-    legal_pdf_support::profile::measure("prepare.detached_references", || {
-        associate_detached_references(pages, separators)
-    });
     let diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
     });
