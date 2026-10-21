@@ -2712,9 +2712,6 @@ fn classify_document_pages(
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
-    let mut expected_endnote: Option<u32> = None;
-    let mut continuing_size: Option<f64> = None;
     let mut continuing_table = false;
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
@@ -2812,12 +2809,79 @@ fn classify_document_pages(
         );
     }
 
-    previous_page = None;
-    for ((page, (table_page, table_cells, table_notes)), separator) in pages
-        .iter_mut()
-        .zip(table_pages)
-        .zip(separators.iter().copied())
-    {
+    // Read note history within one language; tables and physical order retain the whole page.
+    if translation.is_empty() {
+        diagnostics.extend(classify_line_roles(
+            pages,
+            separators,
+            &contents_pages,
+            evidence,
+        ));
+    } else {
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        constituents::within_document_contexts(pages, &HashMap::new(), &translation, |language| {
+            let separators = language
+                .iter()
+                .map(|page| separators_by_page[&page.index])
+                .collect::<Vec<_>>();
+            diagnostics.extend(classify_line_roles(
+                language,
+                &separators,
+                &contents_pages,
+                evidence,
+            ));
+        });
+    }
+    for (page, (table_page, _, table_notes)) in pages.iter_mut().zip(table_pages) {
+        diagnostics.extend(order_page(page, table_page, &table_notes));
+        legal_pdf_tables::order_table_lines(page, &tables);
+    }
+    evidence.tables.extend(tables);
+    evidence.translation_line_ids.extend(translation);
+    // Keep page-wide contents evidence precise when two documents share a physical page.
+    contents_line_ids.extend(
+        pages
+            .iter()
+            .filter(|page| {
+                shared_pages.contains(&page.index) && contents_pages.contains(&page.index)
+            })
+            .flat_map(|page| page.lines.iter().map(|line| line.id.clone())),
+    );
+    evidence.contents_line_ids.extend(contents_line_ids);
+    evidence.contents_pages.extend(contents_pages);
+    diagnostics
+}
+
+fn classify_line_roles(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    contents_pages: &HashSet<usize>,
+    evidence: &mut PdfPrimitiveEvidence,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
+    let mut expected_endnote: Option<u32> = None;
+    let mut continuing_size: Option<f64> = None;
+    let mut previous_page: Option<usize> = None;
+    for (page, separator) in pages.iter_mut().zip(separators.iter().copied()) {
+        let table_cells = page
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| evidence.table_cell_line_ids.contains(&line.id))
+            .map(|(slot, _)| slot)
+            .collect::<HashSet<_>>();
+        let table_notes = page
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| evidence.table_note_line_ids.contains(&line.id))
+            .map(|(slot, _)| slot)
+            .collect::<HashSet<_>>();
         if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
             expected_endnote = None;
             continuing_size = None;
@@ -3452,22 +3516,7 @@ fn classify_document_pages(
                 continuing_size = Some(size);
             }
         }
-        diagnostics.extend(order_page(page, table_page, &table_notes));
-        legal_pdf_tables::order_table_lines(page, &tables);
     }
-    evidence.tables.extend(tables);
-    evidence.translation_line_ids.extend(translation);
-    // Keep page-wide contents evidence precise when two documents share a physical page.
-    contents_line_ids.extend(
-        pages
-            .iter()
-            .filter(|page| {
-                shared_pages.contains(&page.index) && contents_pages.contains(&page.index)
-            })
-            .flat_map(|page| page.lines.iter().map(|line| line.id.clone())),
-    );
-    evidence.contents_line_ids.extend(contents_line_ids);
-    evidence.contents_pages.extend(contents_pages);
     diagnostics
 }
 
