@@ -80,6 +80,10 @@ pub fn assemble_outline(
     navigation: &HashMap<String, Option<String>>,
     heading_levels: &HashMap<String, usize>,
 ) {
+    crate::keep(|captured| {
+        captured.navigation.extend(navigation.iter().map(|(line, parent)| (line.clone(), parent.clone())));
+        captured.heading_levels.extend(heading_levels.iter().map(|(line, level)| (line.clone(), *level)));
+    });
     let lines = pages.iter().flat_map(|page| &page.lines).map(|line| (line.id.as_str(), line)).collect::<HashMap<_, _>>();
     let body_size = median(pages.iter().flat_map(|page| &page.lines).map(size).filter(|size| *size > 0.0).collect());
     let coordinates = ScalarText::new(text);
