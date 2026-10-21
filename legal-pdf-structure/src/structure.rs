@@ -1206,13 +1206,24 @@ fn source_regions_available(pages: &[Page]) -> bool {
     source_region_contract(pages).is_some()
 }
 
-fn heading_source_eligible(regions: &HashMap<String, String>, line: &Line) -> bool {
-    regions.get(&line.id).is_some_and(|region| {
-        matches!(
-            region.as_str(),
-            "text" | "body" | "paragraph_title" | "doc_title" | "heading"
-        )
-    })
+fn heading_line_excluded(primitives: &PdfPrimitiveEvidence, id: &str) -> bool {
+    primitives.translation_line_ids.contains(id)
+        || primitives.contents_line_ids.contains(id)
+        || primitives.table_cell_line_ids.contains(id)
+        || primitives.table_note_line_ids.contains(id)
+}
+
+fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
+    !heading_line_excluded(primitives, &line.id)
+        // Source labels constrain inference when available; they are not required to read a heading.
+        && primitives.source_regions.as_ref().is_none_or(|regions| {
+            regions.get(&line.id).is_some_and(|region| {
+                matches!(
+                    region.as_str(),
+                    "text" | "body" | "paragraph_title" | "doc_title" | "heading"
+                )
+            })
+        })
 }
 
 struct HeadingCandidate {
@@ -1255,7 +1266,6 @@ struct HeadingDecision {
 }
 
 fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
-    let regions = primitives.source_regions.as_ref().expect("source regions");
     let inline = inline_enumerator_re();
     let standalone = standalone_enumerator_re();
     let mut candidates = Vec::new();
@@ -1265,9 +1275,8 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
         }
         for (line_slot, line) in page.lines.iter().enumerate().filter(|(_, line)| {
             !line.exclude_from_body
-                && !primitives.translation_line_ids.contains(&line.id)
                 && matches!(line.region_type.as_str(), "body" | "heading")
-                && heading_source_eligible(regions, line)
+                && heading_source_eligible(primitives, line)
         }) {
             if continues_prose(page, line) {
                 continue;
@@ -1303,7 +1312,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                 !line.text.trim().is_empty()
                     && !line.exclude_from_body
                     && matches!(line.region_type.as_str(), "body" | "heading")
-                    && heading_source_eligible(regions, line)
+                    && heading_source_eligible(primitives, line)
             });
             let Some(follower_slot) = follower else {
                 continue;
@@ -1544,7 +1553,7 @@ fn wrapped_heading_continuations(
     heading_slot: usize,
     structural: &HashSet<(usize, usize)>,
     page_slot: usize,
-    source_regions: &HashMap<String, String>,
+    primitives: &PdfPrimitiveEvidence,
     capitals: bool,
 ) -> Vec<usize> {
     const MAX_WRAPPED_LINES: usize = 3;
@@ -1581,11 +1590,21 @@ fn wrapped_heading_continuations(
         let internal_gap = continuation.bbox[1] - previous.bbox[3];
         let joined = format!("{title} {continuation_text}");
         let cited = has_citation_signal(&joined);
+        let same_size = if heading_size > 0.0 && continuation_size > 0.0 {
+            (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+        } else {
+            // Without font spans, the measured line heights below are the size witness.
+            heading.spans.is_empty() && continuation.spans.is_empty()
+        };
         let continues = !structural.contains(&(page_slot, slot))
-            && matches!(
-                source_regions.get(&continuation.id).map(String::as_str),
-                Some("text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote")
-            )
+            && !continuation.exclude_from_body
+            && !heading_line_excluded(primitives, &continuation.id)
+            && primitives.source_regions.as_ref().is_none_or(|regions| {
+                matches!(
+                    regions.get(&continuation.id).map(String::as_str),
+                    Some("text" | "body" | "paragraph_title" | "doc_title" | "heading" | "block_quote")
+                )
+            })
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
             // A title's line opens on a word; a caption's bracket column (")", "§") is no title.
@@ -1597,9 +1616,7 @@ fn wrapped_heading_continuations(
             && !starts_note_or_list(continuation_text)
             && (!cited || heading_title_plausible(heading, &joined))
             && has_valid_bbox(continuation)
-            && heading_size > 0.0
-            && continuation_size > 0.0
-            && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+            && same_size
             && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
             && (continuation_height - heading_height).abs() <= heading_height * 0.05
             && ((-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
@@ -1630,10 +1647,14 @@ fn wrapped_heading_continuations(
         };
         let resumed = page.lines.get(last + 1).is_some_and(|following| {
             following.region_type == "body"
-                && matches!(
-                    source_regions.get(&following.id).map(String::as_str),
-                    Some("text" | "body")
-                )
+                && !following.exclude_from_body
+                && !heading_line_excluded(primitives, &following.id)
+                && primitives.source_regions.as_ref().is_none_or(|regions| {
+                    matches!(
+                        regions.get(&following.id).map(String::as_str),
+                        Some("text" | "body")
+                    )
+                })
                 && has_valid_bbox(following)
                 && (following.bbox[1] - line.bbox[1]
                     >= line.bbox[1] - above.bbox[1]
@@ -2025,9 +2046,6 @@ fn apply_text_fidelity_headings(
     body_size: f64,
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
-    let Some(source_regions) = primitives.source_regions.as_ref() else {
-        return HashMap::new();
-    };
     let toc_leader = contents_leader_re();
     let mut capitalised = Vec::new();
     for (page_slot, page) in pages.iter_mut().enumerate() {
@@ -2061,12 +2079,9 @@ fn apply_text_fidelity_headings(
                 .chars()
                 .filter(|character| character.is_alphabetic())
                 .count();
-            let source_mutable = source_regions
-                .get(&line.id)
-                .is_some_and(|region| matches!(region.as_str(), "text" | "body"));
             if line.region_type == "body"
-                && source_mutable
-                && !primitives.translation_line_ids.contains(&line.id)
+                && !line.exclude_from_body
+                && heading_source_eligible(primitives, line)
                 && (8..=70).contains(&text.chars().count())
                 && letters >= 4
                 && !text.chars().any(char::is_lowercase)
@@ -2130,7 +2145,9 @@ fn apply_text_fidelity_headings(
             })
             .collect::<Vec<_>>()
     };
-    demote_false_headings(pages, &decisions, source_regions);
+    if let Some(source_regions) = &primitives.source_regions {
+        demote_false_headings(pages, &decisions, source_regions);
+    }
     let mut heading_levels = decisions
         .iter()
         .flat_map(|decision| {
@@ -2177,7 +2194,7 @@ fn apply_text_fidelity_headings(
             line_slot,
             &structural,
             page_slot,
-            source_regions,
+            primitives,
             true,
         ) {
             pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
@@ -2191,10 +2208,7 @@ fn apply_text_fidelity_headings(
         if page_slot >= pages.len() || target_slot >= pages[page_slot].lines.len() {
             continue;
         }
-        if !source_regions
-            .get(&pages[page_slot].lines[target_slot].id)
-            .is_some_and(|region| matches!(region.as_str(), "text" | "body"))
-        {
+        if !heading_source_eligible(primitives, &pages[page_slot].lines[target_slot]) {
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
@@ -2233,7 +2247,7 @@ fn apply_text_fidelity_headings(
             target_slot,
             &structural,
             page_slot,
-            source_regions,
+            primitives,
             false,
         ) {
             let block = pages[page_slot].lines[target_slot].block_index;
@@ -3095,13 +3109,15 @@ fn classify_pages_with_source(
                 line.note_region_mode.clear();
             } else if matches!(line.region_type.as_str(), "header" | "footer") {
                 continue;
-            } else if evidence
-                .source_regions
-                .as_ref()
-                .and_then(|regions| regions.get(&line.id))
-                .is_some_and(|region| {
-                    matches!(region.as_str(), "paragraph_title" | "doc_title" | "heading")
-                })
+            } else if matches!(
+                evidence
+                    .source_regions
+                    .as_ref()
+                    .and_then(|regions| regions.get(&line.id))
+                    .map(String::as_str)
+                    .unwrap_or(line.region_type.as_str()),
+                "paragraph_title" | "doc_title" | "heading"
+            )
             {
                 // Recognition carries no font spans; preserve the layout detector's heading evidence.
                 line.region_type = "heading".to_owned();
@@ -3785,6 +3801,7 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
             primitives.translation_line_ids.contains(id)
                 || primitives.contents_line_ids.contains(id)
                 || primitives.table_cell_line_ids.contains(id)
+                || primitives.table_note_line_ids.contains(id)
         };
         let numbered =
             |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);

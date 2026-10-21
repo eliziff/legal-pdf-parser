@@ -361,6 +361,18 @@ impl FlashLine {
         for span in &line.spans {
             flash.append(FlashSpan::of(span, height));
         }
+        if line.spans.is_empty() {
+            let rect = Rect::from_native(line.bbox, height);
+            // OCR supplies glyph boxes, not font spans; retain its text and measured height.
+            flash.append(FlashSpan {
+                rect,
+                stats: CharStats::of(trim_unicode_ws(&line.text)),
+                font_name: String::new(),
+                size: rect.height(),
+                bold: false,
+                italic: false,
+            });
+        }
         flash
     }
 
