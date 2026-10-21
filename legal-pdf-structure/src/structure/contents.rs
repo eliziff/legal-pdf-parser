@@ -14,7 +14,7 @@ use super::graph::contents_leader_re;
 use super::PdfPrimitiveEvidence;
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Indents within this many points are one tier.
@@ -42,7 +42,7 @@ fn leader_tail_re() -> &'static Regex {
 }
 
 /// The enumerator family an entry's title opens with.
-fn family(title: &str) -> &'static str {
+pub(super) fn family(title: &str) -> &'static str {
     static FAMILIES: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
     let families = FAMILIES.get_or_init(|| {
         [
@@ -73,12 +73,12 @@ struct Row {
     locator: Option<String>,
 }
 
-fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
-    // Lines sharing a baseline band are one row: a grid sets the title and its page apart.
+pub(super) fn row_bands<'a>(lines: &[&'a Line]) -> Vec<Vec<&'a Line>> {
+    // Adjacent lines sharing a baseline band are one row. Preserve column reading order.
     let mut bands: Vec<Vec<&Line>> = Vec::new();
     for line in lines {
         let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
-        match bands.iter_mut().find(|band| {
+        match bands.last_mut().filter(|band| {
             let first = band[0];
             let height = (first.bbox[3] - first.bbox[1]).max(1.0);
             ((first.bbox[1] + first.bbox[3]) / 2.0 - middle).abs() <= height / 2.0
@@ -87,51 +87,162 @@ fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
             None => bands.push(vec![line]),
         }
     }
-    bands.sort_by(|a, b| a[0].bbox[1].total_cmp(&b[0].bbox[1]));
+    for band in &mut bands {
+        band.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
+    }
     bands
-        .into_iter()
-        .map(|mut band| {
-            band.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
-            let left = band[0].bbox[0];
-            // A locator alone at the row's right, apart from its title.
-            let apart = band.len() > 1
-                && locator_re().is_match(band.last().unwrap().text.trim())
-                && band.last().unwrap().bbox[0] > page.width * 0.5;
-            let (title_lines, locator) = if apart {
-                let last = band.pop().unwrap();
-                (band, Some(last.text.trim().to_owned()))
-            } else {
-                (band, None)
-            };
-            let mut title = title_lines
+}
+
+/// Contents subheadings use the list's own type size, independently of body prose.
+pub(super) fn retain_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
+    for page in pages {
+        let lines = page
+            .lines
+            .iter()
+            .filter(|line| {
+                !line.exclude_from_body && primitives.contents_line_ids.contains(&line.id)
+            })
+            .collect::<Vec<_>>();
+        let size = super::median(
+            lines
                 .iter()
-                .map(|line| line.text.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let mut locator = locator;
-            if locator.is_none() && contents_leader_re().is_match(&title) {
-                if let Some(captures) = leader_tail_re().captures(&title) {
-                    let found = captures[1].to_owned();
-                    if locator_re().is_match(&found) {
-                        let cut = captures.get(0).unwrap().start();
-                        title.truncate(cut);
-                        locator = Some(found);
-                    }
-                }
+                .map(|line| legal_pdf_core::line_font_size(line))
+                .filter(|size| *size > 0.0)
+                .collect(),
+        );
+        let mut headings = HashSet::new();
+        for band in row_bands(&lines) {
+            if row_of(page, 0, band.clone()).locator.is_some() {
+                continue;
             }
-            let title = title
-                .trim_end_matches(|c: char| {
-                    c == '.' || c == '_' || c == '\u{2026}' || c.is_whitespace()
-                })
-                .trim()
-                .to_owned();
-            Row {
-                page_slot,
-                left,
-                title,
-                locator,
+            headings.extend(
+                band.iter()
+                    .filter(|line| {
+                        size > 0.0
+                            && legal_pdf_core::line_font_size(line)
+                                >= size * super::FONT_HEADING_SIZE_RATIO
+                            && (line.region_type == "heading"
+                                || primitives.font_heading_candidates.contains(&line.id))
+                    })
+                    .map(|line| line.id.clone()),
+            );
+        }
+        for line in page
+            .lines
+            .iter_mut()
+            .filter(|line| headings.contains(&line.id))
+        {
+            primitives.contents_line_ids.remove(&line.id);
+            line.region_type = "heading".to_owned();
+        }
+    }
+}
+
+/// A printed marker or completed locator starts the next entry, even when prose geometry joined it.
+pub(super) fn group_rows(pages: &mut [Page], primitives: &PdfPrimitiveEvidence) {
+    for page in pages {
+        if !page
+            .lines
+            .iter()
+            .any(|line| primitives.contents_line_ids.contains(&line.id))
+        {
+            continue;
+        }
+        let lines = page
+            .lines
+            .iter()
+            .filter(|line| !line.exclude_from_body)
+            .collect::<Vec<_>>();
+        let mut block = page
+            .lines
+            .iter()
+            .map(|line| line.block_index)
+            .max()
+            .unwrap_or(0);
+        let mut open = false;
+        let mut groups = HashMap::new();
+        for band in row_bands(&lines) {
+            if band.iter().any(|line| {
+                line.region_type != "body" || !primitives.contents_line_ids.contains(&line.id)
+            }) {
+                open = false;
+                continue;
             }
-        })
+            let row = row_of(page, 0, band.clone());
+            let first = band[0].text.trim();
+            let token = first.split_whitespace().next().unwrap_or("");
+            let numeric = token.chars().any(|c| c.is_ascii_digit())
+                && token.chars().all(|c| c.is_ascii_digit() || c == '.');
+            let locator = band.len() == 1
+                && band[0].bbox[0] > page.width * 0.5
+                && locator_re().is_match(first);
+            let marker = !locator
+                && (numeric
+                    || !family(&row.title).is_empty()
+                    || band.len() > 1
+                        && first.chars().count() == 1
+                        && first.chars().all(char::is_alphabetic));
+            let continues = !marker && open;
+            if !continues {
+                block += 1;
+            }
+            for line in &band {
+                groups.insert(line.id.clone(), block);
+            }
+            open = row.locator.is_none() && !locator;
+        }
+        for line in &mut page.lines {
+            if let Some(&block) = groups.get(&line.id) {
+                line.block_index = block;
+            }
+        }
+    }
+}
+
+fn row_of(page: &Page, page_slot: usize, mut band: Vec<&Line>) -> Row {
+    let left = band[0].bbox[0];
+    // A locator alone at the row's right, apart from its title.
+    let apart = band.len() > 1
+        && locator_re().is_match(band.last().unwrap().text.trim())
+        && band.last().unwrap().bbox[0] > page.width * 0.5;
+    let (title_lines, locator) = if apart {
+        let last = band.pop().unwrap();
+        (band, Some(last.text.trim().to_owned()))
+    } else {
+        (band, None)
+    };
+    let mut title = title_lines
+        .iter()
+        .map(|line| line.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut locator = locator;
+    if locator.is_none() && contents_leader_re().is_match(&title) {
+        if let Some(captures) = leader_tail_re().captures(&title) {
+            let found = captures[1].to_owned();
+            if locator_re().is_match(&found) {
+                let cut = captures.get(0).unwrap().start();
+                title.truncate(cut);
+                locator = Some(found);
+            }
+        }
+    }
+    let title = title
+        .trim_end_matches(|c: char| c == '.' || c == '_' || c == '\u{2026}' || c.is_whitespace())
+        .trim()
+        .to_owned();
+    Row {
+        page_slot,
+        left,
+        title,
+        locator,
+    }
+}
+
+fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
+    row_bands(lines)
+        .into_iter()
+        .map(|band| row_of(page, page_slot, band))
         .collect()
 }
 
@@ -154,6 +265,7 @@ fn listed_entries(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<List
             .filter(|line| {
                 !line.exclude_from_body
                     && !matches!(line.region_type.as_str(), "header" | "footer")
+                    && line.region_type != "heading"
                     && !line.text.trim().is_empty()
                     && (grid || primitives.contents_line_ids.contains(&line.id))
             })
