@@ -3333,7 +3333,7 @@ fn classify_pages_with_source(
     evidence.constituent_starts = constituents::starts(pages);
     evidence.document_line_ids = constituents::document_lines(pages, &evidence.constituent_starts);
     let mut heading_levels = HashMap::new();
-    constituents::within_heading_contexts(
+    constituents::within_document_contexts(
         pages,
         &evidence.document_line_ids,
         &evidence.translation_line_ids,
@@ -3348,7 +3348,7 @@ fn classify_pages_with_source(
         }
     }
     legal_pdf_support::profile::measure("classify.paragraphs", || {
-        constituents::within_heading_contexts(
+        constituents::within_document_contexts(
             pages,
             &evidence.document_line_ids,
             &evidence.translation_line_ids,
@@ -3959,9 +3959,49 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
     let diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
     });
-    // Which lines are notes, settled over the whole document before any heading claims them.
+    // Each document and language keeps its own note type, ladder and continuation history.
     legal_pdf_support::profile::measure("prepare.note_regions", || {
-        note_regions::correct_note_regions(pages, separators)
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        let mut changed = 0;
+        constituents::within_document_contexts(
+            pages,
+            &primitives.document_line_ids,
+            &primitives.translation_line_ids,
+            |document| {
+                let separators = document
+                    .iter()
+                    .map(|page| separators_by_page[&page.index])
+                    .collect::<Vec<_>>();
+                // The generic note reader honors source exclusions. Supply the stronger table
+                // and contents witnesses for this view, retaining the original source flags.
+                let mut excluded = Vec::new();
+                for (page_slot, page) in document.iter_mut().enumerate() {
+                    let contents = primitives.contents_pages.contains(&page.index);
+                    for (slot, line) in page.lines.iter_mut().enumerate() {
+                        let table = primitives.table_cell_line_ids.contains(&line.id)
+                            || primitives.table_note_line_ids.contains(&line.id);
+                        if !line.exclude_from_body
+                            && (table
+                                || line.region_type == "body"
+                                    && (contents
+                                        || primitives.contents_line_ids.contains(&line.id)))
+                        {
+                            line.exclude_from_body = true;
+                            excluded.push((page_slot, slot));
+                        }
+                    }
+                }
+                changed += note_regions::correct_note_regions(document, &separators);
+                for (page, line) in excluded {
+                    document[page].lines[line].exclude_from_body = false;
+                }
+            },
+        );
+        changed
     });
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
@@ -3972,7 +4012,7 @@ fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(Pdf
         let numbered =
             |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);
         let translation = |id: &str| primitives.translation_line_ids.contains(id);
-        constituents::within_heading_contexts(
+        constituents::within_document_contexts(
             pages,
             &primitives.document_line_ids,
             &primitives.translation_line_ids,
