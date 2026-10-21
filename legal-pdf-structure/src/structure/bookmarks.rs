@@ -17,7 +17,7 @@
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use super::{
-    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator, HeadingContext,
+    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator, DocumentContext,
     PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
@@ -436,7 +436,7 @@ pub(super) fn reconcile_bookmarks(
     };
     let mut claimed = HashSet::<(usize, usize)>::new();
     let mut anchors = vec![None::<Anchor>; entries.len()];
-    let mut last = HashMap::<HeadingContext, (usize, usize)>::new();
+    let mut last = HashMap::<DocumentContext, (usize, usize)>::new();
     for (index, entry) in entries.iter().enumerate() {
         let title = normalize_title(&entry.title);
         let Some(&target) = slot_of_page.get(&(entry.page - 1)) else {
@@ -461,8 +461,8 @@ pub(super) fn reconcile_bookmarks(
                         for end in start..(start + MAX_TITLE_LINES).min(page.lines.len()) {
                             if claimed.contains(&(page_slot, end))
                                 || !eligible(page, end)
-                                || primitives.heading_context(&page.lines[end].id)
-                                    != primitives.heading_context(&page.lines[start].id)
+                                || primitives.document_context(&page.lines[end].id)
+                                    != primitives.document_context(&page.lines[start].id)
                             {
                                 return None;
                             }
@@ -492,7 +492,7 @@ pub(super) fn reconcile_bookmarks(
         };
         let position = (anchor.page_slot, anchor.lines[0]);
         let context =
-            primitives.heading_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
+            primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
         if last.get(&context).is_some_and(|last| position <= *last) {
             continue;
         }
@@ -540,7 +540,7 @@ pub(super) fn reconcile_bookmarks(
         .iter()
         .map(|anchor| {
             anchor.as_ref().map_or((0, false), |anchor| {
-                primitives.heading_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
+                primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
             })
         })
         .collect::<Vec<_>>();
@@ -565,8 +565,8 @@ pub(super) fn reconcile_bookmarks(
             let same = |slot: usize, page: &Page| {
                 page.lines[slot].region_type == "heading"
                     && page.lines[slot].block_index == block
-                    && primitives.heading_context(&page.lines[slot].id)
-                        == primitives.heading_context(&page.lines[anchor.lines[0]].id)
+                    && primitives.document_context(&page.lines[slot].id)
+                        == primitives.document_context(&page.lines[anchor.lines[0]].id)
                     && levels.get(&page.lines[slot].id)
                         == levels.get(&page.lines[anchor.lines[0]].id)
             };
@@ -606,7 +606,7 @@ pub(super) fn reconcile_bookmarks(
         line_ids: Vec<String>,
         text: String,
         level: Option<usize>,
-        context: HeadingContext,
+        context: DocumentContext,
     }
     let mut units = Vec::<Unit>::new();
     let mut unit_at = HashMap::<(usize, usize), usize>::new();
@@ -618,8 +618,8 @@ pub(super) fn reconcile_bookmarks(
             let continues = slot > 0
                 && page.lines[slot - 1].region_type == "heading"
                 && page.lines[slot - 1].block_index == line.block_index
-                && primitives.heading_context(&page.lines[slot - 1].id)
-                    == primitives.heading_context(&line.id)
+                && primitives.document_context(&page.lines[slot - 1].id)
+                    == primitives.document_context(&line.id)
                 && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
             if !continues {
                 units.push(Unit {
@@ -627,7 +627,7 @@ pub(super) fn reconcile_bookmarks(
                     line_ids: Vec::new(),
                     text: String::new(),
                     level: None,
-                    context: primitives.heading_context(&line.id),
+                    context: primitives.document_context(&line.id),
                 });
             }
             let unit = units.last_mut().expect("unit");
@@ -661,7 +661,7 @@ pub(super) fn reconcile_bookmarks(
     let mut frame_units = HashMap::<usize, usize>::new();
     let mut levels_out = HashMap::<usize, Option<usize>>::new();
     {
-        let mut stacks = HashMap::<HeadingContext, Vec<usize>>::new();
+        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
         for (index, entry) in entries.iter().enumerate() {
             let Some(unit) = entry_unit[index].filter(|_| framed(entry)) else {
                 continue;
@@ -684,7 +684,7 @@ pub(super) fn reconcile_bookmarks(
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
     let parents = {
-        let mut stacks = HashMap::<HeadingContext, Vec<usize>>::new();
+        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
         entries
             .iter()
             .enumerate()
@@ -725,7 +725,7 @@ pub(super) fn reconcile_bookmarks(
     let detected = (0..units.len())
         .filter(|unit| !levels_out.contains_key(unit) && !promoted.contains(unit))
         .collect::<Vec<_>>();
-    let mut title_counts = HashMap::<(HeadingContext, String), usize>::new();
+    let mut title_counts = HashMap::<(DocumentContext, String), usize>::new();
     for unit in &detected {
         *title_counts
             .entry((units[*unit].context, normalize_title(&units[*unit].text)))

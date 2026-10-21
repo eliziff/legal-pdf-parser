@@ -4,6 +4,7 @@ mod bookmarks;
 mod constituents;
 mod contents;
 mod graph;
+mod note_pairing;
 mod note_regions;
 mod quotations;
 mod numbered_paragraphs;
@@ -52,7 +53,7 @@ pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 const MAX_FONT_HEADING_CHARS: usize = 180;
 
 /// Constituent document and parallel sequence; the PDF's primary text is (0, false).
-pub(super) type HeadingContext = (usize, bool);
+pub(super) type DocumentContext = (usize, bool);
 
 #[derive(Debug, Clone)]
 pub(super) struct LabelPrefix {
@@ -83,11 +84,17 @@ struct PdfPrimitiveEvidence {
 }
 
 impl PdfPrimitiveEvidence {
-    fn heading_context(&self, id: &str) -> HeadingContext {
+    fn document_context(&self, id: &str) -> DocumentContext {
         (
             self.document_line_ids.get(id).copied().unwrap_or(0),
             self.translation_line_ids.contains(id),
         )
+    }
+
+    fn note_context(&self, note: &Footnote) -> DocumentContext {
+        note.body_line_ids
+            .first()
+            .map_or((0, false), |id| self.document_context(id))
     }
 }
 
@@ -3634,14 +3641,23 @@ fn sentence_at(text: &str, offset: usize) -> String {
     sentence_at_boundaries(&chars, &sentence_boundaries(&chars), offset)
 }
 
-fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
+fn attach_propositions(
+    footnotes: &mut [Footnote],
+    paragraphs: &[Paragraph],
+    primitives: &PdfPrimitiveEvidence,
+) {
     let by_pair: HashMap<String, usize> = footnotes
         .iter()
         .enumerate()
         .map(|(index, footnote)| (footnote.pair_id.clone(), index))
         .collect();
-    let mut previous_tail = String::new();
+    let mut tails = HashMap::<DocumentContext, String>::new();
     for paragraph in paragraphs {
+        let context = paragraph
+            .line_ids
+            .first()
+            .map_or((0, false), |id| primitives.document_context(id));
+        let previous_tail = tails.entry(context).or_default();
         let chars: Vec<char> = paragraph.text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
         let mut previous_offset = 0;
@@ -3664,7 +3680,7 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
             };
             previous_offset = offset + 5 + anchor.pair_id.chars().count();
         }
-        previous_tail = chars[previous_offset.min(chars.len())..]
+        *previous_tail = chars[previous_offset.min(chars.len())..]
             .iter()
             .collect::<String>()
             .trim()
@@ -3676,7 +3692,14 @@ fn infer_note_region_modes(pages: &mut [Page]) {
     let mut prior_note_page = false;
     let mut active_endnotes = false;
     let mut expected_endnote = None::<u32>;
+    let mut previous_page = None;
     for page in pages {
+        if previous_page.is_some_and(|prior: usize| prior.checked_add(1) != Some(page.index)) {
+            prior_note_page = false;
+            active_endnotes = false;
+            expected_endnote = None;
+        }
+        previous_page = Some(page.index);
         let footnote_indexes: Vec<usize> = page
             .lines
             .iter()
@@ -3795,8 +3818,15 @@ fn unmatched_reference_diagnostics(
     pages: &[Page],
     footnotes: &[Footnote],
     anchors: &HashMap<String, Vec<Anchor>>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
-    let labels: HashSet<&str> = footnotes.iter().map(|note| note.label.as_str()).collect();
+    let labels: HashSet<_> = footnotes
+        .iter()
+        .map(|note| {
+            let context = primitives.note_context(note);
+            (context, note.label.as_str())
+        })
+        .collect();
     let primary_lines: HashSet<&str> = footnotes
         .iter()
         .filter_map(|note| note.reference_line_id.as_deref())
@@ -3833,7 +3863,11 @@ fn unmatched_reference_diagnostics(
             continue;
         }
         if line.spans.iter().any(|span| {
-            span.superscript && labels.contains(normalize_label(span.text.trim()).as_str())
+            span.superscript
+                && labels.contains(&(
+                    primitives.document_context(&line.id),
+                    normalize_label(span.text.trim()).as_str(),
+                ))
         }) {
             let mut diagnostic = Diagnostic::warning(
                 "FOOTNOTE_UNMATCHED_REFERENCE",
@@ -3847,7 +3881,11 @@ fn unmatched_reference_diagnostics(
     diagnostics
 }
 
-fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic>) {
+fn attach_crossrefs(
+    footnotes: &mut [Footnote],
+    diagnostics: &mut Vec<Diagnostic>,
+    primitives: &PdfPrimitiveEvidence,
+) {
     static RE: OnceLock<Regex> = OnceLock::new();
     let pattern = RE.get_or_init(|| {
         Regex::new(
@@ -3855,16 +3893,17 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
         )
         .unwrap()
     });
-    let mut by_number: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
+    let mut by_number: HashMap<(DocumentContext, u32), Vec<(usize, String)>> = HashMap::new();
     for footnote in footnotes.iter() {
         if let Ok(number) = footnote.label.parse::<u32>() {
             by_number
-                .entry(number)
+                .entry((primitives.note_context(footnote), number))
                 .or_default()
                 .push((footnote.restart_sequence, footnote.pair_id.clone()));
         }
     }
     for footnote in footnotes {
+        let context = primitives.note_context(footnote);
         let (mut prior_byte, mut prior_scalar) = (0, 0);
         for capture in pattern.captures_iter(&footnote.body) {
             let Some(found) = capture.get(0) else {
@@ -3875,7 +3914,7 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
                 .and_then(|value| value.as_str().parse::<u32>().ok())
                 .unwrap_or(0);
             let candidates = by_number
-                .get(&number)
+                .get(&(context, number))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let target_pair_id = if candidates.len() == 1 {
@@ -3906,17 +3945,24 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
                 shortform: crossref_shortform(&footnote.body, found.start()),
                 start,
                 end,
-                resolved: !candidates.is_empty(),
+                resolved: !target_pair_id.is_empty(),
                 target_pair_id,
                 target_count: candidates.len(),
             };
-            if candidates.is_empty() {
+            if !record.resolved {
                 let mut diagnostic = Diagnostic::info(
                     "NOTE_CROSSREF_UNRESOLVED",
-                    format!(
+                    if candidates.is_empty() {
+                        format!(
                         "Note {} references {} note {}, which no paired note carries - a pairing-quality witness.",
                         footnote.label, record.kind, number
-                    ),
+                    )
+                    } else {
+                        format!(
+                            "Note {} references {} note {}, which has multiple possible targets.",
+                            footnote.label, record.kind, number
+                        )
+                    },
                     footnote.reference_page.map(|page| page as usize),
                 );
                 diagnostic
@@ -4065,7 +4111,14 @@ fn derive_prepared(
     mut prepared: PdfPreparation,
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    legal_pdf_support::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
+    legal_pdf_support::profile::measure("derive.note_regions", || {
+        constituents::within_document_contexts(
+            pages,
+            &prepared.primitives.document_line_ids,
+            &prepared.primitives.translation_line_ids,
+            infer_note_region_modes,
+        );
+    });
     prepared
         .diagnostics
         .extend(legal_pdf_support::profile::measure(
@@ -4073,12 +4126,22 @@ fn derive_prepared(
             || text_flow_faults(pages),
         ));
     // Note labels recognition cut short, restored before any text is indexed.
-    legal_pdf_core::layout_analysis().repair_label_dropouts(pages);
+    constituents::within_document_contexts(
+        pages,
+        &prepared.primitives.document_line_ids,
+        &prepared.primitives.translation_line_ids,
+        |document| legal_pdf_core::layout_analysis().repair_label_dropouts(document),
+    );
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
     let pairing = legal_pdf_support::profile::measure("derive.pair_footnotes", || {
-        legal_pdf_core::layout_analysis().pair_footnotes(pages, &resolution.citation_spans, false)
+        note_pairing::pair_notes(
+            pages,
+            &prepared.primitives,
+            &resolution.citation_spans,
+            &resolution.index,
+        )
     });
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
@@ -4087,16 +4150,16 @@ fn derive_prepared(
     diagnostics.extend(pairing.diagnostics);
     diagnostics.extend(legal_pdf_support::profile::measure(
         "derive.unmatched_references",
-        || unmatched_reference_diagnostics(pages, &footnotes, &anchors),
+        || unmatched_reference_diagnostics(pages, &footnotes, &anchors, &prepared.primitives),
     ));
     let paragraphs = legal_pdf_support::profile::measure("derive.paragraphs", || {
         build_paragraphs(pages, &anchors)
     });
     legal_pdf_support::profile::measure("derive.propositions", || {
-        attach_propositions(&mut footnotes, &paragraphs)
+        attach_propositions(&mut footnotes, &paragraphs, &prepared.primitives)
     });
     legal_pdf_support::profile::measure("derive.crossrefs", || {
-        attach_crossrefs(&mut footnotes, &mut diagnostics)
+        attach_crossrefs(&mut footnotes, &mut diagnostics, &prepared.primitives)
     });
     let mut nodes =
         native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
