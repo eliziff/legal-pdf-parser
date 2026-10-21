@@ -20,6 +20,7 @@ pub(super) struct Block {
     pub(super) page: usize,
     pub(super) line_slots: Vec<usize>,
     pub(super) heading: bool,
+    /// A numbering marker is present; the ladder need not have accepted it as a heading.
     pub(super) numbered: bool,
     pub(super) is_body: bool,
 }
@@ -297,13 +298,13 @@ impl Scan<'_> {
         true
     }
 
-    /// Upstream `scan_page_headings` for blocks no numbering or keyword claims, then
-    /// `detect_font_heading`.
+    /// Typography fallback for blocks no earlier heading reader accepted.
     pub(super) fn candidate(&mut self, position: usize) -> bool {
         let page = &self.pages[self.page];
         let block = &self.blocks[page.blocks[position]];
         let flash = &block.flash;
-        if flash.char_count() == 0 || flash.skew > 1.0 || block.heading || block.numbered {
+        // A printed number alone does not settle the line's role.
+        if flash.char_count() == 0 || flash.skew > 1.0 || block.heading {
             return false;
         }
         let neighbors = &self.neighbors[position];
