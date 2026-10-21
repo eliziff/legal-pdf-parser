@@ -80,6 +80,23 @@ fn appended_title(text: &str) -> Option<&'static str> {
     })
 }
 
+/// A fresh court caption distinguishes a mid-page appendix from a reference to one.
+fn court_caption<'a>(lines: impl Iterator<Item = &'a str>) -> bool {
+    let mut dated = false;
+    let mut filed = false;
+    for text in lines {
+        let Some((field, _)) = text.split_once(':') else {
+            continue;
+        };
+        match field.trim().to_ascii_lowercase().as_str() {
+            "date" => dated = true,
+            "docket" | "registry" => filed = true,
+            _ => {}
+        }
+    }
+    dated && filed
+}
+
 /// A form's title: "Form F28.02A: Request for a Summary Judgment".
 fn form_title(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -180,13 +197,21 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
             // An exhibit's certificate heads its page or stands on a cover page; one in running
             // text is a reference to the exhibit.
             Some("exhibit")
+        } else if let Some(kind) = appended_title(&line.text) {
+            (page > 0
+                && (place < 2
+                    || court_caption(
+                        body[slot + 1..]
+                            .iter()
+                            .take(10)
+                            .map(|(line, ..)| line.text.as_str()),
+                    )))
+            .then_some(kind)
         } else if place < 2 {
             // A form's title heads each of its pages; the form opens on the first.
             let new_form = form_title(&line.text)
                 && forms.insert(line.text.trim().chars().take(24).collect::<String>());
-            (page > 0)
-                .then(|| appended_title(&line.text).or(new_form.then_some("form")))
-                .flatten()
+            (page > 0 && new_form).then_some("form")
         } else {
             None
         };
@@ -235,7 +260,10 @@ pub(super) fn bookmarked_starts(pages: &[Page], outline: &[PdfOutlineEntry]) -> 
                             line.region_type.as_str(),
                             "header" | "footer" | "footnote" | "endnote"
                         )
-                        && line.text.chars().any(char::is_alphabetic)
+                        // Version stamps contain letters but supply no word of an opening.
+                        && line.text.split(|c: char| !c.is_alphanumeric()).any(|word| {
+                            !word.is_empty() && word.chars().all(char::is_alphabetic)
+                        })
                 })
                 .min_by(|a, b| {
                     a.reading_order

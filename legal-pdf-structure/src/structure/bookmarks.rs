@@ -285,15 +285,37 @@ fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
 pub(super) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
-    let entries = validate(outline, pages)
+    let entries = validate(outline, pages);
+    let authorities = entries
+        .iter()
+        .find(|entry| {
+            entry.page == 1
+                && tokens(&entry.title).windows(3).any(|words| {
+                    words == ["book", "of", "authorities"]
+                        || words == ["bundle", "of", "authorities"]
+                })
+        })
+        .map(|entry| entry.level);
+    let entries = entries
         .into_iter()
         .filter_map(|entry| {
             let words = tokens(&entry.title);
             let unit = words.first()?;
             let counter = words.get(1)?;
-            (PACKAGE_UNITS.contains(&unit.as_str())
-                && (label_remainder().is_match(counter) || is_roman(counter)))
-            .then(|| (entry.page - 1, entry.level, unit.clone()))
+            let kind = if PACKAGE_UNITS.contains(&unit.as_str())
+                && (label_remainder().is_match(counter) || is_roman(counter))
+            {
+                unit.clone()
+            } else if authorities == Some(entry.level)
+                && legal_pdf_core::layout_analysis()
+                    .numbering_marker(entry.title.split_whitespace().next()?, None)
+                    .is_some()
+            {
+                "authority".to_owned()
+            } else {
+                return None;
+            };
+            Some((entry.page - 1, entry.level, kind))
         })
         .collect::<Vec<_>>();
     let mut families = HashMap::<(&str, usize), HashSet<usize>>::new();

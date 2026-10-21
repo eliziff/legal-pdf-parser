@@ -2725,6 +2725,9 @@ fn classify_pages_with_source(
                 evidence,
             ));
         });
+        for page in pages.iter_mut() {
+            order_furniture(page);
+        }
         evidence
             .contents_pages
             .retain(|page| !shared_pages.contains(page));
