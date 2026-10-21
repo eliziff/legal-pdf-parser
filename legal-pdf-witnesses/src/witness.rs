@@ -124,6 +124,7 @@ pub struct Context<'a> {
     pub layout: Option<&'a HashMap<String, String>>,
 }
 
+#[derive(Clone)]
 pub struct Row {
     pub page: usize,
     pub id: String,
