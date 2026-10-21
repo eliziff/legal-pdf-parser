@@ -49,6 +49,7 @@ const HARD_DIAGNOSTICS: &[&str] = &[
     "TEXT_QUALITY_LOW",
 ];
 pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
+const MAX_FONT_HEADING_CHARS: usize = 180;
 
 #[derive(Debug, Clone)]
 pub(super) struct LabelPrefix {
@@ -1158,14 +1159,12 @@ fn has_word_character(text: &str) -> bool {
 }
 
 /// Text-Fidelity's native-PDF body-font estimator: the largest rounded font
-/// bucket carrying at least ten percent of document character mass. Smaller
+/// bucket carrying at least ten percent of the supplied character mass. Smaller
 /// quote/note fonts can be common without redefining the body face, while
 /// headings normally lack enough mass to become a substantial bucket.
-fn article_body_font_size(pages: &[Page]) -> f64 {
+fn body_font_size<'a>(lines: impl IntoIterator<Item = &'a Line>) -> f64 {
     let mut mass = HashMap::<i64, usize>::new();
-    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| {
-        !line.exclude_from_body && matches!(line.region_type.as_str(), "text" | "body")
-    }) {
+    for line in lines {
         let size = line_font_size(line);
         if size > 0.0 {
             *mass.entry((size * 100.0).round() as i64).or_default() += line.text.chars().count();
@@ -2075,7 +2074,7 @@ fn demote_false_headings(
 
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
-    body_size: f64,
+    body_sizes: &[f64],
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
     let toc_leader = contents_leader_re();
@@ -2262,6 +2261,7 @@ fn apply_text_fidelity_headings(
                 continue;
             }
             let target = &page.lines[target_slot];
+            let body_size = body_sizes[page_slot];
             let visual = bold_char_share(target) >= 0.60
                 || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
             if !visual && !decision.coherent_family {
@@ -2472,7 +2472,9 @@ fn classify_pages_with_source(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let article_body_size = if source_regions_cover_pages(pages, evidence.source_regions.as_ref()) {
-        article_body_font_size(pages)
+        body_font_size(pages.iter().flat_map(|page| &page.lines).filter(|line| {
+            !line.exclude_from_body && matches!(line.region_type.as_str(), "text" | "body")
+        }))
     } else {
         0.0
     };
@@ -2571,6 +2573,7 @@ fn classify_pages_with_source(
         );
     }
 
+    let mut heading_body_sizes = Vec::with_capacity(pages.len());
     for (page, (table_page, table_cells, table_notes)) in pages.iter_mut().zip(table_pages) {
         let line_sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
         let body_size = median(
@@ -2590,6 +2593,50 @@ fn classify_pages_with_source(
                 .collect(),
         );
         let body_size = if body_size > 0.0 { body_size } else { 10.0 };
+        let local_body_size =
+            if line_sizes.iter().any(|size| *size > 0.0) {
+                // Calibrate from complete prose paragraphs rather than short potential titles.
+                let paragraphs = crate::paragraphs::paragraph_indices(page, |line| {
+                    !line.exclude_from_body
+                        && line.note_region_mode.is_empty()
+                        && matches!(line.region_type.as_str(), "text" | "body")
+                        && !translation.contains(&line.id)
+                        && !contents_line_ids.contains(&line.id)
+                        && !evidence.contents_pages.contains(&page.index)
+                        && !evidence.table_cell_line_ids.contains(&line.id)
+                        && !evidence.table_note_line_ids.contains(&line.id)
+                        && evidence
+                            .source_regions
+                            .as_ref()
+                            .and_then(|regions| regions.get(&line.id))
+                            .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
+                });
+                let mut paragraph_chars = HashMap::<usize, usize>::new();
+                for (line, paragraph) in page.lines.iter().zip(&paragraphs) {
+                    if let Some(paragraph) = paragraph {
+                        *paragraph_chars.entry(*paragraph).or_default() +=
+                            line.text.chars().count();
+                    }
+                }
+                body_font_size(page.lines.iter().zip(&paragraphs).filter_map(
+                    |(line, paragraph)| {
+                        paragraph
+                            .filter(|id| paragraph_chars[id] > MAX_FONT_HEADING_CHARS)
+                            .map(|_| line)
+                    },
+                ))
+            } else {
+                0.0
+            };
+        // Long local prose establishes the page's type; the document is a prior for sparse pages.
+        let heading_body_size = if local_body_size > 0.0 {
+            local_body_size
+        } else if article_body_size > 0.0 {
+            article_body_size
+        } else {
+            body_size
+        };
+        heading_body_sizes.push(heading_body_size);
         let wide_sizes: Vec<_> = page
             .lines
             .iter()
@@ -3159,14 +3206,10 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
-            } else if line.text.chars().count() <= 180
+            } else if line.text.chars().count() <= MAX_FONT_HEADING_CHARS
+                && heading_source_eligible(evidence, line)
                 && !translation.contains(&line.id)
-                && size
-                    >= (if article_body_size > 0.0 {
-                        article_body_size
-                    } else {
-                        body_size
-                    }) * 1.18
+                && size >= heading_body_size * 1.18
                 && has_word_character(&line.text)
                 // A blank to fill in ("CACR ____", "DATED ____") makes the line a form's field.
                 && !line.text.contains("___")
@@ -3212,7 +3255,7 @@ fn classify_pages_with_source(
     }
     evidence.translation_line_ids = translation;
     evidence.contents_line_ids.extend(contents_line_ids);
-    let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
+    let heading_levels = apply_text_fidelity_headings(pages, &heading_body_sizes, evidence);
     evidence.heading_levels = heading_levels;
     // A transcript's line numbers locate its lines; they are no part of its paragraphs.
     for page in pages.iter_mut() {
