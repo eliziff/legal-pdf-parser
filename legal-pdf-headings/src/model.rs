@@ -297,7 +297,7 @@ impl FlashSpan {
             ),
             stats: CharStats::of(trim_unicode_ws(&span.text)),
             bold: span.flags & 16 != 0 || bold_font().is_match(&font_name),
-            italic: italic_font().is_match(&font_name),
+            italic: span.flags & 2 != 0 || italic_font().is_match(&font_name),
             font_name,
             size: span.size,
         }

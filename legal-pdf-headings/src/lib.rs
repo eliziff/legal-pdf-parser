@@ -56,6 +56,7 @@ fn join_wrapped_headings(
     pages: &mut [Page],
     levels: &HashMap<String, usize>,
     tagged_levels: &HashMap<String, usize>,
+    counted: &[Vec<bool>],
 ) {
     let style = |line: &legal_pdf_core::model::Line| {
         line.spans.first().map(|span| {
@@ -66,7 +67,7 @@ fn join_wrapped_headings(
             )
         })
     };
-    for page in pages.iter_mut() {
+    for (page_slot, page) in pages.iter_mut().enumerate() {
         for slot in 1..page.lines.len() {
             let (prior, line) = (&page.lines[slot - 1], &page.lines[slot]);
             let height = prior.bbox[3] - prior.bbox[1];
@@ -75,9 +76,9 @@ fn join_wrapped_headings(
                 ((prior.bbox[0] + prior.bbox[2]) - (line.bbox[0] + line.bbox[2])).abs() / 2.0 < 2.0;
             let joined = prior.region_type == "heading"
                 && line.region_type == "heading"
+                && counted[page_slot][slot - 1]
+                && counted[page_slot][slot]
                 && prior.block_index != line.block_index
-                && !prior.exclude_from_body
-                && !line.exclude_from_body
                 && style(prior).is_some()
                 && style(prior) == style(line)
                 && tagged_levels.get(&prior.id) == tagged_levels.get(&line.id)
@@ -221,7 +222,24 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             }
         }
     }
-    join_wrapped_headings(pages, evidence.levels, &tagged_levels);
+    // Every typography reader uses the same population, including its neighbors and style seeds.
+    let counted = pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| {
+                    !line.exclude_from_body
+                        && line.note_region_mode.is_empty()
+                        && matches!(line.region_type.as_str(), "body" | "heading")
+                        && !caption.contains(&line.id)
+                        && !(evidence.excluded)(&line.id)
+                        && !evidence.contents_pages.contains(&page.index)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    join_wrapped_headings(pages, evidence.levels, &tagged_levels, &counted);
 
     let flash_lines = pages
         .iter()
@@ -234,35 +252,26 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .collect::<Vec<_>>();
     let page_stats = pages
         .iter()
-        .zip(&flash_lines)
-        .map(|(page, lines)| {
-            // Notes, tables and furniture must not define the document's body typography.
-            let text = page.lines.iter().zip(lines).filter(|(line, _)| {
-                !line.exclude_from_body
-                    && line.note_region_mode.is_empty()
-                    && matches!(line.region_type.as_str(), "body" | "heading")
-                    && !caption.contains(&line.id)
-                    && !(evidence.excluded)(&line.id)
-                    && !evidence.contents_pages.contains(&page.index)
-            });
-            stats::page_stats(text.map(|(_, line)| line), page.width)
+        .enumerate()
+        .map(|(page_slot, page)| {
+            let text = flash_lines[page_slot]
+                .iter()
+                .zip(&counted[page_slot])
+                .filter_map(|(line, &keep)| keep.then_some(line));
+            stats::page_stats(text, page.width)
         })
         .collect::<Vec<_>>();
     let doc = stats::doc_stats(&page_stats);
 
     // Blocks: runs of body or heading lines sharing a block, as regions group them.
     let mut blocks = Vec::<Block>::new();
-    let mut eligible = Vec::<bool>::new();
     let mut flash_pages = Vec::<FlashPage>::new();
     for (page_slot, page) in pages.iter().enumerate() {
         let mut ids = Vec::new();
         let mut slot = 0;
         while slot < page.lines.len() {
             let line = &page.lines[slot];
-            if line.exclude_from_body
-                || !line.note_region_mode.is_empty()
-                || !matches!(line.region_type.as_str(), "body" | "heading")
-            {
+            if !counted[page_slot][slot] {
                 slot += 1;
                 continue;
             }
@@ -270,8 +279,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             while end < page.lines.len()
                 && page.lines[end].region_type == line.region_type
                 && page.lines[end].block_index == line.block_index
-                && !page.lines[end].exclude_from_body
-                && page.lines[end].note_region_mode.is_empty()
+                && counted[page_slot][end]
                 && tagged_levels.get(&page.lines[end].id) == tagged_levels.get(&line.id)
             {
                 end += 1;
@@ -294,12 +302,6 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     || (evidence.numbered)(first),
                 is_body: false,
             });
-            eligible.push(
-                lines
-                    .iter()
-                    .all(|line| !caption.contains(&line.id) && !(evidence.excluded)(&line.id))
-                    && !evidence.contents_pages.contains(&page.index),
-            );
             ids.push(blocks.len() - 1);
             slot = end;
         }
@@ -326,12 +328,10 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     // capital or a number, ends no lead-in, and stands on rows of its own beside no running text.
     // The citation grammar's answer for each text, read once: a document repeats its running heads
     // and titles page after page.
+    let mut eligible = vec![true; blocks.len()];
     let mut cited: HashMap<String, bool> = HashMap::new();
     for page in &flash_pages {
         for (position, &block) in page.blocks.iter().enumerate() {
-            if !eligible[block] {
-                continue;
-            }
             let flash = &blocks[block].flash;
             let text = flash
                 .lines
