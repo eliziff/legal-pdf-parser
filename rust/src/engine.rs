@@ -380,10 +380,21 @@ fn derive_extracted(
     cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
 ) -> Result<StructureOutput> {
-    // The readers' state, named for their input pages and their code.
+    // Reader state depends on both its local code and the supplied engine's layout services.
     let reader_cache = cache_root.and_then(|root| {
-        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), semantic_profile, &extracted.pages, &extracted.separators)).ok()?;
-        Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
+        let key = serialization_sha256(&(
+            env!("LEGAL_PDF_READER_SHA256"),
+            legal_pdf_core::layout_analysis().source_sha256(),
+            semantic_profile,
+            &extracted.pages,
+            &extracted.separators,
+        ))
+        .ok()?;
+        Some(
+            parse_cache_root(root)
+                .join("reader")
+                .join(format!("{key}.json.gz")),
+        )
     });
     let mut derived = legal_pdf_structure::derive_cached(
         &mut extracted.pages,
