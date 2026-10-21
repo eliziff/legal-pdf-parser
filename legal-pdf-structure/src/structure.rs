@@ -2471,13 +2471,13 @@ fn apply_text_fidelity_headings(
     heading_levels
 }
 
-/// "Notes", "NOTES", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
+/// "Notes", "Footnotes", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
 /// is a sentence's word wrapped ("... on the information or indictment, / note").
 fn endnote_heading(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
     text.starts_with(char::is_uppercase)
-        && RE.get_or_init(|| Regex::new(r"(?i)^(?:end)?notes?$").unwrap()).is_match(text)
+        && RE.get_or_init(|| Regex::new(r"(?i)^(?:end|foot)?notes?$").unwrap()).is_match(text)
 }
 
 fn continuing_note_heading(text: &str) -> bool {
