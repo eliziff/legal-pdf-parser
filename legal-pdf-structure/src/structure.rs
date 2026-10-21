@@ -68,6 +68,8 @@ struct PdfPrimitiveEvidence {
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
+    /// Native body type calibrated for each page before heading roles are assigned.
+    heading_body_sizes: Vec<f64>,
     #[serde(default)]
     navigation_parents: HashMap<String, Option<String>>,
     /// Tables drawn with rules, read from each page's painted rules.
@@ -2074,7 +2076,7 @@ fn demote_false_headings(
 
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
-    body_sizes: &[f64],
+    body_size: f64,
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
     let toc_leader = contents_leader_re();
@@ -2261,7 +2263,7 @@ fn apply_text_fidelity_headings(
                 continue;
             }
             let target = &page.lines[target_slot];
-            let body_size = body_sizes[page_slot];
+            let body_size = primitives.heading_body_sizes.get(page_slot).copied().unwrap_or(body_size);
             let visual = bold_char_share(target) >= 0.60
                 || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
             if !visual && !decision.coherent_family {
@@ -3255,7 +3257,8 @@ fn classify_pages_with_source(
     }
     evidence.translation_line_ids = translation;
     evidence.contents_line_ids.extend(contents_line_ids);
-    let heading_levels = apply_text_fidelity_headings(pages, &heading_body_sizes, evidence);
+    evidence.heading_body_sizes = heading_body_sizes;
+    let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
     evidence.heading_levels = heading_levels;
     // A transcript's line numbers locate its lines; they are no part of its paragraphs.
     for page in pages.iter_mut() {
