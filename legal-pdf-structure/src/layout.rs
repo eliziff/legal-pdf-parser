@@ -1262,6 +1262,27 @@ pub(super) fn weave_note_columns(
     body
 }
 
+/// Restore physical header and footer bands after independent readers share a page.
+pub(super) fn order_furniture(page: &mut Page) {
+    let band = |line: &Line| match line.region_type.as_str() {
+        "header" => 0,
+        "footer" => 2,
+        _ => 1,
+    };
+    page.lines.sort_by(|a, b| {
+        band(a).cmp(&band(b)).then_with(|| {
+            if band(a) == 1 {
+                std::cmp::Ordering::Equal
+            } else {
+                band_geometry_order(a, b)
+            }
+        })
+    });
+    for (slot, line) in page.lines.iter_mut().enumerate() {
+        line.reading_order = slot + 1;
+    }
+}
+
 pub(super) fn order_page(
     page: &mut Page,
     table_page: bool,
@@ -1281,7 +1302,6 @@ pub(super) fn order_page(
             _ => body.push(line),
         }
     }
-    header.sort_by(band_geometry_order);
     repair_drop_caps(&mut body);
     let contents = table_page && !has_table_caption(&body) && contents_grid(&body, page.width);
     let decision = if contents && y_regressions(&body) > 0 {
@@ -1321,14 +1341,11 @@ pub(super) fn order_page(
         diagnostics.push(diagnostic);
     }
     order_note_lines(&mut note, page.width);
-    footer.sort_by(band_geometry_order);
     let mut ordered = header;
     ordered.extend(weave_note_columns(body, note, page.width));
     ordered.extend(footer);
-    for (index, line) in ordered.iter_mut().enumerate() {
-        line.reading_order = index + 1;
-    }
     page.lines = ordered;
+    order_furniture(page);
     diagnostics
 }
 
