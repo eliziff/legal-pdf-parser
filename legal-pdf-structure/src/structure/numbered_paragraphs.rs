@@ -567,7 +567,8 @@ pub(super) fn candidates(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let paragraphs = super::build_paragraphs(pages_original, &std::collections::HashMap::new());
+    let paragraphs =
+        super::build_paragraphs_with_context(pages_original, &HashMap::new(), primitives);
     let headings = paragraphs
         .iter()
         .filter(|paragraph| paragraph.region_type == "heading")
@@ -575,16 +576,10 @@ pub(super) fn candidates(
         .collect::<HashSet<_>>();
     let mut groups = BTreeMap::<super::DocumentContext, Vec<Vec<String>>>::new();
     for paragraph in paragraphs {
-        let mut local = BTreeMap::<super::DocumentContext, Vec<String>>::new();
-        for id in paragraph.line_ids {
-            local
-                .entry(primitives.document_context(&id))
-                .or_default()
-                .push(id);
-        }
-        for (context, lines) in local {
-            groups.entry(context).or_default().push(lines);
-        }
+        groups
+            .entry(primitives.document_context(&paragraph.line_ids[0]))
+            .or_default()
+            .push(paragraph.line_ids);
     }
     let mut readings = BTreeMap::<super::DocumentContext, (usize, Vec<PdfTextPage>)>::new();
     for (slot, page) in pages.into_iter().enumerate() {
