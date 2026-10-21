@@ -1,11 +1,11 @@
 use super::{
-    arabic_page_number, body_flow_edge, scalar_suffix, sentence_ended, starts_note_or_list,
-    DocumentContext, PdfPrimitiveEvidence,
+    arabic_page_number, body_flow_edge, continues_prose, scalar_suffix, sentence_ended,
+    starts_note_or_list, DocumentContext, PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
 use legal_structure_model::structure_analysis;
 use legal_pdf_core::{Error, Result};
-use legal_pdf_support::protected_citation_spans;
+use legal_pdf_support::{has_citation_signal, protected_citation_spans};
 use legal_structure_model::{
     CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity,
     NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange, ScalarText,
@@ -1125,7 +1125,20 @@ impl PdfResolutionInput {
                 });
                 let opening = run.grammar == CandidateGrammar::Hierarchy
                     && candidate.parent_candidate_id.is_none();
+                // Bare period markers can be words in wrapped prose or a case citation.
+                let prose_continuation = run.grammar == CandidateGrammar::Enumerator
+                    && candidate.label.ends_with('.')
+                    && marker_lines.iter().any(|indexed| {
+                        by_line
+                            .get(indexed.line_id.as_str())
+                            .is_some_and(|(page, line)| {
+                                continues_prose(page, line)
+                                    && !sentence_items.contains(candidate.id.as_str())
+                                    || candidate.label == "v." && has_citation_signal(&line.text)
+                            })
+                    });
                 if marker_is_cross_reference
+                    || prose_continuation
                     || (opening && wrapped_into(&index, &by_line, &measures, candidate, primitives))
                 {
                     add_observation(&mut observations, CandidateObservationV2::CrossReference);
