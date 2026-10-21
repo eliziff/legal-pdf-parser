@@ -3614,19 +3614,21 @@ fn join_lines(lines: &[&Line]) -> (String, Vec<legal_pdf_core::model::SourceText
     (text, source_spans)
 }
 
-fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
-    let boundaries = constituents::starts(pages)
-        .into_iter()
-        .map(|start| start.line_id)
-        .collect::<HashSet<_>>();
+fn build_paragraphs_with_context(
+    pages: &[Page],
+    anchors: &HashMap<String, Vec<Anchor>>,
+    primitives: &PdfPrimitiveEvidence,
+) -> Vec<Paragraph> {
+    let context = |id: &str| primitives.document_context(id);
     let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
+    let mut tails = HashMap::<DocumentContext, usize>::new();
     for page in pages {
         let line_by_id: HashMap<&str, &Line> = page
             .lines
             .iter()
             .map(|line| (line.id.as_str(), line))
             .collect();
-        let mut first = true;
+        let mut seen = HashSet::new();
         for region in &page.regions {
             if !matches!(region.kind.as_str(), "body" | "heading") {
                 continue;
@@ -3637,23 +3639,24 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
                 .filter_map(|id| line_by_id.get(id.as_str()).copied())
                 .filter(|line| !line.exclude_from_body)
                 .collect();
-            if lines.is_empty() {
-                continue;
-            }
-            // A paragraph the page break interrupts goes on as the next page's first.
-            if let Some((_, "body", previous)) = regions.last_mut() {
-                if first
-                    && region.kind == "body"
-                    && !boundaries.contains(&lines[0].id)
-                    && crate::paragraphs::continues_onto(previous, &lines)
-                {
-                    previous.extend(lines);
-                    first = false;
-                    continue;
+            for lines in lines.chunk_by(|left, right| context(&left.id) == context(&right.id)) {
+                let key = context(&lines[0].id);
+                let first = seen.insert(key);
+                // The other column's intervening regions do not close this context's paragraph.
+                if let Some(&slot) = tails.get(&key) {
+                    let (_, kind, previous) = &mut regions[slot];
+                    if first
+                        && region.kind == "body"
+                        && *kind == "body"
+                        && crate::paragraphs::continues_onto(previous, lines)
+                    {
+                        previous.extend_from_slice(lines);
+                        continue;
+                    }
                 }
+                tails.insert(key, regions.len());
+                regions.push((page, region.kind.as_str(), lines.to_vec()));
             }
-            first = false;
-            regions.push((page, region.kind.as_str(), lines));
         }
     }
     let mut paragraphs = Vec::new();
@@ -3721,6 +3724,17 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
         });
     }
     paragraphs
+}
+
+#[cfg(test)]
+fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
+    let starts = constituents::starts(pages);
+    let primitives = PdfPrimitiveEvidence {
+        document_line_ids: constituents::document_lines(pages, &starts),
+        translation_line_ids: translation_lines(pages),
+        ..Default::default()
+    };
+    build_paragraphs_with_context(pages, anchors, &primitives)
 }
 
 fn marker_re() -> &'static Regex {
@@ -4303,7 +4317,7 @@ fn derive_prepared(
         || unmatched_reference_diagnostics(pages, &footnotes, &anchors, &prepared.primitives),
     ));
     let paragraphs = legal_pdf_support::profile::measure("derive.paragraphs", || {
-        build_paragraphs(pages, &anchors)
+        build_paragraphs_with_context(pages, &anchors, &prepared.primitives)
     });
     legal_pdf_support::profile::measure("derive.propositions", || {
         attach_propositions(&mut footnotes, &paragraphs, &prepared.primitives)
