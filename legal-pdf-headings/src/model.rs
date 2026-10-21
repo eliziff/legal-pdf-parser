@@ -520,11 +520,15 @@ impl FlashBlock {
         self.stats.caps_heavy()
     }
 
-    /// Dominant font size, plus two for capitals and one for bold.
-    pub(super) fn heading_score(&self) -> f64 {
-        self.dominant_size()
+    /// Dominant type size, plus two for capitals and one for comparable observed bold.
+    pub(super) fn heading_score(&self, scale: f64, known_style: bool) -> f64 {
+        self.dominant_size() * scale
             + if self.caps_heavy() { 2.0 } else { 0.0 }
-            + if self.bold > 0.5 { 1.0 } else { 0.0 }
+            + if known_style && self.bold > 0.5 {
+                1.0
+            } else {
+                0.0
+            }
     }
 
     /// 1 justified, 2 left-aligned, 3 centered, 4 right-aligned, 5 mixed.

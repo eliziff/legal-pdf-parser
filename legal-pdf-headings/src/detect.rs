@@ -25,11 +25,26 @@ pub(super) struct Block {
     pub(super) is_body: bool,
     /// Parallel text has its own heading sequence.
     pub(super) translation: bool,
+    /// Recognized glyph heights are distinct from native font sizes.
+    pub(super) fontless: bool,
 }
 
 impl Block {
     pub(super) fn rect(&self) -> &Rect {
         &self.flash.rect
+    }
+
+    pub(super) fn scale_to(&self, other: &Block, doc: &[DocStats; 2]) -> f64 {
+        if self.fontless == other.fontless {
+            return 1.0;
+        }
+        let from = doc[usize::from(self.fontless)].body_font_size;
+        let to = doc[usize::from(other.fontless)].body_font_size;
+        if from > 0.0 && to > 0.0 {
+            to / from
+        } else {
+            f64::NAN
+        }
     }
 }
 
@@ -37,14 +52,24 @@ impl Block {
 pub(super) struct FlashPage {
     pub(super) width: f64,
     pub(super) height: f64,
-    pub(super) stats: PageStats,
+    /// Native font sizes, then recognized glyph heights.
+    pub(super) stats: [PageStats; 2],
     /// Indexes into the document's blocks, in reading order.
     pub(super) blocks: Vec<usize>,
-    pub(super) body_styles: HashSet<String>,
+    pub(super) body_styles: [HashSet<String>; 2],
+}
+
+impl FlashPage {
+    pub(super) fn stats(&self, fontless: bool) -> &PageStats {
+        &self.stats[usize::from(fontless)]
+    }
 }
 
 /// Lines of at least 40 characters of ordinary weight and size that read as running text.
-pub(super) fn is_body_paragraph(doc: &DocStats, page: &FlashPage, block: &FlashBlock) -> bool {
+pub(super) fn is_body_paragraph(doc: &[DocStats; 2], page: &FlashPage, block: &Block) -> bool {
+    let stats = page.stats(block.fontless);
+    let doc = &doc[usize::from(block.fontless)];
+    let block = &block.flash;
     if block.fill < 0.6 {
         return false;
     }
@@ -89,7 +114,7 @@ pub(super) fn is_body_paragraph(doc: &DocStats, page: &FlashPage, block: &FlashB
         return false;
     }
     let size = block.size;
-    let body = page.stats.font_size.min(doc.body_font_size);
+    let body = stats.font_size.min(doc.body_font_size);
     let minimum = doc.body_font_size.min(page.height.max(page.width) / 60.0);
     let minimum = (0.7 * minimum).min(minimum - 3.0);
     if size < body - 2.0 || size < minimum {
@@ -105,14 +130,14 @@ pub(super) fn is_body_paragraph(doc: &DocStats, page: &FlashPage, block: &FlashB
         return true;
     }
     if (chars >= 100.0 || block.stats.last == 6)
-        && (size >= page.stats.font_size - 0.5 || size > doc.body_font_size - 0.1)
+        && (size >= stats.font_size - 0.5 || size > doc.body_font_size - 0.1)
     {
         return block
             .first_span()
-            .is_some_and(|span| span.font_name == page.stats.dominant_font)
+            .is_some_and(|span| span.font_name == stats.dominant_font)
             || block
                 .last_span()
-                .is_some_and(|span| span.font_name == page.stats.dominant_font);
+                .is_some_and(|span| span.font_name == stats.dominant_font);
     }
     false
 }
@@ -214,7 +239,7 @@ pub(super) fn vertically_close(a: Option<&Block>, b: &Block) -> bool {
 }
 
 pub(super) struct Scan<'a> {
-    pub(super) doc: &'a DocStats,
+    pub(super) doc: &'a [DocStats; 2],
     pub(super) pages: &'a [FlashPage],
     pub(super) blocks: &'a [Block],
     pub(super) page: usize,
@@ -231,11 +256,12 @@ impl Scan<'_> {
     fn too_wide(&self, block: &Block) -> bool {
         let width = block.rect().width();
         let page = &self.pages[self.page];
-        if width > 0.7 * page.width / 2.0 || width > 0.7 * self.doc.line_width {
+        let doc = &self.doc[usize::from(block.fontless)];
+        if width > 0.7 * page.width / 2.0 || width > 0.7 * doc.line_width {
             return true;
         }
         let count = (self.page.saturating_sub(1)..=(self.page + 1).min(self.pages.len() - 1))
-            .filter(|index| width > 0.7 * self.pages[*index].stats.line_width)
+            .filter(|index| width > 0.7 * self.pages[*index].stats(block.fontless).line_width)
             .count();
         count >= 2
     }
@@ -304,6 +330,8 @@ impl Scan<'_> {
     pub(super) fn candidate(&mut self, position: usize) -> bool {
         let page = &self.pages[self.page];
         let block = &self.blocks[page.blocks[position]];
+        let stats = page.stats(block.fontless);
+        let doc = &self.doc[usize::from(block.fontless)];
         let flash = &block.flash;
         // A printed number alone does not settle the line's role.
         if flash.char_count() == 0 || flash.skew > 1.0 || block.heading {
@@ -337,13 +365,13 @@ impl Scan<'_> {
         let size = flash.size;
         let lots_caps =
             f64::from(flash.stats.counts[2]) >= 3f64.max(f64::from(flash.stats.letters()) / 2.0);
-        if rows > 4 || (rows >= 3 && !(size >= 1.5 * page.stats.font_size || lots_caps)) {
+        if rows > 4 || (rows >= 3 && !(size >= 1.5 * stats.font_size || lots_caps)) {
             return false;
         }
-        if flash.fill < 0.5 * self.doc.upper_fill || flash.stats.letters() == 0 {
+        if flash.fill < 0.5 * doc.upper_fill || flash.stats.letters() == 0 {
             return false;
         }
-        if flash.bold < 0.1 && !lots_caps && size < self.doc.body_font_size - 2.0 {
+        if !block.fontless && flash.bold < 0.1 && !lots_caps && size < doc.body_font_size - 2.0 {
             return false;
         }
         if self.neighbor_rejects(position) {
@@ -361,19 +389,20 @@ impl Scan<'_> {
             .map(|&slot| &self.blocks[slot]);
         // Headers are not native blocks: a block's neighbors are never one.
         if !neighbors.body_crossed
-            && (flash.heading_score() < page.stats.font_size + 1.5
+            && (flash.heading_score(1.0, !block.fontless) < stats.font_size + 1.5
                 || above.is_some()
                 || previous.is_some()
                 || next.is_some_and(|next| !(next.rect().top < block.rect().bottom - size)))
         {
             return false;
         }
-        if flash.bold < 0.1
+        if !block.fontless
+            && flash.bold < 0.1
             && !lots_caps
             && flash
                 .first_span()
-                .is_some_and(|span| span.font_name == page.stats.dominant_font)
-            && size < self.doc.body_font_size - 0.5
+                .is_some_and(|span| span.font_name == stats.dominant_font)
+            && size < doc.body_font_size - 0.5
         {
             return false;
         }
@@ -387,8 +416,8 @@ impl Scan<'_> {
         if below_gap < -0.9 * block.rect().height() {
             return false;
         }
-        let line_gap = page.stats.line_gap - page.stats.font_size;
-        if top_gap < line_gap && size < page.stats.font_size - 1.0 {
+        let line_gap = stats.line_gap - stats.font_size;
+        if top_gap < line_gap && size < stats.font_size - 1.0 {
             return false;
         }
         if chars >= 120 || top_gap <= line_gap - 0.1 {
@@ -404,6 +433,9 @@ impl Scan<'_> {
     fn font_heading(&self, position: usize) -> bool {
         let page = &self.pages[self.page];
         let block = &self.blocks[page.blocks[position]];
+        let stats = page.stats(block.fontless);
+        let doc = &self.doc[usize::from(block.fontless)];
+        let size_of = |other: &Block| other.flash.size * other.scale_to(block, self.doc);
         let flash = &block.flash;
         let rect = block.rect();
         let neighbors = &self.neighbors[position];
@@ -413,7 +445,7 @@ impl Scan<'_> {
         let body_below = self.at(neighbors.body_below);
         let top_gap = above.map_or(f64::INFINITY, |above| above.rect().bottom - rect.top);
         let below_gap = below.map_or(f64::INFINITY, |below| rect.bottom - below.rect().top);
-        let doc_size = self.doc.body_font_size;
+        let doc_size = doc.body_font_size;
         if !(vertically_close(body_above, block)
             || vertically_close(body_below, block)
             || (rect.bottom >= 0.8 * page.height
@@ -423,15 +455,15 @@ impl Scan<'_> {
         {
             return false;
         }
-        let far = 10.0 * flash.size.min(page.stats.line_gap);
+        let far = 10.0 * flash.size.min(stats.line_gap);
         if top_gap.is_finite() && top_gap > far {
             return false;
         }
         if let Some(below) = below {
-            if below.flash.fill < 0.67 * self.doc.upper_fill
+            if below.flash.fill < 0.67 * doc.upper_fill
                 || (flash.char_count() < 30
                     && below.flash.char_count() < 300
-                    && below.flash.fill < 0.8 * self.doc.upper_fill)
+                    && below.flash.fill < 0.8 * doc.upper_fill)
             {
                 return false;
             }
@@ -449,29 +481,29 @@ impl Scan<'_> {
             && below_gap > 0.0
             && flash.line_height >= doc_size + 2.0
             && flash.size >= doc_size + 1.5
-            && flash.size >= page.stats.font_size + 0.5
+            && flash.size >= stats.font_size + 0.5
             && above.is_none_or(|above| {
-                flash.line_height >= above.flash.line_height && flash.size >= above.flash.size
+                flash.line_height >= above.flash.line_height && flash.size >= size_of(above)
             })
             && below.is_some_and(|below| {
-                flash.line_height >= below.flash.line_height && flash.size >= below.flash.size
+                flash.line_height >= below.flash.line_height && flash.size >= size_of(below)
             })
         {
             return true;
         }
         let caps = flash.caps_heavy();
         let dominant = flash.dominant_style();
-        if (page.body_styles.contains(dominant)
+        if (!block.fontless
+            && page.body_styles[usize::from(block.fontless)].contains(dominant)
             && !caps
-            && (page.stats.dominant_style == dominant
+            && (stats.dominant_style == dominant
                 || (flash.bold < 0.9
                     && flash.italic < 0.9
                     && flash.alignment_code() != 3
                     && !flash.sentence_like())))
             || (above.is_some()
-                && below.is_some_and(|below| {
-                    flash.size <= below.flash.size && top_gap < below_gap / 4.0
-                }))
+                && below
+                    .is_some_and(|below| flash.size <= size_of(below) && top_gap < below_gap / 4.0))
         {
             return false;
         }
@@ -481,25 +513,25 @@ impl Scan<'_> {
             && flash.size >= doc_size + 0.5
             && below.is_some_and(|below| {
                 flash.line_height >= below.flash.line_height
-                    && flash.size >= below.flash.size
-                    && below.flash.size >= page.stats.font_size - 0.5
+                    && flash.size >= size_of(below)
+                    && size_of(below) >= stats.font_size - 0.5
                     && rect.width() < 0.95 * below.rect().width()
                     && below.rect().width() >= 0.25 * page.width
             })
         {
             return true;
         }
-        let line_height = page.stats.line_gap - page.stats.font_size;
+        let line_height = stats.line_gap - stats.font_size;
         // Branch 4: a moderate gap before a body paragraph in smaller type.
         if below_gap > line_height
             && below_gap < 5.0 * line_height
-            && above.is_none_or(|above| flash.size >= above.flash.size + 0.5)
+            && above.is_none_or(|above| flash.size >= size_of(above) + 0.5)
             && below.is_some_and(|below| {
-                flash.size >= below.flash.size + 0.5
+                flash.size >= size_of(below) + 0.5
                     && flash.size >= doc_size - 0.5
                     && rect.width() < 0.95 * below.rect().width()
                     && below.is_body
-                    && below.flash.size >= page.stats.font_size - 0.5
+                    && size_of(below) >= stats.font_size - 0.5
                     && below.flash.stats.first != 1
             })
         {
@@ -542,9 +574,9 @@ impl Scan<'_> {
         // Branch A: set apart in bold or capitals beside an aligned body paragraph.
         let neighbor_cue = below_gap.is_finite()
             && below_gap > lowered
-            && flash.size >= page.stats.font_size - 0.1
+            && flash.size >= stats.font_size - 0.1
             && below.is_some_and(|below| {
-                flash.size >= below.flash.size - 0.1
+                flash.size >= size_of(below) - 0.1
                     && flash.size >= doc_size - 0.5
                     && ((below.is_body
                         && rect.width() < 0.95 * below.rect().width()
@@ -558,15 +590,19 @@ impl Scan<'_> {
                                     && top_gap < 6.0 * rect.height()
                             })))
                     && (capital || caps)
-                    && ((flash.bold > below.flash.bold
+                    && ((!below.fontless
+                        && flash.bold > below.flash.bold
                         && flash.bold > 0.5
                         && (!below.flash.first_span().is_some_and(|span| span.bold)
-                            || above.is_some_and(|above| flash.bold > above.flash.bold)))
+                            || above.is_some_and(|above| {
+                                !above.fontless && flash.bold > above.flash.bold
+                            })))
                         || caps)
             });
         let difference_style = below.is_some_and(|below| {
             below.is_body
-                && below.flash.size > page.stats.font_size - 0.5
+                && block.fontless == below.fontless
+                && size_of(below) > stats.font_size - 0.5
                 && below_gap > 0.0
                 && below_gap < 3.0 * rect.height()
                 && dominant != below.flash.dominant_style()
@@ -575,6 +611,7 @@ impl Scan<'_> {
             difference_style
                 && above.is_some_and(|above| {
                     above.is_body
+                        && above.fontless == below.fontless
                         && top_gap > 0.0
                         && top_gap < 3.0 * rect.height()
                         && capital
@@ -585,8 +622,9 @@ impl Scan<'_> {
             return true;
         }
         let top = above.is_none();
-        let body_dominant =
-            |other: &Block| other.flash.dominant_style() == page.stats.dominant_style;
+        let body_dominant = |other: &Block| {
+            other.flash.dominant_style() == page.stats(other.fontless).dominant_style
+        };
         let c1 = top
             && capital
             && difference_style
@@ -599,8 +637,8 @@ impl Scan<'_> {
                     neighbors.below != neighbors.body_below
                         && below.rect().bottom - body.rect().top < below.flash.size
                         && body_dominant(body)
-                        && dominant != page.stats.dominant_style
-                        && (flash.size >= below.flash.size + 0.5
+                        && dominant != stats.dominant_style
+                        && (flash.size >= size_of(below) + 0.5
                             || (caps && !below.flash.stats.upper_dominant()))
                 }
                 _ => false,
@@ -610,7 +648,7 @@ impl Scan<'_> {
                 || neighbors
                     .above
                     .is_some_and(|slot| self.proposed.contains(&slot)))
-                && (above.flash.size >= flash.size + 0.5
+                && (size_of(above) >= flash.size + 0.5
                     || (above.flash.stats.upper_dominant() && !caps))
                 && capital
                 && difference_style
