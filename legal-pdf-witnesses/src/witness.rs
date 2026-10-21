@@ -703,7 +703,11 @@ fn witness_rows(
             .filter_map(|span| span.structure_role.as_deref())
             .collect::<std::collections::HashSet<_>>();
         values.extend([
-            flag(!tags.is_empty() || layout.is_some_and(legal_pdf_core::is_heading_role)),
+            flag(
+                !tags.is_empty()
+                    || layout.is_some_and(legal_pdf_core::is_heading_role)
+                    || layout == Some("LI"),
+            ),
             flag(
                 layout.is_some_and(legal_pdf_core::is_heading_role)
                     || tags
@@ -713,8 +717,10 @@ fn witness_rows(
             flag(tags.contains("Title")),
             flag(tags.contains("P")),
             flag(
-                tags.iter()
-                    .any(|role| matches!(*role, "L" | "LI" | "Lbl" | "LBody")),
+                layout == Some("LI")
+                    || tags
+                        .iter()
+                        .any(|role| matches!(*role, "L" | "LI" | "Lbl" | "LBody")),
             ),
             flag(
                 tags.iter()

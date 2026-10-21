@@ -25,14 +25,19 @@ pub fn tagged_heading<'a>(
     line: &'a Line,
     role: impl Fn(&'a Span) -> Option<&'a str>,
 ) -> Option<&'a str> {
+    tagged_line_role(line, |span| role(span).filter(|role| is_heading_role(role)))
+}
+
+/// One source role covering the line's exact visible text, including every anchored span.
+pub fn tagged_line_role<'a>(
+    line: &'a Line,
+    role: impl Fn(&'a Span) -> Option<&'a str>,
+) -> Option<&'a str> {
     let spans = line
         .spans
         .iter()
         .filter(|span| !span.text.trim().is_empty());
-    let heading = role(spans.clone().next()?)?;
-    if !is_heading_role(heading) {
-        return None;
-    }
+    let tag = role(spans.clone().next()?)?;
     let mut spans = spans.collect::<Vec<_>>();
     spans.sort_unstable_by_key(|span| (span.start, span.end));
     let bytes = line
@@ -43,7 +48,7 @@ pub fn tagged_heading<'a>(
         .collect::<Vec<_>>();
     let mut covered = 0;
     for span in spans {
-        if role(span) != Some(heading) || span.start >= span.end {
+        if role(span) != Some(tag) || span.start >= span.end {
             return None;
         }
         let (start, end) = (*bytes.get(span.start)?, *bytes.get(span.end)?);
@@ -54,10 +59,7 @@ pub fn tagged_heading<'a>(
         }
         covered = covered.max(span.end);
     }
-    line.text[bytes[covered]..]
-        .trim()
-        .is_empty()
-        .then_some(heading)
+    line.text[bytes[covered]..].trim().is_empty().then_some(tag)
 }
 
 /// Mark the words a horizontal rule on their page underlines: painted in the PDF, or drawn on a
