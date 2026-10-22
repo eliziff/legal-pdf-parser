@@ -2374,7 +2374,8 @@ fn recognized_page(page: &Page) -> bool {
         fonts.insert(span.font.as_str());
         styled |= span.flags & (16 | 2) != 0;
     }
-    fonts.len() == 1 && !styled
+    // A tab divider ("Tab" / "1") or a cover of two lines in one face says nothing about the layer.
+    body.len() >= 8 && fonts.len() == 1 && !styled
 }
 
 /// On a recognized page, a short title-case line set apart above a full body line: a heading the
