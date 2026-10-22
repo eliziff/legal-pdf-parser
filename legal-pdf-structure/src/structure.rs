@@ -435,6 +435,55 @@ fn standalone_enumerator(text: &str) -> bool {
     standalone_enumerator_re().is_match(text)
 }
 
+/// A heading's enumerator, alone on its line: as [`standalone_enumerator_re`], and a decimal
+/// section number ("1.1", "2.3.1") with no period after it.
+fn heading_standalone_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3})([.)])|(\d{1,2}(?:\.\d{1,2}){1,3})([.)]?))\s*$",
+        )
+        .unwrap()
+    })
+}
+
+/// A heading's enumerator with its title on the line: as [`inline_enumerator_re`], and a decimal
+/// section number with no period after it ("1.1 Definitions").
+fn heading_inline_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3})([.)])|(\d{1,2}(?:\.\d{1,2}){1,3})([.)]?))\s+(\S.*)$",
+        )
+        .unwrap()
+    })
+}
+
+/// (value, punctuation, title) of a heading enumerator match from either lenient regex.
+fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str, &'t str, &'t str) {
+    let (value, punct) = match (capture.get(1), capture.get(3)) {
+        (Some(value), _) => (value.as_str(), capture.get(2).map_or("", |m| m.as_str())),
+        (None, Some(value)) => (value.as_str(), capture.get(4).map_or("", |m| m.as_str())),
+        (None, None) => ("", ""),
+    };
+    (value, punct, capture.get(5).map_or("", |m| m.as_str()).trim())
+}
+
+/// The title after a leading enumerator, or the whole text.
+fn title_after_enumerator(text: &str) -> &str {
+    heading_inline_re()
+        .captures(text.trim())
+        .map(|capture| heading_enumerator(&capture).2)
+        .unwrap_or(text.trim())
+}
+
+/// A title set in capitals: the typographic evidence a recognized page keeps when it loses bold
+/// and size.
+fn caps_title(text: &str) -> bool {
+    let title = title_after_enumerator(text);
+    title.chars().filter(|c| c.is_alphabetic()).count() >= 4 && all_caps(title) && !sentence_ended(title)
+}
+
 /// "[12]" alone on its line; four digits would be a bracketed year.
 fn standalone_paragraph_number(text: &str) -> bool {
     text.trim()
@@ -1354,8 +1403,8 @@ struct HeadingDecision {
 }
 
 fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
-    let inline = inline_enumerator_re();
-    let standalone = standalone_enumerator_re();
+    let inline = heading_inline_re();
+    let standalone = heading_standalone_re();
     let mut candidates = Vec::new();
     for (page_slot, page) in pages.iter().enumerate() {
         if primitives.contents_pages.contains(&page.index) {
@@ -1391,9 +1440,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                 continue;
             }
             if let Some(capture) = inline.captures(line.text.trim()) {
-                let value = capture.get(1).unwrap().as_str();
-                let punct = capture.get(2).unwrap().as_str();
-                let text = capture.get(3).unwrap().as_str().trim();
+                let (value, punct, text) = heading_enumerator(&capture);
                 let interpretations = enumerator_interpretations(value, punct);
                 // A line opening "v. Party, 2016 ONCA 409" carries a style of cause on; a
                 // fifth title ("v. The Rule of Lenity") cites nothing.
@@ -1432,8 +1479,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                 continue;
             };
             let text = page.lines[follower_slot].text.trim();
-            let value = capture.get(1).unwrap().as_str();
-            let punct = capture.get(2).unwrap().as_str();
+            let (value, punct, _) = heading_enumerator(&capture);
             // "v." alone between two parties' names is the style of cause's versus.
             let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
@@ -2255,6 +2301,104 @@ fn heading_body_sizes(
         .collect()
 }
 
+/// With LEGALPDF_HEADING_TRACE set, each enumerated heading candidate's fate on stderr.
+fn heading_trace(line: &Line, decision: &HeadingDecision, why: &str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_HEADING_TRACE").is_some()) {
+        let text: String = line.text.trim().chars().take(48).collect();
+        eprintln!(
+            "htrace\t{}\t{}\t{why}\t{:?}\t{:?}\tclean={}\tcoherent={}\tplausible={}\t{text}",
+            line.page_index,
+            line.id,
+            decision.action,
+            decision.level,
+            decision.ladder_clean,
+            decision.coherent_family,
+            decision.text_plausible
+        );
+    }
+}
+
+/// A page whose text was recognized from its image: lines with recognition evidence or no spans,
+/// or a text layer set in one face and size throughout.
+fn recognized_page(page: &Page) -> bool {
+    let body: Vec<&Line> = page.lines.iter().filter(|line| !line.exclude_from_body).collect();
+    if body.is_empty() {
+        return false;
+    }
+    if body.iter().any(|line| line.ocr.is_some() || line.spans.is_empty()) {
+        return true;
+    }
+    let mut fonts: HashSet<&str> = HashSet::new();
+    let (mut low, mut high) = (f64::MAX, f64::MIN);
+    for span in body.iter().flat_map(|line| &line.spans) {
+        fonts.insert(span.font.as_str());
+        low = low.min(span.size);
+        high = high.max(span.size);
+    }
+    fonts.len() == 1 && high - low <= 0.5
+}
+
+/// On a recognized page, a short title-case line set apart above a full body line: a heading the
+/// page's lost bold and size would have shown. Never one in a run of short lines (a table, a
+/// caption, an address).
+fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence) -> Vec<usize> {
+    let measure = page
+        .lines
+        .iter()
+        .filter(|line| !line.exclude_from_body && line.region_type == "body")
+        .map(|line| line.bbox[2] - line.bbox[0])
+        .fold(0.0, f64::max);
+    if measure <= 0.0 {
+        return Vec::new();
+    }
+    let short = |line: &Line| line.bbox[2] - line.bbox[0] < 0.6 * measure;
+    let cased = |line: &Line| {
+        let text = line.text.trim();
+        text.chars().filter(|c| c.is_alphabetic()).count() >= 4
+            && (4..=70).contains(&text.chars().count())
+            && titlecase_ratio(text) >= 0.6
+    };
+    let mut found = Vec::new();
+    for (slot, line) in page.lines.iter().enumerate() {
+        let text = line.text.trim();
+        if line.region_type != "body"
+            || line.exclude_from_body
+            || !line.note_region_mode.is_empty()
+            || !heading_source_eligible(primitives, line)
+            || !cased(line)
+            || !short(line)
+            || text.chars().next().is_some_and(char::is_lowercase)
+            || sentence_ended(text)
+            || text.ends_with([':', ',', ';'])
+            || has_citation_signal(text)
+            || !heading_text_plausible(title_after_enumerator(text))
+        {
+            continue;
+        }
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        let previous = slot.checked_sub(1).map(|p| &page.lines[p]);
+        let apart = previous.is_none_or(|p| {
+            line.bbox[1] - p.bbox[3] >= 0.5 * height || p.region_type != "body"
+        });
+        let in_run = previous.is_some_and(|p| p.region_type == "body" && short(p) && cased(p));
+        let Some(next) = page.lines.get(slot + 1) else {
+            continue;
+        };
+        let followed = next.region_type == "body"
+            && !next.exclude_from_body
+            && !short(next)
+            && next.bbox[1] >= line.bbox[3] - 0.25 * height;
+        if apart && !in_run && followed {
+            found.push(slot);
+        }
+    }
+    if found.len() >= 20 {
+        return Vec::new();
+    }
+    found
+}
+
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
     body_size: f64,
@@ -2334,7 +2478,7 @@ fn apply_text_fidelity_headings(
                 && letters >= 4
                 && !text.chars().any(char::is_lowercase)
                 && !text.ends_with(['.', '?', '!', ';', ':', ','])
-                && heading_text_plausible(text)
+                && heading_text_plausible(title_after_enumerator(text))
             {
                 lines[usize::from(primitives.translation_line_ids.contains(&line.id))]
                     .push(line_slot);
@@ -2349,6 +2493,16 @@ fn apply_text_fidelity_headings(
                 page.lines[line_slot].region_type = "heading".to_owned();
                 capitalised.push((page_slot, line_slot));
             }
+        }
+    }
+
+    for (page_slot, page) in pages.iter_mut().enumerate() {
+        if primitives.contents_pages.contains(&page.index) || !recognized_page(page) {
+            continue;
+        }
+        for line_slot in title_case_headings(page, primitives) {
+            page.lines[line_slot].region_type = "heading".to_owned();
+            capitalised.push((page_slot, line_slot));
         }
     }
 
@@ -2475,17 +2629,28 @@ fn apply_text_fidelity_headings(
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
+        let trace = |why: &str| {
+            heading_trace(&pages[page_slot].lines[target_slot], decision, why);
+        };
+        let caps = caps_title(&pages[page_slot].lines[target_slot].text);
         if !target_is_heading {
-            if (!decision.ladder_clean && !decision.coherent_family)
-                || !decision.text_plausible
-                || matches!(
-                    decision.action,
-                    HeadingAction::IllegalRestart | HeadingAction::Violation
-                )
-            {
+            if !decision.ladder_clean && !decision.coherent_family && !caps {
+                trace("ladder");
+                continue;
+            }
+            if !decision.text_plausible {
+                trace("text");
+                continue;
+            }
+            if matches!(
+                decision.action,
+                HeadingAction::IllegalRestart | HeadingAction::Violation
+            ) {
+                trace("action");
                 continue;
             }
             if decision.footnote_suspect || decision.level.unwrap_or(0) == 0 {
+                trace("footnote-or-level");
                 continue;
             }
             let page = &pages[page_slot];
@@ -2496,16 +2661,19 @@ fn apply_text_fidelity_headings(
                 page_slot,
                 &primitives.translation_line_ids,
             ) {
+                trace("body-flow");
                 continue;
             }
             let target = &page.lines[target_slot];
             let body_size = body_sizes[page_slot];
             let visual = bold_char_share(target) >= 0.60
                 || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
-            if !visual && !decision.coherent_family {
+            if !visual && !decision.coherent_family && !caps {
+                trace("visual");
                 continue;
             }
         }
+        trace(if target_is_heading { "kept" } else { "taken" });
         pages[page_slot].lines[target_slot].region_type = "heading".to_owned();
         if target_slot != marker_slot && marker_slot < pages[page_slot].lines.len() {
             let block = pages[page_slot].lines[target_slot].block_index;
