@@ -766,6 +766,21 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
     legal_pdf_support::profile::measure("furniture.apply", || {
         for (page_slot, page) in pages.iter_mut().enumerate() {
             let line_sizes: Vec<_> = page.lines.iter().map(line_font_size).collect();
+            // Without a sequence witness, a folio must sit beyond the remaining body text.
+            let (top, bottom) = page
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    !line.text.trim().is_empty()
+                        && !repeated.contains(&(page_slot, *index))
+                        && !sequence_folios.contains(&(page_slot, *index))
+                        && !edge_folios.contains_key(&(page_slot, *index))
+                })
+                .fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(top, bottom), (_, line)| (top.min(line.bbox[1]), bottom.max(line.bbox[3])),
+                );
             let body_size = upper_quartile(
                 page.lines
                     .iter()
@@ -859,6 +874,11 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     line.region_type = if at_top { "header" } else { "footer" }.to_owned();
                 } else if (line.bbox[3] < page.height * 0.14 || line.bbox[1] > page.height * 0.86)
                     && footer_page_number(&line.text)
+                    && if page_number_at_top {
+                        line.bbox[1] - top < (line.bbox[3] - line.bbox[1]) * 0.5
+                    } else {
+                        bottom - line.bbox[3] < (line.bbox[3] - line.bbox[1]) * 0.5
+                    }
                     && line_size >= body_size * 0.75
                     && !attached_labels.contains(&index)
                     && !citation_note_lines.contains(&index)
@@ -1298,6 +1318,7 @@ struct HeadingCandidate {
     line_slot: usize,
     joined_line_slot: Option<usize>,
     text_plausible: bool,
+    requires_sequence: bool,
     interpretations: Vec<EnumeratorInterpretation>,
 }
 
@@ -1348,6 +1369,27 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
             if continues_prose(page, line) {
                 continue;
             }
+            let text = line.text.trim();
+            if (1..=7).contains(&text.len())
+                && text.bytes().all(|byte| b"IVXLCDM".contains(&byte))
+                && bold_char_share(line) >= 0.60
+            {
+                let interpretations = enumerator_interpretations(text, "")
+                    .into_iter()
+                    .filter(|(family, _, _)| family == "roman_")
+                    .collect::<Vec<_>>();
+                if !interpretations.is_empty() {
+                    candidates.push(HeadingCandidate {
+                        page_slot,
+                        line_slot,
+                        joined_line_slot: None,
+                        text_plausible: true,
+                        requires_sequence: true,
+                        interpretations,
+                    });
+                }
+                continue;
+            }
             if let Some(capture) = inline.captures(line.text.trim()) {
                 let value = capture.get(1).unwrap().as_str();
                 let punct = capture.get(2).unwrap().as_str();
@@ -1366,6 +1408,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                         line_slot,
                         joined_line_slot: None,
                         text_plausible: true,
+                        requires_sequence: false,
                         interpretations,
                     });
                 }
@@ -1403,6 +1446,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                     line_slot,
                     joined_line_slot: Some(follower_slot),
                     text_plausible: true,
+                    requires_sequence: false,
                     interpretations,
                 });
             }
@@ -2344,15 +2388,17 @@ fn apply_text_fidelity_headings(
                 decisions.extend(own[set[0]..set[1]].iter().zip(&parsed.assignments).map(
                     |(candidate, assignment)| {
                         let family = parsed.families.get(assignment.family);
+                        let coherent = family.is_some_and(coherent_heading_family);
                         HeadingDecision {
                             page_slot: candidate.page_slot,
                             line_slot: candidate.line_slot,
                             joined_line_slot: candidate.joined_line_slot,
-                            text_plausible: candidate.text_plausible,
+                            text_plausible: candidate.text_plausible
+                                && (!candidate.requires_sequence || coherent),
                             level: assignment.level,
                             action: assignment.action,
                             ladder_clean: clean,
-                            coherent_family: family.is_some_and(coherent_heading_family),
+                            coherent_family: coherent,
                             footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
                         }
                     },
