@@ -2461,7 +2461,18 @@ fn apply_text_fidelity_headings(
             .filter(|line| primitives.contents_line_ids.contains(&line.id))
             .map(|line| line.bbox[1])
             .min_by(f64::total_cmp);
-        for line in &mut page.lines {
+        // On a recognized page size is box height, so a sized line must also read as a title and
+        // name no caption party.
+        let sized_title: Vec<bool> = (0..page.lines.len())
+            .map(|slot| {
+                let text = page.lines[slot].text.trim();
+                !recognized
+                    || (heading_style_corroborated(text)
+                        && !text.ends_with(':')
+                        && !caption_party(page, slot))
+            })
+            .collect();
+        for (slot, line) in page.lines.iter_mut().enumerate() {
             if line.region_type == "heading" {
                 heading_source_trace(line, "upstream");
             }
@@ -2485,7 +2496,7 @@ fn apply_text_fidelity_headings(
                 && primitives.font_heading_candidates.contains(&line.id)
                 && heading_source_eligible(primitives, line)
                 && line_font_size(line) >= body_size * FONT_HEADING_SIZE_RATIO
-                && (!recognized || heading_style_corroborated(&line.text))
+                && sized_title[slot]
             {
                 heading_source_trace(line, "font");
                 line.region_type = "heading".to_owned();
