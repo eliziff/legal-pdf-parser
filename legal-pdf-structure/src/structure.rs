@@ -4389,6 +4389,14 @@ fn prepare_reader(
             "common input must contain one separator value per page".to_owned(),
         ));
     }
+    // A numbering marker printed on its own line joins the line that carries its text.
+    legal_pdf_support::profile::measure("prepare.detached_markers", || {
+        for page in pages.iter_mut() {
+            if std::env::var_os("LEGALPDF_NO_DETACHED_MARKERS").is_none() {
+                join_detached_markers(page);
+            }
+        }
+    });
     let mut primitives = PdfPrimitiveEvidence {
         constituent_starts: constituents::bookmarked_starts(pages, outline),
         source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
