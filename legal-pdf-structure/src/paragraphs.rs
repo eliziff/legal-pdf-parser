@@ -142,10 +142,12 @@ fn size_key(value: f64) -> i64 {
     (value * 2.0).round() as i64
 }
 
-/// The page's typical baseline-to-baseline pitch, by text size.
+/// The page's typical baseline-to-baseline pitch, by text size, and its column edges: left
+/// edges where three or more body lines start.
 struct Pitch {
     by_size: HashMap<i64, f64>,
     any: f64,
+    edges: Vec<f64>,
 }
 
 impl Pitch {
@@ -174,7 +176,18 @@ impl Pitch {
             }
         };
         let all: Vec<f64> = samples.values().flatten().copied().collect();
+        let mut lefts: HashMap<i64, (usize, f64)> = HashMap::new();
+        for line in lines {
+            let slot = lefts.entry((line.bbox[0] / 3.0).round() as i64).or_default();
+            slot.0 += 1;
+            slot.1 += line.bbox[0];
+        }
         Self {
+            edges: lefts
+                .values()
+                .filter(|(count, _)| *count >= 3)
+                .map(|(count, sum)| sum / *count as f64)
+                .collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
             by_size: samples
                 .into_iter()
@@ -190,10 +203,15 @@ impl Pitch {
             .copied()
             .unwrap_or(self.any)
     }
+
+    /// Does a column of the page start within `tolerance` of `x`?
+    fn at_edge(&self, x: f64, tolerance: f64) -> bool {
+        self.edges.iter().any(|edge| (edge - x).abs() <= tolerance)
+    }
 }
 
-/// Does `b` begin a new visual block after `a`?
-fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
+/// Does `b` begin a new visual block after `a`? The rule that says so, by name.
+fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
     if same_row(a, b) {
         // A marker set apart from its text on the text's row ("1." then the paragraph).
         let text = a.text.trim();
@@ -204,18 +222,26 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
                 || enumerator_re().is_match(&b.text)
                 || marker_only_re().is_match(&b.text))
         {
-            return true;
+            return Some("row-marker");
         }
-        // The extractor uses MuPDF's 0.8-em inter-run spacing for one printed line.
-        let adjacent = b.bbox[0] - a.bbox[2] <= 0.8 * size(a).max(size(b));
-        return !(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent));
+        // The extractor uses MuPDF's 0.8-em inter-run spacing for one printed line; a wider
+        // gap parts the row only where a column of the page starts.
+        let em = size(a).max(size(b));
+        let gap = b.bbox[0] - a.bbox[2];
+        let adjacent = gap <= 0.8 * em || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em));
+        return (!(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent))).then_some("row-apart");
     }
-    if b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0] {
-        return true;
+    let goes_on = goes_on(b);
+    if (b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0])
+        && !goes_on
+        && pitch.at_edge(b.bbox[0], 0.5 * size(b))
+        && (b.bbox[0] - a.bbox[0]).abs() > 3.0 * char_width(a)
+    {
+        return Some("column");
     }
     let advance = advance(a, b);
     if advance <= 0.3 * height(a).min(height(b)).max(1.0) {
-        return true;
+        return Some("overlap");
     }
     // A typeset page keeps its leading exactly, so a quarter more marks a break; a
     // recognized line's box wanders more.
@@ -224,12 +250,17 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     } else {
         1.25
     };
-    if resized(a, b) || advance > gap * pitch.typical(size(a).min(size(b))) {
-        return true;
+    if resized(a, b) && !goes_on {
+        return Some("resized");
+    }
+    if advance > gap * pitch.typical(size(a).min(size(b))) {
+        return Some("gap");
     }
     let contrast = |a: f64, b: f64| (a > 0.8 && b < 0.2) || (a < 0.2 && b > 0.8);
-    matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
-        if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi))
+    (!goes_on
+        && matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
+            if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi)))
+    .then_some("font-contrast")
 }
 
 /// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
@@ -256,28 +287,28 @@ fn indents_first_lines(block: &[&Line]) -> bool {
         >= 2
 }
 
-/// Does `b` begin a new paragraph after `a` inside one visual block? Where first lines
-/// are set in from the `margin`, every line set in begins one and a short line ends none
-/// by itself.
+/// Does `b` begin a new paragraph after `a` inside one visual block? The rule that says so,
+/// by name. Where first lines are set in from the `margin`, every line set in begins one and
+/// a short line ends none by itself.
 fn starts_paragraph(
     a: &Line,
     b: &Line,
     block: &[&Line],
     after: Option<&Line>,
     margin: Option<f64>,
-) -> bool {
+) -> Option<&'static str> {
     if same_row(a, b) {
-        return false;
+        return None;
     }
     if bullet_re().is_match(&b.text) || marker_only_re().is_match(&b.text) {
-        return true;
+        return Some("bullet");
     }
     // A contents entry ends at its leader and page number; its earlier lines wrap short of that column.
     if leader_re().is_match(&a.text) {
-        return true;
+        return Some("leader");
     }
     if leader_re().is_match(&b.text) {
-        return false;
+        return None;
     }
     let cw = char_width(a);
     let terminal = terminal_re().is_match(a.text.trim());
@@ -296,7 +327,12 @@ fn starts_paragraph(
             > following
     };
     if enumerator_re().is_match(&b.text) && (terminal || fits) {
-        return true;
+        return Some("enumerator");
+    }
+    // A line that goes on with the sentence (lower case, or the punctuation a wrap left it) opens
+    // nothing, however it is set.
+    if goes_on(b) {
+        return None;
     }
     let marker = bullet_re().is_match(&a.text)
         || enumerator_re().is_match(&a.text)
@@ -307,19 +343,24 @@ fn starts_paragraph(
         && (terminal
             || fits
             || after.is_some_and(|line| (line.bbox[0] - a.bbox[0]).abs() < 1.5 * cw));
-    if let Some(left) = margin {
-        return first_line_indent || (!marker && b.bbox[0] > left + 1.5 * cw);
+    if first_line_indent {
+        return Some("first-line-indent");
     }
-    // A wrap inside a sentence: a line that ran most of the measure and ended no sentence, with the
-    // next going on in lower case or with the punctuation the wrap left it. Only text the page sets
-    // says so; recognition misreads a line's first letter ("chief Judge").
-    let wrapped = !a.spans.is_empty()
-        && !b.spans.is_empty()
-        && !terminal
-        && !noted_terminal_re().is_match(a.text.trim())
-        && goes_on(b)
-        && width(a) >= 0.6 * block.iter().map(|line| width(line)).fold(0.0, f64::max);
-    first_line_indent || (fits && !wrapped && !a.text.trim_end().ends_with('-'))
+    if let Some(left) = margin {
+        return (!marker && b.bbox[0] > left + 1.5 * cw).then_some("margin-indent");
+    }
+    // A short line ends its paragraph with its sentence. Recognition drops a line's last period,
+    // so a recognized line well short of the measure ends one when the next line opens a sentence.
+    let ended = terminal || noted_terminal_re().is_match(a.text.trim());
+    let measure = block.iter().map(|line| width(line)).fold(0.0, f64::max);
+    let opens = b
+        .text
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase() || c.is_ascii_digit());
+    let recognized_end = a.spans.is_empty() && width(a) < 0.6 * measure && opens;
+    (fits && (ended || recognized_end) && !a.text.trim_end().ends_with('-')).then_some("short-line")
 }
 
 /// Does the line go on with the sentence a short line before it broke? It does when it opens in
@@ -382,6 +423,16 @@ fn in_body(line: &Line) -> bool {
     line.region_type == "body" && !line.exclude_from_body && line.note_region_mode.is_empty()
 }
 
+/// With LEGALPDF_PARAGRAPH_TRACE set, each break names its rule on stderr: the page, the line
+/// that opens the new block or paragraph, its first characters.
+fn trace(line: &Line, kind: &str, reason: &str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_PARAGRAPH_TRACE").is_some()) {
+        let text: String = line.text.trim().chars().take(48).collect();
+        eprintln!("ptrace\t{}\t{}\t{kind}\t{reason}\t{text}", line.page_index, line.id);
+    }
+}
+
 /// Read paragraph boundaries without changing source block indices. Classification can use
 /// the same geometry before assigning roles that the final paragraph reader uses afterward.
 pub(crate) fn paragraph_indices(
@@ -411,8 +462,11 @@ pub(crate) fn paragraph_indices(
         let run = &page.lines[start..end];
         let mut block_start = 0;
         for k in 1..=run.len() {
-            if k < run.len() && !starts_block(&run[k - 1], &run[k], &pitch) {
-                continue;
+            if k < run.len() {
+                match starts_block(&run[k - 1], &run[k], &pitch) {
+                    None => continue,
+                    Some(reason) => trace(&run[k], "block", reason),
+                }
             }
             let block: Vec<&Line> = run[block_start..k].iter().collect();
             assigned[start + block_start] = Some(next);
@@ -420,7 +474,8 @@ pub(crate) fn paragraph_indices(
             for j in 1..block.len() {
                 let after = block.get(j + 1).copied();
                 let margin = indented.then(|| margin_at(&block, j));
-                if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                    trace(block[j], "paragraph", reason);
                     next += 1;
                 }
                 assigned[start + block_start + j] = Some(next);
