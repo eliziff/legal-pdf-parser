@@ -4,7 +4,7 @@
 //! every line of double-spaced text its own block, put a whole page in one, or give
 //! recognized pages none. Body lines are first parted into visual blocks where the
 //! layout changes (a column or row change, a larger gap than the page's line pitch,
-//! another size or weight), then into paragraphs where a line starts a list item, is
+//! another size or emphasis), then into paragraphs where a line starts a list item, is
 //! indented as a first line, or follows a line that ended short of the block's measure.
 
 use legal_pdf_core::{line_font_size, Line, Page};
@@ -71,9 +71,9 @@ fn char_width(line: &Line) -> f64 {
     width(line) / line.text.trim().chars().count().max(1) as f64
 }
 
-/// Share of the line's visible characters set in a bold face, when its spans say.
-fn bold_share(line: &Line) -> Option<f64> {
-    let (mut total, mut bold) = (0, 0);
+/// Shares of the line's visible characters set in bold and italic, when its spans say.
+fn font_shares(line: &Line) -> Option<(f64, f64)> {
+    let (mut total, mut bold, mut italic) = (0, 0, 0);
     for span in &line.spans {
         let count = span.text.trim().chars().count();
         total += count;
@@ -81,8 +81,11 @@ fn bold_share(line: &Line) -> Option<f64> {
         if span.flags & 16 != 0 || ["bold", "black", "heavy"].iter().any(|w| font.contains(w)) {
             bold += count;
         }
+        if span.flags & 2 != 0 || font.contains("ital") || font.contains("oblique") {
+            italic += count;
+        }
     }
-    (total > 0).then(|| bold as f64 / total as f64)
+    (total > 0).then(|| (bold as f64 / total as f64, italic as f64 / total as f64))
 }
 
 fn first_word_width(line: &Line) -> f64 {
@@ -224,7 +227,9 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     if resized(a, b) || advance > gap * pitch.typical(size(a).min(size(b))) {
         return true;
     }
-    matches!((bold_share(a), bold_share(b)), (Some(x), Some(y)) if (x > 0.8 && y < 0.2) || (x < 0.2 && y > 0.8))
+    let contrast = |a: f64, b: f64| (a > 0.8 && b < 0.2) || (a < 0.2 && b > 0.8);
+    matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
+        if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi))
 }
 
 /// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
