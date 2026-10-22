@@ -399,6 +399,35 @@ pub fn assemble_outline(
     let mut sections = HashMap::<Context, (usize, Option<usize>)>::new();
     for (position, unit) in units.iter().enumerate() {
         if heading(&nodes[unit.node]) {
+            if let Some(&(_, Some(parent))) = sections.get(&unit.context) {
+                // A less prominent marginal title can continue the open section's subsections.
+                if heading(&nodes[units[parent].node])
+                    && units[parent].rank < unit.rank
+                    && !unit.package
+                    && !unit.opinion
+                    && navigation_claim(&nodes[unit.node]).is_none()
+                {
+                    let subsection = units[position + 1..]
+                        .iter()
+                        .find(|next| next.context == unit.context)
+                        .and_then(|next| membership_text(&nodes[next.node], &coordinates))
+                        .and_then(|text| {
+                            text.split_whitespace().next().and_then(|word| {
+                                legal_pdf_core::layout_analysis().numbering_marker(word, None)
+                            })
+                        })
+                        .is_some_and(|marker| {
+                            (marker.ordinal > 1 || !marker.prefix.is_empty())
+                                && marker.family.split_once(':').is_some_and(|(wrap, count)| {
+                                    wrap == "()" && count.split('.').all(|part| part == "1")
+                                })
+                        });
+                    if subsection {
+                        chosen[position] = Some(parent);
+                        continue;
+                    }
+                }
+            }
             sections.remove(&unit.context);
             continue;
         }

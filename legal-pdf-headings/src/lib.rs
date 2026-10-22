@@ -28,8 +28,8 @@ mod outline;
 mod stats;
 
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
-use legal_pdf_core::model::Page;
 use legal_pdf_core::layout_analysis;
+use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
 use regex::Regex;
@@ -219,23 +219,26 @@ fn provision_label(text: &str) -> bool {
 }
 
 /// A line that is a citation and little else ("[2026] SGCA 26") names a case, not a section.
-fn citation_only(block: &FlashBlock) -> bool {
-    let text = block
-        .lines
-        .iter()
-        .map(|line| line.text.trim())
-        .collect::<Vec<_>>()
-        .join(" ");
-    // The layout reading of citations: the full citator would resolve each one, at a cost
-    // every short block on a page of authorities pays.
-    let spans = layout_analysis().protected_citation_spans(&text);
-    if spans.is_empty() {
+fn citation_only(text: &str, complete: bool) -> bool {
+    let analysis = layout_analysis();
+    let spans = analysis.protected_citation_spans(text);
+    // Styled citation-bearing blocks also mask case names before counting title words.
+    let citations = if complete {
+        analysis.citations(text)
+    } else {
+        Vec::new()
+    };
+    if spans.is_empty() && citations.is_empty() {
         return false;
     }
-    text.chars()
+    text.char_indices()
         .enumerate()
-        .filter(|(at, character)| {
-            character.is_alphabetic() && !spans.iter().any(|(start, end)| start <= at && at < end)
+        .filter(|(at, (byte, character))| {
+            character.is_alphabetic()
+                && !spans.iter().any(|(start, end)| start <= at && at < end)
+                && !citations
+                    .iter()
+                    .any(|citation| citation.range.contains(byte))
         })
         .count()
         < 3
@@ -570,12 +573,20 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             eligible[block] = !indented
                 && !runs_on
                 && !beside()
-                && (provision
-                    || (!*cited.entry(text.clone()).or_insert_with(|| {
+                && (provision || {
+                    let reference = *cited.entry(text.clone()).or_insert_with(|| {
                         (analysis.has_citation_cue(&text)
                             && text.chars().any(|c| c.is_ascii_digit()))
                             || analysis.has_citation_signal(&text)
-                    }) && !citation_only(flash)));
+                    });
+                    let title = type_candidates[block]
+                        && !matches!(ends, Some('.' | ':'))
+                        && text
+                            .chars()
+                            .find(|c| c.is_alphabetic())
+                            .is_some_and(char::is_uppercase);
+                    (!reference || title) && !citation_only(&text, reference)
+                });
         }
     }
     let mut positions = vec![0; blocks.len()];
