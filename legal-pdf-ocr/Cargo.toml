@@ -8,12 +8,13 @@ build = "build.rs"
 [[bin]]
 name = "legalocr"
 path = "src/bin/legalocr.rs"
-required-features = ["indra"]
+required-features = ["ocr"]
 
 [features]
 default = []
-ocr = ["dep:hayro"]
-indra = ["ocr", "dep:cc", "dep:image", "dep:libloading", "dep:ort", "legal-pdf-core/ort-runtime"]
+ocr = ["dep:hayro", "dep:cc", "dep:image", "dep:libloading", "dep:ort", "legal-pdf-core/ort-runtime"]
+# The one OCR engine; kept as a name for callers that ask for it.
+indra = ["ocr"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }

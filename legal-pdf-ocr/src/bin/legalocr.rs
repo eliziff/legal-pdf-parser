@@ -85,7 +85,6 @@ fn run() -> Result<()> {
                 options.layout = IndraLayout::parse(&text)
                     .ok_or_else(|| Error::Message("unknown line detector".into()))?
             }
-            Some("--tesseract-library") => options.tesseract_library = Some(value.into()),
             Some("--workers") => options.workers = number()?,
             Some("--threads") => options.threads = number()?,
             Some("--layout-workers") => options.layout_workers = number()?,

@@ -45,21 +45,18 @@ pub(crate) const RECOVERED_CONFIDENCE: f64 = 0.95;
 pub enum IndraLayout {
     #[default]
     Indra,
-    Tesseract,
 }
 
 impl IndraLayout {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "indra" => Some(Self::Indra),
-            "tesseract" => Some(Self::Tesseract),
             _ => None,
         }
     }
     fn name(self) -> &'static str {
         match self {
             Self::Indra => "indra",
-            Self::Tesseract => "tesseract",
         }
     }
 }
@@ -103,7 +100,6 @@ impl IndraTier {
 pub struct IndraOptions {
     pub model_pack: Option<PathBuf>,
     pub runtime: Option<PathBuf>,
-    pub tesseract_library: Option<PathBuf>,
     pub dpi: u16,
     pub threads: usize,
     pub workers: usize,
@@ -126,7 +122,6 @@ impl Default for IndraOptions {
         Self {
             model_pack: None,
             runtime: None,
-            tesseract_library: None,
             dpi: 144,
             threads: 0,
             workers: 0,
@@ -448,7 +443,6 @@ pub struct IndraOcr {
 pub(crate) struct PreparedIndra {
     pub(crate) pack: ModelPack,
     pub(crate) runtime: PathBuf,
-    pub(crate) tesseract_library: Option<PathBuf>,
     pub(crate) plan: RuntimePlan,
     pub(crate) ready: Option<Box<IndraOcr>>,
     pub(crate) identity: String,
@@ -505,20 +499,7 @@ impl IndraOcr {
         if let Some(path) = &options.orientation {
             pack.orientation = Some(canonical_file(path, "orientation model")?);
         }
-        let tesseract_library = if options.layout == IndraLayout::Tesseract {
-            Some(canonical_file(
-                &required_path(
-                    &options.tesseract_library,
-                    "LEGALPDF_TESSERACT_LIBRARY",
-                    "Tesseract layout library",
-                )?,
-                "Tesseract layout library",
-            )?)
-        } else {
-            None
-        };
-        let layout_identity =
-            provider_asset_sha256(tesseract_library.as_deref().unwrap_or(&pack.detector))?;
+        let layout_identity = provider_asset_sha256(&pack.detector)?;
         let identity=format!("indra-native-v1:backend={}:device={device}:model={}:codec={}:runtime={}:layout={}:layout-model={layout_identity}:side={}:orientation={}:tier={}:dpi={}:batch={}:bucket={}:workers={}:threads={}:layout-workers={}:cpu-arena={}",
             plan.backend.name(),provider_asset_sha256(&pack.model)?,provider_asset_sha256(&pack.codec)?,provider_asset_sha256(&runtime)?,options.layout.name(),pack.detector_side,
             pack.orientation.as_deref().map(provider_asset_sha256).transpose()?.unwrap_or_default(),
@@ -526,7 +507,6 @@ impl IndraOcr {
         Ok(PreparedIndra {
             pack,
             runtime,
-            tesseract_library,
             plan,
             ready: None,
             name: identity.clone(),
@@ -553,24 +533,19 @@ impl IndraOcr {
     }
     pub(crate) fn open_prepared(options: &IndraOptions, prepared: &PreparedIndra) -> Result<Self> {
         let independent_pool = legal_pdf_core::init_ort_runtime(&prepared.runtime, None)?.is_some();
-        let (plan, pack, tesseract_library) =
-            (&prepared.plan, &prepared.pack, &prepared.tesseract_library);
+        let (plan, pack) = (&prepared.plan, &prepared.pack);
         let (layouts, sessions) = std::thread::scope(|scope| -> Result<_> {
             // Independent model pools can initialize together; recognition weights stay shared.
             let layouts = scope.spawn(|| {
                 (0..plan.layout_workers)
                     .map(|_| {
-                        if let Some(path) = tesseract_library {
-                            LineDetector::tesseract(path, options.dpi)
-                        } else {
-                            LineDetector::indra(
-                                &pack.detector,
-                                pack.detector_side,
-                                plan.backend,
-                                &plan.device,
-                                independent_pool,
-                            )
-                        }
+                        LineDetector::indra(
+                            &pack.detector,
+                            pack.detector_side,
+                            plan.backend,
+                            &plan.device,
+                            independent_pool,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()
             });
@@ -1166,7 +1141,7 @@ impl IndraOcr {
             for handle in handles {
                 handle
                     .join()
-                    .map_err(|_| Error::Message("Tesseract layout worker panicked".to_owned()))?;
+                    .map_err(|_| Error::Message("layout worker panicked".to_owned()))?;
             }
             if let Some(error) = failure {
                 return Err(error);
