@@ -921,6 +921,8 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     && !citation_note_lines.contains(&index)
                 {
                     line.region_type = if at_top { "header" } else { "footer" }.to_owned();
+                } else if (at_top || at_bottom) && document_id_line(&line.text) {
+                    line.region_type = if at_top { "header" } else { "footer" }.to_owned();
                 } else if (line.bbox[3] < page.height * 0.14 || line.bbox[1] > page.height * 0.86)
                     && footer_page_number(&line.text)
                     && if page_number_at_top {
@@ -1039,6 +1041,22 @@ fn mark_print_margins(page: &mut Page) {
             line.region_type = kind.to_owned();
         }
     }
+}
+
+/// A document management identifier a firm prints in the margin ("MT DOCS 20632860v5",
+/// "33312.140943.JMS3.15349802.2", "43882055_21NATDOCS"): digits with at most capitals, dots,
+/// underscores and a version suffix, and no words.
+fn document_id_line(value: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let text = value.trim();
+    let digits = text.chars().filter(char::is_ascii_digit).count();
+    let visible = text.chars().filter(|c| !c.is_whitespace()).count();
+    digits >= 6
+        && digits * 5 >= visible * 2
+        && text.chars().count() <= 40
+        && RE
+            .get_or_init(|| Regex::new(r"^[A-Z0-9][A-Z0-9 ._/-]*(?:v\d{1,3})?$").unwrap())
+            .is_match(text)
 }
 
 fn footer_page_number(value: &str) -> bool {
@@ -1351,6 +1369,8 @@ fn heading_line_excluded(primitives: &PdfPrimitiveEvidence, id: &str) -> bool {
 
 fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
     !heading_line_excluded(primitives, &line.id)
+        // A blank to fill in ("CACR ____", "DATED ____") makes the line a form's field.
+        && !line.text.contains("___")
         // Source labels constrain inference when available; they are not required to read a heading.
         && primitives
             .source_regions
@@ -1478,7 +1498,11 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
             let Some(follower_slot) = follower else {
                 continue;
             };
-            let text = page.lines[follower_slot].text.trim();
+            let text = page.lines[follower_slot]
+                .text
+                .trim()
+                .trim_start_matches(['-', '\u{2013}', '\u{2014}'])
+                .trim_start();
             let (value, punct, _) = heading_enumerator(&capture);
             // "v." alone between two parties' names is the style of cause's versus.
             let versus = value == "v" && punct == ".";
@@ -2375,7 +2399,42 @@ fn recognized_page(page: &Page) -> bool {
         styled |= span.flags & (16 | 2) != 0;
     }
     // A tab divider ("Tab" / "1") or a cover of two lines in one face says nothing about the layer.
-    body.len() >= 8 && fonts.len() == 1 && !styled
+    (body.len() >= 8 && fonts.len() == 1 && !styled) || measured_sizes(&body)
+}
+
+/// Are the lines' sizes measured rather than set? A recognizer sizes each line by its box, so
+/// a page's short lines spread over many sizes off the half-point grid around the body's size
+/// (main dev: 46 of 227 recognized pages, 1 of 435 typeset; train 210 of 568 and none); a typeset
+/// page sets every size on the grid.
+fn measured_sizes(body: &[&Line]) -> bool {
+    let mut characters: HashMap<i64, usize> = HashMap::new();
+    for line in body {
+        let count = line.text.trim().chars().count();
+        let size = line_font_size(line);
+        if count > 0 && size > 0.0 {
+            *characters.entry((size * 10.0).round() as i64).or_default() += count;
+        }
+    }
+    let total: usize = characters.values().sum();
+    if total < 200 {
+        return false;
+    }
+    let mut sizes: Vec<i64> = characters.keys().copied().collect();
+    sizes.sort_unstable();
+    let mut seen = 0;
+    let median = sizes
+        .iter()
+        .find(|size| {
+            seen += characters[*size];
+            seen * 2 >= total
+        })
+        .copied()
+        .unwrap_or(0);
+    let off_grid = sizes
+        .iter()
+        .filter(|&&size| size * 100 >= median * 80 && size * 100 <= median * 125 && size % 5 != 0)
+        .count();
+    off_grid >= 5
 }
 
 /// On a recognized page, a short title-case line set apart above a full body line: a heading the
@@ -3747,6 +3806,7 @@ fn classify_line_roles(
                                 && (*typographic
                                     || reference_backed
                                     || (lower_note_run
+                                        && !recognized_page(page)
                                         && page.lines[*index].bbox[1] >= page.height * 0.48
                                         && size > 0.0
                                         && size <= body_size * 0.90))))))
