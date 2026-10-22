@@ -1,23 +1,17 @@
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 use std::path::PathBuf;
 
 fn main() {
-    #[cfg(feature = "indra")]
+    #[cfg(feature = "ocr")]
     build_layout_shim();
 }
 
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 fn build_layout_shim() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest
         .parent()
         .expect("core crate has a workspace parent");
-    let source = root.join("rust/native/tesseract_layout.c");
-    println!("cargo:rerun-if-changed={}", source.display());
-    cc::Build::new()
-        .file(source)
-        .warnings(true)
-        .compile("legalpdf_tesseract_layout");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let source = root.join("rust/native/gpu_adapter.cpp");
         println!("cargo:rerun-if-changed={}", source.display());
