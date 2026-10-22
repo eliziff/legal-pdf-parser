@@ -115,6 +115,16 @@ fn first_word_width(line: &Line) -> f64 {
     width(line) * first as f64 / text.chars().count().max(1) as f64
 }
 
+/// A form's or a signature block's field label ("Per:", "Name:", "Title:", "Email:"): the value
+/// set beside or under it belongs with it, whatever the layout says.
+fn field_label(line: &Line) -> bool {
+    let text = line.text.trim();
+    text.ends_with(':')
+        && text.chars().count() <= 24
+        && text.split_whitespace().count() <= 3
+        && !text[..text.len() - 1].contains([':', '.', ';'])
+}
+
 fn same_row(a: &Line, b: &Line) -> bool {
     let overlap = a.bbox[3].min(b.bbox[3]) - a.bbox[1].max(b.bbox[1]);
     overlap > 0.5 * height(a).min(height(b))
@@ -229,9 +239,10 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         let em = size(a).max(size(b));
         let gap = b.bbox[0] - a.bbox[2];
         let adjacent = gap <= 0.8 * em || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em));
-        return (!(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent))).then_some("row-apart");
+        return (!(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent || field_label(a))))
+            .then_some("row-apart");
     }
-    let goes_on = goes_on(b);
+    let goes_on = goes_on(b) || field_label(a);
     if (b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0])
         && !goes_on
         && pitch.at_edge(b.bbox[0], 0.5 * size(b))
