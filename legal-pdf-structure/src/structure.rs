@@ -1483,6 +1483,12 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
             // "v." alone between two parties' names is the style of cause's versus.
             let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
+            if !(!versus
+                && heading_title_plausible(&page.lines[follower_slot], text)
+                && !interpretations.is_empty())
+            {
+                heading_source_trace(&page.lines[follower_slot], if interpretations.is_empty() { "standalone-noint" } else { "standalone-implausible" });
+            }
             if !versus
                 && heading_title_plausible(&page.lines[follower_slot], text)
                 && !interpretations.is_empty()
@@ -2319,8 +2325,41 @@ fn heading_trace(line: &Line, decision: &HeadingDecision, why: &str) {
     }
 }
 
+/// A line in capitals that names a party of a caption: a corporate name, a party label, or a name
+/// between the caption's connectives ("BETWEEN:", "AND:", "- AND -", "AMONG:").
+fn caption_party(page: &Page, slot: usize) -> bool {
+    static CORPORATE: OnceLock<Regex> = OnceLock::new();
+    static CONNECTIVE: OnceLock<Regex> = OnceLock::new();
+    let corporate = CORPORATE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:inc|ltd|ltée|limited|limitée|corp|corporation|co|company|llp|lp|ulc|llc|s\.e\.c|gp|partnership|trust|bank|credit union)\.?,?$").unwrap()
+    });
+    let connective = CONNECTIVE.get_or_init(|| {
+        Regex::new(r"(?i)^[\-\u{2013}\u{2014}\s]*(?:between|and|among|et|entre|c\.|v\.|vs\.?)[\-\u{2013}\u{2014}\s:]*$").unwrap()
+    });
+    let text = page.lines[slot].text.trim();
+    if corporate.is_match(text) || legal_pdf_headings::party_label().is_match(text) {
+        return true;
+    }
+    let neighbour = |step: isize| {
+        let mut at = slot as isize + step;
+        while at >= 0 && (at as usize) < page.lines.len() {
+            let line = &page.lines[at as usize];
+            if !line.text.trim().is_empty() {
+                return Some(line);
+            }
+            at += step;
+        }
+        None
+    };
+    [neighbour(-1), neighbour(1)].into_iter().flatten().any(|line| {
+        let near = line.text.trim();
+        connective.is_match(near) || legal_pdf_headings::party_label().is_match(near)
+    })
+}
+
 /// A page whose text was recognized from its image: lines with recognition evidence or no spans,
-/// or a text layer set in one face and size throughout.
+/// or a text layer set in one face throughout with no bold or italic (a recognizer writes one
+/// generic face and sizes its boxes; a typeset page changes face or weight somewhere).
 fn recognized_page(page: &Page) -> bool {
     let body: Vec<&Line> = page.lines.iter().filter(|line| !line.exclude_from_body).collect();
     if body.is_empty() {
@@ -2330,13 +2369,12 @@ fn recognized_page(page: &Page) -> bool {
         return true;
     }
     let mut fonts: HashSet<&str> = HashSet::new();
-    let (mut low, mut high) = (f64::MAX, f64::MIN);
+    let mut styled = false;
     for span in body.iter().flat_map(|line| &line.spans) {
         fonts.insert(span.font.as_str());
-        low = low.min(span.size);
-        high = high.max(span.size);
+        styled |= span.flags & (16 | 2) != 0;
     }
-    fonts.len() == 1 && high - low <= 0.5
+    fonts.len() == 1 && !styled
 }
 
 /// On a recognized page, a short title-case line set apart above a full body line: a heading the
@@ -2399,6 +2437,15 @@ fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence) -> Vec<us
     found
 }
 
+/// With LEGALPDF_HEADING_TRACE set, a heading taken by a rule other than the enumerated ladder.
+fn heading_source_trace(line: &Line, why: &str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_HEADING_TRACE").is_some()) {
+        let text: String = line.text.trim().chars().take(48).collect();
+        eprintln!("hsrc	{}	{}	{why}	{text}", line.page_index, line.id);
+    }
+}
+
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
     body_size: f64,
@@ -2406,6 +2453,7 @@ fn apply_text_fidelity_headings(
 ) -> HashMap<String, usize> {
     let body_sizes = heading_body_sizes(pages, body_size, primitives);
     for (page, body_size) in pages.iter_mut().zip(&body_sizes) {
+        let recognized = recognized_page(page);
         let listed_top = page
             .lines
             .iter()
@@ -2413,6 +2461,9 @@ fn apply_text_fidelity_headings(
             .map(|line| line.bbox[1])
             .min_by(f64::total_cmp);
         for line in &mut page.lines {
+            if line.region_type == "heading" {
+                heading_source_trace(line, "upstream");
+            }
             if matches!(line.region_type.as_str(), "body" | "heading")
                 && primitives.contents_line_ids.contains(&line.id)
             {
@@ -2433,7 +2484,9 @@ fn apply_text_fidelity_headings(
                 && primitives.font_heading_candidates.contains(&line.id)
                 && heading_source_eligible(primitives, line)
                 && line_font_size(line) >= body_size * FONT_HEADING_SIZE_RATIO
+                && (!recognized || heading_style_corroborated(&line.text))
             {
+                heading_source_trace(line, "font");
                 line.region_type = "heading".to_owned();
             }
         }
@@ -2479,6 +2532,7 @@ fn apply_text_fidelity_headings(
                 && !text.chars().any(char::is_lowercase)
                 && !text.ends_with(['.', '?', '!', ';', ':', ','])
                 && heading_text_plausible(title_after_enumerator(text))
+                && !caption_party(page, line_slot)
             {
                 lines[usize::from(primitives.translation_line_ids.contains(&line.id))]
                     .push(line_slot);
@@ -2490,6 +2544,7 @@ fn apply_text_fidelity_headings(
                 continue;
             }
             for line_slot in lines {
+                heading_source_trace(&page.lines[line_slot], "caps");
                 page.lines[line_slot].region_type = "heading".to_owned();
                 capitalised.push((page_slot, line_slot));
             }
@@ -2501,6 +2556,7 @@ fn apply_text_fidelity_headings(
             continue;
         }
         for line_slot in title_case_headings(page, primitives) {
+            heading_source_trace(&page.lines[line_slot], "title");
             page.lines[line_slot].region_type = "heading".to_owned();
             capitalised.push((page_slot, line_slot));
         }
@@ -2649,7 +2705,9 @@ fn apply_text_fidelity_headings(
                 trace("action");
                 continue;
             }
-            if decision.footnote_suspect || decision.level.unwrap_or(0) == 0 {
+            let titled = decision.joined_line_slot.is_some()
+                && heading_style_corroborated(&pages[page_slot].lines[target_slot].text);
+            if (decision.footnote_suspect && !titled) || decision.level.unwrap_or(0) == 0 {
                 trace("footnote-or-level");
                 continue;
             }
