@@ -21,6 +21,7 @@ use super::{
     PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
+use legal_pdf_witnesses::PACKAGE_UNITS;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -43,15 +44,6 @@ const MAX_TITLE_LINES: usize = 4;
 const CONTENT_UNITS: &[&str] = &[
     "chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix", "unit", "lesson",
     "章", "部", "节", "篇", "卷", "第章", "第部", "第节", "第篇", "第卷",
-];
-/// Words that number the constituents of a filed package.
-const PACKAGE_UNITS: &[&str] = &[
-    "tab",
-    "exhibit",
-    "schedule",
-    "appendix",
-    "annex",
-    "attachment",
 ];
 const ROMAN_EXCLUDED: &[&str] = &["di", "div", "li", "liv", "mi", "mix", "xi"];
 

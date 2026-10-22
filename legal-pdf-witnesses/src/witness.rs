@@ -223,6 +223,38 @@ const LEAD_WORDS: &[&str] = &[
     "doit",
 ];
 
+/// Words that number the constituents of a filed package.
+pub const PACKAGE_UNITS: &[&str] = &[
+    "tab",
+    "exhibit",
+    "schedule",
+    "appendix",
+    "annex",
+    "attachment",
+];
+
+/// A package division, rather than a reference to one inside a heading's sentence.
+pub(crate) fn package_heading(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let unit = words.next().unwrap_or_default().to_ascii_lowercase();
+    if !PACKAGE_UNITS.contains(&unit.as_str()) {
+        return false;
+    }
+    let Some(label) = words.next() else {
+        // The printed label can be a separate source unit below the title.
+        return true;
+    };
+    let label = label.trim_matches(['"', '\'', '\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}']);
+    words.next().is_none()
+        && !label.is_empty()
+        && (label
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            || legal_pdf_core::layout_analysis()
+                .numbering_marker(label, None)
+                .is_some())
+}
+
 /// Wording or punctuation that can introduce a list; it needs marker and layout evidence too.
 pub fn list_lead_in(text: &str) -> bool {
     let text = text.trim_end();

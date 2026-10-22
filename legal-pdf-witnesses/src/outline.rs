@@ -3,10 +3,12 @@
 //! from, other units under the nearest open heading or lead-in, and the printed contents or
 //! bookmarks place a heading where they name its parent.
 
-use crate::witness::{list_lead_in, median, size};
+use crate::witness::{list_lead_in, median, package_heading, size};
 use legal_pdf_core::model::{Line, Page};
 use legal_structure_model::{NodeKind, NumberingMarker, ScalarRange, ScalarText, StructureNode};
+use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Where a unit's outline lives: its document, quotation, and note, table cell or parallel text.
 pub type Context = (String, Option<String>, Option<String>);
@@ -27,10 +29,25 @@ struct Unit {
     level: Option<usize>,
     lead_in: bool,
     list_intro: bool,
+    opinion: bool,
+    package: bool,
 }
 
 fn heading(node: &StructureNode) -> bool {
     node.role == Some(legal_structure_model::PrimaryRole::Heading) || node.kind == NodeKind::Heading
+}
+
+/// A judicial byline introduces an opinion, independently of its headings' typography.
+fn opinion_author(value: &str) -> bool {
+    static BYLINE: OnceLock<Regex> = OnceLock::new();
+    BYLINE
+        .get_or_init(|| {
+            Regex::new(
+                r"^(?:\p{Lu}[\p{L}\p{M}.'’&-]*\s+)+(?:J|JJ|C\.?J|C\.?J\.?C|C\.?J\.?O|R\.?S\.?J|S\.?J|J\.?A|JJ\.?A|J\.?C\.?A)\.(?:\s+[A-Z][a-z]{0,4}\.\s+(?:[A-Z]\.)*J\.)?(?:\s*\((?:orally|concurring|dissenting)\))?\s*:$",
+            )
+            .expect("judicial byline regex")
+        })
+        .is_match(value.trim())
 }
 
 fn outline_unit(node: &StructureNode) -> bool {
@@ -201,6 +218,8 @@ pub fn assemble_outline(
                     .find_map(|id| heading_levels.get(id).copied()),
                 lead_in: own.trim_end().ends_with(':'),
                 list_intro,
+                opinion: heading(node) && opinion_author(&own),
+                package: heading(node) && package_heading(&own),
             }
         })
         .collect::<Vec<_>>();
@@ -309,14 +328,20 @@ pub fn assemble_outline(
     for (position, unit) in units.iter().enumerate() {
         let stack = stacks.entry(unit.context.clone()).or_default();
         let node = &nodes[unit.node];
+        // Package divisions close the opinion before their own outline resumes.
+        if unit.package && stack.iter().any(|&candidate| units[candidate].opinion) {
+            stack.clear();
+        }
         let mut parent = stack.iter().rposition(|&candidate| {
             let parent = &units[candidate];
             if heading(node) {
                 return heading(&nodes[parent.node])
-                    && match (parent.level, unit.level) {
-                        (Some(parent), Some(child)) => parent < child,
-                        _ => parent.rank < unit.rank,
-                    };
+                    && !unit.opinion
+                    && (parent.opinion
+                        || match (parent.level, unit.level) {
+                            (Some(parent), Some(child)) => parent < child,
+                            _ => parent.rank < unit.rank,
+                        });
             }
             if let (Some(marker), Some(other)) = (&unit.marker, &parent.marker) {
                 if marker.family == other.family && marker.prefix == other.prefix {
