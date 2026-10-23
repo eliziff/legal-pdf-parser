@@ -471,6 +471,7 @@ fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
         detached_references: vec![],
         exclude_from_body: false,
         ink: 0.0,
+        weight: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),

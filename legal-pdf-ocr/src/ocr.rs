@@ -105,7 +105,7 @@ impl PdfOcrProvider for OcrProvider {
     }
 
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
-        raster_page_rules(pdf, requests).into_iter().map(|(separator, _, _)| separator).collect()
+        raster_page_rules(pdf, requests).into_iter().map(|(separator, _, _, _)| separator).collect()
     }
 }
 
@@ -113,9 +113,9 @@ impl PdfOcrProvider for OcrProvider {
 /// and scanned as the recognizers scan their own renders: for a scan whose text layer is kept,
 /// whose image is read for nothing else.
 /// Each requested page rendered once: the note band's separator rule, every thin horizontal
-/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read, and the dark
-/// share of each requested line box.
-pub type RasterRules = (Option<f64>, Vec<[f64; 4]>, Vec<f64>);
+/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read, the dark
+/// share of each requested line box, and each box's stroke weight.
+pub type RasterRules = (Option<f64>, Vec<[f64; 4]>, Vec<f64>, Vec<f64>);
 
 pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterRules> {
     #[cfg(feature = "ocr")]
@@ -126,7 +126,7 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
         use hayro::{render, RenderCache, RenderSettings};
 
         let Ok(document) = Pdf::new(pdf.to_vec()) else {
-            return vec![(None, Vec::new(), Vec::new()); requests.len()];
+            return vec![(None, Vec::new(), Vec::new(), Vec::new()); requests.len()];
         };
         let cache = RenderCache::new();
         let interpreter = InterpreterSettings::default();
@@ -142,11 +142,11 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
             .iter()
             .map(|request| {
                 let Some(page) = pages.iter().nth(request.page_index) else {
-                    return (None, Vec::new(), Vec::new());
+                    return (None, Vec::new(), Vec::new(), Vec::new());
                 };
                 let pixmap = render(page, &cache, &interpreter, &settings);
                 if pixmap.width() == 0 || pixmap.height() == 0 {
-                    return (None, Vec::new(), Vec::new());
+                    return (None, Vec::new(), Vec::new(), Vec::new());
                 }
                 let gray = gray_of(&pixmap);
                 let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
@@ -155,14 +155,56 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
                     raster_separator_gray(&gray, width, height, request.height),
                     thin_strokes(&gray, width, height, sx, sy),
                     line_inks(&gray, width, height, sx, sy, &request.lines),
+                    line_weights(&gray, width, height, sx, sy, &request.lines),
                 )
             })
             .collect()
     }
     #[cfg(not(feature = "ocr"))]
     {
-        vec![(None, Vec::new(), Vec::new()); requests.len()]
+        vec![(None, Vec::new(), Vec::new(), Vec::new()); requests.len()]
     }
+}
+
+/// Each box's stroke weight: the median horizontal run of dark pixels through it, over the box's
+/// height in pixels (boxes [x0, y0, x1, y1] in points, `sx` and `sy` points per pixel). Horizontal
+/// runs cross the letters' stems, so the median reads the stem width, which bold type sets about
+/// half again as wide; a measured box reads at least 0.0001, an empty one 0.
+#[cfg(feature = "ocr")]
+fn line_weights(gray: &[u8], width: usize, height: usize, sx: f64, sy: f64, boxes: &[[f64; 4]]) -> Vec<f64> {
+    const DARK: u8 = 128;
+    boxes
+        .iter()
+        .map(|b| {
+            let x0 = ((b[0] / sx).floor().max(0.0) as usize).min(width);
+            let x1 = ((b[2] / sx).ceil().max(0.0) as usize).min(width);
+            let y0 = ((b[1] / sy).floor().max(0.0) as usize).min(height);
+            let y1 = ((b[3] / sy).ceil().max(0.0) as usize).min(height);
+            if x1 <= x0 || y1 <= y0 {
+                return 0.0;
+            }
+            let mut runs: Vec<u32> = Vec::new();
+            for y in y0..y1 {
+                let mut run = 0u32;
+                for &p in &gray[y * width + x0..y * width + x1] {
+                    if p < DARK {
+                        run += 1;
+                    } else if run > 0 {
+                        runs.push(run);
+                        run = 0;
+                    }
+                }
+                if run > 0 {
+                    runs.push(run);
+                }
+            }
+            if runs.is_empty() {
+                return 0.0001;
+            }
+            runs.sort_unstable();
+            (f64::from(runs[runs.len() / 2]) / (y1 - y0) as f64).max(0.0001)
+        })
+        .collect()
 }
 
 /// Each box's share of dark pixels in the render (boxes [x0, y0, x1, y1] in points, `sx` and `sy`
