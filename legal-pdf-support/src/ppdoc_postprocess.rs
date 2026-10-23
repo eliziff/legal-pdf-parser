@@ -1147,6 +1147,7 @@ mod tests {
             words: Vec::new(),
             detached_references: Vec::new(),
             exclude_from_body: false,
+            ink: 0.0,
             suppress_footnote_label: false,
             paragraph_label_candidate: false,
             note_region_mode: String::new(),

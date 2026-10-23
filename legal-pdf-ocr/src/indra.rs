@@ -2593,6 +2593,7 @@ mod tests {
                     width: 612.0,
                     height: 792.0,
                     regions: vec![[0.0, 30.0, 612.0, 65.0]],
+                    lines: Vec::new(),
                 }],
             )
             .unwrap();
