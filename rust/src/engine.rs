@@ -541,9 +541,26 @@ struct PinnedRecognition {
 impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
     fn extract_pages(
         &mut self,
-        _pdf: &[u8],
+        pdf: &[u8],
         requests: &[legal_pdf_core::OcrPageRequest],
     ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
+        // A page the authoring parse never cached a reading of (its text layer was kept then) is
+        // read now by the environment's recognizer where one is named, else it is an error as before.
+        let missing: Vec<legal_pdf_core::OcrPageRequest> = requests.iter()
+            .filter(|request| !self.pages.contains_key(&request.page_index)).cloned().collect();
+        if !missing.is_empty() {
+            let reader = self.reader.get_or_insert_with(|| {
+                if std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_none() || std::env::var_os("LEGALPDF_ONNXRUNTIME").is_none() {
+                    return None;
+                }
+                OcrProvider::new(&OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())).ok()
+            });
+            if let Some(provider) = reader {
+                for page in legal_pdf_core::PdfOcrProvider::extract_pages(provider, pdf, &missing)? {
+                    self.pages.insert(page.page_index, page);
+                }
+            }
+        }
         requests
             .iter()
             .map(|request| {
