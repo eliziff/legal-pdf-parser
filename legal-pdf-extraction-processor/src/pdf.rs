@@ -1161,6 +1161,7 @@ fn make_line(
         detached_references: vec![],
         ocr: None,
         exclude_from_body: false,
+        ink: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1277,6 +1278,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
             marker: None,
         }),
         exclude_from_body: false,
+        ink: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1797,6 +1799,7 @@ pub fn recognize_pdf(
                     width: page.width,
                     height: page.height,
                     regions,
+                    lines: Vec::new(),
                 })
             })
             .collect();
@@ -1891,17 +1894,18 @@ pub fn recognize_pdf(
             }
         }
         // A scan that keeps its own text layer still prints the rule above its notes in its
-        // image: read the rule there where nothing else found one.
+        // image: read the rule there where nothing else found one, and each line's ink.
         let requests: Vec<_> = metadata
             .scanned_pages
             .iter()
-            .filter(|&&index| separators.get(index).is_some_and(Option::is_none))
+            .filter(|&&index| pages.get(index).is_some_and(|page| page.source == "native" && !page.lines.is_empty()))
             .filter_map(|&page_index| {
                 pages.get(page_index).map(|page| OcrPageRequest {
                     page_index,
                     width: page.width,
                     height: page.height,
                     regions: Vec::new(),
+                    lines: page.lines.iter().map(|line| line.bbox).collect(),
                 })
             })
             .collect();
@@ -1918,6 +1922,9 @@ pub fn recognize_pdf(
                     && text.chars().nth(label).is_some_and(|c| c.is_whitespace() || ".)".contains(c))
             };
             for (request, separator) in requests.iter().zip(provider.separators(pdf, &requests)) {
+                if separators[request.page_index].is_some() {
+                    continue;
+                }
                 separators[request.page_index] = separator.filter(|y| {
                     pages[request.page_index]
                         .lines
@@ -1939,6 +1946,7 @@ pub fn recognize_pdf(
                         width: page.width,
                         height: page.height,
                         regions: Vec::new(),
+                        lines: Vec::new(),
                     })
             })
             .collect();

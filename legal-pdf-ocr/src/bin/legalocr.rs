@@ -21,6 +21,7 @@ fn pdf_requests(bytes: &[u8]) -> Result<Vec<OcrPageRequest>> {
                 width: f64::from(width) * f64::from(unit),
                 height: f64::from(height) * f64::from(unit),
                 regions: Vec::new(),
+                lines: Vec::new(),
             })
         })
         .collect()

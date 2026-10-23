@@ -105,16 +105,17 @@ impl PdfOcrProvider for OcrProvider {
     }
 
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
-        raster_page_rules(pdf, requests).into_iter().map(|(separator, _)| separator).collect()
+        raster_page_rules(pdf, requests).into_iter().map(|(separator, _, _)| separator).collect()
     }
 }
 
 /// The rule printed above each requested page's notes, read from the page rendered at 150 dpi
 /// and scanned as the recognizers scan their own renders: for a scan whose text layer is kept,
 /// whose image is read for nothing else.
-/// Each requested page rendered once: the note band's separator rule, and every thin horizontal
-/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read.
-pub type RasterRules = (Option<f64>, Vec<[f64; 4]>);
+/// Each requested page rendered once: the note band's separator rule, every thin horizontal
+/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read, and the dark
+/// share of each requested line box.
+pub type RasterRules = (Option<f64>, Vec<[f64; 4]>, Vec<f64>);
 
 pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterRules> {
     #[cfg(feature = "ocr")]
@@ -125,7 +126,7 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
         use hayro::{render, RenderCache, RenderSettings};
 
         let Ok(document) = Pdf::new(pdf.to_vec()) else {
-            return vec![(None, Vec::new()); requests.len()];
+            return vec![(None, Vec::new(), Vec::new()); requests.len()];
         };
         let cache = RenderCache::new();
         let interpreter = InterpreterSettings::default();
@@ -141,25 +142,50 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
             .iter()
             .map(|request| {
                 let Some(page) = pages.iter().nth(request.page_index) else {
-                    return (None, Vec::new());
+                    return (None, Vec::new(), Vec::new());
                 };
                 let pixmap = render(page, &cache, &interpreter, &settings);
                 if pixmap.width() == 0 || pixmap.height() == 0 {
-                    return (None, Vec::new());
+                    return (None, Vec::new(), Vec::new());
                 }
                 let gray = gray_of(&pixmap);
                 let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
+                let (sx, sy) = (request.width / width as f64, request.height / height as f64);
                 (
                     raster_separator_gray(&gray, width, height, request.height),
-                    thin_strokes(&gray, width, height, request.width / width as f64, request.height / height as f64),
+                    thin_strokes(&gray, width, height, sx, sy),
+                    line_inks(&gray, width, height, sx, sy, &request.lines),
                 )
             })
             .collect()
     }
     #[cfg(not(feature = "ocr"))]
     {
-        vec![(None, Vec::new()); requests.len()]
+        vec![(None, Vec::new(), Vec::new()); requests.len()]
     }
+}
+
+/// Each box's share of dark pixels in the render (boxes [x0, y0, x1, y1] in points, `sx` and `sy`
+/// points per pixel); a measured box reads at least 0.0001, an empty one 0.
+#[cfg(feature = "ocr")]
+fn line_inks(gray: &[u8], width: usize, height: usize, sx: f64, sy: f64, boxes: &[[f64; 4]]) -> Vec<f64> {
+    const DARK: u8 = 128;
+    boxes
+        .iter()
+        .map(|b| {
+            let x0 = ((b[0] / sx).floor().max(0.0) as usize).min(width);
+            let x1 = ((b[2] / sx).ceil().max(0.0) as usize).min(width);
+            let y0 = ((b[1] / sy).floor().max(0.0) as usize).min(height);
+            let y1 = ((b[3] / sy).ceil().max(0.0) as usize).min(height);
+            if x1 <= x0 || y1 <= y0 {
+                return 0.0;
+            }
+            let dark: usize = (y0..y1)
+                .map(|y| gray[y * width + x0..y * width + x1].iter().filter(|&&p| p < DARK).count())
+                .sum();
+            (dark as f64 / ((x1 - x0) * (y1 - y0)) as f64).max(0.0001)
+        })
+        .collect()
 }
 
 #[cfg(feature = "ocr")]

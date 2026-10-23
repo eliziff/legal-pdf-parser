@@ -364,6 +364,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "diff-match-patch-rs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1e836eb966678daed8789e698dbdb1016a260c3cdaca6172585e13580c4e4be"
+dependencies = [
+ "chrono",
+ "percent-encoding",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -930,7 +940,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "chrono",
- "diff-match-patch-rs",
+ "diff-match-patch-rs 0.5.1",
  "fancy-regex",
  "flate2",
  "legal-grammar",
@@ -1053,6 +1063,7 @@ dependencies = [
  "legal-pdf-support",
  "legal-pdf-witnesses",
  "legal-structure-model",
+ "legal-structure-tagger",
  "lopdf",
  "mimalloc",
  "serde",
@@ -1137,6 +1148,20 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "unicode-normalization",
+]
+
+[[package]]
+name = "legal-structure-tagger"
+version = "0.1.0"
+dependencies = [
+ "diff-match-patch-rs 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "legal-pdf-core",
+ "legal-structure",
+ "legal-structure-model",
+ "ort",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

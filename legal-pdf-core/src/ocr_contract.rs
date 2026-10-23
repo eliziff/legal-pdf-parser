@@ -56,6 +56,9 @@ pub struct OcrPageRequest {
     /// corner, or none for the whole page. A provider may recognize the whole page instead;
     /// only its lines inside a part are read.
     pub regions: Vec<[f64; 4]>,
+    /// Line boxes whose ink the page's render measures, `[x0, y0, x1, y1]` in points; none to
+    /// measure nothing.
+    pub lines: Vec<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
