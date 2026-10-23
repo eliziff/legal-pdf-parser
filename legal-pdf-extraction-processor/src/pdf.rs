@@ -1162,6 +1162,7 @@ fn make_line(
         ocr: None,
         exclude_from_body: false,
         ink: 0.0,
+        weight: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1279,6 +1280,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
         }),
         exclude_from_body: false,
         ink: 0.0,
+        weight: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1892,6 +1894,23 @@ pub fn recognize_pdf(
             if let Some(separator) = separator_y {
                 separators[page_index] = Some(separator);
             }
+        }
+        // A recognized page's lines are measured in its render too: the recognizer writes no font
+        // flags, so a line's ink and stroke weight are its only weight evidence.
+        let requests: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .filter(|(index, page)| page.source == "ocr" && !page.lines.is_empty() && ocr_pages.is_none_or(|selected| selected.contains(index)))
+            .map(|(page_index, page)| OcrPageRequest {
+                page_index,
+                width: page.width,
+                height: page.height,
+                regions: Vec::new(),
+                lines: page.lines.iter().map(|line| line.bbox).collect(),
+            })
+            .collect();
+        if !requests.is_empty() {
+            provider.separators(pdf, &requests);
         }
         // A scan that keeps its own text layer still prints the rule above its notes in its
         // image: read the rule there where nothing else found one, and each line's ink.
