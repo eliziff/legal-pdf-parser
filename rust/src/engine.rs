@@ -230,6 +230,16 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         Ok(results)
     }
 
+    fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<legal_pdf_core::OcrLine>> {
+        if self.runtime.is_none() {
+            let prepared = self.prepared.take().ok_or_else(|| {
+                Error::Message("OCR runtime preparation was already consumed".to_owned())
+            })?;
+            self.runtime = Some(OcrProvider::from_prepared(self.options, prepared)?);
+        }
+        legal_pdf_core::PdfOcrProvider::read_region(self.runtime.as_mut().expect("OCR runtime initialized"), pdf, page_index, region, scale)
+    }
+
     fn separators(
         &mut self,
         pdf: &[u8],
@@ -522,6 +532,9 @@ struct PinnedRecognition {
     strokes: BTreeMap<usize, Vec<[f64; 4]>>,
     inks: BTreeMap<usize, Vec<f64>>,
     weights: BTreeMap<usize, Vec<f64>>,
+    /// A recognizer for re-reading margins, built from LEGALPDF_INDRA_MODEL_PACK and
+    /// LEGALPDF_ONNXRUNTIME the first time one is asked for; none where they are not set.
+    reader: Option<Option<OcrProvider>>,
 }
 
 #[cfg(feature = "ocr")]
@@ -539,6 +552,19 @@ impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
                 })
             })
             .collect()
+    }
+
+    fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<legal_pdf_core::OcrLine>> {
+        let reader = self.reader.get_or_insert_with(|| {
+            if std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_none() || std::env::var_os("LEGALPDF_ONNXRUNTIME").is_none() {
+                return None;
+            }
+            OcrProvider::new(&OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())).ok()
+        });
+        match reader {
+            Some(provider) => legal_pdf_core::PdfOcrProvider::read_region(provider, pdf, page_index, region, scale),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn separators(
@@ -579,7 +605,7 @@ pub fn gold_structure_inputs(
     {
         return Err(Error::Message("invalid extraction cache".to_owned()));
     }
-    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), strokes: BTreeMap::new(), inks: BTreeMap::new(), weights: BTreeMap::new() };
+    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), strokes: BTreeMap::new(), inks: BTreeMap::new(), weights: BTreeMap::new(), reader: None };
     for path in readings {
         #[derive(Deserialize)]
         struct Reading {

@@ -80,4 +80,12 @@ pub trait PdfOcrProvider {
     fn separators(&mut self, _pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
         vec![None; requests.len()]
     }
+
+    /// A part of a page read again: the lines the recognizer reads inside `region` ([x0, y0, x1, y1]
+    /// in points from the page's top-left) rendered at `scale` times the page's size in points, their
+    /// boxes in page points; none by default. A paragraph number a first reading lost is looked
+    /// for this way, in the margin where its run says it stands.
+    fn read_region(&mut self, _pdf: &[u8], _page_index: usize, _region: [f64; 4], _scale: f64) -> Result<Vec<OcrLine>> {
+        Ok(Vec::new())
+    }
 }

@@ -1986,6 +1986,10 @@ pub fn recognize_pdf(
                 }
             }
         }
+        // Paragraph numbers the scan lost, from the run they stand in and the margin read again.
+        if crate::paragraph_recovery::recover(pdf, pages, &metadata.scanned_pages, provider) > 0 {
+            reindex = true;
+        }
     }
     if reindex {
         reindex_source_lines(pages);
