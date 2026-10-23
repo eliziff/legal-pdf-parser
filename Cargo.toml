@@ -28,7 +28,8 @@ profiling = ["pdf", "legal-pdf-support/profiling"]
 allocation-profiling = ["profiling", "legal-pdf-support/allocation-profiling"]
 ppdoc-openvino = ["pdf", "legal-pdf-support/ppdoc-openvino"]
 ppdoc-full = ["pdf", "legal-pdf-support/ppdoc"]
-full = ["language", "indra", "ppdoc-full"]
+tagger = ["pdf", "dep:legal-structure-tagger", "legal-pdf-core/ort-runtime"]
+full = ["language", "indra", "ppdoc-full", "tagger"]
 # The command-line tools, which run this checkout's structure engine.
 cli = ["pdf", "legal-pdf-core/structure-analysis"]
 
@@ -43,6 +44,7 @@ required-features = ["cli"]
 
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
+legal-structure-tagger = { path = "../legal-structure/tagger", features = ["onnx"], optional = true }
 legal-pdf-extraction = { path = "legal-pdf-extraction", optional = true }
 legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }

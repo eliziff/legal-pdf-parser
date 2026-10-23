@@ -2,6 +2,8 @@
 mod contract;
 #[cfg(feature = "pdf")]
 mod engine;
+#[cfg(feature = "tagger")]
+mod tagger;
 #[cfg(feature = "pdf")]
 mod supplied_ocr;
 

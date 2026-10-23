@@ -445,9 +445,15 @@ fn derive_document(
 ) -> Result<PdfDocument> {
     let document_id = format!("doc-{}", &source_hash[..20]);
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
-    let derived = profile::measure("derive_document", || {
+    #[allow(unused_mut)]
+    let mut derived = profile::measure("derive_document", || {
         derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile)
     })?;
+    // The structure tagger, where a model is configured, re-labels the graph's paragraph-level
+    // nodes: regions, starts, markers and heading levels from the model, parents by the
+    // hierarchy rule (legal-structure-tagger).
+    #[cfg(feature = "tagger")]
+    profile::measure("derive_document.tagger", || crate::tagger::retag(&mut derived.structure_graph, &extracted.pages, source_hash))?;
     profile::measure("build.validate_document", || {
         validate_pdf_components(
             &document_id,
