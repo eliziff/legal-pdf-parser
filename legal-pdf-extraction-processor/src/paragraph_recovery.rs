@@ -361,6 +361,10 @@ fn splice(line: &mut Line, family: Family, value: u32, taken: usize, reread: Opt
 
 /// Recover the lost paragraph numbers of the scanned pages; returns how many lines took a number.
 pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provider: &mut dyn PdfOcrProvider) -> usize {
+    // LEGALPDF_PARAGRAPH_RECOVERY=off: the yardstick's baseline without this pass.
+    if std::env::var("LEGALPDF_PARAGRAPH_RECOVERY").is_ok_and(|v| v == "off") {
+        return 0;
+    }
     let mut repaired = 0;
     for family in [Family::Bracket, Family::Dot] {
         let places = places(pages, scanned);

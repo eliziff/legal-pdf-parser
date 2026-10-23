@@ -43,5 +43,5 @@ fn configured() -> Result<Option<&'static Mutex<Tagger>>> {
 pub(crate) fn retag(structure: &mut DocumentStructure, pages: &[Page], source_sha256: &str) -> Result<()> {
     let Some(tagger) = configured()? else { return Ok(()) };
     let mut tagger = tagger.lock().map_err(|_| Error::Message("structure tagger poisoned".to_owned()))?;
-    tagger.retag(structure, pages, source_sha256, true).map_err(Error::Message)
+    tagger.retag(structure, pages, source_sha256, false).map_err(Error::Message)
 }
