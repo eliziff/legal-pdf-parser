@@ -207,6 +207,39 @@ fn line_weights(gray: &[u8], width: usize, height: usize, sx: f64, sy: f64, boxe
         .collect()
 }
 
+/// Every page of `pdf` rendered to 8-bit grey at `dpi`: (width, height, pixels) per page, in page
+/// order. The structure gold's synthetic scans are made of these renders.
+pub fn render_gray_pages(pdf: &[u8], dpi: f64) -> Vec<(usize, usize, Vec<u8>)> {
+    #[cfg(feature = "ocr")]
+    {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::vello_cpu::color::palette::css::WHITE;
+        use hayro::{render, RenderCache, RenderSettings};
+
+        let Ok(document) = Pdf::new(pdf.to_vec()) else {
+            return Vec::new();
+        };
+        let cache = RenderCache::new();
+        let interpreter = InterpreterSettings::default();
+        let scale = (dpi / 72.0) as f32;
+        let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
+        document
+            .pages()
+            .iter()
+            .map(|page| {
+                let pixmap = render(page, &cache, &interpreter, &settings);
+                (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap))
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = (pdf, dpi);
+        Vec::new()
+    }
+}
+
 /// Each box's share of dark pixels in the render (boxes [x0, y0, x1, y1] in points, `sx` and `sy`
 /// points per pixel); a measured box reads at least 0.0001, an empty one 0.
 #[cfg(feature = "ocr")]
