@@ -85,7 +85,7 @@ fn unit_style(
         .iter()
         .filter_map(|part| {
             let (start, end) = (part.start.max(source.start), part.end.min(source.end));
-            (start < end).then_some((start - source.start, end - source.start))
+            (start < end).then(|| (start - source.start, end - source.start))
         })
         .collect::<Vec<_>>();
     let coordinates = ScalarText::new(&line.text);
