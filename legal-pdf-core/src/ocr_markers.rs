@@ -17,13 +17,17 @@ pub fn associate_ocr_markers(pages: &mut [Page]) {
             let Some(marker) = analysis.numbering_marker(text, previous.get(&column)) else { continue };
             previous.insert(column, marker.clone());
             let height = line.bbox[3] - line.bbox[1];
+            let width = line.bbox[2] - line.bbox[0];
             let mut bodies = page.lines.iter().enumerate().filter_map(|(index, body)| {
                 let body_height = body.bbox[3] - body.bbox[1];
                 let gap = body.bbox[0] - line.bbox[2];
                 let overlap = line.bbox[3].min(body.bbox[3]) - line.bbox[1].max(body.bbox[1]);
-                let order_gap = body.reading_order.checked_sub(line.reading_order)?;
+                // The body may be read just before the number as well as after it, and a recognizer's
+                // body box may start inside the number's box (its padding, or the number's trailing
+                // bracket): the body starts right of the number's middle.
+                let order_gap = body.reading_order as i64 - line.reading_order as i64;
                 if index == line_index || height <= 0.0 || body_height <= 0.0
-                    || order_gap == 0 || order_gap > 3 || gap < 0.0 || gap > body_height * 3.0
+                    || order_gap == 0 || order_gap > 3 || order_gap < -2 || gap < -width * 0.5 || gap > body_height * 3.0
                     || overlap < height.min(body_height) * 0.5
                     || (line.bbox[1] + line.bbox[3] - body.bbox[1] - body.bbox[3]).abs() > body_height * 0.8
                     || body.text.chars().filter(|c| c.is_alphabetic()).count() < 4
