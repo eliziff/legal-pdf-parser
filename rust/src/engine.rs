@@ -606,6 +606,32 @@ pub fn gold_structure_inputs(
     Ok(extracted)
 }
 
+/// The structure gold's synthetic scan: `pdf`, an image-only copy of a typeset document, extracted
+/// and recognized by `options`' recognizer, every recognized line measured in its render, as the
+/// structure stage receives a scan. `runtime` keeps the recognizer across documents.
+#[cfg(feature = "ocr")]
+#[doc(hidden)]
+pub fn gold_synthetic_inputs(pdf: &[u8], options: &OcrOptions, runtime: &mut Option<OcrProvider>) -> Result<ExtractedPdf> {
+    let mut extracted = extract_pdf(pdf, None, None)?;
+    let prepared = if runtime.is_none() { Some(OcrProvider::prepare(options)?) } else { None };
+    let mut provider = DeferredOcrProvider {
+        options,
+        prepared,
+        runtime: runtime.take(),
+        cache_root: None,
+        cache_identity: "synthetic".to_owned(),
+        progress: None,
+        strokes: BTreeMap::new(),
+        inks: BTreeMap::new(),
+        weights: BTreeMap::new(),
+    };
+    let recognized = recognize_pdf(pdf, &mut extracted, Some(&mut provider as &mut dyn legal_pdf_core::PdfOcrProvider), None);
+    *runtime = provider.runtime.take();
+    recognized?;
+    finish_recognition(&mut extracted.pages, provider.strokes, provider.inks, provider.weights);
+    Ok(extracted)
+}
+
 /// The structure gold's replay: a recognized extraction through the structure stage, uncached;
 /// `pages`, where given, receives the pages as the structure stage left them.
 #[doc(hidden)]

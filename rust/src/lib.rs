@@ -24,6 +24,10 @@ pub use engine::{corpus_check_cached_extraction, gold_structure_document};
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
 pub use engine::gold_structure_inputs;
+#[cfg(feature = "ocr")]
+pub use engine::gold_synthetic_inputs;
+#[cfg(feature = "ocr")]
+pub use legal_pdf_ocr::render_gray_pages;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
 pub use legal_pdf_extraction::ExtractedPdf;
