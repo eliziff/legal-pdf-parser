@@ -1,4 +1,4 @@
-use legal_pdf_core::{OcrPageRequest, OcrPageResult, PdfOcrProvider, Result};
+use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, PdfOcrProvider, Result};
 
 #[derive(Debug, Clone)]
 pub enum OcrOptions {
@@ -107,6 +107,69 @@ impl PdfOcrProvider for OcrProvider {
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
         raster_page_rules(pdf, requests).into_iter().map(|(separator, _, _, _)| separator).collect()
     }
+
+    fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<OcrLine>> {
+        #[cfg(feature = "ocr")]
+        {
+            let Some((width, height, gray)) = render_gray_page(pdf, page_index, scale * 72.0) else {
+                return Ok(Vec::new());
+            };
+            let x0 = ((region[0] * scale).floor().max(0.0) as usize).min(width);
+            let x1 = ((region[2] * scale).ceil().max(0.0) as usize).min(width);
+            let y0 = ((region[1] * scale).floor().max(0.0) as usize).min(height);
+            let y1 = ((region[3] * scale).ceil().max(0.0) as usize).min(height);
+            if x1 <= x0 + 4 || y1 <= y0 + 4 {
+                return Ok(Vec::new());
+            }
+            let mut crop = Vec::with_capacity((x1 - x0) * (y1 - y0));
+            for y in y0..y1 {
+                crop.extend_from_slice(&gray[y * width + x0..y * width + x1]);
+            }
+            let Some(image) = image::GrayImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, crop) else {
+                return Ok(Vec::new());
+            };
+            let lines = match self {
+                Self::Indra(provider) => provider.recognize_gray_image(&image)?,
+            };
+            Ok(lines
+                .into_iter()
+                .map(|mut line| {
+                    let place = |b: [f64; 4]| {
+                        [(b[0] + x0 as f64) / scale, (b[1] + y0 as f64) / scale, (b[2] + x0 as f64) / scale, (b[3] + y0 as f64) / scale]
+                    };
+                    line.bbox = place(line.bbox);
+                    for word in &mut line.words {
+                        word.bbox = place(word.bbox);
+                    }
+                    line
+                })
+                .collect())
+        }
+        #[cfg(not(feature = "ocr"))]
+        {
+            let _ = (pdf, page_index, region, scale);
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// One page of `pdf` rendered to 8-bit grey at `dpi`: (width, height, pixels).
+#[cfg(feature = "ocr")]
+fn render_gray_page(pdf: &[u8], page_index: usize, dpi: f64) -> Option<(usize, usize, Vec<u8>)> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{render, RenderCache, RenderSettings};
+
+    let document = Pdf::new(pdf.to_vec()).ok()?;
+    let cache = RenderCache::new();
+    let interpreter = InterpreterSettings::default();
+    let scale = (dpi / 72.0) as f32;
+    let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
+    let pages = document.pages();
+    let page = pages.iter().nth(page_index)?;
+    let pixmap = render(page, &cache, &interpreter, &settings);
+    (pixmap.width() > 0 && pixmap.height() > 0).then(|| (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap)))
 }
 
 /// The rule printed above each requested page's notes, read from the page rendered at 150 dpi
