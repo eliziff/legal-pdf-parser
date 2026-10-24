@@ -341,8 +341,9 @@ fn starts_paragraph(
         return Some("enumerator");
     }
     // A line that goes on with the sentence (lower case, or the punctuation a wrap left it) opens
-    // nothing, however it is set.
-    if goes_on(b) {
+    // nothing, however it is set; nor does the value under a field's label ("Beneficiary:" and the
+    // address beneath it are one block, as a form or a letter of credit sets them).
+    if goes_on(b) || field_label(a) {
         return None;
     }
     let marker = bullet_re().is_match(&a.text)
@@ -471,12 +472,22 @@ pub(crate) fn paragraph_indices(
             end += 1;
         }
         let run = &page.lines[start..end];
+        // LEGALPDF_LAYOUT_UNITS=on: where a page layout model has given every line a region, the
+        // regions are the paragraphs: a block starts where the region changes and nowhere else.
+        let layout_units = layout_units_mode() && run.iter().all(|line| !line.region_id.is_empty());
         let mut block_start = 0;
         for k in 1..=run.len() {
             if k < run.len() {
-                match starts_block(&run[k - 1], &run[k], &pitch) {
-                    None => continue,
-                    Some(reason) => trace(&run[k], "block", reason),
+                if layout_units {
+                    if run[k - 1].region_id == run[k].region_id {
+                        continue;
+                    }
+                    trace(&run[k], "block", "layout-region");
+                } else {
+                    match starts_block(&run[k - 1], &run[k], &pitch) {
+                        None => continue,
+                        Some(reason) => trace(&run[k], "block", reason),
+                    }
                 }
             }
             let block: Vec<&Line> = run[block_start..k].iter().collect();
@@ -485,9 +496,11 @@ pub(crate) fn paragraph_indices(
             for j in 1..block.len() {
                 let after = block.get(j + 1).copied();
                 let margin = indented.then(|| margin_at(&block, j));
-                if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin) {
-                    trace(block[j], "paragraph", reason);
-                    next += 1;
+                if !layout_units {
+                    if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                        trace(block[j], "paragraph", reason);
+                        next += 1;
+                    }
                 }
                 assigned[start + block_start + j] = Some(next);
             }
@@ -602,4 +615,10 @@ mod tests {
             );
         }
     }
+}
+
+/// Whether a page layout model's regions, when present on every line, define the paragraphs.
+pub(crate) fn layout_units_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGALPDF_LAYOUT_UNITS").is_ok_and(|v| v == "on"))
 }
