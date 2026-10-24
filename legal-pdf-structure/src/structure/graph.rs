@@ -663,17 +663,14 @@ fn read_candidates(
     // same citations it read from its own view, save one straddling a context boundary.
     let mut whole_citations: Vec<(usize, usize)> =
         legal_pdf_support::profile::measure("candidates.citations", || {
-            cached_citations(text.value).unwrap_or_else(|| {
-                let mut found: Vec<(usize, usize)> = protected_citation_spans(text.value);
-                found.extend(structure_analysis().citations(text.value).into_iter().map(|citation| {
-                    (
-                        text.scalar_at_byte(citation.core_range.start).expect("citation start"),
-                        text.scalar_at_byte(citation.core_range.end).expect("citation end"),
-                    )
-                }));
-                remember_citations(text.value, &found);
-                found
-            })
+            let mut found: Vec<(usize, usize)> = protected_citation_spans(text.value);
+            found.extend(structure_analysis().citations(text.value).into_iter().map(|citation| {
+                (
+                    text.scalar_at_byte(citation.core_range.start).expect("citation start"),
+                    text.scalar_at_byte(citation.core_range.end).expect("citation end"),
+                )
+            }));
+            found
         });
     whole_citations.sort_unstable();
     let mut read = |coordinates: &ScalarText<'_>,
@@ -1676,32 +1673,4 @@ pub(super) fn native_graph_parts(
         nodes.push(node);
     }
     Ok(nodes)
-}
-
-/// The citation reader is the structure stage's costliest step and a text's citations never change
-/// between readings of the same text: with LEGALPDF_CITATION_CACHE naming a directory, the spans
-/// read for a text are kept there by the text's hash and length, for the gold harness's repeated
-/// replays. Unset (the product), nothing is kept or read.
-fn citation_cache_path(text: &str) -> Option<std::path::PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let dir = std::env::var_os("LEGALPDF_CITATION_CACHE")?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    Some(std::path::PathBuf::from(dir).join(format!("{:016x}-{}.json", hasher.finish(), text.len())))
-}
-
-fn cached_citations(text: &str) -> Option<Vec<(usize, usize)>> {
-    let bytes = std::fs::read(citation_cache_path(text)?).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn remember_citations(text: &str, found: &[(usize, usize)]) {
-    if let Some(path) = citation_cache_path(text) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec(found) {
-            let _ = std::fs::write(path, bytes);
-        }
-    }
 }
