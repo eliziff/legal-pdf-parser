@@ -235,6 +235,19 @@ pub(super) fn contents_row(text: &str) -> bool {
     contents_leader_re().is_match(text)
 }
 
+/// A heading's printed number before its title: "1.", "1.1", "I.", "(a)", "ii.", a bare "1", or a
+/// numbered word ("PART 1", "Section 1.01"). A number alone on its line is no marker of a title.
+fn heading_marker_re() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Regex::new(concat!(
+            r"^\s*((?i:PART|PARTIE|ARTICLE|SECTION|CHAPTER|CHAPITRE|SCHEDULE|ANNEXE|GC)\s+[0-9IVXLC]{1,6}(?:\.[0-9]{1,3})*\.?",
+            r"|\(?[0-9]{1,3}(?:\.[0-9]{1,3})*[.)]?|\(?[IVXLCivxlc]{1,6}[.)]|\(?[A-Za-z][.)])\s+\S"
+        ))
+        .expect("heading marker regex")
+    })
+}
+
 pub(super) fn contents_leader_re() -> &'static Regex {
     static LEADER: OnceLock<Regex> = OnceLock::new();
     // A leader runs to the line's end or to the locator that ends it: dots inside a line are an
@@ -1525,6 +1538,15 @@ pub(super) fn native_graph_parts(
         node.label = heading.then(|| node.ranges.iter().map(|part|
             text.slice(part.start..part.end).expect("indexed heading part must be in bounds")
         ).collect::<Vec<_>>().join(" "));
+        if let Some(first) = node.ranges.first().filter(|_| heading) {
+            let line = text.slice(first.start..first.end).expect("indexed heading part must be in bounds");
+            if let Some(found) = heading_marker_re().captures(line).and_then(|c| c.get(1)) {
+                node.marker_range = Some(ScalarRange {
+                    start: first.start + line[..found.start()].chars().count(),
+                    end: first.start + line[..found.end()].chars().count(),
+                });
+            }
+        }
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
         node.grammar = if heading {
