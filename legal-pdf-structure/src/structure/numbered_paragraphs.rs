@@ -1001,8 +1001,25 @@ fn own_sequence(values: &[usize]) -> Vec<bool> {
             at = prev[at];
         }
     }
-    for i in 0..n {
-        if !decided[i] && spans.iter().any(|&(a, b)| a < i && i < b) {
+    // A scanned parallel text's second copy may read too broken for a chain, but it still runs
+    // upward: when the leftovers inside the spans mostly keep increasing (a non-decreasing
+    // subsequence of at least four fifths of them, five or more), they are the document's own.
+    let leftovers: Vec<usize> = (0..n).filter(|&i| !decided[i] && spans.iter().any(|&(a, b)| a < i && i < b)).collect();
+    if leftovers.len() >= 5 {
+        let mut tails: Vec<usize> = Vec::new();
+        for &i in &leftovers {
+            let at = tails.partition_point(|&t| t <= values[i]);
+            if at == tails.len() { tails.push(values[i]); } else { tails[at] = values[i]; }
+        }
+        if tails.len() * 5 >= leftovers.len() * 4 {
+            return own;
+        }
+    }
+    // A quoted number duplicates one the document itself reaches; a number nothing else prints
+    // is the reading's own, however it broke the chain (a misread digit).
+    let printed: HashSet<usize> = (0..n).filter(|&i| decided[i]).map(|i| values[i]).collect();
+    for &i in &leftovers {
+        if printed.contains(&values[i]) {
             own[i] = false;
         }
     }
