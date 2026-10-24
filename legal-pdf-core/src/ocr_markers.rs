@@ -77,3 +77,73 @@ pub fn associate_ocr_markers(pages: &mut [Page]) {
         }
     }
 }
+
+/// A recognized number standing on a line of its own, read beside its paragraph's first line
+/// (`associate_ocr_markers`), joins that line: "[35]" and "All of the decisions ..." become the one
+/// line "[35] All of the decisions ...", the number its first word, the box the union, as a
+/// typeset page sets a hanging number and as the structure stage reads it. Only a line that is
+/// nothing but its number joins; a number with words of its own stays. Returns how many joined.
+pub fn merge_ocr_marker_lines(pages: &mut [Page]) -> usize {
+    let analysis = layout_analysis();
+    let mut merged = 0;
+    for page in pages {
+        let mut joins: Vec<(usize, usize)> = Vec::new();
+        for (index, line) in page.lines.iter().enumerate() {
+            let Some(body_id) = line.ocr.as_ref().and_then(|ocr| ocr.marker.as_ref()).and_then(|m| m.body_line_id.as_deref()) else { continue };
+            let text = line.text.trim();
+            if analysis.numbering_marker(text, None).is_none() {
+                continue;
+            }
+            // The whole line is the number: one token of a few characters, nothing after it.
+            if text.chars().count() > 7 || text.chars().any(char::is_whitespace) {
+                continue;
+            }
+            if let Some(body) = page.lines.iter().position(|other| other.id == body_id) {
+                if body != index && !joins.iter().any(|(_, b)| *b == body) {
+                    joins.push((index, body));
+                }
+            }
+        }
+        if joins.is_empty() {
+            continue;
+        }
+        let mut remove = Vec::new();
+        for (marker_index, body_index) in joins {
+            let marker = page.lines[marker_index].clone();
+            let body = &mut page.lines[body_index];
+            let label = marker.text.trim().to_owned();
+            let shift = label.chars().count() + 1;
+            for word in &mut body.words {
+                word.start += shift;
+                word.end += shift;
+            }
+            body.words.insert(0, crate::Word {
+                id: format!("{}-w000", body.id),
+                text: label.clone(),
+                bbox: marker.bbox,
+                start: 0,
+                end: label.chars().count(),
+                underlined: false,
+            });
+            for (k, word) in body.words.iter_mut().enumerate() {
+                word.id = format!("{}-w{:03}", body.id, k + 1);
+            }
+            body.text = format!("{label} {}", body.text);
+            body.bbox = [
+                body.bbox[0].min(marker.bbox[0]), body.bbox[1].min(marker.bbox[1]),
+                body.bbox[2].max(marker.bbox[2]), body.bbox[3].max(marker.bbox[3]),
+            ];
+            if let (Some(own), Some(theirs)) = (body.ocr.as_mut(), marker.ocr.as_ref()) {
+                own.confidence = own.confidence.min(theirs.confidence);
+                own.marker = None;
+            }
+            remove.push(marker_index);
+            merged += 1;
+        }
+        remove.sort_unstable();
+        for index in remove.into_iter().rev() {
+            page.lines.remove(index);
+        }
+    }
+    merged
+}
