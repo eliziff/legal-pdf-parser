@@ -1994,11 +1994,11 @@ pub fn recognize_pdf(
     if reindex {
         reindex_source_lines(pages);
         legal_pdf_core::associate_ocr_markers(pages);
-        // A number read on a line of its own joins its paragraph's first line, as the page sets it.
-        if legal_pdf_core::merge_ocr_marker_lines(pages) > 0 {
-            reindex_source_lines(pages);
-            legal_pdf_core::associate_ocr_markers(pages);
-        }
+    }
+    // A number standing on a line of its own, read or typeset, joins its paragraph's first line.
+    if legal_pdf_core::merge_marker_lines(pages) > 0 {
+        reindex_source_lines(pages);
+        legal_pdf_core::associate_ocr_markers(pages);
     }
     let unresolved_pages: Vec<_> = weak_pages.into_iter().collect();
     for &page_index in &unresolved_pages {

@@ -78,27 +78,30 @@ pub fn associate_ocr_markers(pages: &mut [Page]) {
     }
 }
 
-/// A recognized number standing on a line of its own, read beside its paragraph's first line
-/// (`associate_ocr_markers`), joins that line: "[35]" and "All of the decisions ..." become the one
-/// line "[35] All of the decisions ...", the number its first word, the box the union, as a
-/// typeset page sets a hanging number and as the structure stage reads it. Only a line that is
-/// nothing but its number joins; a number with words of its own stays. Returns how many joined.
-pub fn merge_ocr_marker_lines(pages: &mut [Page]) -> usize {
+/// A number standing on a line of its own joins its paragraph's first line, as a typeset page sets a
+/// hanging number and as the structure stage reads it: "[35]" and "All of the decisions ..." become the
+/// one line "[35] All of the decisions ...", the number its first word, the box the union. A recognized
+/// number joins the body `associate_ocr_markers` read it beside; a native number (an extractor splits
+/// "1." from its paragraph at the tab stop) joins the one line set beside it on its baseline, within three
+/// line heights, when no other line competes. Only a line that is nothing but its number joins; a number
+/// with words of its own stays. Returns how many joined.
+pub fn merge_marker_lines(pages: &mut [Page]) -> usize {
     let analysis = layout_analysis();
     let mut merged = 0;
     for page in pages {
         let mut joins: Vec<(usize, usize)> = Vec::new();
         for (index, line) in page.lines.iter().enumerate() {
-            let Some(body_id) = line.ocr.as_ref().and_then(|ocr| ocr.marker.as_ref()).and_then(|m| m.body_line_id.as_deref()) else { continue };
             let text = line.text.trim();
-            if analysis.numbering_marker(text, None).is_none() {
-                continue;
-            }
             // The whole line is the number: one token of a few characters, nothing after it.
-            if text.chars().count() > 7 || text.chars().any(char::is_whitespace) {
+            if text.chars().count() > 7 || text.chars().any(char::is_whitespace) || analysis.numbering_marker(text, None).is_none() {
                 continue;
             }
-            if let Some(body) = page.lines.iter().position(|other| other.id == body_id) {
+            let body = match &line.ocr {
+                Some(ocr) => ocr.marker.as_ref().and_then(|m| m.body_line_id.as_deref())
+                    .and_then(|body_id| page.lines.iter().position(|other| other.id == body_id)),
+                None => native_body(&page.lines, index),
+            };
+            if let Some(body) = body {
                 if body != index && !joins.iter().any(|(_, b)| *b == body) {
                     joins.push((index, body));
                 }
@@ -146,4 +149,38 @@ pub fn merge_ocr_marker_lines(pages: &mut [Page]) -> usize {
         }
     }
     merged
+}
+
+/// The line a native number joins: set beside it on its baseline, starting right of the number's middle
+/// and within three line heights of its end, with words of its own and not a number itself; the nearest
+/// such line, and none when a second one competes for it.
+fn native_body(lines: &[crate::Line], marker: usize) -> Option<usize> {
+    let analysis = layout_analysis();
+    let line = &lines[marker];
+    let height = line.bbox[3] - line.bbox[1];
+    let width = line.bbox[2] - line.bbox[0];
+    if height <= 0.0 {
+        return None;
+    }
+    let mut bodies: Vec<(f64, f64, usize)> = lines.iter().enumerate().filter_map(|(index, body)| {
+        let body_height = body.bbox[3] - body.bbox[1];
+        let gap = body.bbox[0] - line.bbox[2];
+        let overlap = line.bbox[3].min(body.bbox[3]) - line.bbox[1].max(body.bbox[1]);
+        if index == marker || body.ocr.is_some() || body_height <= 0.0
+            || gap < -width * 0.5 || gap > body_height * 3.0
+            || overlap < height.min(body_height) * 0.5
+            || (line.bbox[1] + line.bbox[3] - body.bbox[1] - body.bbox[3]).abs() > body_height * 0.8
+            || body.text.chars().filter(|c| c.is_alphabetic()).count() < 4
+            || analysis.numbering_marker(body.text.trim(), None).is_some()
+        {
+            return None;
+        }
+        Some((gap, body_height, index))
+    }).collect();
+    bodies.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let first = bodies.first()?;
+    if bodies.get(1).is_some_and(|second| second.0 - first.0 <= first.1 * 0.5) {
+        return None;
+    }
+    Some(first.2)
 }
