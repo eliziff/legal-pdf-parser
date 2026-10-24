@@ -2,7 +2,7 @@ use super::{
     arabic_page_number, body_flow_edge, continues_prose, scalar_suffix, sentence_ended,
     starts_note_or_list, DocumentContext, PdfPrimitiveEvidence,
 };
-use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
+use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan, Span, Word};
 use legal_structure_model::structure_analysis;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_support::{has_citation_signal, protected_citation_spans};
@@ -60,15 +60,17 @@ impl PdfTextIndex {
             let mut page_start = None;
             let mut page_end = scalar_cursor;
             let mut previous: Option<&Line> = None;
+            let line_numbers = line_number_column(page).into_iter().map(|slot| page.lines[slot].id.as_str()).collect::<HashSet<_>>();
             for line in ordered_lines {
                 if !lines.is_empty() {
                     // A number set on a line of its own with its paragraph beside it on the same row
                     // ("1." then "In this decision ...", a hanging "[35]" read apart from its text) reads
                     // as one printed line: the grammars see "1. In this decision ...", and the ranges
-                    // still fall on their own source lines.
+                    // still fall on their own source lines. A transcript's line number stays apart.
                     let beside = previous.is_some_and(|before| {
                         let label = before.text.trim();
-                        crate::paragraphs::same_row(before, line)
+                        !line_numbers.contains(before.id.as_str())
+                            && crate::paragraphs::same_row(before, line)
                             && line.bbox[0] >= before.bbox[2] - 1.0
                             && !label.is_empty()
                             && (crate::paragraphs::marker_only_re().is_match(&before.text)
@@ -258,17 +260,106 @@ pub(super) fn contents_leader_re() -> &'static Regex {
     })
 }
 
-fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
+fn transcript_line_numbers(pages: &[Page]) -> HashSet<&str> {
     pages
         .iter()
-        .filter(|page| !line_number_column(page).is_empty())
-        .map(|page| page.index)
+        .flat_map(|page| line_number_column(page).into_iter().map(|slot| page.lines[slot].id.as_str()))
         .collect()
 }
 
-/// A transcript's printed line numbers: a column of small numbers counting at least
-/// 1 to 15 down the page. Returns the column's line slots, or none.
+/// A transcript's printed line numbers: a column of small numbers, each a line of its own,
+/// counting at least 1 to 15 down the page. Returns the column's line slots, or none.
 pub(super) fn line_number_column(page: &Page) -> Vec<usize> {
+    number_column(page, |line| arabic_page_number(&line.text).map(|number| (line.bbox[0], number)))
+}
+
+/// A line's printed transcript line number where the extraction read it into the line it numbers
+/// ("4        Q.   What is"): its left edge and value. A number whose next word stands at least two
+/// line heights away is set in the margin, not in the text.
+fn fused_line_number(line: &Line) -> Option<(f64, u32)> {
+    let [first, second, ..] = line.words.as_slice() else {
+        return None;
+    };
+    let number = first.text.parse::<u32>().ok().filter(|_| first.text.len() <= 2)?;
+    let height = (first.bbox[3] - first.bbox[1]).max(1.0);
+    let set_apart = second.bbox[0] - first.bbox[2] >= 2.0 * height;
+    let read = line.text.chars().skip(first.start).take(first.end.saturating_sub(first.start)).eq(first.text.chars());
+    let ordered = first.end <= second.start && second.start <= line.text.chars().count();
+    (set_apart && read && ordered).then_some((first.bbox[0], number))
+}
+
+/// A transcript's line numbers read into the lines they number, split off as lines of their own,
+/// so they stand in their column as numbers printed apart do. Returns whether the page has a
+/// line-number column.
+pub(super) fn split_line_numbers(page: &mut Page) -> bool {
+    let column = number_column(page, |line| {
+        arabic_page_number(&line.text).map(|number| (line.bbox[0], number)).or_else(|| fused_line_number(line))
+    });
+    let mut fused = column
+        .iter()
+        .copied()
+        .filter(|&slot| arabic_page_number(&page.lines[slot].text).is_none())
+        .collect::<Vec<_>>();
+    fused.sort_unstable();
+    for &slot in fused.iter().rev() {
+        let number = split_line_number(&mut page.lines[slot]);
+        let id = page.lines[slot].id.clone();
+        for region in &mut page.regions {
+            if let Some(at) = region.line_ids.iter().position(|line_id| *line_id == id) {
+                region.line_ids.insert(at, number.id.clone());
+            }
+        }
+        page.lines.insert(slot, number);
+    }
+    !column.is_empty()
+}
+
+/// The line's leading number as a line of its own, the line keeping its words from the next on.
+fn split_line_number(line: &mut Line) -> Line {
+    let first = line.words[0].clone();
+    let cut = line.words[1].start;
+    let chars = line.text.chars().collect::<Vec<_>>();
+    let width = first.end - first.start;
+    let mut number = line.clone();
+    number.id = format!("{}-n", line.id);
+    number.text.clone_from(&first.text);
+    number.bbox = first.bbox;
+    number.words = vec![Word { start: 0, end: width, ..first.clone() }];
+    number.spans = line
+        .spans
+        .iter()
+        .filter(|span| span.start <= first.start && first.start < span.end)
+        .map(|span| Span { id: format!("{}-n", span.id), text: first.text.clone(), bbox: first.bbox, start: 0, end: width, ..span.clone() })
+        .take(1)
+        .collect();
+    number.detached_references.clear();
+    line.text = chars[cut..].iter().collect();
+    line.bbox[0] = line.words[1].bbox[0];
+    line.words.remove(0);
+    for word in &mut line.words {
+        word.start -= cut;
+        word.end -= cut;
+    }
+    line.spans.retain(|span| span.end > cut);
+    for span in &mut line.spans {
+        if span.start < cut {
+            span.text = chars[cut..span.end.min(chars.len())].iter().collect();
+            span.bbox[0] = line.bbox[0];
+            span.start = cut;
+        }
+        span.start -= cut;
+        span.end -= cut;
+    }
+    for reference in &mut line.detached_references {
+        reference.start_offset = reference.start_offset.saturating_sub(cut);
+        reference.end_offset = reference.end_offset.saturating_sub(cut);
+    }
+    number
+}
+
+/// A column of small numbers counting at least 1 to 15 down the page, as `number` reads each
+/// line's (left edge, value). Returns the column's line slots, or none.
+fn number_column(page: &Page, number: impl Fn(&Line) -> Option<(f64, u32)>) -> Vec<usize> {
     const MIN_LINE_NUMBERS: u32 = 15;
     if page.width <= 0.0 {
         return Vec::new();
@@ -278,8 +369,8 @@ pub(super) fn line_number_column(page: &Page) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(slot, line)| {
-            let number = arabic_page_number(&line.text)?;
-            (number <= 40).then_some((line.bbox[0], number, slot))
+            let (x, number) = number(line)?;
+            (number <= 40).then_some((x, number, slot))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
@@ -924,7 +1015,7 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let transcript_line_number_pages = transcript_line_number_pages(pages);
+        let transcript_line_numbers = transcript_line_numbers(pages);
         let index_pages = index_pages(pages);
         let mut flow_lines = HashSet::new();
         for page in pages {
@@ -1243,7 +1334,7 @@ impl PdfResolutionInput {
                 }
                 if marker_lines
                     .iter()
-                    .any(|line| transcript_line_number_pages.contains(&line.page_index))
+                    .any(|line| transcript_line_numbers.contains(line.line_id.as_str()))
                 {
                     add_observation(
                         &mut observations,
@@ -1505,6 +1596,27 @@ pub(super) fn native_graph_parts(
         node.page_indexes.push(page.index);
         node.line_ids = index.line_ids(range);
         nodes.push(node);
+        // A transcript's printed line numbers: with the page's label, the page and line a reader
+        // cites ("p. 451, l. 12").
+        for slot in line_number_column(page) {
+            let line = &page.lines[slot];
+            let Some(indexed) = index.line(&line.id) else {
+                continue;
+            };
+            let mut node = StructureNode::new(
+                format!("{}:line", line.id),
+                NodeKind::Prose,
+                indexed.range,
+                ORIGIN,
+                Derivation::Heuristic,
+                None,
+            );
+            node.role = Some(legal_structure_model::PrimaryRole::LineLabel);
+            node.label = Some(line.text.trim().to_owned());
+            node.page_indexes.push(page.index);
+            node.line_ids = vec![line.id.clone()];
+            nodes.push(node);
+        }
     }
     for paragraph in paragraphs {
         let range = index
