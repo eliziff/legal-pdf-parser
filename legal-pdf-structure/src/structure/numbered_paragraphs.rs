@@ -832,3 +832,117 @@ pub(super) fn margin_label_ids(pages: &[legal_pdf_core::model::Page]) -> HashSet
         })
         .collect()
 }
+
+/// A document's own paragraph numbers run on from one another; a number that breaks the run where
+/// the run goes on around it is another text's, quoted (R. v. White, 2020 NSCA 33 sets R. v. L.M.'s
+/// "[14]" and "[15]" between its own "[20]" and "[21]"). Per document context, the body's bracketed
+/// numbers in reading order are sorted by `own_sequence`; a quoted number's paragraph (the composed
+/// paragraph holding its line) is returned, paragraph by paragraph, as the lines of a quotation.
+pub(super) fn foreign_numbered_paragraphs(
+    pages: &[legal_pdf_core::model::Page],
+    primitives: &super::PdfPrimitiveEvidence,
+) -> Vec<Vec<String>> {
+    let paragraphs = super::build_paragraphs_with_context(pages, &HashMap::new(), primitives);
+    let mut paragraph_of = HashMap::<&str, usize>::new();
+    for (k, paragraph) in paragraphs.iter().enumerate() {
+        for id in &paragraph.line_ids {
+            paragraph_of.insert(id.as_str(), k);
+        }
+    }
+    let mut ordered = pages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|page| page.index);
+    let mut labels = BTreeMap::<super::DocumentContext, Vec<(usize, &str)>>::new();
+    for page in ordered {
+        let mut lines = page
+            .lines
+            .iter()
+            .filter(|line| {
+                !line.exclude_from_body
+                    && line.note_region_mode.is_empty()
+                    && line.region_type == "body"
+                    && !primitives.table_cell_line_ids.contains(&line.id)
+                    && !primitives.contents_line_ids.contains(&line.id)
+            })
+            .collect::<Vec<_>>();
+        lines.sort_by(|a, b| a.reading_order.cmp(&b.reading_order).then_with(|| a.id.cmp(&b.id)));
+        for line in lines {
+            if let Some(number) = bracket_label(&line.text) {
+                labels
+                    .entry(primitives.document_context(&line.id))
+                    .or_default()
+                    .push((number, line.id.as_str()));
+            }
+        }
+    }
+    let mut foreign = Vec::new();
+    let mut taken = HashSet::new();
+    for labels in labels.into_values() {
+        let own = own_sequence(&labels.iter().map(|(number, _)| *number).collect::<Vec<_>>());
+        for ((_, id), own) in labels.iter().zip(own) {
+            if own {
+                continue;
+            }
+            let Some(&k) = paragraph_of.get(id) else { continue };
+            if paragraphs[k].region_type == "heading" || !taken.insert(k) {
+                continue;
+            }
+            foreign.push(paragraphs[k].line_ids.clone());
+        }
+    }
+    foreign
+}
+
+/// Which of a reading's bracketed numbers, in order, are the document's own: the members of the
+/// longest chain of consecutive numbers, and of further chains of three or more set wholly before
+/// or after every chain found (numbering that restarts, or resumes past a number the reading lost);
+/// a number set among an own chain's members and on no chain is quoted. Fewer than four numbers
+/// are all the document's own.
+fn own_sequence(values: &[usize]) -> Vec<bool> {
+    let n = values.len();
+    let mut own = vec![true; n];
+    if n < 4 {
+        return own;
+    }
+    let mut decided = vec![false; n];
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| !decided[i] && !spans.iter().any(|&(a, b)| a < i && i < b))
+            .collect();
+        if free.len() < 3 {
+            break;
+        }
+        let mut best = vec![1usize; free.len()];
+        let mut prev = vec![usize::MAX; free.len()];
+        for j in 0..free.len() {
+            for i in 0..j {
+                if values[free[i]] + 1 == values[free[j]] && best[i] + 1 > best[j] {
+                    best[j] = best[i] + 1;
+                    prev[j] = i;
+                }
+            }
+        }
+        let (mut at, len) = best.iter().enumerate().map(|(k, &l)| (k, l)).max_by_key(|&(_, l)| l).unwrap_or((0, 0));
+        if len < 3 {
+            break;
+        }
+        let mut members = Vec::new();
+        loop {
+            members.push(free[at]);
+            if prev[at] == usize::MAX {
+                break;
+            }
+            at = prev[at];
+        }
+        for &m in &members {
+            decided[m] = true;
+        }
+        spans.push((*members.iter().min().unwrap_or(&0), *members.iter().max().unwrap_or(&0)));
+    }
+    for i in 0..n {
+        if !decided[i] && spans.iter().any(|&(a, b)| a < i && i < b) {
+            own[i] = false;
+        }
+    }
+    own
+}

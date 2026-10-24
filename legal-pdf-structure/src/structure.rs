@@ -81,6 +81,10 @@ struct PdfPrimitiveEvidence {
     document_line_ids: HashMap<String, usize>,
     #[serde(default)]
     quotations: quotations::Reading,
+    /// The lines of paragraphs whose bracketed number is another text's (a quoted decision's
+    /// paragraphs): quotations, and no numbered-paragraph candidates.
+    #[serde(default)]
+    foreign_numbered_line_ids: HashSet<String>,
     #[serde(default)]
     reading_line_ids: HashMap<String, usize>,
     #[serde(default)]
@@ -4750,6 +4754,13 @@ fn prepare_reader(
         changed
     });
     primitives.quotations = quotations::read(pages, &primitives);
+    for group in numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives) {
+        let id = format!("quotation:{}", group[0]);
+        for line in &group {
+            primitives.quotations.scopes.entry(line.clone()).or_insert_with(|| id.clone());
+        }
+        primitives.foreign_numbered_line_ids.extend(group);
+    }
     primitives.reading_line_ids = quotations::reading_lines(pages, &primitives);
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
