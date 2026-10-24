@@ -643,12 +643,31 @@ fn read_candidates(
 ) {
     let mut runs = Vec::new();
     let mut citations = Vec::new();
+    // Citations are read once over the whole text (the citation parser is the stage's costliest
+    // reader) and given to the context whose line holds their start; a reading context sees the
+    // same citations it read from its own view, save one straddling a context boundary.
+    let mut whole_citations: Vec<(usize, usize)> =
+        legal_pdf_support::profile::measure("candidates.citations", || {
+            cached_citations(text.value).unwrap_or_else(|| {
+                let mut found: Vec<(usize, usize)> = protected_citation_spans(text.value);
+                found.extend(structure_analysis().citations(text.value).into_iter().map(|citation| {
+                    (
+                        text.scalar_at_byte(citation.core_range.start).expect("citation start"),
+                        text.scalar_at_byte(citation.core_range.end).expect("citation end"),
+                    )
+                }));
+                remember_citations(text.value, &found);
+                found
+            })
+        });
+    whole_citations.sort_unstable();
     let mut read = |coordinates: &ScalarText<'_>,
                     offset: usize,
                     context: DocumentContext,
-                    ordinal: Option<usize>| {
+                    ordinal: Option<usize>,
+                    lines: Option<&[&IndexedPdfLine]>| {
         let prefix = ordinal.map_or_else(String::new, |slot| format!("context-{slot:06}-"));
-        let mut found = structure_analysis().detect_structure_candidate_runs(coordinates.value);
+        let mut found = legal_pdf_support::profile::measure("candidates.detect", || structure_analysis().detect_structure_candidate_runs(coordinates.value));
         let shift = |range: &mut ScalarRange| {
             range.start += offset;
             range.end += offset;
@@ -667,32 +686,24 @@ fn read_candidates(
             }
         }
         runs.extend(found);
-        citations.extend(
-            protected_citation_spans(coordinates.value)
-                .into_iter()
-                .map(|(start, end)| (context, start + offset, end + offset)),
-        );
-        citations.extend(
-            structure_analysis()
-                .citations(coordinates.value)
-                .into_iter()
-                .map(|citation| {
-                    (
-                        context,
-                        coordinates
-                            .scalar_at_byte(citation.core_range.start)
-                            .expect("citation start")
-                            + offset,
-                        coordinates
-                            .scalar_at_byte(citation.core_range.end)
-                            .expect("citation end")
-                            + offset,
-                    )
-                }),
-        );
+        let _ = offset;
+        match lines {
+            None => citations.extend(whole_citations.iter().map(|&(start, end)| (context, start, end))),
+            Some(lines) => {
+                for line in lines {
+                    let from = whole_citations.partition_point(|(start, _)| *start < line.range.start);
+                    citations.extend(
+                        whole_citations[from..]
+                            .iter()
+                            .take_while(|(start, _)| *start < line.range.end)
+                            .map(|&(start, end)| (context, start, end)),
+                    );
+                }
+            }
+        }
     };
     if primitives.reading_lines().is_empty() && primitives.translation_line_ids.is_empty() {
-        read(text, 0, (0, false), None);
+        read(text, 0, (0, false), None, None);
     } else {
         let mut readings = BTreeMap::<DocumentContext, Vec<&IndexedPdfLine>>::new();
         for line in &index.lines {
@@ -705,7 +716,8 @@ fn read_candidates(
             let offset = lines[0].range.start;
             let mut view = String::new();
             let mut cursor = offset;
-            for line in lines {
+            let view_started = std::time::Instant::now();
+            for line in &lines {
                 // Blank foreign text without moving source scalar offsets or line boundaries.
                 view.extend(
                     text.slice(cursor..line.range.start)
@@ -719,7 +731,11 @@ fn read_candidates(
                 );
                 cursor = line.range.end;
             }
-            read(&ScalarText::new(&view), offset, context, Some(ordinal));
+            if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() {
+                eprintln!("phase	candidates.context_view	{}", view_started.elapsed().as_micros());
+            }
+            let scalar = legal_pdf_support::profile::measure("candidates.context_text", || ScalarText::new(&view));
+            legal_pdf_support::profile::measure("candidates.context_read", || read(&scalar, offset, context, Some(ordinal), Some(&lines)));
         }
     }
     runs.sort_by_key(|run| {
@@ -737,7 +753,7 @@ impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let text = ScalarText::new(index.text());
-        let (mut runs, citation_ranges) = read_candidates(&index, &text, primitives);
+        let (mut runs, citation_ranges) = legal_pdf_support::profile::measure("candidates.grammar_runs", || read_candidates(&index, &text, primitives));
         let by_line = pages
             .iter()
             .flat_map(|page| {
@@ -788,7 +804,7 @@ impl PdfResolutionInput {
             layout: primitives.source_regions.as_ref(),
         };
         // Existing composition rules retain their counted-line feature population.
-        let table = legal_pdf_witnesses::witnesses(pages, &context);
+        let table = legal_pdf_support::profile::measure("candidates.witnesses", || legal_pdf_witnesses::witnesses(pages, &context));
         legal_pdf_witnesses::dump(&table, "candidates");
         let rows = table.by_id();
         let compositions = legal_pdf_witnesses::compositions();
@@ -901,8 +917,8 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let (layout_runs, layout_evidence) =
-            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations);
+        let (layout_runs, layout_evidence) = legal_pdf_support::profile::measure("candidates.printed_paragraphs", ||
+            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations));
         runs.extend(layout_runs);
         // A quoted decision's own numbers (`foreign_numbered_paragraphs`) number nothing here,
         // whichever source read them as a run.
@@ -1645,4 +1661,32 @@ pub(super) fn native_graph_parts(
         nodes.push(node);
     }
     Ok(nodes)
+}
+
+/// The citation reader is the structure stage's costliest step and a text's citations never change
+/// between readings of the same text: with LEGALPDF_CITATION_CACHE naming a directory, the spans
+/// read for a text are kept there by the text's hash and length, for the gold harness's repeated
+/// replays. Unset (the product), nothing is kept or read.
+fn citation_cache_path(text: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = std::env::var_os("LEGALPDF_CITATION_CACHE")?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(std::path::PathBuf::from(dir).join(format!("{:016x}-{}.json", hasher.finish(), text.len())))
+}
+
+fn cached_citations(text: &str) -> Option<Vec<(usize, usize)>> {
+    let bytes = std::fs::read(citation_cache_path(text)?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn remember_citations(text: &str, found: &[(usize, usize)]) {
+    if let Some(path) = citation_cache_path(text) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(found) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
 }

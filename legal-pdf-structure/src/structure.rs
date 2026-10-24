@@ -3175,6 +3175,7 @@ fn classify_document_pages(
     }
     let index_pages = index_pages(pages);
     let mut previous_page: Option<usize> = None;
+    let table_started = std::time::Instant::now();
     let table_pages: Vec<_> = pages
         .iter()
         .zip(separators.iter().copied())
@@ -3228,6 +3229,9 @@ fn classify_document_pages(
         })
         .collect();
 
+    if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() {
+        eprintln!("phase	classify.table_pages	{}", table_started.elapsed().as_micros());
+    }
     for (page, (_, table_cells, table_notes)) in pages.iter().zip(&table_pages) {
         evidence.table_cell_line_ids.extend(
             table_cells
@@ -3270,10 +3274,12 @@ fn classify_document_pages(
             ));
         });
     }
-    for (page, (table_page, _, table_notes)) in pages.iter_mut().zip(table_pages) {
-        diagnostics.extend(order_page(page, table_page, &table_notes));
-        legal_pdf_tables::order_table_lines(page, &tables);
-    }
+    legal_pdf_support::profile::measure("classify.order_pages", || {
+        for (page, (table_page, _, table_notes)) in pages.iter_mut().zip(table_pages) {
+            diagnostics.extend(order_page(page, table_page, &table_notes));
+            legal_pdf_tables::order_table_lines(page, &tables);
+        }
+    });
     evidence.tables.extend(tables);
     // Keep page-wide contents evidence precise when two documents share a physical page.
     contents_line_ids.extend(
@@ -3286,8 +3292,10 @@ fn classify_document_pages(
     );
     evidence.contents_line_ids.extend(contents_line_ids);
     evidence.contents_pages.extend(contents_pages);
-    constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
-        captions::classify(document, evidence);
+    legal_pdf_support::profile::measure("classify.captions", || {
+        constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
+            captions::classify(document, evidence);
+        });
     });
     evidence.translation_line_ids.extend(translation);
     diagnostics
@@ -4753,8 +4761,8 @@ fn prepare_reader(
         );
         changed
     });
-    primitives.quotations = quotations::read(pages, &primitives);
-    for group in numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives) {
+    primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || quotations::read(pages, &primitives));
+    for group in legal_pdf_support::profile::measure("reader.sequence", || numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives)) {
         if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
             eprintln!("sequence\tquoted paragraph\t{}\t{} lines", group[0], group.len());
         }
@@ -4764,7 +4772,7 @@ fn prepare_reader(
         }
         primitives.foreign_numbered_line_ids.extend(group);
     }
-    primitives.reading_line_ids = quotations::reading_lines(pages, &primitives);
+    primitives.reading_line_ids = legal_pdf_support::profile::measure("reader.reading_lines", || quotations::reading_lines(pages, &primitives));
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
             primitives.contents_line_ids.contains(id)
