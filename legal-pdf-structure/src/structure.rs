@@ -4699,6 +4699,17 @@ fn prepare_reader(
             "common input must contain one separator value per page".to_owned(),
         ));
     }
+    // A page layout model's labels (docling: text, paragraph_title, doc_title, footnote, header,
+    // footer, table ...) in the stage's region vocabulary: its text is body, its titles headings.
+    for page in pages.iter_mut() {
+        for line in page.lines.iter_mut().filter(|line| line.region_id.contains("-ppdoc-r")) {
+            line.region_type = match line.region_type.as_str() {
+                "text" => "body".to_owned(),
+                "paragraph_title" | "doc_title" => "heading".to_owned(),
+                other => other.to_owned(),
+            };
+        }
+    }
     // A numbering marker printed on its own line joins the line that carries its text.
     legal_pdf_support::profile::measure("prepare.detached_markers", || {
         for page in pages.iter_mut() {
