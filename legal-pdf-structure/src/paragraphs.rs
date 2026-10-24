@@ -122,7 +122,8 @@ fn field_label(line: &Line) -> bool {
     text.ends_with(':')
         && text.chars().count() <= 24
         && text.split_whitespace().count() <= 3
-        && !text[..text.len() - 1].contains([':', '.', ';'])
+        && !text[..text.len() - 1].contains([':', ';'])
+        && !text[..text.len() - 1].trim_end_matches('.').contains('.')
 }
 
 pub(crate) fn same_row(a: &Line, b: &Line) -> bool {
@@ -158,6 +159,8 @@ struct Pitch {
     by_size: HashMap<i64, f64>,
     any: f64,
     edges: Vec<f64>,
+    /// The page's measure: the widest body line.
+    measure: f64,
 }
 
 impl Pitch {
@@ -199,6 +202,7 @@ impl Pitch {
                 .map(|(count, sum)| sum / *count as f64)
                 .collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
+            measure: lines.iter().map(|line| width(line)).fold(0.0, f64::max),
             by_size: samples
                 .into_iter()
                 .filter(|(_, values)| values.len() >= 2)
@@ -212,6 +216,11 @@ impl Pitch {
             .get(&size_key(size))
             .copied()
             .unwrap_or(self.any)
+    }
+
+    /// A line well short of the page's measure: a label, a value, an address or caption line.
+    fn short(&self, line: &Line) -> bool {
+        width(line) < 0.6 * self.measure
     }
 
     /// Does a column of the page start within `tolerance` of `x`?
@@ -242,7 +251,11 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         return (!(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent || field_label(a))))
             .then_some("row-apart");
     }
-    let goes_on = goes_on(b) || field_label(a);
+    // Two short lines, the first ending no sentence, stack as one block (an address, a caption, a
+    // signature block, a label and its value): a change of column, weight or face parts them no
+    // more than it parts the lines of a paragraph. A gap still does.
+    let stacked = pitch.short(a) && pitch.short(b) && !terminal_re().is_match(a.text.trim());
+    let goes_on = goes_on(b) || field_label(a) || stacked;
     if (b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0])
         && !goes_on
         && pitch.at_edge(b.bbox[0], 0.5 * size(b))
