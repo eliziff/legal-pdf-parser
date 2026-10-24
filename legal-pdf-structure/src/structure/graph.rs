@@ -59,11 +59,26 @@ impl PdfTextIndex {
             });
             let mut page_start = None;
             let mut page_end = scalar_cursor;
+            let mut previous: Option<&Line> = None;
             for line in ordered_lines {
                 if !lines.is_empty() {
-                    text.push('\n');
+                    // A number set on a line of its own with its paragraph beside it on the same row
+                    // ("1." then "In this decision ...", a hanging "[35]" read apart from its text) reads
+                    // as one printed line: the grammars see "1. In this decision ...", and the ranges
+                    // still fall on their own source lines.
+                    let beside = previous.is_some_and(|before| {
+                        let label = before.text.trim();
+                        crate::paragraphs::same_row(before, line)
+                            && line.bbox[0] >= before.bbox[2] - 1.0
+                            && !label.is_empty()
+                            && (crate::paragraphs::marker_only_re().is_match(&before.text)
+                                || (label.chars().count() <= 7 && !label.contains(' ')
+                                    && legal_pdf_core::layout_analysis().numbering_marker(label, None).is_some()))
+                    });
+                    text.push(if beside { ' ' } else { '\n' });
                     scalar_cursor += 1;
                 }
+                previous = Some(line);
                 let start = scalar_cursor;
                 text.push_str(&line.text);
                 scalar_cursor += line.text.chars().count();
