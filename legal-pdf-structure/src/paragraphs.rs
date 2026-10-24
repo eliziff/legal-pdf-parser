@@ -202,7 +202,13 @@ impl Pitch {
                 .map(|(count, sum)| sum / *count as f64)
                 .collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
-            measure: lines.iter().map(|line| width(line)).fold(0.0, f64::max),
+            measure: {
+                // The ninth decile of the body lines' widths: a two-column page's column, not its
+                // one full-width title.
+                let mut widths: Vec<f64> = lines.iter().map(|line| width(line)).collect();
+                widths.sort_by(f64::total_cmp);
+                widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0)
+            },
             by_size: samples
                 .into_iter()
                 .filter(|(_, values)| values.len() >= 2)
@@ -236,19 +242,27 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         let text = a.text.trim();
         let marker = marker_only_re().is_match(&a.text)
             || (text.chars().count() <= 4 && !text.contains(' '));
+        // An item opens with its marker and its text; a marker alone at the row's end ("[63]" after a
+        // citation, a cell's number) and a value after a field label ("Tel.:") open nothing.
         if !marker
-            && (bullet_re().is_match(&b.text)
-                || enumerator_re().is_match(&b.text)
-                || marker_only_re().is_match(&b.text))
+            && !field_label(a)
+            && !marker_only_re().is_match(&b.text)
+            && (bullet_re().is_match(&b.text) || enumerator_re().is_match(&b.text))
         {
             return Some("row-marker");
         }
         // The extractor uses MuPDF's 0.8-em inter-run spacing for one printed line; a wider
-        // gap parts the row only where a column of the page starts.
+        // gap parts the row only where a column of the page starts. Two short lines on one row
+        // (a table row's cells, a form's label and value, a caption's two sides) are one block
+        // whatever the gap: the gold reads a row as a unit. A recognized line's pieces may
+        // overlap by a little.
         let em = size(a).max(size(b));
         let gap = b.bbox[0] - a.bbox[2];
-        let adjacent = gap <= 0.8 * em || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em));
-        return (!(b.bbox[0] >= a.bbox[2] - 1.0 && (marker || adjacent || field_label(a))))
+        let adjacent = gap <= 0.8 * em
+            || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em))
+            || (pitch.short(a) && pitch.short(b));
+        let overlap_allowed = if goes_on(b) || (pitch.short(a) && pitch.short(b)) { 2.0 * em } else { 1.0 };
+        return (!(b.bbox[0] >= a.bbox[2] - overlap_allowed && (marker || adjacent || field_label(a))))
             .then_some("row-apart");
     }
     // Two short lines, the first ending no sentence, stack as one block (an address, a caption, a
