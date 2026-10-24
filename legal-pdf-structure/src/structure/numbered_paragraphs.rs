@@ -567,8 +567,8 @@ pub(super) fn candidates(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let paragraphs =
-        super::build_paragraphs_with_context(pages_original, &HashMap::new(), primitives);
+    let paragraphs = legal_pdf_support::profile::measure("printed_paragraphs.build_paragraphs", ||
+        super::build_paragraphs_with_context(pages_original, &HashMap::new(), primitives));
     let headings = paragraphs
         .iter()
         .filter(|paragraph| paragraph.region_type == "heading")
@@ -670,7 +670,8 @@ fn append_candidates(
             printing.entry(number).or_default().push(slot);
         }
     }
-    for (number, status, selected) in printed_paragraphs(pages, &lines, &labels, groups, headings) {
+    let printed = legal_pdf_support::profile::measure("printed_paragraphs.plan", || printed_paragraphs(pages, &lines, &labels, groups, headings));
+    for (number, status, selected) in printed {
         let selections = if status == PdfLookupStatus::Found {
             vec![selected]
         } else if status == PdfLookupStatus::Ambiguous {

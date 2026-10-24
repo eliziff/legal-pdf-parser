@@ -155,7 +155,7 @@ fn citation_title(line: &Line) -> Option<bool> {
     if !text.chars().any(|c| c.is_ascii_digit()) {
         return None;
     }
-    let citations = layout_analysis().citations(text);
+    let citations = legal_pdf_support::profile::measure("captions.citations", || layout_analysis().citations(text));
     if citations.is_empty()
         || text
             .char_indices()
