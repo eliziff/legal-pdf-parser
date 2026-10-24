@@ -936,11 +936,20 @@ impl PdfResolutionInput {
         // whichever source read them as a run.
         if !primitives.foreign_numbered_line_ids.is_empty() {
             for run in &mut runs {
+                let parents: HashMap<String, Option<String>> = run.markers.iter()
+                    .map(|candidate| (candidate.id.clone(), candidate.parent_candidate_id.clone())).collect();
                 run.markers.retain(|candidate| {
                     !index
                         .line_at(candidate.marker_range.start)
                         .is_some_and(|line| primitives.foreign_numbered_line_ids.contains(&line.line_id))
                 });
+                // A child of a removed marker hangs from its nearest surviving ancestor, else roots the run.
+                let kept: HashSet<String> = run.markers.iter().map(|candidate| candidate.id.clone()).collect();
+                for candidate in &mut run.markers {
+                    while let Some(parent) = candidate.parent_candidate_id.clone().filter(|parent| !kept.contains(parent)) {
+                        candidate.parent_candidate_id = parents.get(&parent).cloned().flatten();
+                    }
+                }
             }
             runs.retain(|run| !run.markers.is_empty());
         }

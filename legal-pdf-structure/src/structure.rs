@@ -2284,11 +2284,12 @@ fn heading_body_sizes(
     } else {
         0.0
     };
+    let measure = crate::paragraphs::document_measure(pages, prose);
     pages
         .iter()
         .map(|page| {
             let local = if page.lines.iter().any(|line| line_font_size(line) > 0.0) {
-                let paragraphs = crate::paragraphs::paragraph_indices(page, prose);
+                let paragraphs = crate::paragraphs::paragraph_indices(page, prose, measure);
                 let mut chars = HashMap::<usize, usize>::new();
                 for (line, paragraph) in page.lines.iter().zip(&paragraphs) {
                     if let Some(paragraph) = paragraph {
@@ -3315,14 +3316,16 @@ fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPrimitiveEvid
     };
     let mut rejected = HashSet::new();
     let mut prose_styles = HashMap::<String, HashSet<_>>::new();
+    let heading_line = |line: &Line| {
+        !line.exclude_from_body
+            && !heading_line_excluded(evidence, &line.id)
+            && regions
+                .get(&line.id)
+                .is_some_and(|role| legal_pdf_core::is_heading_role(role))
+    };
+    let measure = crate::paragraphs::document_measure(pages, heading_line);
     for page in pages.iter() {
-        let assigned = crate::paragraphs::paragraph_indices(page, |line| {
-            !line.exclude_from_body
-                && !heading_line_excluded(evidence, &line.id)
-                && regions
-                    .get(&line.id)
-                    .is_some_and(|role| legal_pdf_core::is_heading_role(role))
-        });
+        let assigned = crate::paragraphs::paragraph_indices(page, heading_line, measure);
         let mut paragraphs = HashMap::<(usize, &str), Vec<&Line>>::new();
         for (line, paragraph) in page.lines.iter().zip(assigned) {
             if let Some(paragraph) = paragraph {

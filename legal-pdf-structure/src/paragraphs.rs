@@ -159,12 +159,26 @@ struct Pitch {
     by_size: HashMap<i64, f64>,
     any: f64,
     edges: Vec<f64>,
-    /// The page's measure: the widest body line.
+    /// The document's measure (`document_measure`).
     measure: f64,
 }
 
+/// The document's measure: the ninth decile of its counted lines' widths over every page. A
+/// two-column statute's column, not its full-width title; a brief's text measure, not the short
+/// lines of its page of counsel.
+pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> f64 {
+    let mut widths: Vec<f64> = pages
+        .iter()
+        .flat_map(|page| page.lines.iter())
+        .filter(|line| counted(line))
+        .map(width)
+        .collect();
+    widths.sort_by(f64::total_cmp);
+    widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0)
+}
+
 impl Pitch {
-    fn of(lines: &[&Line]) -> Self {
+    fn of(lines: &[&Line], measure: f64) -> Self {
         let mut samples: HashMap<i64, Vec<f64>> = HashMap::new();
         for pair in lines.windows(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -202,13 +216,7 @@ impl Pitch {
                 .map(|(count, sum)| sum / *count as f64)
                 .collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
-            measure: {
-                // The ninth decile of the body lines' widths: a two-column page's column, not its
-                // one full-width title.
-                let mut widths: Vec<f64> = lines.iter().map(|line| width(line)).collect();
-                widths.sort_by(f64::total_cmp);
-                widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0)
-            },
+            measure,
             by_size: samples
                 .into_iter()
                 .filter(|(_, values)| values.len() >= 2)
@@ -477,6 +485,7 @@ fn trace(line: &Line, kind: &str, reason: &str) {
 pub(crate) fn paragraph_indices(
     page: &Page,
     counted: impl Fn(&Line) -> bool,
+    measure: f64,
 ) -> Vec<Option<usize>> {
     let mut next = page
         .lines
@@ -486,7 +495,7 @@ pub(crate) fn paragraph_indices(
         .unwrap_or(0)
         + 1;
     let body: Vec<&Line> = page.lines.iter().filter(|line| counted(line)).collect();
-    let pitch = Pitch::of(&body);
+    let pitch = Pitch::of(&body, measure);
     let mut assigned = vec![None; page.lines.len()];
     let mut start = 0;
     while start < page.lines.len() {
@@ -541,8 +550,9 @@ pub(crate) fn paragraph_indices(
 
 /// Give each printed paragraph of body text its own block index.
 pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
+    let measure = document_measure(pages, in_body);
     for page in pages {
-        let assigned = paragraph_indices(page, in_body);
+        let assigned = paragraph_indices(page, in_body, measure);
         for (line, block) in page.lines.iter_mut().zip(assigned) {
             if let Some(block) = block {
                 line.block_index = block;
