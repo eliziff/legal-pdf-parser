@@ -4755,6 +4755,9 @@ fn prepare_reader(
     });
     primitives.quotations = quotations::read(pages, &primitives);
     for group in numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives) {
+        if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
+            eprintln!("sequence\tquoted paragraph\t{}\t{} lines", group[0], group.len());
+        }
         let id = format!("quotation:{}", group[0]);
         for line in &group {
             primitives.quotations.scopes.entry(line.clone()).or_insert_with(|| id.clone());

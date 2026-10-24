@@ -904,6 +904,18 @@ impl PdfResolutionInput {
         let (layout_runs, layout_evidence) =
             super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations);
         runs.extend(layout_runs);
+        // A quoted decision's own numbers (`foreign_numbered_paragraphs`) number nothing here,
+        // whichever source read them as a run.
+        if !primitives.foreign_numbered_line_ids.is_empty() {
+            for run in &mut runs {
+                run.markers.retain(|candidate| {
+                    !index
+                        .line_at(candidate.marker_range.start)
+                        .is_some_and(|line| primitives.foreign_numbered_line_ids.contains(&line.line_id))
+                });
+            }
+            runs.retain(|run| !run.markers.is_empty());
+        }
         let layout_evidence = layout_evidence
             .iter()
             .map(|item| (item.candidate_id.as_str(), item))
