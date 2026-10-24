@@ -776,8 +776,9 @@ impl PdfResolutionInput {
                 bounds.1 = bounds.1.max(line.bbox[2]);
             }
         }
-        // Every run owns its reading context; quoted text is not foreign to its own run.
-        let quotations = HashSet::new();
+        // Every run owns its reading context; quoted text is not foreign to its own run, except a
+        // quoted decision's own numbered paragraphs, which number nothing here.
+        let quotations = primitives.foreign_numbered_line_ids.clone();
         let context = legal_pdf_witnesses::Context {
             documents: Some(primitives.reading_lines()),
             quoted: None,
