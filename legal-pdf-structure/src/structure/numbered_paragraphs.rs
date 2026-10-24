@@ -852,6 +852,9 @@ pub(super) fn foreign_numbered_paragraphs(
     let mut ordered = pages.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|page| page.index);
     let mut labels = BTreeMap::<super::DocumentContext, Vec<(usize, &str)>>::new();
+    // The body's lines of each context in reading order, and each label's place among them.
+    let mut body = BTreeMap::<super::DocumentContext, Vec<&str>>::new();
+    let mut place = HashMap::<&str, usize>::new();
     for page in ordered {
         let mut lines = page
             .lines
@@ -866,27 +869,47 @@ pub(super) fn foreign_numbered_paragraphs(
             .collect::<Vec<_>>();
         lines.sort_by(|a, b| a.reading_order.cmp(&b.reading_order).then_with(|| a.id.cmp(&b.id)));
         for line in lines {
-            if let Some(number) = bracket_label(&line.text) {
-                labels
-                    .entry(primitives.document_context(&line.id))
-                    .or_default()
-                    .push((number, line.id.as_str()));
+            let context = primitives.document_context(&line.id);
+            let lines = body.entry(context).or_default();
+            place.insert(line.id.as_str(), lines.len());
+            lines.push(line.id.as_str());
+            // A bracketed year ("[2008] 2 S.C.R. 3") numbers no paragraph.
+            if let Some(number) = bracket_label(&line.text).filter(|number| *number < 1000) {
+                labels.entry(context).or_default().push((number, line.id.as_str()));
             }
         }
     }
     let mut foreign = Vec::new();
     let mut taken = HashSet::new();
-    for labels in labels.into_values() {
+    if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
+        eprintln!("sequence	contexts {}	labels {:?}	paragraphs {}", labels.len(),
+            labels.values().map(|l| l.iter().map(|(n, _)| *n).collect::<Vec<_>>()).collect::<Vec<_>>(), paragraphs.len());
+    }
+    for (context, labels) in labels {
         let own = own_sequence(&labels.iter().map(|(number, _)| *number).collect::<Vec<_>>());
-        for ((_, id), own) in labels.iter().zip(own) {
-            if own {
+        if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
+            eprintln!("sequence	foreign {} of {}	unmapped {}", own.iter().filter(|o| !**o).count(), own.len(),
+                labels.iter().zip(&own).filter(|((_, id), o)| !**o && !paragraph_of.contains_key(*id)).count());
+        }
+        let lines = &body[&context];
+        for (k, ((_, id), own)) in labels.iter().zip(&own).enumerate() {
+            if *own {
                 continue;
             }
-            let Some(&k) = paragraph_of.get(id) else { continue };
-            if paragraphs[k].region_type == "heading" || !taken.insert(k) {
+            // The composed paragraph holding the number; failing that, the number's line through to
+            // the line before the next numbered one.
+            if let Some(&k) = paragraph_of.get(id) {
+                if paragraphs[k].region_type == "heading" || !taken.insert(k) {
+                    continue;
+                }
+                foreign.push(paragraphs[k].line_ids.clone());
                 continue;
             }
-            foreign.push(paragraphs[k].line_ids.clone());
+            let start = place[id];
+            let end = labels.get(k + 1).and_then(|(_, next)| place.get(next).copied()).unwrap_or(lines.len());
+            if end > start {
+                foreign.push(lines[start..end].iter().map(|id| (*id).to_owned()).collect());
+            }
         }
     }
     foreign
