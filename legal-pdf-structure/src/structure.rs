@@ -4713,10 +4713,11 @@ fn prepare_reader(
             };
         }
     }
-    // A numbering marker printed on its own line joins the line that carries its text.
+    // A numbering marker printed on its own line joins the line that carries its text; a
+    // transcript's line numbers stand apart from the lines they number.
     legal_pdf_support::profile::measure("prepare.detached_markers", || {
         for page in pages.iter_mut() {
-            if std::env::var_os("LEGALPDF_NO_DETACHED_MARKERS").is_none() {
+            if !graph::split_line_numbers(page) && std::env::var_os("LEGALPDF_NO_DETACHED_MARKERS").is_none() {
                 join_detached_markers(page);
             }
         }

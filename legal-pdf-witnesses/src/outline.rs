@@ -23,7 +23,7 @@ fn outline_region(node: &StructureNode, container: Option<NodeKind>) -> Option<R
     if matches!(container, Some(NodeKind::Footnote | NodeKind::Endnote))
         || matches!(
             node.role,
-            Some(PrimaryRole::Furniture | PrimaryRole::PageLabel | PrimaryRole::MarginalNote)
+            Some(PrimaryRole::Furniture | PrimaryRole::PageLabel | PrimaryRole::LineLabel | PrimaryRole::MarginalNote)
         )
         || node.grammar.as_deref() == Some("contents")
     {
