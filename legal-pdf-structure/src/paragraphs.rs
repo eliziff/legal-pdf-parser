@@ -29,7 +29,7 @@ fn enumerator_re() -> &'static Regex {
 }
 
 /// A line that is nothing but a bullet or an enumerator.
-fn marker_only_re() -> &'static Regex {
+pub(crate) fn marker_only_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(&format!(r"^\s*([{BULLETS}o]|{ENUMERATOR})\s*$")).unwrap())
 }
@@ -125,7 +125,7 @@ fn field_label(line: &Line) -> bool {
         && !text[..text.len() - 1].contains([':', '.', ';'])
 }
 
-fn same_row(a: &Line, b: &Line) -> bool {
+pub(crate) fn same_row(a: &Line, b: &Line) -> bool {
     let overlap = a.bbox[3].min(b.bbox[3]) - a.bbox[1].max(b.bbox[1]);
     overlap > 0.5 * height(a).min(height(b))
 }

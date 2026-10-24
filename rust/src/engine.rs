@@ -646,6 +646,41 @@ pub fn gold_structure_inputs(
     };
     recognize_pdf(pdf, &mut extracted, Some(&mut pinned as &mut dyn legal_pdf_core::PdfOcrProvider), None)?;
     finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.strokes), std::mem::take(&mut pinned.inks), std::mem::take(&mut pinned.weights));
+    // The gold's inputs read through a page layout model when LEGALPDF_PPDOC_MODEL_PACK names one
+    // (LEGALPDF_ONNXRUNTIME its runtime): each line takes the detected region it lies in, as the
+    // product's layout provider sets it. One model per thread.
+    #[cfg(feature = "ppdoc-full")]
+    if let Some(pack) = std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK") {
+        thread_local! {
+            static LAYOUT: std::cell::RefCell<Option<PPDocLayout>> = const { std::cell::RefCell::new(None) };
+        }
+        let diagnostics = LAYOUT.with(|slot| -> Result<Vec<legal_pdf_core::model::Diagnostic>> {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                // LEGALPDF_PPDOC_BACKEND: cpu (default), directml, cuda, openvino; LEGALPDF_PPDOC_DEVICE its device.
+                let backend = std::env::var("LEGALPDF_PPDOC_BACKEND").ok()
+                    .and_then(|name| legal_pdf_core::OrtBackend::parse(&name))
+                    .unwrap_or_default();
+                let options = PPDocOptions {
+                    model_pack: Some(PathBuf::from(&pack)),
+                    runtime: std::env::var_os("LEGALPDF_ONNXRUNTIME").map(PathBuf::from),
+                    threads: std::env::var("LEGALPDF_PPDOC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+                    backend,
+                    device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
+                    cpu_fallback: backend != legal_pdf_core::OrtBackend::Cpu,
+                    ..PPDocOptions::default()
+                };
+                *slot = Some(PPDocLayout::new(&options)?);
+            }
+            let started = std::time::Instant::now();
+            let found = slot.as_mut().expect("layout model").annotate_pdf(pdf, &mut extracted.pages)?;
+            if std::env::var_os("STRUCTURE_GOLD_TIMING").is_some() {
+                eprintln!("timing	layout	pages	{}	layout_ms	{:.1}", extracted.pages.len(), started.elapsed().as_secs_f64() * 1e3);
+            }
+            Ok(found)
+        })?;
+        extracted.diagnostics.extend(diagnostics);
+    }
     Ok(extracted)
 }
 
