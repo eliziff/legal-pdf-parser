@@ -21,6 +21,8 @@ fn pdf_requests(bytes: &[u8]) -> Result<Vec<OcrPageRequest>> {
                 width: f64::from(width) * f64::from(unit),
                 height: f64::from(height) * f64::from(unit),
                 regions: Vec::new(),
+                lines: Vec::new(),
+                words: Vec::new(),
             })
         })
         .collect()
@@ -85,7 +87,6 @@ fn run() -> Result<()> {
                 options.layout = IndraLayout::parse(&text)
                     .ok_or_else(|| Error::Message("unknown line detector".into()))?
             }
-            Some("--tesseract-library") => options.tesseract_library = Some(value.into()),
             Some("--workers") => options.workers = number()?,
             Some("--threads") => options.threads = number()?,
             Some("--layout-workers") => options.layout_workers = number()?,

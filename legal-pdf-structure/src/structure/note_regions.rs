@@ -287,6 +287,16 @@ impl<'a> DocumentLines<'a> {
         }
     }
 
+    /// A line set larger than the document's note type, where that type is known: body text a
+    /// band below a rule must not take (a statute's sections under their heading's rule, with the
+    /// small source notes between them).
+    fn body_type(&self, (page, line): LineRef) -> bool {
+        let line = &self.pages[page].lines[line];
+        let size = note_text_size(line);
+        self.note_sizes[usize::from(line.spans.is_empty())]
+            .is_some_and(|note| size > note + 0.6)
+    }
+
     /// The line set in the document's note type.
     fn matches_note_type(&self, (page, line): LineRef) -> bool {
         let line = &self.pages[page].lines[line];
@@ -598,7 +608,7 @@ fn note_band(
                 band_lines.push((y, lines.text(line).to_owned()));
                 continue;
             }
-            if !lines.mutable(line) {
+            if !lines.mutable(line) || lines.body_type(line) {
                 continue;
             }
             let text = lines.text(line);

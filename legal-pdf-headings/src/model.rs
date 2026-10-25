@@ -358,17 +358,21 @@ impl FlashLine {
             fill: 0.0,
             text: line.text.clone(),
         };
+        // A scanned line's type size is the one measured on its image.
+        let measured = (line.cap_height > 0.0).then(|| legal_pdf_core::line_font_size(line));
         for span in &line.spans {
-            flash.append(FlashSpan::of(span, height));
+            let mut span = FlashSpan::of(span, height);
+            span.size = measured.unwrap_or(span.size);
+            flash.append(span);
         }
         if line.spans.is_empty() {
             let rect = Rect::from_native(line.bbox, height);
-            // OCR supplies glyph boxes, not font spans; retain its text and measured height.
+            // OCR supplies glyph boxes, not font spans; retain its text and measured size.
             flash.append(FlashSpan {
                 rect,
                 stats: CharStats::of(trim_unicode_ws(&line.text)),
                 font_name: String::new(),
-                size: rect.height(),
+                size: measured.unwrap_or(rect.height()),
                 bold: false,
                 italic: false,
             });

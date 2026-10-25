@@ -1,5 +1,4 @@
 use crate::indra::{open_session, ort_error, IndraBackend, LineBox};
-use crate::tesseract_layout::TesseractLayout;
 use image::{imageops, GrayImage};
 use legal_pdf_core::{Error, Result};
 use ort::{
@@ -10,7 +9,6 @@ use std::path::Path;
 
 pub(crate) enum LineDetector {
     Indra(IndraDetector),
-    Tesseract(TesseractLayout),
 }
 
 impl LineDetector {
@@ -35,20 +33,14 @@ impl LineDetector {
         }))
     }
 
-    pub fn tesseract(path: &Path, dpi: u16) -> Result<Self> {
-        TesseractLayout::new(path, dpi).map(Self::Tesseract)
-    }
-
     pub fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
         match self {
             Self::Indra(detector) => detector.lines(image),
-            Self::Tesseract(detector) => detector.lines(image),
         }
     }
 
     pub fn lines_rgba(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<Vec<LineBox>> {
         match self {
-            Self::Tesseract(detector) => detector.lines_rgba(pixels, width, height),
             Self::Indra(detector) => {
                 let gray = pixels
                     .chunks_exact(4)
@@ -126,7 +118,7 @@ impl IndraDetector {
             boxes,
         );
         Ok(
-            crate::tesseract_layout::order_footnotes(boxes, width as usize, height as usize)
+            order_footnotes(boxes, width as usize, height as usize)
                 .into_iter()
                 .map(|bbox| LineBox {
                     left: bbox.left.saturating_sub(10),
@@ -238,6 +230,72 @@ fn xycut(lines: &mut [LineBox]) {
     let (first, second) = lines.split_at_mut(best.1);
     xycut(first);
     xycut(second);
+}
+
+fn median(mut values: Vec<usize>) -> usize {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+fn footer_start(mut lines: Vec<LineBox>, page_height: usize) -> Option<usize> {
+    lines.sort_by_key(|line| line.top);
+    if lines.len() < 8 {
+        return None;
+    }
+    let body_end = (lines.len() * 65).div_ceil(100);
+    let body_height = median(lines[..body_end].iter().map(|line| line.height()).collect());
+    for index in (lines.len() * 45).div_ceil(100)..lines.len() - 2 {
+        let gap = lines[index].top.saturating_sub(lines[index - 1].bottom);
+        let tail_height = median(lines[index..].iter().map(|line| line.height()).collect());
+        if lines[index].top > page_height * 55 / 100
+            && gap >= 12_usize.max(body_height * 3 / 4)
+            && tail_height * 100 <= body_height * 92
+        {
+            return Some(lines[index].top);
+        }
+    }
+    None
+}
+
+// Reading order is kept except for the two-column footnote band, which reads column by column.
+pub(crate) fn order_footnotes(boxes: Vec<LineBox>, page_width: usize, page_height: usize) -> Vec<LineBox> {
+    if boxes.len() < 16 {
+        return boxes;
+    }
+    let center = |line: &LineBox| (line.left + line.right) as f64 / 2.0;
+    let left = boxes
+        .iter()
+        .copied()
+        .filter(|line| center(line) < page_width as f64 * 0.48)
+        .collect::<Vec<_>>();
+    let right = boxes
+        .iter()
+        .copied()
+        .filter(|line| center(line) > page_width as f64 * 0.52)
+        .collect::<Vec<_>>();
+    let (Some(left_start), Some(right_start)) = (
+        footer_start(left, page_height),
+        footer_start(right, page_height),
+    ) else {
+        return boxes;
+    };
+    if left_start.abs_diff(right_start) > page_height * 8 / 100 {
+        return boxes;
+    }
+    let is_footer = |line: &LineBox| {
+        let middle = center(line);
+        (middle < page_width as f64 * 0.48 && line.top >= left_start)
+            || (middle > page_width as f64 * 0.52 && line.top >= right_start)
+    };
+    let mut output = boxes
+        .iter()
+        .copied()
+        .filter(|line| !is_footer(line))
+        .collect::<Vec<_>>();
+    let mut footnotes = boxes.into_iter().filter(is_footer).collect::<Vec<_>>();
+    footnotes.sort_by_key(|line| (center(line) > page_width as f64 / 2.0, line.top, line.left));
+    output.extend(footnotes);
+    output
 }
 
 #[cfg(test)]

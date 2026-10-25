@@ -89,7 +89,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     ]);
     recognition.extend(crate_inputs(root, "ocr"));
     if indra {
-        recognition.push(root.join("rust/native/tesseract_layout.c"));
         recognition.push(root.join("rust/native/gpu_adapter.cpp"));
     }
     let mut document = paths(&[
@@ -144,7 +143,6 @@ fn main() {
         }
     }
     if enabled("INDRA") {
-        inputs.push(root.join("rust/native/tesseract_layout.c"));
         inputs.push(root.join("rust/native/gpu_adapter.cpp"));
     }
     for (active, name) in [

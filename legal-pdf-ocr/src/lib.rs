@@ -1,29 +1,24 @@
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod indra;
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod line_detector;
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod model_pack;
 mod ocr;
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod orientation;
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod planning;
 mod separator;
-#[cfg(feature = "indra")]
-mod tesseract_layout;
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 mod uncovered;
 
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 pub use indra::{
     IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics, IndraLayout,
     IndraOcr, IndraOptions, IndraTier,
 };
-pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
-pub use ocr::{
-    raster_page_rules, OcrOptions, OcrProvider, PreparedOcrProvider, RasterRules, TesseractOcr,
-    TesseractOptions,
-};
-#[cfg(feature = "indra")]
+pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
+pub use ocr::{raster_page_rules, render_gray_pages, OcrOptions, OcrProvider, PreparedOcrProvider};
+#[cfg(feature = "ocr")]
 pub use planning::RuntimePlan as IndraRuntimePlan;

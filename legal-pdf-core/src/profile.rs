@@ -262,7 +262,15 @@ pub fn measure<T>(name: &'static str, operation: impl FnOnce() -> T) -> T {
     }
     #[cfg(not(feature = "profiling"))]
     {
-        let _ = name;
+        // Wall-clock phase timing in any build, when LEGALPDF_PHASE_TIMING is set: one line per
+        // measured phase, "phase	<name>	<elapsed_us>".
+        static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TIMING.get_or_init(|| std::env::var_os("LEGALPDF_PHASE_TIMING").is_some()) {
+            let started = std::time::Instant::now();
+            let result = operation();
+            eprintln!("phase	{name}	{}", started.elapsed().as_micros());
+            return result;
+        }
         operation()
     }
 }

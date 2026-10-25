@@ -105,9 +105,10 @@ struct Typography {
 
 impl Typography {
     fn size(&self, row: &Row) -> f64 {
-        if row
-            .spans()
-            .any(|span| span.size > 0.0 && !span.text.trim().is_empty())
+        if row.lines.iter().any(|line| line.cap_height > 0.0)
+            || row
+                .spans()
+                .any(|span| span.size > 0.0 && !span.text.trim().is_empty())
         {
             self.font
         } else {
@@ -116,11 +117,18 @@ impl Typography {
     }
 }
 
-/// Native font sizes and recognized glyph heights keep separate character-weighted means.
+/// Type sizes (a font's, or a scanned line's measured on its image) and the glyph heights of
+/// lines with neither keep separate character-weighted means.
 fn typography<'a>(rows: impl IntoIterator<Item = &'a Row<'a>>) -> Typography {
     let (mut characters, mut italics, mut size) = (0.0, 0.0, 0.0);
     let (mut glyph_characters, mut height) = (0.0, 0.0);
     for line in rows.into_iter().flat_map(|row| &row.lines) {
+        if line.cap_height > 0.0 {
+            let count = line.text.trim().chars().count() as f64;
+            characters += count;
+            size += count * legal_pdf_core::line_font_size(line);
+            continue;
+        }
         let mut native = false;
         for span in &line.spans {
             let count = span.text.trim().chars().count() as f64;
@@ -255,14 +263,14 @@ pub(super) fn read(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Reading
     }
     let mut found = Reading::default();
     for document in readings.into_values() {
-        let reading = quotation_rows(&document.rows, &document.pages);
+        let reading = quotation_rows(&document.rows, &document.pages, &primitives.stroke_bold);
         found.scopes.extend(reading.scopes);
         found.introductions.extend(reading.introductions);
     }
     found
 }
 
-fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
+fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page], stroke_bold: &HashMap<String, f64>) -> Reading {
     let mut quoted = Reading::default();
     let mut pending = vec![rows.iter().collect::<Vec<_>>()];
     while let Some(rows) = pending.pop() {
@@ -444,7 +452,7 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
                     last_line: last.text(),
                 })
             });
-            if quotation(&block, introduction.as_ref(), &body, justified, &measure) {
+            if quotation(&block, introduction.as_ref(), &body, justified, &measure, stroke_bold) {
                 let id = format!("quotation:{}", block[0].lines[0].id);
                 if let Some(introduction) = &introduction {
                     quoted
@@ -468,7 +476,8 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
     quoted
 }
 
-fn opens_with_heading(block: &[&Row<'_>]) -> bool {
+/// A scanned line's bold is read from its strokes (`stroke_bold`), as every heading reader reads it.
+fn opens_with_heading(block: &[&Row<'_>], stroke_bold: &HashMap<String, f64>) -> bool {
     let first = block[0];
     let lines = block
         .iter()
@@ -492,21 +501,31 @@ fn opens_with_heading(block: &[&Row<'_>]) -> bool {
     {
         return false;
     }
-    let (mut total, mut bold, mut italics) = (0, 0, 0);
-    for span in lines.iter().flat_map(|line| &line.spans) {
-        let count = span.text.trim().chars().count();
-        total += count;
-        italics += usize::from(italic(span)) * count;
-        let font = span.font.to_ascii_lowercase();
-        if span.flags & 16 != 0
-            || ["bold", "black", "heavy"]
-                .iter()
-                .any(|word| font.contains(word))
-        {
-            bold += count;
+    let (mut total, mut bold, mut italics) = (0.0, 0.0, 0.0);
+    for line in &lines {
+        if let Some(share) = stroke_bold.get(&line.id) {
+            let count = line.text.trim().chars().count() as f64;
+            total += count;
+            bold += share * count;
+            continue;
+        }
+        for span in &line.spans {
+            let count = span.text.trim().chars().count() as f64;
+            total += count;
+            if italic(span) {
+                italics += count;
+            }
+            let font = span.font.to_ascii_lowercase();
+            if span.flags & 16 != 0
+                || ["bold", "black", "heavy"]
+                    .iter()
+                    .any(|word| font.contains(word))
+            {
+                bold += count;
+            }
         }
     }
-    total > 0 && (bold * 20 >= total * 19 || italics * 20 >= total * 19)
+    total > 0.0 && (bold >= 0.95 * total || italics >= 0.95 * total)
 }
 
 /// Whether a block of rows set in from the body's margin is a display quotation; `introduction`
@@ -517,6 +536,7 @@ fn quotation(
     body: &Typography,
     justified: bool,
     measure: &dyn Fn(&Row) -> (f64, f64),
+    stroke_bold: &HashMap<String, f64>,
 ) -> bool {
     // A centred block (an address, a title) or one reaching into the right half of the page (a
     // table's columns) is no quotation.
@@ -596,7 +616,7 @@ fn quotation(
     }
     // A cited or headed extract can share the body's type and right margin.
     if block.len() >= 2 {
-        let heading = opens_with_heading(block);
+        let heading = opens_with_heading(block, stroke_bold);
         let cited =
             introduction.is_some_and(|intro| layout_analysis().has_citation_signal(&intro.text));
         let located = introduction.is_some_and(|intro| {

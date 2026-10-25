@@ -17,7 +17,6 @@ def main():
         ("vendor/pdf-inspector/src/bin/cli.rs", (False, False, False, False)),
         ("legal-pdf-extraction-processor/src/pdf.rs", (True, False, False, False)),
         ("legal-pdf-ocr/src/ocr.rs", (False, True, False, False)),
-        ("rust/native/tesseract_layout.c", (False, True, False, False)),
         ("rust/native/gpu_adapter.cpp", (False, True, False, False)),
         ("legal-pdf-structure/src/structure.rs", (False, False, True, False)),
         ("legal-pdf-support/src/projection.rs", (False, False, True, False)),

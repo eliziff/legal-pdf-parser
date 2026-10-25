@@ -1,6 +1,7 @@
-//! Case captions from their opening metadata and aligned filing labels.
+//! Case captions from their opening metadata, aligned filing labels and party labels: claimed
+//! before any heading is read.
 
-use super::{heading_line_excluded, PdfPrimitiveEvidence};
+use super::PdfPrimitiveEvidence;
 use legal_pdf_core::{layout_analysis, line_font_size, Line, Page};
 use legal_pdf_headings::party_label;
 use std::collections::HashMap;
@@ -155,7 +156,7 @@ fn citation_title(line: &Line) -> Option<bool> {
     if !text.chars().any(|c| c.is_ascii_digit()) {
         return None;
     }
-    let citations = layout_analysis().citations(text);
+    let citations = legal_pdf_support::profile::measure("captions.citations", || layout_analysis().citations(text));
     if citations.is_empty()
         || text
             .char_indices()
@@ -180,7 +181,7 @@ pub(super) fn classify(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) 
         !line.exclude_from_body
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
-            && !heading_line_excluded(evidence, &line.id)
+            && !evidence.claimed(&line.id)
     };
     let window = pages
         .iter()
@@ -409,6 +410,28 @@ pub(super) fn classify(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) 
         if let Some(&block) = assigned.get(&line.id) {
             line.region_type = "caption".to_owned();
             line.block_index = block;
+            evidence.heading_levels.remove(&line.id);
+        }
+    }
+    // A caption set over party labels ("APPLICANT", "— Respondent"), on any page of the document,
+    // a cover page's or a filing's: its lines down to the page's last label are the caption.
+    for page in pages.iter_mut() {
+        let Some(last) = page
+            .lines
+            .iter()
+            .rposition(|line| !line.exclude_from_body && party_label().is_match(line.text.trim()))
+        else {
+            continue;
+        };
+        for line in &mut page.lines[..=last] {
+            if line.exclude_from_body
+                || !line.note_region_mode.is_empty()
+                || !matches!(line.region_type.as_str(), "body" | "heading")
+                || evidence.claimed(&line.id)
+            {
+                continue;
+            }
+            line.region_type = "caption".to_owned();
             evidence.heading_levels.remove(&line.id);
         }
     }
