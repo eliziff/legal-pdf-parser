@@ -3,8 +3,9 @@
 //! Each page's words go to pdf-inspector as its text items and the page's painted rules as its
 //! lines: its rule-grid detector reads the ruled tables, its white-space detector the rest of the
 //! page where the parser's layout says white space can be read (`TableLayout`). What it finds is
-//! mapped back onto the words it was read from, cell by cell. A contents list is no table, and a
-//! text set beside its translation is none either. A table the page cuts off goes on at the top
+//! mapped back onto the words it was read from, cell by cell. A contents list is no table, nor a
+//! text set beside its translation, nor a list set in two columns (its markers counting down the
+//! first). A table the page cuts off goes on at the top
 //! of the next page, or under its repeated caption and head row, when its columns stand where
 //! they stood.
 
@@ -399,6 +400,63 @@ fn bilingual_columns(page: &Page, table: &PdfTable, layout: &dyn TableLayout) ->
     languages.contains(&Some(true)) && languages.contains(&Some(false))
 }
 
+/// Where a marker cell stands in its count ("a)", "(iv)", "12.", "3.05", "•"): the count's family
+/// and the marker's value in it. A marker keeps a bracket or a stop (a bare figure is a table's),
+/// and OCR's "}" for ")" reads as ")".
+fn list_marker(text: &str) -> Option<(u8, u32)> {
+    let text = text.trim();
+    if text.chars().count() == 1 && "•·▪◦●○■□➢-–—*\u{f0b7}\u{f0a7}\u{f0d8}".contains(text) {
+        return Some((0, 0));
+    }
+    let inner = text.trim_start_matches(['(', '[']).trim_end_matches([')', ']', '}', '.']);
+    if inner.is_empty() || inner.len() == text.len() || inner.chars().count() > 6 {
+        return None;
+    }
+    let parts: Vec<&str> = inner.split('.').collect();
+    if parts.iter().all(|part| !part.is_empty() && part.len() <= 3 && part.bytes().all(|b| b.is_ascii_digit())) {
+        return Some((parts.len() as u8, parts.last()?.parse().ok()?));
+    }
+    let upper = inner.bytes().all(|b| b.is_ascii_uppercase());
+    if inner.len() == 1 && inner.bytes().all(|b| b.is_ascii_alphabetic()) {
+        let letter = inner.bytes().next()?.to_ascii_lowercase();
+        return Some((if upper { 6 } else { 5 }, u32::from(letter - b'a') + 1));
+    }
+    let digit = |b: u8| match b.to_ascii_lowercase() { b'i' => Some(1), b'v' => Some(5), b'x' => Some(10), b'l' => Some(50), b'c' => Some(100), _ => None };
+    let values = inner.bytes().map(digit).collect::<Option<Vec<i64>>>()?;
+    if !(upper || inner.bytes().all(|b| b.is_ascii_lowercase())) {
+        return None;
+    }
+    let value: i64 = values.iter().enumerate().map(|(k, v)| if values.get(k + 1).is_some_and(|next| next > v) { -v } else { *v }).sum();
+    Some((if upper { 8 } else { 7 }, u32::try_from(value).ok().filter(|v| *v > 0)?))
+}
+
+/// Whether a table pdf-inspector read is a list set in two columns: each row that fills both holds
+/// a marker in the first and its item's words in the second, and the markers count on from row to
+/// row (a), b), c) ...; 1., 2., 3.), a count opening at its first value where a list starts again.
+/// A row of one cell may stand between: a heading over the items, or a line an item runs on to.
+fn two_column_list(table: &PdfTable) -> bool {
+    if table.xs.len() != 3 {
+        return false;
+    }
+    let mut markers = Vec::new();
+    for row in &table.rows {
+        let text = |column: usize| row.cells.iter().filter(|cell| cell.column == column).map(TableCell::text).collect::<Vec<_>>().join(" ");
+        let (left, right) = (text(0), text(1));
+        if left.trim().is_empty() || right.trim().is_empty() {
+            continue;
+        }
+        match list_marker(&left) {
+            Some(marker) => markers.push(marker),
+            None => return false,
+        }
+    }
+    let follows = markers.windows(2).filter(|pair| {
+        let ((family, value), (next_family, next)) = (pair[0], pair[1]);
+        family == next_family && (family == 0 || next == value + 1) || next == 1
+    }).count();
+    markers.len() >= 3 && follows * 3 >= (markers.len() - 1) * 2
+}
+
 /// A page's tables, and the lines of the contents lists pdf-inspector read there as tables.
 fn page_tables(
     page: &Page,
@@ -441,6 +499,7 @@ fn page_tables(
         .filter_map(|table| converted(page, &items, &origin, table))
         .filter(|table| !table.line_ids().into_iter().any(|id| translation.contains(id)))
         .filter(|table| !bilingual_columns(page, table, layout))
+        .filter(|table| !two_column_list(table))
         .collect();
     tables.sort_by(|left, right| left.top.total_cmp(&right.top));
     (tables, contents)
