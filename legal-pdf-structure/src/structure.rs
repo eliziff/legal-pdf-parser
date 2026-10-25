@@ -5,6 +5,7 @@ mod captions;
 mod constituents;
 mod contents;
 mod graph;
+mod heading_rules;
 mod note_pairing;
 mod note_regions;
 mod quotations;
@@ -4016,7 +4017,60 @@ fn classify_line_roles(
             }
         }
     }
+    verify_endnotes(pages);
     diagnostics
+}
+
+/// Endnotes are notes: the body before them refers to them. Each run of consecutive pages read as
+/// endnotes keeps them only where a notes heading opens it, or where references earlier in the
+/// document (raised numbers, detached references) name at least half of its note numbers; else
+/// its lines are the body's, a numbered sequence the page-by-page reading took for notes. On the
+/// structure gold (batches 5-7) endnote runs held 126 note lines and 5,472 lines of body; the
+/// references keep 49 of the notes and give back 5,429 of the body.
+fn verify_endnotes(pages: &mut [Page]) {
+    let endnote = |page: &Page| page.lines.iter().any(|line| line.note_region_mode == "endnote");
+    let mut slot = 0;
+    while slot < pages.len() {
+        if !endnote(&pages[slot]) {
+            slot += 1;
+            continue;
+        }
+        let mut end = slot + 1;
+        while end < pages.len() && endnote(&pages[end]) && pages[end].index == pages[end - 1].index + 1 {
+            end += 1;
+        }
+        let run = &pages[slot..end];
+        let headed = run.iter().flat_map(|page| &page.lines).any(|line| endnote_heading(&line.text));
+        let labels: BTreeSet<String> = run
+            .iter()
+            .flat_map(|page| &page.lines)
+            .filter(|line| line.note_region_mode == "endnote")
+            .filter_map(|line| label_prefix(&line.text).map(|prefix| prefix.label))
+            .collect();
+        let first_note = pages[slot]
+            .lines
+            .iter()
+            .filter(|line| line.note_region_mode == "endnote")
+            .map(|line| line.bbox[1])
+            .min_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        let referenced = labels
+            .iter()
+            .filter(|label| {
+                pages[..slot].iter().any(|page| has_prior_reference(page, label, f64::INFINITY))
+                    || has_prior_reference(&pages[slot], label, first_note)
+            })
+            .count();
+        if !headed && referenced * 2 < labels.len().max(1) {
+            for line in pages[slot..end].iter_mut().flat_map(|page| &mut page.lines) {
+                if line.note_region_mode == "endnote" {
+                    line.region_type = "body".to_owned();
+                    line.note_region_mode.clear();
+                }
+            }
+        }
+        slot = end;
+    }
 }
 
 #[cfg(test)]
@@ -4820,6 +4874,9 @@ fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &m
             bookmarks::reconcile_bookmarks(pages, &listed, primitives);
         }
     });
+    // Then what the whole document says of its headings: a transcript's witnesses and examinations,
+    // and the lines that never head a division.
+    legal_pdf_support::profile::measure("prepare.heading_rules", || heading_rules::read(pages, primitives));
 }
 
 /// Bold on a recognized page, read from its strokes: a scan's text layer names no bold face, and a
