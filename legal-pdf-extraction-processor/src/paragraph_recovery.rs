@@ -39,7 +39,7 @@ impl Family {
 /// A reading of a line's opening token as a paragraph number: the family, the value, and whether
 /// the characters were exactly the number (an exact reading is evidence; a repaired one a fit).
 #[derive(Clone, Debug)]
-struct Reading {
+pub(crate) struct Reading {
     family: Family,
     /// The value as read, then the values a misread bracket could hide ("[131": 131, or 13 with
     /// its closing bracket read as a 1); an exact reading has one.

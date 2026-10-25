@@ -1684,7 +1684,7 @@ fn starts_note_or_list(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^\s*(?:(?:[-*â€¢])|(?:\(?\d{1,4}[.)])|(?:\(?[A-Za-z][.)])|(?:[IVXLCDMivxlcdm]{1,8}[.)])|(?:[*â€ â€¡Â§]))\s+\S",
+            r"^\s*(?:(?:[-*•])|(?:\(?\d{1,4}[.)])|(?:\(?[A-Za-z][.)])|(?:[IVXLCDMivxlcdm]{1,8}[.)])|(?:[*†‡§]))\s+\S",
         )
         .unwrap()
     })
