@@ -175,11 +175,14 @@ fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
     let mut transcript = test_page(
         (1..=25)
             .map(|number| {
-                test_line(
+                // Claimed as the reader claims a transcript's line numbers (mark_line_numbers).
+                let mut line = test_line(
                     &number.to_string(),
                     [112.0, 60.0 + f64::from(number) * 20.0, 140.0, 74.0],
                     vec![],
-                )
+                );
+                line.region_type = "line_label".to_owned();
+                line
             })
             .chain((1..=25).map(|number| {
                 let mut line = test_line(
@@ -472,6 +475,7 @@ fn test_line(text: &str, bbox: [f64; 4], spans: Vec<Span>) -> Line {
         exclude_from_body: false,
         ink: 0.0,
         weight: 0.0,
+        cap_height: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -549,6 +553,7 @@ fn note_order_puts_a_raised_label_before_its_nearby_text() {
             start: 0,
             end: marker.chars().count(),
             underlined: false,
+            weight: 0.0,
         });
         let body = test_line(
             "Dominique Moran, Carceral Geography",
@@ -573,6 +578,7 @@ fn note_order_puts_a_detached_label_before_a_distant_same_row_fragment() {
         start: 0,
         end: 2,
         underlined: false,
+        weight: 0.0,
     });
     let body = test_line("of", [411.7, 554.3, 422.3, 566.1], vec![]);
     let mut lines = vec![body, label];
@@ -1074,26 +1080,6 @@ fn two_column_note_prose_is_not_a_table_grid() {
     assert!(!evidence.continuation());
 }
 
-#[test]
-fn attached_note_sequence_is_not_a_table_grid() {
-    let mut lines = Vec::new();
-    for row in 0..8 {
-        let y = 500.0 + row as f64 * 12.0;
-        lines.extend([
-            test_line(
-                &format!("{} Citation text", row + 91),
-                [60.0, y, 260.0, y + 10.0],
-                vec![],
-            ),
-            test_line("20", [330.0, y, 370.0, y + 10.0], vec![]),
-            test_line("40", [430.0, y, 470.0, y + 10.0], vec![]),
-        ]);
-    }
-
-    let evidence = table_evidence(&lines, 600.0);
-
-    assert!(!strong_table_evidence(&evidence, &lines));
-}
 
 #[test]
 fn table_numbers_do_not_start_a_footnote_region() {

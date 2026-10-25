@@ -2594,6 +2594,7 @@ mod tests {
                     height: 792.0,
                     regions: vec![[0.0, 30.0, 612.0, 65.0]],
                     lines: Vec::new(),
+                    words: Vec::new(),
                 }],
             )
             .unwrap();

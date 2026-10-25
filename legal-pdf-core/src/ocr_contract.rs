@@ -59,6 +59,27 @@ pub struct OcrPageRequest {
     /// Line boxes whose ink the page's render measures, `[x0, y0, x1, y1]` in points; none to
     /// measure nothing.
     pub lines: Vec<[f64; 4]>,
+    /// Each measured line's word boxes, in points, where its words' strokes are measured too;
+    /// none, or fewer than `lines`, to measure lines alone.
+    pub words: Vec<Vec<[f64; 4]>>,
+}
+
+/// What a requested page's render shows the readers: the rule above its notes, its thin
+/// horizontal strokes (`[x0, y, x1, y]` in points, read as underlines and rules), and for each
+/// requested line its dark share, its stroke weight, the height of its capitals over its baseline
+/// (points) and its words' stroke weights. A recognized page names no type; this is its type.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RasterReading {
+    pub separator: Option<f64>,
+    pub strokes: Vec<[f64; 4]>,
+    #[serde(default)]
+    pub inks: Vec<f64>,
+    #[serde(default)]
+    pub weights: Vec<f64>,
+    #[serde(default)]
+    pub cap_heights: Vec<f64>,
+    #[serde(default)]
+    pub word_weights: Vec<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

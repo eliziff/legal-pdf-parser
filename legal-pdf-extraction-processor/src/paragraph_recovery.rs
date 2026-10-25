@@ -343,6 +343,7 @@ fn splice(line: &mut Line, family: Family, value: u32, taken: usize, reread: Opt
         start: 0,
         end: marker.chars().count(),
         underlined: false,
+        weight: 0.0,
     });
     for (k, word) in words.iter_mut().enumerate() {
         word.id = format!("{}-w{:03}", line.id, k + 1);

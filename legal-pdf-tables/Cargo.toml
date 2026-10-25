@@ -6,5 +6,5 @@ license = "MIT"
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
-regex = "1.11"
+pdf-inspector = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }

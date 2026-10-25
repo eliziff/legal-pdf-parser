@@ -1108,7 +1108,7 @@ name = "legal-pdf-tables"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
- "regex",
+ "pdf-inspector",
  "serde",
 ]
 

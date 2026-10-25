@@ -269,6 +269,40 @@ fn transform_item(item: &mut TextItem, geometry: PageGeometry) {
     item.height = (y1.min(geometry.height) - f64::from(item.y)).max(0.0) as f32;
 }
 
+/// Text set through a symbol-encoded font map extracts as private-use code points, U+F000 plus
+/// the character's byte. A text face's are its ASCII characters; Symbol's space, digits and
+/// punctuation are ASCII's too (a folio "- 5 -"); a dingbat face's are pictures and stay. One
+/// character for one, so the item's glyphs keep their places.
+fn unmap_symbol_text(item: &mut TextItem) {
+    let font = item.font.to_ascii_lowercase();
+    if ["wingding", "webding", "dingbat"].iter().any(|face| font.contains(face)) {
+        return;
+    }
+    let symbol = font.contains("symbol");
+    let ascii = |character: char| {
+        let code = u32::from(character);
+        let byte = char::from_u32(code.wrapping_sub(0xF000)).filter(|_| (0xF020..=0xF07E).contains(&code));
+        byte.filter(|byte| {
+            !symbol
+                || matches!(byte, ' ' | '!' | '#' | '%' | '&' | '(' | ')' | '+' | ',' | '-' | '.' | '/'
+                    | '0'..='9' | ':' | ';' | '<' | '=' | '>' | '?' | '[' | ']' | '_' | '{' | '|' | '}')
+        })
+        .unwrap_or(character)
+    };
+    let unmap = |text: &mut String| {
+        if text.chars().any(|character| ('\u{f020}'..='\u{f07e}').contains(&character)) {
+            *text = text.chars().map(ascii).collect();
+        }
+    };
+    unmap(&mut item.text);
+    if let Some(fidelity) = item.fidelity.as_mut() {
+        unmap(&mut fidelity.text);
+        for glyph in &mut fidelity.glyphs {
+            unmap(&mut glyph.text);
+        }
+    }
+}
+
 fn round3(value: f64) -> f64 {
     (value * 1_000.0).round() / 1_000.0
 }
@@ -907,6 +941,7 @@ fn line_words(
                     start,
                     end,
                     underlined: false,
+                    weight: 0.0,
                 });
             }
         } else if start.is_none() {
@@ -1163,6 +1198,7 @@ fn make_line(
         exclude_from_body: false,
         ink: 0.0,
         weight: 0.0,
+        cap_height: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1257,6 +1293,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
             start: word.start - shift,
             end: word.end - shift,
             underlined: false,
+            weight: 0.0,
         })
         .collect();
     Some(Line {
@@ -1281,6 +1318,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
         exclude_from_body: false,
         ink: 0.0,
         weight: 0.0,
+        cap_height: 0.0,
         suppress_footnote_label: false,
         paragraph_label_candidate: false,
         note_region_mode: String::new(),
@@ -1459,6 +1497,7 @@ pub fn assemble_pdf(
             if let Some((_, geometry)) = geometries.get(&item.page) {
                 transform_item(item, *geometry);
             }
+            unmap_symbol_text(item);
         }
         !is_text || !item.text.is_empty()
     });
@@ -1802,6 +1841,7 @@ pub fn recognize_pdf(
                     height: page.height,
                     regions,
                     lines: Vec::new(),
+                    words: Vec::new(),
                 })
             })
             .collect();
@@ -1895,8 +1935,8 @@ pub fn recognize_pdf(
                 separators[page_index] = Some(separator);
             }
         }
-        // A recognized page's lines are measured in its render too: the recognizer writes no font
-        // flags, so a line's ink and stroke weight are its only weight evidence.
+        // A recognized page's lines and words are measured in its render too: the recognizer writes
+        // no font flags or sizes, so their strokes and capitals are its only type evidence.
         let requests: Vec<_> = pages
             .iter()
             .enumerate()
@@ -1907,6 +1947,7 @@ pub fn recognize_pdf(
                 height: page.height,
                 regions: Vec::new(),
                 lines: page.lines.iter().map(|line| line.bbox).collect(),
+                words: page.lines.iter().map(|line| line.words.iter().map(|word| word.bbox).collect()).collect(),
             })
             .collect();
         if !requests.is_empty() {
@@ -1925,6 +1966,7 @@ pub fn recognize_pdf(
                     height: page.height,
                     regions: Vec::new(),
                     lines: page.lines.iter().map(|line| line.bbox).collect(),
+                    words: page.lines.iter().map(|line| line.words.iter().map(|word| word.bbox).collect()).collect(),
                 })
             })
             .collect();
@@ -1966,6 +2008,7 @@ pub fn recognize_pdf(
                         height: page.height,
                         regions: Vec::new(),
                         lines: Vec::new(),
+                        words: Vec::new(),
                     })
             })
             .collect();

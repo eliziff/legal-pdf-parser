@@ -6,6 +6,13 @@
 //! layout changes (a column or row change, a larger gap than the page's line pitch,
 //! another size or emphasis), then into paragraphs where a line starts a list item, is
 //! indented as a first line, or follows a line that ended short of the block's measure.
+//!
+//! A scan's boxes and type sizes are a recognizer's guesses, so a scanned page is read by its
+//! leading alone, as the Text-Fidelity Project's galley reads it (`paragraph_geometry.py`,
+//! `text_flow_continuity.py`, `text_flow.py`), with the line height and paragraph gap measured
+//! once for the document: a blank of twice the gap, or most of a line, opens a block; a sentence
+//! end and an indent open a paragraph; a line going on with a sentence or a hyphened word opens
+//! nothing.
 
 use legal_pdf_core::{line_font_size, Line, Page};
 use regex::Regex;
@@ -61,6 +68,16 @@ fn size(line: &Line) -> f64 {
 
 fn height(line: &Line) -> f64 {
     line.bbox[3] - line.bbox[1]
+}
+
+/// A scanned line: recognized by us, or a scan's own text layer measured on its image.
+fn scanned(line: &Line) -> bool {
+    line.ocr.is_some() || line.spans.is_empty() || line.cap_height > 0.0
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values.get(values.len() / 2).copied().unwrap_or(0.0)
 }
 
 fn width(line: &Line) -> f64 {
@@ -159,14 +176,27 @@ struct Pitch {
     by_size: HashMap<i64, f64>,
     any: f64,
     edges: Vec<f64>,
-    /// The document's measure (`document_measure`).
-    measure: f64,
+    /// The document's measure and leading (`document_measure`).
+    measure: Measure,
+    /// Most of the page's lines are scanned: it is read by its leading alone.
+    scan: bool,
 }
 
-/// The document's measure: the ninth decile of its counted lines' widths over every page. A
-/// two-column statute's column, not its full-width title; a brief's text measure, not the short
-/// lines of its page of counsel.
-pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> f64 {
+/// The document's measure, and its scans' leading.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Measure {
+    /// The ninth decile of its counted lines' widths over every page. A two-column statute's
+    /// column, not its full-width title; a brief's text measure, not the short lines of its page
+    /// of counsel.
+    width: f64,
+    /// A scanned line's median box height.
+    height: f64,
+    /// The median blank between two scanned lines stacked in one column, counted up to 1.25 line
+    /// heights: a paragraph's own leading, not the space between paragraphs.
+    gap: f64,
+}
+
+pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> Measure {
     let mut widths: Vec<f64> = pages
         .iter()
         .flat_map(|page| page.lines.iter())
@@ -174,11 +204,33 @@ pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) 
         .map(width)
         .collect();
     widths.sort_by(f64::total_cmp);
-    widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0)
+    let width = widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0);
+    let scans = || {
+        pages.iter().map(|page| {
+            page.lines
+                .iter()
+                .filter(|line| counted(line) && scanned(line) && height(line) > 0.0)
+                .collect::<Vec<_>>()
+        })
+    };
+    let line_height = median(scans().flatten().map(height).collect());
+    let gap = median(
+        scans()
+            .flat_map(|lines| {
+                lines
+                    .windows(2)
+                    .filter(|pair| pair[1].bbox[0] < pair[0].bbox[2] && pair[0].bbox[0] < pair[1].bbox[2])
+                    .map(|pair| pair[1].bbox[1] - pair[0].bbox[3])
+                    .filter(|gap| (0.0..=1.25 * line_height).contains(gap))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    );
+    Measure { width, height: line_height, gap }
 }
 
 impl Pitch {
-    fn of(lines: &[&Line], measure: f64) -> Self {
+    fn of(lines: &[&Line], measure: Measure) -> Self {
         let mut samples: HashMap<i64, Vec<f64>> = HashMap::new();
         for pair in lines.windows(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -217,6 +269,7 @@ impl Pitch {
                 .collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
             measure,
+            scan: lines.iter().filter(|line| scanned(line)).count() * 2 > lines.len(),
             by_size: samples
                 .into_iter()
                 .filter(|(_, values)| values.len() >= 2)
@@ -234,7 +287,17 @@ impl Pitch {
 
     /// A line well short of the page's measure: a label, a value, an address or caption line.
     fn short(&self, line: &Line) -> bool {
-        width(line) < 0.6 * self.measure
+        width(line) < 0.6 * self.measure.width
+    }
+
+    /// Are two lines on one row? A scan's boxes swell and overlap their neighbours, so there its
+    /// lines share a row when their centres are within half the document's line pitch.
+    fn same_row(&self, a: &Line, b: &Line) -> bool {
+        if !self.scan || self.measure.height <= 0.0 {
+            return same_row(a, b);
+        }
+        let centre = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
+        (centre(a) - centre(b)).abs() < 0.5 * (self.measure.height + self.measure.gap)
     }
 
     /// Does a column of the page start within `tolerance` of `x`?
@@ -245,7 +308,7 @@ impl Pitch {
 
 /// Does `b` begin a new visual block after `a`? The rule that says so, by name.
 fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
-    if same_row(a, b) {
+    if pitch.same_row(a, b) {
         // A marker set apart from its text on the text's row ("1." then the paragraph).
         let text = a.text.trim();
         let marker = marker_only_re().is_match(&a.text)
@@ -285,6 +348,9 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
     {
         return Some("column");
     }
+    if pitch.scan {
+        return scan_starts_block(a, b, goes_on, pitch);
+    }
     let advance = advance(a, b);
     if advance <= 0.3 * height(a).min(height(b)).max(1.0) {
         return Some("overlap");
@@ -307,6 +373,23 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         && matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
             if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi)))
     .then_some("font-contrast")
+}
+
+/// Does `b` begin a new visual block after `a` on a scanned page? Only its leading says: a blank
+/// of at least most of a line, or twice the document's paragraph gap, opens a block, unless the
+/// line goes on with the sentence or the word a hyphen broke, or the line before left a bracket
+/// open. A line set back up the page opens nothing by itself: a scan's text layer jumps about
+/// inside one paragraph (on the gold's scans, 1,649 false breaks fell at such jumps), and a
+/// change of column is the column rule's.
+fn scan_starts_block(a: &Line, b: &Line, goes_on: bool, pitch: &Pitch) -> Option<&'static str> {
+    let line = height(a).min(height(b)).max(1.0);
+    let text = a.text.trim_end();
+    let open = text.matches(['(', '[']).count() > text.matches([')', ']']).count();
+    if goes_on || open || (text.ends_with('-') && !text.ends_with(" -")) {
+        return None;
+    }
+    let blank = b.bbox[1] - a.bbox[3];
+    (blank >= (0.85 * line).max(2.0 * pitch.measure.gap + 0.25).max(2.0)).then_some("gap")
 }
 
 /// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
@@ -342,8 +425,9 @@ fn starts_paragraph(
     block: &[&Line],
     after: Option<&Line>,
     margin: Option<f64>,
+    pitch: &Pitch,
 ) -> Option<&'static str> {
-    if same_row(a, b) {
+    if pitch.same_row(a, b) {
         return None;
     }
     if bullet_re().is_match(&b.text) || marker_only_re().is_match(&b.text) {
@@ -380,6 +464,17 @@ fn starts_paragraph(
     // address beneath it are one block, as a form or a letter of credit sets them).
     if goes_on(b) || field_label(a) {
         return None;
+    }
+    if pitch.scan {
+        // A scan's paragraph opens where a sentence ended and the next line is set in from the
+        // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure; a
+        // short line by itself ends none, as recognition loses lines' ends.
+        let mut lefts = block.iter().map(|line| line.bbox[0]).collect::<Vec<_>>();
+        lefts.sort_by(f64::total_cmp);
+        let flush = lefts[lefts.len() / 4];
+        let ended = terminal || noted_terminal_re().is_match(a.text.trim());
+        return (ended && b.bbox[0] >= flush + (0.018 * pitch.measure.width).max(3.0))
+            .then_some("sentence-indent");
     }
     let marker = bullet_re().is_match(&a.text)
         || enumerator_re().is_match(&a.text)
@@ -439,6 +534,12 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     {
         return false;
     }
+    let lower = text.chars().next().is_some_and(char::is_lowercase);
+    // A scan's paragraph goes on over the page unless its last line ended a sentence and the
+    // next page opens in capitals: its boxes and sizes say nothing.
+    if scanned(a) && scanned(b) {
+        return !terminal_re().is_match(a.text.trim()) || lower;
+    }
     if resized(a, b) {
         return false;
     }
@@ -462,7 +563,6 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
         .map(|line| line.bbox[2])
         .fold(f64::MIN, f64::max);
     let full = right - a.bbox[2] <= first_word_width(b) + 1.5 * cw;
-    let lower = text.chars().next().is_some_and(char::is_lowercase);
     full && (!terminal_re().is_match(a.text.trim()) || lower)
 }
 
@@ -485,7 +585,7 @@ fn trace(line: &Line, kind: &str, reason: &str) {
 pub(crate) fn paragraph_indices(
     page: &Page,
     counted: impl Fn(&Line) -> bool,
-    measure: f64,
+    measure: Measure,
 ) -> Vec<Option<usize>> {
     let mut next = page
         .lines
@@ -533,7 +633,7 @@ pub(crate) fn paragraph_indices(
                 let after = block.get(j + 1).copied();
                 let margin = indented.then(|| margin_at(&block, j));
                 if !layout_units {
-                    if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                    if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin, &pitch) {
                         trace(block[j], "paragraph", reason);
                         next += 1;
                     }

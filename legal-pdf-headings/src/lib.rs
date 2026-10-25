@@ -17,9 +17,9 @@
 //! - A new heading is in the page's own type size or larger, opens with a capital or a number,
 //!   and does not sit beside running text. Inside a quotation, a bold provision label or an
 //!   italic title above contrasting prose can structure that passage.
-//! - Lines above the last party label on a page (`APPLICANT`, `— Respondent`) are the case
-//!   caption, never headings; a heading of a few stray characters holds no section; a
-//!   capitalized title wrapped onto a second line is one heading.
+//! - The structure stage claims a page's case caption (its lines down to the last party label,
+//!   `APPLICANT`, `— Respondent`) before headings are read; a heading of a few stray characters
+//!   holds no section; a capitalized title wrapped onto a second line is one heading.
 //! - Numbered and unnumbered headings compare by type, not numbering (see `outline.rs`).
 
 mod detect;
@@ -260,6 +260,9 @@ pub struct HeadingEvidence<'a> {
     pub numbered: &'a dyn Fn(&str) -> bool,
     /// Original source roles retain explicit PDF Hn levels after local classification.
     pub source_regions: Option<&'a HashMap<String, String>>,
+    /// The share of a line's characters set bold where its face cannot say: on a recognized page,
+    /// read from its strokes.
+    pub bold: &'a dyn Fn(&str) -> Option<f64>,
 }
 
 /// Read the headings set apart by type alone and the depth of every heading. Line roles and
@@ -283,25 +286,8 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 .map(|level| (id.clone(), level))
         })
         .collect::<HashMap<String, usize>>();
-    // The case caption: lines down to a page's last party label are no headings.
-    let mut caption = HashSet::<String>::new();
-    for page in pages.iter_mut() {
-        let Some(last) = page
-            .lines
-            .iter()
-            .rposition(|line| !line.exclude_from_body && party_label().is_match(line.text.trim()))
-        else {
-            continue;
-        };
-        for line in &mut page.lines[..=last] {
-            caption.insert(line.id.clone());
-            if line.region_type == "heading" && model::CharStats::of(&line.text).caps_heavy() {
-                line.region_type = "body".to_owned();
-                evidence.levels.remove(&line.id);
-            }
-        }
-    }
-    // Source exclusions constrain grouping and typography alike.
+    // Source exclusions constrain grouping and typography alike; a case caption is claimed as
+    // caption before headings are read, so it is neither.
     let available = pages
         .iter()
         .map(|page| {
@@ -317,18 +303,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    // Existing headings can wrap inside a caption without training the typography profile.
-    let counted = pages
-        .iter()
-        .zip(&available)
-        .map(|(page, available)| {
-            page.lines
-                .iter()
-                .zip(available)
-                .map(|(line, &keep)| keep && !caption.contains(&line.id))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let counted = &available;
     let starts = pages
         .iter()
         .flat_map(|page| &page.lines)
@@ -340,7 +315,16 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .map(|page| {
             page.lines
                 .iter()
-                .map(|line| FlashLine::of(line, page.height))
+                .map(|line| {
+                    let mut flash = FlashLine::of(line, page.height);
+                    if let Some(share) = (evidence.bold)(&line.id) {
+                        flash.bold = share;
+                        for span in &mut flash.spans {
+                            span.bold = share >= 0.5;
+                        }
+                    }
+                    flash
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
