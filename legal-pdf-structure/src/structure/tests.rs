@@ -2413,6 +2413,42 @@ fn region_dependent_lanes_require_a_complete_source_contract() {
 }
 
 #[test]
+fn layout_headings_survive_recognition_without_font_spans() {
+    for source_role in ["paragraph_title", "doc_title", "heading"] {
+        let mut lines = vec![
+            test_line(
+                "The river survey recorded the following observations.",
+                [60.0, 100.0, 520.0, 112.0],
+                vec![],
+            ),
+            test_line(
+                "What the water samples revealed",
+                [60.0, 150.0, 340.0, 162.0],
+                vec![],
+            ),
+            test_line(
+                "Measurements continued throughout the spring season.",
+                [60.0, 200.0, 520.0, 212.0],
+                vec![],
+            ),
+        ];
+        for line in &mut lines {
+            line.source = "ocr".to_owned();
+            line.region_type = "text".to_owned();
+        }
+        lines[1].region_type = source_role.to_owned();
+        let mut pages = vec![test_page(lines)];
+        pages[0].source = "ocr".to_owned();
+
+        classify_pages(&mut pages, &[None]);
+
+        assert_eq!(pages[0].lines[1].region_type, "heading", "{source_role}");
+        assert_eq!(pages[0].lines[0].region_type, "body");
+        assert_eq!(pages[0].lines[2].region_type, "body");
+    }
+}
+
+#[test]
 fn source_roles_admit_display_headings_without_promoting_authors() {
     let mut pages = vec![test_page(vec![
         sized_line(

@@ -9,25 +9,27 @@
 
 use super::detect::{Block, FlashPage, Neighbors};
 use super::model::y_overlaps;
+use super::stats::DocStats;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Upstream types kept here: 0 plain, 1 numbered, 11 introduction keyword; 12 set apart by type.
+/// Upstream types: 0 plain, 1 numbered, 11 introduction; 2 is a PDF Hn, 12 set apart by type.
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub(super) block: usize,
     pub(super) kind: u8,
-    /// The native ladder's level for a numbered heading; upstream's numbering length.
+    /// The numbering ladder's level or an explicit PDF Hn level.
     pub(super) level: Option<usize>,
 }
 
 impl Candidate {
     fn numbered(&self) -> bool {
-        self.level.is_some()
+        self.kind == 1 && self.level.is_some()
     }
 }
 
 pub(super) struct Context<'a> {
+    pub(super) doc: &'a [DocStats; 2],
     pub(super) blocks: &'a [Block],
     pub(super) pages: &'a [FlashPage],
     /// Position of each block within its page's reading order.
@@ -47,7 +49,7 @@ impl Context<'_> {
     /// unnumbered heading above any numbered one; legal numbering marks parts and sections at
     /// every depth, so type decides between a numbered and an unnumbered heading instead.
     pub(super) fn compare(&self, a: &Candidate, b: &Candidate) -> i8 {
-        if a.kind == 1 && b.kind == 1 {
+        if a.kind == b.kind && matches!(a.kind, 1 | 2) {
             return match (a.level, b.level) {
                 (Some(left), Some(right)) if left == right => 0,
                 (Some(left), Some(right)) if left < right => 1,
@@ -58,7 +60,19 @@ impl Context<'_> {
             return -1;
         }
         let (left, right) = (&self.blocks[a.block].flash, &self.blocks[b.block].flash);
-        let (score, other) = (left.heading_score(), right.heading_score());
+        let styles_known = !self.blocks[a.block].fontless && !self.blocks[b.block].fontless;
+        // Sizes compare on one body-relative scale; unknown font styles supply no contrast.
+        let score = |block: usize| {
+            let block = &self.blocks[block];
+            let (font, glyph) = (self.doc[0].body_font_size, self.doc[1].body_font_size);
+            let scale = if block.fontless && font > 0.0 && glyph > 0.0 {
+                font / glyph
+            } else {
+                1.0
+            };
+            block.flash.heading_score(scale, styles_known)
+        };
+        let (score, other) = (score(a.block), score(b.block));
         if (score - other).abs() > 0.9 {
             return if score > other { 1 } else { -1 };
         }
@@ -71,14 +85,14 @@ impl Context<'_> {
             return if left_centered { 1 } else { -1 };
         }
         let (left_italic, right_italic) = (left.italic > 0.99, right.italic > 0.99);
-        if left_italic != right_italic {
+        if styles_known && left_italic != right_italic {
             return if left_italic { -1 } else { 1 };
         }
         if left_caps {
             return 0;
         }
         let (left_bold, right_bold) = (left.bold > 0.5, right.bold > 0.5);
-        if left_bold != right_bold {
+        if styles_known && left_bold != right_bold {
             return if left_bold { 1 } else { -1 };
         }
         0
@@ -101,8 +115,14 @@ impl Context<'_> {
     }
 
     fn signature(&self, block: usize) -> String {
-        let flash = &self.blocks[block].flash;
-        format!("{} {}", flash.dominant_style(), flash.caps_heavy())
+        let block = &self.blocks[block];
+        let flash = &block.flash;
+        format!(
+            "{} {} {}",
+            block.fontless,
+            flash.dominant_style(),
+            flash.caps_heavy()
+        )
     }
 }
 
@@ -278,7 +298,7 @@ pub(super) fn body_headings(
             if first.as_deref() != Some(style) && last.as_deref() != Some(style) {
                 continue;
             }
-            if style == page.stats.dominant_style {
+            if style == page.stats(entry.fontless).dominant_style {
                 continue;
             }
             let near = &neighbors[page_index][position];
@@ -301,7 +321,8 @@ pub(super) fn body_headings(
                     return false;
                 };
                 let other_flash = &context.blocks[other].flash;
-                if !y_overlaps(&flash.rect, &other_flash.rect)
+                if context.blocks[other].fontless != entry.fontless
+                    || !y_overlaps(&flash.rect, &other_flash.rect)
                     || other_flash.dominant_style() != style
                 {
                     return false;
@@ -401,7 +422,7 @@ pub(super) fn candidate_fonts(context: &Context<'_>, candidates: &[Candidate]) -
             let mut entries = Vec::new();
             if let Some(line) = flash.lines.first() {
                 for span in &line.spans {
-                    if span.stats.letters() == 0 {
+                    if span.stats.letters() == 0 || span.font_name.is_empty() {
                         continue;
                     }
                     if seen.insert(span.style_key()) {
@@ -423,6 +444,10 @@ pub(super) fn stands_alone(
     body_below_gap: Option<f64>,
 ) -> bool {
     let own = &fonts[index];
+    // Missing font evidence cannot establish an isolated font style.
+    if own.is_empty() {
+        return false;
+    }
     let mut distance = f64::INFINITY;
     for (other_index, other) in fonts.iter().enumerate() {
         if other_index == index {

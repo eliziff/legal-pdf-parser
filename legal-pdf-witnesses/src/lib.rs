@@ -20,7 +20,7 @@ mod witness;
 
 pub use compositions::{compositions, compositions_sha256, Compositions, Decision};
 pub use outline::{assemble_outline, Context as OutlineContext};
-pub use witness::{witnesses, Context, Row, Table, NAMES};
+pub use witness::{list_lead_in, witnesses, Context, Row, Table, NAMES, PACKAGE_UNITS};
 
 /// What the structure stage read while a `capture` ran: every witness table, by stage, and the
 /// outline's own evidence: each bookmarked heading line's parent heading line (`None`: at the top)

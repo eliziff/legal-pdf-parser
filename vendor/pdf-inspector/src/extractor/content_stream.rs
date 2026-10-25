@@ -2963,11 +2963,11 @@ pub(crate) fn extract_page_text_items_impl(
                                     paint_size * paint_scale,
                                 ));
                                 let base_font = font_base_names
-                                    .get(&current_font)
+                                    .get(&paint_font)
                                     .map(|s| s.as_str())
-                                    .unwrap_or(&current_font);
+                                    .unwrap_or(&paint_font);
                                 let style =
-                                    font_styles.get(&current_font).copied().unwrap_or_default();
+                                    font_styles.get(&paint_font).copied().unwrap_or_default();
                                 logical_text_items.push(items.len());
                                 // The span's own glyphs were left out as they
                                 // were painted; the paint that made them
@@ -2979,18 +2979,9 @@ pub(crate) fn extract_page_text_items_impl(
                                 // in the check for alphanumeric content; a
                                 // symbol face is ruled out by the painting
                                 // font's name.
-                                let paint_base_font = font_base_names
-                                    .get(&paint_font)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or(&paint_font);
                                 let painted_bold = actual_text_glyph_count > 0
                                     && paintable_fonts.contains(&paint_font)
-                                    && glyph_paint.adds_bold(
-                                        &at,
-                                        rendered_size,
-                                        paint_base_font,
-                                        &ctm,
-                                    );
+                                    && glyph_paint.adds_bold(&at, rendered_size, base_font, &ctm);
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
@@ -2998,14 +2989,14 @@ pub(crate) fn extract_page_text_items_impl(
                                     width: geometry.width,
                                     height: geometry.height,
                                     font: crate::extractor::fonts::item_font_name(
-                                        &current_font,
+                                        &paint_font,
                                         base_font,
                                     )
                                     .to_string(),
                                     font_tag: font_names
-                                        .get(&current_font)
+                                        .get(&paint_font)
                                         .cloned()
-                                        .unwrap_or_else(|| current_font.clone()),
+                                        .unwrap_or_else(|| paint_font.clone()),
                                     legacy_symbol_rewrite: false,
                                     font_size: rendered_size,
                                     page: page_num,
@@ -3023,15 +3014,15 @@ pub(crate) fn extract_page_text_items_impl(
                                     is_strikeout: false,
                                     fidelity: fidelity_info(
                                         font_fidelity.as_ref(),
-                                        &current_font,
+                                        &paint_font,
                                         at.clone(),
                                         text_object_index,
                                         source_line_index,
                                         rise,
                                         Vec::new(),
                                         combined,
-                                        current_font_size,
-                                        type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                        paint_size,
+                                        type3_scales.get(&paint_font).copied().unwrap_or(1.0),
                                         advance_ts.unwrap_or(actual_text_estimate_ts),
                                     ),
                                     rotation: geometry.rotation,

@@ -4,7 +4,7 @@
 //! every line of double-spaced text its own block, put a whole page in one, or give
 //! recognized pages none. Body lines are first parted into visual blocks where the
 //! layout changes (a column or row change, a larger gap than the page's line pitch,
-//! another size or weight), then into paragraphs where a line starts a list item, is
+//! another size or emphasis), then into paragraphs where a line starts a list item, is
 //! indented as a first line, or follows a line that ended short of the block's measure.
 
 use legal_pdf_core::{line_font_size, Line, Page};
@@ -71,9 +71,9 @@ fn char_width(line: &Line) -> f64 {
     width(line) / line.text.trim().chars().count().max(1) as f64
 }
 
-/// Share of the line's visible characters set in a bold face, when its spans say.
-fn bold_share(line: &Line) -> Option<f64> {
-    let (mut total, mut bold) = (0, 0);
+/// Shares of the line's visible characters set in bold and italic, when its spans say.
+fn font_shares(line: &Line) -> Option<(f64, f64)> {
+    let (mut total, mut bold, mut italic) = (0, 0, 0);
     for span in &line.spans {
         let count = span.text.trim().chars().count();
         total += count;
@@ -81,8 +81,11 @@ fn bold_share(line: &Line) -> Option<f64> {
         if span.flags & 16 != 0 || ["bold", "black", "heavy"].iter().any(|w| font.contains(w)) {
             bold += count;
         }
+        if span.flags & 2 != 0 || font.contains("ital") || font.contains("oblique") {
+            italic += count;
+        }
     }
-    (total > 0).then(|| bold as f64 / total as f64)
+    (total > 0).then(|| (bold as f64 / total as f64, italic as f64 / total as f64))
 }
 
 fn first_word_width(line: &Line) -> f64 {
@@ -224,7 +227,9 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> bool {
     if resized(a, b) || advance > gap * pitch.typical(size(a).min(size(b))) {
         return true;
     }
-    matches!((bold_share(a), bold_share(b)), (Some(x), Some(y)) if (x > 0.8 && y < 0.2) || (x < 0.2 && y > 0.8))
+    let contrast = |a: f64, b: f64| (a > 0.8 && b < 0.2) || (a < 0.2 && b > 0.8);
+    matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
+        if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi))
 }
 
 /// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
@@ -336,6 +341,9 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     let (Some(a), Some(b)) = (previous.last(), next.first()) else {
         return false;
     };
+    if a.page_index.checked_add(1) != Some(b.page_index) {
+        return false;
+    }
     let text = b.text.trim_start();
     if bullet_re().is_match(text)
         || enumerator_re().is_match(text)
@@ -374,51 +382,61 @@ fn in_body(line: &Line) -> bool {
     line.region_type == "body" && !line.exclude_from_body && line.note_region_mode.is_empty()
 }
 
+/// Read paragraph boundaries without changing source block indices. Classification can use
+/// the same geometry before assigning roles that the final paragraph reader uses afterward.
+pub(crate) fn paragraph_indices(
+    page: &Page,
+    counted: impl Fn(&Line) -> bool,
+) -> Vec<Option<usize>> {
+    let mut next = page
+        .lines
+        .iter()
+        .map(|line| line.block_index)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let body: Vec<&Line> = page.lines.iter().filter(|line| counted(line)).collect();
+    let pitch = Pitch::of(&body);
+    let mut assigned = vec![None; page.lines.len()];
+    let mut start = 0;
+    while start < page.lines.len() {
+        if !counted(&page.lines[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < page.lines.len() && counted(&page.lines[end]) {
+            end += 1;
+        }
+        let run = &page.lines[start..end];
+        let mut block_start = 0;
+        for k in 1..=run.len() {
+            if k < run.len() && !starts_block(&run[k - 1], &run[k], &pitch) {
+                continue;
+            }
+            let block: Vec<&Line> = run[block_start..k].iter().collect();
+            assigned[start + block_start] = Some(next);
+            let indented = indents_first_lines(&block);
+            for j in 1..block.len() {
+                let after = block.get(j + 1).copied();
+                let margin = indented.then(|| margin_at(&block, j));
+                if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
+                    next += 1;
+                }
+                assigned[start + block_start + j] = Some(next);
+            }
+            next += 1;
+            block_start = k;
+        }
+        start = end;
+    }
+    assigned
+}
+
 /// Give each printed paragraph of body text its own block index.
 pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
     for page in pages {
-        let mut next = page
-            .lines
-            .iter()
-            .map(|line| line.block_index)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let body: Vec<&Line> = page.lines.iter().filter(|line| in_body(line)).collect();
-        let pitch = Pitch::of(&body);
-        let mut assigned = vec![None; page.lines.len()];
-        let mut start = 0;
-        while start < page.lines.len() {
-            if !in_body(&page.lines[start]) {
-                start += 1;
-                continue;
-            }
-            let mut end = start + 1;
-            while end < page.lines.len() && in_body(&page.lines[end]) {
-                end += 1;
-            }
-            let run = &page.lines[start..end];
-            let mut block_start = 0;
-            for k in 1..=run.len() {
-                if k < run.len() && !starts_block(&run[k - 1], &run[k], &pitch) {
-                    continue;
-                }
-                let block: Vec<&Line> = run[block_start..k].iter().collect();
-                assigned[start + block_start] = Some(next);
-                let indented = indents_first_lines(&block);
-                for j in 1..block.len() {
-                    let after = block.get(j + 1).copied();
-                    let margin = indented.then(|| margin_at(&block, j));
-                    if starts_paragraph(block[j - 1], block[j], &block, after, margin) {
-                        next += 1;
-                    }
-                    assigned[start + block_start + j] = Some(next);
-                }
-                next += 1;
-                block_start = k;
-            }
-            start = end;
-        }
+        let assigned = paragraph_indices(page, in_body);
         for (line, block) in page.lines.iter_mut().zip(assigned) {
             if let Some(block) = block {
                 line.block_index = block;

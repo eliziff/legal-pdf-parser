@@ -2,7 +2,7 @@
 
 use legal_pdf_core::model::{Line, Page};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// The witnesses, in the order of each row's values. Flags are 1 or 0; measures are ratios to the
@@ -116,11 +116,13 @@ pub fn index(name: &str) -> Option<usize> {
 /// What the structure stage has read that witnesses use.
 #[derive(Default)]
 pub struct Context<'a> {
+    /// Logical document ids; unmapped lines belong to the primary document.
+    pub documents: Option<&'a HashMap<String, usize>>,
     pub quoted: Option<&'a HashSet<String>>,
     pub table_cells: Option<&'a HashSet<String>>,
     pub contents: Option<&'a HashSet<String>>,
     pub translation: Option<&'a HashSet<String>>,
-    /// A layout model's label for each line, where one ran.
+    /// Original line roles from a layout provider or the native PDF structure tree.
     pub layout: Option<&'a HashMap<String, String>>,
 }
 
@@ -161,12 +163,12 @@ pattern!(
     r"^\s*[•·▪◦‣●○■□➢✓\u{f0b7}\u{f0a7}\u{f0d8}\u{f076}*–-]\s"
 );
 pattern!(paren_num, r"^\s*\(\d{1,3}\)");
-pattern!(paren_letter, r"^\s*\([a-z]{1,2}\)");
+pattern!(paren_letter, r"^\s*\((?:[a-z]{1,2}|[A-Za-z]\.\d+)\)");
 pattern!(paren_roman, r"^\s*\((?:[ivx]{1,5})\)");
 pattern!(decimal, r"^\s*\d{1,3}(?:\.\d{1,3})+\.?\s");
 pattern!(num, r"^\s*\d{1,3}[.)]\s");
 pattern!(num_bare, r"^\s*\d{1,3}\s+[A-Z]");
-pattern!(letter, r"^\s*[a-zA-Z][.)]\s");
+pattern!(letter, r"^\s*[a-zA-Z](?:\.\d+)?[.)]\s");
 pattern!(roman, r"^\s*[IVXivx]{1,5}[.)]\s");
 pattern!(
     word_marker,
@@ -174,7 +176,7 @@ pattern!(
 );
 pattern!(
     bare,
-    r"^\s*(\(?[0-9]{1,3}[.)]?|\(?[ivxlcIVXLC]{1,6}[.)]|\(?[A-Za-z][.)]|\([a-zA-Z0-9]{1,4}\)|[•·▪◦‣\-–*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$"
+    r"^\s*(\(?[0-9]{1,3}[.)]?|\(?[ivxlcIVXLC]{1,6}[.)]|\(?[A-Za-z](?:\.\d+)?[.)]|\((?:[a-zA-Z0-9]{1,4}|[A-Za-z]\.\d+)\)|[•·▪◦‣\-–*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$"
 );
 pattern!(
     court,
@@ -215,7 +217,56 @@ const LEAD_WORDS: &[&str] = &[
     "to",
     "that",
     "whether",
+    "may",
+    "shall",
+    "must",
+    "peut",
+    "doit",
 ];
+
+/// Words that number the constituents of a filed package.
+pub const PACKAGE_UNITS: &[&str] = &[
+    "tab",
+    "exhibit",
+    "schedule",
+    "appendix",
+    "annex",
+    "attachment",
+];
+
+/// A package division, rather than a reference to one inside a heading's sentence.
+pub(crate) fn package_heading(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let unit = words.next().unwrap_or_default().to_ascii_lowercase();
+    if !PACKAGE_UNITS.contains(&unit.as_str()) {
+        return false;
+    }
+    let Some(label) = words.next() else {
+        // The printed label can be a separate source unit below the title.
+        return true;
+    };
+    let label = label.trim_matches(['"', '\'', '\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}']);
+    words.next().is_none()
+        && !label.is_empty()
+        && (label
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            || legal_pdf_core::layout_analysis()
+                .numbering_marker(label, None)
+                .is_some())
+}
+
+/// Wording or punctuation that can introduce a list; it needs marker and layout evidence too.
+pub fn list_lead_in(text: &str) -> bool {
+    let text = text.trim_end();
+    matches!(
+        text.chars().last(),
+        Some(':' | '-' | '\u{2013}' | '\u{2014}')
+    ) || text
+        .rsplit(|c: char| !c.is_alphabetic())
+        .find(|word| !word.is_empty())
+        .is_some_and(|word| LEAD_WORDS.contains(&word.to_lowercase().as_str()))
+}
 
 fn families(text: &str) -> [bool; 10] {
     [
@@ -317,18 +368,82 @@ fn letters_key(text: &str) -> String {
 
 /// Every counted line's witnesses, in reading order.
 pub fn witnesses(pages: &[Page], context: &Context) -> Table {
-    let lines = pages
-        .iter()
-        .enumerate()
-        .flat_map(|(p, page)| {
-            page.lines
-                .iter()
-                .filter(|l| counted(l))
-                .map(move |l| (p, l))
-        })
-        .collect::<Vec<_>>();
+    let scoped = context.documents.is_some_and(|ids| !ids.is_empty())
+        || context.translation.is_some_and(|ids| !ids.is_empty());
+    if !scoped {
+        let lines = pages
+            .iter()
+            .enumerate()
+            .flat_map(|(p, page)| {
+                page.lines
+                    .iter()
+                    .filter(|line| counted(line))
+                    .map(move |line| (p, line))
+            })
+            .collect::<Vec<_>>();
+        return Table {
+            rows: witness_rows(
+                pages,
+                context,
+                &lines,
+                &(0..pages.len()).collect::<Vec<_>>(),
+            ),
+        };
+    }
+    #[derive(Default)]
+    struct Reading<'a> {
+        pages: Vec<usize>,
+        positions: Vec<usize>,
+        lines: Vec<(usize, &'a Line)>,
+    }
+    let mut readings = BTreeMap::<(usize, bool), Reading>::new();
+    let mut position = 0;
+    for (p, page) in pages.iter().enumerate() {
+        for line in &page.lines {
+            let key = (
+                context
+                    .documents
+                    .and_then(|ids| ids.get(&line.id))
+                    .copied()
+                    .unwrap_or(0),
+                context
+                    .translation
+                    .is_some_and(|ids| ids.contains(&line.id)),
+            );
+            let reading = readings.entry(key).or_default();
+            if reading.pages.last() != Some(&p) {
+                reading.pages.push(p);
+            }
+            if counted(line) {
+                reading.positions.push(position);
+                reading.lines.push((p, line));
+                position += 1;
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(position);
+    for reading in readings.into_values() {
+        rows.extend(
+            witness_rows(pages, context, &reading.lines, &reading.pages)
+                .into_iter()
+                .zip(reading.positions)
+                .map(|(row, slot)| (slot, row)),
+        );
+    }
+    rows.sort_by_key(|(slot, _)| *slot);
+    Table {
+        rows: rows.into_iter().map(|(_, row)| row).collect(),
+    }
+}
+
+fn witness_rows(
+    pages: &[Page],
+    context: &Context,
+    lines: &[(usize, &Line)],
+    profile_pages: &[usize],
+) -> Vec<Row> {
     if lines.is_empty() {
-        return Table { rows: Vec::new() };
+        return Vec::new();
     }
     let body_size = median(
         lines
@@ -337,14 +452,17 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             .filter(|s| *s > 0.0)
             .collect(),
     );
-    let body_height = median(
-        lines
-            .iter()
-            .map(|(_, l)| l.bbox[3] - l.bbox[1])
-            .filter(|h| *h > 0.0)
-            .collect(),
-    )
-    .max(1.0);
+    let body_heights = [false, true].map(|font| {
+        median(
+            lines
+                .iter()
+                .filter(|(_, line)| (size(line) > 0.0) == font)
+                .map(|(_, line)| line.bbox[3] - line.bbox[1])
+                .filter(|height| *height > 0.0)
+                .collect(),
+        )
+        .max(1.0)
+    });
     let styled = lines
         .iter()
         .filter_map(|(_, l)| bold(l))
@@ -362,10 +480,15 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         .max_by_key(|(_, n)| **n)
         .map(|(f, _)| f.clone())
         .unwrap_or_default();
-    let page_count = pages.len().max(1) as f32;
+    let page_count = profile_pages.len() as f32;
+    let page_positions = profile_pages
+        .iter()
+        .enumerate()
+        .map(|(position, &p)| (p, position))
+        .collect::<HashMap<_, _>>();
     // Text repeated page after page: running heads and titles.
     let mut seen_on = HashMap::<String, HashSet<usize>>::new();
-    for (p, l) in &lines {
+    for (p, l) in lines {
         seen_on.entry(normal(&l.text)).or_default().insert(*p);
     }
     // The style ladder: each style (bold, size step, capitals), ranked by prominence.
@@ -376,12 +499,12 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         let step = if body_size > 0.0 && size(l) > 0.0 {
             (size(l) / body_size * 10.0).round() as i64
         } else {
-            ((l.bbox[3] - l.bbox[1]) / body_height * 10.0).round() as i64
+            ((l.bbox[3] - l.bbox[1]) / body_heights[0] * 10.0).round() as i64
         };
         (bold(l) == Some(true), step, caps)
     };
     let mut style_count = HashMap::<(bool, i64, bool), usize>::new();
-    for (_, l) in &lines {
+    for (_, l) in lines {
         *style_count.entry(style(l)).or_default() += 1;
     }
     let mut ranked = style_count.keys().copied().collect::<Vec<_>>();
@@ -397,7 +520,7 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         .map(|(st, _)| *st);
     // Backbone counts: a marker family spread over a third of the document's pages.
     let mut family_pages = HashMap::<usize, HashSet<usize>>::new();
-    for (p, l) in &lines {
+    for (p, l) in lines {
         if let Some(f) = family(&l.text) {
             family_pages.entry(f).or_default().insert(*p);
         }
@@ -421,7 +544,8 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         .unwrap_or_default();
     // Pages set at another width than most, and pages switching between scan and type.
     let mut widths = HashMap::<i64, usize>::new();
-    for page in pages {
+    for &p in profile_pages {
+        let page = &pages[p];
         *widths.entry(page.width.round() as i64).or_default() += 1;
     }
     let usual_width = widths
@@ -429,37 +553,31 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         .max_by_key(|(_, n)| **n)
         .map(|(w, _)| *w as f64)
         .unwrap_or(0.0);
-    // Each page's text measure.
-    let measures = pages
-        .iter()
-        .map(|page| {
-            let mut lefts = page
-                .lines
-                .iter()
-                .filter(|l| counted(l))
-                .map(|l| l.bbox[0])
-                .collect::<Vec<_>>();
-            let mut rights = page
-                .lines
-                .iter()
-                .filter(|l| counted(l))
-                .map(|l| l.bbox[2])
-                .collect::<Vec<_>>();
-            if lefts.is_empty() {
-                return (0.0, page.width.max(1.0));
-            }
+    // Each context's own text measure on the physical page.
+    let mut page_lines = HashMap::<usize, Vec<&Line>>::new();
+    for &(p, line) in lines {
+        page_lines.entry(p).or_default().push(line);
+    }
+    let measures = page_lines
+        .into_iter()
+        .map(|(p, lines)| {
+            let mut lefts = lines.iter().map(|line| line.bbox[0]).collect::<Vec<_>>();
+            let mut rights = lines.iter().map(|line| line.bbox[2]).collect::<Vec<_>>();
             lefts.sort_by(f64::total_cmp);
             rights.sort_by(f64::total_cmp);
             (
-                lefts[lefts.len() / 10],
-                rights[rights.len() - 1 - rights.len() / 10],
+                p,
+                (
+                    lefts[lefts.len() / 10],
+                    rights[rights.len() - 1 - rights.len() / 10],
+                ),
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<HashMap<_, _>>();
     let lexicon = crate::lexicon::lexicon();
     let flag = |b: bool| if b { 1.0 } else { 0.0 };
     let mut region_lines = HashMap::<(usize, &str), usize>::new();
-    for (p, l) in &lines {
+    for (p, l) in lines {
         if !l.region_id.is_empty() {
             *region_lines.entry((*p, l.region_id.as_str())).or_default() += 1;
         }
@@ -470,8 +588,10 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
     let mut rows = Vec::with_capacity(lines.len());
     for (n, &(p, l)) in lines.iter().enumerate() {
         let page = &pages[p];
+        let page_position = page_positions[&p];
+        let body_height = body_heights[usize::from(size(l) > 0.0)];
         let text = l.text.trim();
-        let (left, right) = measures[p];
+        let (left, right) = measures[&p];
         let measure = (right - left).max(1.0);
         let [x0, y0, x1, y1] = l.bbox;
         let prev = n.checked_sub(1).map(|m| lines[m]);
@@ -485,12 +605,6 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         let end = text.chars().last().unwrap_or(' ');
         let prev_text = prev.map_or("", |(_, o)| o.text.trim());
         let prev_end = prev_text.chars().last().unwrap_or(' ');
-        let prev_words = prev_text
-            .rsplit(|c: char| !c.is_alphabetic())
-            .filter(|w| !w.is_empty())
-            .take(1)
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
         let marks = families(text);
         let own = style(l);
         let recognized = page.source != "native" || l.spans.is_empty();
@@ -501,10 +615,12 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
         let contains = |set: Option<&HashSet<String>>| set.is_some_and(|ids| ids.contains(&l.id));
         let values = vec![
             flag(recognized),
-            (page.index + 1) as f32 / page_count,
+            (page_position + 1) as f32 / page_count,
             flag(prev.is_none_or(|(q, _)| q != p)),
             flag(usual_width > 0.0 && (page.width - usual_width).abs() > 20.0),
-            flag(p > 0 && pages[p - 1].source != page.source),
+            flag(
+                page_position > 0 && pages[profile_pages[page_position - 1]].source != page.source,
+            ),
             bold_share,
             flag(
                 seen_on
@@ -564,12 +680,7 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             flag(prev_end == ';'),
             flag(matches!(prev_end, '-' | '\u{2013}' | '\u{2014}')),
             flag(next.is_some_and(|(_, o)| o.text.trim_start().starts_with(char::is_lowercase))),
-            flag(
-                matches!(prev_end, ':' | '-' | '\u{2013}' | '\u{2014}')
-                    || prev_words
-                        .first()
-                        .is_some_and(|w| LEAD_WORDS.contains(&w.as_str())),
-            ),
+            flag(list_lead_in(prev_text)),
             flag(court().is_match(text)),
             flag(address().is_match(text)),
             flag(party().is_match(text)),
@@ -630,16 +741,24 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             .filter_map(|span| span.structure_role.as_deref())
             .collect::<std::collections::HashSet<_>>();
         values.extend([
-            flag(!tags.is_empty()),
             flag(
-                tags.iter()
-                    .any(|role| matches!(*role, "H" | "H1" | "H2" | "H3" | "H4" | "H5" | "H6")),
+                !tags.is_empty()
+                    || layout.is_some_and(legal_pdf_core::is_heading_role)
+                    || layout == Some("LI"),
+            ),
+            flag(
+                layout.is_some_and(legal_pdf_core::is_heading_role)
+                    || tags
+                        .iter()
+                        .any(|role| legal_pdf_core::is_heading_role(role)),
             ),
             flag(tags.contains("Title")),
             flag(tags.contains("P")),
             flag(
-                tags.iter()
-                    .any(|role| matches!(*role, "L" | "LI" | "Lbl" | "LBody")),
+                layout == Some("LI")
+                    || tags
+                        .iter()
+                        .any(|role| matches!(*role, "L" | "LI" | "Lbl" | "LBody")),
             ),
             flag(
                 tags.iter()
@@ -666,5 +785,5 @@ pub fn witnesses(pages: &[Page], context: &Context) -> Table {
             values,
         });
     }
-    Table { rows }
+    rows
 }

@@ -6,15 +6,17 @@
 //! `build_doc_heading_candidates` / `detect_body_headings` → the outline stack. The port reads
 //! native lines and regions instead of Flash's own lines and blocks; each submodule names the
 //! upstream functions it ports. Deliberate adaptations:
-//! - Numbered headings come from the native ladder, which also supplies their depth; Flash's
-//!   numbered, labeled, chapter and caption detectors are not ported.
+//! - The native ladder supplies numbered headings and their depth; unresolved numbered blocks
+//!   can still be read by typography. Flash's numbered, labeled, chapter and caption detectors
+//!   are not ported.
 //! - The keyword tables are not ported except the introduction keywords: the section and
 //!   abstract tables index academic and medical papers.
 //! - A heading the native rules already accepted is kept; only new candidates face the
 //!   font-distance rejection.
 //! - Native line boxes rise to the font's ascent; Flash's glyph boxes stop near the capitals.
 //! - A new heading is in the page's own type size or larger, opens with a capital or a number,
-//!   is no quotation, citation or lead-in, and does not sit beside running text.
+//!   and does not sit beside running text. Inside a quotation, a bold provision label or an
+//!   italic title above contrasting prose can structure that passage.
 //! - Lines above the last party label on a page (`APPLICANT`, `— Respondent`) are the case
 //!   caption, never headings; a heading of a few stray characters holds no section; a
 //!   capitalized title wrapped onto a second line is one heading.
@@ -26,8 +28,8 @@ mod outline;
 mod stats;
 
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
-use legal_pdf_core::model::Page;
 use legal_pdf_core::layout_analysis;
+use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
 use regex::Regex;
@@ -49,9 +51,22 @@ pub fn party_label() -> &'static Regex {
     })
 }
 
-/// A capitalized heading wrapped onto the next line keeps one block: the same type, set at the
+/// A heading wrapped onto the next line keeps one block: the same type, set at the
 /// line's leading, the first line ending no sentence and the second opening no numbered heading.
-fn join_wrapped_headings(pages: &mut [Page], levels: &std::collections::HashMap<String, usize>) {
+fn join_wrapped_headings(
+    pages: &mut [Page],
+    flash_lines: &[Vec<FlashLine>],
+    doc: &[stats::DocStats; 2],
+    starts: &HashSet<String>,
+    tagged_levels: &HashMap<String, usize>,
+    available: &[Vec<bool>],
+    translation: &dyn Fn(&str) -> bool,
+) -> Vec<(usize, usize, usize)> {
+    let mut joined_lines = Vec::new();
+    let parenthetical = |text: &str| {
+        let text = text.trim();
+        text.starts_with('(') && text.ends_with(')')
+    };
     let style = |line: &legal_pdf_core::model::Line| {
         line.spans.first().map(|span| {
             (
@@ -61,38 +76,58 @@ fn join_wrapped_headings(pages: &mut [Page], levels: &std::collections::HashMap<
             )
         })
     };
-    for page in pages.iter_mut() {
+    for (page_slot, page) in pages.iter_mut().enumerate() {
         for slot in 1..page.lines.len() {
             let (prior, line) = (&page.lines[slot - 1], &page.lines[slot]);
-            let height = prior.bbox[3] - prior.bbox[1];
-            let gap = line.bbox[1] - prior.bbox[3];
-            let centered =
-                ((prior.bbox[0] + prior.bbox[2]) - (line.bbox[0] + line.bbox[2])).abs() / 2.0 < 2.0;
+            let (above, below) = (
+                &flash_lines[page_slot][slot - 1],
+                &flash_lines[page_slot][slot],
+            );
+            let height = above.rect.height();
+            let gap = above.rect.bottom - below.rect.top;
+            let advance = above.rect.top - below.rect.top;
+            let leading = doc[usize::from(prior.spans.is_empty())].body_line_leading;
+            let max_advance = above.size
+                * if leading.is_finite() && leading > 0.0 {
+                    (1.25 * leading).max(1.5)
+                } else {
+                    1.5
+                };
             let joined = prior.region_type == "heading"
                 && line.region_type == "heading"
+                && available[page_slot][slot - 1]
+                && available[page_slot][slot]
+                && translation(&prior.id) == translation(&line.id)
                 && prior.block_index != line.block_index
-                && !prior.exclude_from_body
-                && !line.exclude_from_body
-                && style(prior).is_some()
-                && style(prior) == style(line)
-                && model::CharStats::of(&prior.text).caps_heavy()
-                && model::CharStats::of(&line.text).caps_heavy()
+                && match (style(prior), style(line)) {
+                    (Some(left), Some(right)) => left == right,
+                    // Recognized headings have glyph heights in place of native font spans.
+                    (None, None) => {
+                        height > 0.0
+                            && (line.bbox[3] - line.bbox[1] - height).abs() <= 0.05 * height
+                    }
+                    _ => false,
+                }
+                && tagged_levels.get(&prior.id) == tagged_levels.get(&line.id)
+                && (above.stats.caps_heavy() == below.stats.caps_heavy()
+                    || parenthetical(&line.text))
+                && (!parenthetical(&prior.text) || parenthetical(&line.text))
                 && !prior.text.trim_end().ends_with(['.', '?', '!', ':', ';'])
-                && !levels.contains_key(&line.id)
+                && !starts.contains(&line.id)
+                && advance > 0.0
+                && advance <= max_advance
                 && gap >= -1.0
                 && gap < height
-                && (centered || (prior.bbox[0] - line.bbox[0]).abs() < 2.0);
+                && (model::center_aligned(&above.rect, &below.rect, 2.0)
+                    || model::left_aligned(&above.rect, &below.rect, 2.0));
             if joined {
-                let (from, to) = (line.block_index, prior.block_index);
-                for later in page.lines[slot..]
-                    .iter_mut()
-                    .take_while(|later| later.block_index == from)
-                {
-                    later.block_index = to;
-                }
+                let to = prior.block_index;
+                page.lines[slot].block_index = to;
+                joined_lines.push((page_slot, slot, slot - 1));
             }
         }
     }
+    joined_lines
 }
 
 /// The introduction section names upstream's `introduction_dict` lists.
@@ -145,38 +180,65 @@ fn introduction(block: &FlashBlock) -> bool {
         || (tokens.len() == words.len() + 1 && matches!(tokens[words.len()].kind, 3 | 4 | 5))
 }
 
-/// A block set apart by its type alone, as the structure gold reads the units that open a
-/// section: bold all through, unless it is mostly punctuation, or mostly figures with more than
-/// a short line after it; or in capitals.
+/// Bold or capitals can set a title apart even below the body text's size.
 fn set_apart_by_type(block: &FlashBlock, next: Option<&FlashBlock>) -> bool {
     let stats = &block.stats;
     let total = f64::from(stats.total.max(1));
     if block.bold >= 0.95 {
         let figures = f64::from(stats.counts[1]) / total > 0.41;
         return f64::from(stats.punctuation()) / total <= 0.58
-            && (!figures || next.is_none_or(|next| next.lines.first().is_none_or(|line| line.char_count() <= 62)));
+            && (!figures
+                || next.is_none_or(|next| {
+                    next.lines
+                        .first()
+                        .is_none_or(|line| line.char_count() <= 62)
+                }));
     }
     stats.letters() > 0 && f64::from(stats.counts[2]) >= 0.78 * f64::from(stats.letters())
 }
 
-/// A line that is a citation and little else ("[2026] SGCA 26") names a case, not a section.
-fn citation_only(block: &FlashBlock) -> bool {
-    let text = block
-        .lines
-        .iter()
-        .map(|line| line.text.trim())
-        .collect::<Vec<_>>()
-        .join(" ");
-    // The layout reading of citations: the full citator would resolve each one, at a cost
-    // every short block on a page of authorities pays.
-    let spans = layout_analysis().protected_citation_spans(&text);
-    if spans.is_empty() {
+/// A provision label consists of its legal prefix and numbering, without running words.
+fn provision_label(text: &str) -> bool {
+    let Some((prefix, rest)) = text.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let analysis = layout_analysis();
+    let word = prefix.trim_end_matches('.').to_ascii_lowercase();
+    if !(matches!(word.as_str(), "s" | "ss") || analysis.is_counter_noun(&word))
+        || !analysis.has_citation_cue(prefix)
+    {
         return false;
     }
-    text.chars()
+    let mut parts = rest
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
+        .filter(|part| !part.is_empty());
+    parts.next().is_some_and(|first| {
+        first.starts_with(|c: char| c.is_ascii_digit())
+            && analysis.numbering_marker(first, None).is_some()
+    }) && parts.all(|part| analysis.numbering_marker(part, None).is_some())
+}
+
+/// A line that is a citation and little else ("[2026] SGCA 26") names a case, not a section.
+fn citation_only(text: &str, complete: bool) -> bool {
+    let analysis = layout_analysis();
+    let spans = analysis.protected_citation_spans(text);
+    // Styled citation-bearing blocks also mask case names before counting title words.
+    let citations = if complete {
+        analysis.citations(text)
+    } else {
+        Vec::new()
+    };
+    if spans.is_empty() && citations.is_empty() {
+        return false;
+    }
+    text.char_indices()
         .enumerate()
-        .filter(|(at, character)| {
-            character.is_alphabetic() && !spans.iter().any(|(start, end)| start <= at && at < end)
+        .filter(|(at, (byte, character))| {
+            character.is_alphabetic()
+                && !spans.iter().any(|(start, end)| start <= at && at < end)
+                && !citations
+                    .iter()
+                    .any(|citation| citation.range.contains(byte))
         })
         .count()
         < 3
@@ -184,21 +246,43 @@ fn citation_only(block: &FlashBlock) -> bool {
 
 /// What the structure stage has read that the heading reader needs.
 pub struct HeadingEvidence<'a> {
+    /// This reading belongs to a quotation, whose labels and titles structure only that passage.
+    pub quotation: bool,
     /// Line id to level of every heading accepted so far; the reader adds and removes.
     pub levels: &'a mut HashMap<String, usize>,
     /// Lines that can be no heading: a contents row, a table cell.
     pub excluded: &'a dyn Fn(&str) -> bool,
-    /// Lines of a parallel translation, whose headings form a ladder of their own beside the text's.
+    /// Parallel text whose numbering and parent stack must remain separate.
     pub translation: &'a dyn Fn(&str) -> bool,
     /// Contents pages, none of whose lines is a heading.
     pub contents_pages: &'a HashSet<usize>,
-    /// Does a line open with a heading's number ("1.", "(a)", "IV")?
+    /// Does a line open with a heading-like number ("1.", "(a)", "IV")? This is no role decision.
     pub numbered: &'a dyn Fn(&str) -> bool,
+    /// Original source roles retain explicit PDF Hn levels after local classification.
+    pub source_regions: Option<&'a HashMap<String, String>>,
 }
 
 /// Read the headings set apart by type alone and the depth of every heading. Line roles and
 /// `evidence.levels` change; the caller rebuilds the pages' regions.
 pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) {
+    let native_list = |id: &str| {
+        evidence
+            .source_regions
+            .and_then(|regions| regions.get(id))
+            .is_some_and(|role| role == "LI")
+    };
+    let tagged_levels = evidence
+        .source_regions
+        .into_iter()
+        .flatten()
+        .filter(|(_, role)| legal_pdf_core::is_heading_role(role))
+        .filter_map(|(id, role)| {
+            role.strip_prefix('H')?
+                .parse()
+                .ok()
+                .map(|level| (id.clone(), level))
+        })
+        .collect::<HashMap<String, usize>>();
     // The case caption: lines down to a page's last party label are no headings.
     let mut caption = HashSet::<String>::new();
     for page in pages.iter_mut() {
@@ -217,8 +301,40 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             }
         }
     }
-    join_wrapped_headings(pages, evidence.levels);
-
+    // Source exclusions constrain grouping and typography alike.
+    let available = pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| {
+                    !line.exclude_from_body
+                        && line.note_region_mode.is_empty()
+                        && matches!(line.region_type.as_str(), "body" | "heading")
+                        && !(evidence.excluded)(&line.id)
+                        && !evidence.contents_pages.contains(&page.index)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // Existing headings can wrap inside a caption without training the typography profile.
+    let counted = pages
+        .iter()
+        .zip(&available)
+        .map(|(page, available)| {
+            page.lines
+                .iter()
+                .zip(available)
+                .map(|(line, &keep)| keep && !caption.contains(&line.id))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let starts = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .filter(|line| evidence.levels.contains_key(&line.id) || (evidence.numbered)(&line.text))
+        .map(|line| line.id.clone())
+        .collect::<HashSet<_>>();
     let flash_lines = pages
         .iter()
         .map(|page| {
@@ -230,24 +346,40 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .collect::<Vec<_>>();
     let page_stats = pages
         .iter()
-        .zip(&flash_lines)
-        .map(|(page, lines)| stats::page_stats(lines, page.width))
+        .enumerate()
+        .map(|(page_slot, page)| {
+            [false, true].map(|fontless| {
+                let text = flash_lines[page_slot]
+                    .iter()
+                    .zip(&counted[page_slot])
+                    .zip(&page.lines)
+                    .filter_map(|((line, &keep), source)| {
+                        (keep && source.spans.is_empty() == fontless).then_some(line)
+                    });
+                stats::page_stats(text, page.width)
+            })
+        })
         .collect::<Vec<_>>();
-    let doc = stats::doc_stats(&page_stats);
+    let doc = [0, 1].map(|kind| stats::doc_stats(page_stats.iter().map(|page| &page[kind])));
+    join_wrapped_headings(
+        pages,
+        &flash_lines,
+        &doc,
+        &starts,
+        &tagged_levels,
+        &available,
+        evidence.translation,
+    );
 
     // Blocks: runs of body or heading lines sharing a block, as regions group them.
     let mut blocks = Vec::<Block>::new();
-    let mut eligible = Vec::<bool>::new();
     let mut flash_pages = Vec::<FlashPage>::new();
     for (page_slot, page) in pages.iter().enumerate() {
         let mut ids = Vec::new();
         let mut slot = 0;
         while slot < page.lines.len() {
             let line = &page.lines[slot];
-            if line.exclude_from_body
-                || !line.note_region_mode.is_empty()
-                || !matches!(line.region_type.as_str(), "body" | "heading")
-            {
+            if !counted[page_slot][slot] {
                 slot += 1;
                 continue;
             }
@@ -255,8 +387,10 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             while end < page.lines.len()
                 && page.lines[end].region_type == line.region_type
                 && page.lines[end].block_index == line.block_index
-                && !page.lines[end].exclude_from_body
-                && page.lines[end].note_region_mode.is_empty()
+                && page.lines[end].spans.is_empty() == line.spans.is_empty()
+                && counted[page_slot][end]
+                && (evidence.translation)(&page.lines[end].id) == (evidence.translation)(&line.id)
+                && tagged_levels.get(&page.lines[end].id) == tagged_levels.get(&line.id)
             {
                 end += 1;
             }
@@ -277,14 +411,9 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                     .any(|line| evidence.levels.contains_key(&line.id))
                     || (evidence.numbered)(first),
                 is_body: false,
-                translation: lines.iter().all(|line| (evidence.translation)(&line.id)),
+                translation: (evidence.translation)(&line.id),
+                fontless: line.spans.is_empty(),
             });
-            eligible.push(
-                lines
-                    .iter()
-                    .all(|line| !caption.contains(&line.id) && !(evidence.excluded)(&line.id))
-                    && !evidence.contents_pages.contains(&page.index),
-            );
             ids.push(blocks.len() - 1);
             slot = end;
         }
@@ -293,45 +422,66 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             height: page.height,
             stats: page_stats[page_slot].clone(),
             blocks: ids,
-            body_styles: HashSet::new(),
+            body_styles: std::array::from_fn(|_| HashSet::new()),
         });
     }
     for page in &mut flash_pages {
         for &block in &page.blocks {
-            let body =
-                !blocks[block].heading && is_body_paragraph(&doc, page, &blocks[block].flash);
+            let body = !blocks[block].heading && is_body_paragraph(&doc, page, &blocks[block]);
             blocks[block].is_body = body;
             if body {
-                page.body_styles
+                page.body_styles[usize::from(blocks[block].fontless)]
                     .insert(blocks[block].flash.dominant_style().to_owned());
             }
         }
     }
     // A new heading is a short block set in the page's own type size or larger, opens with a
-    // capital or a number, ends no lead-in, and stands on rows of its own beside no running text.
+    // capital or a number, and stands on rows of its own beside no running text. A colon-ending
+    // title needs the stronger type witness below.
     // The citation grammar's answer for each text, read once: a document repeats its running heads
     // and titles page after page.
+    let mut eligible = vec![true; blocks.len()];
+    let mut type_candidates = vec![false; blocks.len()];
     let mut cited: HashMap<String, bool> = HashMap::new();
     for page in &flash_pages {
         for (position, &block) in page.blocks.iter().enumerate() {
-            if !eligible[block] {
-                continue;
-            }
             let flash = &blocks[block].flash;
+            let stats = page.stats(blocks[block].fontless);
             let text = flash
                 .lines
                 .iter()
                 .map(|line| line.text.trim())
                 .collect::<Vec<_>>()
                 .join(" ");
-            if flash.line_count() > 4 || text.chars().count() > 300 {
+            if flash.line_count() > 4
+                || text.chars().count() > 300
+                || blocks[block]
+                    .line_slots
+                    .iter()
+                    .any(|&slot| native_list(&pages[blocks[block].page].lines[slot].id))
+            {
                 eligible[block] = false;
                 continue;
             }
-            let opens = text
-                .chars()
-                .find(|character| character.is_alphanumeric())
-                .is_some_and(|character| character.is_uppercase() || character.is_numeric());
+            let next = page.blocks[position + 1..]
+                .iter()
+                .find(|&&next| blocks[next].translation == blocks[block].translation)
+                .map(|&next| &blocks[next].flash);
+            let provision = evidence.quotation
+                && flash.bold >= 0.95
+                && next.is_some_and(|next| next.bold < 0.5)
+                && provision_label(&text);
+            let italic_title = evidence.quotation
+                && flash.italic >= 0.95
+                && flash.line_count() <= 2
+                && !text.trim_end().ends_with(['.', ',', ';', '?', '!'])
+                && next.is_some_and(|next| next.italic < 0.5 && next.line_count() >= 2);
+            type_candidates[block] = provision || italic_title || set_apart_by_type(flash, next);
+            let opens = provision
+                || text
+                    .chars()
+                    .find(|character| character.is_alphanumeric())
+                    .is_some_and(|character| character.is_uppercase() || character.is_numeric());
             let ends = text
                 .trim_end_matches(|character: char| {
                     character.is_whitespace() || "\"')]\u{201d}\u{2019}".contains(character)
@@ -341,11 +491,28 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             let quoted = text.starts_with(['"', '\u{201c}', '\u{2018}'])
                 || text.ends_with(".\u{201d}")
                 || text.ends_with("\u{201d}.");
+            // Printed provisions can use smaller bold titles immediately above their number.
+            let provision_title = type_candidates[block]
+                && flash.bold >= 0.95
+                && next.is_some_and(|next| {
+                    next.rect.top < flash.rect.top
+                        && flash.rect.bottom - next.rect.top < flash.size
+                        && next.rect.left < flash.rect.right
+                        && flash.rect.left < next.rect.right
+                        && next.lines.first().is_some_and(|line| {
+                            line.text
+                                .trim_start()
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_digit())
+                        })
+                });
             // The type and wording tests are cheap; the layout tests below read the whole page.
-            if flash.size < page.stats.font_size - 0.5
+            if (flash.size < stats.font_size - 0.5 && !provision_title)
                 || !opens
                 || quoted
-                || matches!(ends, Some(',' | ';' | ':'))
+                || matches!(ends, Some(',' | ';'))
+                || (ends == Some(':') && !type_candidates[block])
             {
                 eligible[block] = false;
                 continue;
@@ -406,11 +573,20 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             eligible[block] = !indented
                 && !runs_on
                 && !beside()
-                && !*cited.entry(text.clone()).or_insert_with(|| {
-                    (analysis.has_citation_cue(&text) && text.chars().any(|c| c.is_ascii_digit()))
-                        || analysis.has_citation_signal(&text)
-                })
-                && !citation_only(flash);
+                && (provision || {
+                    let reference = *cited.entry(text.clone()).or_insert_with(|| {
+                        (analysis.has_citation_cue(&text)
+                            && text.chars().any(|c| c.is_ascii_digit()))
+                            || analysis.has_citation_signal(&text)
+                    });
+                    let title = type_candidates[block]
+                        && !matches!(ends, Some('.' | ':'))
+                        && text
+                            .chars()
+                            .find(|c| c.is_alphabetic())
+                            .is_some_and(char::is_uppercase);
+                    (!reference || title) && !citation_only(&text, reference)
+                });
         }
     }
     let mut positions = vec![0; blocks.len()];
@@ -444,15 +620,27 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         let mut found = Vec::new();
         for (position, &block) in page.blocks.iter().enumerate() {
             if blocks[block].heading {
+                let tagged_level = blocks[block]
+                    .line_slots
+                    .first()
+                    .and_then(|slot| tagged_levels.get(&pages[page_index].lines[*slot].id))
+                    .copied();
+                let numbered_level = blocks[block]
+                    .line_slots
+                    .iter()
+                    .filter_map(|slot| evidence.levels.get(&pages[page_index].lines[*slot].id))
+                    .min()
+                    .copied();
                 candidates.push(Candidate {
                     block,
-                    kind: if blocks[block].numbered { 1 } else { 0 },
-                    level: blocks[block]
-                        .line_slots
-                        .iter()
-                        .filter_map(|slot| evidence.levels.get(&pages[page_index].lines[*slot].id))
-                        .min()
-                        .copied(),
+                    kind: if tagged_level.is_some() {
+                        2
+                    } else if numbered_level.is_some() {
+                        1
+                    } else {
+                        0
+                    },
+                    level: tagged_level.or(numbered_level),
                 });
                 continue;
             }
@@ -466,10 +654,10 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 && introduction(&blocks[block].flash)
             {
                 Some(11)
+            } else if type_candidates[block] {
+                Some(12)
             } else if scan.candidate(position) {
                 Some(0)
-            } else if set_apart_by_type(&blocks[block].flash, page.blocks.get(position + 1).map(|&next| &blocks[next].flash)) {
-                Some(12)
             } else {
                 None
             };
@@ -482,16 +670,19 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
                 });
             }
         }
-        // A page proposing twenty headings in one language is a table or a list.
+        // Apply the page cap to each parallel sequence independently.
         for translation in [false, true] {
-            let own: Vec<Candidate> = found.iter().filter(|c| blocks[c.block].translation == translation).cloned().collect();
-            if own.len() < 20 {
-                proposed.extend(own.iter().map(|candidate| candidate.block));
-                candidates.extend(own);
+            let own = found
+                .iter()
+                .filter(|candidate| blocks[candidate.block].translation == translation);
+            if own.clone().count() < 20 {
+                proposed.extend(own.clone().map(|candidate| candidate.block));
+                candidates.extend(own.cloned());
             }
         }
     }
     let context = Context {
+        doc: &doc,
         blocks: &blocks,
         pages: &flash_pages,
         positions: &positions,
@@ -544,33 +735,76 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .map(|(_, candidate)| candidate.clone())
         .collect::<Vec<_>>();
 
-    // Levels: each heading under the nearest earlier one of its own language that may hold it.
+    // Parallel sequences retain independent open ancestors.
     let mut stacks = [Vec::<usize>::new(), Vec::<usize>::new()];
     let mut levels = vec![0usize; accepted.len()];
     for index in 0..accepted.len() {
         let stack = &mut stacks[usize::from(blocks[accepted[index].block].translation)];
         let parent = context.parent(stack, &accepted, &accepted[index]);
-        levels[index] = parent.map_or(1, |parent| levels[parent] + 1);
+        let inferred = parent.map_or(1, |parent| levels[parent].saturating_add(1));
+        levels[index] = if accepted[index].kind == 2 {
+            accepted[index].level.unwrap_or(inferred)
+        } else {
+            inferred
+        };
         stack.push(index);
     }
-    // A heading read with a numbered one inside it ("III. Law and Argument" over "A. Approving
-    // Sale") keeps the inner one's ladder step below it, for a later reading that parts them.
+    // Region assembly groups lines by their block. Give each accepted heading and each inner
+    // ladder step its own block, retaining wrapped lines at one level together.
+    let mut next_blocks = pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| line.block_index)
+                .max()
+                .unwrap_or(0)
+                + 1
+        })
+        .collect::<Vec<_>>();
     for (candidate, level) in accepted.iter().zip(&levels) {
         let block = &blocks[candidate.block];
+        let mut block_index = next_blocks[block.page];
+        next_blocks[block.page] += 1;
+        let mut prior_level = None;
         for &slot in &block.line_slots {
             let line = &mut pages[block.page].lines[slot];
             if proposed.contains(&candidate.block) {
                 line.region_type = "heading".to_owned();
             }
-            let step = candidate.level.and_then(|top| {
-                evidence
-                    .levels
-                    .get(&line.id)
-                    .map(|own| own.saturating_sub(top))
-            });
+            let step = (candidate.kind != 2)
+                .then_some(candidate.level)
+                .flatten()
+                .and_then(|top| {
+                    evidence
+                        .levels
+                        .get(&line.id)
+                        .map(|own| own.saturating_sub(top))
+                });
+            let own_level = level.saturating_add(step.unwrap_or(0));
+            if prior_level.is_some_and(|prior| prior != own_level) {
+                block_index = next_blocks[block.page];
+                next_blocks[block.page] += 1;
+            }
+            prior_level = Some(own_level);
+            line.block_index = block_index;
+            evidence.levels.insert(line.id.clone(), own_level);
+        }
+    }
+    // Style classification can reveal more wrapped lines. The resulting block has one level.
+    for (page, line, prior) in join_wrapped_headings(
+        pages,
+        &flash_lines,
+        &doc,
+        &starts,
+        &tagged_levels,
+        &available,
+        evidence.translation,
+    ) {
+        if let Some(level) = evidence.levels.get(&pages[page].lines[prior].id).copied() {
             evidence
                 .levels
-                .insert(line.id.clone(), level + step.unwrap_or(0));
+                .insert(pages[page].lines[line].id.clone(), level);
         }
     }
 }

@@ -715,8 +715,8 @@ fn is_superscript(item: &TextItem, body_size: f64, baseline: f64, inline: bool) 
         || (inline
             && body_size > 0.0
             && item.font_size > 0.0
-            && f64::from(item.font_size) <= body_size * 0.82
-            && item_baseline(item) >= baseline + (body_size * 0.08).max(0.5))
+            // A producer may raise a script without appreciably shrinking its type.
+            && item_baseline(item) >= baseline + (f64::from(item.font_size) * 0.1).max(0.5))
 }
 
 fn line_spans(
@@ -755,10 +755,12 @@ fn line_spans(
                 .iter()
                 .map(|item| item_bbox(item, page_height)),
         );
+        let superscript = is_superscript(item, body_size, baseline, assembled.spans.len() > 1);
         if let (Some(previous), Some(prior_item_index)) = (spans.last_mut(), previous_item_index) {
             let gap_start = previous_byte_end;
             let gap_end = start_byte;
             if same_renderer_span(&text_line.items[prior_item_index], item)
+                && previous.superscript == superscript
                 && text_line.items[prior_item_index].mcid == item.mcid
                 && same_source_text_object(&text_line.items[prior_item_index], item)
                 && assembled.text[gap_start..gap_end]
@@ -773,7 +775,6 @@ fn line_spans(
                 continue;
             }
         }
-        let superscript = is_superscript(item, body_size, baseline, assembled.spans.len() > 1);
         let span = Span {
             mcid: item.mcid,
             structure_role: None,
