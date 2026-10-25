@@ -10,6 +10,7 @@
 
 use super::{bold_char_share, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page};
+use legal_structure_model::{enumerator_interpretations, parse_heading_ladder, EnumeratorInterpretation, HeadingAction};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -73,15 +74,16 @@ fn turn_or_event(text: &str) -> bool {
         || pattern(&RE, r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
 }
 
-/// A label never a heading, with or without its colon: counsel and appearances, the parties and
-/// signatories, a recital's "WHEREAS", a caption's connectives, contact details, a placeholder.
+/// A label never a heading, with or without its colon: counsel and appearances, a litigant's role
+/// (the caption reader's `party_label`) and a contract's parties and signatories, a recital's
+/// "WHEREAS", a caption's connectives, contact details, a placeholder.
 fn label(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, concat!(
+    legal_pdf_headings::party_label().is_match(text) || pattern(&RE, concat!(
         r"(?i)^\W*(?:appearances?|comparutions?|a\s*p\s*p\s*e\s*a\s*r\s*a\s*n\s*c\s*e\s*s|solicitors?\s+of\s+record|counsel(?:\s+of\s+record)?",
         r"|procureurs?(?:\s+inscrits?(?:\s+aux?\s+dossiers?)?)?|also\s+present|parties\s+present\b.*|written\s+representations\s+by",
-        r"|(?:the\s+)?(?:additional\s+)?(?:borrowers?|lenders?|guarantors?|monitor|covenantors?|applicants?|respondents?|appellants?",
-        r"|plaintiffs?|defendants?|interveners?|intervenors?|interested\s+parties|vendors?|purchasers?|assignors?|assignees?)(?:\s*\(s\))?",
+        r"|(?:the\s+)?(?:additional\s+)?(?:borrowers?|lenders?|guarantors?|monitor|covenantors?",
+        r"|vendors?|purchasers?|assignors?|assignees?)(?:\s*\(s\))?",
         r"|whereas|between|and(?:\s+to)?|et\s+entre|entre|of\s+the\s+(?:first|second|third)\s+part|copy\s+to|attention|attn",
         r"|address|adresse|tel(?:ephone)?|phone|fax|t[ée]l[ée]copieur|e-?mail|courriel|(?:court\s+)?file\s+no\.?|our\s+file|your\s+file",
         r"|for\s+(?:further\s+)?(?:information|inquiries)\b.*|intentionally\s+(?:deleted|left\s+blank|omitted)|\[?\s*reserved\s*\]?|not\s+used)",
@@ -96,70 +98,83 @@ fn judge(text: &str) -> bool {
         .is_match(text)
 }
 
-/// A line opening with its division's number in any printed form: a division word ("PART",
-/// "Section", "ARTICLE"), "4.", "4.1", "(a)", "iv.", "B)", or a numeral before capitals
-/// ("V RECOMMENDATIONS", OCR having dropped the stop).
+/// A line opening with its division's number: the parser's own heading enumerators ("4.", "4.1",
+/// "iv.", "B)", alone or before a title), a bracketed one ("(a)", "(1)"), a division word ("PART",
+/// "Section", "ARTICLE"), or a numeral before capitals ("V RECOMMENDATIONS", OCR having dropped the
+/// stop).
 fn numbered(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, concat!(
-        r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\b",
-        r"|\(?[0-9]{1,3}(?:\.[0-9]{1,3})*[.)]?(?:\s|$)|\(?(?:[ivxlc]{1,6}|[IVXLC]{1,6})[.)](?:\s|$)|[IVXLC]{1,4}\s+[A-Z]|\(?[A-Za-z][.)](?:\s|$))"
-    )).is_match(text)
-}
-
-/// A heading's numbering family as its marker prints it: a division word ("article"), a decimal
-/// of its depth and punctuation ("1.", "1.1", "(1)"), roman or letter numerals of either case and
-/// bracketing. A lone I, V, X, L or C is a numeral where the document prints a longer numeral of
-/// that case among its headings (`romans`: capitals, small letters), else a letter.
-fn family(text: &str, romans: (bool, bool)) -> Option<String> {
-    static DIVISION: OnceLock<Regex> = OnceLock::new();
-    static DECIMAL: OnceLock<Regex> = OnceLock::new();
-    static NUMERAL: OnceLock<Regex> = OnceLock::new();
-    static LETTER: OnceLock<Regex> = OnceLock::new();
-    static BARE_NUMERAL: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
-    if let Some(word) = pattern(&DIVISION, r"(?i)^(part|book|title|chapter|division|article|section|schedule|appendix|annex|exhibit|partie|chapitre|annexe)\b").captures(text) {
-        return Some(format!("word:{}", word[1].to_lowercase()));
-    }
-    if let Some(found) = pattern(&DECIMAL, r"^(\(?)(\d{1,3}(?:\.\d{1,3})*)([.)]?)(?:\s|$)").captures(text) {
-        return Some(format!("decimal{}{}{}", found[2].matches('.').count(), &found[3], &found[1]));
-    }
-    if let Some(found) = pattern(&NUMERAL, r"^(\(?)([IVXLC]{2,6}|[ivxlc]{2,6})([.)])(?:\s|$)").captures(text) {
-        return Some(format!("{}{}{}", if found[2].starts_with(char::is_uppercase) { "ROMAN" } else { "roman" }, &found[1], &found[3]));
-    }
-    if let Some(found) = pattern(&LETTER, r"^(\(?)([A-Za-z])([.)])(?:\s|$)").captures(text) {
-        let letter = found[2].chars().next().unwrap_or('a');
-        let numeral = "IVXLCivxlc".contains(letter) && if letter.is_uppercase() { romans.0 } else { romans.1 };
-        let kind = match (numeral, letter.is_uppercase()) {
-            (true, true) => "ROMAN",
-            (true, false) => "roman",
-            (false, true) => "LETTER",
-            (false, false) => "letter",
-        };
-        return Some(format!("{kind}{}{}", &found[1], &found[3]));
-    }
-    pattern(&BARE_NUMERAL, r"^[IVXLC]{1,4}\s+[A-Z]").is_match(text).then(|| "ROMAN".to_owned())
+    super::heading_inline_re().is_match(text)
+        || super::heading_standalone_re().is_match(text)
+        || pattern(&RE, concat!(
+            r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\b",
+            r"|\(\s*(?:\d{1,3}|[a-zA-Z]{1,2}|[ivxlc]{1,6})\s*\)(?:\s|$)|[IVXLC]{1,4}\s+[A-Z])"
+        )).is_match(text)
 }
 
-/// A heading's marker when it is one letter ("C.", "(b)"), in small letters.
-fn lone_letter(text: &str) -> Option<char> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^\s*\(?([A-Za-z])[.)](?:\s|$)").captures(text).and_then(|found| found[1].chars().next()).map(|c| c.to_ascii_lowercase())
+/// Division words whose numbering starts the document's ladder over at its top.
+const ATTACHMENTS: [&str; 5] = ["schedule", "appendix", "annex", "exhibit", "annexe"];
+
+/// A heading's enumerator as the ladder reads it, (value, punctuation): from the parser's own heading
+/// patterns, a bracketed one ("(a)" read as "a" in brackets), or a division word's numeral ("PART IV",
+/// "ARTICLE 5"), the word standing for the punctuation so that each word counts its own family.
+fn enumerator(text: &str) -> Option<(String, String)> {
+    static DIVISION: OnceLock<Regex> = OnceLock::new();
+    static BRACKETED: OnceLock<Regex> = OnceLock::new();
+    let text = text.trim();
+    if let Some(found) = pattern(&DIVISION, r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
+        return Some((found[2].to_owned(), found[1].to_lowercase()));
+    }
+    if let Some(capture) = super::heading_inline_re().captures(text).or_else(|| super::heading_standalone_re().captures(text)) {
+        let (value, punct, _) = super::heading_enumerator(&capture);
+        return Some((value.to_owned(), punct.to_owned()));
+    }
+    pattern(&BRACKETED, r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
 }
 
-/// Attachments stand at a document's top level whatever comes before them.
-fn attachment(family: &str) -> bool {
-    matches!(family, "word:schedule" | "word:appendix" | "word:annex" | "word:exhibit" | "word:annexe")
+/// The levels a run of headings' (or a contents list's entries') enumerators take on the engine's
+/// heading ladder (`parse_heading_ladder`, the Text-Fidelity grammar the readers level numbered
+/// headings with): each enumerator in every family it can be read in ("C." a letter or a numeral), a
+/// skipped value read by its shortest jump, a restart at the top opening a new run, as the readers
+/// split them. An attachment (a schedule, an appendix, an exhibit) stands at the top and starts the
+/// ladder over. Each numbered text's level, and whether it opens a run; None where unnumbered.
+pub(super) fn ladder_levels(texts: &[&str]) -> Vec<Option<(usize, bool)>> {
+    let mut levels = vec![None; texts.len()];
+    let numbered: Vec<(usize, Vec<EnumeratorInterpretation>, bool)> = texts.iter().enumerate().filter_map(|(k, text)| {
+        let (value, punct) = enumerator(text)?;
+        let readings = enumerator_interpretations(&value, &punct);
+        (!readings.is_empty()).then(|| (k, readings, ATTACHMENTS.contains(&punct.as_str())))
+    }).collect();
+    let mut start = 0;
+    while start < numbered.len() {
+        let end = (start + 1..numbered.len()).find(|&n| numbered[n].2).unwrap_or(numbered.len());
+        let run = &numbered[start..end];
+        let readings = || run.iter().map(|(_, readings, _)| readings.as_slice());
+        let mut sets: Vec<usize> = parse_heading_ladder(readings()).assignments.iter().enumerate()
+            .filter(|(_, assignment)| assignment.action == HeadingAction::IllegalRestart && assignment.level == Some(1))
+            .map(|(n, _)| n)
+            .collect();
+        sets.insert(0, 0);
+        sets.push(run.len());
+        sets.dedup();
+        for set in sets.windows(2) {
+            let parsed = parse_heading_ladder(run[set[0]..set[1]].iter().map(|(_, readings, _)| readings.as_slice()));
+            for (n, ((k, _, attachment), assignment)) in run[set[0]..set[1]].iter().zip(&parsed.assignments).enumerate() {
+                let level = if *attachment { Some(1) } else { assignment.level };
+                levels[*k] = level.map(|level| (level, n == 0));
+            }
+        }
+        start = end;
+    }
+    levels
 }
 
-/// Heading levels read as the document's numbering grammar, walking its headings in reading
-/// order: a numbered heading stands at its family's level, which the family's first appearance
-/// sets (one under the heading before it; an attachment at the top); an unnumbered heading keeps
-/// the readers' step from the heading before it. A lone letter a numeral could also be ("C.")
-/// continues the letter run it follows ("B."). A heading the document's own outline or contents
-/// placed (`placed`) keeps the level they gave it, and its family takes that level. Measured on
-/// the gold's headings the parser finds, the steps between consecutive headings come out exact
-/// 85.0% of the time against the readers' 82.1%.
+/// Heading levels once the headings are settled, walking them in reading order: a numbered heading
+/// at its level on the document's heading ladder (`ladder_levels`), the run of the ladder set under
+/// the unnumbered heading that opens it ("I. Introduction" under "Reasons for Judgment"); an
+/// unnumbered heading at the readers' step from the heading before it. A heading the document's
+/// own outline or contents placed (`placed`) keeps the level they gave it.
 fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: &HashMap<String, Option<String>>) -> Vec<(String, usize)> {
     let mut headings: Vec<Vec<&Line>> = Vec::new();
     for page in document {
@@ -171,7 +186,10 @@ fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: 
                 previous = None;
                 continue;
             }
-            let joins = previous.is_some_and(|prior| prior.block_index == line.block_index && levels.get(&prior.id) == levels.get(&line.id));
+            // A line opening with a number of its own is the next heading ("II. Background" over
+            // "A. Sexual Activities"), whatever block holds them both.
+            let joins = previous.is_some_and(|prior| prior.block_index == line.block_index && levels.get(&prior.id) == levels.get(&line.id))
+                && !numbered(line.text.trim());
             match headings.last_mut() {
                 Some(current) if joins => current.push(line),
                 _ => headings.push(vec![line]),
@@ -179,47 +197,32 @@ fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: 
             previous = Some(line);
         }
     }
-    let text = |heading: &[&Line]| heading.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
-    static LONG_NUMERAL: OnceLock<Regex> = OnceLock::new();
-    let long = pattern(&LONG_NUMERAL, r"^\(?(?:([IVXLC]{2,6})|([ivxlc]{2,6}))[.)]");
-    let romans = headings.iter().fold((false, false), |seen, heading| match long.captures(&text(heading)) {
-        Some(found) => (seen.0 || found.get(1).is_some(), seen.1 || found.get(2).is_some()),
-        None => seen,
-    });
+    let texts: Vec<String> = headings.iter()
+        .map(|heading| heading.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" "))
+        .collect();
+    let ladder = ladder_levels(&texts.iter().map(String::as_str).collect::<Vec<_>>());
     let mut out = Vec::new();
-    let (mut family_level, mut last_letter): (HashMap<String, usize>, HashMap<String, char>) = (HashMap::new(), HashMap::new());
-    let (mut prior_level, mut prior_read): (Option<usize>, Option<usize>) = (None, None);
-    for heading in &headings {
-        let words = text(heading);
-        let mut family = family(&words, romans);
-        if let (Some(found), Some(letter)) = (family.clone(), lone_letter(&words)) {
-            // "C." after "B." continues the letters, whatever numerals the document prints.
-            let letters = found.replacen("ROMAN", "LETTER", 1).replacen("roman", "letter", 1);
-            if letters != found && last_letter.get(&letters).is_some_and(|&before| char::from(before as u8 + 1) == letter) {
-                family = Some(letters);
-            }
-            if family.as_deref().is_some_and(|found| found.starts_with(['L', 'l'])) {
-                last_letter.insert(family.clone().unwrap_or_default(), letter);
-            }
-        }
+    // The level the current run of the ladder hangs from.
+    let mut base = 0;
+    let (mut prior_level, mut prior_read, mut prior_numbered): (Option<usize>, Option<usize>, bool) = (None, None, false);
+    for (heading, rung) in headings.iter().zip(ladder) {
         // A line no reader levelled (one these rules raised) sits level with the heading before it.
         let read = levels.get(&heading[0].id).copied().or(prior_read).unwrap_or(1);
-        let level = match family {
-            Some(found) if placed.contains_key(&heading[0].id) => {
-                family_level.entry(found).or_insert(read);
-                read
+        let level = if placed.contains_key(&heading[0].id) {
+            read
+        } else if let Some((step, opens)) = rung {
+            if opens {
+                base = if prior_numbered { 0 } else { prior_level.unwrap_or(0) };
             }
-            None if placed.contains_key(&heading[0].id) => read,
-            Some(found) => *family_level.entry(found.clone()).or_insert_with(|| {
-                if attachment(&found) { 1 } else { prior_level.map_or(1, |level| level + 1) }
-            }),
-            None => match (prior_level, prior_read) {
+            base + step
+        } else {
+            match (prior_level, prior_read) {
                 (Some(level), Some(before)) => (level + read).saturating_sub(before).max(1),
                 _ => read,
-            },
+            }
         };
         out.extend(heading.iter().map(|line| (line.id.clone(), level)));
-        (prior_level, prior_read) = (Some(level), Some(read));
+        (prior_level, prior_read, prior_numbered) = (Some(level), Some(read), rung.is_some());
     }
     out
 }
@@ -255,24 +258,24 @@ fn index_letter(text: &str) -> bool {
     pattern(&RE, r"^\s*(?:<\s*[A-Z0-9]\s*>|-\s*[A-Z]\s*-)\s*$").is_match(text)
 }
 
-/// A number and nothing else ("III.", "4", "(b)"): a heading's numeral on its own line, not a sentence.
+/// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's
+/// numeral on its own line, not a sentence.
 fn bare_number(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^\(?(?:[0-9]{1,3}|[ivxlc]{1,6}|[IVXLC]{1,6}|[A-Za-z])[.)]?$").is_match(text)
+    let numeral = text.trim().trim_end_matches(['.', ')']);
+    crate::paragraphs::marker_only_re().is_match(text)
+        || !numeral.is_empty() && numeral.chars().all(|c| "IVXLCDM".contains(c))
 }
 
 fn capitals(text: &str) -> bool {
-    let mut letters = text.chars().filter(|c| c.is_alphabetic()).peekable();
-    letters.peek().is_some() && letters.all(char::is_uppercase)
+    super::all_caps(text)
 }
 
 fn words(text: &str) -> String {
     text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>().join(" ")
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
-    values.sort_by(f64::total_cmp);
-    values.get(values.len() / 2).copied().unwrap_or(0.0)
+fn median(values: Vec<f64>) -> f64 {
+    super::median(values)
 }
 
 fn quantile(mut values: Vec<f64>, q: f64) -> f64 {
@@ -451,7 +454,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
                 while end < measure.order.len() {
                     let next = &page.lines[measure.order[end]];
                     if next.region_type != "heading" || next.exclude_from_body || next.block_index != first.block_index
-                        || primitives.heading_levels.get(&next.id) != level
+                        || primitives.heading_levels.get(&next.id) != level || numbered(next.text.trim())
                     {
                         break;
                     }

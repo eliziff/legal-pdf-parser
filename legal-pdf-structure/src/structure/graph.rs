@@ -1592,16 +1592,25 @@ pub(super) fn native_graph_parts(
     primitives: &PdfPrimitiveEvidence,
 ) -> Result<Vec<StructureNode>> {
     // A passage wholly in a contents list, or wholly a parallel translation, says so: a
-    // reader of the text's own structure skips it.
+    // reader of the text's own structure skips it. A transcript's line numbers are no part of
+    // what a passage is.
+    let labelled: HashSet<&str> = pages.iter().flat_map(|page| &page.lines)
+        .filter(|line| line.region_type == "line_label").map(|line| line.id.as_str()).collect();
     let role = |line_ids: &[String]| {
         let all =
             |test: &dyn Fn(&String) -> bool| !line_ids.is_empty() && line_ids.iter().all(test);
-        if all(&|id| {
+        let numbered = |id: &String| labelled.contains(id.as_str());
+        let listed = |id: &String| {
             primitives.contents_line_ids.contains(id)
                 || index
                     .line(id)
                     .is_some_and(|line| primitives.contents_pages.contains(&line.page_index))
-        }) {
+        };
+        // Nearly all of it listed: a stray line the paragraph reader took in (a folio it did not
+        // know for one) does not undo a list.
+        let counted = line_ids.iter().filter(|id| !numbered(id)).count();
+        let in_list = line_ids.iter().filter(|id| listed(id)).count();
+        if counted > 0 && in_list * 5 >= counted * 4 {
             Some("contents")
         } else if all(&|id| primitives.translation_line_ids.contains(id)) {
             Some("translation")

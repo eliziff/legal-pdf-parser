@@ -200,10 +200,14 @@ pub(super) fn group_rows(pages: &mut [Page], primitives: &PdfPrimitiveEvidence) 
 
 fn row_of(page: &Page, page_slot: usize, mut band: Vec<&Line>) -> Row {
     let left = band[0].bbox[0];
-    // A locator alone at the row's right, apart from its title.
-    let apart = band.len() > 1
-        && locator_re().is_match(band.last().unwrap().text.trim())
-        && band.last().unwrap().bbox[0] > page.width * 0.5;
+    // A locator alone at the row's right, apart from its title: in the page's right half, or a
+    // gap of its own away (a list set in a narrow column).
+    let apart = band.len() > 1 && {
+        let (last, before) = (band[band.len() - 1], band[band.len() - 2]);
+        let height = (last.bbox[3] - last.bbox[1]).max(1.0);
+        locator_re().is_match(last.text.trim())
+            && (last.bbox[0] > page.width * 0.5 || last.bbox[0] - before.bbox[2] >= 3.0 * height)
+    };
     let (title_lines, locator) = if apart {
         let last = band.pop().unwrap();
         (band, Some(last.text.trim().to_owned()))
@@ -272,9 +276,14 @@ fn listed_entries(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<List
         if lines.is_empty() {
             continue;
         }
-        // Rows with no locator are a title wrapping onto the next row that has one.
+        // Rows with no locator are a title wrapping onto the next row that has one; a row that is
+        // only a locator closes the title above it.
         let mut pending = Vec::<Row>::new();
-        for row in rows_of(page, page_slot, &lines) {
+        for mut row in rows_of(page, page_slot, &lines) {
+            if row.locator.is_none() && !pending.is_empty() && locator_re().is_match(&row.title) {
+                let last = pending.pop().unwrap();
+                row = Row { locator: Some(row.title), title: last.title, left: last.left, page_slot: last.page_slot };
+            }
             match row.locator {
                 Some(locator) => {
                     let (left, title) = match pending.first() {
@@ -311,10 +320,14 @@ fn listed_entries(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<List
     entries
 }
 
-/// The level of each entry: its indent's tier, or where all start at one indent, the order in
-/// which their enumerator families first appear; a plain title under an enumerated list takes the
-/// first level.
+/// The level of each entry: where most entries print an enumerator, their level on the heading
+/// ladder the headings themselves are levelled on (`heading_rules::ladder_levels`); else its
+/// indent's tier. A plain title under an enumerated list takes the first level.
 fn levels(entries: &[Listed]) -> Vec<usize> {
+    let rungs = super::heading_rules::ladder_levels(&entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>());
+    if rungs.iter().filter(|rung| rung.is_some()).count() * 2 >= entries.len() {
+        return rungs.iter().map(|rung| rung.map_or(1, |(level, _)| level.min(MAX_LEVEL))).collect();
+    }
     let mut tiers = entries.iter().map(|entry| entry.left).collect::<Vec<_>>();
     tiers.sort_by(f64::total_cmp);
     tiers.dedup_by(|a, b| (*a - *b).abs() <= INDENT_TOLERANCE);
