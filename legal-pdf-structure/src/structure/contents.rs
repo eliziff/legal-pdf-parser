@@ -121,8 +121,7 @@ pub(super) fn retain_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveE
                         size > 0.0
                             && legal_pdf_core::line_font_size(line)
                                 >= size * super::FONT_HEADING_SIZE_RATIO
-                            && (line.region_type == "heading"
-                                || primitives.font_heading_candidates.contains(&line.id))
+                            && line.region_type == "heading"
                     })
                     .map(|line| line.id.clone()),
             );

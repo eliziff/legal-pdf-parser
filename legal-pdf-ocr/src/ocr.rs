@@ -1,29 +1,12 @@
-use legal_pdf_core::{Error, OcrLine, OcrPageRequest, OcrPageResult, PdfOcrProvider, Result};
-use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-#[cfg(feature = "ocr")]
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, PdfOcrProvider, Result};
 
 #[derive(Debug, Clone)]
 pub enum OcrOptions {
-    Tesseract(TesseractOptions),
-    #[cfg(feature = "indra")]
+    #[cfg(feature = "ocr")]
     Indra(crate::indra::IndraOptions),
 }
 
-impl From<TesseractOptions> for OcrOptions {
-    fn from(options: TesseractOptions) -> Self {
-        Self::Tesseract(options)
-    }
-}
-
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 impl From<crate::indra::IndraOptions> for OcrOptions {
     fn from(options: crate::indra::IndraOptions) -> Self {
         Self::Indra(options)
@@ -31,8 +14,7 @@ impl From<crate::indra::IndraOptions> for OcrOptions {
 }
 
 pub enum OcrProvider {
-    Tesseract(TesseractOcr),
-    #[cfg(feature = "indra")]
+    #[cfg(feature = "ocr")]
     Indra(crate::indra::IndraOcr),
 }
 
@@ -41,8 +23,7 @@ pub struct PreparedOcrProvider {
 }
 
 enum PreparedProvider {
-    Tesseract(PreparedTesseract),
-    #[cfg(feature = "indra")]
+    #[cfg(feature = "ocr")]
     Indra(crate::indra::PreparedIndra),
 }
 
@@ -53,13 +34,7 @@ impl OcrProvider {
 
     pub fn prepare(options: &OcrOptions) -> Result<PreparedOcrProvider> {
         match options {
-            OcrOptions::Tesseract(options) => {
-                let provider = TesseractOcr::prepare(options)?;
-                Ok(PreparedOcrProvider {
-                    provider: PreparedProvider::Tesseract(provider),
-                })
-            }
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             OcrOptions::Indra(options) => {
                 let provider = crate::indra::IndraOcr::prepare(options)?;
                 Ok(PreparedOcrProvider {
@@ -71,32 +46,23 @@ impl OcrProvider {
 
     pub fn from_prepared(options: &OcrOptions, prepared: PreparedOcrProvider) -> Result<Self> {
         match (options, prepared.provider) {
-            (OcrOptions::Tesseract(options), PreparedProvider::Tesseract(prepared)) => Ok(
-                Self::Tesseract(TesseractOcr::from_prepared(options, prepared)),
-            ),
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             (OcrOptions::Indra(options), PreparedProvider::Indra(prepared)) => {
                 crate::indra::IndraOcr::from_prepared(options, prepared).map(Self::Indra)
             }
-            #[cfg(feature = "indra")]
-            _ => Err(Error::Message(
-                "OCR options changed after identity preparation".to_owned(),
-            )),
         }
     }
 
     pub fn identity(&self) -> &str {
         match self {
-            Self::Tesseract(provider) => provider.identity(),
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             Self::Indra(provider) => provider.identity(),
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Self::Tesseract(provider) => provider.name(),
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             Self::Indra(provider) => provider.name(),
         }
     }
@@ -107,8 +73,7 @@ impl OcrProvider {
         requests: &[OcrPageRequest],
     ) -> Result<Vec<OcrPageResult>> {
         match self {
-            Self::Tesseract(provider) => provider.extract_pages(pdf, requests),
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             Self::Indra(provider) => provider.extract_pages(pdf, requests),
         }
     }
@@ -117,16 +82,14 @@ impl OcrProvider {
 impl PreparedOcrProvider {
     pub fn identity(&self) -> &str {
         match &self.provider {
-            PreparedProvider::Tesseract(provider) => &provider.identity,
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             PreparedProvider::Indra(provider) => provider.identity(),
         }
     }
 
     pub fn name(&self) -> &str {
         match &self.provider {
-            PreparedProvider::Tesseract(provider) => &provider.name,
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             PreparedProvider::Indra(provider) => provider.name(),
         }
     }
@@ -142,530 +105,95 @@ impl PdfOcrProvider for OcrProvider {
     }
 
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
-        raster_page_rules(pdf, requests).into_iter().map(|(separator, _)| separator).collect()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TesseractOptions {
-    pub command: Option<PathBuf>,
-    pub language: String,
-    pub dpi: u16,
-    pub psm: u8,
-    pub timeout_seconds: u64,
-    pub expected_identity: Option<String>,
-}
-
-impl Default for TesseractOptions {
-    fn default() -> Self {
-        Self {
-            command: None,
-            language: "eng".to_owned(),
-            dpi: 180,
-            psm: 3,
-            timeout_seconds: 120,
-            expected_identity: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TesseractOcr {
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-    command: PathBuf,
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-    language: String,
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-    dpi: u16,
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-    psm: u8,
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-    timeout: Duration,
-    identity: String,
-    name: String,
-}
-
-struct PreparedTesseract {
-    command: PathBuf,
-    identity: String,
-    name: String,
-}
-
-impl TesseractOcr {
-    pub fn new(options: &TesseractOptions) -> Result<Self> {
-        let prepared = Self::prepare(options)?;
-        Ok(Self::from_prepared(options, prepared))
+        raster_page_rules(pdf, requests).into_iter().map(|reading| reading.separator).collect()
     }
 
-    fn prepare(options: &TesseractOptions) -> Result<PreparedTesseract> {
-        validate_options(options)?;
-        let command = options
-            .command
-            .clone()
-            .or_else(|| std::env::var_os("LEGALPDF_TESSERACT_COMMAND").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("tesseract"));
-        let output = run_checked(
-            &command,
-            &[OsString::from("--version")],
-            Duration::from_secs(10),
-        )?;
-        let version = first_sanitized_line(&output).unwrap_or_else(|| "unknown".to_owned());
-        let identity = format!("tesseract-cli-v1:{version}");
-        if options
-            .expected_identity
-            .as_deref()
-            .is_some_and(|expected| expected != identity)
+    fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<OcrLine>> {
+        #[cfg(feature = "ocr")]
         {
-            return Err(Error::Message(format!(
-                "Tesseract identity changed before OCR began: expected {}, found {identity}",
-                options.expected_identity.as_deref().unwrap_or_default()
-            )));
-        }
-        let name = format!(
-            "{identity}:lang={}:dpi={}:psm={}",
-            options.language, options.dpi, options.psm
-        );
-        Ok(PreparedTesseract {
-            command,
-            identity,
-            name,
-        })
-    }
-
-    fn from_prepared(options: &TesseractOptions, prepared: PreparedTesseract) -> Self {
-        Self {
-            command: prepared.command,
-            language: options.language.clone(),
-            dpi: options.dpi,
-            psm: options.psm,
-            timeout: Duration::from_secs(options.timeout_seconds),
-            identity: prepared.identity,
-            name: prepared.name,
-        }
-    }
-
-    pub fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[cfg(feature = "ocr")]
-    pub(crate) fn extract_pages(
-        &self,
-        bytes: &[u8],
-        requests: &[OcrPageRequest],
-    ) -> Result<Vec<OcrPageResult>> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::vello_cpu::color::palette::css::WHITE;
-        use hayro::{render, RenderCache, RenderSettings};
-        use std::fs;
-        use std::io::Write;
-
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pdf = Pdf::new(bytes.to_vec()).map_err(|error| {
-            Error::Message(format!("OCR renderer could not open PDF: {error:?}"))
-        })?;
-        let cache = RenderCache::new();
-        let interpreter = InterpreterSettings::default();
-        let scale = f32::from(self.dpi) / 72.0;
-        let settings = RenderSettings {
-            x_scale: scale,
-            y_scale: scale,
-            bg_color: WHITE,
-            ..Default::default()
-        };
-        let mut results = Vec::with_capacity(requests.len());
-        for request in requests {
-            let page = pdf.pages().iter().nth(request.page_index).ok_or_else(|| {
-                Error::Message(format!(
-                    "PDF page index is out of range: {}",
-                    request.page_index
-                ))
-            })?;
-            let pixmap = render(page, &cache, &interpreter, &settings);
-            let pixel_width = pixmap.width();
-            let pixel_height = pixmap.height();
-            if pixel_width < 1 || pixel_height < 1 {
-                return Err(Error::Message(format!(
-                    "OCR renderer produced an empty page image for page {}",
-                    request.page_index + 1
-                )));
+            let Some((width, height, gray)) = render_gray_page(pdf, page_index, scale * 72.0) else {
+                return Ok(Vec::new());
+            };
+            let x0 = ((region[0] * scale).floor().max(0.0) as usize).min(width);
+            let x1 = ((region[2] * scale).ceil().max(0.0) as usize).min(width);
+            let y0 = ((region[1] * scale).floor().max(0.0) as usize).min(height);
+            let y1 = ((region[3] * scale).ceil().max(0.0) as usize).min(height);
+            if x1 <= x0 + 4 || y1 <= y0 + 4 {
+                return Ok(Vec::new());
             }
-            let separator_y = raster_separator_y(&pixmap, request.height);
-            let png = pixmap.into_png().map_err(|error| {
-                Error::Message(format!("OCR renderer could not encode page PNG: {error}"))
-            })?;
-            let temporary = temporary_png(request.page_index);
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|source| Error::io(&temporary, source))?;
-            if let Err(source) = file.write_all(&png) {
-                let _ = fs::remove_file(&temporary);
-                return Err(Error::io(&temporary, source));
+            let mut crop = Vec::with_capacity((x1 - x0) * (y1 - y0));
+            for y in y0..y1 {
+                crop.extend_from_slice(&gray[y * width + x0..y * width + x1]);
             }
-            drop(file);
-            let arguments = [
-                temporary.as_os_str().to_owned(),
-                OsString::from("stdout"),
-                OsString::from("-l"),
-                OsString::from(&self.language),
-                OsString::from("--dpi"),
-                OsString::from(self.dpi.to_string()),
-                OsString::from("--psm"),
-                OsString::from(self.psm.to_string()),
-                OsString::from("tsv"),
-            ];
-            let output = run_checked(&self.command, &arguments, self.timeout);
-            let cleanup =
-                fs::remove_file(&temporary).map_err(|source| Error::io(&temporary, source));
-            let output = output?;
-            cleanup?;
-            let text = String::from_utf8_lossy(&output);
-            let lines = tsv_lines(
-                &text,
-                request.width / f64::from(pixel_width),
-                request.height / f64::from(pixel_height),
-                request.width,
-                request.height,
-            );
-            results.push(OcrPageResult {
-                page_index: request.page_index,
-                lines,
-                separator_y,
-            });
-        }
-        Ok(results)
-    }
-
-    #[cfg(not(feature = "ocr"))]
-    pub(crate) fn extract_pages(
-        &self,
-        _pdf: &[u8],
-        _requests: &[OcrPageRequest],
-    ) -> Result<Vec<OcrPageResult>> {
-        Err(Error::Message(
-            "this legalpdf binary was built without the `ocr` feature".to_owned(),
-        ))
-    }
-}
-
-fn validate_options(options: &TesseractOptions) -> Result<()> {
-    if options.language.is_empty()
-        || !options
-            .language
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_+-".contains(character))
-    {
-        return Err(Error::Message(
-            "OCR language must be a Tesseract language code".to_owned(),
-        ));
-    }
-    if !(72..=600).contains(&options.dpi) {
-        return Err(Error::Message(
-            "OCR DPI must be between 72 and 600".to_owned(),
-        ));
-    }
-    if options.psm > 13 {
-        return Err(Error::Message(
-            "Tesseract page segmentation mode must be 0 through 13".to_owned(),
-        ));
-    }
-    if !(1..=3600).contains(&options.timeout_seconds) {
-        return Err(Error::Message(
-            "OCR timeout must be between 1 and 3600 seconds".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn first_sanitized_line(bytes: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(bytes).lines().find_map(|line| {
-        let value: String = line
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .take(200)
-            .collect();
-        let value = value.trim().to_owned();
-        (!value.is_empty()).then_some(value)
-    })
-}
-
-fn run_checked(command: &Path, arguments: &[OsString], timeout: Duration) -> Result<Vec<u8>> {
-    let mut process = Command::new(command);
-    process
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        process.creation_flags(0x0800_0000);
-    }
-    let mut child = process.spawn().map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            Error::Message(
-                "Tesseract was not found; install it or set LEGALPDF_TESSERACT_COMMAND".to_owned(),
-            )
-        } else {
-            Error::io(command, source)
-        }
-    })?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| Error::io(command, source))?
-        {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(Error::Message("Tesseract OCR timed out".to_owned()));
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = join_reader(stdout_reader, command)?;
-    let stderr = join_reader(stderr_reader, command)?;
-    if !status.success() {
-        let detail = first_sanitized_line(&stderr).unwrap_or_else(|| "no error output".to_owned());
-        return Err(Error::Message(format!(
-            "Tesseract OCR failed with exit code {}: {detail}",
-            status
-                .code()
-                .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
-        )));
-    }
-    Ok(stdout)
-}
-
-fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn join_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    command: &Path,
-) -> Result<Vec<u8>> {
-    handle
-        .join()
-        .map_err(|_| Error::Message("Tesseract output reader panicked".to_owned()))?
-        .map_err(|source| Error::io(command, source))
-}
-
-#[cfg(feature = "ocr")]
-static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(feature = "ocr")]
-fn temporary_png(page_index: usize) -> PathBuf {
-    let sequence = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "legalpdf-ocr-{}-{sequence}-p{}.png",
-        std::process::id(),
-        page_index + 1
-    ))
-}
-
-#[derive(Debug)]
-struct TsvWord {
-    order: i64,
-    text: String,
-    bbox: [f64; 4],
-    confidence: f64,
-}
-
-pub(crate) fn tsv_lines(
-    value: &str,
-    x_scale: f64,
-    y_scale: f64,
-    page_width: f64,
-    page_height: f64,
-) -> Vec<OcrLine> {
-    let mut lines = value.lines();
-    let Some(header) = lines.next() else {
-        return Vec::new();
-    };
-    let columns: BTreeMap<&str, usize> = header
-        .trim_end_matches('\r')
-        .split('\t')
-        .enumerate()
-        .map(|(index, name)| (name, index))
-        .collect();
-    let required = [
-        "level",
-        "page_num",
-        "block_num",
-        "par_num",
-        "line_num",
-        "word_num",
-        "left",
-        "top",
-        "width",
-        "height",
-        "conf",
-        "text",
-    ];
-    if required.iter().any(|name| !columns.contains_key(name)) {
-        return Vec::new();
-    }
-    let mut groups: Vec<Vec<TsvWord>> = Vec::new();
-    let mut group_indexes: HashMap<[String; 4], usize> = HashMap::new();
-    for line in lines {
-        let row = line.trim_end_matches('\r').split('\t').collect::<Vec<_>>();
-        let field = |name: &str| -> Option<&str> {
-            columns.get(name).and_then(|index| row.get(*index)).copied()
-        };
-        if field("level") != Some("5") {
-            continue;
-        }
-        let text = field("text").unwrap_or_default().trim();
-        if text.is_empty() {
-            continue;
-        }
-        let Some(left) = field("left").and_then(|item| item.parse::<f64>().ok()) else {
-            continue;
-        };
-        let Some(top) = field("top").and_then(|item| item.parse::<f64>().ok()) else {
-            continue;
-        };
-        let Some(width) = field("width").and_then(|item| item.parse::<f64>().ok()) else {
-            continue;
-        };
-        let Some(height) = field("height").and_then(|item| item.parse::<f64>().ok()) else {
-            continue;
-        };
-        if width <= 0.0 || height <= 0.0 {
-            continue;
-        }
-        let key = ["page_num", "block_num", "par_num", "line_num"]
-            .map(|name| field(name).unwrap_or("0").to_owned());
-        let group_index = if let Some(index) = group_indexes.get(&key) {
-            *index
-        } else {
-            let index = groups.len();
-            group_indexes.insert(key, index);
-            groups.push(Vec::new());
-            index
-        };
-        groups[group_index].push(TsvWord {
-            order: field("word_num")
-                .and_then(|item| item.parse().ok())
-                .unwrap_or(0),
-            text: text.to_owned(),
-            bbox: [
-                (left * x_scale).max(0.0),
-                (top * y_scale).max(0.0),
-                ((left + width) * x_scale).min(page_width),
-                ((top + height) * y_scale).min(page_height),
-            ],
-            confidence: field("conf")
-                .and_then(|item| item.parse().ok())
-                .unwrap_or(0.0),
-        });
-    }
-    groups
-        .into_iter()
-        .filter_map(|mut words| {
-            words.sort_by_key(|word| word.order);
-            let first = words.first()?;
-            let mut bbox = first.bbox;
-            let mut confidence = 0.0;
-            let mut confidence_count = 0_u32;
-            for word in &words {
-                bbox[0] = bbox[0].min(word.bbox[0]);
-                bbox[1] = bbox[1].min(word.bbox[1]);
-                bbox[2] = bbox[2].max(word.bbox[2]);
-                bbox[3] = bbox[3].max(word.bbox[3]);
-                if word.confidence >= 0.0 {
-                    confidence += word.confidence;
-                    confidence_count += 1;
-                }
-            }
-            let mut text = String::new();
-            let mut offset = 0;
-            let recognized_words = words
+            let Some(image) = image::GrayImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, crop) else {
+                return Ok(Vec::new());
+            };
+            let lines = match self {
+                Self::Indra(provider) => provider.recognize_gray_image(&image)?,
+            };
+            Ok(lines
                 .into_iter()
-                .map(|word| {
-                    if !text.is_empty() {
-                        text.push(' ');
-                        offset += 1;
+                .map(|mut line| {
+                    let place = |b: [f64; 4]| {
+                        [(b[0] + x0 as f64) / scale, (b[1] + y0 as f64) / scale, (b[2] + x0 as f64) / scale, (b[3] + y0 as f64) / scale]
+                    };
+                    line.bbox = place(line.bbox);
+                    for word in &mut line.words {
+                        word.bbox = place(word.bbox);
                     }
-                    let start = offset;
-                    offset += word.text.chars().count();
-                    text.push_str(&word.text);
-                    legal_pdf_core::OcrWord {
-                        text: word.text,
-                        bbox: word.bbox,
-                        start,
-                        end: offset,
-                    }
+                    line
                 })
-                .collect();
-            Some(OcrLine {
-                recovered: false,
-                text,
-                bbox,
-                confidence: if confidence_count == 0 {
-                    0.0
-                } else {
-                    (confidence / confidence_count as f64 / 100.0).clamp(0.0, 1.0)
-                },
-                baseline: vec![],
-                boundary: vec![],
-                words: recognized_words,
-                region_id: String::new(),
-                region_type: "unknown".to_owned(),
-                block_index: 0,
-            })
-        })
-        .collect()
+                .collect())
+        }
+        #[cfg(not(feature = "ocr"))]
+        {
+            let _ = (pdf, page_index, region, scale);
+            Ok(Vec::new())
+        }
+    }
 }
 
-/// The rule printed above each requested page's notes, read from the page rendered at 150 dpi
-/// and scanned as the recognizers scan their own renders: for a scan whose text layer is kept,
-/// whose image is read for nothing else.
-/// Each requested page rendered once: the note band's separator rule, and every thin horizontal
-/// stroke on it ([x0, y, x1, y] in page points), which underlines and rules read.
-pub type RasterRules = (Option<f64>, Vec<[f64; 4]>);
+/// One page of `pdf` rendered to 8-bit grey at `dpi`: (width, height, pixels).
+#[cfg(feature = "ocr")]
+fn render_gray_page(pdf: &[u8], page_index: usize, dpi: f64) -> Option<(usize, usize, Vec<u8>)> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{render, RenderCache, RenderSettings};
 
-pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterRules> {
+    let document = Pdf::new(pdf.to_vec()).ok()?;
+    let cache = RenderCache::new();
+    let interpreter = InterpreterSettings::default();
+    let scale = (dpi / 72.0) as f32;
+    let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
+    let pages = document.pages();
+    let page = pages.iter().nth(page_index)?;
+    let pixmap = render(page, &cache, &interpreter, &settings);
+    (pixmap.width() > 0 && pixmap.height() > 0).then(|| (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap)))
+}
+
+/// Each requested page rendered once, at 300 dpi: the resolution scans are made at, where a bold
+/// stem stands two pixels wider than a plain one rather than one (on the structure gold's scans,
+/// stem weight told headings from text at an AUC of 0.89 at 300 dpi against 0.83 at 150, and read
+/// body lines five times as steadily). The note band's separator and the thin strokes are read at
+/// 150 dpi, the 300 dpi render's pixels averaged in fours, as their pixel bounds were set; every
+/// requested line's ink, stroke weight and capital height, and its words' stroke weights, at 300.
+/// For a scan whose text layer is kept, whose image is read for nothing else.
+pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<legal_pdf_core::RasterReading> {
     #[cfg(feature = "ocr")]
     {
         use hayro::hayro_interpret::InterpreterSettings;
         use hayro::hayro_syntax::Pdf;
         use hayro::vello_cpu::color::palette::css::WHITE;
         use hayro::{render, RenderCache, RenderSettings};
+        use legal_pdf_core::RasterReading;
 
         let Ok(document) = Pdf::new(pdf.to_vec()) else {
-            return vec![(None, Vec::new()); requests.len()];
+            return vec![RasterReading::default(); requests.len()];
         };
         let cache = RenderCache::new();
         let interpreter = InterpreterSettings::default();
-        let scale = 150.0 / 72.0;
+        let scale = 300.0 / 72.0;
         let settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
@@ -677,24 +205,165 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
             .iter()
             .map(|request| {
                 let Some(page) = pages.iter().nth(request.page_index) else {
-                    return (None, Vec::new());
+                    return RasterReading::default();
                 };
                 let pixmap = render(page, &cache, &interpreter, &settings);
-                if pixmap.width() == 0 || pixmap.height() == 0 {
-                    return (None, Vec::new());
+                if pixmap.width() < 2 || pixmap.height() < 2 {
+                    return RasterReading::default();
                 }
                 let gray = gray_of(&pixmap);
                 let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
-                (
-                    raster_separator_gray(&gray, width, height, request.height),
-                    thin_strokes(&gray, width, height, request.width / width as f64, request.height / height as f64),
-                )
+                let (sx, sy) = (request.width / width as f64, request.height / height as f64);
+                let (half, half_width, half_height) = halved(&gray, width, height);
+                let (hx, hy) = (request.width / half_width as f64, request.height / half_height as f64);
+                let render = Render { gray: &gray, width, height, sx, sy };
+                RasterReading {
+                    separator: raster_separator_gray(&half, half_width, half_height, request.height),
+                    strokes: thin_strokes(&half, half_width, half_height, hx, hy),
+                    inks: request.lines.iter().map(|b| render.ink(b)).collect(),
+                    weights: request.lines.iter().map(|b| render.weight(b)).collect(),
+                    cap_heights: request.lines.iter().map(|b| render.cap_height(b)).collect(),
+                    word_weights: request.words.iter().map(|words| words.iter().map(|b| render.weight(b)).collect()).collect(),
+                }
             })
             .collect()
     }
     #[cfg(not(feature = "ocr"))]
     {
-        vec![(None, Vec::new()); requests.len()]
+        vec![legal_pdf_core::RasterReading::default(); requests.len()]
+    }
+}
+
+/// A grey render with the points each of its pixels spans (`sx`, `sy`).
+#[cfg(feature = "ocr")]
+struct Render<'a> {
+    gray: &'a [u8],
+    width: usize,
+    height: usize,
+    sx: f64,
+    sy: f64,
+}
+
+#[cfg(feature = "ocr")]
+impl Render<'_> {
+    const DARK: u8 = 128;
+
+    /// A box [x0, y0, x1, y1] in points as the pixel rows and columns it covers, if any.
+    fn pixels(&self, b: &[f64; 4]) -> Option<(usize, usize, usize, usize)> {
+        let x0 = ((b[0] / self.sx).floor().max(0.0) as usize).min(self.width);
+        let x1 = ((b[2] / self.sx).ceil().max(0.0) as usize).min(self.width);
+        let y0 = ((b[1] / self.sy).floor().max(0.0) as usize).min(self.height);
+        let y1 = ((b[3] / self.sy).ceil().max(0.0) as usize).min(self.height);
+        (x1 > x0 && y1 > y0).then_some((x0, x1, y0, y1))
+    }
+
+    fn row(&self, y: usize, x0: usize, x1: usize) -> &[u8] {
+        &self.gray[y * self.width + x0..y * self.width + x1]
+    }
+
+    /// The box's share of dark pixels; a measured box reads at least 0.0001, an empty one 0.
+    fn ink(&self, b: &[f64; 4]) -> f64 {
+        let Some((x0, x1, y0, y1)) = self.pixels(b) else {
+            return 0.0;
+        };
+        let dark: usize = (y0..y1).map(|y| self.row(y, x0, x1).iter().filter(|&&p| p < Self::DARK).count()).sum();
+        (dark as f64 / ((x1 - x0) * (y1 - y0)) as f64).max(0.0001)
+    }
+
+    /// The box's capital height in points: from its row profile, the baseline is the lowest row of
+    /// the dense core (half the busiest row's dark pixels or more) and the top the highest row with
+    /// an eighth of them, so descenders and stray specks count for nothing; 0 for an empty box.
+    fn cap_height(&self, b: &[f64; 4]) -> f64 {
+        let Some((x0, x1, y0, y1)) = self.pixels(b) else {
+            return 0.0;
+        };
+        let profile = (y0..y1)
+            .map(|y| self.row(y, x0, x1).iter().filter(|&&p| p < Self::DARK).count())
+            .collect::<Vec<_>>();
+        let peak = profile.iter().copied().max().unwrap_or(0);
+        let base = profile.iter().rposition(|&count| peak > 0 && count * 2 >= peak);
+        let top = profile.iter().position(|&count| peak > 0 && count * 8 >= peak);
+        match (top, base) {
+            (Some(top), Some(base)) if base >= top => (base + 1 - top) as f64 * self.sy,
+            _ => 0.0,
+        }
+    }
+
+    /// The box's stroke weight: the median horizontal run of dark pixels through it, over the box's
+    /// height in pixels. Horizontal runs cross the letters' stems, so the median reads the stem
+    /// width, which bold type sets about half again as wide; a measured box reads at least 0.0001,
+    /// an empty one 0.
+    fn weight(&self, b: &[f64; 4]) -> f64 {
+        let Some((x0, x1, y0, y1)) = self.pixels(b) else {
+            return 0.0;
+        };
+        let mut runs: Vec<u32> = Vec::new();
+        for y in y0..y1 {
+            let mut run = 0u32;
+            for &p in self.row(y, x0, x1) {
+                if p < Self::DARK {
+                    run += 1;
+                } else if run > 0 {
+                    runs.push(run);
+                    run = 0;
+                }
+            }
+            if run > 0 {
+                runs.push(run);
+            }
+        }
+        if runs.is_empty() {
+            return 0.0001;
+        }
+        runs.sort_unstable();
+        (f64::from(runs[runs.len() / 2]) / (y1 - y0) as f64).max(0.0001)
+    }
+}
+
+/// A grey render at half its resolution, each pixel the mean of the four it covers.
+#[cfg(feature = "ocr")]
+fn halved(gray: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
+    let (half_width, half_height) = (width / 2, height / 2);
+    let mut out = vec![255u8; half_width * half_height];
+    for y in 0..half_height {
+        for x in 0..half_width {
+            let at = |dx: usize, dy: usize| u32::from(gray[(2 * y + dy) * width + 2 * x + dx]);
+            out[y * half_width + x] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4) as u8;
+        }
+    }
+    (out, half_width, half_height)
+}
+
+/// Every page of `pdf` rendered to 8-bit grey at `dpi`: (width, height, pixels) per page, in page
+/// order. The structure gold's synthetic scans are made of these renders.
+pub fn render_gray_pages(pdf: &[u8], dpi: f64) -> Vec<(usize, usize, Vec<u8>)> {
+    #[cfg(feature = "ocr")]
+    {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::vello_cpu::color::palette::css::WHITE;
+        use hayro::{render, RenderCache, RenderSettings};
+
+        let Ok(document) = Pdf::new(pdf.to_vec()) else {
+            return Vec::new();
+        };
+        let cache = RenderCache::new();
+        let interpreter = InterpreterSettings::default();
+        let scale = (dpi / 72.0) as f32;
+        let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
+        document
+            .pages()
+            .iter()
+            .map(|page| {
+                let pixmap = render(page, &cache, &interpreter, &settings);
+                (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap))
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = (pdf, dpi);
+        Vec::new()
     }
 }
 
@@ -766,50 +435,4 @@ fn raster_separator_gray(gray: &[u8], width: usize, height: usize, page_height: 
             .first()
             .map(|rule| rule.y_center_ratio * page_height)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tesseract_options_reject_unsafe_values() {
-        let mut options = TesseractOptions::default();
-        options.language = "eng;rm".to_owned();
-        assert!(validate_options(&options).is_err());
-        options.language = "eng+fra".to_owned();
-        options.dpi = 601;
-        assert!(validate_options(&options).is_err());
-    }
-
-    #[test]
-    fn tsv_words_become_pdf_coordinate_lines() {
-        let value = concat!(
-            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n",
-            "5\t1\t1\t1\t1\t1\t10\t20\t30\t10\t90\tHello\n",
-            "5\t1\t1\t1\t1\t2\t45\t20\t35\t10\t80\tworld\n",
-        );
-        let lines = tsv_lines(value, 0.5, 0.25, 100.0, 100.0);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].text, "Hello world");
-        assert_eq!(lines[0].bbox, [5.0, 5.0, 40.0, 7.5]);
-        assert_eq!(lines[0].confidence, 0.85);
-        assert_eq!(
-            lines[0].words,
-            vec![
-                legal_pdf_core::OcrWord {
-                    text: "Hello".into(),
-                    bbox: [5.0, 5.0, 20.0, 7.5],
-                    start: 0,
-                    end: 5
-                },
-                legal_pdf_core::OcrWord {
-                    text: "world".into(),
-                    bbox: [22.5, 5.0, 40.0, 7.5],
-                    start: 6,
-                    end: 11
-                },
-            ]
-        );
-    }
 }

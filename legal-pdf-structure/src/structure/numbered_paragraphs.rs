@@ -567,8 +567,8 @@ pub(super) fn candidates(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let paragraphs =
-        super::build_paragraphs_with_context(pages_original, &HashMap::new(), primitives);
+    let paragraphs = legal_pdf_support::profile::measure("printed_paragraphs.build_paragraphs", ||
+        super::build_paragraphs_with_context(pages_original, &HashMap::new(), primitives));
     let headings = paragraphs
         .iter()
         .filter(|paragraph| paragraph.region_type == "heading")
@@ -670,7 +670,8 @@ fn append_candidates(
             printing.entry(number).or_default().push(slot);
         }
     }
-    for (number, status, selected) in printed_paragraphs(pages, &lines, &labels, groups, headings) {
+    let printed = legal_pdf_support::profile::measure("printed_paragraphs.plan", || printed_paragraphs(pages, &lines, &labels, groups, headings));
+    for (number, status, selected) in printed {
         let selections = if status == PdfLookupStatus::Found {
             vec![selected]
         } else if status == PdfLookupStatus::Ambiguous {
@@ -831,4 +832,213 @@ pub(super) fn margin_label_ids(pages: &[legal_pdf_core::model::Page]) -> HashSet
                 .map(|line| line.id.clone())
         })
         .collect()
+}
+
+/// A document's own paragraph numbers run on from one another; a number that breaks the run where
+/// the run goes on around it is another text's, quoted (R. v. White, 2020 NSCA 33 sets R. v. L.M.'s
+/// "[14]" and "[15]" between its own "[20]" and "[21]"). Per document context, the body's bracketed
+/// numbers in reading order are sorted by `own_sequence`; a quoted number's paragraph (the composed
+/// paragraph holding its line) is returned, paragraph by paragraph, as the lines of a quotation.
+pub(super) fn foreign_numbered_paragraphs(
+    pages: &[legal_pdf_core::model::Page],
+    primitives: &super::PdfPrimitiveEvidence,
+) -> Vec<Vec<String>> {
+    let paragraphs = super::build_paragraphs_with_context(pages, &HashMap::new(), primitives);
+    let mut paragraph_of = HashMap::<&str, usize>::new();
+    for (k, paragraph) in paragraphs.iter().enumerate() {
+        for id in &paragraph.line_ids {
+            paragraph_of.insert(id.as_str(), k);
+        }
+    }
+    let mut ordered = pages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|page| page.index);
+    let mut labels = BTreeMap::<super::DocumentContext, Vec<(usize, &str)>>::new();
+    // The body's lines of each context in reading order, and each label's place among them.
+    let mut body = BTreeMap::<super::DocumentContext, Vec<&str>>::new();
+    let mut place = HashMap::<&str, usize>::new();
+    let mut text_of = HashMap::<&str, &str>::new();
+    for page in ordered {
+        let mut lines = page
+            .lines
+            .iter()
+            .filter(|line| {
+                !line.exclude_from_body
+                    && line.note_region_mode.is_empty()
+                    && line.region_type == "body"
+                    && !primitives.table_cell_line_ids.contains(&line.id)
+                    && !primitives.contents_line_ids.contains(&line.id)
+            })
+            .collect::<Vec<_>>();
+        lines.sort_by(|a, b| a.reading_order.cmp(&b.reading_order).then_with(|| a.id.cmp(&b.id)));
+        for line in lines {
+            let context = primitives.document_context(&line.id);
+            let lines = body.entry(context).or_default();
+            place.insert(line.id.as_str(), lines.len());
+            text_of.insert(line.id.as_str(), line.text.as_str());
+            lines.push(line.id.as_str());
+            // A bracketed year ("[2008] 2 S.C.R. 3") numbers no paragraph.
+            if let Some(number) = bracket_label(&line.text).filter(|number| *number < 1000) {
+                labels.entry(context).or_default().push((number, line.id.as_str()));
+            }
+        }
+    }
+    let mut foreign = Vec::new();
+    let mut taken = HashSet::new();
+    if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
+        eprintln!("sequence	contexts {}	labels {:?}	paragraphs {}", labels.len(),
+            labels.values().map(|l| l.iter().map(|(n, _)| *n).collect::<Vec<_>>()).collect::<Vec<_>>(), paragraphs.len());
+    }
+    for (context, labels) in labels {
+        let own = own_sequence(&labels.iter().map(|(number, _)| *number).collect::<Vec<_>>());
+        if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
+            eprintln!("sequence	foreign {} of {}	unmapped {}	paragraph ids like {:?}	label ids like {:?}", own.iter().filter(|o| !**o).count(), own.len(),
+                labels.iter().zip(&own).filter(|((_, id), o)| !**o && !paragraph_of.contains_key(*id)).count(),
+                paragraphs.first().and_then(|p| p.line_ids.first()), labels.first().map(|(_, id)| id));
+        }
+        let lines = &body[&context];
+        for (k, ((_, id), own)) in labels.iter().zip(&own).enumerate() {
+            if *own {
+                continue;
+            }
+            // The composed paragraph holding the number; failing that, the number's line through to
+            // the line before the next numbered one.
+            if let Some(&k) = paragraph_of.get(id) {
+                if paragraphs[k].region_type == "heading" || !taken.insert(k) {
+                    continue;
+                }
+                foreign.push(paragraphs[k].line_ids.clone());
+                continue;
+            }
+            // The number's line through to the line before the next numbered one or the next line
+            // that opens an enumerated item, heading or set-apart passage of its own.
+            let start = place[id];
+            let next_label = labels.get(k + 1).and_then(|(_, next)| place.get(next).copied()).unwrap_or(lines.len());
+            let mut end = start + 1;
+            while end < next_label && !opens_item(text_of[lines[end]]) {
+                end += 1;
+            }
+            foreign.push(lines[start..end].iter().map(|id| (*id).to_owned()).collect());
+        }
+    }
+    foreign
+}
+
+/// Which of a reading's bracketed numbers, in order, are the document's own: the members of the
+/// longest chain of consecutive numbers, and of further chains of three or more set wholly before
+/// or after every chain found (numbering that restarts, or resumes past a number the reading lost);
+/// a number set among an own chain's members and on no chain is quoted. Fewer than four numbers
+/// are all the document's own.
+fn own_sequence(values: &[usize]) -> Vec<bool> {
+    let n = values.len();
+    let mut own = vec![true; n];
+    if n < 4 {
+        return own;
+    }
+    let mut decided = vec![false; n];
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| !decided[i] && !spans.iter().any(|&(a, b)| a < i && i < b))
+            .collect();
+        if free.len() < 3 {
+            break;
+        }
+        let mut best = vec![1usize; free.len()];
+        let mut prev = vec![usize::MAX; free.len()];
+        for j in 0..free.len() {
+            for i in 0..j {
+                if values[free[i]] + 1 == values[free[j]] && best[i] + 1 > best[j] {
+                    best[j] = best[i] + 1;
+                    prev[j] = i;
+                }
+            }
+        }
+        let (mut at, len) = best.iter().enumerate().map(|(k, &l)| (k, l)).max_by_key(|&(_, l)| l).unwrap_or((0, 0));
+        if len < 3 {
+            break;
+        }
+        let mut members = Vec::new();
+        loop {
+            members.push(free[at]);
+            if prev[at] == usize::MAX {
+                break;
+            }
+            at = prev[at];
+        }
+        for &m in &members {
+            decided[m] = true;
+        }
+        spans.push((*members.iter().min().unwrap_or(&0), *members.iter().max().unwrap_or(&0)));
+    }
+    // A parallel text prints the whole sequence twice, the second copy interleaved with the first
+    // page by page: a chain among the leftovers inside a span that is at least half the longest
+    // chain's length is a parallel reading, the document's own; quotations are short fragments.
+    let longest = spans.iter().map(|&(a, b)| (a..=b).filter(|&i| decided[i]).count()).max().unwrap_or(0);
+    loop {
+        let free: Vec<usize> = (0..n).filter(|&i| !decided[i] && spans.iter().any(|&(a, b)| a < i && i < b)).collect();
+        if free.len() < 3 {
+            break;
+        }
+        let mut best = vec![1usize; free.len()];
+        let mut prev = vec![usize::MAX; free.len()];
+        for j in 0..free.len() {
+            for i in 0..j {
+                if values[free[i]] + 1 == values[free[j]] && best[i] + 1 > best[j] {
+                    best[j] = best[i] + 1;
+                    prev[j] = i;
+                }
+            }
+        }
+        let (mut at, len) = best.iter().enumerate().map(|(k, &l)| (k, l)).max_by_key(|&(_, l)| l).unwrap_or((0, 0));
+        if len < 3 || len * 2 < longest {
+            break;
+        }
+        loop {
+            decided[free[at]] = true;
+            if prev[at] == usize::MAX {
+                break;
+            }
+            at = prev[at];
+        }
+    }
+    // A scanned parallel text's second copy may read too broken for a chain, but it still runs
+    // upward: when the leftovers inside the spans mostly keep increasing (a non-decreasing
+    // subsequence of at least four fifths of them, five or more), they are the document's own.
+    let leftovers: Vec<usize> = (0..n).filter(|&i| !decided[i] && spans.iter().any(|&(a, b)| a < i && i < b)).collect();
+    if leftovers.len() >= 5 {
+        let mut tails: Vec<usize> = Vec::new();
+        for &i in &leftovers {
+            let at = tails.partition_point(|&t| t <= values[i]);
+            if at == tails.len() { tails.push(values[i]); } else { tails[at] = values[i]; }
+        }
+        if tails.len() * 5 >= leftovers.len() * 4 {
+            return own;
+        }
+    }
+    // A quoted number duplicates one the document itself reaches; a number nothing else prints
+    // is the reading's own, however it broke the chain (a misread digit).
+    let printed: HashSet<usize> = (0..n).filter(|&i| decided[i]).map(|i| values[i]).collect();
+    for &i in &leftovers {
+        if printed.contains(&values[i]) {
+            own[i] = false;
+        }
+    }
+    own
+}
+
+/// A line that opens an enumerated item ("(a)", "1.", "iv)", "•"), a heading-like short capitalised
+/// line, or another numbered paragraph: where a quoted paragraph's extent ends.
+fn opens_item(text: &str) -> bool {
+    let text = text.trim_start();
+    if bracket_label(text).is_some() || text.starts_with(['•', '-', '–', '●', '▪']) {
+        return true;
+    }
+    let head: String = text.chars().take_while(|c| !c.is_whitespace()).collect();
+    let token = head.trim_start_matches('(');
+    let item = token.ends_with([')', '.']) && {
+        let core = token.trim_end_matches([')', '.']);
+        !core.is_empty() && core.chars().count() <= 4
+            && (core.chars().all(|c| c.is_ascii_digit() || c == '.') || core.chars().all(|c| matches!(c, 'a'..='z')) || core.chars().all(|c| matches!(c, 'A'..='Z')))
+    };
+    item || legal_pdf_support::heading_text_plausible(text)
 }

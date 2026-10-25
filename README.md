@@ -133,7 +133,7 @@ records the selected plan, exact model/runtime identity, startup and processing
 time. Parser JSON uses `ocr: {provider: "indra", settings: {model_pack: "...",
 runtime: "..."}}`; omit `settings.backend` for automatic selection. Native
 orientation, word geometry, partial-page regions and bounded page streaming are
-retained. Tesseract layout remains an explicit alternative to learned detection.
+retained.
 
 ## Structure and queries
 

@@ -2,6 +2,8 @@
 mod contract;
 #[cfg(feature = "pdf")]
 mod engine;
+#[cfg(feature = "tagger")]
+mod tagger;
 #[cfg(feature = "pdf")]
 mod supplied_ocr;
 
@@ -22,6 +24,10 @@ pub use engine::{corpus_check_cached_extraction, gold_structure_document};
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
 pub use engine::gold_structure_inputs;
+#[cfg(feature = "ocr")]
+pub use engine::gold_synthetic_inputs;
+#[cfg(feature = "ocr")]
+pub use legal_pdf_ocr::render_gray_pages;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
 pub use legal_pdf_extraction::ExtractedPdf;
@@ -42,15 +48,13 @@ pub use legal_pdf_language::{
     fix_docx_supra_cross_references, has_docx_supra_references, DocxSupraCleanup,
     MAX_DOCX_SUPRA_BYTES,
 };
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 pub use legal_pdf_ocr::{
     IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics,
     IndraLayout, IndraOcr, IndraOptions, IndraTier,
 };
 #[cfg(feature = "ocr")]
-pub use legal_pdf_ocr::{
-    OcrLine, OcrOptions, OcrProvider, OcrWord, TesseractOcr, TesseractOptions,
-};
+pub use legal_pdf_ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_support::{
     to_alr_payload, to_toa_text_units, PdfLookupNote, PdfLookupPage, PdfLookupProposition,

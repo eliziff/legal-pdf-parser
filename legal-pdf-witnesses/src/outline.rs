@@ -1,136 +1,91 @@
-//! Each unit's parent, chosen in reading order among the open units of its own context: a heading
-//! nests under a more prominent heading, a numbered unit under the unit its numbering descends
-//! from, other units under the nearest open heading or lead-in, and the printed contents or
-//! bookmarks place a heading where they name its parent.
+//! Parents follow heading levels, open numbering families and reading order within each
+//! constituent document. Source membership, quotation containers and locators stay unchanged.
 
-use crate::witness::{list_lead_in, median, package_heading, size};
-use legal_pdf_core::model::{Line, Page};
-use legal_structure_model::{NodeKind, NumberingMarker, ScalarRange, ScalarText, StructureNode};
-use regex::Regex;
+use legal_pdf_core::model::Page;
+use legal_structure_model::{
+    NodeKind, NumberingMarker, PrimaryRole, ScalarRange, ScalarText, StructureNode,
+};
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-/// Where a unit's outline lives: its document, quotation, and note, table cell or parallel text.
+/// A unit's document, quotation, and note, table cell or parallel text membership.
 pub type Context = (String, Option<String>, Option<String>);
 
-// Native font sizes and recognized glyph heights need separate baselines.
 #[derive(Clone, Copy)]
-struct BodySizes {
-    font: f64,
-    glyph: f64,
+enum Region {
+    Heading,
+    Text,
+    UnderHeading,
+    ListItem,
+    Quote,
 }
 
-struct Unit {
-    node: usize,
-    context: Context,
-    marker: Option<NumberingMarker>,
-    style: (i32, bool, bool),
-    rank: f32,
-    level: Option<usize>,
-    lead_in: bool,
-    list_intro: bool,
-    opinion: bool,
-    package: bool,
-}
-
-fn heading(node: &StructureNode) -> bool {
-    node.role == Some(legal_structure_model::PrimaryRole::Heading) || node.kind == NodeKind::Heading
-}
-
-/// A judicial byline introduces an opinion, independently of its headings' typography.
-fn opinion_author(value: &str) -> bool {
-    static BYLINE: OnceLock<Regex> = OnceLock::new();
-    BYLINE
-        .get_or_init(|| {
-            Regex::new(
-                r"^(?:\p{Lu}[\p{L}\p{M}.'’&-]*\s+)+(?:J|JJ|C\.?J|C\.?J\.?C|C\.?J\.?O|R\.?S\.?J|S\.?J|J\.?A|JJ\.?A|J\.?C\.?A)\.(?:\s+[A-Z][a-z]{0,4}\.\s+(?:[A-Z]\.)*J\.)?(?:\s*\((?:orally|concurring|dissenting)\))?\s*:$",
+fn outline_region(node: &StructureNode, container: Option<NodeKind>) -> Option<Region> {
+    if matches!(container, Some(NodeKind::Footnote | NodeKind::Endnote))
+        || matches!(
+            node.role,
+            Some(PrimaryRole::Furniture | PrimaryRole::PageLabel | PrimaryRole::LineLabel | PrimaryRole::MarginalNote)
+        )
+        || node.grammar.as_deref() == Some("contents")
+    {
+        return None;
+    }
+    if !matches!(
+        node.kind,
+        NodeKind::Heading
+            | NodeKind::ListItem
+            | NodeKind::Paragraph
+            | NodeKind::Prose
+            | NodeKind::Quote
+            | NodeKind::Table
+    ) && !(node.kind == NodeKind::Section && node.marker_range.is_some())
+    {
+        return None;
+    }
+    Some(
+        if container == Some(NodeKind::Cell) || node.kind == NodeKind::Table {
+            Region::UnderHeading
+        } else if node.role == Some(PrimaryRole::Heading) || node.kind == NodeKind::Heading {
+            Region::Heading
+        } else if node.kind == NodeKind::Quote {
+            Region::Quote
+        } else if matches!(
+            node.role,
+            Some(
+                PrimaryRole::Caption
+                    | PrimaryRole::Headnote
+                    | PrimaryRole::Judges
+                    | PrimaryRole::Counsel
+                    | PrimaryRole::Date
+                    | PrimaryRole::DocketNumber
+                    | PrimaryRole::Court
             )
-            .expect("judicial byline regex")
-        })
-        .is_match(value.trim())
-}
-
-fn outline_unit(node: &StructureNode) -> bool {
-    if matches!(node.role, Some(legal_structure_model::PrimaryRole::Furniture | legal_structure_model::PrimaryRole::PageLabel)) {
-        return false;
-    }
-    matches!(node.kind, NodeKind::Heading | NodeKind::ListItem | NodeKind::Paragraph | NodeKind::Prose)
-        || node.kind == NodeKind::Section && node.marker_range.is_some()
-}
-
-/// The unit's own parts of its text, never the text between them.
-fn membership_text(node: &StructureNode, text: &ScalarText<'_>) -> Option<String> {
-    let ranges = if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges };
-    let ranges = ranges.iter().map(|range| Some(ScalarRange {
-        start: text.utf16_at_scalar(range.start)?,
-        end: text.utf16_at_scalar(range.end)?,
-    })).collect::<Option<Vec<_>>>()?;
-    Some(text.membership_text_utf16(&ranges))
-}
-
-/// The type of the unit's own text on its first line (`source`, that line's place in the text):
-/// its size in hundredths of the body size, and whether most of it is bold and italic.
-fn unit_style(
-    line: &Line,
-    source: ScalarRange,
-    node: &StructureNode,
-    body: BodySizes,
-) -> (i32, bool, bool) {
-    let parts = if node.ranges.is_empty() {
-        std::slice::from_ref(&node.range)
-    } else {
-        &node.ranges
-    };
-    let ranges = parts
-        .iter()
-        .filter_map(|part| {
-            let (start, end) = (part.start.max(source.start), part.end.min(source.end));
-            (start < end).then(|| (start - source.start, end - source.start))
-        })
-        .collect::<Vec<_>>();
-    let coordinates = ScalarText::new(&line.text);
-    let (mut weight, mut relative_size, mut bold, mut italic) = (0usize, 0.0f32, 0usize, 0usize);
-    for span in line.spans.iter().filter(|span| {
-        span.start < span.end && coordinates.slice(span.start..span.end) == Some(span.text.as_str())
-    }) {
-        let count = ranges
-            .iter()
-            .map(|(lo, hi)| span.end.min(*hi).saturating_sub(span.start.max(*lo)))
-            .sum::<usize>();
-        let share = if body.font > 0.0 {
-            (span.size / body.font) as f32
+        ) {
+            Region::UnderHeading
+        } else if node.kind == NodeKind::ListItem {
+            Region::ListItem
         } else {
-            0.0
-        };
-        if count == 0 || share <= 0.0 {
-            continue;
-        }
-        weight += count;
-        relative_size += share * count as f32;
-        bold += usize::from(span.flags & 16 != 0 || span.font.to_lowercase().contains("bold")) * count;
-        italic += usize::from(span.flags & 2 != 0 || span.font.to_lowercase().contains("ital")) * count;
-    }
-    if weight == 0 && size(line) <= 0.0 && !ranges.is_empty() && body.glyph > 0.0 {
-        let ratio = (line.bbox[3] - line.bbox[1]) / body.glyph;
-        return ((ratio * 100.0).round() as i32, false, false);
-    }
-    let weight = weight.max(1) as f32;
-    (
-        (relative_size / weight * 100.0).round() as i32,
-        bold as f32 / weight >= 0.5,
-        italic as f32 / weight >= 0.5,
+            Region::Text
+        },
     )
 }
 
-/// Set every outline unit's parent. `contexts` holds each node's context; a parent link between
-/// contexts is dropped, except table ownership and a quotation's local roots. `navigation` also
-/// names each quotation's introducing source line. `line_range` gives a page line's place in `text`.
+#[derive(Default)]
+struct Outline {
+    headings: Vec<(usize, usize)>,       // (level, node)
+    lists: Vec<(String, Option<usize>)>, // (family, parent)
+    previous: Option<usize>,
+    open_letter: Option<NumberingMarker>,
+}
+
+/// Set ranked units' parents from inferred heading levels and the shared numbering grammar.
+/// Only constituent documents scope the stacks; quotation and object membership stay intact.
+/// The unused source/navigation arguments remain part of this crate's public API.
 pub fn assemble_outline(
     nodes: &mut [StructureNode],
     contexts: &[Context],
     text: &str,
-    pages: &[Page],
-    line_range: &dyn Fn(&str) -> Option<ScalarRange>,
+    _pages: &[Page],
+    _line_range: &dyn Fn(&str) -> Option<ScalarRange>,
     navigation: &HashMap<String, Option<String>>,
     heading_levels: &HashMap<String, usize>,
 ) {
@@ -138,364 +93,108 @@ pub fn assemble_outline(
         captured.navigation.extend(navigation.iter().map(|(line, parent)| (line.clone(), parent.clone())));
         captured.heading_levels.extend(heading_levels.iter().map(|(line, level)| (line.clone(), *level)));
     });
-    let lines = pages
+    let containers = nodes
         .iter()
-        .flat_map(|page| &page.lines)
-        .map(|line| (line.id.as_str(), line))
+        .map(|node| (node.id.as_str(), node.kind))
         .collect::<HashMap<_, _>>();
-    let mut type_lines = HashMap::<Context, HashMap<&str, (f64, f64)>>::new();
-    for (node, context) in nodes
-        .iter()
-        .zip(contexts)
-        .filter(|(node, _)| outline_unit(node))
-    {
-        let own = type_lines.entry(context.clone()).or_default();
-        for id in &node.line_ids {
-            if let Some(line) = lines.get(id.as_str()) {
-                own.entry(id)
-                    .or_insert_with(|| (size(line), line.bbox[3] - line.bbox[1]));
-            }
-        }
-    }
-    let body_sizes = type_lines
-        .into_iter()
-        .map(|(context, lines)| {
-            let body = BodySizes {
-                font: median(
-                    lines
-                        .values()
-                        .map(|(font, _)| *font)
-                        .filter(|font| *font > 0.0)
-                        .collect(),
-                ),
-                glyph: median(
-                    lines
-                        .values()
-                        .filter(|(font, _)| *font <= 0.0)
-                        .map(|(_, glyph)| *glyph)
-                        .filter(|glyph| *glyph > 0.0)
-                        .collect(),
-                ),
-            };
-            (context, body)
-        })
-        .collect::<HashMap<_, _>>();
-    let coordinates = ScalarText::new(text);
     let mut units = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| outline_unit(node))
-        .map(|(node_index, node)| {
-            let source = |id: &String| Some((*lines.get(id.as_str())?, line_range(id)?));
-            let first = node
-                .line_ids
-                .iter()
-                .filter_map(source)
-                .find(|(_, range)| node.content_start.is_none_or(|start| start < range.end))
-                .or_else(|| node.line_ids.first().and_then(source));
-            let own = membership_text(node, &coordinates).unwrap_or_default();
-            let style = first.map_or((0, false, false), |(line, source)| {
-                unit_style(line, source, node, body_sizes[&contexts[node_index]])
-            });
-            let numbered = own.split_whitespace().next()
-                .and_then(|word| legal_pdf_core::layout_analysis().numbering_marker(word, None))
-                .is_some_and(|marker| {
-                    marker.family.split_once(':')
-                        .is_some_and(|(_, count)| count.split('.').all(|part| part == "1"))
-                });
-            let tail = own.trim_end_matches(|c: char| {
-                c.is_whitespace() || "\"')]}\u{201d}\u{2019}".contains(c)
-            });
-            let list_intro = node.role == Some(legal_structure_model::PrimaryRole::Text)
-                && node.kind != NodeKind::ListItem
-                && !tail.ends_with(['.', ';', '?', '!'])
-                && (list_lead_in(&own) || style.1 || numbered);
-            Unit {
-                node: node_index,
-                context: contexts[node_index].clone(),
-                marker: None,
-                style,
-                rank: 0.0,
-                level: node
-                    .line_ids
-                    .iter()
-                    .find_map(|id| heading_levels.get(id).copied()),
-                lead_in: own.trim_end().ends_with(':'),
-                list_intro,
-                opinion: heading(node) && opinion_author(&own),
-                package: heading(node) && package_heading(&own),
-            }
+        .filter_map(|(index, node)| {
+            let container = contexts[index]
+                .2
+                .as_deref()
+                .and_then(|id| id.strip_prefix("object:"))
+                .and_then(|id| containers.get(id).copied());
+            outline_region(node, container).map(|region| (index, region))
         })
         .collect::<Vec<_>>();
-    units.sort_by_key(|unit| {
+    // A quotation container opens before units with the same source start.
+    units.sort_by_key(|&(index, _)| {
         (
-            nodes[unit.node].range.start,
-            nodes[unit.node].range.end,
-            nodes[unit.node].id.clone(),
+            nodes[index].range.start,
+            nodes[index].kind != NodeKind::Quote,
+            nodes[index].range.end,
+            nodes[index].id.clone(),
         )
     });
-    let mut styles = HashMap::<Context, Vec<(i32, bool, bool)>>::new();
-    let mut previous_marker = HashMap::<Context, NumberingMarker>::new();
-    for unit in &mut units {
-        styles.entry(unit.context.clone()).or_default().push(unit.style);
-        let node = &nodes[unit.node];
-        let marker = node.marker_range.and_then(|range| coordinates.slice(range.start..range.end)).or(node.label.as_deref());
-        unit.marker = marker.and_then(|marker| legal_pdf_core::layout_analysis().numbering_marker(marker, previous_marker.get(&unit.context)));
-        if let Some(marker) = &unit.marker {
-            previous_marker.insert(unit.context.clone(), marker.clone());
-        }
-    }
-    // A unit's rank is its type's place among its context's types, most prominent first.
-    for ladder in styles.values_mut() {
-        ladder.sort_unstable_by(|left, right| right.cmp(left));
-        ladder.dedup();
-    }
-    for unit in &mut units {
-        unit.rank = styles[&unit.context].iter().position(|style| style == &unit.style).unwrap_or(0) as f32;
-    }
-    let mut introducers = HashMap::<&str, Vec<usize>>::new();
-    for node in nodes.iter().filter(|node| node.kind == NodeKind::Quote) {
-        if let Some(Some(line)) = navigation.get(&node.id) {
-            introducers.entry(line).or_default();
-        }
-    }
-    for (position, unit) in units.iter().enumerate() {
-        for id in &nodes[unit.node].line_ids {
-            if let Some(owners) = introducers.get_mut(id.as_str()) {
-                owners.push(position);
-            }
-        }
-    }
-    let quote_owners = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| node.kind == NodeKind::Quote)
-        .filter_map(|(position, node)| {
-            let line = navigation.get(&node.id)?.as_deref()?;
-            let owner = introducers
-                .get(line)?
-                .iter()
-                .copied()
-                .filter(|&owner| {
-                    units[owner].context == contexts[position]
-                        && nodes[units[owner].node].range.start < node.range.start
-                })
-                .min_by_key(|&owner| {
-                    let node = &nodes[units[owner].node];
-                    let parts = if node.ranges.is_empty() {
-                        std::slice::from_ref(&node.range)
-                    } else {
-                        &node.ranges
-                    };
-                    let size = parts
-                        .iter()
-                        .map(|part| part.end - part.start)
-                        .sum::<usize>();
-                    let priority = if node.role.is_some() {
-                        0
-                    } else if node.kind == NodeKind::Heading {
-                        1
-                    } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem) {
-                        2
-                    } else {
-                        3
-                    };
-                    (size, priority, owner)
-                })?;
-            Some((position, owner))
-        })
-        .collect::<Vec<_>>();
-    for (quote, owner) in quote_owners {
-        nodes[quote].parent_id = Some(nodes[units[owner].node].id.clone());
-        // The quotation consumes this lead-in; later prose resumes in the enclosing outline.
-        units[owner].lead_in = false;
-        units[owner].list_intro = false;
-    }
-    let quote_positions = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| node.kind == NodeKind::Quote)
-        .map(|(position, node)| (node.id.clone(), position))
-        .collect::<HashMap<_, _>>();
-    let mut heading_targets = HashMap::<&str, Option<usize>>::new();
-    for (position, unit) in units.iter().enumerate().filter(|(_, unit)| heading(&nodes[unit.node])) {
-        heading_targets.insert(nodes[unit.node].id.as_str(), Some(position));
-        for line in &nodes[unit.node].line_ids {
-            heading_targets.entry(line.as_str()).and_modify(|prior| *prior = None).or_insert(Some(position));
-        }
-    }
-    let navigation_claim = |node: &StructureNode| navigation.get(&node.id).or_else(|| node.line_ids.iter()
-        .filter(|line| heading_targets.get(line.as_str()).is_some_and(Option::is_some))
-        .find_map(|line| navigation.get(line)));
-    let mut stacks = HashMap::<Context, Vec<usize>>::new();
-    let mut chosen: Vec<Option<usize>> = vec![None; units.len()];
-    for (position, unit) in units.iter().enumerate() {
-        let stack = stacks.entry(unit.context.clone()).or_default();
-        let node = &nodes[unit.node];
-        // Package divisions close the opinion before their own outline resumes.
-        if unit.package && stack.iter().any(|&candidate| units[candidate].opinion) {
-            stack.clear();
-        }
-        let mut parent = stack.iter().rposition(|&candidate| {
-            let parent = &units[candidate];
-            if heading(node) {
-                return heading(&nodes[parent.node])
-                    && !unit.opinion
-                    && (parent.opinion
-                        || match (parent.level, unit.level) {
-                            (Some(parent), Some(child)) => parent < child,
-                            _ => parent.rank < unit.rank,
-                        });
-            }
-            if let (Some(marker), Some(other)) = (&unit.marker, &parent.marker) {
-                if marker.family == other.family && marker.prefix == other.prefix {
-                    return false;
-                }
-                let mut components = other.prefix.clone();
-                components.push(other.ordinal);
-                if marker.prefix.starts_with(&components) {
-                    return true;
-                }
-                // A newly opened count nests like the shared text parser's numbering stack.
-                if marker.ordinal == 1 && marker.prefix.is_empty() && marker.family != other.family {
-                    return true;
-                }
-            }
-            heading(&nodes[parent.node]) || parent.lead_in
-                || node.kind == NodeKind::ListItem && parent.list_intro
-                    && unit.marker.as_ref().is_some_and(|marker| {
-                        marker.ordinal == 1 && marker.prefix.is_empty()
-                    })
-        }).map(|index| stack[index]);
-        // A sibling closes itself and its descendants while retaining its enclosing ancestors.
-        if let Some(sibling) = unit.marker.as_ref().and_then(|marker| stack.iter().rev().find(|&&candidate|
-            units[candidate].marker.as_ref().is_some_and(|other| marker.family == other.family && marker.prefix == other.prefix))) {
-            parent = chosen[*sibling];
-        }
-        let navigation_parent = navigation_claim(node).and_then(|claimed| match claimed {
-            None => Some(None),
-            Some(line) => heading_targets.get(line.as_str()).copied().flatten()
-                .filter(|&parent| parent < position && units[parent].context == unit.context).map(Some),
-        });
-        if let Some(claimed) = navigation_parent.filter(|claimed| claimed.is_none_or(|parent| stack.contains(&parent))) {
-            parent = claimed;
-        }
-        chosen[position] = parent;
-        match parent.map(|parent| (parent, stack.iter().position(|&p| p == parent))) {
-            Some((_, Some(at))) => stack.truncate(at + 1),
-            // A parent off the stack reopens its own ancestry.
-            Some((parent, None)) => {
-                stack.clear();
-                let mut ancestor = Some(parent);
-                while let Some(at) = ancestor {
-                    stack.push(at);
-                    ancestor = chosen[at];
-                }
-                stack.reverse();
-            }
-            None => stack.clear(),
-        }
-        stack.push(position);
-    }
-    // A section and its first subsection can share one unit. Later subsections and their
-    // marginal notes belong to that unit until a heading or the next numbered section.
-    // Keep one open section per context, including each side of a parallel text.
-    let mut sections = HashMap::<Context, (usize, Option<usize>)>::new();
-    for (position, unit) in units.iter().enumerate() {
-        if heading(&nodes[unit.node]) {
-            if let Some(&(_, Some(parent))) = sections.get(&unit.context) {
-                // A less prominent marginal title can continue the open section's subsections.
-                if heading(&nodes[units[parent].node])
-                    && units[parent].rank < unit.rank
-                    && !unit.package
-                    && !unit.opinion
-                    && navigation_claim(&nodes[unit.node]).is_none()
+    let mut parents = vec![None; nodes.len()];
+    let coordinates = ScalarText::new(text);
+    let mut documents = HashMap::<&str, Outline>::new();
+    for (index, region) in units {
+        let outline = documents.entry(&contexts[index].0).or_default();
+        let heading = outline.headings.last().map(|&(_, node)| node);
+        let parent = match region {
+            Region::Heading => {
+                let level = nodes[index]
+                    .line_ids
+                    .iter()
+                    .find_map(|id| heading_levels.get(id).copied())
+                    .unwrap_or(1);
+                while outline
+                    .headings
+                    .last()
+                    .is_some_and(|&(open, _)| open >= level)
                 {
-                    let subsection = units[position + 1..]
-                        .iter()
-                        .find(|next| next.context == unit.context)
-                        .and_then(|next| membership_text(&nodes[next.node], &coordinates))
-                        .and_then(|text| {
-                            text.split_whitespace().next().and_then(|word| {
-                                legal_pdf_core::layout_analysis().numbering_marker(word, None)
-                            })
-                        })
-                        .is_some_and(|marker| {
-                            (marker.ordinal > 1 || !marker.prefix.is_empty())
-                                && marker.family.split_once(':').is_some_and(|(wrap, count)| {
-                                    wrap == "()" && count.split('.').all(|part| part == "1")
-                                })
-                        });
-                    if subsection {
-                        chosen[position] = Some(parent);
-                        continue;
-                    }
+                    outline.headings.pop();
                 }
+                let parent = outline.headings.last().map(|&(_, node)| node);
+                outline.headings.push((level, index));
+                outline.lists.clear();
+                outline.open_letter = None;
+                parent
             }
-            sections.remove(&unit.context);
-            continue;
-        }
-        let own = membership_text(&nodes[unit.node], &coordinates).unwrap_or_default();
-        let mut words = own.split_whitespace();
-        let number = words
-            .next()
-            .and_then(|word| legal_pdf_core::layout_analysis().numbering_marker(word, None))
-            .is_some_and(|marker| {
-                marker.family.split_once(':').is_some_and(|(wrap, count)| {
-                    matches!(wrap, "" | ".") && count.split('.').all(|part| part == "1")
-                })
-            });
-        if number {
-            sections.remove(&unit.context);
-            if words.next() == Some("(1)") {
-                sections.insert(unit.context.clone(), (position, chosen[position]));
+            Region::Text => {
+                outline.lists.clear();
+                outline.open_letter = None;
+                heading
             }
-        } else if let Some(&(section, parent)) = sections.get(&unit.context) {
-            if chosen[position] == parent {
-                chosen[position] = Some(section);
-            }
-        }
-    }
-    for (position, unit) in units.iter().enumerate() {
-        let parent = chosen[position]
-            .map(|parent| units[parent].node)
-            .or_else(|| {
-                let quote = unit
-                    .context
-                    .1
+            Region::UnderHeading => heading,
+            Region::ListItem => {
+                let node = &nodes[index];
+                let marker = node
+                    .marker_range
+                    .and_then(|range| coordinates.slice(range.start..range.end))
+                    .or(node.label.as_deref());
+                let marker = marker.and_then(|value| {
+                    legal_pdf_core::layout_analysis()
+                        .numbering_marker(value, outline.open_letter.as_ref())
+                });
+                let family = marker.as_ref().map_or("", |marker| marker.family.as_str());
+                let found = outline
+                    .lists
+                    .iter()
+                    .rposition(|(open, _)| !family.is_empty() && open == family);
+                let parent = if let Some(at) = found {
+                    let parent = outline.lists[at].1;
+                    outline.lists.truncate(at + 1);
+                    parent
+                } else if family.is_empty() && !outline.lists.is_empty() {
+                    outline.lists.last().unwrap().1
+                } else {
+                    let parent = outline.previous.or(heading);
+                    outline.lists.push((family.to_owned(), parent));
+                    parent
+                };
+                if marker
                     .as_ref()
-                    .and_then(|id| quote_positions.get(id))
-                    .copied()?;
-                (contexts[quote].0 == unit.context.0 && contexts[quote].2 == unit.context.2)
-                    .then_some(quote)
-            });
-        nodes[unit.node].parent_id = parent.map(|parent| nodes[parent].id.clone());
-    }
-    let positions = nodes.iter().enumerate().map(|(position, node)| (node.id.clone(), position)).collect::<HashMap<_, _>>();
-    for position in 0..nodes.len() {
-        let Some(parent) = nodes[position]
-            .parent_id
-            .as_ref()
-            .map(|id| positions.get(id).copied())
-        else {
-            continue;
+                    .is_some_and(|marker| marker.family.rsplit(':').next() == Some("a"))
+                {
+                    outline.open_letter = marker;
+                }
+                parent
+            }
+            Region::Quote => outline.previous.and_then(|previous| {
+                if nodes[previous].kind == NodeKind::Quote {
+                    parents[previous]
+                } else {
+                    Some(previous)
+                }
+            }),
         };
-        let grid = parent.is_some_and(|parent| {
-            matches!(
-                (nodes[position].kind, nodes[parent].kind),
-                (NodeKind::Cell, NodeKind::Row) | (NodeKind::Row, NodeKind::Table)
-            )
-        });
-        let quotation = parent.is_some_and(|parent| {
-            nodes[parent].kind == NodeKind::Quote
-                && contexts[position].1.as_deref() == Some(nodes[parent].id.as_str())
-                && contexts[position].0 == contexts[parent].0
-                && contexts[position].2 == contexts[parent].2
-        });
-        if !grid && !quotation && parent.is_none_or(|parent| contexts[parent] != contexts[position])
-        {
-            nodes[position].parent_id = None;
-        }
+        parents[index] = parent;
+        nodes[index].parent_id = parent.map(|parent| nodes[parent].id.clone());
+        outline.previous = Some(index);
     }
 }
 

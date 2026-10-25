@@ -66,6 +66,8 @@ fn line_center_y(line: &Line) -> f64 {
     (line.bbox[1] + line.bbox[3]) / 2.0
 }
 
+/// A page's grid of short lines in rows and columns, read for its contents list: a contents
+/// page's titles and page numbers. Tables themselves are pdf-inspector's (legal_pdf_tables).
 #[derive(Default)]
 pub(super) struct TableEvidence {
     pub(super) lines: HashSet<usize>,
@@ -75,10 +77,6 @@ pub(super) struct TableEvidence {
     numeric_cells: usize,
     cells: usize,
     top: f64,
-    bottom: f64,
-    left: f64,
-    right: f64,
-    line_height: f64,
 }
 
 impl TableEvidence {
@@ -90,163 +88,57 @@ impl TableEvidence {
         self.rows >= 6 && self.columns >= 2 && self.numeric_cells * 10 >= self.cells
     }
 
-    pub(super) fn reaches_page_bottom(&self, page_height: f64) -> bool {
-        page_height > 0.0 && self.bottom >= page_height * 0.70
-    }
-
     pub(super) fn continuation_on_page(&self, page_height: f64) -> bool {
         page_height > 0.0 && self.top <= page_height * 0.30 && self.continuation()
     }
-
-    pub(super) fn expanded_lines(
-        &self,
-        lines: &[Line],
-        page_height: f64,
-        continuation: bool,
-        separator: Option<f64>,
-    ) -> HashSet<usize> {
-        if self.lines.is_empty() {
-            return HashSet::new();
-        }
-        let top = if continuation {
-            lines
-                .iter()
-                .filter(|line| {
-                    has_valid_bbox(line)
-                        && !line.exclude_from_body
-                        && line.bbox[1] >= page_height * 0.08
-                        && line.bbox[1] <= self.top
-                })
-                .map(|line| line.bbox[1])
-                .min_by(f64::total_cmp)
-                .unwrap_or(self.top)
-        } else {
-            self.top
-        };
-        let table_size = p50(self
-            .lines
-            .iter()
-            .map(|index| line_font_size(&lines[*index]))
-            .filter(|size| *size > 0.0)
-            .collect());
-        let bottom = separator
-            .filter(|cut| {
-                *cut > top
-                    && lines
-                        .iter()
-                        .filter(|line| has_valid_bbox(line) && line.bbox[1] >= *cut)
-                        .min_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]))
-                        .is_some_and(|next| {
-                            let gap = next.bbox[1] - cut;
-                            gap >= self.line_height * 1.5
-                                && (gap >= self.line_height * 4.0
-                                    || (table_size > 0.0
-                                        && line_font_size(next) <= table_size * 0.90))
-                        })
-            })
-            .unwrap_or(self.bottom);
-        lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                (has_valid_bbox(line)
-                    && !line.exclude_from_body
-                    && line.bbox[3] >= top - self.line_height
-                    && line.bbox[1] <= bottom
-                    && line.bbox[2] >= self.left
-                    && line.bbox[0] <= self.right)
-                    .then_some(index)
-            })
-            .collect()
-    }
-
-    pub(super) fn table_note_lines(
-        &self,
-        lines: &[Line],
-        cells: &HashSet<usize>,
-    ) -> HashSet<usize> {
-        let anchors: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                let prefix = label_prefix(&line.text)?;
-                let symbolic = prefix
-                    .label
-                    .chars()
-                    .all(|character| !character.is_ascii_digit());
-                let tail = scalar_suffix(&line.text, prefix.end);
-                (symbolic
-                    && tail
-                        .chars()
-                        .filter(|character| character.is_alphabetic())
-                        .count()
-                        >= 4
-                    && ((!self.lines.contains(&index) && cells.contains(&index))
-                        || (line.bbox[1] > self.bottom
-                            && line.bbox[1] <= self.bottom + self.line_height * 3.0)))
-                    .then_some(index)
-            })
-            .collect();
-        let mut notes: HashSet<_> = anchors.iter().copied().collect();
-        for anchor in anchors {
-            let mut bottom = lines[anchor].bbox[3];
-            let mut following: Vec<_> = lines
-                .iter()
-                .enumerate()
-                .filter(|(index, line)| *index != anchor && line.bbox[1] >= lines[anchor].bbox[1])
-                .collect();
-            following.sort_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]));
-            for (index, line) in following {
-                if line.bbox[1] - bottom > self.line_height * 1.6
-                    || cells.contains(&index)
-                    || has_table_caption(std::slice::from_ref(line))
-                {
-                    break;
-                }
-                notes.insert(index);
-                bottom = bottom.max(line.bbox[3]);
-            }
-        }
-        notes
-    }
 }
 
-pub(super) fn strong_table_evidence(evidence: &TableEvidence, lines: &[Line]) -> bool {
-    let mut prior = None;
-    let mut run = 0;
-    let mut longest = 0;
-    for line in lines {
-        let Some(prefix) = label_prefix(&line.text) else {
-            continue;
-        };
-        let Ok(label) = prefix.label.parse::<u32>() else {
-            continue;
-        };
-        if !scalar_suffix(&line.text, prefix.end)
-            .chars()
-            .any(char::is_alphabetic)
-        {
-            continue;
-        }
-        run = if prior.is_some_and(|value| (1..=3).contains(&label.saturating_sub(value))) {
-            run + 1
-        } else {
-            1
-        };
-        longest = longest.max(run);
-        prior = Some(label);
+/// Notes to a table: a line set just below where a table ends on the page that opens with a
+/// symbol mark ("*", "†", "a)") over words, and the lines set close under it.
+pub(super) fn table_note_lines(lines: &[Line], cells: &HashSet<usize>, ends: &[f64]) -> HashSet<usize> {
+    let line_height = p50(cells
+        .iter()
+        .map(|index| lines[*index].bbox[3] - lines[*index].bbox[1])
+        .filter(|height| *height > 0.0)
+        .collect());
+    if ends.is_empty() || line_height <= 0.0 {
+        return HashSet::new();
     }
-    evidence.strong()
-        && longest < 3
-        && lines
+    let anchors: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let prefix = label_prefix(&line.text)?;
+            let symbolic = prefix.label.chars().all(|character| !character.is_ascii_digit());
+            let tail = scalar_suffix(&line.text, prefix.end);
+            (symbolic
+                && tail.chars().filter(|character| character.is_alphabetic()).count() >= 4
+                && !cells.contains(&index)
+                && ends.iter().any(|bottom| line.bbox[1] > *bottom && line.bbox[1] <= bottom + line_height * 3.0))
+                .then_some(index)
+        })
+        .collect();
+    let mut notes: HashSet<_> = anchors.iter().copied().collect();
+    for anchor in anchors {
+        let mut bottom = lines[anchor].bbox[3];
+        let mut following: Vec<_> = lines
             .iter()
             .enumerate()
-            .filter(|(index, line)| {
-                standalone_note_label(line) && aligned_note_body_index(lines, *index).is_some()
-            })
-            .take(3)
-            .count()
-            < 3
+            .filter(|(index, line)| *index != anchor && line.bbox[1] >= lines[anchor].bbox[1])
+            .collect();
+        following.sort_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]));
+        for (index, line) in following {
+            if line.bbox[1] - bottom > line_height * 1.6
+                || cells.contains(&index)
+                || has_table_caption(std::slice::from_ref(line))
+            {
+                break;
+            }
+            notes.insert(index);
+            bottom = bottom.max(line.bbox[3]);
+        }
+    }
+    notes
 }
 
 pub(super) fn has_table_caption(lines: &[Line]) -> bool {
@@ -260,8 +152,10 @@ pub(super) fn has_table_caption(lines: &[Line]) -> bool {
 pub(super) struct TableReadings;
 
 impl legal_pdf_tables::TableLayout for TableReadings {
-    fn contents_grid(&self, lines: &[Line], page_width: f64) -> bool {
-        contents_grid(lines, page_width)
+    /// A recognized page's lines are no measure of its white space, unless they stand in a plain
+    /// grid of rows, columns and figures.
+    fn white_space(&self, page: &Page) -> bool {
+        page.source != "ocr" || table_evidence(&page.lines, page.width).strong()
     }
 
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool> {
@@ -416,22 +310,6 @@ pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
             .map(|index| lines[*index].bbox[1])
             .min_by(f64::total_cmp)
             .unwrap_or(0.0),
-        bottom: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[3])
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        left: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[0])
-            .min_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        right: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[2])
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        line_height: height,
         lines: dense_lines,
         rows: row_count,
         columns: column_count,
@@ -1354,9 +1232,8 @@ pub(super) fn order_pages(pages: &mut [Page]) -> Vec<Diagnostic> {
     pages
         .iter_mut()
         .flat_map(|page| {
-            let evidence = table_evidence(&page.lines, page.width);
-            let table_page =
-                has_table_caption(&page.lines) || strong_table_evidence(&evidence, &page.lines);
+            let table_page = has_table_caption(&page.lines)
+                || !legal_pdf_tables::document_tables(std::slice::from_ref(page), &HashSet::new(), &TableReadings).0.is_empty();
             order_page(page, table_page, &HashSet::new())
         })
         .collect()
@@ -1403,4 +1280,115 @@ pub(super) fn build_regions(pages: &mut [Page]) {
             });
         }
     }
+}
+
+fn marker_alone() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:\(?(?:\d{1,3}(?:\.\d{1,3}){0,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})[.)]|\(\s*(?:\d{1,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})\s*\)|[•·▪◦●○■□➢✓\-–—*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$")
+            .expect("detached marker regex")
+    })
+}
+
+/// A clause's decimal number standing alone, as contracts print it in a column of its own
+/// ("3.05", "*1.04" for an amended clause, "10.01 (a)" with its first item).
+fn decimal_alone() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*\*?\d{1,3}(?:\.\d{1,3}){1,3}(?:\s*\(\s*(?:\d{1,3}|[A-Za-z]{1,2}|[ivxlc]{1,6})\s*\))?\s*$")
+            .expect("decimal marker regex")
+    })
+}
+
+/// A numbering marker printed on a line of its own ("11.", "(a)", "•", "3.05") belongs to the
+/// line that carries its text: the nearest line to its right on the same row, within six line
+/// heights. A bare decimal joins only words (a letter, bracket or quote first), never a table's
+/// next figure. The marker joins the front of that line, which keeps its identity; the marker's
+/// line goes. Returns the number of joins.
+pub(super) fn join_detached_markers(page: &mut Page) -> usize {
+    let height = |line: &Line| (line.bbox[3] - line.bbox[1]).max(0.1);
+    let alone = |line: &Line| marker_alone().is_match(&line.text) || decimal_alone().is_match(&line.text);
+    let mut joins: Vec<(usize, usize)> = Vec::new(); // (marker, body)
+    let mut taken: HashSet<usize> = HashSet::new();
+    for (m, marker) in page.lines.iter().enumerate() {
+        let decimal = decimal_alone().is_match(&marker.text);
+        if !has_valid_bbox(marker) || marker.text.chars().count() > 12 || !(decimal || marker_alone().is_match(&marker.text)) {
+            continue;
+        }
+        let h = height(marker);
+        let mut best: Option<(f64, usize)> = None;
+        for (b, body) in page.lines.iter().enumerate() {
+            if b == m || taken.contains(&b) || !has_valid_bbox(body) || alone(body) {
+                continue;
+            }
+            if decimal && !body.text.trim_start().starts_with(|c: char| c.is_alphabetic() || matches!(c, '(' | '"' | '“' | '\'' | '‘')) {
+                continue;
+            }
+            let overlap = body.bbox[3].min(marker.bbox[3]) - body.bbox[1].max(marker.bbox[1]);
+            let gap = body.bbox[0] - marker.bbox[2];
+            if overlap >= 0.5 * h.min(height(body)) && gap >= -0.25 * h && gap <= 6.0 * h {
+                if best.is_none_or(|(g, _)| gap < g) {
+                    best = Some((gap, b));
+                }
+            }
+        }
+        if let Some((_, b)) = best {
+            taken.insert(b);
+            joins.push((m, b));
+        }
+    }
+    if joins.is_empty() {
+        return 0;
+    }
+    let mut removed: HashSet<usize> = HashSet::new();
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    for &(m, b) in &joins {
+        let marker = page.lines[m].clone();
+        let body = &mut page.lines[b];
+        let prefix = marker.text.trim().to_owned();
+        let shift = prefix.chars().count() + 1;
+        let mut text = prefix.clone();
+        text.push(' ');
+        text.push_str(&body.text);
+        body.text = text;
+        for span in &mut body.spans {
+            span.start += shift;
+            span.end += shift;
+        }
+        for word in &mut body.words {
+            word.start += shift;
+            word.end += shift;
+        }
+        let lead = marker.text.chars().count() - marker.text.trim_start().chars().count();
+        let mut marker_spans = marker.spans;
+        for span in &mut marker_spans {
+            span.start = span.start.saturating_sub(lead).min(prefix.chars().count());
+            span.end = span.end.saturating_sub(lead).min(prefix.chars().count());
+        }
+        let mut marker_words = marker.words;
+        for word in &mut marker_words {
+            word.start = word.start.saturating_sub(lead).min(prefix.chars().count());
+            word.end = word.end.saturating_sub(lead).min(prefix.chars().count());
+        }
+        marker_spans.append(&mut body.spans);
+        body.spans = marker_spans;
+        marker_words.append(&mut body.words);
+        body.words = marker_words;
+        body.bbox = union_bbox([marker.bbox, body.bbox]);
+        removed.insert(m);
+        renamed.insert(marker.id, body.id.clone());
+    }
+    for region in &mut page.regions {
+        region.line_ids.retain(|id| !renamed.contains_key(id));
+    }
+    if let Some(id) = page.printed_label_line_id.as_ref().and_then(|id| renamed.get(id)) {
+        page.printed_label_line_id = Some(id.clone());
+    }
+    let mut index = 0usize;
+    page.lines.retain(|_| {
+        let keep = !removed.contains(&index);
+        index += 1;
+        keep
+    });
+    removed.len()
 }

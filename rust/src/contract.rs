@@ -1,11 +1,11 @@
 use crate::engine::{parse_pdf, ParseOptions};
-#[cfg(feature = "indra")]
+#[cfg(feature = "ocr")]
 use crate::IndraOptions;
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
 use crate::PPDocOptions;
 use crate::{Error, PdfLookupRequest, PdfStructureLookup, Result};
 #[cfg(feature = "ocr")]
-use crate::{OcrOptions, TesseractOptions};
+use crate::OcrOptions;
 pub use legal_pdf_support::{PdfDocument, PdfSummary};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -53,18 +53,13 @@ pub struct PdfRequest {
 #[derive(Deserialize)]
 #[serde(tag = "provider", deny_unknown_fields)]
 enum OcrRequest {
-    #[serde(rename = "tesseract")]
-    Tesseract {
-        #[serde(default)]
-        settings: TesseractOptions,
-    },
-    #[cfg(feature = "indra")]
+    #[cfg(feature = "ocr")]
     #[serde(rename = "indra")]
     Indra {
         #[serde(default)]
         settings: IndraOptions,
     },
-    #[cfg(not(feature = "indra"))]
+    #[cfg(not(feature = "ocr"))]
     #[serde(rename = "indra")]
     Indra {
         #[serde(rename = "settings", default = "ignored_any")]
@@ -83,7 +78,7 @@ enum LayoutRequest {
     },
 }
 
-#[cfg(all(feature = "ocr", not(feature = "indra")))]
+#[cfg(all(feature = "ocr", not(feature = "ocr")))]
 fn ignored_any() -> serde::de::IgnoredAny {
     serde::de::IgnoredAny
 }
@@ -151,10 +146,9 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     #[cfg(feature = "ocr")]
     if let Some(request) = &request.ocr {
         options.ocr = match request {
-            OcrRequest::Tesseract { settings } => Some(OcrOptions::Tesseract(settings.clone())),
-            #[cfg(feature = "indra")]
+            #[cfg(feature = "ocr")]
             OcrRequest::Indra { settings } => Some(OcrOptions::Indra(settings.clone())),
-            #[cfg(not(feature = "indra"))]
+            #[cfg(not(feature = "ocr"))]
             OcrRequest::Indra { .. } => {
                 return Err(Error::Message(
                     "indra requires a legalpdf binary built with the indra feature"

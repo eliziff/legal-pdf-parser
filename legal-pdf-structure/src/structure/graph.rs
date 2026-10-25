@@ -2,7 +2,7 @@ use super::{
     arabic_page_number, body_flow_edge, continues_prose, scalar_suffix, sentence_ended,
     starts_note_or_list, DocumentContext, PdfPrimitiveEvidence,
 };
-use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan};
+use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan, Span, Word};
 use legal_structure_model::structure_analysis;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_support::{has_citation_signal, protected_citation_spans};
@@ -59,11 +59,28 @@ impl PdfTextIndex {
             });
             let mut page_start = None;
             let mut page_end = scalar_cursor;
+            let mut previous: Option<&Line> = None;
+            let line_numbers = line_labels(page).map(|line| line.id.as_str()).collect::<HashSet<_>>();
             for line in ordered_lines {
                 if !lines.is_empty() {
-                    text.push('\n');
+                    // A number set on a line of its own with its paragraph beside it on the same row
+                    // ("1." then "In this decision ...", a hanging "[35]" read apart from its text) reads
+                    // as one printed line: the grammars see "1. In this decision ...", and the ranges
+                    // still fall on their own source lines. A transcript's line number stays apart.
+                    let beside = previous.is_some_and(|before| {
+                        let label = before.text.trim();
+                        !line_numbers.contains(before.id.as_str())
+                            && crate::paragraphs::same_row(before, line)
+                            && line.bbox[0] >= before.bbox[2] - 1.0
+                            && !label.is_empty()
+                            && (crate::paragraphs::marker_only_re().is_match(&before.text)
+                                || (label.chars().count() <= 7 && !label.contains(' ')
+                                    && legal_pdf_core::layout_analysis().numbering_marker(label, None).is_some()))
+                    });
+                    text.push(if beside { ' ' } else { '\n' });
                     scalar_cursor += 1;
                 }
+                previous = Some(line);
                 let start = scalar_cursor;
                 text.push_str(&line.text);
                 scalar_cursor += line.text.chars().count();
@@ -220,6 +237,19 @@ pub(super) fn contents_row(text: &str) -> bool {
     contents_leader_re().is_match(text)
 }
 
+/// A heading's printed number before its title: "1.", "1.1", "I.", "(a)", "ii.", a bare "1", or a
+/// numbered word ("PART 1", "Section 1.01"). A number alone on its line is no marker of a title.
+fn heading_marker_re() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Regex::new(concat!(
+            r"^\s*((?i:PART|PARTIE|ARTICLE|SECTION|CHAPTER|CHAPITRE|SCHEDULE|ANNEXE|GC)\s+[0-9IVXLC]{1,6}(?:\.[0-9]{1,3})*\.?",
+            r"|\(?[0-9]{1,3}(?:\.[0-9]{1,3})*[.)]?|\(?[IVXLCivxlc]{1,6}[.)]|\(?[A-Za-z][.)])\s+\S"
+        ))
+        .expect("heading marker regex")
+    })
+}
+
 pub(super) fn contents_leader_re() -> &'static Regex {
     static LEADER: OnceLock<Regex> = OnceLock::new();
     // A leader runs to the line's end or to the locator that ends it: dots inside a line are an
@@ -230,17 +260,140 @@ pub(super) fn contents_leader_re() -> &'static Regex {
     })
 }
 
-fn transcript_line_number_pages(pages: &[Page]) -> HashSet<usize> {
+fn transcript_line_numbers(pages: &[Page]) -> HashSet<&str> {
     pages
         .iter()
-        .filter(|page| !line_number_column(page).is_empty())
-        .map(|page| page.index)
+        .flat_map(|page| line_labels(page).map(|line| line.id.as_str()))
         .collect()
 }
 
-/// A transcript's printed line numbers: a column of small numbers counting at least
-/// 1 to 15 down the page. Returns the column's line slots, or none.
-pub(super) fn line_number_column(page: &Page) -> Vec<usize> {
+/// The page's transcript line numbers, as `mark_line_numbers` claimed them.
+pub(super) fn line_labels<'a>(page: &'a Page) -> impl Iterator<Item = &'a Line> + 'a {
+    page.lines.iter().filter(|line| line.region_type == "line_label")
+}
+
+/// A line's transcript line number, printed apart or read into the line it numbers.
+fn line_number(line: &Line) -> Option<(f64, u32)> {
+    arabic_page_number(&line.text).map(|number| (line.bbox[0], number)).or_else(|| fused_line_number(line))
+}
+
+/// A transcript's printed line numbers, decided for the whole document. A page whose numbers
+/// count 1 to 15 down one column shows where the column stands; on every page, the numbers set
+/// there that count up are its line numbers too (a short last page, numbers every fifth line).
+/// A number the extraction read into its line is split off as a line of its own. Each is a
+/// line_label, outside the body, before any other reading of the page.
+pub(super) fn mark_line_numbers(pages: &mut [Page]) {
+    let mut lefts: Vec<f64> = pages
+        .iter()
+        .flat_map(|page| {
+            let column = number_column(page, line_number);
+            column.into_iter().filter_map(|slot| line_number(&page.lines[slot]).map(|(left, _)| left)).collect::<Vec<_>>()
+        })
+        .collect();
+    if lefts.is_empty() {
+        return;
+    }
+    lefts.sort_by(f64::total_cmp);
+    let left = lefts[lefts.len() / 2];
+    for page in pages.iter_mut() {
+        let tolerance = page.width * 0.03;
+        let mut found: Vec<(f64, u32, usize)> = page
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, line)| {
+                let (x, number) = line_number(line)?;
+                ((x - left).abs() <= tolerance && number <= 40).then_some((line.bbox[1], number, slot))
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if found.len() < 3 || !found.windows(2).all(|pair| pair[0].1 < pair[1].1) {
+            continue;
+        }
+        let mut slots: Vec<usize> = found.into_iter().map(|(_, _, slot)| slot).collect();
+        slots.sort_unstable();
+        for &slot in slots.iter().rev() {
+            if arabic_page_number(&page.lines[slot].text).is_none() {
+                let number = split_line_number(&mut page.lines[slot]);
+                let id = page.lines[slot].id.clone();
+                for region in &mut page.regions {
+                    if let Some(at) = region.line_ids.iter().position(|line_id| *line_id == id) {
+                        region.line_ids.insert(at, number.id.clone());
+                    }
+                }
+                page.lines.insert(slot, number);
+            } else {
+                page.lines[slot].region_type = "line_label".to_owned();
+                page.lines[slot].exclude_from_body = true;
+            }
+        }
+    }
+}
+
+/// A line's printed transcript line number where the extraction read it into the line it numbers
+/// ("4        Q.   What is"): its left edge and value. A number whose next word stands at least two
+/// line heights away is set in the margin, not in the text.
+fn fused_line_number(line: &Line) -> Option<(f64, u32)> {
+    let [first, second, ..] = line.words.as_slice() else {
+        return None;
+    };
+    let number = first.text.parse::<u32>().ok().filter(|_| first.text.len() <= 2)?;
+    let height = (first.bbox[3] - first.bbox[1]).max(1.0);
+    let set_apart = second.bbox[0] - first.bbox[2] >= 2.0 * height;
+    let read = line.text.chars().skip(first.start).take(first.end.saturating_sub(first.start)).eq(first.text.chars());
+    let ordered = first.end <= second.start && second.start <= line.text.chars().count();
+    (set_apart && read && ordered).then_some((first.bbox[0], number))
+}
+
+/// The line's leading number as a line label of its own, the line keeping its words from the
+/// next on.
+fn split_line_number(line: &mut Line) -> Line {
+    let first = line.words[0].clone();
+    let cut = line.words[1].start;
+    let chars = line.text.chars().collect::<Vec<_>>();
+    let width = first.end - first.start;
+    let mut number = line.clone();
+    number.id = format!("{}-n", line.id);
+    number.text.clone_from(&first.text);
+    number.bbox = first.bbox;
+    number.words = vec![Word { start: 0, end: width, ..first.clone() }];
+    number.spans = line
+        .spans
+        .iter()
+        .filter(|span| span.start <= first.start && first.start < span.end)
+        .map(|span| Span { id: format!("{}-n", span.id), text: first.text.clone(), bbox: first.bbox, start: 0, end: width, ..span.clone() })
+        .take(1)
+        .collect();
+    number.detached_references.clear();
+    number.region_type = "line_label".to_owned();
+    number.exclude_from_body = true;
+    line.text = chars[cut..].iter().collect();
+    line.bbox[0] = line.words[1].bbox[0];
+    line.words.remove(0);
+    for word in &mut line.words {
+        word.start -= cut;
+        word.end -= cut;
+    }
+    line.spans.retain(|span| span.end > cut);
+    for span in &mut line.spans {
+        if span.start < cut {
+            span.text = chars[cut..span.end.min(chars.len())].iter().collect();
+            span.bbox[0] = line.bbox[0];
+            span.start = cut;
+        }
+        span.start -= cut;
+        span.end -= cut;
+    }
+    for reference in &mut line.detached_references {
+        reference.start_offset = reference.start_offset.saturating_sub(cut);
+        reference.end_offset = reference.end_offset.saturating_sub(cut);
+    }
+    number
+}
+
+/// A column of small numbers counting at least 1 to 15 down the page, as `number` reads each
+/// line's (left edge, value). Returns the column's line slots, or none.
+fn number_column(page: &Page, number: impl Fn(&Line) -> Option<(f64, u32)>) -> Vec<usize> {
     const MIN_LINE_NUMBERS: u32 = 15;
     if page.width <= 0.0 {
         return Vec::new();
@@ -250,8 +403,8 @@ pub(super) fn line_number_column(page: &Page) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(slot, line)| {
-            let number = arabic_page_number(&line.text)?;
-            (number <= 40).then_some((line.bbox[0], number, slot))
+            let (x, number) = number(line)?;
+            (number <= 40).then_some((x, number, slot))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
@@ -643,12 +796,28 @@ fn read_candidates(
 ) {
     let mut runs = Vec::new();
     let mut citations = Vec::new();
+    // Citations are read once over the whole text (the citation parser is the stage's costliest
+    // reader) and given to the context whose line holds their start; a reading context sees the
+    // same citations it read from its own view, save one straddling a context boundary.
+    let mut whole_citations: Vec<(usize, usize)> =
+        legal_pdf_support::profile::measure("candidates.citations", || {
+            let mut found: Vec<(usize, usize)> = protected_citation_spans(text.value);
+            found.extend(structure_analysis().citations(text.value).into_iter().map(|citation| {
+                (
+                    text.scalar_at_byte(citation.core_range.start).expect("citation start"),
+                    text.scalar_at_byte(citation.core_range.end).expect("citation end"),
+                )
+            }));
+            found
+        });
+    whole_citations.sort_unstable();
     let mut read = |coordinates: &ScalarText<'_>,
                     offset: usize,
                     context: DocumentContext,
-                    ordinal: Option<usize>| {
+                    ordinal: Option<usize>,
+                    lines: Option<&[&IndexedPdfLine]>| {
         let prefix = ordinal.map_or_else(String::new, |slot| format!("context-{slot:06}-"));
-        let mut found = structure_analysis().detect_structure_candidate_runs(coordinates.value);
+        let mut found = legal_pdf_support::profile::measure("candidates.detect", || structure_analysis().detect_structure_candidate_runs(coordinates.value));
         let shift = |range: &mut ScalarRange| {
             range.start += offset;
             range.end += offset;
@@ -667,32 +836,24 @@ fn read_candidates(
             }
         }
         runs.extend(found);
-        citations.extend(
-            protected_citation_spans(coordinates.value)
-                .into_iter()
-                .map(|(start, end)| (context, start + offset, end + offset)),
-        );
-        citations.extend(
-            structure_analysis()
-                .citations(coordinates.value)
-                .into_iter()
-                .map(|citation| {
-                    (
-                        context,
-                        coordinates
-                            .scalar_at_byte(citation.core_range.start)
-                            .expect("citation start")
-                            + offset,
-                        coordinates
-                            .scalar_at_byte(citation.core_range.end)
-                            .expect("citation end")
-                            + offset,
-                    )
-                }),
-        );
+        let _ = offset;
+        match lines {
+            None => citations.extend(whole_citations.iter().map(|&(start, end)| (context, start, end))),
+            Some(lines) => {
+                for line in lines {
+                    let from = whole_citations.partition_point(|(start, _)| *start < line.range.start);
+                    citations.extend(
+                        whole_citations[from..]
+                            .iter()
+                            .take_while(|(start, _)| *start < line.range.end)
+                            .map(|&(start, end)| (context, start, end)),
+                    );
+                }
+            }
+        }
     };
     if primitives.reading_lines().is_empty() && primitives.translation_line_ids.is_empty() {
-        read(text, 0, (0, false), None);
+        read(text, 0, (0, false), None, None);
     } else {
         let mut readings = BTreeMap::<DocumentContext, Vec<&IndexedPdfLine>>::new();
         for line in &index.lines {
@@ -705,7 +866,8 @@ fn read_candidates(
             let offset = lines[0].range.start;
             let mut view = String::new();
             let mut cursor = offset;
-            for line in lines {
+            let view_started = std::time::Instant::now();
+            for line in &lines {
                 // Blank foreign text without moving source scalar offsets or line boundaries.
                 view.extend(
                     text.slice(cursor..line.range.start)
@@ -719,7 +881,11 @@ fn read_candidates(
                 );
                 cursor = line.range.end;
             }
-            read(&ScalarText::new(&view), offset, context, Some(ordinal));
+            if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() {
+                eprintln!("phase	candidates.context_view	{}", view_started.elapsed().as_micros());
+            }
+            let scalar = legal_pdf_support::profile::measure("candidates.context_text", || ScalarText::new(&view));
+            legal_pdf_support::profile::measure("candidates.context_read", || read(&scalar, offset, context, Some(ordinal), Some(&lines)));
         }
     }
     runs.sort_by_key(|run| {
@@ -737,7 +903,7 @@ impl PdfResolutionInput {
     pub(super) fn from_pages(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let text = ScalarText::new(index.text());
-        let (mut runs, citation_ranges) = read_candidates(&index, &text, primitives);
+        let (mut runs, citation_ranges) = legal_pdf_support::profile::measure("candidates.grammar_runs", || read_candidates(&index, &text, primitives));
         let by_line = pages
             .iter()
             .flat_map(|page| {
@@ -776,8 +942,9 @@ impl PdfResolutionInput {
                 bounds.1 = bounds.1.max(line.bbox[2]);
             }
         }
-        // Every run owns its reading context; quoted text is not foreign to its own run.
-        let quotations = HashSet::new();
+        // Every run owns its reading context; quoted text is not foreign to its own run, except a
+        // quoted decision's own numbered paragraphs, which number nothing here.
+        let quotations = primitives.foreign_numbered_line_ids.clone();
         let context = legal_pdf_witnesses::Context {
             documents: Some(primitives.reading_lines()),
             quoted: None,
@@ -787,7 +954,7 @@ impl PdfResolutionInput {
             layout: primitives.source_regions.as_ref(),
         };
         // Existing composition rules retain their counted-line feature population.
-        let table = legal_pdf_witnesses::witnesses(pages, &context);
+        let table = legal_pdf_support::profile::measure("candidates.witnesses", || legal_pdf_witnesses::witnesses(pages, &context));
         legal_pdf_witnesses::dump(&table, "candidates");
         let rows = table.by_id();
         let compositions = legal_pdf_witnesses::compositions();
@@ -882,7 +1049,7 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let transcript_line_number_pages = transcript_line_number_pages(pages);
+        let transcript_line_numbers = transcript_line_numbers(pages);
         let index_pages = index_pages(pages);
         let mut flow_lines = HashSet::new();
         for page in pages {
@@ -900,9 +1067,30 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let (layout_runs, layout_evidence) =
-            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations);
+        let (layout_runs, layout_evidence) = legal_pdf_support::profile::measure("candidates.printed_paragraphs", ||
+            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations));
         runs.extend(layout_runs);
+        // A quoted decision's own numbers (`foreign_numbered_paragraphs`) number nothing here,
+        // whichever source read them as a run.
+        if !primitives.foreign_numbered_line_ids.is_empty() {
+            for run in &mut runs {
+                let parents: HashMap<String, Option<String>> = run.markers.iter()
+                    .map(|candidate| (candidate.id.clone(), candidate.parent_candidate_id.clone())).collect();
+                run.markers.retain(|candidate| {
+                    !index
+                        .line_at(candidate.marker_range.start)
+                        .is_some_and(|line| primitives.foreign_numbered_line_ids.contains(&line.line_id))
+                });
+                // A child of a removed marker hangs from its nearest surviving ancestor, else roots the run.
+                let kept: HashSet<String> = run.markers.iter().map(|candidate| candidate.id.clone()).collect();
+                for candidate in &mut run.markers {
+                    while let Some(parent) = candidate.parent_candidate_id.clone().filter(|parent| !kept.contains(parent)) {
+                        candidate.parent_candidate_id = parents.get(&parent).cloned().flatten();
+                    }
+                }
+            }
+            runs.retain(|run| !run.markers.is_empty());
+        }
         let layout_evidence = layout_evidence
             .iter()
             .map(|item| (item.candidate_id.as_str(), item))
@@ -1180,7 +1368,7 @@ impl PdfResolutionInput {
                 }
                 if marker_lines
                     .iter()
-                    .any(|line| transcript_line_number_pages.contains(&line.page_index))
+                    .any(|line| transcript_line_numbers.contains(line.line_id.as_str()))
                 {
                     add_observation(
                         &mut observations,
@@ -1442,6 +1630,49 @@ pub(super) fn native_graph_parts(
         node.page_indexes.push(page.index);
         node.line_ids = index.line_ids(range);
         nodes.push(node);
+        // A transcript's printed line numbers: with the page's label, the page and line a reader
+        // cites ("p. 451, l. 12").
+        for line in line_labels(page) {
+            let Some(indexed) = index.line(&line.id) else {
+                continue;
+            };
+            let mut node = StructureNode::new(
+                format!("{}:line", line.id),
+                NodeKind::Prose,
+                indexed.range,
+                ORIGIN,
+                Derivation::Heuristic,
+                None,
+            );
+            node.role = Some(legal_structure_model::PrimaryRole::LineLabel);
+            node.label = Some(line.text.trim().to_owned());
+            node.page_indexes.push(page.index);
+            node.line_ids = vec![line.id.clone()];
+            nodes.push(node);
+        }
+        // The page's running heads, footers and print margins, and its printed page number.
+        for line in page.lines.iter().filter(|line| matches!(line.region_type.as_str(), "header" | "footer")) {
+            let Some(indexed) = index.line(&line.id) else {
+                continue;
+            };
+            let folio = page.printed_label_line_id.as_deref() == Some(line.id.as_str());
+            let mut node = StructureNode::new(
+                format!("{}:{}", line.id, if folio { "page" } else { "furniture" }),
+                NodeKind::Prose,
+                indexed.range,
+                ORIGIN,
+                Derivation::Heuristic,
+                None,
+            );
+            node.role = Some(if folio {
+                legal_structure_model::PrimaryRole::PageLabel
+            } else {
+                legal_structure_model::PrimaryRole::Furniture
+            });
+            node.page_indexes.push(page.index);
+            node.line_ids = vec![line.id.clone()];
+            nodes.push(node);
+        }
     }
     for paragraph in paragraphs {
         let range = index
@@ -1475,6 +1706,15 @@ pub(super) fn native_graph_parts(
         node.label = heading.then(|| node.ranges.iter().map(|part|
             text.slice(part.start..part.end).expect("indexed heading part must be in bounds")
         ).collect::<Vec<_>>().join(" "));
+        if let Some(first) = node.ranges.first().filter(|_| heading) {
+            let line = text.slice(first.start..first.end).expect("indexed heading part must be in bounds");
+            if let Some(found) = heading_marker_re().captures(line).and_then(|c| c.get(1)) {
+                node.marker_range = Some(ScalarRange {
+                    start: first.start + line[..found.start()].chars().count(),
+                    end: first.start + line[..found.end()].chars().count(),
+                });
+            }
+        }
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
         node.grammar = if heading {
