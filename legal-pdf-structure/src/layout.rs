@@ -1239,20 +1239,41 @@ pub(super) fn order_pages(pages: &mut [Page]) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Whether a transcript's line opens a unit of its own: a speaker's turn, or a line in capitals
+/// (an examination's "BY MR. JONES:", "EXHIBIT NO. 3", "--- Upon resuming").
+fn opens_turn(line: &Line) -> bool {
+    let text = line.text.trim_start();
+    legal_structure_model::transcript::speaker_label(text).is_some()
+        || text.starts_with("--")
+        || (text.chars().any(char::is_alphabetic) && !text.chars().any(char::is_lowercase))
+}
+
+/// Each page's regions: its lines in order, a region where their kind and extraction block run on.
+/// On a transcript's page (one with line numbers) a line number stands apart and parts no region,
+/// and its body reads by turns: a turn runs from the line that opens it to the next that opens one.
 pub(super) fn build_regions(pages: &mut [Page]) {
     for page in pages {
+        let transcript = page.lines.iter().any(|line| line.region_type == "line_label");
         let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut labels: Vec<Vec<usize>> = Vec::new();
         for index in 0..page.lines.len() {
+            let line = &page.lines[index];
+            if transcript && line.region_type == "line_label" {
+                labels.push(vec![index]);
+                continue;
+            }
             if groups.last().is_some_and(|group| {
                 let prior = &page.lines[*group.last().expect("non-empty group")];
-                prior.region_type == page.lines[index].region_type
-                    && prior.block_index == page.lines[index].block_index
+                prior.region_type == line.region_type
+                    && if transcript && line.region_type == "body" { !opens_turn(line) } else { prior.block_index == line.block_index }
             }) {
                 groups.last_mut().expect("group exists").push(index);
             } else {
                 groups.push(vec![index]);
             }
         }
+        groups.extend(labels);
+        groups.sort_by_key(|group| group[0]);
         page.regions.clear();
         for (region_index, indexes) in groups.into_iter().enumerate() {
             let id = format!("p{:04}-r{:04}", page.number, region_index + 1);
