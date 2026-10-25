@@ -263,6 +263,10 @@ struct CachedExtraction<T = ExtractedPdf> {
 pub(crate) struct ParseOptions {
     pub profile: Option<DetectionProfile>,
     pub cache_dir: Option<PathBuf>,
+    /// Where page recognition (OCR) and its scanner rasters are cached: apart from the parse
+    /// cache, keyed by the OCR code and settings alone, so no parser change discards them.
+    /// Defaults to `ocr` in the cache directory.
+    pub ocr_cache_dir: Option<PathBuf>,
     pub cache_key: Option<String>,
     pub require_cache_write: bool,
     pub use_cache: bool,
@@ -283,6 +287,7 @@ impl Default for ParseOptions {
         Self {
             profile: None,
             cache_dir: None,
+            ocr_cache_dir: None,
             cache_key: None,
             require_cache_write: false,
             use_cache: true,
@@ -789,10 +794,16 @@ fn touch_cache(path: &Path) {
     }
 }
 
-fn prune_document_cache(root: &Path) {
-    let mut files = ["documents", "extractions", "recognition"]
-        .into_iter()
-        .flat_map(|directory| fs::read_dir(parse_cache_root(root).join(directory)))
+/// The OCR cache's root for a parse cache root: the request's own, else `ocr` beside `parse-v1`.
+fn ocr_cache_root(root: &Path, options: &ParseOptions) -> PathBuf {
+    options.ocr_cache_dir.clone().unwrap_or_else(|| root.join("ocr"))
+}
+
+/// Oldest files out of the given folders until they fit the cache limit.
+fn prune_cache(directories: &[PathBuf]) {
+    let mut files = directories
+        .iter()
+        .flat_map(fs::read_dir)
         .flatten()
         .flatten()
         .filter_map(|entry| {
@@ -822,11 +833,13 @@ fn prune_document_cache(root: &Path) {
     }
 }
 
-fn maybe_prune_document_cache(root: &Path) {
+fn maybe_prune_document_cache(root: &Path, ocr_root: &Path) {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
     // ponytail: amortized maintenance; rescan sooner if cache overshoot becomes material.
     if WRITES.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
-        prune_document_cache(root);
+        // The parse cache and the OCR cache are bounded apart: a parse never evicts recognition.
+        prune_cache(&["documents", "extractions"].map(|directory| parse_cache_root(root).join(directory)));
+        prune_cache(&[ocr_root.join("recognition")]);
     }
 }
 
@@ -957,6 +970,8 @@ pub(crate) fn parse_pdf(
             .map(|provider| (provider.0.as_str(), provider.1.as_str())),
     ))?;
     #[cfg(feature = "ocr")]
+    let recognition_root = cache_root.as_ref().map(|root| ocr_cache_root(root, options).join("recognition"));
+    #[cfg(feature = "ocr")]
     let mut ocr_provider =
         options
             .ocr
@@ -966,9 +981,7 @@ pub(crate) fn parse_pdf(
                 options,
                 prepared: Some(prepared),
                 runtime: None,
-                cache_root: cache_root
-                    .as_ref()
-                    .map(|root| parse_cache_root(root).join("recognition")),
+                cache_root: recognition_root,
                 cache_identity: recognition_key.clone(),
                 progress,
                 rasters: BTreeMap::new(),
@@ -1071,7 +1084,7 @@ pub(crate) fn parse_pdf(
         match profile::measure("document_cache_write", || {
             write_gzip_json(&cache_path, &parsed)
         }) {
-            Ok(()) => maybe_prune_document_cache(root),
+            Ok(()) => maybe_prune_document_cache(root, &ocr_cache_root(root, options)),
             Err(error) if options.require_cache_write => return Err(error),
             Err(_) => {}
         }

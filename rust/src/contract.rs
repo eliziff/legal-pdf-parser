@@ -24,6 +24,7 @@ where
 pub struct PdfRequest {
     profile: Option<legal_structure_model::DetectionProfile>,
     cache_dir: Option<PathBuf>,
+    ocr_cache_dir: Option<PathBuf>,
     #[serde(default, deserialize_with = "present")]
     cache_key: Option<String>,
     #[serde(default, deserialize_with = "present")]
@@ -126,6 +127,7 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     let mut options = ParseOptions {
         profile: request.profile,
         cache_dir: request.cache_dir.clone(),
+        ocr_cache_dir: request.ocr_cache_dir.clone(),
         supplied_ocr: request.supplied_ocr.clone(),
         ocr_pages: selected_pages(request.pages.as_deref())?,
         cache_key: sha256_field(&request.cache_key, "cache_key")?,
