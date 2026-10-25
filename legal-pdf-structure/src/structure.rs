@@ -4,6 +4,7 @@ mod bookmarks;
 mod captions;
 mod constituents;
 mod contents;
+mod contents_lists;
 mod graph;
 mod heading_rules;
 mod note_pairing;
@@ -94,6 +95,9 @@ struct PdfPrimitiveEvidence {
     /// their strokes (`mark_stroke_bold`).
     #[serde(default)]
     stroke_bold: HashMap<String, f64>,
+    /// The page labels the PDF itself declares (its `/PageLabels`), by page index.
+    #[serde(default)]
+    embedded_page_labels: Vec<Option<String>>,
 }
 
 impl PdfPrimitiveEvidence {
@@ -145,6 +149,8 @@ pub struct StructureIdentity {
     pub profile: Option<legal_structure_model::DetectionProfile>,
     pub document_id: String,
     pub source_sha256: String,
+    /// The page labels the PDF declares (`/PageLabels`), by page index; empty where it has none.
+    pub page_labels: Vec<Option<String>>,
 }
 
 pub struct StructureOutput {
@@ -3121,9 +3127,26 @@ fn classify_document_pages(
     let (tables, listed) = legal_pdf_support::profile::measure("classify.tables", || {
         legal_pdf_tables::document_tables(pages, &translation, &TableReadings)
     });
-    let table_lines = legal_pdf_tables::table_line_ids(&tables);
     // A contents list pdf-inspector read as a table is contents, beside the rows read below.
     contents_line_ids.extend(listed);
+    // The document's own lists, read by their typography before any table keeps their lines: a
+    // table that is a contents list or a word index is that list.
+    let lists = legal_pdf_support::profile::measure("classify.contents_lists", || {
+        contents_lists::read(pages, &legal_pdf_tables::table_line_ids(&tables), &evidence.embedded_page_labels)
+    });
+    let tables: Vec<_> = tables
+        .into_iter()
+        .filter(|table| {
+            let ids = table.line_ids();
+            let listed = ids.iter().filter(|id| lists.contents.contains(id.as_str())).count();
+            if std::env::var_os("LEGALPDF_CONTENTS_TRACE").is_some() {
+                eprintln!("contents\ttable of {} lines, {listed} listed: {}", ids.len(), if listed * 2 <= ids.len() { "kept" } else { "dropped" });
+            }
+            listed * 2 <= ids.len()
+        })
+        .collect();
+    let table_lines = legal_pdf_tables::table_line_ids(&tables);
+    contents_line_ids.extend(lists.contents);
     // A row the extractor read across both columns parts into its two languages.
     for page in pages.iter_mut() {
         let base = page
@@ -3248,6 +3271,14 @@ fn classify_document_pages(
             })
             .flat_map(|page| page.lines.iter().map(|line| line.id.clone())),
     );
+    // A table of authorities is no contents list, whatever its leaders and locators.
+    let authority_pages: HashSet<usize> = pages
+        .iter()
+        .filter(|page| page.lines.iter().any(|line| lists.authorities.contains(&line.id)))
+        .map(|page| page.index)
+        .collect();
+    contents_line_ids.retain(|id| !lists.authorities.contains(id));
+    contents_pages.retain(|page| !authority_pages.contains(page));
     evidence.contents_line_ids.extend(contents_line_ids);
     evidence.contents_pages.extend(contents_pages);
     legal_pdf_support::profile::measure("classify.captions", || {
@@ -4712,6 +4743,7 @@ fn prepare_reader(
     pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
+    page_labels: &[Option<String>],
 ) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
     if separators.len() != pages.len() {
         return Err(Error::Message(
@@ -4741,6 +4773,7 @@ fn prepare_reader(
         }
     });
     let mut primitives = PdfPrimitiveEvidence {
+        embedded_page_labels: page_labels.to_vec(),
         constituent_starts: constituents::bookmarked_starts(pages, outline),
         source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
             source_region_contract(pages)
@@ -5262,7 +5295,7 @@ pub fn derive_cached(
         }
         None => {
             let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || {
-                prepare_reader(pages, separators, outline)
+                prepare_reader(pages, separators, outline, &identity.page_labels)
             })?;
             if let Some(path) = reader_cache {
                 let state = ReaderState { pages: pages.to_vec(), primitives, diagnostics };

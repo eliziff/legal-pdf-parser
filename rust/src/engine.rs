@@ -419,6 +419,7 @@ fn derive_extracted(
             document_id: document_id.to_owned(),
             source_sha256: source_hash.to_owned(),
             profile: semantic_profile,
+            page_labels: extracted.metadata.embedded_page_labels.clone(),
         },
         reader_cache.as_deref(),
     )?;
