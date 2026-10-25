@@ -1,9 +1,11 @@
 //! Shared structure derivation for aligned page and line evidence.
 
 mod bookmarks;
+mod captions;
 mod constituents;
 mod contents;
 mod graph;
+mod note_pairing;
 mod note_regions;
 mod quotations;
 mod numbered_paragraphs;
@@ -49,6 +51,11 @@ const HARD_DIAGNOSTICS: &[&str] = &[
     "TEXT_QUALITY_LOW",
 ];
 pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
+const MAX_FONT_HEADING_CHARS: usize = 180;
+const FONT_HEADING_SIZE_RATIO: f64 = 1.18;
+
+/// A document or embedded reading and its parallel sequence; primary text is (0, false).
+pub(super) type DocumentContext = (usize, bool);
 
 #[derive(Debug, Clone)]
 pub(super) struct LabelPrefix {
@@ -67,12 +74,50 @@ struct PdfPrimitiveEvidence {
     table_cell_line_ids: HashSet<String>,
     table_note_line_ids: HashSet<String>,
     heading_levels: HashMap<String, usize>,
+    /// Font-only candidates retain the classifier's note, paragraph and source-role vetoes.
+    #[serde(skip)]
+    font_heading_candidates: HashSet<String>,
+    constituent_starts: Vec<constituents::Start>,
+    document_line_ids: HashMap<String, usize>,
+    #[serde(default)]
+    quotations: quotations::Reading,
+    #[serde(default)]
+    reading_line_ids: HashMap<String, usize>,
     #[serde(default)]
     navigation_parents: HashMap<String, Option<String>>,
     /// Tables drawn with rules, read from each page's painted rules.
     tables: Vec<legal_pdf_tables::PdfTable>,
 }
 
+impl PdfPrimitiveEvidence {
+    fn document_context(&self, id: &str) -> DocumentContext {
+        (
+            self.document_line_ids.get(id).copied().unwrap_or(0),
+            self.translation_line_ids.contains(id),
+        )
+    }
+
+    fn reading_lines(&self) -> &HashMap<String, usize> {
+        if self.reading_line_ids.is_empty() {
+            &self.document_line_ids
+        } else {
+            &self.reading_line_ids
+        }
+    }
+
+    fn reading_context(&self, id: &str) -> DocumentContext {
+        (
+            self.reading_lines().get(id).copied().unwrap_or(0),
+            self.translation_line_ids.contains(id),
+        )
+    }
+
+    fn note_context(&self, note: &Footnote) -> DocumentContext {
+        note.body_line_ids
+            .first()
+            .map_or((0, false), |id| self.document_context(id))
+    }
+}
 
 #[derive(Debug)]
 struct PdfPreparation {
@@ -369,8 +414,10 @@ fn compact_note_line(text: &str) -> bool {
 fn standalone_enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$")
-            .unwrap()
+        Regex::new(
+            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$",
+        )
+        .unwrap()
     })
 }
 
@@ -378,7 +425,7 @@ fn inline_enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z]|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
+            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
         )
         .unwrap()
     })
@@ -719,6 +766,21 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
     legal_pdf_support::profile::measure("furniture.apply", || {
         for (page_slot, page) in pages.iter_mut().enumerate() {
             let line_sizes: Vec<_> = page.lines.iter().map(line_font_size).collect();
+            // Without a sequence witness, a folio must sit beyond the remaining body text.
+            let (top, bottom) = page
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    !line.text.trim().is_empty()
+                        && !repeated.contains(&(page_slot, *index))
+                        && !sequence_folios.contains(&(page_slot, *index))
+                        && !edge_folios.contains_key(&(page_slot, *index))
+                })
+                .fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(top, bottom), (_, line)| (top.min(line.bbox[1]), bottom.max(line.bbox[3])),
+                );
             let body_size = upper_quartile(
                 page.lines
                     .iter()
@@ -812,6 +874,11 @@ fn mark_repeated_furniture(pages: &mut [Page]) {
                     line.region_type = if at_top { "header" } else { "footer" }.to_owned();
                 } else if (line.bbox[3] < page.height * 0.14 || line.bbox[1] > page.height * 0.86)
                     && footer_page_number(&line.text)
+                    && if page_number_at_top {
+                        line.bbox[1] - top < (line.bbox[3] - line.bbox[1]) * 0.5
+                    } else {
+                        bottom - line.bbox[3] < (line.bbox[3] - line.bbox[1]) * 0.5
+                    }
                     && line_size >= body_size * 0.75
                     && !attached_labels.contains(&index)
                     && !citation_note_lines.contains(&index)
@@ -990,7 +1057,7 @@ fn detached_reference_target(
 }
 
 fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>]) {
-    for page in pages {
+    for (page, separator) in pages.iter_mut().zip(separators) {
         let body_size = median(
             page.lines
                 .iter()
@@ -1003,11 +1070,7 @@ fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>])
                 .collect(),
         );
         let body_size = if body_size > 0.0 { body_size } else { 10.0 };
-        let note_cut = separators
-            .get(page.index)
-            .copied()
-            .flatten()
-            .unwrap_or(page.height * 0.88);
+        let note_cut = separator.unwrap_or(page.height * 0.88);
         // The oracle consumes accepted markers one at a time. Preserve that
         // mutation order so a consumed row cannot become a later host.
         for marker_index in 0..page.lines.len() {
@@ -1015,10 +1078,12 @@ fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>])
                 continue;
             };
             let size = line_font_size(&page.lines[marker_index]);
-            if matches!(
-                page.lines[marker_index].region_type.as_str(),
-                "header" | "footer"
-            ) || !(0.0 < size && size <= body_size * 0.75)
+            if page.lines[marker_index].exclude_from_body
+                || matches!(
+                    page.lines[marker_index].region_type.as_str(),
+                    "header" | "footer"
+                )
+                || !(0.0 < size && size <= body_size * 0.75)
                 || page.lines[marker_index].bbox[1] >= note_cut
             {
                 continue;
@@ -1158,14 +1223,12 @@ fn has_word_character(text: &str) -> bool {
 }
 
 /// Text-Fidelity's native-PDF body-font estimator: the largest rounded font
-/// bucket carrying at least ten percent of document character mass. Smaller
+/// bucket carrying at least ten percent of the supplied character mass. Smaller
 /// quote/note fonts can be common without redefining the body face, while
 /// headings normally lack enough mass to become a substantial bucket.
-fn article_body_font_size(pages: &[Page]) -> f64 {
+fn body_font_size<'a>(lines: impl IntoIterator<Item = &'a Line>) -> f64 {
     let mut mass = HashMap::<i64, usize>::new();
-    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| {
-        !line.exclude_from_body && matches!(line.region_type.as_str(), "text" | "body")
-    }) {
+    for line in lines {
         let size = line_font_size(line);
         if size > 0.0 {
             *mass.entry((size * 100.0).round() as i64).or_default() += line.text.chars().count();
@@ -1179,40 +1242,75 @@ fn article_body_font_size(pages: &[Page]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Region-dependent Text-Fidelity lanes are fail-closed. A complete set of
-/// non-unknown line labels may come from PPDoc or any MLLM; consumers depend
-/// on the region contract, not the provider identity. The snapshot survives
-/// the engine's later ordering and normalized-label passes.
+/// Source labels survive ordering and classification. Unknown labels carry no evidence;
+/// they must not erase the known labels of other lines. Ambiguous identities invalidate the map.
 fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, String>> {
     let mut regions = HashMap::new();
+    let mut ids = HashSet::new();
     for line in pages
         .iter()
         .flat_map(|page| &page.lines)
         .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
     {
-        let region = line.region_type.trim().to_ascii_lowercase();
-        if line.id.is_empty()
-            || matches!(region.as_str(), "" | "unknown" | "unknown_region")
-            || regions.insert(line.id.clone(), region).is_some()
-        {
+        if line.id.is_empty() || !ids.insert(line.id.as_str()) {
             return None;
+        }
+        let source = line.region_type.trim();
+        let tag = matches!(source, "text" | "body" | "" | "unknown" | "unknown_region")
+            .then(|| {
+                legal_pdf_core::tagged_heading(line, |span| span.structure_role.as_deref()).or_else(
+                    || {
+                        legal_pdf_core::tagged_line_role(line, |span| {
+                            span.structure_role.as_deref().filter(|role| *role == "LI")
+                        })
+                    },
+                )
+            })
+            .flatten();
+        let region = match tag {
+            Some(tag) => tag.to_owned(),
+            None if legal_pdf_core::is_heading_role(source) || source == "LI" => source.to_owned(),
+            None => source.to_ascii_lowercase(),
+        };
+        if !matches!(region.as_str(), "" | "unknown" | "unknown_region") {
+            regions.insert(line.id.clone(), region);
         }
     }
     (!regions.is_empty()).then_some(regions)
 }
 
-#[cfg(test)]
-fn source_regions_available(pages: &[Page]) -> bool {
-    source_region_contract(pages).is_some()
+fn source_regions_cover_pages(pages: &[Page], regions: Option<&HashMap<String, String>>) -> bool {
+    regions.is_some_and(|regions| {
+        pages
+            .iter()
+            .flat_map(|page| &page.lines)
+            .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
+            .all(|line| regions.contains_key(&line.id))
+    })
 }
 
-fn heading_source_eligible(regions: &HashMap<String, String>, line: &Line) -> bool {
-    regions.get(&line.id).is_some_and(|region| {
-        matches!(
-            region.as_str(),
-            "text" | "body" | "paragraph_title" | "heading"
-        )
-    })
+#[cfg(test)]
+fn source_regions_available(pages: &[Page]) -> bool {
+    source_regions_cover_pages(pages, source_region_contract(pages).as_ref())
+}
+
+fn heading_line_excluded(primitives: &PdfPrimitiveEvidence, id: &str) -> bool {
+    primitives.contents_line_ids.contains(id)
+        || primitives.table_cell_line_ids.contains(id)
+        || primitives.table_note_line_ids.contains(id)
+}
+
+fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
+    !heading_line_excluded(primitives, &line.id)
+        // Source labels constrain inference when available; they are not required to read a heading.
+        && primitives
+            .source_regions
+            .as_ref()
+            .and_then(|regions| regions.get(&line.id))
+            .is_none_or(|region| {
+                matches!(region.as_str(), "text" | "body")
+                    || legal_pdf_core::is_heading_region(region)
+            })
 }
 
 struct HeadingCandidate {
@@ -1220,6 +1318,7 @@ struct HeadingCandidate {
     line_slot: usize,
     joined_line_slot: Option<usize>,
     text_plausible: bool,
+    requires_sequence: bool,
     interpretations: Vec<EnumeratorInterpretation>,
 }
 
@@ -1255,7 +1354,6 @@ struct HeadingDecision {
 }
 
 fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
-    let regions = primitives.source_regions.as_ref().expect("source regions");
     let inline = inline_enumerator_re();
     let standalone = standalone_enumerator_re();
     let mut candidates = Vec::new();
@@ -1265,11 +1363,31 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
         }
         for (line_slot, line) in page.lines.iter().enumerate().filter(|(_, line)| {
             !line.exclude_from_body
-                && !primitives.translation_line_ids.contains(&line.id)
                 && matches!(line.region_type.as_str(), "body" | "heading")
-                && heading_source_eligible(regions, line)
+                && heading_source_eligible(primitives, line)
         }) {
             if continues_prose(page, line) {
+                continue;
+            }
+            let text = line.text.trim();
+            if (1..=7).contains(&text.len())
+                && text.bytes().all(|byte| b"IVXLCDM".contains(&byte))
+                && bold_char_share(line) >= 0.60
+            {
+                let interpretations = enumerator_interpretations(text, "")
+                    .into_iter()
+                    .filter(|(family, _, _)| family == "roman_")
+                    .collect::<Vec<_>>();
+                if !interpretations.is_empty() {
+                    candidates.push(HeadingCandidate {
+                        page_slot,
+                        line_slot,
+                        joined_line_slot: None,
+                        text_plausible: true,
+                        requires_sequence: true,
+                        interpretations,
+                    });
+                }
                 continue;
             }
             if let Some(capture) = inline.captures(line.text.trim()) {
@@ -1290,6 +1408,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                         line_slot,
                         joined_line_slot: None,
                         text_plausible: true,
+                        requires_sequence: false,
                         interpretations,
                     });
                 }
@@ -1302,8 +1421,12 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                 let line = &page.lines[*index];
                 !line.text.trim().is_empty()
                     && !line.exclude_from_body
+                    && primitives.translation_line_ids.contains(&line.id)
+                        == primitives
+                            .translation_line_ids
+                            .contains(&page.lines[line_slot].id)
                     && matches!(line.region_type.as_str(), "body" | "heading")
-                    && heading_source_eligible(regions, line)
+                    && heading_source_eligible(primitives, line)
             });
             let Some(follower_slot) = follower else {
                 continue;
@@ -1323,6 +1446,7 @@ fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<
                     line_slot,
                     joined_line_slot: Some(follower_slot),
                     text_plausible: true,
+                    requires_sequence: false,
                     interpretations,
                 });
             }
@@ -1503,6 +1627,7 @@ fn has_body_flow(
     line_slot: usize,
     structural: &HashSet<(usize, usize)>,
     page_slot: usize,
+    translation: &HashSet<String>,
 ) -> bool {
     [
         ("incoming", line_slot.checked_sub(1)),
@@ -1515,6 +1640,8 @@ fn has_body_flow(
         };
         if structural.contains(&(page_slot, neighbor_slot))
             || page.lines[neighbor_slot].region_type != "body"
+            || translation.contains(&page.lines[line_slot].id)
+                != translation.contains(&page.lines[neighbor_slot].id)
         {
             return false;
         }
@@ -1544,7 +1671,7 @@ fn wrapped_heading_continuations(
     heading_slot: usize,
     structural: &HashSet<(usize, usize)>,
     page_slot: usize,
-    source_regions: &HashMap<String, String>,
+    primitives: &PdfPrimitiveEvidence,
     capitals: bool,
 ) -> Vec<usize> {
     const MAX_WRAPPED_LINES: usize = 3;
@@ -1572,6 +1699,13 @@ fn wrapped_heading_continuations(
     let mut wrapped = Vec::new();
     let mut previous_slot = heading_slot;
     let mut previous = heading;
+    let native_role = |line: &Line| {
+        primitives
+            .source_regions
+            .as_ref()
+            .and_then(|regions| regions.get(&line.id))
+            .filter(|role| legal_pdf_core::is_heading_role(role))
+    };
     for slot in heading_slot + 1..page.lines.len().min(heading_slot + 1 + MAX_WRAPPED_LINES) {
         let continuation = &page.lines[slot];
         let continuation_text = continuation.text.trim();
@@ -1581,11 +1715,26 @@ fn wrapped_heading_continuations(
         let internal_gap = continuation.bbox[1] - previous.bbox[3];
         let joined = format!("{title} {continuation_text}");
         let cited = has_citation_signal(&joined);
+        let same_size = if heading_size > 0.0 && continuation_size > 0.0 {
+            (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+        } else {
+            // Without font spans, the measured line heights below are the size witness.
+            heading.spans.is_empty() && continuation.spans.is_empty()
+        };
         let continues = !structural.contains(&(page_slot, slot))
-            && matches!(
-                source_regions.get(&continuation.id).map(String::as_str),
-                Some("text" | "body" | "paragraph_title" | "heading" | "block_quote")
-            )
+            && primitives.translation_line_ids.contains(&heading.id)
+                == primitives.translation_line_ids.contains(&continuation.id)
+            && native_role(heading) == native_role(continuation)
+            && !continuation.exclude_from_body
+            && !heading_line_excluded(primitives, &continuation.id)
+            && primitives
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(&continuation.id))
+                .is_none_or(|region| {
+                    matches!(region.as_str(), "text" | "body" | "block_quote")
+                        || legal_pdf_core::is_heading_region(region)
+                })
             && matches!(continuation.region_type.as_str(), "body" | "heading")
             && (1..=12).contains(&continuation_text.split_whitespace().count())
             // A title's line opens on a word; a caption's bracket column (")", "§") is no title.
@@ -1597,9 +1746,7 @@ fn wrapped_heading_continuations(
             && !starts_note_or_list(continuation_text)
             && (!cited || heading_title_plausible(heading, &joined))
             && has_valid_bbox(continuation)
-            && heading_size > 0.0
-            && continuation_size > 0.0
-            && (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
+            && same_size
             && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
             && (continuation_height - heading_height).abs() <= heading_height * 0.05
             && ((-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
@@ -1630,10 +1777,13 @@ fn wrapped_heading_continuations(
         };
         let resumed = page.lines.get(last + 1).is_some_and(|following| {
             following.region_type == "body"
-                && matches!(
-                    source_regions.get(&following.id).map(String::as_str),
-                    Some("text" | "body")
-                )
+                && !following.exclude_from_body
+                && !heading_line_excluded(primitives, &following.id)
+                && primitives
+                    .source_regions
+                    .as_ref()
+                    .and_then(|regions| regions.get(&following.id))
+                    .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
                 && has_valid_bbox(following)
                 && (following.bbox[1] - line.bbox[1]
                     >= line.bbox[1] - above.bbox[1]
@@ -1931,9 +2081,17 @@ fn demote_false_headings(
             if page.lines[line_slot].region_type != "heading" {
                 continue;
             }
+            if source_regions
+                .get(&page.lines[line_slot].id)
+                .is_some_and(|region| legal_pdf_core::is_heading_role(region))
+            {
+                continue;
+            }
             if !source_regions
                 .get(&page.lines[line_slot].id)
-                .is_some_and(|region| matches!(region.as_str(), "paragraph_title" | "heading"))
+                .is_some_and(|region| {
+                    matches!(region.as_str(), "paragraph_title" | "doc_title" | "heading")
+                })
             {
                 continue;
             }
@@ -2018,14 +2176,124 @@ fn demote_false_headings(
     }
 }
 
+/// Long local prose establishes body type; sparse pages use their own document's prior.
+fn heading_body_sizes(
+    pages: &[Page],
+    fallback: f64,
+    primitives: &PdfPrimitiveEvidence,
+) -> Vec<f64> {
+    let prose = |line: &Line| {
+        !line.exclude_from_body
+            && line.note_region_mode.is_empty()
+            && matches!(line.region_type.as_str(), "text" | "body")
+            && !primitives.contents_pages.contains(&line.page_index)
+            && !heading_line_excluded(primitives, &line.id)
+            && primitives
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(&line.id))
+                .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
+    };
+    let document = if source_regions_cover_pages(pages, primitives.source_regions.as_ref()) {
+        body_font_size(
+            pages
+                .iter()
+                .flat_map(|page| &page.lines)
+                .filter(|line| prose(line)),
+        )
+    } else {
+        0.0
+    };
+    pages
+        .iter()
+        .map(|page| {
+            let local = if page.lines.iter().any(|line| line_font_size(line) > 0.0) {
+                let paragraphs = crate::paragraphs::paragraph_indices(page, prose);
+                let mut chars = HashMap::<usize, usize>::new();
+                for (line, paragraph) in page.lines.iter().zip(&paragraphs) {
+                    if let Some(paragraph) = paragraph {
+                        *chars.entry(*paragraph).or_default() += line.text.chars().count();
+                    }
+                }
+                body_font_size(page.lines.iter().zip(&paragraphs).filter_map(
+                    |(line, paragraph)| {
+                        paragraph
+                            .filter(|id| chars[id] > MAX_FONT_HEADING_CHARS)
+                            .map(|_| line)
+                    },
+                ))
+            } else {
+                0.0
+            };
+            if local > 0.0 {
+                return local;
+            }
+            if document > 0.0 {
+                return document;
+            }
+            if fallback > 0.0 {
+                return fallback;
+            }
+            let page_body = median(
+                page.lines
+                    .iter()
+                    .filter(|line| {
+                        prose(line)
+                            && page.height * 0.10 <= line.bbox[1]
+                            && line.bbox[1] <= page.height * 0.75
+                    })
+                    .map(line_font_size)
+                    .filter(|size| (4.0..=24.0).contains(size))
+                    .collect(),
+            );
+            if page_body > 0.0 {
+                page_body
+            } else {
+                10.0
+            }
+        })
+        .collect()
+}
+
 fn apply_text_fidelity_headings(
     pages: &mut [Page],
     body_size: f64,
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
-    let Some(source_regions) = primitives.source_regions.as_ref() else {
-        return HashMap::new();
-    };
+    let body_sizes = heading_body_sizes(pages, body_size, primitives);
+    for (page, body_size) in pages.iter_mut().zip(&body_sizes) {
+        let listed_top = page
+            .lines
+            .iter()
+            .filter(|line| primitives.contents_line_ids.contains(&line.id))
+            .map(|line| line.bbox[1])
+            .min_by(f64::total_cmp);
+        for line in &mut page.lines {
+            if matches!(line.region_type.as_str(), "body" | "heading")
+                && primitives.contents_line_ids.contains(&line.id)
+            {
+                line.region_type = "body".to_owned();
+                continue;
+            }
+            if line.region_type == "body"
+                && !line.exclude_from_body
+                && contents_heading(&line.text)
+                && listed_top.is_some_and(|top| line.bbox[3] <= top)
+                && heading_source_eligible(primitives, line)
+            {
+                line.region_type = "heading".to_owned();
+            }
+            if line.region_type == "body"
+                && !line.exclude_from_body
+                && line.note_region_mode.is_empty()
+                && primitives.font_heading_candidates.contains(&line.id)
+                && heading_source_eligible(primitives, line)
+                && line_font_size(line) >= body_size * FONT_HEADING_SIZE_RATIO
+            {
+                line.region_type = "heading".to_owned();
+            }
+        }
+    }
     let toc_leader = contents_leader_re();
     let mut capitalised = Vec::new();
     for (page_slot, page) in pages.iter_mut().enumerate() {
@@ -2049,7 +2317,7 @@ fn apply_text_fidelity_headings(
         if listed && list_bottom.is_none() {
             continue;
         }
-        let mut lines = Vec::new();
+        let mut lines = [Vec::new(), Vec::new()];
         for (line_slot, line) in page.lines.iter().enumerate() {
             if listed && list_bottom.is_some_and(|bottom| line.bbox[1] < bottom) {
                 continue;
@@ -2059,76 +2327,90 @@ fn apply_text_fidelity_headings(
                 .chars()
                 .filter(|character| character.is_alphabetic())
                 .count();
-            let source_mutable = source_regions
-                .get(&line.id)
-                .is_some_and(|region| matches!(region.as_str(), "text" | "body"));
             if line.region_type == "body"
-                && source_mutable
-                && !primitives.translation_line_ids.contains(&line.id)
+                && !line.exclude_from_body
+                && heading_source_eligible(primitives, line)
                 && (8..=70).contains(&text.chars().count())
                 && letters >= 4
                 && !text.chars().any(char::is_lowercase)
                 && !text.ends_with(['.', '?', '!', ';', ':', ','])
                 && heading_text_plausible(text)
             {
-                lines.push(line_slot);
+                lines[usize::from(primitives.translation_line_ids.contains(&line.id))]
+                    .push(line_slot);
             }
         }
-        // Twenty lines in capitals on one page label a map, a drawing or a table, not sections.
-        if lines.len() >= 20 {
-            continue;
-        }
-        for line_slot in lines {
-            page.lines[line_slot].region_type = "heading".to_owned();
-            capitalised.push((page_slot, line_slot));
+        // The page cap belongs to each parallel sequence, not their combined line count.
+        for lines in lines {
+            if lines.len() >= 20 {
+                continue;
+            }
+            for line_slot in lines {
+                page.lines[line_slot].region_type = "heading".to_owned();
+                capitalised.push((page_slot, line_slot));
+            }
         }
     }
 
     let decisions = {
         let candidates = heading_candidates(pages, primitives);
-        let interpretations = candidates
-            .iter()
-            .map(|candidate| candidate.interpretations.as_slice())
-            .collect::<Vec<_>>();
-        // A judgment with more than one set of reasons numbers each from "I." again: every
-        // restart of the outermost numbering opens a ladder of its own.
-        let mut sets = parse_heading_ladder(interpretations.iter().copied())
-            .assignments
-            .iter()
-            .enumerate()
-            .filter(|(_, assignment)| {
-                assignment.action == HeadingAction::IllegalRestart && assignment.level == Some(1)
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        sets.insert(0, 0);
-        sets.push(candidates.len());
-        sets.windows(2)
-            .flat_map(|set| {
+        let mut decisions = Vec::new();
+        for translation in [false, true] {
+            let own = candidates
+                .iter()
+                .filter(|candidate| {
+                    primitives
+                        .translation_line_ids
+                        .contains(&pages[candidate.page_slot].lines[candidate.line_slot].id)
+                        == translation
+                })
+                .collect::<Vec<_>>();
+            let interpretations = own
+                .iter()
+                .map(|candidate| candidate.interpretations.as_slice())
+                .collect::<Vec<_>>();
+            // Reuse the same restart-aware ladder independently for each parallel sequence.
+            let mut sets = parse_heading_ladder(interpretations.iter().copied())
+                .assignments
+                .iter()
+                .enumerate()
+                .filter(|(_, assignment)| {
+                    assignment.action == HeadingAction::IllegalRestart
+                        && assignment.level == Some(1)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            sets.insert(0, 0);
+            sets.push(own.len());
+            for set in sets.windows(2) {
                 let parsed = parse_heading_ladder(interpretations[set[0]..set[1]].iter().copied());
                 let clean = parsed.status == HeadingLadderStatus::ParsedClean;
-                candidates[set[0]..set[1]]
-                    .iter()
-                    .zip(&parsed.assignments)
-                    .map(|(candidate, assignment)| {
+                decisions.extend(own[set[0]..set[1]].iter().zip(&parsed.assignments).map(
+                    |(candidate, assignment)| {
                         let family = parsed.families.get(assignment.family);
+                        let coherent = family.is_some_and(coherent_heading_family);
                         HeadingDecision {
                             page_slot: candidate.page_slot,
                             line_slot: candidate.line_slot,
                             joined_line_slot: candidate.joined_line_slot,
-                            text_plausible: candidate.text_plausible,
+                            text_plausible: candidate.text_plausible
+                                && (!candidate.requires_sequence || coherent),
                             level: assignment.level,
                             action: assignment.action,
                             ladder_clean: clean,
-                            coherent_family: family.is_some_and(coherent_heading_family),
+                            coherent_family: coherent,
                             footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
                         }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+                    },
+                ));
+            }
+        }
+        decisions.sort_by_key(|decision| (decision.page_slot, decision.line_slot));
+        decisions
     };
-    demote_false_headings(pages, &decisions, source_regions);
+    if let Some(source_regions) = &primitives.source_regions {
+        demote_false_headings(pages, &decisions, source_regions);
+    }
     let mut heading_levels = decisions
         .iter()
         .flat_map(|decision| {
@@ -2175,7 +2457,7 @@ fn apply_text_fidelity_headings(
             line_slot,
             &structural,
             page_slot,
-            source_regions,
+            primitives,
             true,
         ) {
             pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
@@ -2189,15 +2471,12 @@ fn apply_text_fidelity_headings(
         if page_slot >= pages.len() || target_slot >= pages[page_slot].lines.len() {
             continue;
         }
-        if !source_regions
-            .get(&pages[page_slot].lines[target_slot].id)
-            .is_some_and(|region| matches!(region.as_str(), "text" | "body"))
-        {
+        if !heading_source_eligible(primitives, &pages[page_slot].lines[target_slot]) {
             continue;
         }
         let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
         if !target_is_heading {
-            if !decision.ladder_clean
+            if (!decision.ladder_clean && !decision.coherent_family)
                 || !decision.text_plausible
                 || matches!(
                     decision.action,
@@ -2210,10 +2489,17 @@ fn apply_text_fidelity_headings(
                 continue;
             }
             let page = &pages[page_slot];
-            if has_body_flow(page, target_slot, &structural, page_slot) {
+            if has_body_flow(
+                page,
+                target_slot,
+                &structural,
+                page_slot,
+                &primitives.translation_line_ids,
+            ) {
                 continue;
             }
             let target = &page.lines[target_slot];
+            let body_size = body_sizes[page_slot];
             let visual = bold_char_share(target) >= 0.60
                 || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
             if !visual && !decision.coherent_family {
@@ -2231,7 +2517,7 @@ fn apply_text_fidelity_headings(
             target_slot,
             &structural,
             page_slot,
-            source_regions,
+            primitives,
             false,
         ) {
             let block = pages[page_slot].lines[target_slot].block_index;
@@ -2240,12 +2526,6 @@ fn apply_text_fidelity_headings(
             if let Some(level) = decision.level {
                 heading_levels.insert(pages[page_slot].lines[continuation_slot].id.clone(), level);
             }
-        }
-    }
-    // A translation's headings repeat the English column's; the English is read.
-    for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
-        if line.region_type == "heading" && primitives.translation_line_ids.contains(&line.id) {
-            line.region_type = "body".to_owned();
         }
     }
     let accepted = pages
@@ -2258,13 +2538,13 @@ fn apply_text_fidelity_headings(
     heading_levels
 }
 
-/// "Notes", "NOTES", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
+/// "Notes", "Footnotes", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
 /// is a sentence's word wrapped ("... on the information or indictment, / note").
 fn endnote_heading(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
     text.starts_with(char::is_uppercase)
-        && RE.get_or_init(|| Regex::new(r"(?i)^(?:end)?notes?$").unwrap()).is_match(text)
+        && RE.get_or_init(|| Regex::new(r"(?i)^(?:end|foot)?notes?$").unwrap()).is_match(text)
 }
 
 fn continuing_note_heading(text: &str) -> bool {
@@ -2330,27 +2610,24 @@ fn has_prior_reference(page: &Page, label: &str, label_y: f64) -> bool {
     })
 }
 
-/// The rows of a contents list on a page that is not wholly a contents grid: the
-/// contents heading and the entries contiguous with it, where an entry is a
-/// leader-dotted title ending in a locator or, under a heading or on a
-/// continuation page, a row of the page's dense table. Titles wrapped between
-/// entries and locators split onto their own line belong to the list; lines
-/// before the list and the body heading or paragraph after it stay body.
+fn contents_heading(text: &str) -> bool {
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "contents"
+            | "table of contents"
+            | "table des matières"
+            | "table of provisions"
+            | "table analytique"
+    )
+}
+
+/// Contents entries include their split markers and locators, with the title kept outside.
 fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option<Vec<usize>> {
     const MIN_ENTRIES: usize = 5;
     const MAX_WRAPPED: usize = 6;
     let leader = contents_leader_re();
-    let heading = |line: &Line| {
-        matches!(
-            line.text.trim().to_lowercase().as_str(),
-            "contents"
-                | "table of contents"
-                | "table des matières"
-                | "table of provisions"
-                | "table analytique"
-        )
-    };
-    let tabular = continuing || page.lines.iter().any(heading) && table.strong();
+    let heading = |line: &Line| contents_heading(&line.text);
+    let tabular = table.contents || continuing || page.lines.iter().any(heading) && table.strong();
     let entry = |index: usize| {
         let line = &page.lines[index];
         leader.is_match(&line.text)
@@ -2365,7 +2642,7 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
                 .chars()
                 .all(|c| c.is_ascii_digit() || c == '.' || c.is_whitespace())
     };
-    let mut order: Vec<usize> = (0..page.lines.len())
+    let slots: Vec<usize> = (0..page.lines.len())
         .filter(|index| {
             let line = &page.lines[*index];
             has_valid_bbox(line)
@@ -2373,14 +2650,31 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
                 && !matches!(line.region_type.as_str(), "header" | "footer")
         })
         .collect();
-    order.sort_by(|left, right| band_geometry_order(&page.lines[*left], &page.lines[*right]));
+    let by_id = slots
+        .iter()
+        .map(|&slot| (page.lines[slot].id.as_str(), slot))
+        .collect::<HashMap<_, _>>();
+    let lines = slots
+        .iter()
+        .map(|&slot| &page.lines[slot])
+        .collect::<Vec<_>>();
+    let order = contents::row_bands(&lines)
+        .into_iter()
+        .flatten()
+        .map(|line| by_id[line.id.as_str()])
+        .collect::<Vec<_>>();
     // A page whose running head names the contents list is that list, row by row.
     if page
         .lines
         .iter()
         .any(|line| line.region_type == "header" && heading(line))
     {
-        return (!order.is_empty()).then_some(order);
+        return (!order.is_empty()).then(|| {
+            order
+                .into_iter()
+                .filter(|&index| !heading(&page.lines[index]))
+                .collect()
+        });
     }
     let mut rows = Vec::new();
     let mut wrapped = Vec::new();
@@ -2391,7 +2685,12 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
             if continuing && position > 1 {
                 return None;
             }
-            if heading(&page.lines[index]) || entry(index) {
+            let opens_entry = !contents::family(&page.lines[index].text).is_empty()
+                && order[position + 1..]
+                    .iter()
+                    .take(MAX_WRAPPED)
+                    .any(|&next| entry(next));
+            if heading(&page.lines[index]) || entry(index) || opens_entry {
                 rows.push(index);
                 entries = usize::from(entry(index));
             }
@@ -2414,7 +2713,11 @@ fn contents_rows(page: &Page, table: &TableEvidence, continuing: bool) -> Option
             }
         }
     }
-    (entries >= MIN_ENTRIES).then_some(rows)
+    (entries >= MIN_ENTRIES || table.contents).then(|| {
+        rows.into_iter()
+            .filter(|&index| !heading(&page.lines[index]))
+            .collect()
+    })
 }
 
 fn classify_pages_with_source(
@@ -2422,24 +2725,136 @@ fn classify_pages_with_source(
     separators: &[Option<f64>],
     evidence: &mut PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let article_body_size = if evidence.source_regions.is_some() {
-        article_body_font_size(pages)
+    // Discover openings with the existing furniture/reference filters before calibrating each document.
+    let source = pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .map(|line| {
+            (
+                line.region_type.clone(),
+                line.exclude_from_body,
+                line.detached_references.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
+    legal_pdf_support::profile::measure("prepare.detached_references", || {
+        associate_detached_references(pages, separators)
+    });
+    constituents::reconcile_starts(pages, &mut evidence.constituent_starts);
+    let documents = constituents::document_lines(pages, &evidence.constituent_starts);
+    let diagnostics = if documents.is_empty() {
+        drop(source);
+        classify_document_pages(pages, separators, &HashSet::new(), evidence)
     } else {
-        0.0
+        for (line, (region, excluded, references)) in pages
+            .iter_mut()
+            .flat_map(|page| &mut page.lines)
+            .zip(source)
+        {
+            line.region_type = region;
+            line.exclude_from_body = excluded;
+            line.detached_references.truncate(references);
+        }
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        let shared_pages = pages
+            .iter()
+            .filter(|page| {
+                let mut contexts = page
+                    .lines
+                    .iter()
+                    .map(|line| documents.get(&line.id).copied().unwrap_or(0));
+                contexts
+                    .next()
+                    .is_some_and(|first| contexts.any(|context| context != first))
+            })
+            .map(|page| page.index)
+            .collect::<HashSet<_>>();
+        let mut diagnostics = Vec::new();
+        constituents::within_document_contexts(pages, &documents, &HashSet::new(), |document| {
+            let separators = document
+                .iter()
+                .map(|page| separators_by_page[&page.index])
+                .collect::<Vec<_>>();
+            legal_pdf_support::profile::measure("prepare.furniture", || {
+                mark_repeated_furniture(document)
+            });
+            legal_pdf_support::profile::measure("prepare.detached_references", || {
+                associate_detached_references(document, &separators)
+            });
+            diagnostics.extend(classify_document_pages(
+                document,
+                &separators,
+                &shared_pages,
+                evidence,
+            ));
+        });
+        for page in pages.iter_mut() {
+            order_furniture(page);
+        }
+        evidence
+            .contents_pages
+            .retain(|page| !shared_pages.contains(page));
+        diagnostics
     };
-    let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
-    let mut expected_endnote: Option<u32> = None;
-    let mut continuing_size: Option<f64> = None;
+    evidence.document_line_ids = documents;
+    let mut heading_levels = HashMap::new();
+    let document_contexts = evidence.document_line_ids.clone();
+    let translation_context = evidence.translation_line_ids.clone();
+    constituents::within_document_contexts(
+        pages,
+        &document_contexts,
+        &translation_context,
+        |document| {
+            demote_prose_heading_tags(document, evidence);
+            contents::retain_headings(document, evidence);
+            heading_levels.extend(apply_text_fidelity_headings(document, 0.0, evidence));
+        },
+    );
+    evidence.heading_levels = heading_levels;
+    evidence.font_heading_candidates = HashSet::new();
+    // A transcript's line numbers locate its lines; they are no part of its paragraphs.
+    for page in pages.iter_mut() {
+        for slot in graph::line_number_column(page) {
+            page.lines[slot].exclude_from_body = true;
+        }
+    }
+    legal_pdf_support::profile::measure("classify.paragraphs", || {
+        constituents::within_document_contexts(
+            pages,
+            &evidence.document_line_ids,
+            &evidence.translation_line_ids,
+            |document| {
+                crate::paragraphs::segment_paragraphs(document);
+                contents::group_rows(document, evidence);
+            },
+        );
+        legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
+    });
+    diagnostics
+}
+
+fn classify_document_pages(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    shared_pages: &HashSet<usize>,
+    evidence: &mut PdfPrimitiveEvidence,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     let mut continuing_table = false;
     let mut continuing_contents = false;
     let mut contents_line_ids = HashSet::new();
+    let mut contents_pages = HashSet::new();
     let translation =
         legal_pdf_support::profile::measure("classify.translation", || translation_lines(pages));
-    evidence.tables = legal_pdf_support::profile::measure("classify.tables", || {
+    let tables = legal_pdf_support::profile::measure("classify.tables", || {
         legal_pdf_tables::ruled_tables(pages, &translation, &TableReadings)
     });
-    let ruled = legal_pdf_tables::table_line_ids(&evidence.tables);
+    let ruled = legal_pdf_tables::table_line_ids(&tables);
     // A row the extractor read across both columns parts into its two languages.
     for page in pages.iter_mut() {
         let base = page
@@ -2458,14 +2873,20 @@ fn classify_pages_with_source(
         }
     }
     let index_pages = index_pages(pages);
+    let mut previous_page: Option<usize> = None;
     let table_pages: Vec<_> = pages
         .iter()
         .zip(separators.iter().copied())
         .map(|(page, separator)| {
+            if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
+                continuing_table = false;
+                continuing_contents = false;
+            }
+            previous_page = Some(page.index);
             let continuation = continuing_table;
             let table = table_evidence(&page.lines, page.width);
             let caption = has_table_caption(&page.lines);
-            let rows = (!table.contents && !index_pages.contains(&page.index))
+            let rows = (!index_pages.contains(&page.index))
                 .then(|| {
                     let continuing =
                         continuing_contents && !caption && table.continuation_on_page(page.height);
@@ -2482,9 +2903,7 @@ fn classify_pages_with_source(
                     .flatten()
                     .map(|index| page.lines[index].id.clone()),
             );
-            evidence
-                .contents_pages
-                .extend(table.contents.then_some(page.index));
+            contents_pages.extend(table.contents.then_some(page.index));
             let is_table = caption
                 || strong_table_evidence(&table, &page.lines)
                 || continuation && table.continuation_on_page(page.height);
@@ -2523,7 +2942,176 @@ fn classify_pages_with_source(
         );
     }
 
-    for (page, (table_page, table_cells, table_notes)) in pages.iter_mut().zip(table_pages) {
+    // Read note history within one language; tables and physical order retain the whole page.
+    if translation.is_empty() {
+        diagnostics.extend(classify_line_roles(
+            pages,
+            separators,
+            &contents_pages,
+            evidence,
+        ));
+    } else {
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        constituents::within_document_contexts(pages, &HashMap::new(), &translation, |language| {
+            let separators = language
+                .iter()
+                .map(|page| separators_by_page[&page.index])
+                .collect::<Vec<_>>();
+            diagnostics.extend(classify_line_roles(
+                language,
+                &separators,
+                &contents_pages,
+                evidence,
+            ));
+        });
+    }
+    for (page, (table_page, _, table_notes)) in pages.iter_mut().zip(table_pages) {
+        diagnostics.extend(order_page(page, table_page, &table_notes));
+        legal_pdf_tables::order_table_lines(page, &tables);
+    }
+    evidence.tables.extend(tables);
+    // Keep page-wide contents evidence precise when two documents share a physical page.
+    contents_line_ids.extend(
+        pages
+            .iter()
+            .filter(|page| {
+                shared_pages.contains(&page.index) && contents_pages.contains(&page.index)
+            })
+            .flat_map(|page| page.lines.iter().map(|line| line.id.clone())),
+    );
+    evidence.contents_line_ids.extend(contents_line_ids);
+    evidence.contents_pages.extend(contents_pages);
+    constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
+        captions::classify(document, evidence);
+    });
+    evidence.translation_line_ids.extend(translation);
+    diagnostics
+}
+
+/// A mislabelled PDF paragraph style can tag every line of ordinary prose as Hn.
+fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) {
+    let Some(regions) = evidence.source_regions.as_ref() else {
+        return;
+    };
+    let style = |span: &legal_pdf_core::Span| {
+        (
+            span.font.clone(),
+            (span.size * 10.0).round() as i64,
+            span.flags & 18,
+        )
+    };
+    let mut rejected = HashSet::new();
+    let mut prose_styles = HashMap::<String, HashSet<_>>::new();
+    for page in pages.iter() {
+        let assigned = crate::paragraphs::paragraph_indices(page, |line| {
+            !line.exclude_from_body
+                && !heading_line_excluded(evidence, &line.id)
+                && regions
+                    .get(&line.id)
+                    .is_some_and(|role| legal_pdf_core::is_heading_role(role))
+        });
+        let mut paragraphs = HashMap::<(usize, &str), Vec<&Line>>::new();
+        for (line, paragraph) in page.lines.iter().zip(assigned) {
+            if let Some(paragraph) = paragraph {
+                paragraphs
+                    .entry((paragraph, regions[&line.id].as_str()))
+                    .or_default()
+                    .push(line);
+            }
+        }
+        for lines in paragraphs.values() {
+            let text = lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.chars().count() > MAX_FONT_HEADING_CHARS
+                && sentence_ended(&text)
+                && !text.ends_with('?')
+                && titlecase_ratio(&text) < 0.45
+            {
+                rejected.extend(lines.iter().map(|line| line.id.clone()));
+                let mut fonts = HashMap::<_, usize>::new();
+                for span in lines.iter().flat_map(|line| &line.spans) {
+                    *fonts.entry(style(span)).or_default() += span.text.chars().count();
+                }
+                let total: usize = fonts.values().sum();
+                if let Some((font, mass)) = fonts.into_iter().max_by_key(|(_, mass)| *mass) {
+                    if mass * 5 >= total * 3 {
+                        prose_styles
+                            .entry(regions[&lines[0].id].clone())
+                            .or_default()
+                            .insert(font);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(regions) = evidence.source_regions.as_mut() {
+        for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+            if line.exclude_from_body || line.region_type != "heading" {
+                continue;
+            }
+            let styles = regions
+                .get(&line.id)
+                .and_then(|role| prose_styles.get(role));
+            if styles.is_none() && !rejected.contains(&line.id) {
+                continue;
+            }
+            let total: usize = line
+                .spans
+                .iter()
+                .map(|span| span.text.chars().count())
+                .sum();
+            let prose: usize = line
+                .spans
+                .iter()
+                .filter(|span| styles.is_some_and(|styles| styles.contains(&style(span))))
+                .map(|span| span.text.chars().count())
+                .sum();
+            if rejected.contains(&line.id) || total > 0 && prose * 5 >= total * 3 {
+                regions.insert(line.id.clone(), "body".to_owned());
+                line.region_type = "body".to_owned();
+            }
+        }
+    }
+}
+
+fn classify_line_roles(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    contents_pages: &HashSet<usize>,
+    evidence: &mut PdfPrimitiveEvidence,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let paragraph_candidates = numbered_paragraphs::margin_label_ids(pages);
+    let mut expected_endnote: Option<u32> = None;
+    let mut continuing_size: Option<f64> = None;
+    let mut previous_page: Option<usize> = None;
+    for (page, separator) in pages.iter_mut().zip(separators.iter().copied()) {
+        let table_cells = page
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| evidence.table_cell_line_ids.contains(&line.id))
+            .map(|(slot, _)| slot)
+            .collect::<HashSet<_>>();
+        let table_notes = page
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| evidence.table_note_line_ids.contains(&line.id))
+            .map(|(slot, _)| slot)
+            .collect::<HashSet<_>>();
+        if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
+            expected_endnote = None;
+            continuing_size = None;
+        }
+        previous_page = Some(page.index);
         let line_sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
         let body_size = median(
             page.lines
@@ -2576,7 +3164,7 @@ fn classify_pages_with_source(
                 }),
             )
         });
-        let separator = separators.get(page.index).copied().flatten().filter(|cut| {
+        let separator = separator.filter(|cut| {
             table_band
                 .is_none_or(|(top, bottom)| *cut < top - tolerance || *cut > bottom + tolerance)
         });
@@ -2970,7 +3558,7 @@ fn classify_pages_with_source(
             .collect();
         let selected_size = (!selected_sizes.is_empty()).then(|| median(selected_sizes));
         let separator_starts_small_text = separator.is_some_and(|cut| {
-            !evidence.contents_pages.contains(&page.index)
+            !contents_pages.contains(&page.index)
                 && page
                     .lines
                     .iter()
@@ -3072,7 +3660,6 @@ fn classify_pages_with_source(
             if line.exclude_from_body {
                 continue;
             }
-            let size = line_sizes[index];
             let is_note = endnote_heading_source.is_some_and(|start| {
                 column_cuts.is_none() && endnote_page && line.source_index >= start
             }) || column_cuts.as_ref().map_or_else(
@@ -3093,6 +3680,17 @@ fn classify_pages_with_source(
                 line.note_region_mode.clear();
             } else if matches!(line.region_type.as_str(), "header" | "footer") {
                 continue;
+            } else if legal_pdf_core::is_heading_region(
+                evidence
+                    .source_regions
+                    .as_ref()
+                    .and_then(|regions| regions.get(&line.id))
+                    .map(String::as_str)
+                    .unwrap_or(line.region_type.as_str()),
+            ) {
+                // Source roles survive the font-size fallback, including recognized and tagged text.
+                line.region_type = "heading".to_owned();
+                line.note_region_mode.clear();
             } else if paragraph_labels.contains(&line.id) {
                 line.region_type = "body".to_owned();
                 line.note_region_mode.clear();
@@ -3100,19 +3698,14 @@ fn classify_pages_with_source(
                 line.region_type = "footnote".to_owned();
                 line.note_region_mode =
                     if endnote_page { "endnote" } else { "footnote" }.to_owned();
-            } else if line.text.chars().count() <= 180
-                && !translation.contains(&line.id)
-                && size
-                    >= (if article_body_size > 0.0 {
-                        article_body_size
-                    } else {
-                        body_size
-                    }) * 1.18
+            } else if line.text.chars().count() <= MAX_FONT_HEADING_CHARS
+                && heading_source_eligible(evidence, line)
                 && has_word_character(&line.text)
                 // A blank to fill in ("CACR ____", "DATED ____") makes the line a form's field.
                 && !line.text.contains("___")
             {
-                line.region_type = "heading".to_owned();
+                evidence.font_heading_candidates.insert(line.id.clone());
+                line.region_type = "body".to_owned();
             } else {
                 line.region_type = "body".to_owned();
             }
@@ -3148,23 +3741,7 @@ fn classify_pages_with_source(
                 continuing_size = Some(size);
             }
         }
-        diagnostics.extend(order_page(page, table_page, &table_notes));
-        legal_pdf_tables::order_table_lines(page, &evidence.tables);
     }
-    evidence.translation_line_ids = translation;
-    evidence.contents_line_ids.extend(contents_line_ids);
-    let heading_levels = apply_text_fidelity_headings(pages, article_body_size, evidence);
-    evidence.heading_levels = heading_levels;
-    // A transcript's line numbers locate its lines; they are no part of its paragraphs.
-    for page in pages.iter_mut() {
-        for slot in graph::line_number_column(page) {
-            page.lines[slot].exclude_from_body = true;
-        }
-    }
-    legal_pdf_support::profile::measure("classify.paragraphs", || {
-        crate::paragraphs::segment_paragraphs(pages);
-        legal_pdf_tables::part_cell_paragraphs(pages, &evidence.tables);
-    });
     diagnostics
 }
 
@@ -3262,17 +3839,23 @@ fn join_lines(lines: &[&Line]) -> (String, Vec<legal_pdf_core::model::SourceText
     (text, source_spans)
 }
 
-fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
+fn build_paragraphs_with_context(
+    pages: &[Page],
+    anchors: &HashMap<String, Vec<Anchor>>,
+    primitives: &PdfPrimitiveEvidence,
+) -> Vec<Paragraph> {
+    let context = |id: &str| primitives.reading_context(id);
     let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
+    let mut tails = HashMap::<DocumentContext, usize>::new();
     for page in pages {
         let line_by_id: HashMap<&str, &Line> = page
             .lines
             .iter()
             .map(|line| (line.id.as_str(), line))
             .collect();
-        let mut first = true;
+        let mut seen = HashSet::new();
         for region in &page.regions {
-            if !matches!(region.kind.as_str(), "body" | "heading") {
+            if !matches!(region.kind.as_str(), "body" | "heading" | "caption") {
                 continue;
             }
             let lines: Vec<&Line> = region
@@ -3281,22 +3864,24 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
                 .filter_map(|id| line_by_id.get(id.as_str()).copied())
                 .filter(|line| !line.exclude_from_body)
                 .collect();
-            if lines.is_empty() {
-                continue;
-            }
-            // A paragraph the page break interrupts goes on as the next page's first.
-            if let Some((_, "body", previous)) = regions.last_mut() {
-                if first
-                    && region.kind == "body"
-                    && crate::paragraphs::continues_onto(previous, &lines)
-                {
-                    previous.extend(lines);
-                    first = false;
-                    continue;
+            for lines in lines.chunk_by(|left, right| context(&left.id) == context(&right.id)) {
+                let key = context(&lines[0].id);
+                let first = seen.insert(key);
+                // The other column's intervening regions do not close this context's paragraph.
+                if let Some(&slot) = tails.get(&key) {
+                    let (_, kind, previous) = &mut regions[slot];
+                    if first
+                        && region.kind == "body"
+                        && *kind == "body"
+                        && crate::paragraphs::continues_onto(previous, lines)
+                    {
+                        previous.extend_from_slice(lines);
+                        continue;
+                    }
                 }
+                tails.insert(key, regions.len());
+                regions.push((page, region.kind.as_str(), lines.to_vec()));
             }
-            first = false;
-            regions.push((page, region.kind.as_str(), lines));
         }
     }
     let mut paragraphs = Vec::new();
@@ -3364,6 +3949,17 @@ fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> V
         });
     }
     paragraphs
+}
+
+#[cfg(test)]
+fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
+    let starts = constituents::starts(pages);
+    let primitives = PdfPrimitiveEvidence {
+        document_line_ids: constituents::document_lines(pages, &starts),
+        translation_line_ids: translation_lines(pages),
+        ..Default::default()
+    };
+    build_paragraphs_with_context(pages, anchors, &primitives)
 }
 
 fn marker_re() -> &'static Regex {
@@ -3438,14 +4034,23 @@ fn sentence_at(text: &str, offset: usize) -> String {
     sentence_at_boundaries(&chars, &sentence_boundaries(&chars), offset)
 }
 
-fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
+fn attach_propositions(
+    footnotes: &mut [Footnote],
+    paragraphs: &[Paragraph],
+    primitives: &PdfPrimitiveEvidence,
+) {
     let by_pair: HashMap<String, usize> = footnotes
         .iter()
         .enumerate()
         .map(|(index, footnote)| (footnote.pair_id.clone(), index))
         .collect();
-    let mut previous_tail = String::new();
+    let mut tails = HashMap::<DocumentContext, String>::new();
     for paragraph in paragraphs {
+        let context = paragraph
+            .line_ids
+            .first()
+            .map_or((0, false), |id| primitives.document_context(id));
+        let previous_tail = tails.entry(context).or_default();
         let chars: Vec<char> = paragraph.text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
         let mut previous_offset = 0;
@@ -3468,7 +4073,7 @@ fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph]) {
             };
             previous_offset = offset + 5 + anchor.pair_id.chars().count();
         }
-        previous_tail = chars[previous_offset.min(chars.len())..]
+        *previous_tail = chars[previous_offset.min(chars.len())..]
             .iter()
             .collect::<String>()
             .trim()
@@ -3480,7 +4085,14 @@ fn infer_note_region_modes(pages: &mut [Page]) {
     let mut prior_note_page = false;
     let mut active_endnotes = false;
     let mut expected_endnote = None::<u32>;
+    let mut previous_page = None;
     for page in pages {
+        if previous_page.is_some_and(|prior: usize| prior.checked_add(1) != Some(page.index)) {
+            prior_note_page = false;
+            active_endnotes = false;
+            expected_endnote = None;
+        }
+        previous_page = Some(page.index);
         let footnote_indexes: Vec<usize> = page
             .lines
             .iter()
@@ -3599,8 +4211,15 @@ fn unmatched_reference_diagnostics(
     pages: &[Page],
     footnotes: &[Footnote],
     anchors: &HashMap<String, Vec<Anchor>>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> Vec<Diagnostic> {
-    let labels: HashSet<&str> = footnotes.iter().map(|note| note.label.as_str()).collect();
+    let labels: HashSet<_> = footnotes
+        .iter()
+        .map(|note| {
+            let context = primitives.note_context(note);
+            (context, note.label.as_str())
+        })
+        .collect();
     let primary_lines: HashSet<&str> = footnotes
         .iter()
         .filter_map(|note| note.reference_line_id.as_deref())
@@ -3637,7 +4256,11 @@ fn unmatched_reference_diagnostics(
             continue;
         }
         if line.spans.iter().any(|span| {
-            span.superscript && labels.contains(normalize_label(span.text.trim()).as_str())
+            span.superscript
+                && labels.contains(&(
+                    primitives.document_context(&line.id),
+                    normalize_label(span.text.trim()).as_str(),
+                ))
         }) {
             let mut diagnostic = Diagnostic::warning(
                 "FOOTNOTE_UNMATCHED_REFERENCE",
@@ -3651,7 +4274,11 @@ fn unmatched_reference_diagnostics(
     diagnostics
 }
 
-fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic>) {
+fn attach_crossrefs(
+    footnotes: &mut [Footnote],
+    diagnostics: &mut Vec<Diagnostic>,
+    primitives: &PdfPrimitiveEvidence,
+) {
     static RE: OnceLock<Regex> = OnceLock::new();
     let pattern = RE.get_or_init(|| {
         Regex::new(
@@ -3659,16 +4286,17 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
         )
         .unwrap()
     });
-    let mut by_number: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
+    let mut by_number: HashMap<(DocumentContext, u32), Vec<(usize, String)>> = HashMap::new();
     for footnote in footnotes.iter() {
         if let Ok(number) = footnote.label.parse::<u32>() {
             by_number
-                .entry(number)
+                .entry((primitives.note_context(footnote), number))
                 .or_default()
                 .push((footnote.restart_sequence, footnote.pair_id.clone()));
         }
     }
     for footnote in footnotes {
+        let context = primitives.note_context(footnote);
         let (mut prior_byte, mut prior_scalar) = (0, 0);
         for capture in pattern.captures_iter(&footnote.body) {
             let Some(found) = capture.get(0) else {
@@ -3679,7 +4307,7 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
                 .and_then(|value| value.as_str().parse::<u32>().ok())
                 .unwrap_or(0);
             let candidates = by_number
-                .get(&number)
+                .get(&(context, number))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let target_pair_id = if candidates.len() == 1 {
@@ -3710,17 +4338,24 @@ fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic
                 shortform: crossref_shortform(&footnote.body, found.start()),
                 start,
                 end,
-                resolved: !candidates.is_empty(),
+                resolved: !target_pair_id.is_empty(),
                 target_pair_id,
                 target_count: candidates.len(),
             };
-            if candidates.is_empty() {
+            if !record.resolved {
                 let mut diagnostic = Diagnostic::info(
                     "NOTE_CROSSREF_UNRESOLVED",
-                    format!(
+                    if candidates.is_empty() {
+                        format!(
                         "Note {} references {} note {}, which no paired note carries - a pairing-quality witness.",
                         footnote.label, record.kind, number
-                    ),
+                    )
+                    } else {
+                        format!(
+                            "Note {} references {} note {}, which has multiple possible targets.",
+                            footnote.label, record.kind, number
+                        )
+                    },
                     footnote.reference_page.map(|page| page as usize),
                 );
                 diagnostic
@@ -3744,44 +4379,101 @@ struct ReaderState {
 
 /// Everything before the composed decisions: furniture, classification, tables, note bands and
 /// the styled heading reader.
-fn prepare_reader(pages: &mut [Page], separators: &[Option<f64>]) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
+fn prepare_reader(
+    pages: &mut [Page],
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+) -> Result<(PdfPrimitiveEvidence, Vec<Diagnostic>)> {
     if separators.len() != pages.len() {
         return Err(Error::Message(
             "common input must contain one separator value per page".to_owned(),
         ));
     }
     let mut primitives = PdfPrimitiveEvidence {
+        constituent_starts: constituents::bookmarked_starts(pages, outline),
         source_regions: legal_pdf_support::profile::measure("prepare.source_regions", || {
             source_region_contract(pages)
         }),
         ..PdfPrimitiveEvidence::default()
     };
-    legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
-    legal_pdf_support::profile::measure("prepare.detached_references", || {
-        associate_detached_references(pages, separators)
-    });
     let diagnostics = legal_pdf_support::profile::measure("prepare.classify", || {
         classify_pages_with_source(pages, separators, &mut primitives)
     });
-    // Which lines are notes, settled over the whole document before any heading claims them.
+    // Each document and language keeps its own note type, ladder and continuation history.
     legal_pdf_support::profile::measure("prepare.note_regions", || {
-        note_regions::correct_note_regions(pages, separators)
+        let separators_by_page = pages
+            .iter()
+            .zip(separators)
+            .map(|(page, separator)| (page.index, *separator))
+            .collect::<HashMap<_, _>>();
+        let mut changed = 0;
+        constituents::within_document_contexts(
+            pages,
+            &primitives.document_line_ids,
+            &primitives.translation_line_ids,
+            |document| {
+                let separators = document
+                    .iter()
+                    .map(|page| separators_by_page[&page.index])
+                    .collect::<Vec<_>>();
+                // The generic note reader honors source exclusions. Supply the stronger table
+                // and contents witnesses for this view, retaining the original source flags.
+                let mut excluded = Vec::new();
+                for (page_slot, page) in document.iter_mut().enumerate() {
+                    let contents = primitives.contents_pages.contains(&page.index);
+                    for (slot, line) in page.lines.iter_mut().enumerate() {
+                        let table = primitives.table_cell_line_ids.contains(&line.id)
+                            || primitives.table_note_line_ids.contains(&line.id);
+                        if !line.exclude_from_body
+                            && (table
+                                || line.region_type == "body"
+                                    && (contents
+                                        || primitives.contents_line_ids.contains(&line.id)))
+                        {
+                            line.exclude_from_body = true;
+                            excluded.push((page_slot, slot));
+                        }
+                    }
+                }
+                changed += note_regions::correct_note_regions(document, &separators);
+                for (page, line) in excluded {
+                    document[page].lines[line].exclude_from_body = false;
+                }
+            },
+        );
+        changed
     });
+    primitives.quotations = quotations::read(pages, &primitives);
+    primitives.reading_line_ids = quotations::reading_lines(pages, &primitives);
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let excluded = |id: &str| {
-            primitives.contents_line_ids.contains(id) || primitives.table_cell_line_ids.contains(id)
+            primitives.contents_line_ids.contains(id)
+                || primitives.table_cell_line_ids.contains(id)
+                || primitives.table_note_line_ids.contains(id)
         };
-        let translation = |id: &str| primitives.translation_line_ids.contains(id);
         let numbered =
             |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);
-        legal_pdf_headings::reconcile_styled_headings(
+        let translation = |id: &str| primitives.translation_line_ids.contains(id);
+        constituents::within_document_contexts(
             pages,
-            legal_pdf_headings::HeadingEvidence {
-                levels: &mut primitives.heading_levels,
-                excluded: &excluded,
-                translation: &translation,
-                contents_pages: &primitives.contents_pages,
-                numbered: &numbered,
+            &primitives.reading_line_ids,
+            &primitives.translation_line_ids,
+            |document| {
+                legal_pdf_headings::reconcile_styled_headings(
+                    document,
+                    legal_pdf_headings::HeadingEvidence {
+                        quotation: document
+                            .iter()
+                            .flat_map(|page| &page.lines)
+                            .any(|line| primitives.quotations.scopes.contains_key(&line.id)),
+                        levels: &mut primitives.heading_levels,
+                        excluded: &excluded,
+                        translation: &translation,
+                        contents_pages: &primitives.contents_pages,
+                        numbered: &numbered,
+                        source_regions: primitives.source_regions.as_ref(),
+                    },
+                );
             },
         );
     });
@@ -3819,7 +4511,14 @@ fn derive_prepared(
     mut prepared: PdfPreparation,
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    legal_pdf_support::profile::measure("derive.note_regions", || infer_note_region_modes(pages));
+    legal_pdf_support::profile::measure("derive.note_regions", || {
+        constituents::within_document_contexts(
+            pages,
+            &prepared.primitives.document_line_ids,
+            &prepared.primitives.translation_line_ids,
+            infer_note_region_modes,
+        );
+    });
     prepared
         .diagnostics
         .extend(legal_pdf_support::profile::measure(
@@ -3827,12 +4526,22 @@ fn derive_prepared(
             || text_flow_faults(pages),
         ));
     // Note labels recognition cut short, restored before any text is indexed.
-    legal_pdf_core::layout_analysis().repair_label_dropouts(pages);
+    constituents::within_document_contexts(
+        pages,
+        &prepared.primitives.document_line_ids,
+        &prepared.primitives.translation_line_ids,
+        |document| legal_pdf_core::layout_analysis().repair_label_dropouts(document),
+    );
     let resolution = legal_pdf_support::profile::measure("derive.structure_candidates", || {
         PdfResolutionInput::from_pages(pages, &prepared.primitives)
     });
     let pairing = legal_pdf_support::profile::measure("derive.pair_footnotes", || {
-        legal_pdf_core::layout_analysis().pair_footnotes(pages, &resolution.citation_spans, false)
+        note_pairing::pair_notes(
+            pages,
+            &prepared.primitives,
+            &resolution.citation_spans,
+            &resolution.index,
+        )
     });
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
@@ -3841,20 +4550,24 @@ fn derive_prepared(
     diagnostics.extend(pairing.diagnostics);
     diagnostics.extend(legal_pdf_support::profile::measure(
         "derive.unmatched_references",
-        || unmatched_reference_diagnostics(pages, &footnotes, &anchors),
+        || unmatched_reference_diagnostics(pages, &footnotes, &anchors, &prepared.primitives),
     ));
     let paragraphs = legal_pdf_support::profile::measure("derive.paragraphs", || {
-        build_paragraphs(pages, &anchors)
+        build_paragraphs_with_context(pages, &anchors, &prepared.primitives)
     });
     legal_pdf_support::profile::measure("derive.propositions", || {
-        attach_propositions(&mut footnotes, &paragraphs)
+        attach_propositions(&mut footnotes, &paragraphs, &prepared.primitives)
     });
     legal_pdf_support::profile::measure("derive.crossrefs", || {
-        attach_crossrefs(&mut footnotes, &mut diagnostics)
+        attach_crossrefs(&mut footnotes, &mut diagnostics, &prepared.primitives)
     });
     let mut nodes =
         native_graph_parts(&resolution.index, pages, &paragraphs, &prepared.primitives)?;
-    nodes.extend(constituents::constituents(&resolution.index, pages));
+    nodes.extend(constituents::constituents(
+        &resolution.index,
+        pages,
+        &prepared.primitives.constituent_starts,
+    ));
     // The engine's inputs, for the structure gold to replay engine changes without parsing
     // (legal-structure's replay example).
     if let Ok(path) = std::env::var("LEGALPDF_RESOLVER_DUMP") {
@@ -3873,26 +4586,46 @@ fn derive_prepared(
     let source_fragments = resolution.index.source_fragments();
     let pages: &[Page] = pages;
     let document_id = identity.document_id.clone();
-    let mut structure_graph = legal_pdf_support::profile::measure("derive.structure_graph", || {
-        legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
-            identity.document_id,
-            "local-pdf".to_owned(),
-            resolution.index.text(),
-            Some(identity.source_sha256),
-            nodes,
-            &resolution.runs,
-            &resolution.evidence,
-            &note_pairs,
-            graph_diagnostics,
-            &mut |nodes| {
-                let contexts = outline_contexts(nodes, &document_id, &resolution.quotation_scopes, &resolution.index,
-                    &prepared.primitives.translation_line_ids);
-                let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
-                legal_pdf_witnesses::assemble_outline(nodes, &contexts, resolution.index.text(), pages, &line_range, &prepared.primitives.navigation_parents, &prepared.primitives.heading_levels);
-            },
-        )
-    })
-    .map_err(|error| Error::Message(error.to_string()))?;
+    let mut structure_graph =
+        legal_pdf_support::profile::measure("derive.structure_graph", || {
+            legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
+                identity.document_id,
+                "local-pdf".to_owned(),
+                resolution.index.text(),
+                Some(identity.source_sha256),
+                nodes,
+                &resolution.runs,
+                &resolution.evidence,
+                &note_pairs,
+                graph_diagnostics,
+                &mut |nodes| {
+                    let contexts = outline_contexts(
+                        nodes,
+                        &document_id,
+                        &prepared.primitives.quotations,
+                        &resolution.index,
+                        &prepared.primitives,
+                    );
+                    let line_range = |id: &str| resolution.index.line(id).map(|line| line.range);
+                    let mut parents = prepared.primitives.navigation_parents.clone();
+                    parents.extend(
+                        prepared.primitives.quotations.introductions.iter().map(
+                            |(quote, introduction)| (quote.clone(), Some(introduction.clone())),
+                        ),
+                    );
+                    legal_pdf_witnesses::assemble_outline(
+                        nodes,
+                        &contexts,
+                        resolution.index.text(),
+                        pages,
+                        &line_range,
+                        &parents,
+                        &prepared.primitives.heading_levels,
+                    );
+                },
+            )
+        })
+        .map_err(|error| Error::Message(error.to_string()))?;
     structure_graph.profile = identity.profile;
     structure_graph.source_fragments = source_fragments;
     Ok(StructureOutput {
@@ -3904,15 +4637,15 @@ fn derive_prepared(
 }
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the
-/// constituent document holding it, and the quotation and note or table cell holding a unit. A
-/// parallel translation's units keep an outline of their own beside the text's.
+/// constituent document holding it, and its quotation, note, table cell or parallel text.
 fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
-    quote_ids: &HashMap<String, String>,
+    quotes: &quotations::Reading,
     index: &PdfTextIndex,
-    translation: &HashSet<String>,
+    primitives: &PdfPrimitiveEvidence,
 ) -> Vec<legal_pdf_witnesses::OutlineContext> {
     use legal_structure_model::PrimaryRole;
+    let translation = &primitives.translation_line_ids;
     // Establish exact membership before comparing containers. An envelope may cross
     // intervening columns, notes, quotations, or constituent documents.
     for node in nodes.iter_mut() {
@@ -3930,6 +4663,49 @@ fn outline_contexts(
             }
         }
         node.ranges = merged;
+        // Keep owned source fragments when the envelope spans intervening columns.
+        if node.kind != NodeKind::Page && !node.line_ids.is_empty() {
+            let mut source = node
+                .line_ids
+                .iter()
+                .filter_map(|id| index.line(id).map(|line| line.range))
+                .collect::<Vec<_>>();
+            if let Some(marker) = node.marker_range {
+                let ids = index.line_ids(marker);
+                if let Some(first) = ids.first() {
+                    let context = primitives.reading_context(first);
+                    source.extend(
+                        ids.iter()
+                            .filter(|id| primitives.reading_context(id) == context)
+                            .filter_map(|id| index.line(id))
+                            .map(|line| ScalarRange {
+                                start: marker.start.max(line.range.start),
+                                end: marker.end.min(line.range.end),
+                            })
+                            .filter(|part| part.start < part.end),
+                    );
+                }
+            }
+            let source = graph::source_membership(source);
+            let mut owned = Vec::new();
+            let mut at = 0;
+            for range in &node.ranges {
+                while at < source.len() && source[at].end <= range.start {
+                    at += 1;
+                }
+                for part in source[at..]
+                    .iter()
+                    .take_while(|part| part.start < range.end)
+                {
+                    let start = range.start.max(part.start);
+                    let end = range.end.min(part.end);
+                    if start < end {
+                        owned.push(ScalarRange { start, end });
+                    }
+                }
+            }
+            node.ranges = owned;
+        }
         let mut seen_lines = HashSet::new();
         node.line_ids = node.ranges.iter().flat_map(|range| index.line_ids(*range))
             .filter(|id| seen_lines.insert(id.clone())).collect();
@@ -3937,6 +4713,11 @@ fn outline_contexts(
         if let (Some(first), Some(last)) = (node.ranges.first(), node.ranges.last()) {
             node.range.start = first.start;
             node.range.end = last.end;
+        }
+        if let Some(start) = &mut node.content_start {
+            if let Some(part) = node.ranges.iter().find(|part| *start < part.end) {
+                *start = (*start).max(part.start);
+            }
         }
     }
     let constituents = nodes.iter().filter(|node| node.grammar.as_deref().is_some_and(|grammar| grammar.starts_with("constituent_")))
@@ -3947,26 +4728,65 @@ fn outline_contexts(
         !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
             range.start <= part.start && part.end <= range.end))
     };
-    nodes.iter_mut().map(|node| {
-        if node.kind == NodeKind::Heading {
-            node.role = Some(PrimaryRole::Heading);
-            node.heading_range = (node.ranges.len() == 1).then_some(node.range);
-        } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
-            node.role.get_or_insert(PrimaryRole::Text);
-        }
-        let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| holders.iter()
-            .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-            .min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _)| id.clone());
-        // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
-        // belonging to its quotation or note: it names only its document.
-        let unit = node.kind != NodeKind::Page;
-        let quotation = node.line_ids.first().filter(|_| unit).and_then(|id| quote_ids.get(id))
-            .filter(|id| node.line_ids.iter().all(|line| quote_ids.get(line) == Some(*id))).cloned();
-        let translated = unit && !node.line_ids.is_empty() && node.line_ids.iter().all(|id| translation.contains(id));
-        let container = smallest(&cells).filter(|_| unit).map(|id| format!("object:{id}"))
-            .or_else(|| translated.then(|| "translation".to_owned()));
-        (smallest(&constituents).unwrap_or_else(|| document_id.to_owned()), quotation, container)
-    }).collect()
+    nodes
+        .iter_mut()
+        .map(|node| {
+            if node.kind == NodeKind::Heading {
+                node.role = Some(PrimaryRole::Heading);
+                node.heading_range = (node.ranges.len() == 1).then_some(node.range);
+            } else if matches!(
+                node.kind,
+                NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose
+            ) {
+                node.role.get_or_insert(PrimaryRole::Text);
+            }
+            let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| {
+                holders
+                    .iter()
+                    .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
+                    .min_by_key(|(_, ranges)| {
+                        ranges
+                            .iter()
+                            .map(|range| range.end - range.start)
+                            .sum::<usize>()
+                    })
+                    .map(|(id, _)| id.clone())
+            };
+            // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
+            // belonging to its quotation or note: it names only its document.
+            let unit = node.kind != NodeKind::Page;
+            let quotation = if node.kind == NodeKind::Quote {
+                quotes
+                    .introductions
+                    .get(&node.id)
+                    .and_then(|id| quotes.scopes.get(id))
+                    .cloned()
+            } else {
+                node.line_ids
+                    .first()
+                    .filter(|_| unit)
+                    .and_then(|id| quotes.scopes.get(id))
+                    .filter(|id| {
+                        node.line_ids
+                            .iter()
+                            .all(|line| quotes.scopes.get(line) == Some(*id))
+                    })
+                    .cloned()
+            };
+            let translated = unit
+                && !node.line_ids.is_empty()
+                && node.line_ids.iter().all(|id| translation.contains(id));
+            let container = smallest(&cells)
+                .filter(|_| unit)
+                .map(|id| format!("object:{id}"))
+                .or_else(|| translated.then(|| "translation".to_owned()));
+            (
+                smallest(&constituents).unwrap_or_else(|| document_id.to_owned()),
+                quotation,
+                container,
+            )
+        })
+        .collect()
 }
 
 pub fn derive(
@@ -3979,8 +4799,8 @@ pub fn derive(
 }
 
 /// `derive`, reading the readers' state from `reader_cache` where it is there (a file named for the
-/// input pages and the readers' code) and writing it there where not: a change to compositions, or
-/// to anything after the readers, reruns only what follows them.
+/// input pages and reader dependencies) and writing it there where not. Composed decisions run
+/// after restoring the cached state.
 pub fn derive_cached(
     pages: &mut [Page],
     separators: &[Option<f64>],
@@ -3997,7 +4817,9 @@ pub fn derive_cached(
             (state.primitives, state.diagnostics)
         }
         None => {
-            let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || prepare_reader(pages, separators))?;
+            let (primitives, diagnostics) = legal_pdf_support::profile::measure("prepare.reader", || {
+                prepare_reader(pages, separators, outline)
+            })?;
             if let Some(path) = reader_cache {
                 let state = ReaderState { pages: pages.to_vec(), primitives, diagnostics };
                 let _ = legal_pdf_core::write_gzip_json(path, &state);

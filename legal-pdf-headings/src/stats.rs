@@ -80,7 +80,10 @@ fn dominant(order: &[String], weights: &HashMap<String, f64>) -> String {
     best
 }
 
-pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
+pub(super) fn page_stats<'a>(
+    lines: impl IntoIterator<Item = &'a FlashLine>,
+    page_width: f64,
+) -> PageStats {
     let mut gaps = Vec::new();
     let mut widths = Vec::new();
     let mut fills = Vec::new();
@@ -90,8 +93,8 @@ pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
     let mut total = 0.0;
     let mut valid = 0;
     let bucket = page_width / 20.0;
-    let mut buckets: Vec<Option<usize>> = vec![None; 21];
-    for (index, line) in lines.iter().enumerate() {
+    let mut buckets: Vec<Option<&FlashLine>> = vec![None; 21];
+    for line in lines {
         if line.skew > 1.0 {
             continue;
         }
@@ -125,18 +128,18 @@ pub(super) fn page_stats(lines: &[FlashLine], page_width: f64) -> PageStats {
         let mut best_gap = f64::INFINITY;
         let mut best_prior = None;
         for slot in first..last {
-            let prior = buckets[slot].replace(index);
+            let prior = buckets[slot].replace(line);
             let Some(prior) = prior else {
                 continue;
             };
-            let gap = lines[prior].rect.bottom.max(line.rect.top) - line.rect.bottom;
+            let gap = prior.rect.bottom.max(line.rect.top) - line.rect.bottom;
             if gap < best_gap {
                 best_gap = gap;
                 best_prior = Some(prior);
             }
         }
         if let Some(prior) = best_prior.filter(|_| best_gap < f64::INFINITY) {
-            gaps.push((best_gap, lines[prior].stats.info_weight() * line_weight));
+            gaps.push((best_gap, prior.stats.info_weight() * line_weight));
         }
     }
     PageStats {
@@ -157,12 +160,15 @@ pub(super) struct DocStats {
     /// 80th percentile of per-page median span coverage.
     pub(super) upper_fill: f64,
     pub(super) body_font_size: f64,
+    /// Median line advance relative to native font size or recognized glyph height.
+    pub(super) body_line_leading: f64,
 }
 
-pub(super) fn doc_stats(pages: &[PageStats]) -> DocStats {
+pub(super) fn doc_stats<'a>(pages: impl IntoIterator<Item = &'a PageStats>) -> DocStats {
     let mut widths = Vec::new();
     let mut fills = Vec::new();
     let mut sizes = Vec::new();
+    let mut leading = Vec::new();
     for stats in pages {
         if stats.line_count == 0 || stats.total_weight <= 0.0 {
             continue;
@@ -171,10 +177,14 @@ pub(super) fn doc_stats(pages: &[PageStats]) -> DocStats {
         widths.push((stats.line_width, per_page));
         fills.push((stats.fill, per_page));
         sizes.push((stats.font_size, per_page));
+        if stats.line_gap.is_finite() && stats.font_size > 0.0 {
+            leading.push((stats.line_gap / stats.font_size, per_page));
+        }
     }
     DocStats {
         line_width: weighted_percentile(widths, 50.0),
         upper_fill: weighted_percentile(fills, 80.0),
         body_font_size: weighted_percentile(sizes, 50.0),
+        body_line_leading: weighted_percentile(leading, 50.0),
     }
 }

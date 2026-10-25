@@ -13,13 +13,15 @@
 //! frame entry they fall under. Deliberate legal adaptations, apart from line anchoring:
 //! - a `Tab N` / `Exhibit N` set is package navigation, not an enumeration to ignore;
 //! - a bookmark on a contents page holds no other bookmark;
+//! - constituent documents and parallel translations keep separate anchors and bookmark frames;
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use super::{
-    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator,
+    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator, DocumentContext,
     PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
+use legal_pdf_witnesses::PACKAGE_UNITS;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -42,15 +44,6 @@ const MAX_TITLE_LINES: usize = 4;
 const CONTENT_UNITS: &[&str] = &[
     "chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix", "unit", "lesson",
     "章", "部", "节", "篇", "卷", "第章", "第部", "第节", "第篇", "第卷",
-];
-/// Words that number the constituents of a filed package.
-const PACKAGE_UNITS: &[&str] = &[
-    "tab",
-    "exhibit",
-    "schedule",
-    "appendix",
-    "annex",
-    "attachment",
 ];
 const ROMAN_EXCLUDED: &[&str] = &["di", "div", "li", "liv", "mi", "mix", "xi"];
 
@@ -282,6 +275,52 @@ fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
     kept
 }
 
+/// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
+pub(super) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+    let entries = validate(outline, pages);
+    let authorities = entries
+        .iter()
+        .find(|entry| {
+            entry.page == 1
+                && tokens(&entry.title).windows(3).any(|words| {
+                    words == ["book", "of", "authorities"]
+                        || words == ["bundle", "of", "authorities"]
+                })
+        })
+        .map(|entry| entry.level);
+    let entries = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let words = tokens(&entry.title);
+            let unit = words.first()?;
+            let counter = words.get(1)?;
+            let kind = if PACKAGE_UNITS.contains(&unit.as_str())
+                && (label_remainder().is_match(counter) || is_roman(counter))
+            {
+                unit.clone()
+            } else if authorities == Some(entry.level)
+                && legal_pdf_core::layout_analysis()
+                    .numbering_marker(entry.title.split_whitespace().next()?, None)
+                    .is_some()
+            {
+                "authority".to_owned()
+            } else {
+                return None;
+            };
+            Some((entry.page - 1, entry.level, kind))
+        })
+        .collect::<Vec<_>>();
+    let mut families = HashMap::<(&str, usize), HashSet<usize>>::new();
+    for (page, level, unit) in &entries {
+        families.entry((unit, *level)).or_default().insert(*page);
+    }
+    entries
+        .iter()
+        .filter(|(page, level, unit)| *page > 0 && families[&(unit.as_str(), *level)].len() > 1)
+        .map(|(page, _, unit)| (*page, unit.clone()))
+        .collect()
+}
+
 fn restack(entries: &mut [Entry]) {
     let mut stack = Vec::<usize>::new();
     for entry in entries {
@@ -430,13 +469,13 @@ pub(super) fn reconcile_bookmarks(
         !line.exclude_from_body
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
-            && !primitives.translation_line_ids.contains(&line.id)
             && !primitives.contents_line_ids.contains(&line.id)
+            && !primitives.quotations.scopes.contains_key(&line.id)
             && !has_dot_leader(&line.text)
     };
     let mut claimed = HashSet::<(usize, usize)>::new();
     let mut anchors = vec![None::<Anchor>; entries.len()];
-    let mut last = None::<(usize, usize)>;
+    let mut last = HashMap::<DocumentContext, (usize, usize)>::new();
     for (index, entry) in entries.iter().enumerate() {
         let title = normalize_title(&entry.title);
         let Some(&target) = slot_of_page.get(&(entry.page - 1)) else {
@@ -459,7 +498,11 @@ pub(super) fn reconcile_bookmarks(
                         let mut joined = String::new();
                         let mut heading = true;
                         for end in start..(start + MAX_TITLE_LINES).min(page.lines.len()) {
-                            if claimed.contains(&(page_slot, end)) || !eligible(page, end) {
+                            if claimed.contains(&(page_slot, end))
+                                || !eligible(page, end)
+                                || primitives.document_context(&page.lines[end].id)
+                                    != primitives.document_context(&page.lines[start].id)
+                            {
                                 return None;
                             }
                             joined.push_str(&norms[page_slot][end]);
@@ -487,7 +530,9 @@ pub(super) fn reconcile_bookmarks(
             continue;
         };
         let position = (anchor.page_slot, anchor.lines[0]);
-        if last.is_some_and(|last| position <= last) {
+        let context =
+            primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
+        if last.get(&context).is_some_and(|last| position <= *last) {
             continue;
         }
         if !anchor.existing {
@@ -521,13 +566,23 @@ pub(super) fn reconcile_bookmarks(
                 continue;
             }
         }
-        last = Some(position);
+        last.insert(context, position);
         claimed.extend(anchor.lines.iter().map(|slot| (anchor.page_slot, *slot)));
         anchors[index] = Some(anchor);
     }
     if anchors.iter().all(Option::is_none) {
         return false;
     }
+    // A confirmed title places its bookmark in its document and parallel sequence. Unanchored
+    // entries retain the PDF's primary frame and supply no authority over another context.
+    let entry_contexts = anchors
+        .iter()
+        .map(|anchor| {
+            anchor.as_ref().map_or((0, false), |anchor| {
+                primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
+            })
+        })
+        .collect::<Vec<_>>();
 
     // Similar headings may guide discovery, but only a title actually present in the body
     // supplies a confirmed navigation relationship to the attachment predictor.
@@ -547,7 +602,12 @@ pub(super) fn reconcile_bookmarks(
         let block = page.lines[anchor.lines[0]].block_index;
         if anchor.existing {
             let same = |slot: usize, page: &Page| {
-                page.lines[slot].region_type == "heading" && page.lines[slot].block_index == block
+                page.lines[slot].region_type == "heading"
+                    && page.lines[slot].block_index == block
+                    && primitives.document_context(&page.lines[slot].id)
+                        == primitives.document_context(&page.lines[anchor.lines[0]].id)
+                    && levels.get(&page.lines[slot].id)
+                        == levels.get(&page.lines[anchor.lines[0]].id)
             };
             let numbered = |slot: usize, page: &Page| {
                 let text = page.lines[slot].text.trim();
@@ -585,23 +645,29 @@ pub(super) fn reconcile_bookmarks(
         line_ids: Vec<String>,
         text: String,
         level: Option<usize>,
+        context: DocumentContext,
     }
     let mut units = Vec::<Unit>::new();
     let mut unit_at = HashMap::<(usize, usize), usize>::new();
     for (page_slot, page) in pages.iter().enumerate() {
         for (slot, line) in page.lines.iter().enumerate() {
-            if line.region_type != "heading" {
+            if line.region_type != "heading" || primitives.quotations.scopes.contains_key(&line.id)
+            {
                 continue;
             }
             let continues = slot > 0
                 && page.lines[slot - 1].region_type == "heading"
-                && page.lines[slot - 1].block_index == line.block_index;
+                && page.lines[slot - 1].block_index == line.block_index
+                && primitives.reading_context(&page.lines[slot - 1].id)
+                    == primitives.reading_context(&line.id)
+                && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
             if !continues {
                 units.push(Unit {
                     position: (page_slot, slot),
                     line_ids: Vec::new(),
                     text: String::new(),
                     level: None,
+                    context: primitives.document_context(&line.id),
                 });
             }
             let unit = units.last_mut().expect("unit");
@@ -635,11 +701,12 @@ pub(super) fn reconcile_bookmarks(
     let mut frame_units = HashMap::<usize, usize>::new();
     let mut levels_out = HashMap::<usize, Option<usize>>::new();
     {
-        let mut stack = Vec::<usize>::new();
+        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
         for (index, entry) in entries.iter().enumerate() {
             let Some(unit) = entry_unit[index].filter(|_| framed(entry)) else {
                 continue;
             };
+            let stack = stacks.entry(entry_contexts[index]).or_default();
             while stack.last().is_some_and(|level| *level >= entry.level) {
                 stack.pop();
             }
@@ -657,11 +724,12 @@ pub(super) fn reconcile_bookmarks(
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
     let parents = {
-        let mut stack = Vec::<usize>::new();
+        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
         entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
+                let stack = stacks.entry(entry_contexts[index]).or_default();
                 while stack
                     .last()
                     .is_some_and(|prior| entries[*prior].level >= entry.level)
@@ -697,24 +765,27 @@ pub(super) fn reconcile_bookmarks(
     let detected = (0..units.len())
         .filter(|unit| !levels_out.contains_key(unit) && !promoted.contains(unit))
         .collect::<Vec<_>>();
-    let mut title_counts = HashMap::<String, usize>::new();
+    let mut title_counts = HashMap::<(DocumentContext, String), usize>::new();
     for unit in &detected {
         *title_counts
-            .entry(normalize_title(&units[*unit].text))
+            .entry((units[*unit].context, normalize_title(&units[*unit].text)))
             .or_default() += 1;
     }
     let mut groups = HashMap::<usize, Vec<usize>>::new();
     for unit in detected {
-        let norm = normalize_title(&units[unit].text);
+        let key = (units[unit].context, normalize_title(&units[unit].text));
         if tier == Tier::Full
-            && (!norm.is_empty() && title_counts[&norm] >= BACKFILL_DUP_MIN
+            && (!key.1.is_empty() && title_counts[&key] >= BACKFILL_DUP_MIN
                 || units[unit].text.chars().count() > BACKFILL_MAX_TITLE)
         {
             levels_out.insert(unit, None);
             continue;
         }
         let mut active = None;
-        for (index, opens) in &frame {
+        for (index, opens) in frame
+            .iter()
+            .filter(|(index, _)| entry_contexts[*index] == units[unit].context)
+        {
             if *opens > units[unit].position {
                 break;
             }
@@ -764,6 +835,7 @@ pub(super) fn reconcile_bookmarks(
                 // Else the chapter whose pages it falls in.
                 frame
                     .iter()
+                    .filter(|(index, _)| entry_contexts[*index] == units[unit].context)
                     .take_while(|(_, opens)| opens.0 <= units[unit].position.0)
                     .last()
                     .and_then(|(chapter, _)| frame_units.get(chapter))
@@ -785,6 +857,14 @@ pub(super) fn reconcile_bookmarks(
     let levels = &mut primitives.heading_levels;
     for (unit, level) in levels_out {
         for line_id in &units[unit].line_ids {
+            if primitives
+                .source_regions
+                .as_ref()
+                .and_then(|regions| regions.get(line_id))
+                .is_some_and(|role| role != "H" && legal_pdf_core::is_heading_role(role))
+            {
+                continue;
+            }
             match level {
                 Some(level) => levels.insert(line_id.clone(), level),
                 None => levels.remove(line_id),

@@ -297,7 +297,7 @@ impl FlashSpan {
             ),
             stats: CharStats::of(trim_unicode_ws(&span.text)),
             bold: span.flags & 16 != 0 || bold_font().is_match(&font_name),
-            italic: italic_font().is_match(&font_name),
+            italic: span.flags & 2 != 0 || italic_font().is_match(&font_name),
             font_name,
             size: span.size,
         }
@@ -360,6 +360,18 @@ impl FlashLine {
         };
         for span in &line.spans {
             flash.append(FlashSpan::of(span, height));
+        }
+        if line.spans.is_empty() {
+            let rect = Rect::from_native(line.bbox, height);
+            // OCR supplies glyph boxes, not font spans; retain its text and measured height.
+            flash.append(FlashSpan {
+                rect,
+                stats: CharStats::of(trim_unicode_ws(&line.text)),
+                font_name: String::new(),
+                size: rect.height(),
+                bold: false,
+                italic: false,
+            });
         }
         flash
     }
@@ -508,11 +520,15 @@ impl FlashBlock {
         self.stats.caps_heavy()
     }
 
-    /// Dominant font size, plus two for capitals and one for bold.
-    pub(super) fn heading_score(&self) -> f64 {
-        self.dominant_size()
+    /// Dominant type size, plus two for capitals and one for comparable observed bold.
+    pub(super) fn heading_score(&self, scale: f64, known_style: bool) -> f64 {
+        self.dominant_size() * scale
             + if self.caps_heavy() { 2.0 } else { 0.0 }
-            + if self.bold > 0.5 { 1.0 } else { 0.0 }
+            + if known_style && self.bold > 0.5 {
+                1.0
+            } else {
+                0.0
+            }
     }
 
     /// 1 justified, 2 left-aligned, 3 centered, 4 right-aligned, 5 mixed.
