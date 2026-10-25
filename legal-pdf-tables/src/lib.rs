@@ -1,38 +1,34 @@
-//! Tables drawn with rules.
+//! Tables, read by pdf-inspector's own detectors.
 //!
-//! A page's painted rules that cross one another form a lattice. Each rule position
-//! bounds a grid row or column; a cell runs on across a side the rules leave open, so a
-//! merged cell spans the rows or columns it covers. A grid holds a table only when its
-//! cells are rectangles, every line of text inside it sits within one cell, and at least
-//! two rows hold text in more than one cell: a ruled box around a passage, a stack of
-//! single-column panels or a contents list is no table. A line the extractor ran across a
-//! column rule is parted at its words. Rules that only head a table, a pair of equal rules
-//! around its column labels, make one too: its rows are the lines set under those labels.
-//! A table the page cuts off goes on at the top of the next page, or under its repeated
-//! caption and head row, when its columns stand where they stood.
+//! Each page's words go to pdf-inspector as its text items and the page's painted rules as its
+//! lines: its rule-grid detector reads the ruled tables, its white-space detector the rest of the
+//! page where the parser's layout says white space can be read (`TableLayout`). What it finds is
+//! mapped back onto the words it was read from, cell by cell. A contents list is no table, and a
+//! text set beside its translation is none either. A table the page cuts off goes on at the top
+//! of the next page, or under its repeated caption and head row, when its columns stand where
+//! they stood.
 
 use legal_pdf_core::line_font_size;
 use legal_pdf_core::model::{Line, Page};
-use regex::Regex;
+use pdf_inspector::tables::{detect_tables, detect_tables_from_lines, Table, TableKind};
+use pdf_inspector::types::{ItemType, PdfLine, TextItem};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// Layout readings the table detector takes from the parser that owns them.
 pub trait TableLayout {
-    /// Do these lines form a contents page's grid of titles and page numbers?
-    fn contents_grid(&self, lines: &[Line], page_width: f64) -> bool;
     /// The language a column of lines is written in: French, English, or neither clearly
     /// (`Some(true)`, `Some(false)`, `None`), on at least `minimum` telling words.
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool>;
+    /// Whether the page's white space can be read for tables set without rules: not a recognized
+    /// page's, unless its lines stand in a plain grid.
+    fn white_space(&self, page: &Page) -> bool;
 }
 
 /// Points within which rule positions coincide and rule ends meet.
 const TOLERANCE: f64 = 2.0;
-/// Share of a cell side the rules must cover to close it.
-const CLOSED: f64 = 0.5;
 
 /// A line of a cell, or the part of it that stands in the cell when the line runs on
-/// across a column rule into the next cell.
+/// across a column into the next cell.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CellPart {
     pub line_id: String,
@@ -58,21 +54,6 @@ impl TableCell {
             .map(|part| part.text.trim())
             .collect::<Vec<_>>()
             .join(" ")
-    }
-
-    /// The cell's parts by visual row.
-    fn bands(&self) -> Vec<Vec<&CellPart>> {
-        let mut bands: Vec<Vec<&CellPart>> = Vec::new();
-        let mut bottom = f64::NEG_INFINITY;
-        for part in &self.parts {
-            let height = part.bbox[3] - part.bbox[1];
-            if part.bbox[1] > bottom - height * 0.5 {
-                bands.push(Vec::new());
-            }
-            bottom = bottom.max(part.bbox[3]);
-            bands.last_mut().expect("band").push(part);
-        }
-        bands
     }
 
     pub fn line_ids(&self) -> Vec<String> {
@@ -114,106 +95,11 @@ impl PdfTable {
             .filter(|id| seen.insert(*id))
             .collect()
     }
-}
 
-#[derive(Clone, Copy)]
-struct Rule {
-    at: f64,
-    start: f64,
-    end: f64,
-}
-
-fn join(mut rules: Vec<Rule>) -> Vec<Rule> {
-    rules.sort_by(|left, right| left.at.total_cmp(&right.at));
-    let mut groups: Vec<(Vec<f64>, Vec<(f64, f64)>)> = Vec::new();
-    for rule in rules {
-        match groups.last_mut() {
-            Some((ats, spans)) if rule.at - ats[ats.len() - 1] <= TOLERANCE => {
-                ats.push(rule.at);
-                spans.push((rule.start, rule.end));
-            }
-            _ => groups.push((vec![rule.at], vec![(rule.start, rule.end)])),
-        }
+    /// The page the table ends on and where on it it ends: notes to the table are set below.
+    pub fn end(&self) -> (usize, f64) {
+        (self.page_index, self.bottom)
     }
-    let mut joined = Vec::new();
-    for (ats, mut spans) in groups {
-        let at = ats.iter().sum::<f64>() / ats.len() as f64;
-        spans.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let mut current: Option<(f64, f64)> = None;
-        for (start, end) in spans {
-            current = match current {
-                Some((from, to)) if start <= to + TOLERANCE => Some((from, to.max(end))),
-                Some((from, to)) => {
-                    joined.push(Rule {
-                        at,
-                        start: from,
-                        end: to,
-                    });
-                    Some((start, end))
-                }
-                None => Some((start, end)),
-            };
-        }
-        if let Some((start, end)) = current {
-            joined.push(Rule { at, start, end });
-        }
-    }
-    joined.retain(|rule| rule.end - rule.start > 2.0 * TOLERANCE);
-    joined
-}
-
-/// Rule positions that coincide, averaged.
-fn positions(mut values: Vec<f64>) -> Vec<f64> {
-    values.sort_by(f64::total_cmp);
-    let mut clusters: Vec<Vec<f64>> = Vec::new();
-    for value in values {
-        match clusters.last_mut() {
-            Some(cluster) if value - cluster[cluster.len() - 1] <= TOLERANCE => {
-                cluster.push(value);
-            }
-            _ => clusters.push(vec![value]),
-        }
-    }
-    clusters
-        .iter()
-        .map(|cluster| cluster.iter().sum::<f64>() / cluster.len() as f64)
-        .collect()
-}
-
-/// Share of `start..end` that the rules lying at `at` cover.
-fn coverage(rules: &[Rule], at: f64, start: f64, end: f64) -> f64 {
-    let mut spans: Vec<_> = rules
-        .iter()
-        .filter(|rule| {
-            (rule.at - at).abs() <= TOLERANCE
-                && rule.end > start - TOLERANCE
-                && rule.start < end + TOLERANCE
-        })
-        .map(|rule| (rule.start.max(start), rule.end.min(end)))
-        .collect();
-    spans.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let (mut covered, mut cursor) = (0.0, start);
-    for (from, to) in spans {
-        let from = from.max(cursor);
-        if to > from {
-            covered += to - from;
-            cursor = to;
-        }
-    }
-    covered / (end - start).max(f64::EPSILON)
-}
-
-fn find(parents: &mut [usize], mut node: usize) -> usize {
-    while parents[node] != node {
-        parents[node] = parents[parents[node]];
-        node = parents[node];
-    }
-    node
-}
-
-fn union(parents: &mut [usize], left: usize, right: usize) {
-    let (left, right) = (find(parents, left), find(parents, right));
-    parents[left.max(right)] = left.min(right);
 }
 
 fn bold(line: &Line) -> bool {
@@ -229,101 +115,12 @@ fn bold(line: &Line) -> bool {
     total > 0 && heavy * 5 >= total * 4
 }
 
-fn contents_leader(text: &str) -> bool {
-    static LEADER: OnceLock<Regex> = OnceLock::new();
-    LEADER
-        .get_or_init(|| Regex::new(r"(?:\. ?){4,}\s*\S{1,8}\s*$").expect("contents leader regex"))
-        .is_match(text)
-}
-
 /// A line, or the words of it that stand in one cell.
 #[derive(Clone, Copy)]
 struct Piece {
     line: usize,
     chars: Option<(usize, usize)>,
     bbox: [f64; 4],
-}
-
-/// A ruled row whose cells each hold the same number of lines, level with one another
-/// from cell to cell and set apart by more than a wrapped line's leading, is that many
-/// rows the rules leave unparted.
-fn part_unruled_rows(rows: Vec<TableRow>) -> Vec<TableRow> {
-    let mut spanned = vec![false; rows.len()];
-    for (index, row) in rows.iter().enumerate() {
-        for cell in &row.cells {
-            for covered in index + 1..(index + cell.row_span).min(rows.len()) {
-                spanned[covered] = true;
-            }
-        }
-    }
-    let mut parted = Vec::with_capacity(rows.len());
-    for (index, row) in rows.into_iter().enumerate() {
-        let bands: Vec<Vec<Vec<&CellPart>>> = row.cells.iter().map(TableCell::bands).collect();
-        let filled: Vec<&Vec<Vec<&CellPart>>> =
-            bands.iter().filter(|bands| !bands.is_empty()).collect();
-        let count = filled.first().map_or(0, |bands| bands.len());
-        let height = |band: &[&CellPart]| {
-            band.iter()
-                .map(|part| part.bbox[3] - part.bbox[1])
-                .fold(0.0, f64::max)
-        };
-        let top = |band: &[&CellPart]| {
-            band.iter()
-                .map(|part| part.bbox[1])
-                .fold(f64::INFINITY, f64::min)
-        };
-        let bottom = |band: &[&CellPart]| {
-            band.iter()
-                .map(|part| part.bbox[3])
-                .fold(f64::NEG_INFINITY, f64::max)
-        };
-        let level = || {
-            (0..count).all(|band| {
-                let first = top(&filled[0][band]);
-                filled
-                    .iter()
-                    .all(|bands| (top(&bands[band]) - first).abs() <= 0.5 * height(&bands[band]))
-            })
-        };
-        let apart = || {
-            filled.iter().all(|bands| {
-                bands
-                    .windows(2)
-                    .all(|pair| top(&pair[1]) - bottom(&pair[0]) >= 0.5 * height(&pair[0]))
-            })
-        };
-        if spanned[index]
-            || count < 2
-            || filled.len() < 2
-            || row.cells.iter().any(|cell| cell.row_span > 1)
-            || !filled.iter().all(|bands| bands.len() == count)
-            || !level()
-            || !apart()
-        {
-            parted.push(row);
-            continue;
-        }
-        for band in 0..count {
-            parted.push(TableRow {
-                header: false,
-                cells: row
-                    .cells
-                    .iter()
-                    .zip(&bands)
-                    .map(|(cell, bands)| TableCell {
-                        column: cell.column,
-                        row_span: 1,
-                        column_span: cell.column_span,
-                        parts: bands
-                            .get(band)
-                            .map(|parts| parts.iter().map(|part| (*part).clone()).collect())
-                            .unwrap_or_default(),
-                    })
-                    .collect(),
-            });
-        }
-    }
-    parted
 }
 
 /// A cell of pieces in reading order: by visual row, then from the left.
@@ -368,1228 +165,215 @@ fn cell_of(page: &Page, column: usize, mut pieces: Vec<Piece>) -> TableCell {
     }
 }
 
-/// Pieces of a line in the lattice cells their words stand in, or `None` when the line
-/// crosses a rule its words do not part at.
-fn pieces_of(
-    line: &Line,
-    index: usize,
-    cell_at: &dyn Fn(f64, f64) -> Option<usize>,
-    inside: &dyn Fn(usize, [f64; 4]) -> bool,
-) -> Option<Vec<(usize, Piece)>> {
-    let center = |bbox: [f64; 4]| ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0);
-    let whole = |root: usize| {
-        inside(root, line.bbox).then(|| {
-            vec![(
-                root,
-                Piece {
-                    line: index,
-                    chars: None,
-                    bbox: line.bbox,
-                },
-            )]
-        })
+/// A word no word of the line stands for: the line read whole.
+const WHOLE: usize = usize::MAX;
+
+/// The page's words as pdf-inspector's text items (points, y up), with the (line, word) each was
+/// read from. Running heads and footers, and lines the parser has set aside, are not offered.
+fn text_items(page: &Page) -> (Vec<TextItem>, Vec<(usize, usize)>) {
+    let (mut items, mut origin) = (Vec::new(), Vec::new());
+    let item = |line: &Line, text: &str, bbox: [f64; 4], font: &str, underlined: bool| TextItem {
+        text: text.to_owned(),
+        x: bbox[0] as f32,
+        y: (page.height - bbox[3]) as f32,
+        width: (bbox[2] - bbox[0]) as f32,
+        height: (bbox[3] - bbox[1]) as f32,
+        rotation: 0.0,
+        advance_known: true,
+        font: font.to_owned(),
+        font_tag: String::new(),
+        legacy_symbol_rewrite: false,
+        font_size: line_font_size(line).max(bbox[3] - bbox[1]) as f32,
+        page: page.index as u32 + 1,
+        is_bold: bold(line),
+        is_italic: false,
+        font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
+        is_underline: underlined,
+        is_strikeout: false,
+        fidelity: None,
+        item_type: ItemType::Text,
+        mcid: None,
+        baseline_shift: 0.0,
     };
-    let (x, y) = center(line.bbox);
-    let root = cell_at(x, y)?;
-    let words: Vec<_> = line
-        .words
-        .iter()
-        .filter(|word| !word.text.trim().is_empty())
-        .collect();
-    let roots: Vec<Option<usize>> = words
-        .iter()
-        .map(|word| {
-            let (x, y) = center(word.bbox);
-            cell_at(x, y)
-        })
-        .collect();
-    if words.is_empty() || roots.iter().all(|value| *value == Some(root)) {
-        return whole(root);
-    }
-    let mut pieces: Vec<(usize, Piece)> = Vec::new();
-    for (word, root) in words.iter().zip(roots) {
-        let root = root?;
-        match pieces.last_mut() {
-            Some((prior, piece)) if *prior == root => {
-                piece.chars = piece.chars.map(|(start, _)| (start, word.end));
-                piece.bbox[2] = piece.bbox[2].max(word.bbox[2]);
-                piece.bbox[1] = piece.bbox[1].min(word.bbox[1]);
-                piece.bbox[3] = piece.bbox[3].max(word.bbox[3]);
-            }
-            _ => pieces.push((
-                root,
-                Piece {
-                    line: index,
-                    chars: Some((word.start, word.end)),
-                    bbox: word.bbox,
-                },
-            )),
-        }
-    }
-    let mut roots: Vec<usize> = pieces.iter().map(|(root, _)| *root).collect();
-    roots.sort_unstable();
-    roots.dedup();
-    (roots.len() == pieces.len() && pieces.iter().all(|(root, piece)| inside(*root, piece.bbox)))
-        .then_some(pieces)
-}
-
-/// The table one lattice of rules draws on a page, if it is one.
-fn lattice_table(
-    page: &Page,
-    horizontal: &[Rule],
-    vertical: &[Rule],
-    layout: &dyn TableLayout,
-) -> Option<PdfTable> {
-    let xs = positions(vertical.iter().map(|rule| rule.at).collect());
-    let ys = positions(horizontal.iter().map(|rule| rule.at).collect());
-    if xs.len() < 3 || ys.len() < 3 {
-        return None;
-    }
-    let (columns, rows) = (xs.len() - 1, ys.len() - 1);
-    let slot = |row: usize, column: usize| row * columns + column;
-    let mut parents: Vec<usize> = (0..rows * columns).collect();
-    for row in 0..rows {
-        for column in 0..columns {
-            if column + 1 < columns
-                && coverage(vertical, xs[column + 1], ys[row], ys[row + 1]) < CLOSED
-            {
-                union(&mut parents, slot(row, column), slot(row, column + 1));
-            }
-            if row + 1 < rows
-                && coverage(horizontal, ys[row + 1], xs[column], xs[column + 1]) < CLOSED
-            {
-                union(&mut parents, slot(row, column), slot(row + 1, column));
-            }
-        }
-    }
-    // Each cell: its top-left slot, spans and the lines it holds.
-    let mut extents: HashMap<usize, (usize, usize, usize, usize, usize)> = HashMap::new();
-    for row in 0..rows {
-        for column in 0..columns {
-            let root = find(&mut parents, slot(row, column));
-            let extent = extents.entry(root).or_insert((row, column, row, column, 0));
-            extent.2 = extent.2.max(row);
-            extent.3 = extent.3.max(column);
-            extent.4 += 1;
-        }
-    }
-    if extents
-        .values()
-        .any(|(top, left, bottom, right, count)| (bottom - top + 1) * (right - left + 1) != *count)
-    {
-        return None;
-    }
-    let roots: Vec<usize> = (0..rows * columns)
-        .map(|slot| find(&mut parents, slot))
-        .collect();
-    let cell_at = |x: f64, y: f64| {
-        (x > xs[0] && x < xs[columns] && y > ys[0] && y < ys[rows]).then(|| {
-            let column = xs.partition_point(|value| *value < x) - 1;
-            let row = ys.partition_point(|value| *value < y) - 1;
-            roots[slot(row, column)]
-        })
-    };
-    // Text that crosses a cell's rules belongs to no one cell.
-    let inside = |root: usize, bbox: [f64; 4]| {
-        let (top, left, bottom, right, _) = extents[&root];
-        let width = bbox[2] - bbox[0];
-        let height = bbox[3] - bbox[1];
-        let outside_x = (xs[left] - bbox[0]).max(0.0) + (bbox[2] - xs[right + 1]).max(0.0);
-        let outside_y = (ys[top] - bbox[1]).max(0.0) + (bbox[3] - ys[bottom + 1]).max(0.0);
-        outside_x <= (width * 0.25).max(3.0) && outside_y <= (height * 0.5).max(3.0)
-    };
-    let mut members: HashMap<usize, Vec<Piece>> = HashMap::new();
-    for (index, line) in page.lines.iter().enumerate() {
-        if line.text.trim().is_empty() || !line.bbox.iter().all(|value| value.is_finite()) {
-            continue;
-        }
-        let (x, y) = (
-            (line.bbox[0] + line.bbox[2]) / 2.0,
-            (line.bbox[1] + line.bbox[3]) / 2.0,
-        );
-        if cell_at(x, y).is_none() {
-            continue;
-        }
-        for (root, piece) in pieces_of(line, index, &cell_at, &inside)? {
-            members.entry(root).or_default().push(piece);
-        }
-    }
-    let mut cells: Vec<(usize, usize, TableCell)> = extents
-        .iter()
-        .map(|(root, (top, left, bottom, right, _))| {
-            let mut cell = cell_of(page, *left, members.remove(root).unwrap_or_default());
-            cell.row_span = bottom - top + 1;
-            cell.column_span = right - left + 1;
-            (*top, *left, cell)
-        })
-        .collect();
-    cells.sort_by_key(|(row, column, _)| (*row, *column));
-    // A line parted between cells must run straight on from one cell into the next.
-    let sequence: Vec<&CellPart> = cells.iter().flat_map(|(_, _, cell)| &cell.parts).collect();
-    let mut runs: HashMap<&str, usize> = HashMap::new();
-    for (position, part) in sequence.iter().enumerate() {
-        if position == 0 || sequence[position - 1].line_id != part.line_id {
-            *runs.entry(part.line_id.as_str()).or_default() += 1;
-        }
-    }
-    if runs.values().any(|count| *count > 1) {
-        return None;
-    }
-    let lines_in = |cell: &TableCell| cell.parts.len();
-    let filled_rows = (0..rows)
-        .filter(|row| {
-            cells
-                .iter()
-                .filter(|(top, _, cell)| top == row && lines_in(cell) > 0)
-                .count()
-                >= 2
-        })
-        .count();
-    if filled_rows < 2 {
-        return None;
-    }
-    let by_id: HashMap<&str, &Line> = page
-        .lines
-        .iter()
-        .map(|line| (line.id.as_str(), line))
-        .collect();
-    let text_rows: Vec<Vec<&Line>> = (0..rows)
-        .map(|row| {
-            cells
-                .iter()
-                .filter(|(top, _, _)| *top == row)
-                .flat_map(|(_, _, cell)| cell.line_ids())
-                .map(|id| by_id[id.as_str()])
-                .collect()
-        })
-        .filter(|lines: &Vec<&Line>| !lines.is_empty())
-        .collect();
-    // A ruled contents list, or a box the page repeats as its running head or foot.
-    let inside: Vec<Line> = text_rows
-        .iter()
-        .flatten()
-        .map(|line| (*line).clone())
-        .collect();
-    if text_rows
-        .iter()
-        .filter(|lines| lines.iter().any(|line| contents_leader(&line.text)))
-        .count()
-        * 2
-        >= text_rows.len()
-        || layout.contents_grid(&inside, page.width)
-        || text_rows
-            .iter()
-            .flatten()
-            .all(|line| line.exclude_from_body)
-    {
-        return None;
-    }
-    // Rows and columns in which no cell begins are covered by spanning cells: drop them.
-    let row_starts: Vec<bool> = (0..rows)
-        .map(|row| cells.iter().any(|(top, _, _)| *top == row))
-        .collect();
-    let column_starts: Vec<bool> = (0..columns)
-        .map(|column| cells.iter().any(|(_, left, _)| *left == column))
-        .collect();
-    let renumber = |starts: &[bool], index: usize| starts[..index].iter().filter(|s| **s).count();
-    let mut table_rows: Vec<TableRow> = (0..rows)
-        .filter(|row| row_starts[*row])
-        .map(|_| TableRow {
-            header: false,
-            cells: Vec::new(),
-        })
-        .collect();
-    for (top, left, mut cell) in cells {
-        let bottom = top + cell.row_span;
-        let right = left + cell.column_span;
-        cell.row_span = renumber(&row_starts, bottom) - renumber(&row_starts, top);
-        cell.column_span = renumber(&column_starts, right) - renumber(&column_starts, left);
-        cell.column = renumber(&column_starts, left);
-        table_rows[renumber(&row_starts, top)].cells.push(cell);
-    }
-    let kept_xs: Vec<f64> = xs
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index == columns || column_starts[*index])
-        .map(|(_, x)| *x)
-        .collect();
-    let mut table_rows = part_unruled_rows(table_rows);
-    // Leading rows set wholly in bold over rows that are not head the table.
-    let bold_row = |row: &TableRow| {
-        let lines: Vec<&Line> = row
-            .cells
-            .iter()
-            .flat_map(TableCell::line_ids)
-            .map(|id| by_id[id.as_str()])
-            .collect();
-        !lines.is_empty() && lines.iter().all(|line| bold(line))
-    };
-    let leading = table_rows.iter().take_while(|row| bold_row(row)).count();
-    if leading < table_rows.len() && table_rows[leading..].iter().any(|row| !bold_row(row)) {
-        for row in &mut table_rows[..leading] {
-            row.header = true;
-        }
-    }
-    Some(PdfTable {
-        rows: table_rows,
-        page_index: page.index,
-        xs: kept_xs,
-        top: ys[0],
-        bottom: ys[rows],
-    })
-}
-
-fn whole_lines(page: &Page, column: usize, lines: Vec<usize>) -> TableCell {
-    cell_of(
-        page,
-        column,
-        lines
-            .into_iter()
-            .map(|line| Piece {
-                line,
-                chars: None,
-                bbox: page.lines[line].bbox,
-            })
-            .collect(),
-    )
-}
-
-/// Tables that rules only head: two rules of one width enclose a row of at least two
-/// column labels, and the rows set below them in those columns, up to a rule of the same
-/// width, a wider gap or a line that crosses a column, are the body. A title set between
-/// rules heads no columns, and the rules a form leaves to be filled in enclose no labels.
-fn open_tables(page: &Page, rules: &[Rule], taken: &HashSet<usize>) -> Vec<PdfTable> {
-    let mut heights: Vec<f64> = page
-        .lines
-        .iter()
-        .map(|line| line.bbox[3] - line.bbox[1])
-        .filter(|height| *height > 0.0)
-        .collect();
-    if heights.is_empty() {
-        return Vec::new();
-    }
-    heights.sort_by(f64::total_cmp);
-    let pitch = heights[heights.len() / 2];
-    let slack = 3.0 * TOLERANCE;
-    let mut rules: Vec<Rule> = rules
-        .iter()
-        .copied()
-        .filter(|rule| rule.end - rule.start >= 72.0)
-        .collect();
-    rules.sort_by(|left, right| left.at.total_cmp(&right.at));
-    let same_width = |left: &Rule, right: &Rule| {
-        (left.start - right.start).abs() <= slack && (left.end - right.end).abs() <= slack
-    };
-    let free: Vec<usize> = (0..page.lines.len())
-        .filter(|index| !taken.contains(index) && !page.lines[*index].text.trim().is_empty())
-        .collect();
-    let mut tables = Vec::new();
-    let mut after = f64::NEG_INFINITY;
-    for (slot, top) in rules.iter().enumerate() {
-        if top.at < after {
-            continue;
-        }
-        let Some(bottom) = rules[slot + 1..].iter().find(|rule| {
-            same_width(top, rule)
-                && rule.at - top.at > 0.8 * pitch
-                && rule.at - top.at <= 4.5 * pitch
-        }) else {
-            continue;
-        };
-        let within =
-            |line: &Line| line.bbox[0] >= top.start - slack && line.bbox[2] <= top.end + slack;
-        let mut labels: Vec<usize> = free
-            .iter()
-            .copied()
-            .filter(|index| {
-                let line = &page.lines[*index];
-                let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
-                middle > top.at && middle < bottom.at && within(line)
-            })
-            .collect();
-        labels.sort_by(|left, right| {
-            page.lines[*left].bbox[0].total_cmp(&page.lines[*right].bbox[0])
-        });
-        // Column labels stacked over one another head one column.
-        let mut columns: Vec<(f64, f64, Vec<usize>)> = Vec::new();
-        for index in labels {
-            let line = &page.lines[index];
-            match columns.last_mut() {
-                Some(column) if line.bbox[0] < column.1 => {
-                    column.1 = column.1.max(line.bbox[2]);
-                    column.2.push(index);
-                }
-                _ => columns.push((line.bbox[0], line.bbox[2], vec![index])),
-            }
-        }
-        // Labels are words, set short; figures between rules are a row of data.
-        let labelled = columns.iter().flat_map(|column| &column.2).all(|index| {
-            let text = page.lines[*index].text.trim();
-            text.chars().any(char::is_alphabetic) && text.chars().count() <= 60
-        });
-        if columns.len() < 2 || !labelled {
-            continue;
-        }
-        let mut xs = vec![top.start];
-        xs.extend(columns.windows(2).map(|pair| (pair[0].1 + pair[1].0) / 2.0));
-        xs.push(top.end);
-        // A body line stands under the one label it overlaps, inside that label's column.
-        let column_of = |line: &Line| {
-            let mut under = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, (left, right, _))| line.bbox[0] < *right && *left < line.bbox[2])
-                .map(|(column, _)| column);
-            let column = under.next()?;
-            (under.next().is_none()
-                && line.bbox[0] >= xs[column] - slack
-                && line.bbox[2] <= xs[column + 1] + slack)
-                .then_some(column)
-        };
-        let closing = rules[slot + 1..]
-            .iter()
-            .filter(|rule| rule.at > bottom.at && same_width(top, rule))
-            .map(|rule| rule.at)
-            .next()
-            .unwrap_or(f64::INFINITY);
-        let mut below: Vec<usize> = free
-            .iter()
-            .copied()
-            .filter(|index| {
-                let line = &page.lines[*index];
-                line.bbox[1] > bottom.at - 1.0
-                    && line.bbox[3] <= closing + 1.0
-                    && line.bbox[2] > top.start
-                    && line.bbox[0] < top.end
-            })
-            .collect();
-        below.sort_by(|left, right| {
-            page.lines[*left].bbox[1].total_cmp(&page.lines[*right].bbox[1])
-        });
-        // The body, band by band.
-        let mut body: Vec<Vec<Vec<usize>>> = Vec::new();
-        let mut floor = bottom.at;
-        let mut position = 0;
-        while position < below.len() {
-            let first = &page.lines[below[position]];
-            if first.bbox[1] - floor > 2.5 * pitch {
-                break;
-            }
-            let mut band = vec![below[position]];
-            let mut band_bottom = first.bbox[3];
-            position += 1;
-            while position < below.len()
-                && page.lines[below[position]].bbox[1] < band_bottom - 0.5 * pitch
-            {
-                band_bottom = band_bottom.max(page.lines[below[position]].bbox[3]);
-                band.push(below[position]);
-                position += 1;
-            }
-            let mut cells = vec![Vec::new(); columns.len()];
-            let mut fits = true;
-            for index in &band {
-                match column_of(&page.lines[*index]) {
-                    Some(column) => cells[column].push(*index),
-                    None => fits = false,
-                }
-            }
-            if !fits {
-                break;
-            }
-            // A band with nothing in the first column, close under a row, wraps that row.
-            let wraps = cells[0].is_empty()
-                && first.bbox[1] - floor <= 0.6 * pitch
-                && body
-                    .last()
-                    .is_some_and(|row: &Vec<Vec<usize>>| !row[0].is_empty());
-            match body.last_mut() {
-                Some(row) if wraps => {
-                    for (column, lines) in cells.into_iter().enumerate() {
-                        row[column].extend(lines);
-                    }
-                }
-                _ => body.push(cells),
-            }
-            floor = band_bottom;
-        }
-        let paired = body
-            .iter()
-            .any(|row| row.iter().filter(|cell| !cell.is_empty()).count() >= 2);
-        if body.len() < 2 || (columns.len() < 3 && !paired) {
-            continue;
-        }
-        let header = TableRow {
-            header: true,
-            cells: columns
-                .iter()
-                .enumerate()
-                .map(|(column, (_, _, lines))| whole_lines(page, column, lines.clone()))
-                .collect(),
-        };
-        let mut rows = vec![header];
-        rows.extend(body.into_iter().map(|cells| {
-            TableRow {
-                header: false,
-                cells: cells
-                    .into_iter()
-                    .enumerate()
-                    .map(|(column, lines)| whole_lines(page, column, lines))
-                    .collect(),
-            }
-        }));
-        after = floor.max(bottom.at);
-        tables.push(PdfTable {
-            rows,
-            page_index: page.index,
-            xs,
-            top: top.at,
-            bottom: if closing.is_finite() { closing } else { floor },
-        });
-    }
-    tables
-}
-
-/// Party roles a caption sets beside the names it lists.
-fn party_role(text: &str) -> bool {
-    static ROLE: OnceLock<Words> = OnceLock::new();
-    ROLE.get_or_init(|| {
-        Words::new(
-            r"applicants?|respondents?|plaintiffs?|defendants?|appellants?|petitioners?|claimants?|interveners?|intervenors?|interested\s+part(?:y|ies)|amic(?:us|i)\s+curiae|accused|complainants?|third\s+part(?:y|ies)|requérante?s?|intimée?s?|demandeur|demanderesse|défendeur|défenderesse|appelante?s?",
-            None,
-        )
-    })
-    .is_match(text)
-}
-
-/// A list marker or a line number standing alone: "3.", "(b)", "[12]", "iv)", "17".
-fn bare_marker(text: &str) -> bool {
-    static MARKER: OnceLock<Regex> = OnceLock::new();
-    MARKER
-        .get_or_init(|| {
-            Regex::new(r"^[\[(]?(?:\d{1,4}|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})(?:\.\d{1,3})*[.)\]]?$")
-                .expect("list marker regex")
-        })
-        .is_match(text.trim())
-}
-
-/// A form's label, set before or above its value: "Lawyer:", "Date: 4 May".
-fn form_label(text: &str) -> bool {
-    static LABEL: OnceLock<Regex> = OnceLock::new();
-    text.trim().ends_with(':')
-        || LABEL
-            .get_or_init(|| {
-                Regex::new(r"^\p{L}[\p{L} .'/&-]{0,25}:(?:\s|$)").expect("form label regex")
-            })
-            .is_match(text.trim())
-}
-
-/// A letterhead's or an address for service's contact details.
-fn contact_detail(text: &str) -> bool {
-    static CONTACT: OnceLock<Words> = OnceLock::new();
-    CONTACT
-        .get_or_init(|| {
-            Words::new(
-                r"tel|telephone|phone|fax|e-?mail|t[ée]l[ée]copieur|courriel|LLP",
-                Some(r"@|www\."),
-            )
-        })
-        .is_match(text)
-}
-
-/// Whole words, in any case, with marks that need no word around them. A word boundary
-/// keeps the regex engine off its fast automaton wherever a text holds a letter outside
-/// ASCII, so the words without boundaries, which it runs fast, first rule out the many
-/// texts holding none of them.
-struct Words {
-    loose: Regex,
-    bounded: Regex,
-}
-
-impl Words {
-    fn new(words: &str, marks: Option<&str>) -> Self {
-        let marks = marks.map(|marks| format!("|{marks}")).unwrap_or_default();
-        Self {
-            loose: Regex::new(&format!(r"(?i)(?:{words}){marks}")).expect("words regex"),
-            bounded: Regex::new(&format!(r"(?i)\b(?:{words})\b{marks}")).expect("words regex"),
-        }
-    }
-
-    fn is_match(&self, text: &str) -> bool {
-        self.loose.is_match(text) && self.bounded.is_match(text)
-    }
-}
-
-/// Tables set without rules: rows of text whose columns stand apart by gutters of white
-/// space that run the table's full height, each column's cells aligned on a left, right
-/// or centre edge. Columns of prose side by side are a page's or a bilingual text's
-/// columns, not a table; parties beside their roles are a caption; labels ending in a
-/// colon over their values are a form; numbered lines and items beside their text are a
-/// transcript or a list unless a head row names the columns; a contents list is no table.
-/// What stays has three or more columns, a column of figures or a head row.
-fn aligned_tables(
-    page: &Page,
-    taken: &HashSet<usize>,
-    translation: &HashSet<String>,
-    layout: &dyn TableLayout,
-) -> Vec<PdfTable> {
-    let mut heights: Vec<f64> = page
-        .lines
-        .iter()
-        .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
-        .map(|line| line.bbox[3] - line.bbox[1])
-        .filter(|height| *height > 0.0)
-        .collect();
-    // A recognized page's lines are no measure of its white space.
-    if heights.len() < 6 || page.source == "ocr" {
-        return Vec::new();
-    }
-    heights.sort_by(f64::total_cmp);
-    let pitch = heights[heights.len() / 2];
-    let gutter = (0.6 * pitch).max(6.0);
-    // Lines, parted where their words leave a column's gap.
-    let mut pieces: Vec<Piece> = Vec::new();
-    for (index, line) in page.lines.iter().enumerate() {
-        // A watermark's large or turned letters stand over the page's columns; a signing
-        // stamp's tiny print stands beside the signature.
-        if taken.contains(&index)
-            || line.exclude_from_body
+    for (slot, line) in page.lines.iter().enumerate() {
+        if line.exclude_from_body
+            || matches!(line.region_type.as_str(), "header" | "footer")
             || line.text.trim().is_empty()
             || !line.bbox.iter().all(|value| value.is_finite())
-            || line.bbox[3] - line.bbox[1] > 2.5 * pitch
-            || line.bbox[3] - line.bbox[1] < 0.5 * pitch
         {
             continue;
         }
-        let size = line_font_size(line)
-            .max(line.bbox[3] - line.bbox[1])
-            .max(1.0);
-        let words: Vec<_> = line
+        let font = |at: usize| {
+            line.spans
+                .iter()
+                .find(|span| span.start <= at && at < span.end.max(span.start + 1))
+                .or(line.spans.first())
+                .map_or("", |span| span.font.as_str())
+        };
+        let words: Vec<(usize, &legal_pdf_core::model::Word)> = line
             .words
             .iter()
-            .filter(|word| !word.text.trim().is_empty())
+            .enumerate()
+            .filter(|(_, word)| !word.text.trim().is_empty())
             .collect();
-        let mut start = 0;
-        for split in 1..=words.len() {
-            if split < words.len() && words[split].bbox[0] - words[split - 1].bbox[2] < 1.2 * size {
-                continue;
-            }
-            if start == 0 && split == words.len() {
-                break;
-            }
-            let part = &words[start..split];
-            pieces.push(Piece {
-                line: index,
-                chars: Some((part[0].start, part[part.len() - 1].end)),
-                bbox: [
-                    part[0].bbox[0],
-                    part.iter()
-                        .map(|word| word.bbox[1])
-                        .fold(f64::INFINITY, f64::min),
-                    part[part.len() - 1].bbox[2],
-                    part.iter()
-                        .map(|word| word.bbox[3])
-                        .fold(f64::NEG_INFINITY, f64::max),
-                ],
-            });
-            start = split;
+        if words.is_empty() {
+            items.push(item(line, line.text.trim(), line.bbox, font(0), false));
+            origin.push((slot, WHOLE));
         }
-        if start == 0 {
-            pieces.push(Piece {
-                line: index,
-                chars: None,
-                bbox: line.bbox,
-            });
+        for (at, word) in words {
+            items.push(item(line, &word.text, word.bbox, font(word.start), word.underlined));
+            origin.push((slot, at));
         }
     }
-    // Each piece's words, cut from its line once for every run of rows that reads them.
-    let texts: HashMap<(usize, Option<(usize, usize)>), String> = pieces
-        .iter()
-        .map(|piece| {
-            let line = &page.lines[piece.line].text;
-            let text = match piece.chars {
-                Some((start, end)) => line.chars().skip(start).take(end - start).collect(),
-                None => line.clone(),
-            };
-            ((piece.line, piece.chars), text)
-        })
-        .collect();
-    pieces.sort_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]));
-    // Visual rows.
-    let mut bands: Vec<Vec<Piece>> = Vec::new();
-    let mut floor = f64::NEG_INFINITY;
-    for piece in pieces {
-        let height = piece.bbox[3] - piece.bbox[1];
-        if piece.bbox[1] > floor - 0.5 * height {
-            bands.push(Vec::new());
-            floor = piece.bbox[3];
-        }
-        floor = floor.max(piece.bbox[3]);
-        bands.last_mut().expect("band").push(piece);
-    }
-    // Each band's covered spans, top and bottom, read once for every run that crosses it.
-    let coverage: Vec<Vec<(f64, f64)>> = bands
-        .iter()
-        .map(|band| {
-            let mut spans: Vec<(f64, f64)> = band
-                .iter()
-                .map(|piece| (piece.bbox[0], piece.bbox[2]))
-                .collect();
-            spans.sort_by(|left, right| left.0.total_cmp(&right.0));
-            let mut merged: Vec<(f64, f64)> = Vec::new();
-            for (start, end) in spans {
-                match merged.last_mut() {
-                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                    _ => merged.push((start, end)),
-                }
-            }
-            merged
-        })
-        .collect();
-    let top: Vec<f64> = bands
-        .iter()
-        .map(|band| {
-            band.iter()
-                .map(|piece| piece.bbox[1])
-                .fold(f64::INFINITY, f64::min)
-        })
-        .collect();
-    let bottom: Vec<f64> = bands
-        .iter()
-        .map(|band| {
-            band.iter()
-                .map(|piece| piece.bbox[3])
-                .fold(f64::NEG_INFINITY, f64::max)
-        })
-        .collect();
-    let mut tables = Vec::new();
-    let mut start = 0;
-    while start < bands.len() {
-        let spans = &coverage[start];
-        let mut gutters: Vec<(f64, f64)> = spans
-            .windows(2)
-            .map(|pair| (pair[0].1, pair[1].0))
-            .filter(|(left, right)| right - left >= gutter)
-            .collect();
-        if gutters.is_empty() {
-            start += 1;
-            continue;
-        }
-        let mut extent = (spans[0].0, spans[spans.len() - 1].1);
-        let mut end = start + 1;
-        while end < bands.len() && top[end] - bottom[end - 1] <= 2.5 * pitch {
-            let spans = &coverage[end];
-            let narrowed: Vec<(f64, f64)> = gutters
-                .iter()
-                .flat_map(|&gap| open_parts(gap, spans))
-                .filter(|(left, right)| right - left >= gutter)
-                .collect();
-            if narrowed.is_empty() {
-                break;
-            }
-            gutters = narrowed;
-            extent = (
-                extent.0.min(spans[0].0),
-                extent.1.max(spans[spans.len() - 1].1),
-            );
-            end += 1;
-        }
-        let found = aligned_table(page, &texts, &bands[start..end], &gutters, extent, pitch, layout)
-            .filter(|table| {
-                !table
-                    .line_ids()
-                    .into_iter()
-                    .any(|id| translation.contains(id))
-            });
-        start = if found.is_some() { end } else { start + 1 };
-        tables.extend(found);
-    }
-    tables
+    (items, origin)
 }
 
-/// What of a gap a band's covered spans leave open, left to right: the gap is cut at each span
-/// that reaches into what is still open of it. The spans are sorted and apart, so each cut leaves
-/// its left part behind every span still to come; a span reaching past an edge leaves a part of
-/// negative width, which only ever splits into more of them and which no gutter's width admits.
-fn open_parts((left, right): (f64, f64), spans: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut parts = Vec::new();
-    let mut open = (left, right);
-    for &(start, end) in spans {
-        if end <= open.0 || start >= open.1 {
-            continue;
-        }
-        parts.push((open.0, start));
-        open = (end, open.1);
-    }
-    parts.push(open);
-    parts
+/// The page's painted rules as pdf-inspector's lines (points, y up).
+fn rules(page: &Page) -> Vec<PdfLine> {
+    let number = page.index as u32 + 1;
+    page.regions
+        .iter()
+        .filter(|region| region.kind == "rule")
+        .map(|region| {
+            let [x0, y0, x1, y1] = region.bbox;
+            let flip = |y: f64| (page.height - y) as f32;
+            if (y1 - y0).abs() <= (x1 - x0).abs() {
+                let at = flip((y0 + y1) / 2.0);
+                PdfLine { x1: x0.min(x1) as f32, y1: at, x2: x0.max(x1) as f32, y2: at, page: number }
+            } else {
+                let at = ((x0 + x1) / 2.0) as f32;
+                PdfLine { x1: at, y1: flip(y0.max(y1)), x2: at, y2: flip(y0.min(y1)), page: number }
+            }
+        })
+        .collect()
 }
 
-/// The table some visual rows make between the gutters they share, if it passes.
-fn aligned_table(
-    page: &Page,
-    texts: &HashMap<(usize, Option<(usize, usize)>), String>,
-    bands: &[Vec<Piece>],
-    gutters: &[(f64, f64)],
-    extent: (f64, f64),
-    pitch: f64,
-    layout: &dyn TableLayout,
-) -> Option<PdfTable> {
-    if bands.len() < 3 {
+/// Which of `n` slots a position falls in: the detector gives `n + 1` boundaries, or one
+/// position per slot (a centre or an edge), the nearest of which is taken.
+fn slot(positions: &[f32], n: usize, at: f32) -> usize {
+    let mut sorted = positions.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let k = if sorted.len() == n + 1 {
+        sorted.partition_point(|position| *position <= at).saturating_sub(1)
+    } else {
+        (0..sorted.len())
+            .min_by(|a, b| (sorted[*a] - at).abs().total_cmp(&(sorted[*b] - at).abs()))
+            .unwrap_or(0)
+    };
+    k.min(n - 1)
+}
+
+/// The cell of the detector's grid an item stands in, by its position; where that cell's text
+/// does not hold the item's, the nearest cell along its row, then its column, that does.
+fn grid_cell(table: &Table, item: &TextItem) -> Option<(usize, usize)> {
+    let rows = table.cells.len();
+    let columns = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    if rows == 0 || columns == 0 {
         return None;
     }
-    let mut xs = vec![extent.0];
-    xs.extend(gutters.iter().map(|(left, right)| (left + right) / 2.0));
-    xs.push(extent.1);
-    let columns = xs.len() - 1;
-    let column_of = |piece: &Piece| {
-        let middle = (piece.bbox[0] + piece.bbox[2]) / 2.0;
-        xs.partition_point(|x| *x < middle).clamp(1, columns) - 1
+    let column = slot(&table.columns, columns, item.x + item.width / 2.0);
+    // Rows run down the page; the detector's y runs up it.
+    let row = rows - 1 - slot(&table.rows, rows, item.y + item.height / 2.0);
+    let text = item.text.trim();
+    let holds = |r: usize, c: usize| {
+        table.cells.get(r).and_then(|cells| cells.get(c)).is_some_and(|cell| cell.contains(text))
     };
-    // Rows: a band with nothing in the first column, close under a row, wraps that row.
-    let mut rows: Vec<(Vec<Vec<Piece>>, f64)> = Vec::new();
-    for band in bands {
-        let mut cells = vec![Vec::new(); columns];
-        for piece in band {
-            cells[column_of(piece)].push(*piece);
+    let near = |n: usize, at: usize| {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|k| k.abs_diff(at));
+        order
+    };
+    if holds(row, column) {
+        return Some((row, column));
+    }
+    near(columns, column)
+        .into_iter()
+        .find(|&c| holds(row, c))
+        .map(|c| (row, c))
+        .or_else(|| near(rows, row).into_iter().find(|&r| holds(r, column)).map(|r| (r, column)))
+        .or(Some((row, column)))
+}
+
+/// One cell's words as pieces: the words of one line that run on together make one piece, a
+/// line all of whose words stand in the cell is read whole.
+fn pieces(page: &Page, mut words: Vec<(usize, usize)>) -> Vec<Piece> {
+    words.sort_unstable();
+    let mut runs: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (line, word) in words {
+        match runs.last_mut() {
+            Some((at, run)) if *at == line && word != WHOLE && run.last().is_some_and(|last| *last != WHOLE && *last + 1 == word) => run.push(word),
+            _ => runs.push((line, vec![word])),
         }
-        let band_top = band
-            .iter()
-            .map(|piece| piece.bbox[1])
-            .fold(f64::INFINITY, f64::min);
-        let band_bottom = band
-            .iter()
-            .map(|piece| piece.bbox[3])
-            .fold(f64::NEG_INFINITY, f64::max);
-        match rows.last_mut() {
-            Some((row, floor)) if cells[0].is_empty() && band_top - *floor <= 0.6 * pitch => {
-                for (column, pieces) in cells.into_iter().enumerate() {
-                    row[column].extend(pieces);
-                }
-                *floor = band_bottom;
+    }
+    runs.into_iter()
+        .map(|(slot, run)| {
+            let line = &page.lines[slot];
+            let all = line.words.iter().filter(|word| !word.text.trim().is_empty()).count();
+            if run[0] == WHOLE || run.len() == all {
+                return Piece { line: slot, chars: None, bbox: line.bbox };
             }
-            _ => rows.push((cells, band_bottom)),
-        }
-    }
-    let filled = |row: &Vec<Vec<Piece>>| row.iter().filter(|cell| !cell.is_empty()).count();
-    while rows.first().is_some_and(|(row, _)| filled(row) < 2) {
-        rows.remove(0);
-    }
-    while rows.last().is_some_and(|(row, _)| filled(row) < 2) {
-        rows.pop();
-    }
-    let paired = rows.iter().filter(|(row, _)| filled(row) >= 2).count();
-    if paired < 3 || paired * 2 < rows.len() {
-        return None;
-    }
-    // Each column's cells keep one edge or their centre in line.
-    let aligned = (0..columns).all(|column| {
-        let firsts: Vec<[f64; 4]> = rows
-            .iter()
-            .filter_map(|(row, _)| row[column].first().map(|piece| piece.bbox))
-            .collect();
-        if firsts.len() < 2 {
-            return true;
-        }
-        let median = |mut values: Vec<f64>| {
-            values.sort_by(f64::total_cmp);
-            values[values.len() / 2]
-        };
-        let left = median(firsts.iter().map(|bbox| bbox[0]).collect());
-        let right = median(firsts.iter().map(|bbox| bbox[2]).collect());
-        let centre = median(
-            firsts
-                .iter()
-                .map(|bbox| (bbox[0] + bbox[2]) / 2.0)
-                .collect(),
-        );
-        let kept = firsts
-            .iter()
-            .filter(|bbox| {
-                (bbox[0] - left).abs() <= 3.0
-                    || (bbox[2] - right).abs() <= 3.0
-                    || ((bbox[0] + bbox[2]) / 2.0 - centre).abs() <= 3.0
-            })
-            .count();
-        kept * 10 >= firsts.len() * 7
-    });
-    // The rest reads the cells' words.
-    if !aligned {
-        return None;
-    }
-    let text = |pieces: &[Piece]| {
-        pieces
-            .iter()
-            .map(|piece| texts[&(piece.line, piece.chars)].as_str())
-            .collect::<Vec<&str>>()
-            .join(" ")
-    };
-    let column_text = |column: usize| -> Vec<String> {
-        rows.iter()
-            .filter(|(row, _)| !row[column].is_empty())
-            .map(|(row, _)| text(&row[column]).trim().to_owned())
-            .collect()
-    };
-    let share = |texts: &[String], test: &dyn Fn(&str) -> bool| {
-        texts.iter().filter(|text| test(text)).count() as f64 / texts.len().max(1) as f64
-    };
-    let median_length = |texts: &[String]| {
-        let mut lengths: Vec<usize> = texts.iter().map(|text| text.chars().count()).collect();
-        lengths.sort_unstable();
-        lengths.get(lengths.len() / 2).copied().unwrap_or(0)
-    };
-    // A column's share of figures, counted off its pieces' words: the spaces that join a cell's
-    // pieces, and its trimmed ends, are no digit, mark or letter.
-    let figure_share = |column: usize| {
-        let cells: Vec<&Vec<Piece>> = rows
-            .iter()
-            .filter(|(row, _)| !row[column].is_empty())
-            .map(|(row, _)| &row[column])
-            .collect();
-        let hits = cells
-            .iter()
-            .filter(|pieces| {
-                let (mut digits, mut marks, mut letters) = (0_usize, 0_usize, 0_usize);
-                for piece in pieces.iter() {
-                    for character in texts[&(piece.line, piece.chars)].chars() {
-                        digits += usize::from(character.is_ascii_digit());
-                        marks += usize::from(!character.is_whitespace());
-                        letters += usize::from(character.is_alphabetic());
-                    }
-                }
-                digits > 0 && digits * 2 >= marks && letters <= 1
-            })
-            .count();
-        hits as f64 / cells.len().max(1) as f64
-    };
-    let figures = (1..columns).any(|column| figure_share(column) >= 0.6);
-    let first_texts = column_text(0);
-    let header = {
-        let (first, _) = &rows[0];
-        let cells: Vec<String> = first
-            .iter()
-            .filter(|cell| !cell.is_empty())
-            .map(|cell| text(cell))
-            .collect();
-        let bold_head = first
-            .iter()
-            .flatten()
-            .all(|piece| bold(&page.lines[piece.line]))
-            && rows[1..]
-                .iter()
-                .flat_map(|(row, _)| row.iter().flatten())
-                .any(|piece| !bold(&page.lines[piece.line]));
-        let labelled = cells.len() >= 2
-            && cells.iter().all(|cell| {
-                let cell = cell.trim();
-                cell.chars().count() <= 30
-                    && cell.chars().any(char::is_alphabetic)
-                    && !bare_marker(cell)
-                    && !cell.ends_with(':')
+            let (first, last) = (&line.words[run[0]], &line.words[*run.last().expect("run")]);
+            let bbox = run.iter().map(|&k| line.words[k].bbox).fold(first.bbox, |a, b| {
+                [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
             });
-        let numbered = share(&first_texts, &bare_marker) >= 0.7;
-        labelled
-            && (bold_head || (first.iter().all(|cell| !cell.is_empty()) && (numbered || figures)))
-    };
-    // Two columns of words with no figures and no header are no table: the readings below, which
-    // read every column's words, are asked only of a grid that passes this.
-    if !(columns >= 3 || figures || header) {
-        return None;
-    }
-    let column_texts: Vec<Vec<String>> = std::iter::once(first_texts)
-        .chain((1..columns).map(column_text))
-        .collect();
-    // Each reading below is asked only if those before it let the grid stand.
-    let long = || {
-        column_texts
-            .iter()
-            .filter(|texts| median_length(texts) > 30)
-            .count()
-    };
-    let indices: std::collections::BTreeSet<usize> = rows
-        .iter()
-        .flat_map(|(row, _)| row.iter().flatten())
-        .map(|piece| piece.line)
-        .collect();
-    let leaders = || {
-        indices
-            .iter()
-            .filter(|index| contents_leader(&page.lines[**index].text))
-            .count()
-    };
-    let caption = || {
-        column_texts
-            .iter()
-            .any(|texts| share(texts, &party_role) >= 0.4)
-    };
-    let bracketed = || {
-        column_texts
-            .iter()
-            .any(|texts| share(texts, &|text| text.chars().all(|c| c == ')' || c == ':')) >= 0.5)
-    };
-    let labels = || {
-        column_texts
-            .iter()
-            .any(|texts| share(texts, &form_label) >= 0.5)
-    };
-    // Bullets or boxes to tick down a column mark a list or a form.
-    // Columns that each repeat one word down every row are a form's choices: Yes, No.
-    let choices = || {
-        column_texts
-            .iter()
-            .filter(|texts| texts.len() >= 3 && texts.iter().all(|text| *text == texts[0]))
-            .count()
-            >= 2
-    };
-    let ticked = || column_texts.iter().any(|texts| {
-        share(texts, &|text| {
-            text.chars().count() == 1 && text.chars().all(|c| "\u{2022}\u{25e6}\u{25aa}\u{25ab}\u{25a0}\u{25a1}\u{25cf}\u{25cb}\u{f0b7}\u{f0a7}-\u{2013}*\u{b7}".contains(c))
-        }) >= 0.7
-    });
-    let contacts = || share(&column_texts.concat(), &contact_detail) >= 0.2;
-    let sequential = || {
-        let numbers: Vec<u32> = column_texts[0]
-            .iter()
-            .filter_map(|text| text.trim().parse::<u32>().ok())
-            .collect();
-        numbers.len() >= 5 && numbers.windows(2).all(|pair| pair[1] == pair[0] + 1)
-    };
-    // Page numbers or entry numbers running up beside titles are a contents list.
-    let ascending = |texts: &[String]| {
-        let numbers: Vec<u32> = texts
-            .iter()
-            .filter_map(|text| text.trim().trim_end_matches('.').parse::<u32>().ok())
-            .collect();
-        numbers.len() >= 3
-            && numbers.len() * 10 >= texts.len() * 7
-            && numbers.windows(2).filter(|pair| pair[0] <= pair[1]).count() * 5
-                >= (numbers.len() - 1) * 4
-    };
-    let listed = || !header && (ascending(&column_texts[0]) || ascending(&column_texts[columns - 1]));
-    // Markers beside running text are a list or numbered paragraphs.
-    let itemized = || !header
-        && (0..columns - 1).any(|column| {
-            share(&column_texts[column], &bare_marker) >= 0.7
-                && median_length(&column_texts[column + 1]) > 30
-        });
-    if listed()
-        || itemized()
-        || long() > 1
-        || leaders() >= 2
-        || bracketed()
-        || labels()
-        || ticked()
-        || choices()
-        || sequential()
-        || caption()
-        || contacts()
-    {
-        return None;
-    }
-    // The costlier readings, for a grid the cheap ones let stand.
-    // A column whose rows carry on one another's sentences, each line set out to the
-    // column's measure, is running text set beside other running text: panels side by
-    // side, or a text and its translation.
-    let flowing = (0..columns).any(|column| {
-        let measure = rows
-            .iter()
-            .flat_map(|(row, _)| &row[column])
-            .map(|piece| piece.bbox[2])
-            .fold(f64::NEG_INFINITY, f64::max);
-        let start = rows
-            .iter()
-            .flat_map(|(row, _)| &row[column])
-            .map(|piece| piece.bbox[0])
-            .fold(f64::INFINITY, f64::min);
-        let pairs: Vec<(&Vec<Piece>, &Vec<Piece>)> = rows
-            .windows(2)
-            .filter(|pair| !pair[0].0[column].is_empty() && !pair[1].0[column].is_empty())
-            .map(|pair| (&pair[0].0[column], &pair[1].0[column]))
-            .collect();
-        let carried = pairs
-            .iter()
-            .filter(|(before, after)| {
-                let full = before
-                    .iter()
-                    .map(|piece| piece.bbox[2])
-                    .fold(f64::NEG_INFINITY, f64::max)
-                    >= measure - 0.15 * (measure - start);
-                let (before, after) = (text(before), text(after));
-                full && !before.trim_end().ends_with(['.', ';', ':', '!', '?'])
-                    && after
-                        .trim_start()
-                        .chars()
-                        .next()
-                        .is_some_and(char::is_lowercase)
-            })
-            .count();
-        pairs.len() >= 2 && carried * 10 >= pairs.len() * 4
-    });
-    let languages: Vec<Option<bool>> = (0..columns)
-        .map(|column| {
-            let column_lines: Vec<&Line> = rows
-                .iter()
-                .flat_map(|(row, _)| &row[column])
-                .map(|piece| &page.lines[piece.line])
-                .collect();
-            layout.column_language(&column_lines, 5)
+            Piece { line: slot, chars: Some((first.start, last.end)), bbox }
         })
-        .collect();
-    // Neighbouring cells that repeat each other's names and numbers are a text and its
-    // translation, row by row.
-    let parallel = (0..columns - 1).any(|column| {
-        let tokens = |pieces: &[Piece]| -> HashSet<String> {
-            text(pieces)
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|token| {
-                    token.chars().count() >= 3 || token.chars().any(|c| c.is_ascii_digit())
-                })
-                .map(str::to_lowercase)
-                .collect()
+        .collect()
+}
+
+/// A table pdf-inspector read, on the words it was read from.
+fn converted(page: &Page, items: &[TextItem], origin: &[(usize, usize)], table: &Table) -> Option<PdfTable> {
+    let columns = table.cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut grid: Vec<Vec<Vec<(usize, usize)>>> = vec![vec![Vec::new(); columns]; table.cells.len()];
+    let mut boxes: Vec<[f64; 4]> = Vec::new();
+    for &k in &table.item_indices {
+        let Some((row, column)) = items.get(k).and_then(|item| grid_cell(table, item)) else {
+            continue;
         };
-        let pairs: Vec<(HashSet<String>, HashSet<String>)> = rows
-            .iter()
-            .filter(|(row, _)| !row[column].is_empty() && !row[column + 1].is_empty())
-            .map(|(row, _)| (tokens(&row[column]), tokens(&row[column + 1])))
-            .filter(|(left, right)| !left.is_empty() && !right.is_empty())
-            .collect();
-        let alike = pairs
-            .iter()
-            .filter(|(left, right)| {
-                left.intersection(right).count() * 5 >= left.union(right).count() * 2
-            })
-            .count();
-        pairs.len() >= 3 && alike * 2 >= pairs.len()
-    });
-    let bilingual =
-        parallel || (languages.contains(&Some(true)) && languages.contains(&Some(false)));
-    let lines: Vec<Line> = indices
-        .into_iter()
-        .map(|index| page.lines[index].clone())
-        .collect();
-    if flowing || bilingual || layout.contents_grid(&lines, page.width) {
-        return None;
+        let (line, word) = origin[k];
+        grid[row][column].push((line, word));
+        boxes.push(if word == WHOLE { page.lines[line].bbox } else { page.lines[line].words[word].bbox });
     }
-    let mut table_rows: Vec<TableRow> = rows
+    let rows: Vec<TableRow> = grid
         .into_iter()
-        .map(|(row, _)| TableRow {
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .map(|row| TableRow {
             header: false,
             cells: row
                 .into_iter()
                 .enumerate()
-                .map(|(column, pieces)| cell_of(page, column, pieces))
+                .map(|(column, words)| cell_of(page, column, pieces(page, words)))
                 .collect(),
         })
         .collect();
-    table_rows[0].header = header;
-    // A line parted between cells must run straight on from one cell into the next.
-    let sequence: Vec<&CellPart> = table_rows
-        .iter()
-        .flat_map(|row| &row.cells)
-        .flat_map(|cell| &cell.parts)
-        .collect();
-    let mut runs: HashMap<&str, usize> = HashMap::new();
-    for (position, part) in sequence.iter().enumerate() {
-        if position == 0 || sequence[position - 1].line_id != part.line_id {
-            *runs.entry(part.line_id.as_str()).or_default() += 1;
-        }
-    }
-    if runs.values().any(|count| *count > 1) {
+    if rows.len() < 2 || columns == 0 {
         return None;
     }
-    let top = bands[0]
-        .iter()
-        .map(|piece| piece.bbox[1])
-        .fold(f64::INFINITY, f64::min);
-    let bottom = bands[bands.len() - 1]
-        .iter()
-        .map(|piece| piece.bbox[3])
-        .fold(f64::NEG_INFINITY, f64::max);
+    let left = boxes.iter().map(|bbox| bbox[0]).fold(f64::INFINITY, f64::min);
+    let right = boxes.iter().map(|bbox| bbox[2]).fold(f64::NEG_INFINITY, f64::max);
+    let mut marks: Vec<f64> = table.columns.iter().map(|x| f64::from(*x)).collect();
+    marks.sort_by(f64::total_cmp);
+    // Column boundaries: the detector's own, or midway between its column positions.
+    let xs = if marks.len() == columns + 1 {
+        marks
+    } else {
+        std::iter::once(left)
+            .chain(marks.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0))
+            .chain(std::iter::once(right))
+            .collect()
+    };
     Some(PdfTable {
-        rows: table_rows,
+        rows,
         page_index: page.index,
         xs,
-        top,
-        bottom,
+        top: boxes.iter().map(|bbox| bbox[1]).fold(f64::INFINITY, f64::min),
+        bottom: boxes.iter().map(|bbox| bbox[3]).fold(f64::NEG_INFINITY, f64::max),
     })
-}
-
-fn drawn_tables(page: &Page, layout: &dyn TableLayout) -> Vec<PdfTable> {
-    let (mut horizontal, mut vertical) = (Vec::new(), Vec::new());
-    for region in page.regions.iter().filter(|region| region.kind == "rule") {
-        let [x0, y0, x1, y1] = region.bbox;
-        if (y1 - y0).abs() <= (x1 - x0).abs() {
-            horizontal.push(Rule {
-                at: (y0 + y1) / 2.0,
-                start: x0.min(x1),
-                end: x0.max(x1),
-            });
-        } else {
-            vertical.push(Rule {
-                at: (x0 + x1) / 2.0,
-                start: y0.min(y1),
-                end: y0.max(y1),
-            });
-        }
-    }
-    let (horizontal, vertical) = (join(horizontal), join(vertical));
-    if horizontal.len() < 2 {
-        return Vec::new();
-    }
-    // Rules that cross or meet belong to one lattice.
-    let count = horizontal.len();
-    let mut parents: Vec<usize> = (0..count + vertical.len()).collect();
-    for (h, across) in horizontal.iter().enumerate() {
-        for (v, down) in vertical.iter().enumerate() {
-            if down.start - TOLERANCE <= across.at
-                && across.at <= down.end + TOLERANCE
-                && across.start - TOLERANCE <= down.at
-                && down.at <= across.end + TOLERANCE
-            {
-                union(&mut parents, h, count + v);
-            }
-        }
-    }
-    let mut lattices: HashMap<usize, (Vec<Rule>, Vec<Rule>)> = HashMap::new();
-    for (index, rule) in horizontal.iter().enumerate() {
-        lattices
-            .entry(find(&mut parents, index))
-            .or_default()
-            .0
-            .push(*rule);
-    }
-    for (index, rule) in vertical.iter().enumerate() {
-        lattices
-            .entry(find(&mut parents, count + index))
-            .or_default()
-            .1
-            .push(*rule);
-    }
-    let mut tables: Vec<PdfTable> = lattices
-        .values()
-        .filter_map(|(horizontal, vertical)| lattice_table(page, horizontal, vertical, layout))
-        .collect();
-    let lines: HashMap<&str, usize> = page
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| (line.id.as_str(), index))
-        .collect();
-    let taken: HashSet<usize> = tables
-        .iter()
-        .flat_map(PdfTable::line_ids)
-        .map(|id| lines[id.as_str()])
-        .collect();
-    let free: Vec<Rule> = lattices
-        .into_values()
-        .filter(|(_, vertical)| vertical.is_empty())
-        .flat_map(|(horizontal, _)| horizontal)
-        .collect();
-    tables.extend(
-        open_tables(page, &free, &taken)
-            .into_iter()
-            .filter(|table| !bilingual_columns(page, table, layout)),
-    );
-    tables
 }
 
 /// Whether one column of a table reads in English and another in French: a text set beside
@@ -1615,26 +399,51 @@ fn bilingual_columns(page: &Page, table: &PdfTable, layout: &dyn TableLayout) ->
     languages.contains(&Some(true)) && languages.contains(&Some(false))
 }
 
+/// A page's tables, and the lines of the contents lists pdf-inspector read there as tables.
 fn page_tables(
     page: &Page,
     translation: &HashSet<String>,
     layout: &dyn TableLayout,
-) -> Vec<PdfTable> {
-    let mut tables = drawn_tables(page, layout);
-    let lines: HashMap<&str, usize> = page
-        .lines
+) -> (Vec<PdfTable>, Vec<String>) {
+    let (items, origin) = text_items(page);
+    if items.len() < 6 {
+        return (Vec::new(), Vec::new());
+    }
+    let rules = rules(page);
+    let mut found: Vec<Table> = if rules.is_empty() {
+        Vec::new()
+    } else {
+        detect_tables_from_lines(&items, &rules, page.index as u32 + 1)
+    };
+    if layout.white_space(page) {
+        let taken: HashSet<usize> = found.iter().flat_map(|table| table.item_indices.iter().copied()).collect();
+        let rest: Vec<usize> = (0..items.len()).filter(|k| !taken.contains(k)).collect();
+        let free: Vec<TextItem> = rest.iter().map(|&k| items[k].clone()).collect();
+        let mut sizes: Vec<f32> = free.iter().map(|item| item.font_size).collect();
+        sizes.sort_by(f32::total_cmp);
+        let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0);
+        for mut table in detect_tables(&free, body, false) {
+            table.item_indices = table.item_indices.iter().filter_map(|&k| rest.get(k).copied()).collect();
+            found.push(table);
+        }
+    }
+    let contents = found
         .iter()
-        .enumerate()
-        .map(|(index, line)| (line.id.as_str(), index))
+        .filter(|table| table.kind == TableKind::Toc)
+        .flat_map(|table| table.item_indices.iter().filter_map(|&k| origin.get(k)))
+        .map(|&(line, _)| page.lines[line].id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
-    let taken: HashSet<usize> = tables
+    let mut tables: Vec<PdfTable> = found
         .iter()
-        .flat_map(PdfTable::line_ids)
-        .map(|id| lines[id.as_str()])
+        .filter(|table| table.kind == TableKind::Data)
+        .filter_map(|table| converted(page, &items, &origin, table))
+        .filter(|table| !table.line_ids().into_iter().any(|id| translation.contains(id)))
+        .filter(|table| !bilingual_columns(page, table, layout))
         .collect();
-    tables.extend(aligned_tables(page, &taken, translation, layout));
     tables.sort_by(|left, right| left.top.total_cmp(&right.top));
-    tables
+    (tables, contents)
 }
 
 fn row_text(table: &PdfTable, row: usize) -> Vec<String> {
@@ -1683,17 +492,19 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
     }
 }
 
-/// Every ruled table in the document, a table cut off by a page break joined to its
-/// continuation, in reading order.
-pub fn ruled_tables(
+/// Every table in the document, a table cut off by a page break joined to its continuation,
+/// in reading order; and the lines of the contents lists pdf-inspector read as tables.
+pub fn document_tables(
     pages: &[Page],
     translation: &HashSet<String>,
     layout: &dyn TableLayout,
-) -> Vec<PdfTable> {
+) -> (Vec<PdfTable>, HashSet<String>) {
     let mut tables: Vec<PdfTable> = Vec::new();
+    let mut contents = HashSet::new();
     let mut previous_last: Option<usize> = None;
     for page in pages {
-        let found = page_tables(page, translation, layout);
+        let (found, listed) = page_tables(page, translation, layout);
+        contents.extend(listed);
         let empty_band = |from: f64, to: f64| {
             !page.lines.iter().any(|line| {
                 !line.exclude_from_body
@@ -1776,7 +587,7 @@ pub fn ruled_tables(
             .rposition(|table| table.page_index == page.index)
             .filter(|index| empty_band(tables[*index].bottom, page.height * 0.88));
     }
-    tables
+    (tables, contents)
 }
 
 /// Puts each table's lines on the page in row order, cell by cell, where its first line
@@ -1830,8 +641,8 @@ pub fn order_table_lines(page: &mut Page, tables: &[PdfTable]) {
     }
 }
 
-/// Each cell's text is body text of its own: a paragraph never runs from one cell into
-/// the next, though a cell may hold several.
+/// Each cell's text is a block of its own: a paragraph never runs from one cell into the next,
+/// though a cell may hold several.
 pub fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
     // A line parted between cells reads with the first of them.
     let mut cells: HashMap<&str, usize> = HashMap::new();
@@ -1866,13 +677,12 @@ pub fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
             }
             prior = Some((cell, line.block_index));
             line.block_index = next;
-            line.region_type = "body".to_owned();
             line.note_region_mode.clear();
         }
     }
 }
 
-/// Line ids of every ruled table's cells.
+/// Line ids of every table's cells.
 pub fn table_line_ids(tables: &[PdfTable]) -> HashSet<String> {
     tables
         .iter()

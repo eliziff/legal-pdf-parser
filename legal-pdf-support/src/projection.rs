@@ -22,8 +22,9 @@ use unicode_normalization::UnicodeNormalization;
 const MAX_UNITS: usize = 20;
 const MAX_CONTEXT: usize = 2;
 const MAX_RETURN_CHARS: usize = 60_000;
-const LOCATOR_KINDS: [&str; 11] = [
+const LOCATOR_KINDS: [&str; 12] = [
     "page",
+    "line",
     "paragraph",
     "footnote",
     "section",
@@ -866,6 +867,49 @@ fn page_unit(
     }
 }
 
+/// A page's printed transcript lines in reading order: each line number the structure labels
+/// (its `LineLabel` nodes), its node's id, and the words set across its row; a number on a
+/// blank line is left out.
+fn transcript_lines(
+    document: &PdfDocument,
+    page: &ProjectionPage,
+    geometry: &PdfTextPage,
+) -> Vec<(usize, String, String)> {
+    let height = |rect: &[f64; 4]| (rect[3] - rect[1]).max(0.1);
+    document
+        .structure
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.role == Some(legal_structure_model::PrimaryRole::LineLabel)
+                && node.page_indexes.contains(&page.index)
+        })
+        .filter_map(|node| {
+            let number = node.label.as_deref()?.trim().parse().ok()?;
+            let label_id = node.line_ids.first()?;
+            let label = geometry.lines.iter().find(|line| &line.id == label_id)?;
+            let mut row = geometry
+                .lines
+                .iter()
+                .filter(|line| {
+                    line.id != label.id
+                        && line.region_type != "line_label"
+                        && line.rect[3].min(label.rect[3]) - line.rect[1].max(label.rect[1])
+                            > 0.5 * height(&line.rect).min(height(&label.rect))
+                })
+                .collect::<Vec<_>>();
+            row.sort_by(|left, right| left.rect[0].total_cmp(&right.rect[0]));
+            let text = row
+                .iter()
+                .map(|line| line.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then(|| (number, node.id.clone(), text))
+        })
+        .collect()
+}
+
 fn footnote_unit(note: &ProjectionFootnote) -> PdfLookupUnit {
     let mut page_numbers = Vec::new();
     if let Some(page) = note.reference_page {
@@ -959,6 +1003,7 @@ pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
     static RANGE: OnceLock<Regex> = OnceLock::new();
     static PAGE_PREFIX: OnceLock<Regex> = OnceLock::new();
     static PARAGRAPH_PREFIX: OnceLock<Regex> = OnceLock::new();
+    static LINE_PREFIX: OnceLock<Regex> = OnceLock::new();
     let value = nfkc_text(raw);
     let value = value
         .trim()
@@ -969,6 +1014,8 @@ pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
         .trim();
     let prefix = if kind == "page" {
         PAGE_PREFIX.get_or_init(|| Regex::new(r"(?i)^(?:pages?|pp?\.?)[\s:_=-]*").unwrap())
+    } else if kind == "line" {
+        LINE_PREFIX.get_or_init(|| Regex::new(r"(?i)^(?:lines?|ll?\.?)[\s:_=-]*").unwrap())
     } else {
         PARAGRAPH_PREFIX
             .get_or_init(|| Regex::new(r"(?i)^(?:paragraphs?|paras?|pars?)\.?[\s:_=-]*").unwrap())
@@ -1138,13 +1185,105 @@ fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest) -> PdfStru
         );
     }
     let kind = match input.locator_kind.as_str() {
-        "page" | "paragraph" | "footnote" => input.locator_kind.as_str(),
+        "page" | "line" | "paragraph" | "footnote" => input.locator_kind.as_str(),
         _ => "section",
     };
     let end_locator = input
         .end_locator
         .as_deref()
         .filter(|value| !value.is_empty());
+    if kind == "line" {
+        // A transcript's printed line numbers on one page ("p. 451, ll. 12-20"): each numbered
+        // line that carries words, read across the row its number opens.
+        let Some(page_number) = input.page else {
+            return result(
+                input,
+                PdfLookupStatus::Invalid,
+                Some("A line locator needs its page".to_owned()),
+            );
+        };
+        let inline = numeric_range(kind, &input.locator);
+        let start_number = inline
+            .map(|item| item.0)
+            .or_else(|| parse_ordinal(kind, &input.locator));
+        let end_number = end_locator
+            .map(|end| parse_ordinal(kind, end))
+            .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
+        let (Some(start_number), Some(end_number)) = (start_number, end_number) else {
+            return result(
+                input,
+                PdfLookupStatus::Invalid,
+                Some("Invalid exact range".to_owned()),
+            );
+        };
+        if start_number > end_number {
+            return result(
+                input,
+                PdfLookupStatus::Invalid,
+                Some("Invalid exact range".to_owned()),
+            );
+        }
+        // The page a reader cites is the one printed with that number; a PDF whose pages print
+        // none is read by its own page numbers.
+        let printed = page_number.to_string();
+        let page = document
+            .structure
+            .nodes
+            .iter()
+            .find(|node| {
+                node.label.as_deref().is_some_and(|label| label.starts_with("page"))
+                    && node
+                        .aliases
+                        .as_ref()
+                        .is_some_and(|aliases| aliases.iter().any(|alias| alias.trim() == printed))
+            })
+            .and_then(|node| node.page_indexes.first())
+            .and_then(|index| document.pages.iter().find(|page| page.index == *index))
+            .or_else(|| document.pages.iter().find(|page| page.number == page_number));
+        let Some((page, geometry)) = page.and_then(|page| {
+            document
+                .passage_pages
+                .iter()
+                .find(|geometry| geometry.page_number == page.number)
+                .map(|geometry| (page, geometry))
+        }) else {
+            return result(input, PdfLookupStatus::NotFound, None);
+        };
+        let lines = transcript_lines(document, page, geometry);
+        if lines.is_empty() {
+            return result(
+                input,
+                PdfLookupStatus::Unavailable,
+                Some("This page prints no line numbers".to_owned()),
+            );
+        }
+        let at = |number| lines.iter().position(|line| line.0 == number);
+        let (Some(start), Some(end)) = (at(start_number), at(end_number)) else {
+            return result(input, PdfLookupStatus::NotFound, None);
+        };
+        if end < start {
+            return result(input, PdfLookupStatus::NotFound, None);
+        }
+        return finish(document, input, lines.len(), start, end, |index| {
+            let (number, id, text) = &lines[index];
+            PdfLookupUnit {
+                id: id.clone(),
+                kind: "line",
+                locator: format!("page {}, line {number}", page.number),
+                text: text.clone(),
+                page_numbers: vec![page.number],
+                confidence: Some(page.text_quality.clamp(0.0, 1.0)),
+                confidence_basis: "page_text_quality",
+                provenance: if page.source.is_empty() {
+                    "unknown".to_owned()
+                } else {
+                    page.source.clone()
+                },
+                proposition: None,
+                note: None,
+            }
+        });
+    }
     if kind == "page" || kind == "paragraph" {
         let inline = numeric_range(kind, &input.locator);
         let start_number = inline
@@ -1851,6 +1990,7 @@ mod tests {
             start: 0,
             end: 10,
             underlined: false,
+            weight: 0.0,
         });
         let prepared = PdfDocument::project(scanned, vec![], vec![], graph, pdf_summary());
         let restored: PdfDocument =
@@ -1877,6 +2017,7 @@ mod tests {
             start: 0,
             end: 3,
             underlined: false,
+            weight: 0.0,
         });
         let mut plain = source_line("plain", "[7] The tug may berth");
         plain.bbox = [60.0, 120.0, 270.0, 132.0];

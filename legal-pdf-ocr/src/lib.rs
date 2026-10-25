@@ -18,7 +18,7 @@ pub use indra::{
     IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics, IndraLayout,
     IndraOcr, IndraOptions, IndraTier,
 };
-pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider};
-pub use ocr::{raster_page_rules, render_gray_pages, OcrOptions, OcrProvider, PreparedOcrProvider, RasterRules};
+pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
+pub use ocr::{raster_page_rules, render_gray_pages, OcrOptions, OcrProvider, PreparedOcrProvider};
 #[cfg(feature = "ocr")]
 pub use planning::RuntimePlan as IndraRuntimePlan;

@@ -469,7 +469,7 @@ pub(super) fn reconcile_bookmarks(
         !line.exclude_from_body
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
-            && !primitives.contents_line_ids.contains(&line.id)
+            && !primitives.claimed(&line.id)
             && !primitives.quotations.scopes.contains_key(&line.id)
             && !has_dot_leader(&line.text)
     };

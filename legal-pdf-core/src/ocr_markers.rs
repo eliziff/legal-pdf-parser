@@ -127,6 +127,7 @@ pub fn merge_marker_lines(pages: &mut [Page]) -> usize {
                 start: 0,
                 end: label.chars().count(),
                 underlined: false,
+                weight: 0.0,
             });
             for (k, word) in body.words.iter_mut().enumerate() {
                 word.id = format!("{}-w{:03}", body.id, k + 1);

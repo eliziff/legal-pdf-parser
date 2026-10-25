@@ -38,24 +38,16 @@ struct DeferredOcrProvider<'a> {
     cache_root: Option<PathBuf>,
     cache_identity: String,
     progress: RecognitionProgress<'a>,
-    /// The thin strokes each recognized page's render shows, by page.
-    strokes: BTreeMap<usize, Vec<[f64; 4]>>,
-    /// The dark share of each requested line box, by page.
-    inks: BTreeMap<usize, Vec<f64>>,
-    /// The stroke weight of each requested line box, by page.
-    weights: BTreeMap<usize, Vec<f64>>,
+    /// What each measured page's render shows, by page.
+    rasters: BTreeMap<usize, legal_pdf_core::RasterReading>,
 }
 
 #[cfg(feature = "ocr")]
 #[derive(Serialize, Deserialize)]
 struct CachedRaster {
     key: String,
-    separator: Option<f64>,
-    strokes: Vec<[f64; 4]>,
-    #[serde(default)]
-    inks: Vec<f64>,
-    #[serde(default)]
-    weights: Vec<f64>,
+    #[serde(flatten)]
+    reading: legal_pdf_core::RasterReading,
 }
 
 #[cfg(feature = "ocr")]
@@ -73,7 +65,7 @@ fn cached_rasters(
     requests: &[legal_pdf_core::OcrPageRequest],
 ) -> Vec<CachedRaster> {
     let keys = requests.iter().map(|request| {
-        serialization_sha256(&("raster-v3", identity, request.page_index, request.width, request.height, &request.lines))
+        serialization_sha256(&("raster-v4", identity, request.page_index, request.width, request.height, &request.lines, &request.words))
             .unwrap_or_default()
     }).collect::<Vec<_>>();
     let mut found = keys.iter().map(|key| {
@@ -83,17 +75,15 @@ fn cached_rasters(
     let missing = (0..requests.len()).filter(|&n| found[n].is_none()).collect::<Vec<_>>();
     if !missing.is_empty() {
         let wanted = missing.iter().map(|&n| requests[n].clone()).collect::<Vec<_>>();
-        for (&n, (separator, strokes, inks, weights)) in missing.iter().zip(legal_pdf_ocr::raster_page_rules(pdf, &wanted)) {
-            let cached = CachedRaster { key: keys[n].clone(), separator, strokes, inks, weights };
+        for (&n, reading) in missing.iter().zip(legal_pdf_ocr::raster_page_rules(pdf, &wanted)) {
+            let cached = CachedRaster { key: keys[n].clone(), reading };
             if let Some(root) = root {
                 let _ = write_gzip_json(&root.join(format!("{}.json.gz", keys[n])), &cached);
             }
             found[n] = Some(cached);
         }
     }
-    found.into_iter().map(|cached| cached.unwrap_or(CachedRaster {
-        key: String::new(), separator: None, strokes: Vec::new(), inks: Vec::new(), weights: Vec::new(),
-    })).collect()
+    found.into_iter().map(|cached| cached.unwrap_or(CachedRaster { key: String::new(), reading: Default::default() })).collect()
 }
 
 #[cfg(feature = "ocr")]
@@ -252,10 +242,9 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 .iter()
                 .zip(found)
                 .map(|(request, cached)| {
-                    self.strokes.insert(request.page_index, cached.strokes);
-                    self.inks.insert(request.page_index, cached.inks);
-                    self.weights.insert(request.page_index, cached.weights);
-                    cached.separator
+                    let separator = cached.reading.separator;
+                    self.rasters.insert(request.page_index, cached.reading);
+                    separator
                 })
                 .collect()
         })
@@ -433,39 +422,37 @@ fn derive_extracted(
 }
 
 /// Recognized pages made ready for the readers: the strokes each recognized page's image shows,
-/// as rule regions, the words a rule underlines, and each measured line's ink and stroke weight.
+/// as rule regions, the words a rule underlines, each measured line's ink, stroke weight and
+/// capital height, and its words' stroke weights.
 fn finish_recognition(
     pages: &mut [legal_pdf_core::model::Page],
-    strokes: BTreeMap<usize, Vec<[f64; 4]>>,
-    inks: BTreeMap<usize, Vec<f64>>,
-    weights: BTreeMap<usize, Vec<f64>>,
+    rasters: BTreeMap<usize, legal_pdf_core::RasterReading>,
 ) {
-    for (page_index, inks) in inks {
-        if let Some(page) = pages.get_mut(page_index).filter(|page| page.lines.len() == inks.len()) {
-            for (line, ink) in page.lines.iter_mut().zip(inks) {
-                line.ink = ink;
+    for (page_index, reading) in rasters {
+        let Some(page) = pages.get_mut(page_index) else {
+            continue;
+        };
+        if page.lines.len() == reading.weights.len() {
+            for (slot, line) in page.lines.iter_mut().enumerate() {
+                line.weight = reading.weights[slot];
+                line.ink = reading.inks.get(slot).copied().unwrap_or(0.0);
+                line.cap_height = reading.cap_heights.get(slot).copied().unwrap_or(0.0);
+                if let Some(weights) = reading.word_weights.get(slot).filter(|weights| weights.len() == line.words.len()) {
+                    for (word, weight) in line.words.iter_mut().zip(weights) {
+                        word.weight = *weight;
+                    }
+                }
             }
         }
-    }
-    for (page_index, weights) in weights {
-        if let Some(page) = pages.get_mut(page_index).filter(|page| page.lines.len() == weights.len()) {
-            for (line, weight) in page.lines.iter_mut().zip(weights) {
-                line.weight = weight;
-            }
-        }
-    }
-    for (page_index, strokes) in strokes {
-        if let Some(page) = pages.get_mut(page_index) {
-            let number = page.number;
-            page.regions.extend(strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
-                id: format!("p{number:04}-stroke{:04}", n + 1),
-                page_index,
-                kind: "rule".to_owned(),
-                line_ids: Vec::new(),
-                bbox,
-                reading_order: 0,
-            }));
-        }
+        let number = page.number;
+        page.regions.extend(reading.strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
+            id: format!("p{number:04}-stroke{:04}", n + 1),
+            page_index,
+            kind: "rule".to_owned(),
+            line_ids: Vec::new(),
+            bbox,
+            reading_order: 0,
+        }));
     }
     for page in pages {
         legal_pdf_core::model::mark_rule_underlines(page);
@@ -529,9 +516,7 @@ fn derive_document(
 #[cfg(feature = "ocr")]
 struct PinnedRecognition {
     pages: BTreeMap<usize, legal_pdf_core::OcrPageResult>,
-    strokes: BTreeMap<usize, Vec<[f64; 4]>>,
-    inks: BTreeMap<usize, Vec<f64>>,
-    weights: BTreeMap<usize, Vec<f64>>,
+    rasters: BTreeMap<usize, legal_pdf_core::RasterReading>,
     /// A recognizer for re-reading margins, built from LEGALPDF_INDRA_MODEL_PACK and
     /// LEGALPDF_ONNXRUNTIME the first time one is asked for; none where they are not set.
     reader: Option<Option<OcrProvider>>,
@@ -592,10 +577,9 @@ impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
         legal_pdf_ocr::raster_page_rules(pdf, requests)
             .into_iter()
             .zip(requests)
-            .map(|((separator, strokes, inks, weights), request)| {
-                self.strokes.insert(request.page_index, strokes);
-                self.inks.insert(request.page_index, inks);
-                self.weights.insert(request.page_index, weights);
+            .map(|(reading, request)| {
+                let separator = reading.separator;
+                self.rasters.insert(request.page_index, reading);
                 separator
             })
             .collect()
@@ -622,7 +606,7 @@ pub fn gold_structure_inputs(
     {
         return Err(Error::Message("invalid extraction cache".to_owned()));
     }
-    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), strokes: BTreeMap::new(), inks: BTreeMap::new(), weights: BTreeMap::new(), reader: None };
+    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), rasters: BTreeMap::new(), reader: None };
     for path in readings {
         #[derive(Deserialize)]
         struct Reading {
@@ -645,7 +629,7 @@ pub fn gold_structure_inputs(
         cached.extraction
     };
     recognize_pdf(pdf, &mut extracted, Some(&mut pinned as &mut dyn legal_pdf_core::PdfOcrProvider), None)?;
-    finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.strokes), std::mem::take(&mut pinned.inks), std::mem::take(&mut pinned.weights));
+    finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.rasters));
     // The gold's inputs read through a page layout model when LEGALPDF_PPDOC_MODEL_PACK names one
     // (LEGALPDF_ONNXRUNTIME its runtime): each line takes the detected region it lies in, as the
     // product's layout provider sets it. One model per thread.
@@ -699,14 +683,12 @@ pub fn gold_synthetic_inputs(pdf: &[u8], options: &OcrOptions, runtime: &mut Opt
         cache_root: None,
         cache_identity: "synthetic".to_owned(),
         progress: None,
-        strokes: BTreeMap::new(),
-        inks: BTreeMap::new(),
-        weights: BTreeMap::new(),
+        rasters: BTreeMap::new(),
     };
     let recognized = recognize_pdf(pdf, &mut extracted, Some(&mut provider as &mut dyn legal_pdf_core::PdfOcrProvider), None);
     *runtime = provider.runtime.take();
     recognized?;
-    finish_recognition(&mut extracted.pages, provider.strokes, provider.inks, provider.weights);
+    finish_recognition(&mut extracted.pages, provider.rasters);
     Ok(extracted)
 }
 
@@ -989,9 +971,7 @@ pub(crate) fn parse_pdf(
                     .map(|root| parse_cache_root(root).join("recognition")),
                 cache_identity: recognition_key.clone(),
                 progress,
-                strokes: BTreeMap::new(),
-                inks: BTreeMap::new(),
-                weights: BTreeMap::new(),
+                rasters: BTreeMap::new(),
             });
     #[cfg(feature = "ocr")]
     let selected_ocr = ocr_provider
@@ -1061,13 +1041,10 @@ pub(crate) fn parse_pdf(
         options.ocr_pages.as_deref(),
     )?;
     #[cfg(feature = "ocr")]
-    let (strokes, inks, weights) = ocr_provider
-        .as_mut()
-        .map(|provider| (std::mem::take(&mut provider.strokes), std::mem::take(&mut provider.inks), std::mem::take(&mut provider.weights)))
-        .unwrap_or_default();
+    let rasters = ocr_provider.as_mut().map(|provider| std::mem::take(&mut provider.rasters)).unwrap_or_default();
     #[cfg(not(feature = "ocr"))]
-    let (strokes, inks, weights) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-    finish_recognition(&mut extracted.pages, strokes, inks, weights);
+    let rasters = BTreeMap::new();
+    finish_recognition(&mut extracted.pages, rasters);
     #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
         options
