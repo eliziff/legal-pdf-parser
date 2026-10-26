@@ -243,9 +243,6 @@ pub struct HeadingEvidence<'a> {
     pub numbered: &'a dyn Fn(&str) -> bool,
     /// Original source roles retain explicit PDF Hn levels after local classification.
     pub source_regions: Option<&'a HashMap<String, String>>,
-    /// The share of a line's characters set bold where its face cannot say: on a recognized page,
-    /// read from its strokes.
-    pub bold: &'a dyn Fn(&str) -> Option<f64>,
 }
 
 /// Read the headings set apart by type alone and the depth of every heading. Line roles and
@@ -295,21 +292,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
         .collect::<HashSet<_>>();
     let flash_lines = pages
         .iter()
-        .map(|page| {
-            page.lines
-                .iter()
-                .map(|line| {
-                    let mut flash = FlashLine::of(line, page.height);
-                    if let Some(share) = (evidence.bold)(&line.id) {
-                        flash.bold = share;
-                        for span in &mut flash.spans {
-                            span.bold = share >= 0.5;
-                        }
-                    }
-                    flash
-                })
-                .collect::<Vec<_>>()
-        })
+        .map(|page| page.lines.iter().map(|line| FlashLine::of(line, page.height)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let page_stats = pages
         .iter()

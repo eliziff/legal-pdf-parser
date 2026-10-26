@@ -30,7 +30,7 @@ pub(super) struct HeadingCandidate {
 }
 
 /// A title set apart in bold may name a case by its parties; one in body type may not.
-pub(super) fn heading_title_plausible(primitives: &PdfPrimitiveEvidence, line: &Line, text: &str) -> bool {
+pub(super) fn heading_title_plausible(line: &Line, text: &str) -> bool {
     // A title has a word; "F. R." is a name's initials.
     let worded = text.split_whitespace().any(|word| {
         word.chars()
@@ -40,7 +40,7 @@ pub(super) fn heading_title_plausible(primitives: &PdfPrimitiveEvidence, line: &
     });
     if !worded || has_dot_leader(text) {
         false
-    } else if bold_char_share(&primitives.stroke_bold, line) >= 0.60 {
+    } else if bold_char_share(line) >= 0.60 {
         layout_analysis().styled_heading_text_plausible(text)
     } else {
         layout_analysis().heading_text_plausible(text)
@@ -79,7 +79,7 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
             let text = line.text.trim();
             if (1..=7).contains(&text.len())
                 && text.bytes().all(|byte| b"IVXLCDM".contains(&byte))
-                && bold_char_share(&primitives.stroke_bold, line) >= 0.60
+                && bold_char_share(line) >= 0.60
             {
                 let interpretations = enumerator_interpretations(text, "")
                     .into_iter()
@@ -105,7 +105,7 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
                 let versus = value == "v" && punct == "." && layout_analysis().has_citation_signal(text);
                 if !versus
                     && !carries_a_sentence_on(page, line_slot)
-                    && heading_title_plausible(primitives, line, text)
+                    && heading_title_plausible(line, text)
                     && !interpretations.is_empty()
                 {
                     candidates.push(HeadingCandidate {
@@ -146,13 +146,13 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
             let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
             if !(!versus
-                && heading_title_plausible(primitives, &page.lines[follower_slot], text)
+                && heading_title_plausible(&page.lines[follower_slot], text)
                 && !interpretations.is_empty())
             {
                 heading_source_trace(&page.lines[follower_slot], if interpretations.is_empty() { "standalone-noint" } else { "standalone-implausible" });
             }
             if !versus
-                && heading_title_plausible(primitives, &page.lines[follower_slot], text)
+                && heading_title_plausible(&page.lines[follower_slot], text)
                 && !interpretations.is_empty()
             {
                 candidates.push(HeadingCandidate {
@@ -241,13 +241,9 @@ pub(super) fn carries_a_sentence_on(page: &Page, slot: usize) -> bool {
         && !layout_analysis().has_citation_signal(&format!("{text} {following}"))
 }
 
-/// The share of a line's characters set bold: by their strokes on a recognized page, else by
-/// their face.
-pub(super) fn bold_char_share(stroke_bold: &HashMap<String, f64>, line: &Line) -> f64 {
-    match stroke_bold.get(&line.id) {
-        Some(share) => *share,
-        None => flag_share(line, BOLD).unwrap_or(0.0),
-    }
+/// The share of a line's characters its face sets bold.
+pub(super) fn bold_char_share(line: &Line) -> f64 {
+    flag_share(line, BOLD).unwrap_or(0.0)
 }
 
 pub(super) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
@@ -387,10 +383,10 @@ pub(super) fn wrapped_heading_continuations(
             && !(caps_head && continuation_text.chars().any(char::is_lowercase))
             && (!sentence_ended(continuation_text) || continuation_text.ends_with('?') || cited)
             && !starts_note_or_list(continuation_text)
-            && (!cited || heading_title_plausible(primitives, heading, &joined))
+            && (!cited || heading_title_plausible(heading, &joined))
             && has_valid_bbox(continuation)
             && same_size
-            && (bold_char_share(&primitives.stroke_bold, continuation) - bold_char_share(&primitives.stroke_bold, heading)).abs() <= 0.1
+            && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
             && (continuation_height - heading_height).abs() <= heading_height * 0.05
             && ((-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
                 || (line_center_x(continuation) - line_center_x(heading)).abs()
@@ -1188,7 +1184,7 @@ pub(super) fn apply_text_fidelity_headings(
             }
             let target = &page.lines[target_slot];
             let body_size = body_sizes[page_slot];
-            let visual = bold_char_share(&primitives.stroke_bold, target) >= 0.60
+            let visual = bold_char_share(target) >= 0.60
                 || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
             if !visual && !decision.coherent_family && !caps {
                 trace("visual");
@@ -1389,11 +1385,8 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
     });
     stamp(pages, &mut primitives.headings.sources, "native");
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
-        let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids)
-            .chain(&primitives.claims.table_note_line_ids).cloned().collect::<HashSet<_>>();
+        let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids).cloned().collect::<HashSet<_>>();
         let excluded = |id: &str| claimed.contains(id);
-        let stroke_bold = primitives.stroke_bold.clone();
-        let bold = |id: &str| stroke_bold.get(id).copied();
         let numbered = |text: &str| enumerated(text);
         let translation = |id: &str| primitives.contexts.translation_line_ids.contains(id);
         constituents::within_document_contexts(
@@ -1412,7 +1405,6 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
                         contents_pages: &primitives.claims.contents_pages,
                         numbered: &numbered,
                         source_regions: primitives.source_regions.as_ref(),
-                        bold: &bold,
                     },
                 );
             },
@@ -1427,53 +1419,4 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         bookmarks::reconcile_bookmarks(pages, &merged, primitives, authored);
     });
     stamp(pages, &mut primitives.headings.sources, "outline");
-}
-
-/// Bold on a recognized page, read from its strokes: a scan's text layer names no bold face, and a
-/// recognized line has no face at all, but the measured stem width of bold type stands out from
-/// the document's body text. Measured at 300 dpi on the gold's scans, heading lines sit at a median
-/// 1.43 times their document's body weight and nine in ten text lines below 1.18; words read as
-/// well as lines (heading words against text words, AUC 0.875). A line at 1.3 times the
-/// document's median body line or more is bold throughout; in a lighter line, a word of three or
-/// more letters at 1.3 times the median body word or more is bold, and the line's share is its bold
-/// words' share of its letters, so a run-in title counts. Every heading reader reads the same share.
-pub(super) fn mark_stroke_bold(pages: &[Page]) -> HashMap<String, f64> {
-    const BOLD_WEIGHT: f64 = 1.3;
-    let letters = |word: &Word| word.text.chars().filter(|c| c.is_alphanumeric()).count();
-    let measured = |word: &&Word| word.weight > 0.0 && letters(*word) >= 3;
-    let lines = pages
-        .iter()
-        .filter(|page| recognized_page(page))
-        .flat_map(|page| &page.lines)
-        .filter(|line| line.weight > 0.0)
-        .collect::<Vec<_>>();
-    let body = lines
-        .iter()
-        .filter(|line| line.region_type == "body" && !line.exclude_from_body)
-        .collect::<Vec<_>>();
-    if body.len() < 20 {
-        return HashMap::new();
-    }
-    let body_line = median(body.iter().map(|line| line.weight).collect());
-    let body_word = median(body.iter().flat_map(|line| line.words.iter().filter(measured)).map(|word| word.weight).collect());
-    lines
-        .into_iter()
-        .map(|line| {
-            let (mut bold, mut total) = (0, 0);
-            for word in line.words.iter().filter(measured) {
-                total += letters(word);
-                if word.weight >= BOLD_WEIGHT * body_word {
-                    bold += letters(word);
-                }
-            }
-            let share = if line.weight >= BOLD_WEIGHT * body_line {
-                1.0
-            } else if total > 0 && body_word > 0.0 {
-                bold as f64 / total as f64
-            } else {
-                0.0
-            };
-            (line.id.clone(), share)
-        })
-        .collect()
 }

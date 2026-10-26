@@ -211,7 +211,6 @@ pub(super) fn read(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Reading
                     && line.note_region_mode.is_empty()
                     && matches!(line.region_type.as_str(), "body" | "heading")
                     && !primitives.claims.table_cell_line_ids.contains(&line.id)
-                    && !primitives.claims.table_note_line_ids.contains(&line.id)
                     && !primitives.claims.contents_line_ids.contains(&line.id)
                     && !primitives.claims.contents_pages.contains(&page.index)
                     && !line.text.trim().is_empty()
@@ -258,14 +257,14 @@ pub(super) fn read(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Reading
     }
     let mut found = Reading::default();
     for document in readings.into_values() {
-        let reading = quotation_rows(&document.rows, &document.pages, &primitives.stroke_bold);
+        let reading = quotation_rows(&document.rows, &document.pages);
         found.scopes.extend(reading.scopes);
         found.introductions.extend(reading.introductions);
     }
     found
 }
 
-fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page], stroke_bold: &HashMap<String, f64>) -> Reading {
+fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
     let mut quoted = Reading::default();
     let mut pending = vec![rows.iter().collect::<Vec<_>>()];
     while let Some(rows) = pending.pop() {
@@ -447,7 +446,7 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page], stroke_bold: &HashM
                     last_line: last.text(),
                 })
             });
-            if quotation(&block, introduction.as_ref(), &body, justified, &measure, stroke_bold) {
+            if quotation(&block, introduction.as_ref(), &body, justified, &measure) {
                 let id = format!("quotation:{}", block[0].lines[0].id);
                 if let Some(introduction) = &introduction {
                     quoted
@@ -471,8 +470,7 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page], stroke_bold: &HashM
     quoted
 }
 
-/// A scanned line's bold is read from its strokes (`stroke_bold`), as every heading reader reads it.
-fn opens_with_heading(block: &[&Row<'_>], stroke_bold: &HashMap<String, f64>) -> bool {
+fn opens_with_heading(block: &[&Row<'_>]) -> bool {
     let first = block[0];
     let lines = block
         .iter()
@@ -498,12 +496,6 @@ fn opens_with_heading(block: &[&Row<'_>], stroke_bold: &HashMap<String, f64>) ->
     }
     let (mut total, mut bold, mut italics) = (0.0, 0.0, 0.0);
     for line in &lines {
-        if let Some(share) = stroke_bold.get(&line.id) {
-            let count = line.text.trim().chars().count() as f64;
-            total += count;
-            bold += share * count;
-            continue;
-        }
         for span in &line.spans {
             let count = span.text.trim().chars().count() as f64;
             total += count;
@@ -526,7 +518,6 @@ fn quotation(
     body: &Typography,
     justified: bool,
     measure: &dyn Fn(&Row) -> (f64, f64),
-    stroke_bold: &HashMap<String, f64>,
 ) -> bool {
     // A centred block (an address, a title) or one reaching into the right half of the page (a
     // table's columns) is no quotation.
@@ -601,7 +592,7 @@ fn quotation(
     }
     // A cited or headed extract can share the body's type and right margin.
     if block.len() >= 2 {
-        let heading = opens_with_heading(block, stroke_bold);
+        let heading = opens_with_heading(block);
         let cited =
             introduction.is_some_and(|intro| layout_analysis().has_citation_signal(&intro.text));
         let located = introduction.is_some_and(|intro| {

@@ -24,8 +24,8 @@ use text::*;
 pub use graph::PdfTextIndex;
 use graph::{map_note_pairs, native_graph_parts, PdfResolutionInput};
 use legal_pdf_core::model::{
-    DetachedReference, Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
-    ParagraphAnchor, PdfOutlineEntry, Span, Word,
+    Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
+    ParagraphAnchor, PdfOutlineEntry, Span,
 };
 use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
@@ -70,18 +70,15 @@ struct Claims {
     #[serde(default)]
     contents_entries: Vec<contents_lists::Entry>,
     table_cell_line_ids: HashSet<String>,
-    table_note_line_ids: HashSet<String>,
     /// Every table of the document, ruled, headed by rules, aligned by white space or read from
     /// a page's figures: one kind of table, whose lines are its cells.
     tables: Vec<legal_pdf_tables::PdfTable>,
 }
 
 impl Claims {
-    /// A line a container has claimed (a table's cell or note, a contents entry).
+    /// A line a container has claimed (a table's cell, a contents entry).
     fn claimed(&self, id: &str) -> bool {
-        self.contents_line_ids.contains(id)
-            || self.table_cell_line_ids.contains(id)
-            || self.table_note_line_ids.contains(id)
+        self.contents_line_ids.contains(id) || self.table_cell_line_ids.contains(id)
     }
 }
 
@@ -153,10 +150,6 @@ struct PdfPrimitiveEvidence {
     /// paragraphs): quotations, and no numbered-paragraph candidates.
     #[serde(default)]
     foreign_numbered_line_ids: HashSet<String>,
-    /// The share of each measured line's characters set bold on a recognized page, read from
-    /// their strokes (`mark_stroke_bold`).
-    #[serde(default)]
-    stroke_bold: HashMap<String, f64>,
     /// The page labels the PDF itself declares (its `/PageLabels`), by page index.
     #[serde(default)]
     embedded_page_labels: Vec<Option<String>>,
@@ -423,32 +416,18 @@ fn classify_pages_with_source(
     let source = pages
         .iter()
         .flat_map(|page| &page.lines)
-        .map(|line| {
-            (
-                line.region_type.clone(),
-                line.exclude_from_body,
-                line.detached_references.len(),
-            )
-        })
+        .map(|line| (line.region_type.clone(), line.exclude_from_body))
         .collect::<Vec<_>>();
     legal_pdf_support::profile::measure("prepare.furniture", || mark_repeated_furniture(pages));
-    legal_pdf_support::profile::measure("prepare.detached_references", || {
-        associate_detached_references(pages, separators)
-    });
     constituents::reconcile_starts(pages, &mut evidence.contexts.constituent_starts);
     let documents = constituents::document_lines(pages, &evidence.contexts.constituent_starts);
     let diagnostics = if documents.is_empty() {
         drop(source);
         classify_document_pages(pages, separators, &HashSet::new(), evidence)
     } else {
-        for (line, (region, excluded, references)) in pages
-            .iter_mut()
-            .flat_map(|page| &mut page.lines)
-            .zip(source)
-        {
+        for (line, (region, excluded)) in pages.iter_mut().flat_map(|page| &mut page.lines).zip(source) {
             line.region_type = region;
             line.exclude_from_body = excluded;
-            line.detached_references.truncate(references);
         }
         let separators_by_page = pages
             .iter()
@@ -477,9 +456,6 @@ fn classify_pages_with_source(
             legal_pdf_support::profile::measure("prepare.furniture", || {
                 mark_repeated_furniture(document)
             });
-            legal_pdf_support::profile::measure("prepare.detached_references", || {
-                associate_detached_references(document, &separators)
-            });
             diagnostics.extend(classify_document_pages(
                 document,
                 &separators,
@@ -487,9 +463,6 @@ fn classify_pages_with_source(
                 evidence,
             ));
         });
-        for page in pages.iter_mut() {
-            order_furniture(page);
-        }
         evidence
             .claims.contents_pages
             .retain(|page| !shared_pages.contains(page));
@@ -567,42 +540,14 @@ fn classify_document_pages(
             line.block_index += base;
         }
     }
-    let table_started = std::time::Instant::now();
-    let table_pages: Vec<_> = pages
+    // A page holding a table's cells.
+    let table_pages: Vec<bool> = pages
         .iter()
-        .map(|page| {
-            // The tables' cells, and the notes set under a table where it ends on this page.
-            let cells: HashSet<usize> = (0..page.lines.len())
-                .filter(|index| table_lines.contains(&page.lines[*index].id))
-                .collect();
-            let ends: Vec<f64> = tables
-                .iter()
-                .map(legal_pdf_tables::PdfTable::end)
-                .filter(|(at, _)| *at == page.index)
-                .map(|(_, bottom)| bottom)
-                .collect();
-            let notes = table_note_lines(&page.lines, &cells, &ends);
-            (!cells.is_empty(), cells, notes)
-        })
+        .map(|page| page.lines.iter().any(|line| table_lines.contains(&line.id)))
         .collect();
-
-    if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() {
-        eprintln!("phase	classify.table_pages	{}", table_started.elapsed().as_micros());
-    }
-    for (page, (_, table_cells, table_notes)) in pages.iter().zip(&table_pages) {
-        evidence.claims.table_cell_line_ids.extend(
-            table_cells
-                .iter()
-                .filter_map(|index| page.lines.get(*index))
-                .map(|line| line.id.clone()),
-        );
-        evidence.claims.table_note_line_ids.extend(
-            table_notes
-                .iter()
-                .filter_map(|index| page.lines.get(*index))
-                .map(|line| line.id.clone()),
-        );
-    }
+    evidence.claims.table_cell_line_ids.extend(
+        pages.iter().flat_map(|page| &page.lines).filter(|line| table_lines.contains(&line.id)).map(|line| line.id.clone()),
+    );
 
     // Read note history within one language; tables and physical order retain the whole page.
     if translation.is_empty() {
@@ -632,8 +577,8 @@ fn classify_document_pages(
         });
     }
     legal_pdf_support::profile::measure("classify.order_pages", || {
-        for (page, (table_page, _, table_notes)) in pages.iter_mut().zip(table_pages) {
-            diagnostics.extend(order_page(page, table_page, contents_pages.contains(&page.index), &table_notes));
+        for (page, table_page) in pages.iter_mut().zip(table_pages) {
+            diagnostics.extend(order_page(page, table_page, contents_pages.contains(&page.index)));
             legal_pdf_tables::order_table_lines(page, &tables);
         }
     });
@@ -1215,7 +1160,7 @@ fn prepare_reader(
     legal_pdf_support::profile::measure("prepare.detached_markers", || {
         graph::mark_line_numbers(pages);
         for page in pages.iter_mut() {
-            if graph::line_labels(page).next().is_none() && std::env::var_os("LEGALPDF_NO_DETACHED_MARKERS").is_none() {
+            if graph::line_labels(page).next().is_none() {
                 join_detached_markers(page);
             }
         }
@@ -1270,9 +1215,6 @@ fn prepare_reader(
         );
         changed
     });
-    // A scan's bold, read once from its strokes after notes are known, for the quotation and
-    // heading readers alike.
-    primitives.stroke_bold = mark_stroke_bold(pages);
     primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || quotations::read(pages, &primitives));
     for group in legal_pdf_support::profile::measure("reader.sequence", || numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives)) {
         if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
