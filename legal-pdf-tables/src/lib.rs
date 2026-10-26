@@ -1,18 +1,22 @@
 //! Tables, read by pdf-inspector's own detectors.
 //!
-//! Each page's words go to pdf-inspector as its text items and the page's painted rules as its
-//! lines: its rule-grid detector reads the ruled tables, its white-space detector the rest of the
-//! page where the parser's layout says white space can be read (`TableLayout`). What it finds is
-//! mapped back onto the words it was read from, cell by cell. A contents list is no table, nor a
+//! Each page's words go to pdf-inspector as its text items, the page's filled rectangles as its
+//! rects and its painted rules as its lines, and its detectors read them in its own order: filled
+//! cell grids first, then ruled tables where no grid was found, then white space for the rest of
+//! the page where the parser's layout says white space can be read (`TableLayout`). Each word
+//! goes in the cell the detector placed it in. A contents list is no table, nor a
 //! text set beside its translation, nor a list set in two columns (its markers counting down the
 //! first). A table the page cuts off goes on at the top
 //! of the next page, or under its repeated caption and head row, when its columns stand where
 //! they stood.
 
-use legal_pdf_core::line_font_size;
-use legal_pdf_core::model::{Line, Page};
-use pdf_inspector::tables::{detect_tables, detect_tables_from_lines, Table, TableKind};
-use pdf_inspector::types::{ItemType, PdfLine, TextItem};
+use legal_pdf_core::{flag_share, line_font_size, BOLD};
+use legal_pdf_core::model::{Line, Page, Span, ITALIC, MONOSPACED};
+use pdf_inspector::tables::{
+    detect_tables, detect_tables_from_lines, detect_tables_from_rects, try_build_rect_guided_table,
+    Table, TableKind,
+};
+use pdf_inspector::types::{ItemType, PdfLine, PdfRect, TextItem};
 use std::collections::{HashMap, HashSet};
 
 /// Layout readings the table detector takes from the parser that owns them.
@@ -104,16 +108,7 @@ impl PdfTable {
 }
 
 fn bold(line: &Line) -> bool {
-    let (mut total, mut heavy) = (0, 0);
-    for span in &line.spans {
-        let count = span.text.trim().chars().count();
-        let font = span.font.to_ascii_lowercase();
-        total += count;
-        if span.flags & 16 != 0 || ["bold", "black", "heavy"].iter().any(|w| font.contains(w)) {
-            heavy += count;
-        }
-    }
-    total > 0 && heavy * 5 >= total * 4
+    flag_share(line, BOLD).is_some_and(|share| share >= 0.8)
 }
 
 /// A line, or the words of it that stand in one cell.
@@ -167,41 +162,48 @@ fn cell_of(page: &Page, column: usize, mut pieces: Vec<Piece>) -> TableCell {
 }
 
 /// A word no word of the line stands for: the line read whole.
-const WHOLE: usize = usize::MAX;
+pub const WHOLE: usize = usize::MAX;
 
-/// The page's words as pdf-inspector's text items (points, y up), with the (line, word) each was
-/// read from. Running heads and footers, and lines the parser has set aside, are not offered.
 fn text_items(page: &Page) -> (Vec<TextItem>, Vec<(usize, usize)>) {
+    line_items(&page.lines, page.index as u32 + 1, page.height)
+}
+
+/// Lines' words as pdf-inspector's text items (points, y up, on page `number`), with the (line,
+/// word) each was read from, so its readers read our pages, recognized ones too. Running heads and
+/// footers, and lines the parser has set aside, are not offered.
+pub fn line_items(lines: &[Line], number: u32, height: f64) -> (Vec<TextItem>, Vec<(usize, usize)>) {
     let (mut items, mut origin) = (Vec::new(), Vec::new());
-    let item = |line: &Line, text: &str, bbox: [f64; 4], font: &str, underlined: bool| TextItem {
+    // Each word as its span sets it: face, weight, slant and pitch; a recognized line's by its
+    // strokes alone.
+    let item = |line: &Line, text: &str, bbox: [f64; 4], span: Option<&Span>, underlined: bool, struck: bool| TextItem {
         text: text.to_owned(),
         x: bbox[0] as f32,
-        y: (page.height - bbox[3]) as f32,
+        y: (height - bbox[3]) as f32,
         width: (bbox[2] - bbox[0]) as f32,
         height: (bbox[3] - bbox[1]) as f32,
         rotation: 0.0,
         advance_known: true,
-        font: font.to_owned(),
+        font: span.map_or(String::new(), |span| span.font.clone()),
         font_tag: String::new(),
         legacy_symbol_rewrite: false,
         font_size: line_font_size(line).max(bbox[3] - bbox[1]) as f32,
-        page: page.index as u32 + 1,
-        is_bold: bold(line),
-        is_italic: false,
+        page: number,
+        is_bold: span.map_or_else(|| bold(line), |span| span.flags & BOLD != 0),
+        is_italic: span.is_some_and(|span| span.flags & ITALIC != 0),
         font_weight: None,
         bold_source: None,
-        fixed_pitch: None,
+        fixed_pitch: span.map(|span| span.flags & MONOSPACED != 0),
         fill_color: None,
         stroke_color: None,
         render_mode: None,
         is_underline: underlined,
-        is_strikeout: false,
+        is_strikeout: struck,
         fidelity: None,
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
     };
-    for (slot, line) in page.lines.iter().enumerate() {
+    for (slot, line) in lines.iter().enumerate() {
         if line.exclude_from_body
             || matches!(line.region_type.as_str(), "header" | "footer")
             || line.text.trim().is_empty()
@@ -209,12 +211,11 @@ fn text_items(page: &Page) -> (Vec<TextItem>, Vec<(usize, usize)>) {
         {
             continue;
         }
-        let font = |at: usize| {
+        let span = |at: usize| {
             line.spans
                 .iter()
                 .find(|span| span.start <= at && at < span.end.max(span.start + 1))
                 .or(line.spans.first())
-                .map_or("", |span| span.font.as_str())
         };
         let words: Vec<(usize, &legal_pdf_core::model::Word)> = line
             .words
@@ -223,15 +224,34 @@ fn text_items(page: &Page) -> (Vec<TextItem>, Vec<(usize, usize)>) {
             .filter(|(_, word)| !word.text.trim().is_empty())
             .collect();
         if words.is_empty() {
-            items.push(item(line, line.text.trim(), line.bbox, font(0), false));
+            items.push(item(line, line.text.trim(), line.bbox, span(0), false, false));
             origin.push((slot, WHOLE));
         }
         for (at, word) in words {
-            items.push(item(line, &word.text, word.bbox, font(word.start), word.underlined));
+            items.push(item(line, &word.text, word.bbox, span(word.start), word.underlined, word.struck));
             origin.push((slot, at));
         }
     }
     (items, origin)
+}
+
+/// Clears the underline and strike read under the words of a table drawn with rules or filled
+/// cells, as pdf-inspector clears them (suppress_table_underlines): the table's rulings, not the
+/// words'.
+pub fn clear_table_underlines(page: &mut Page) {
+    if !page.lines.iter().flat_map(|line| &line.words).any(|word| word.underlined || word.struck) {
+        return;
+    }
+    let (mut items, origin) = text_items(page);
+    let marked: Vec<bool> = items.iter().map(|item| item.is_underline || item.is_strikeout).collect();
+    pdf_inspector::extractor::suppress_table_underlines(&mut items, &rects(page), &rules(page), page.index as u32 + 1);
+    for ((item, marked), (line, word)) in items.iter().zip(marked).zip(origin) {
+        if marked && !item.is_underline && !item.is_strikeout && word != WHOLE {
+            let word = &mut page.lines[line].words[word];
+            word.underlined = false;
+            word.struck = false;
+        }
+    }
 }
 
 /// The page's painted rules as pdf-inspector's lines (points, y up).
@@ -254,50 +274,24 @@ fn rules(page: &Page) -> Vec<PdfLine> {
         .collect()
 }
 
-/// Which of `n` slots a position falls in: the detector gives `n + 1` boundaries, or one
-/// position per slot (a centre or an edge), the nearest of which is taken.
-fn slot(positions: &[f32], n: usize, at: f32) -> usize {
-    let mut sorted = positions.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let k = if sorted.len() == n + 1 {
-        sorted.partition_point(|position| *position <= at).saturating_sub(1)
-    } else {
-        (0..sorted.len())
-            .min_by(|a, b| (sorted[*a] - at).abs().total_cmp(&(sorted[*b] - at).abs()))
-            .unwrap_or(0)
-    };
-    k.min(n - 1)
-}
-
-/// The cell of the detector's grid an item stands in, by its position; where that cell's text
-/// does not hold the item's, the nearest cell along its row, then its column, that does.
-fn grid_cell(table: &Table, item: &TextItem) -> Option<(usize, usize)> {
-    let rows = table.cells.len();
-    let columns = table.cells.iter().map(Vec::len).max().unwrap_or(0);
-    if rows == 0 || columns == 0 {
-        return None;
-    }
-    let column = slot(&table.columns, columns, item.x + item.width / 2.0);
-    // Rows run down the page; the detector's y runs up it.
-    let row = rows - 1 - slot(&table.rows, rows, item.y + item.height / 2.0);
-    let text = item.text.trim();
-    let holds = |r: usize, c: usize| {
-        table.cells.get(r).and_then(|cells| cells.get(c)).is_some_and(|cell| cell.contains(text))
-    };
-    let near = |n: usize, at: usize| {
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|k| k.abs_diff(at));
-        order
-    };
-    if holds(row, column) {
-        return Some((row, column));
-    }
-    near(columns, column)
-        .into_iter()
-        .find(|&c| holds(row, c))
-        .map(|c| (row, c))
-        .or_else(|| near(rows, row).into_iter().find(|&r| holds(r, column)).map(|r| (r, column)))
-        .or(Some((row, column)))
+/// The page's filled rectangles as pdf-inspector's rects (points, y up, from the bottom-left
+/// corner).
+fn rects(page: &Page) -> Vec<PdfRect> {
+    let number = page.index as u32 + 1;
+    page.regions
+        .iter()
+        .filter(|region| region.kind == "rect")
+        .map(|region| {
+            let [x0, y0, x1, y1] = region.bbox;
+            PdfRect {
+                x: x0.min(x1) as f32,
+                y: (page.height - y0.max(y1)) as f32,
+                width: (x1 - x0).abs() as f32,
+                height: (y1 - y0).abs() as f32,
+                page: number,
+            }
+        })
+        .collect()
 }
 
 /// One cell's words as pieces: the words of one line that run on together make one piece, a
@@ -327,16 +321,20 @@ fn pieces(page: &Page, mut words: Vec<(usize, usize)>) -> Vec<Piece> {
         .collect()
 }
 
-/// A table pdf-inspector read, on the words it was read from.
-fn converted(page: &Page, items: &[TextItem], origin: &[(usize, usize)], table: &Table) -> Option<PdfTable> {
+/// A table pdf-inspector read, on the words it was read from: each word in the cell the detector
+/// placed it in.
+fn converted(page: &Page, origin: &[(usize, usize)], table: &Table) -> Option<PdfTable> {
     let columns = table.cells.iter().map(Vec::len).max().unwrap_or(0);
     let mut grid: Vec<Vec<Vec<(usize, usize)>>> = vec![vec![Vec::new(); columns]; table.cells.len()];
     let mut boxes: Vec<[f64; 4]> = Vec::new();
-    for &k in &table.item_indices {
-        let Some((row, column)) = items.get(k).and_then(|item| grid_cell(table, item)) else {
+    let mut placed = HashSet::new();
+    for &(k, row, column) in &table.item_cells {
+        let Some(&(line, word)) = origin.get(k) else {
             continue;
         };
-        let (line, word) = origin[k];
+        if row >= grid.len() || column >= columns || !placed.insert(k) {
+            continue;
+        }
         grid[row][column].push((line, word));
         boxes.push(if word == WHOLE { page.lines[line].bbox } else { page.lines[line].words[word].bbox });
     }
@@ -421,13 +419,8 @@ fn list_marker(text: &str) -> Option<(u8, u32)> {
         let letter = inner.bytes().next()?.to_ascii_lowercase();
         return Some((if upper { 6 } else { 5 }, u32::from(letter - b'a') + 1));
     }
-    let digit = |b: u8| match b.to_ascii_lowercase() { b'i' => Some(1), b'v' => Some(5), b'x' => Some(10), b'l' => Some(50), b'c' => Some(100), _ => None };
-    let values = inner.bytes().map(digit).collect::<Option<Vec<i64>>>()?;
-    if !(upper || inner.bytes().all(|b| b.is_ascii_lowercase())) {
-        return None;
-    }
-    let value: i64 = values.iter().enumerate().map(|(k, v)| if values.get(k + 1).is_some_and(|next| next > v) { -v } else { *v }).sum();
-    Some((if upper { 8 } else { 7 }, u32::try_from(value).ok().filter(|v| *v > 0)?))
+    let value = legal_pdf_core::roman_value(inner).filter(|_| !inner.contains(['d', 'm', 'D', 'M']))?;
+    Some((if upper { 8 } else { 7 }, value))
 }
 
 /// Whether a table pdf-inspector read is a list set in two columns: each row that fills both holds
@@ -467,22 +460,64 @@ fn page_tables(
     if items.len() < 6 {
         return (Vec::new(), Vec::new());
     }
-    let rules = rules(page);
-    let mut found: Vec<Table> = if rules.is_empty() {
-        Vec::new()
-    } else {
-        detect_tables_from_lines(&items, &rules, page.index as u32 + 1)
+    let number = page.index as u32 + 1;
+    let mut found: Vec<Table> = Vec::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+    // A table read on some of the items: its item indices taken back to the page's.
+    let on_page = |mut table: Table, subset: &[usize]| {
+        table.item_indices = table.item_indices.iter().filter_map(|&k| subset.get(k).copied()).collect();
+        table.item_cells = table
+            .item_cells
+            .iter()
+            .filter_map(|&(k, row, column)| subset.get(k).map(|&k| (k, row, column)))
+            .collect();
+        table
     };
+    // Filled cell grids first, each on items no grid before it took.
+    let (grids, hints) = detect_tables_from_rects(&items, &rects(page), number);
+    for table in grids {
+        if table.item_indices.iter().any(|k| claimed.contains(k)) {
+            continue;
+        }
+        claimed.extend(table.item_indices.iter().copied());
+        found.push(table);
+    }
+    // Ruled tables where no grid was found.
+    let rules = rules(page);
+    if claimed.is_empty() && !rules.is_empty() {
+        for table in detect_tables_from_lines(&items, &rules, number) {
+            claimed.extend(table.item_indices.iter().copied());
+            found.push(table);
+        }
+    }
+    // Neither: cell rects too sparse for a grid still set the columns of the words among them.
+    if claimed.is_empty() {
+        const PADDING: f32 = 15.0;
+        for hint in hints.iter().filter(|hint| !hint.cluster_rects.is_empty()) {
+            let inside: Vec<usize> = (0..items.len())
+                .filter(|&k| {
+                    let item = &items[k];
+                    item.y >= hint.y_bottom - PADDING
+                        && item.y <= hint.y_top + PADDING
+                        && item.x >= hint.x_left - PADDING
+                        && item.x <= hint.x_right + PADDING
+                })
+                .collect();
+            let inside_items: Vec<TextItem> = inside.iter().map(|&k| items[k].clone()).collect();
+            if let Some(table) = try_build_rect_guided_table(&inside_items, &hint.cluster_rects) {
+                claimed.extend(inside.iter().copied());
+                found.push(on_page(table, &inside[..]));
+            }
+        }
+    }
     if layout.white_space(page) {
-        let taken: HashSet<usize> = found.iter().flat_map(|table| table.item_indices.iter().copied()).collect();
-        let rest: Vec<usize> = (0..items.len()).filter(|k| !taken.contains(k)).collect();
+        let rest: Vec<usize> = (0..items.len()).filter(|k| !claimed.contains(k)).collect();
         let free: Vec<TextItem> = rest.iter().map(|&k| items[k].clone()).collect();
         let mut sizes: Vec<f32> = free.iter().map(|item| item.font_size).collect();
         sizes.sort_by(f32::total_cmp);
         let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0);
-        for mut table in detect_tables(&free, body, false) {
-            table.item_indices = table.item_indices.iter().filter_map(|&k| rest.get(k).copied()).collect();
-            found.push(table);
+        for table in detect_tables(&free, body, false) {
+            found.push(on_page(table, &rest[..]));
         }
     }
     let contents = found
@@ -496,7 +531,7 @@ fn page_tables(
     let mut tables: Vec<PdfTable> = found
         .iter()
         .filter(|table| table.kind == TableKind::Data)
-        .filter_map(|table| converted(page, &items, &origin, table))
+        .filter_map(|table| converted(page, &origin, table))
         .filter(|table| !table.line_ids().into_iter().any(|id| translation.contains(id)))
         .filter(|table| !bilingual_columns(page, table, layout))
         .filter(|table| !two_column_list(table))

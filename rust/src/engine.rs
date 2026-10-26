@@ -37,6 +37,10 @@ struct DeferredOcrProvider<'a> {
     runtime: Option<OcrProvider>,
     cache_root: Option<PathBuf>,
     cache_identity: String,
+    /// What the raster measures are cached under: this source and the raster code, not recognition.
+    raster_identity: String,
+    /// The page last rendered for regions read again, by page and scale: a page's regions share it.
+    region_render: Option<(usize, i64, legal_pdf_ocr::GrayRender)>,
     progress: RecognitionProgress<'a>,
     /// What each measured page's render shows, by page.
     rasters: BTreeMap<usize, legal_pdf_core::RasterReading>,
@@ -55,6 +59,13 @@ struct CachedRaster {
 struct CachedOcrPage {
     key: String,
     page: legal_pdf_core::OcrPageResult,
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Serialize, Deserialize)]
+struct CachedRegion {
+    key: String,
+    lines: Vec<legal_pdf_core::OcrLine>,
 }
 
 #[cfg(feature = "ocr")]
@@ -145,6 +156,10 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 paths.insert(request.page_index, (key, path));
             }
         }
+        // LEGALPDF_RECOGNITION_TRACE: how many of the pages asked for the recognition cache held.
+        if std::env::var_os("LEGALPDF_RECOGNITION_TRACE").is_some() {
+            eprintln!("recognition\t{} cached\t{} to read", results.len(), missing.len());
+        }
         let progress = self.progress;
         let report = |done: usize| {
             if let Some(progress) = progress {
@@ -175,7 +190,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         }
         let raster_root = self.cache_root.as_deref().and_then(Path::parent).map(|root| root.join("raster"));
         let raster_requests = missing.iter().filter(|request| request.regions.is_empty()).cloned().collect::<Vec<_>>();
-        let raster_identity = self.cache_identity.clone();
+        let raster_identity = self.raster_identity.clone();
         std::thread::scope(|scope| -> Result<()> {
             // Keep the exact 150 dpi scanner, overlapping its existing cache fill with recognition.
             let raster = raster_root.map(|root| scope.spawn(move || {
@@ -220,14 +235,32 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         Ok(results)
     }
 
+    /// A region read again, through the recognition cache as a page reading is: the same OCR code
+    /// and provider read the same region of the same page the same way.
     fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<legal_pdf_core::OcrLine>> {
+        let key = serialization_sha256(&("region-v1", &self.cache_identity, page_index, region.map(|value| (value * 100.0).round() as i64), (scale * 100.0).round() as i64))?;
+        let path = self.cache_root.as_ref().map(|root| root.join(format!("region-{key}.json.gz")));
+        if let Some(cached) = path.as_ref().and_then(|path| read_gzip_json::<CachedRegion>(path).ok()).filter(|cached| cached.key == key) {
+            return Ok(cached.lines);
+        }
         if self.runtime.is_none() {
             let prepared = self.prepared.take().ok_or_else(|| {
                 Error::Message("OCR runtime preparation was already consumed".to_owned())
             })?;
             self.runtime = Some(OcrProvider::from_prepared(self.options, prepared)?);
         }
-        legal_pdf_core::PdfOcrProvider::read_region(self.runtime.as_mut().expect("OCR runtime initialized"), pdf, page_index, region, scale)
+        let scaled = (scale * 100.0).round() as i64;
+        if self.region_render.as_ref().is_none_or(|(page, at, _)| (*page, *at) != (page_index, scaled)) {
+            self.region_render = legal_pdf_ocr::render_gray_page(pdf, page_index, scale * 72.0).map(|render| (page_index, scaled, render));
+        }
+        let Some((_, _, render)) = &self.region_render else {
+            return Ok(Vec::new());
+        };
+        let lines = self.runtime.as_mut().expect("OCR runtime initialized").read_rendered_region(render, region, scale)?;
+        if let Some(path) = &path {
+            write_gzip_json(path, &CachedRegion { key, lines: lines.clone() })?;
+        }
+        Ok(lines)
     }
 
     fn separators(
@@ -237,7 +270,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
     ) -> Vec<Option<f64>> {
         profile::measure("extract.raster_separators", || {
             let root = self.cache_root.as_ref().and_then(|root| root.parent()).map(|parse| parse.join("raster"));
-            let found = cached_rasters(root.as_deref(), &self.cache_identity, pdf, requests);
+            let found = cached_rasters(root.as_deref(), &self.raster_identity, pdf, requests);
             requests
                 .iter()
                 .zip(found)
@@ -461,7 +494,7 @@ fn finish_recognition(
         }));
     }
     for page in pages {
-        legal_pdf_core::model::mark_rule_underlines(page);
+        legal_pdf_extraction::mark_rule_underlines(page);
     }
 }
 
@@ -499,6 +532,26 @@ fn derive_document(
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
         pages.clone_from(&extracted.pages);
+        // For a reader after the parser: each heading line's source, as regions of kind
+        // "heading_source" (id "heading-source:<reader>") on these pages only.
+        for page in pages.iter_mut() {
+            let mut by_source: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for line in &page.lines {
+                if let Some(source) = derived.heading_sources.get(&line.id) {
+                    by_source.entry(source.as_str()).or_default().push(line.id.clone());
+                }
+            }
+            for (source, line_ids) in by_source {
+                page.regions.push(legal_pdf_core::model::Region {
+                    id: format!("heading-source:{source}"),
+                    page_index: page.index,
+                    kind: "heading_source".to_owned(),
+                    line_ids,
+                    bbox: [0.0; 4],
+                    reading_order: 0,
+                });
+            }
+        }
     }
     let mut parsed = profile::measure("project_document", || {
         PdfDocument::from_parts(
@@ -516,164 +569,65 @@ fn derive_document(
     Ok(parsed)
 }
 
-/// Recognition pinned to the readings an earlier parse cached, page by page, so the structure
-/// gold replays the structure stage over the very lines its gold was authored on. The rules on
-/// each page's image are read again, as a parse reads them.
-#[cfg(feature = "ocr")]
-struct PinnedRecognition {
-    pages: BTreeMap<usize, legal_pdf_core::OcrPageResult>,
-    rasters: BTreeMap<usize, legal_pdf_core::RasterReading>,
-    /// A recognizer for re-reading margins, built from LEGALPDF_INDRA_MODEL_PACK and
-    /// LEGALPDF_ONNXRUNTIME the first time one is asked for; none where they are not set.
-    reader: Option<Option<OcrProvider>>,
-}
-
-#[cfg(feature = "ocr")]
-impl legal_pdf_core::PdfOcrProvider for PinnedRecognition {
-    fn extract_pages(
-        &mut self,
-        pdf: &[u8],
-        requests: &[legal_pdf_core::OcrPageRequest],
-    ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
-        // A page the authoring parse never cached a reading of (its text layer was kept then) is
-        // read now by the environment's recognizer where one is named, else it is an error as before.
-        let missing: Vec<legal_pdf_core::OcrPageRequest> = requests.iter()
-            .filter(|request| !self.pages.contains_key(&request.page_index)).cloned().collect();
-        if !missing.is_empty() {
-            let reader = self.reader.get_or_insert_with(|| {
-                if std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_none() || std::env::var_os("LEGALPDF_ONNXRUNTIME").is_none() {
-                    return None;
-                }
-                OcrProvider::new(&OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())).ok()
-            });
-            if let Some(provider) = reader {
-                for page in legal_pdf_core::PdfOcrProvider::extract_pages(provider, pdf, &missing)? {
-                    self.pages.insert(page.page_index, page);
-                }
-            }
-        }
-        requests
-            .iter()
-            .map(|request| {
-                self.pages.get(&request.page_index).cloned().ok_or_else(|| {
-                    Error::Message(format!("No cached reading of page {}", request.page_index + 1))
-                })
-            })
-            .collect()
-    }
-
-    fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<legal_pdf_core::OcrLine>> {
-        let reader = self.reader.get_or_insert_with(|| {
-            if std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_none() || std::env::var_os("LEGALPDF_ONNXRUNTIME").is_none() {
-                return None;
-            }
-            OcrProvider::new(&OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())).ok()
-        });
-        match reader {
-            Some(provider) => legal_pdf_core::PdfOcrProvider::read_region(provider, pdf, page_index, region, scale),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn separators(
-        &mut self,
-        pdf: &[u8],
-        requests: &[legal_pdf_core::OcrPageRequest],
-    ) -> Vec<Option<f64>> {
-        legal_pdf_ocr::raster_page_rules(pdf, requests)
-            .into_iter()
-            .zip(requests)
-            .map(|(reading, request)| {
-                let separator = reading.separator;
-                self.rasters.insert(request.page_index, reading);
-                separator
-            })
-            .collect()
-    }
-}
-
-/// The structure gold's inputs: a cached extraction with the cached readings of its pages
-/// recognized into it, as the structure stage receives them. `fresh` extracts the PDF again with
-/// this build, which must read the very lines the cached extraction holds, so the gold's lines stay
-/// its lines while their evidence (spans, type, marks) comes from the current extraction.
+/// The structure gold's inputs: `pdf`'s pages exactly as a parse of this build feeds its structure
+/// stage (`recognized_extraction`), cached under `cache_dir` as a parse caches them. Recognition is
+/// Indra's where LEGALPDF_INDRA_MODEL_PACK and LEGALPDF_ONNXRUNTIME name it, through the product's
+/// recognition cache (a page read before by the same OCR code is not read again); the layout model
+/// PP-DocLayout's where LEGALPDF_PPDOC_MODEL_PACK names a pack. The gold is aligned to whatever
+/// lines these are, so nothing here is chosen by the gold.
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
-pub fn gold_structure_inputs(
-    pdf: &[u8],
-    extraction: &Path,
-    readings: &[PathBuf],
-    fresh: bool,
-) -> Result<ExtractedPdf> {
-    let cached: CachedExtraction = read_gzip_json(extraction)?;
+pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPdf> {
     let source_hash = format!("{:x}", Sha256::digest(pdf));
-    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
-        || cached.source_sha256 != source_hash
-        || cached.extraction.pages.len() != cached.extraction.separators.len()
-    {
-        return Err(Error::Message("invalid extraction cache".to_owned()));
-    }
-    let mut pinned = PinnedRecognition { pages: BTreeMap::new(), rasters: BTreeMap::new(), reader: None };
-    for path in readings {
-        #[derive(Deserialize)]
-        struct Reading {
-            page: legal_pdf_core::OcrPageResult,
-        }
-        let reading: Reading = read_gzip_json(path)?;
-        if pinned.pages.insert(reading.page.page_index, reading.page).is_some() {
-            return Err(Error::Message(format!("Two cached readings of one page: {}", path.display())));
-        }
-    }
-    let mut extracted = if fresh {
-        let current = extract_pdf(pdf, None, None)?;
-        let lines = |e: &ExtractedPdf| e.pages.iter()
-            .flat_map(|page| page.lines.iter().map(|line| (line.id.clone(), line.text.clone()))).collect::<Vec<_>>();
-        if lines(&current) != lines(&cached.extraction) {
-            return Err(Error::Message("the current extraction reads other lines than the cached one".to_owned()));
-        }
-        current
-    } else {
-        cached.extraction
+    let recognizer = std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_some() && std::env::var_os("LEGALPDF_ONNXRUNTIME").is_some();
+    let options = ParseOptions {
+        cache_dir: Some(cache_dir.to_owned()),
+        ocr: recognizer.then(|| OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())),
+        #[cfg(feature = "ppdoc-full")]
+        ppdoc: std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK").map(|pack| {
+            // LEGALPDF_PPDOC_BACKEND: cpu (default), directml, cuda, openvino; LEGALPDF_PPDOC_DEVICE its device.
+            let backend = std::env::var("LEGALPDF_PPDOC_BACKEND").ok()
+                .and_then(|name| legal_pdf_core::OrtBackend::parse(&name))
+                .unwrap_or_default();
+            PPDocOptions {
+                model_pack: Some(PathBuf::from(&pack)),
+                runtime: std::env::var_os("LEGALPDF_ONNXRUNTIME").map(PathBuf::from),
+                threads: std::env::var("LEGALPDF_PPDOC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+                backend,
+                device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
+                cpu_fallback: backend != legal_pdf_core::OrtBackend::Cpu,
+                ..PPDocOptions::default()
+            }
+        }),
+        ..ParseOptions::default()
     };
-    recognize_pdf(pdf, &mut extracted, Some(&mut pinned as &mut dyn legal_pdf_core::PdfOcrProvider), None)?;
-    finish_recognition(&mut extracted.pages, std::mem::take(&mut pinned.rasters));
-    // The gold's inputs read through a page layout model when LEGALPDF_PPDOC_MODEL_PACK names one
-    // (LEGALPDF_ONNXRUNTIME its runtime): each line takes the detected region it lies in, as the
-    // product's layout provider sets it. One model per thread.
-    #[cfg(feature = "ppdoc-full")]
-    if let Some(pack) = std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK") {
-        thread_local! {
-            static LAYOUT: std::cell::RefCell<Option<PPDocLayout>> = const { std::cell::RefCell::new(None) };
-        }
-        let diagnostics = LAYOUT.with(|slot| -> Result<Vec<legal_pdf_core::model::Diagnostic>> {
-            let mut slot = slot.borrow_mut();
-            if slot.is_none() {
-                // LEGALPDF_PPDOC_BACKEND: cpu (default), directml, cuda, openvino; LEGALPDF_PPDOC_DEVICE its device.
-                let backend = std::env::var("LEGALPDF_PPDOC_BACKEND").ok()
-                    .and_then(|name| legal_pdf_core::OrtBackend::parse(&name))
-                    .unwrap_or_default();
-                let options = PPDocOptions {
-                    model_pack: Some(PathBuf::from(&pack)),
-                    runtime: std::env::var_os("LEGALPDF_ONNXRUNTIME").map(PathBuf::from),
-                    threads: std::env::var("LEGALPDF_PPDOC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
-                    backend,
-                    device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
-                    cpu_fallback: backend != legal_pdf_core::OrtBackend::Cpu,
-                    ..PPDocOptions::default()
-                };
-                *slot = Some(PPDocLayout::new(&options)?);
-            }
-            let started = std::time::Instant::now();
-            let found = slot.as_mut().expect("layout model").annotate_pdf(pdf, &mut extracted.pages)?;
-            if std::env::var_os("STRUCTURE_GOLD_TIMING").is_some() {
-                eprintln!("timing	layout	pages	{}	layout_ms	{:.1}", extracted.pages.len(), started.elapsed().as_secs_f64() * 1e3);
-            }
-            Ok(found)
-        })?;
-        extracted.diagnostics.extend(diagnostics);
-    }
-    Ok(extracted)
+    let ocr = options.ocr.as_ref().map(OcrProvider::prepare).transpose()?;
+    let providers = Providers {
+        ocr_identity: ocr.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned())),
+        ocr,
+        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+        ppdoc: options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()?,
+    };
+    recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
 }
 
+/// What the structure gold's inputs are made by: the extraction, recognition and layout code of
+/// this build and the models the environment names. Inputs are cached under it, so a build never
+/// grades another build's pages.
+#[doc(hidden)]
+pub fn gold_inputs_identity() -> String {
+    let models = ["LEGALPDF_INDRA_MODEL_PACK", "LEGALPDF_ONNXRUNTIME", "LEGALPDF_PPDOC_MODEL_PACK"].map(|name| std::env::var(name).ok());
+    let identity = serialization_sha256(&(
+        "legalpdf.gold-inputs.v1",
+        env!("LEGAL_PDF_EXTRACTION_SHA256"),
+        env!("LEGAL_PDF_OCR_SHA256"),
+        env!("LEGAL_PDF_RASTER_SHA256"),
+        env!("LEGAL_PDF_LAYOUT_SHA256"),
+        models,
+    ))
+    .unwrap_or_default();
+    identity[..16.min(identity.len())].to_owned()
+}
 /// The structure gold's synthetic scan: `pdf`, an image-only copy of a typeset document, extracted
 /// and recognized by `options`' recognizer, every recognized line measured in its render, as the
 /// structure stage receives a scan. `runtime` keeps the recognizer across documents.
@@ -688,6 +642,8 @@ pub fn gold_synthetic_inputs(pdf: &[u8], options: &OcrOptions, runtime: &mut Opt
         runtime: runtime.take(),
         cache_root: None,
         cache_identity: "synthetic".to_owned(),
+        raster_identity: "synthetic".to_owned(),
+        region_render: None,
         progress: None,
         rasters: BTreeMap::new(),
     };
@@ -961,29 +917,81 @@ pub(crate) fn parse_pdf(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
+    let providers = Providers {
+        ocr_identity,
+        #[cfg(feature = "ocr")]
+        ocr: ocr_prepared.take(),
+        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+        ppdoc: ppdoc_prepared.take(),
+    };
+    let extracted = recognized_extraction(bytes, &source_hash, options, cache_root.as_deref(), providers, progress)?;
+    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, None)?;
+    validate_output_size(&parsed, options)?;
+    if let Some(root) = &cache_root {
+        let cache_path = parse_cache_root(root)
+            .join("documents")
+            .join(format!("{key}.json.gz"));
+        match profile::measure("document_cache_write", || {
+            write_gzip_json(&cache_path, &parsed)
+        }) {
+            Ok(()) => maybe_prune_document_cache(root, &ocr_cache_root(root, options)),
+            Err(error) if options.require_cache_write => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(Some(parsed))
+}
+
+/// The providers a parse reads its pages with, prepared: its recognizer and the identity its
+/// readings are cached under, and its layout model.
+struct Providers {
+    ocr_identity: Option<(String, String)>,
+    #[cfg(feature = "ocr")]
+    ocr: Option<PreparedOcrProvider>,
+    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    ppdoc: Option<legal_pdf_support::PreparedPPDoc>,
+}
+
+/// A PDF's pages as the structure stage receives them: extracted through the extraction cache under
+/// `cache_root`, recognized where they need it through the recognition cache (keyed by the OCR code
+/// and its provider alone, so no parser change discards a reading), and laid out by the layout
+/// model where one is given. A parse and the structure gold read their pages through this one path.
+fn recognized_extraction(
+    bytes: &[u8],
+    source_hash: &str,
+    options: &ParseOptions,
+    cache_root: Option<&Path>,
+    providers: Providers,
+    #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
+) -> Result<ExtractedPdf> {
     #[cfg(feature = "ocr")]
     let recognition_key = serialization_sha256(&(
         "legalpdf.recognition-cache.v1",
-        &source_hash,
+        source_hash,
         env!("LEGAL_PDF_OCR_SHA256"),
-        ocr_identity
+        providers
+            .ocr_identity
             .as_ref()
             .map(|provider| (provider.0.as_str(), provider.1.as_str())),
     ))?;
     #[cfg(feature = "ocr")]
-    let recognition_root = cache_root.as_ref().map(|root| ocr_cache_root(root, options).join("recognition"));
+    let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")))?;
+    #[cfg(feature = "ocr")]
+    let recognition_root = cache_root.map(|root| ocr_cache_root(root, options).join("recognition"));
     #[cfg(feature = "ocr")]
     let mut ocr_provider =
         options
             .ocr
             .as_ref()
-            .zip(ocr_prepared.take())
+            .zip(providers.ocr)
             .map(|(options, prepared)| DeferredOcrProvider {
                 options,
                 prepared: Some(prepared),
                 runtime: None,
                 cache_root: recognition_root,
                 cache_identity: recognition_key.clone(),
+                raster_identity: raster_key.clone(),
+                region_render: None,
                 progress,
                 rasters: BTreeMap::new(),
             });
@@ -1000,10 +1008,10 @@ pub(crate) fn parse_pdf(
     };
     let extraction_key = serialization_sha256(&(
         EXTRACTION_CACHE_SCHEMA,
-        &source_hash,
+        source_hash,
         env!("LEGAL_PDF_EXTRACTION_SHA256"),
     ))?;
-    let extraction_path = cache_root.as_ref().map(|root| {
+    let extraction_path = cache_root.map(|root| {
         parse_cache_root(root)
             .join("extractions")
             .join(format!("{extraction_key}.json.gz"))
@@ -1036,7 +1044,7 @@ pub(crate) fn parse_pdf(
                     path,
                     &CachedExtraction {
                         schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(),
-                        source_sha256: source_hash.clone(),
+                        source_sha256: source_hash.to_owned(),
                         cache_key: extraction_key,
                         extraction: &extracted,
                     },
@@ -1064,7 +1072,7 @@ pub(crate) fn parse_pdf(
         options
             .ppdoc
             .as_ref()
-            .zip(ppdoc_prepared.take())
+            .zip(providers.ppdoc)
             .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
             .transpose()
     })?;
@@ -1076,21 +1084,7 @@ pub(crate) fn parse_pdf(
                 provider.annotate_pdf(bytes, &mut extracted.pages)
             })?);
     }
-    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, None)?;
-    validate_output_size(&parsed, options)?;
-    if let Some(root) = &cache_root {
-        let cache_path = parse_cache_root(root)
-            .join("documents")
-            .join(format!("{key}.json.gz"));
-        match profile::measure("document_cache_write", || {
-            write_gzip_json(&cache_path, &parsed)
-        }) {
-            Ok(()) => maybe_prune_document_cache(root, &ocr_cache_root(root, options)),
-            Err(error) if options.require_cache_write => return Err(error),
-            Err(_) => {}
-        }
-    }
-    Ok(Some(parsed))
+    Ok(extracted)
 }
 
 #[derive(Debug, Default)]

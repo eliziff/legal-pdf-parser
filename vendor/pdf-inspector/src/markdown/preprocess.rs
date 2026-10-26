@@ -150,7 +150,7 @@ pub(crate) fn merge_heading_lines(
 /// Merge drop caps with the appropriate line.
 /// A drop cap is a single large letter at the start of a paragraph.
 /// Due to PDF coordinate sorting, the drop cap may appear AFTER the line it belongs to.
-pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
+pub fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
     for line in &lines {

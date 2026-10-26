@@ -37,6 +37,8 @@ use content_stream::extract_page_text_items_with_options;
 pub(crate) use content_stream::TextExtractionOptions;
 pub(crate) use display_frame::DisplayPage;
 pub use display_frame::PositionFrame;
+pub use display_frame::{page_rotate, PageRotate};
+pub use fonts::clean_symbol_pua;
 
 /// Options of the positioned-text and region APIs, taken by their
 /// `_with_options` variants ([`extract_text_with_positions_mem_with_options`],
@@ -126,21 +128,21 @@ impl PositionOptions {
     }
 }
 use links::{extract_form_fields, extract_page_links};
-pub(crate) use page_box::{visible_page_box, PageBox};
+pub use page_box::{visible_page_box, PageBox};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
 pub(crate) use content_stream::FontProductCache;
-pub(crate) use layout::detect_columns;
+pub use layout::detect_columns;
 #[cfg(test)]
 use layout::filter_markdown_page_numbers;
 pub(crate) use layout::filter_markdown_page_numbers_with_removed_pages;
 pub(crate) use layout::group_into_lines_with_thresholds;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_charts;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_regions;
-pub(crate) use layout::is_newspaper_layout;
-pub(crate) use layout::ColumnRegion;
+pub use layout::is_newspaper_layout;
+pub use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 pub(crate) use scripts::merge_subscript_items;
 pub(crate) use xobjects::FormWalkBudget;
@@ -156,10 +158,24 @@ pub fn extract_fidelity_from_doc(
     let font_cmaps = FontCMaps::from_doc(doc);
     let (extraction, _, _, evidence, _, _) =
         extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
-    let detection = detect_from_page_evidence(
+    let mut detection = detect_from_page_evidence(
         &evidence,
         read_document_info(doc),
         &DetectionConfig::default(),
+    );
+    // The text-quality pass the Markdown path runs: decoding garbage the page
+    // evidence cannot see (private-use and C1 runs, CID garbage, `Word$Word`,
+    // replacement runs, substitution-cipher letters) routes its page to OCR.
+    let text_quality = crate::text_quality::analyze_text_quality(&extraction.0);
+    for page in text_quality.pages_needing_ocr {
+        if !detection.pages_needing_ocr.contains(&page) {
+            detection.pages_needing_ocr.push(page);
+        }
+    }
+    detection.pages_needing_ocr.sort_unstable();
+    crate::merge_ocr_reasons(
+        &mut detection.ocr_reasons_by_page,
+        text_quality.reasons_by_page,
     );
     Ok((extraction, detection))
 }
@@ -1026,7 +1042,10 @@ fn extract_positioned_text_impl(
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
-        suppress_table_underlines(&mut items, &rects, &lines, *page_num);
+        // A fidelity consumer reads its own tables, and clears their rulings' underlines itself.
+        if !fidelity {
+            suppress_table_underlines(&mut items, &rects, &lines, *page_num);
+        }
         debug!(
             "page {}: {} text items, {} rects, {} lines{}",
             page_num,
@@ -1124,7 +1143,7 @@ fn extract_positioned_text_impl(
     ))
 }
 
-fn suppress_table_underlines(
+pub fn suppress_table_underlines(
     items: &mut [TextItem],
     rects: &[PdfRect],
     lines: &[PdfLine],

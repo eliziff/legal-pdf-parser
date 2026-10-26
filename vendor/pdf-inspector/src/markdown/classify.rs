@@ -1,7 +1,7 @@
 //! Line classification: captions, lists, code detection.
 
 /// Check if text is a figure/table caption or source citation
-pub(crate) fn is_caption_line(text: &str) -> bool {
+pub fn is_caption_line(text: &str) -> bool {
     let trimmed = text.trim();
 
     // Caption prefixes that always match (always followed by identifiers)
@@ -81,7 +81,7 @@ pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
 }
 
 /// Check if text looks like a list item
-pub(crate) fn is_list_item(text: &str) -> bool {
+pub fn is_list_item(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     // Bullet patterns

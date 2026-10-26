@@ -1130,6 +1130,7 @@ fn detect_stacked_box_table(
     // (prose paragraphs inside stacked frames are page decor, not a table).
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(boxes.len());
     let mut item_indices: Vec<usize> = Vec::new();
+    let mut item_cells: Vec<(usize, usize, usize)> = Vec::new();
     let mut multi_run_boxes = 0usize;
     for &(bx, by, bw, bh) in &boxes {
         let mut in_box: Vec<(usize, &TextItem)> = items
@@ -1185,6 +1186,7 @@ fn detect_stacked_box_table(
             return None;
         }
         item_indices.extend(in_box.iter().map(|(i, _)| *i));
+        item_cells.extend(in_box.iter().map(|(i, _)| (*i, cells.len(), 0)));
         cells.push(vec![text]);
     }
     if multi_run_boxes * 2 >= boxes.len() {
@@ -1272,7 +1274,7 @@ fn detect_stacked_box_table(
     );
     let columns = vec![boxes[0].0 + boxes[0].2 / 2.0];
     let rows: Vec<f32> = boxes.iter().map(|b| b.1 + b.3 / 2.0).collect();
-    Some(Table::new(columns, rows, cells, item_indices))
+    Some(Table::new(columns, rows, cells, item_indices).with_item_cells(item_cells))
 }
 
 fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
@@ -1573,7 +1575,8 @@ fn try_build_grid(
     }
 
     // Build table: assign text items to cells
-    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices, mut item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges, page);
 
     // Consolidate vertically-merged cells: rects spanning multiple grid rows
     // should have their text collected into the first sub-row.
@@ -1581,7 +1584,9 @@ fn try_build_grid(
     // background fills rather than true merged cells (e.g. statistical lookup
     // tables with row-grouping shading).
     if num_cols <= 10 {
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects);
+        let spans = merged_cell_spans(&col_edges, &row_edges, group_rects, skip_rects);
+        merge_cell_spans(&mut cells, &spans);
+        merge_item_cell_spans(&mut item_cells, &spans);
     }
 
     // Compute column centers and row centers for the Table struct
@@ -1695,8 +1700,22 @@ fn try_build_grid(
     } else {
         (columns, cells)
     };
+    let item_cells = trim_item_cell_columns(item_cells, first_col, last_col);
 
-    GridResult::Ok(Table::new(columns, rows, cells, item_indices))
+    GridResult::Ok(Table::new(columns, rows, cells, item_indices).with_item_cells(item_cells))
+}
+
+/// Item cells on a grid trimmed to columns `first_col..=last_col`.
+fn trim_item_cell_columns(
+    item_cells: Vec<(usize, usize, usize)>,
+    first_col: usize,
+    last_col: usize,
+) -> Vec<(usize, usize, usize)> {
+    item_cells
+        .into_iter()
+        .filter(|&(_, _, col)| col >= first_col && col <= last_col)
+        .map(|(idx, row, col)| (idx, row, col - first_col))
+        .collect()
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
@@ -1720,12 +1739,25 @@ pub(crate) fn snap_edges(values: &[f32], tolerance: f32) -> Vec<f32> {
 ///
 /// Returns `(cells, item_indices)` where `cells[row][col]` is the cell text
 /// and `item_indices` lists the original item indices that were consumed.
+#[cfg(test)]
 pub(crate) fn assign_items_to_grid(
     items: &[TextItem],
     col_edges: &[f32],
     row_edges: &[f32],
     page: u32,
 ) -> (Vec<Vec<String>>, Vec<usize>) {
+    let (cells, indices, _) = assign_items_to_grid_cells(items, col_edges, row_edges, page);
+    (cells, indices)
+}
+
+/// `assign_items_to_grid`, also returning the cell each consumed item was
+/// assigned to, as `(item index, row, col)`.
+pub(crate) fn assign_items_to_grid_cells(
+    items: &[TextItem],
+    col_edges: &[f32],
+    row_edges: &[f32],
+    page: u32,
+) -> (Vec<Vec<String>>, Vec<usize>, Vec<(usize, usize, usize)>) {
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
 
@@ -1733,6 +1765,7 @@ pub(crate) fn assign_items_to_grid(
     let mut cell_items: Vec<Vec<Vec<(usize, &TextItem)>>> =
         vec![vec![Vec::new(); num_cols]; num_rows];
     let mut indices = Vec::new();
+    let mut item_cells = Vec::new();
 
     // Row bands as baselines for the vertical-run test: a run standing
     // across rows is judged by the bands it covers.
@@ -1759,6 +1792,7 @@ pub(crate) fn assign_items_to_grid(
         if let (Some(c), Some(r)) = (col, row) {
             cell_items[r][c].push((idx, item));
             indices.push(idx);
+            item_cells.push((idx, r, c));
         }
     }
 
@@ -1809,7 +1843,7 @@ pub(crate) fn assign_items_to_grid(
         cells.push(row_cells);
     }
 
-    (cells, indices)
+    (cells, indices, item_cells)
 }
 
 fn remove_inner_delimiter_spaces(text: &str) -> String {
@@ -1840,6 +1874,7 @@ fn remove_inner_delimiter_spaces(text: &str) -> String {
 /// others have an empty cell.  This function detects such spans and moves all
 /// text into the first sub-row, clearing the rest so that downstream
 /// continuation-merge in `clean_table_cells` collapses sub-rows correctly.
+#[cfg(test)]
 fn propagate_merged_cells(
     cells: &mut [Vec<String>],
     col_edges: &[f32],
@@ -1847,9 +1882,22 @@ fn propagate_merged_cells(
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
 ) {
+    let spans = merged_cell_spans(col_edges, row_edges, group_rects, skip_rects);
+    merge_cell_spans(cells, &spans);
+}
+
+/// The vertically merged cells `propagate_merged_cells` consolidates, as
+/// `(col, first row, last row)` in the order they are applied.
+fn merged_cell_spans(
+    col_edges: &[f32],
+    row_edges: &[f32],
+    group_rects: &[(f32, f32, f32, f32)],
+    skip_rects: &[bool],
+) -> Vec<(usize, usize, usize)> {
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
     let tol = 6.0;
+    let mut merged = Vec::new();
 
     for col in 0..num_cols {
         for (rect_idx, rect) in group_rects.iter().enumerate() {
@@ -1888,23 +1936,42 @@ fn propagate_merged_cells(
                 (Some(f), Some(l)) if l > f => (f, l),
                 _ => continue, // Single row or no match — skip
             };
+            merged.push((col, first, last));
+        }
+    }
+    merged
+}
 
-            // Collect all text from sub-rows within the merged range
-            let mut combined = String::new();
-            for row in cells.iter().take(last + 1).skip(first) {
-                let text = row[col].trim();
-                if !text.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push(' ');
-                    }
-                    combined.push_str(text);
+/// Collect each merged cell's text into its first sub-row, clearing the rest.
+fn merge_cell_spans(cells: &mut [Vec<String>], spans: &[(usize, usize, usize)]) {
+    for &(col, first, last) in spans {
+        // Collect all text from sub-rows within the merged range
+        let mut combined = String::new();
+        for row in cells.iter().take(last + 1).skip(first) {
+            let text = row[col].trim();
+            if !text.is_empty() {
+                if !combined.is_empty() {
+                    combined.push(' ');
                 }
+                combined.push_str(text);
             }
+        }
 
-            // Place combined text in the first sub-row, clear the rest
-            cells[first][col] = combined;
-            for row in cells.iter_mut().take(last + 1).skip(first + 1) {
-                row[col] = String::new();
+        // Place combined text in the first sub-row, clear the rest
+        cells[first][col] = combined;
+        for row in cells.iter_mut().take(last + 1).skip(first + 1) {
+            row[col] = String::new();
+        }
+    }
+}
+
+/// Move each item of a merged cell's sub-rows to its first sub-row, as
+/// `merge_cell_spans` moves their text.
+fn merge_item_cell_spans(item_cells: &mut [(usize, usize, usize)], spans: &[(usize, usize, usize)]) {
+    for &(col, first, last) in spans {
+        for placed in item_cells.iter_mut() {
+            if placed.2 == col && placed.1 > first && placed.1 <= last {
+                placed.1 = first;
             }
         }
     }
@@ -2052,7 +2119,8 @@ fn detect_row_stripe_table(
     );
 
     // Assign items to grid
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (cells, item_indices, item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         debug!("  row-stripe rejected: no items assigned");
@@ -2145,6 +2213,7 @@ fn detect_row_stripe_table(
     } else {
         (col_edges, cells)
     };
+    let item_cells = trim_item_cell_columns(item_cells, first_col, last_col);
     let num_cols = col_edges.len() - 1;
     if row_stripe_is_sparse_prose_outline(&cells) {
         debug!("  row-stripe rejected: sparse outline/prose continuation shape");
@@ -2173,7 +2242,7 @@ fn detect_row_stripe_table(
         content_ratio * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::new(column_centers, row_centers, cells, item_indices).with_item_cells(item_cells))
 }
 
 /// Detect a grid that swallowed body text instead of tabular data.
@@ -2952,18 +3021,22 @@ fn detect_row_stripe_table_from_cell_rects(
         page_items.len()
     );
 
-    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices, mut item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         return None;
     }
 
     let mut row_edges = row_edges;
-    let (collapsed_cells, collapsed_row_edges, collapsed_rows) =
+    let (collapsed_cells, collapsed_row_edges, collapsed_rows, row_map) =
         collapse_multiline_description_rows(cells, row_edges, &col_edges);
     let has_wrapped_description_rows = collapsed_rows > 0;
     cells = collapsed_cells;
     row_edges = collapsed_row_edges;
+    for placed in &mut item_cells {
+        placed.1 = row_map[placed.1];
+    }
     if collapsed_rows > 0 {
         debug!(
             "  cell-rect collapsed {} wrapped description rows",
@@ -3168,7 +3241,7 @@ fn detect_row_stripe_table_from_cell_rects(
         non_empty_cells as f32 / total_cells * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::new(column_centers, row_centers, cells, item_indices).with_item_cells(item_cells))
 }
 
 /// Merge wrapped description-line bands back into their visual data rows.
@@ -3178,35 +3251,37 @@ fn detect_row_stripe_table_from_cell_rects(
 /// common mapping-table shape, a narrow row-label column precedes one wide
 /// description column, and wrapped continuation bands have content only in that
 /// wide column. Merge only that high-confidence shape so framed prose still
-/// falls through the existing prose guards.
+/// falls through the existing prose guards. Also returns, for each input row,
+/// the output row it went into.
 fn collapse_multiline_description_rows(
     cells: Vec<Vec<String>>,
     row_edges: Vec<f32>,
     col_edges: &[f32],
-) -> (Vec<Vec<String>>, Vec<f32>, usize) {
+) -> (Vec<Vec<String>>, Vec<f32>, usize, Vec<usize>) {
     let num_rows = cells.len();
     let num_cols = col_edges.len().saturating_sub(1);
+    let unchanged: Vec<usize> = (0..num_rows).collect();
     if num_rows < 3 || num_cols < 3 || row_edges.len() != num_rows + 1 {
-        return (cells, row_edges, 0);
+        return (cells, row_edges, 0, unchanged);
     }
 
     let table_width = col_edges[num_cols] - col_edges[0];
     if table_width <= 0.0 {
-        return (cells, row_edges, 0);
+        return (cells, row_edges, 0, unchanged);
     }
 
     let Some((description_col, description_width)) = (0..num_cols)
         .map(|c| (c, col_edges[c + 1] - col_edges[c]))
         .max_by(|a, b| a.1.total_cmp(&b.1))
     else {
-        return (cells, row_edges, 0);
+        return (cells, row_edges, 0, unchanged);
     };
 
     // Require a preceding row-label column. Without it (e.g. a prose frame
     // split into text-start columns), "one populated wide column" is not enough
     // evidence to find visual row starts safely.
     if description_col == 0 || description_width < table_width * 0.35 {
-        return (cells, row_edges, 0);
+        return (cells, row_edges, 0, unchanged);
     }
 
     let row_has_left_label = |row: &[String]| {
@@ -3216,13 +3291,14 @@ fn collapse_multiline_description_rows(
     };
     let labeled_rows = cells.iter().filter(|row| row_has_left_label(row)).count();
     if labeled_rows < 2 {
-        return (cells, row_edges, 0);
+        return (cells, row_edges, 0, unchanged);
     }
 
     let mut merged_rows = 0usize;
     let mut wrapped_description_rows = 0usize;
     let mut new_cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     let mut new_edges = Vec::with_capacity(row_edges.len());
+    let mut row_map: Vec<usize> = Vec::with_capacity(num_rows);
     new_edges.push(row_edges[0]);
 
     for (row_idx, row) in cells.into_iter().enumerate() {
@@ -3280,10 +3356,12 @@ fn collapse_multiline_description_rows(
             if is_description_continuation {
                 wrapped_description_rows += 1;
             }
+            row_map.push(new_cells.len() - 1);
         } else {
             if !new_cells.is_empty() {
                 new_edges.push(row_edges[row_idx]);
             }
+            row_map.push(new_cells.len());
             new_cells.push(row);
         }
     }
@@ -3291,10 +3369,10 @@ fn collapse_multiline_description_rows(
     new_edges.push(*row_edges.last().unwrap());
 
     if merged_rows == 0 || new_cells.len() < 2 || new_edges.len() != new_cells.len() + 1 {
-        return (new_cells, row_edges, 0);
+        return (new_cells, row_edges, 0, row_map);
     }
 
-    (new_cells, new_edges, wrapped_description_rows)
+    (new_cells, new_edges, wrapped_description_rows, row_map)
 }
 
 /// Detect a table by merging all cluster rects into one group.
@@ -3396,7 +3474,8 @@ fn detect_merged_cluster_table(
     );
 
     // Assign items to grid
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (cells, item_indices, item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         debug!("  merged-cluster rejected: no items assigned");
@@ -3481,7 +3560,7 @@ fn detect_merged_cluster_table(
         content_ratio * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::new(column_centers, row_centers, cells, item_indices).with_item_cells(item_cells))
 }
 
 /// Cluster text item X positions into column centers with a given minimum threshold.

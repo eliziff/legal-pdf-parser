@@ -40,7 +40,7 @@ pub enum PositionFrame {
 
 /// A page's `/Rotate`, normalised to a right angle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum PageRotate {
+pub enum PageRotate {
     #[default]
     Rotate0,
     Rotate90,
@@ -67,7 +67,7 @@ impl PageRotate {
     }
 
     /// The clockwise turn a renderer applies to the sheet, in degrees.
-    pub(crate) fn degrees(self) -> f32 {
+    pub fn degrees(self) -> f32 {
         match self {
             PageRotate::Rotate0 => 0.0,
             PageRotate::Rotate90 => 90.0,
@@ -134,7 +134,7 @@ impl PageRotate {
 /// The page's inheritable `/Rotate`, walking `/Parent` links like the page
 /// boxes. The first ancestor carrying the key decides, as in renderers; a
 /// missing or malformed value reads as `0`.
-pub(crate) fn page_rotate(doc: &Document, page_id: ObjectId) -> PageRotate {
+pub fn page_rotate(doc: &Document, page_id: ObjectId) -> PageRotate {
     let mut id = page_id;
     for _ in 0..32 {
         let Ok(dict) = doc.get_dictionary(id) else {

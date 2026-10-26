@@ -67,14 +67,6 @@ fn latex_span() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\$.*?\$").expect("latex span"))
 }
 
-fn roman() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$")
-            .expect("roman numeral")
-    })
-}
-
 /// A numbering label left over beside a title: "1", "a", "part4", "tab12".
 fn label_remainder() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -97,30 +89,8 @@ fn tokens(title: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_roman(token: &str) -> bool {
-    roman().is_match(token) && !ROMAN_EXCLUDED.contains(&token)
-}
-
-fn roman_to_arabic(token: &str) -> String {
-    let (mut total, mut prior) = (0_i64, 0_i64);
-    for character in token.chars().rev() {
-        let value = match character {
-            'i' => 1,
-            'v' => 5,
-            'x' => 10,
-            'l' => 50,
-            'c' => 100,
-            'd' => 500,
-            _ => 1000,
-        };
-        total = if value < prior {
-            total - value
-        } else {
-            total + value
-        };
-        prior = prior.max(value);
-    }
-    total.to_string()
+fn roman(token: &str) -> Option<u32> {
+    legal_pdf_core::roman_value(token).filter(|_| !ROMAN_EXCLUDED.contains(&token))
 }
 
 /// Lowercased, LaTeX dropped, punctuation stripped, roman numerals as digits.
@@ -128,11 +98,7 @@ pub(super) fn normalize_title(title: &str) -> String {
     tokens(title)
         .into_iter()
         .map(|token| {
-            if is_roman(&token) {
-                roman_to_arabic(&token)
-            } else {
-                token
-            }
+            roman(&token).map_or(token, |value| value.to_string())
         })
         .collect()
 }
@@ -142,7 +108,7 @@ fn title_template(title: &str) -> String {
     tokens(title)
         .into_iter()
         .map(|token| {
-            if is_roman(&token) {
+            if roman(&token).is_some() {
                 "#".to_owned()
             } else {
                 let mut out = String::new();
@@ -295,7 +261,7 @@ pub(super) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<
             let unit = words.first()?;
             let counter = words.get(1)?;
             let kind = if PACKAGE_UNITS.contains(&unit.as_str())
-                && (label_remainder().is_match(counter) || is_roman(counter))
+                && (label_remainder().is_match(counter) || roman(counter).is_some())
             {
                 unit.clone()
             } else if authorities == Some(entry.level)
@@ -410,10 +376,44 @@ fn same_title(found: &str, title: &str, heading: bool) -> bool {
     labelled(found, title) || labelled(title, found)
 }
 
+/// Whether a document's bookmarks outline its divisions at all (not generic titles, one numbered
+/// template, or too few).
+pub(super) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
+    classify(&validate(outline, pages), pages) != Tier::Ignore
+}
+
+/// The document's bookmarks and its printed contents list as one outline. A listed entry the
+/// bookmarks name confirms theirs; one they do not name stands after the entry before it, at its
+/// listed level counted from the nearest entry before it that both name (its own listed level
+/// where none does).
+pub(super) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
+    let mut merged = bookmarks.to_vec();
+    let mut cursor: Option<usize> = None;
+    let mut anchor: Option<(usize, usize)> = None;
+    for entry in listed {
+        let title = normalize_title(&entry.title);
+        if let Some(at) = merged.iter().position(|bookmark| normalize_title(&bookmark.title) == title) {
+            cursor = Some(at);
+            anchor = Some((entry.level, merged[at].level));
+            continue;
+        }
+        let mut at = cursor.map_or(0, |cursor| cursor + 1);
+        while merged.get(at).is_some_and(|next| next.page_index < entry.page_index) {
+            at += 1;
+        }
+        let level = anchor.map_or(entry.level, |(listed, bookmarked)| (bookmarked + entry.level).saturating_sub(listed).max(1));
+        merged.insert(at, PdfOutlineEntry { title: entry.title.clone(), level, page_index: entry.page_index });
+        cursor = Some(at);
+    }
+    merged
+}
+
+/// `authored`: the outline holds the document's own bookmarks, not only its printed contents.
 pub(super) fn reconcile_bookmarks(
     pages: &mut [Page],
     outline: &[PdfOutlineEntry],
     primitives: &mut PdfPrimitiveEvidence,
+    authored: bool,
 ) -> bool {
     let mut entries = validate(outline, pages.len());
     let tier = classify(&entries, pages.len());
@@ -428,11 +428,11 @@ pub(super) fn reconcile_bookmarks(
     let contents_pages = pages
         .iter()
         .filter(|page| {
-            primitives.contents_pages.contains(&page.index)
+            primitives.claims.contents_pages.contains(&page.index)
                 || page
                     .lines
                     .iter()
-                    .any(|line| primitives.contents_line_ids.contains(&line.id))
+                    .any(|line| primitives.claims.contents_line_ids.contains(&line.id))
         })
         .map(|page| page.index)
         .collect::<HashSet<_>>();
@@ -469,7 +469,7 @@ pub(super) fn reconcile_bookmarks(
         !line.exclude_from_body
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
-            && !primitives.claimed(&line.id)
+            && !primitives.claims.claimed(&line.id)
             && !primitives.quotations.scopes.contains_key(&line.id)
             && !has_dot_leader(&line.text)
     };
@@ -500,8 +500,8 @@ pub(super) fn reconcile_bookmarks(
                         for end in start..(start + MAX_TITLE_LINES).min(page.lines.len()) {
                             if claimed.contains(&(page_slot, end))
                                 || !eligible(page, end)
-                                || primitives.document_context(&page.lines[end].id)
-                                    != primitives.document_context(&page.lines[start].id)
+                                || primitives.contexts.document_context(&page.lines[end].id)
+                                    != primitives.contexts.document_context(&page.lines[start].id)
                             {
                                 return None;
                             }
@@ -531,7 +531,7 @@ pub(super) fn reconcile_bookmarks(
         };
         let position = (anchor.page_slot, anchor.lines[0]);
         let context =
-            primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
+            primitives.contexts.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
         if last.get(&context).is_some_and(|last| position <= *last) {
             continue;
         }
@@ -579,7 +579,7 @@ pub(super) fn reconcile_bookmarks(
         .iter()
         .map(|anchor| {
             anchor.as_ref().map_or((0, false), |anchor| {
-                primitives.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
+                primitives.contexts.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
             })
         })
         .collect::<Vec<_>>();
@@ -596,7 +596,7 @@ pub(super) fn reconcile_bookmarks(
 
     // An anchored title is a heading of its own. Within a heading it cuts only where a numbered
     // heading starts; otherwise it takes the whole heading.
-    let levels = &primitives.heading_levels;
+    let levels = &primitives.headings.heading_levels;
     for anchor in anchors.iter_mut().flatten() {
         let page = &mut pages[anchor.page_slot];
         let block = page.lines[anchor.lines[0]].block_index;
@@ -604,8 +604,8 @@ pub(super) fn reconcile_bookmarks(
             let same = |slot: usize, page: &Page| {
                 page.lines[slot].region_type == "heading"
                     && page.lines[slot].block_index == block
-                    && primitives.document_context(&page.lines[slot].id)
-                        == primitives.document_context(&page.lines[anchor.lines[0]].id)
+                    && primitives.contexts.document_context(&page.lines[slot].id)
+                        == primitives.contexts.document_context(&page.lines[anchor.lines[0]].id)
                     && levels.get(&page.lines[slot].id)
                         == levels.get(&page.lines[anchor.lines[0]].id)
             };
@@ -658,8 +658,8 @@ pub(super) fn reconcile_bookmarks(
             let continues = slot > 0
                 && page.lines[slot - 1].region_type == "heading"
                 && page.lines[slot - 1].block_index == line.block_index
-                && primitives.reading_context(&page.lines[slot - 1].id)
-                    == primitives.reading_context(&line.id)
+                && primitives.contexts.reading_context(&page.lines[slot - 1].id)
+                    == primitives.contexts.reading_context(&line.id)
                 && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
             if !continues {
                 units.push(Unit {
@@ -667,7 +667,7 @@ pub(super) fn reconcile_bookmarks(
                     line_ids: Vec::new(),
                     text: String::new(),
                     level: None,
-                    context: primitives.document_context(&line.id),
+                    context: primitives.contexts.document_context(&line.id),
                 });
             }
             let unit = units.last_mut().expect("unit");
@@ -771,8 +771,18 @@ pub(super) fn reconcile_bookmarks(
             .entry((units[*unit].context, normalize_title(&units[*unit].text)))
             .or_default() += 1;
     }
+    // Bookmarks that set out every level of the document name its headings: a heading found in
+    // the body after their first entry, in their document, that none names is no heading.
+    let opened = |unit: usize| {
+        frame.iter().any(|(index, opens)| entry_contexts[*index] == units[unit].context && *opens <= units[unit].position)
+    };
+    let mut unnamed = HashSet::<usize>::new();
     let mut groups = HashMap::<usize, Vec<usize>>::new();
     for unit in detected {
+        if authored && tier == Tier::Full && opened(unit) {
+            unnamed.insert(unit);
+            continue;
+        }
         let key = (units[unit].context, normalize_title(&units[unit].text));
         if tier == Tier::Full
             && (!key.1.is_empty() && title_counts[&key] >= BACKFILL_DUP_MIN
@@ -850,11 +860,11 @@ pub(super) fn reconcile_bookmarks(
             .and_then(|&parent| anchors[parent].as_ref())
             .map(|parent| pages[parent.page_slot].lines[parent.lines[0]].id.clone());
         for &slot in &anchor.lines {
-            primitives.navigation_parents.insert(pages[anchor.page_slot].lines[slot].id.clone(), parent.clone());
+            primitives.headings.navigation_parents.insert(pages[anchor.page_slot].lines[slot].id.clone(), parent.clone());
         }
     }
 
-    let levels = &mut primitives.heading_levels;
+    let levels = &mut primitives.headings.heading_levels;
     for (unit, level) in levels_out {
         for line_id in &units[unit].line_ids {
             if primitives
@@ -869,6 +879,13 @@ pub(super) fn reconcile_bookmarks(
                 Some(level) => levels.insert(line_id.clone(), level),
                 None => levels.remove(line_id),
             };
+        }
+    }
+    for (position, unit) in &unit_at {
+        if unnamed.contains(unit) {
+            let line = &mut pages[position.0].lines[position.1];
+            levels.remove(&line.id);
+            line.region_type = "body".to_owned();
         }
     }
     true

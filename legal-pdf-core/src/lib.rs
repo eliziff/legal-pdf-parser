@@ -2,7 +2,6 @@ mod analysis;
 mod asset;
 mod error;
 pub mod model;
-pub mod text_normalization;
 pub mod profile;
 mod ocr_contract;
 mod ocr_markers;

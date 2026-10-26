@@ -6,8 +6,8 @@ use crate::types::{TextItem, TextLine};
 use log::debug;
 
 /// Font statistics for a document
-pub(crate) struct FontStats {
-    pub(crate) most_common_size: f32,
+pub struct FontStats {
+    pub most_common_size: f32,
     /// Font size frequency distribution (size_key → line count).
     /// Used for rarity-based heading detection.
     pub(crate) size_counts: HashMap<i32, usize>,
@@ -58,7 +58,7 @@ pub(crate) fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
 }
 
 /// Calculate font stats from grouped lines
-pub(crate) fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
+pub fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
     let mut size_counts: HashMap<i32, usize> = HashMap::new();
 
     for line in lines {
@@ -106,7 +106,7 @@ pub(crate) fn bold_heading_level(heading_tiers: &[f32]) -> usize {
 /// These lines should never be joined with adjacent lines into a paragraph.
 /// Handles consecutive dots ("...."), spaced groups ("...   ...") and single
 /// dots set a space apart (". . . .", as InDesign paints tab leaders).
-pub(crate) fn has_dot_leaders(text: &str) -> bool {
+pub fn has_dot_leaders(text: &str) -> bool {
     // Consecutive dots (4+)
     if text.contains("....") {
         return true;
@@ -689,7 +689,7 @@ pub(crate) fn correct_base_size(lines: &[TextLine], base_size: f32) -> f32 {
     corrected
 }
 
-pub(crate) fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
+pub fn compute_heading_tiers(lines: &[TextLine], base_size: f32) -> Vec<f32> {
     let mut heading_sizes: Vec<f32> = Vec::new();
 
     for line in lines {
@@ -763,7 +763,7 @@ pub(crate) fn line_is_mostly_bold(line: &TextLine) -> bool {
 /// Detect header level from font size using document-specific heading tiers.
 /// When tiers are available, maps tier 0→H1, tier 1→H2, etc.
 /// Falls back to ratio-based thresholds when no tiers exist.
-pub(crate) fn detect_header_level(
+pub fn detect_header_level(
     font_size: f32,
     base_size: f32,
     heading_tiers: &[f32],

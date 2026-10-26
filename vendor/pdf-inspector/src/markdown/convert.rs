@@ -163,7 +163,7 @@ fn positioned_blocks_for_page<'a>(
 /// Some PDFs (e.g. British Academy grant guidance) tag every numbered paragraph
 /// line as H2, producing hundreds of false headings. We detect this by checking
 /// if any heading level accounts for >25% of tagged lines.
-fn detect_overused_struct_heading_levels(
+pub fn detect_overused_struct_heading_levels(
     lines: &[TextLine],
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,

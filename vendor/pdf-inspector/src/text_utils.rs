@@ -10,7 +10,7 @@ use crate::types::{ItemType, TextItem};
 ///
 /// This strict form is suitable before layout, where removing one numeric item
 /// from substantive text such as `Page 42 explains the result` would lose data.
-pub(crate) fn is_explicit_page_number_expression(text: &str) -> bool {
+pub fn is_explicit_page_number_expression(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return false;
@@ -62,7 +62,7 @@ pub(crate) fn is_explicit_page_number_expression(text: &str) -> bool {
 /// At this stage the complete line and surrounding breaks are available, so a
 /// leading `Page N` remains compatible with the existing header cleanup even
 /// when the PDF appends a chapter or document title.
-pub(crate) fn is_page_number_line(text: &str) -> bool {
+pub fn is_page_number_line(text: &str) -> bool {
     if is_explicit_page_number_expression(text) {
         return true;
     }

@@ -1,12 +1,12 @@
 //! Pair within logical documents, then retain one PDF-wide identity for each materialized note.
 
-use super::{constituents, PdfPrimitiveEvidence, PdfTextIndex};
+use super::{constituents, Contexts, PdfTextIndex};
 use legal_pdf_core::model::{Page, PairingOutput, PdfSourceSpan};
 use std::collections::{BTreeMap, HashMap};
 
 pub(super) fn pair_notes(
     pages: &mut [Page],
-    primitives: &PdfPrimitiveEvidence,
+    contexts: &Contexts,
     citations: &BTreeMap<String, Vec<PdfSourceSpan>>,
     index: &PdfTextIndex,
 ) -> PairingOutput {
@@ -17,7 +17,7 @@ pub(super) fn pair_notes(
         }
     }
     let analysis = legal_pdf_core::layout_analysis();
-    if primitives.document_line_ids.is_empty() && primitives.translation_line_ids.is_empty() {
+    if contexts.document_line_ids.is_empty() && contexts.translation_line_ids.is_empty() {
         return analysis.pair_footnotes(pages, citations, false);
     }
     let mut result = PairingOutput {
@@ -30,8 +30,8 @@ pub(super) fn pair_notes(
     let mut sequence_offset = 0;
     constituents::within_document_contexts(
         pages,
-        &primitives.document_line_ids,
-        &primitives.translation_line_ids,
+        &contexts.document_line_ids,
+        &contexts.translation_line_ids,
         |document| {
             let mut part = analysis.pair_footnotes(document, citations, false);
             let sequences = part

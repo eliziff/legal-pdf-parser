@@ -154,7 +154,7 @@ fn fix_hyphenation(text: &str) -> String {
 /// decision is rendered (plain text vs. inside split emphasis markers) is the
 /// caller's business.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Join {
+pub enum Join {
     /// The fragments are one word: "de- fendant" -> "defendant".
     Plain,
     /// The fragments are a hyphenated compound: "six- month" -> "six-month".
@@ -167,7 +167,7 @@ enum Join {
 /// vocabulary evidence. The whole dehyphenation policy lives here so it can
 /// be reasoned about (and tested) apart from the Markdown scanning around it;
 /// see [`dehyphenate_line_breaks`] for the rule rationale.
-fn join_decision(
+pub fn join_decision(
     a: &str,
     b: &str,
     words: &std::collections::HashSet<String>,
@@ -212,6 +212,21 @@ fn join_decision(
     }
 }
 
+const WORD: &str = r"\p{L}";
+
+// "de- fendant"
+static BREAK_RE: once_cell::sync::Lazy<Regex> =
+    once_cell::sync::Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})- ({WORD}{{2,}})")).unwrap());
+// "Bap-** **tist" — an emphasis span split together with the word. The
+// regex crate has no backreferences, so both markers are captured and
+// compared in the replacement closure.
+static BREAK_EMPH_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(&format!(
+        r"({WORD}{{2,}})-(\*{{1,2}}) (\*{{1,2}})({WORD}{{2,}})"
+    ))
+    .unwrap()
+});
+
 /// Rejoin words hyphenated at the original line breaks.
 ///
 /// Justified print breaks words at syllables; after paragraph lines are
@@ -244,23 +259,22 @@ fn join_decision(
 ///
 /// Table rows and fenced code blocks are left untouched.
 fn dehyphenate_line_breaks(text: &str) -> String {
+    let (words, hyphenated) = document_vocabulary(text);
+    let join = |a: &str, b: &str| join_decision(a, b, &words, &hyphenated);
+    dehyphenate_with(text, join)
+}
+
+/// The document's own dictionary for [`join_decision`]: its whole words and
+/// its hyphenated compounds, as they appear away from line breaks.
+pub fn document_vocabulary(
+    text: &str,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
     use once_cell::sync::Lazy;
     use std::collections::HashSet;
 
-    const WORD: &str = r"\p{L}";
-
-    // "de- fendant"
-    static BREAK_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})- ({WORD}{{2,}})")).unwrap());
-    // "Bap-** **tist" — an emphasis span split together with the word. The
-    // regex crate has no backreferences, so both markers are captured and
-    // compared in the replacement closure.
-    static BREAK_EMPH_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(&format!(
-            r"({WORD}{{2,}})-(\*{{1,2}}) (\*{{1,2}})({WORD}{{2,}})"
-        ))
-        .unwrap()
-    });
     static PLAIN_WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(&format!("{WORD}{{3,}}")).unwrap());
     static HYPHENATED_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})-({WORD}{{2,}})")).unwrap());
@@ -300,9 +314,10 @@ fn dehyphenate_line_breaks(text: &str) -> String {
             caps[2].to_lowercase()
         ));
     }
+    (words, hyphenated)
+}
 
-    let join = |a: &str, b: &str| join_decision(a, b, &words, &hyphenated);
-
+fn dehyphenate_with(text: &str, join: impl Fn(&str, &str) -> Join) -> String {
     let mut in_code_block = false;
     let mut out = String::with_capacity(text.len());
     for (i, line) in text.split('\n').enumerate() {

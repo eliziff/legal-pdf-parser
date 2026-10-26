@@ -11,7 +11,7 @@
 //! deeper insets are read against that passage's margins.
 
 use super::{DocumentContext, PdfPrimitiveEvidence};
-use legal_pdf_core::layout_analysis;
+use legal_pdf_core::{layout_analysis, BOLD, ITALIC};
 use legal_pdf_core::model::{Line, Page, Span};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
@@ -35,10 +35,10 @@ pub(super) fn reading_lines(
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
     if primitives.quotations.scopes.is_empty() {
-        return primitives.document_line_ids.clone();
+        return primitives.contexts.document_line_ids.clone();
     }
     let mut next = primitives
-        .document_line_ids
+        .contexts.document_line_ids
         .values()
         .copied()
         .max()
@@ -50,7 +50,7 @@ pub(super) fn reading_lines(
         .flat_map(|page| &page.lines)
         .map(|line| {
             let document = primitives.quotations.scopes.get(&line.id).map_or_else(
-                || primitives.document_context(&line.id).0,
+                || primitives.contexts.document_context(&line.id).0,
                 |quote| {
                     *quotes.entry(quote).or_insert_with(|| {
                         let id = next;
@@ -92,11 +92,6 @@ impl Row<'_> {
     }
 }
 
-fn italic(span: &Span) -> bool {
-    let font = span.font.to_ascii_lowercase();
-    span.flags & 2 != 0 || font.contains("italic") || font.contains("oblique")
-}
-
 struct Typography {
     font: f64,
     glyph: f64,
@@ -136,7 +131,7 @@ fn typography<'a>(rows: impl IntoIterator<Item = &'a Row<'a>>) -> Typography {
                 native = true;
                 characters += count;
                 size += count * span.size;
-                if italic(span) {
+                if span.flags & ITALIC != 0 {
                     italics += count;
                 }
             }
@@ -215,10 +210,10 @@ pub(super) fn read(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Reading
                 !line.exclude_from_body
                     && line.note_region_mode.is_empty()
                     && matches!(line.region_type.as_str(), "body" | "heading")
-                    && !primitives.table_cell_line_ids.contains(&line.id)
-                    && !primitives.table_note_line_ids.contains(&line.id)
-                    && !primitives.contents_line_ids.contains(&line.id)
-                    && !primitives.contents_pages.contains(&page.index)
+                    && !primitives.claims.table_cell_line_ids.contains(&line.id)
+                    && !primitives.claims.table_note_line_ids.contains(&line.id)
+                    && !primitives.claims.contents_line_ids.contains(&line.id)
+                    && !primitives.claims.contents_pages.contains(&page.index)
                     && !line.text.trim().is_empty()
             })
             .collect::<Vec<_>>();
@@ -229,7 +224,7 @@ pub(super) fn read(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Reading
         });
         for line in lines {
             let reading = readings
-                .entry(primitives.document_context(&line.id))
+                .entry(primitives.contexts.document_context(&line.id))
                 .or_default();
             if reading
                 .pages
@@ -512,15 +507,10 @@ fn opens_with_heading(block: &[&Row<'_>], stroke_bold: &HashMap<String, f64>) ->
         for span in &line.spans {
             let count = span.text.trim().chars().count() as f64;
             total += count;
-            if italic(span) {
+            if span.flags & ITALIC != 0 {
                 italics += count;
             }
-            let font = span.font.to_ascii_lowercase();
-            if span.flags & 16 != 0
-                || ["bold", "black", "heavy"]
-                    .iter()
-                    .any(|word| font.contains(word))
-            {
+            if span.flags & BOLD != 0 {
                 bold += count;
             }
         }
@@ -540,12 +530,7 @@ fn quotation(
 ) -> bool {
     // A centred block (an address, a title) or one reaching into the right half of the page (a
     // table's columns) is no quotation.
-    let mut centres = block
-        .iter()
-        .map(|row| (row.bbox[0] + row.bbox[2]) / 2.0)
-        .collect::<Vec<_>>();
-    centres.sort_by(f64::total_cmp);
-    let centre = centres[centres.len() / 2];
+    let centre = super::median(block.iter().map(|row| (row.bbox[0] + row.bbox[2]) / 2.0).collect());
     let lefts = block.iter().map(|row| row.bbox[0]);
     let spread = lefts.clone().fold(f64::MIN, f64::max) - lefts.fold(f64::MAX, f64::min);
     let centred = block.len() >= 3

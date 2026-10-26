@@ -15,6 +15,8 @@ default = []
 ocr = ["dep:hayro", "dep:cc", "dep:image", "dep:libloading", "dep:ort", "legal-pdf-core/ort-runtime"]
 # The one OCR engine; kept as a name for callers that ask for it.
 indra = ["ocr"]
+# Intermediate witnesses for the structural-mark experiment; absent from ordinary builds.
+attribution = ["ocr"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }

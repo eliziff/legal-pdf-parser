@@ -2,6 +2,8 @@ use crate::line_detector::LineDetector;
 use crate::model_pack::ModelPack;
 use crate::orientation::{place_back, turn, Orientation};
 use crate::planning::{self, RuntimePlan};
+#[cfg(feature = "attribution")]
+pub mod attribution;
 #[cfg(feature = "ocr")]
 use hayro::hayro_interpret::InterpreterSettings;
 #[cfg(feature = "ocr")]
@@ -2167,6 +2169,16 @@ fn prepare_crop(
     width_scale: f32,
     input_height: usize,
 ) -> Option<PreparedLine> {
+    prepare_crop_with_vertical_margin(crop, bbox, width_scale, input_height, 0.2)
+}
+
+fn prepare_crop_with_vertical_margin(
+    crop: GrayImage,
+    bbox: LineBox,
+    width_scale: f32,
+    input_height: usize,
+    vertical_margin: f64,
+) -> Option<PreparedLine> {
     let (mut x0, mut y0, mut x1, mut y1) = (crop.width(), crop.height(), 0, 0);
     for (x, y, pixel) in crop.enumerate_pixels() {
         if pixel[0] < 220 {
@@ -2179,7 +2191,7 @@ fn prepare_crop(
     let (px, py) = if x1 > x0 {
         (
             ((y1 - y0) as f64 * 0.3).ceil() as u32,
-            ((y1 - y0) as f64 * 0.2).ceil() as u32,
+            ((y1 - y0) as f64 * vertical_margin).ceil() as u32,
         )
     } else {
         x0 = 0;
@@ -2223,6 +2235,17 @@ fn prepare_rgba_line(
     width_scale: f32,
     input_height: usize,
 ) -> Option<PreparedLine> {
+    prepare_rgba_line_with_vertical_margin(source, page_width, bbox, width_scale, input_height, 0.2)
+}
+
+fn prepare_rgba_line_with_vertical_margin(
+    source: &[u8],
+    page_width: usize,
+    bbox: LineBox,
+    width_scale: f32,
+    input_height: usize,
+    vertical_margin: f64,
+) -> Option<PreparedLine> {
     if bbox.width() == 0 || bbox.height() == 0 {
         return None;
     }
@@ -2237,7 +2260,7 @@ fn prepare_rgba_line(
                 ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3) as u8;
         }
     }
-    prepare_crop(gray, bbox, width_scale, input_height)
+    prepare_crop_with_vertical_margin(gray, bbox, width_scale, input_height, vertical_margin)
 }
 
 fn prepare_page_line(
