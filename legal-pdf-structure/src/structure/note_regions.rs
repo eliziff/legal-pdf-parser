@@ -15,7 +15,6 @@ use legal_pdf_core::{
     line_font_size,
     model::{Line, Page},
 };
-use legal_pdf_support::protected_citation_spans;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -62,10 +61,6 @@ fn page_label_re() -> &'static Regex {
     })
 }
 
-fn toc_leader_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:\.\s){3,}\.?|\.{4,}").expect("leader regex"))
-}
 
 fn trailing_page_number_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -139,15 +134,8 @@ fn leading_note_number(text: &str) -> Option<i64> {
         .and_then(|found| found[1].parse().ok())
 }
 
-fn terminated(text: &str) -> bool {
-    let stripped = text
-        .trim_end()
-        .trim_end_matches(|c: char| "\"'\u{2019}\u{201d}\u{bb})]}".contains(c));
-    stripped.ends_with(['.', '?', '!', '\u{2026}'])
-}
-
 fn strict_citation(text: &str) -> bool {
-    !protected_citation_spans(text).is_empty()
+    !legal_pdf_core::layout_analysis().protected_citation_spans(text).is_empty()
 }
 
 fn citation_shaped(text: &str) -> bool {
@@ -334,15 +322,11 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
             body[source].push(size);
         }
     }
-    let median = |values: &mut Vec<f64>| {
-        values.sort_by(f64::total_cmp);
-        values[values.len() / 2]
-    };
     std::array::from_fn(|source| {
         if notes[source].len() < 3 || body[source].is_empty() {
             return None;
         }
-        let (note, body) = (median(&mut notes[source]), median(&mut body[source]));
+        let (note, body) = (super::median(notes[source].clone()), super::median(body[source].clone()));
         (note < body - 0.5).then_some(note)
     })
 }
@@ -431,7 +415,7 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             }
             let marker = marker_match(&fold);
             let sandwiched = position < last_note;
-            let continuation = !last_text.is_empty() && last_anchor && !terminated(&last_text);
+            let continuation = !last_text.is_empty() && last_anchor && !super::sentence_ended(&last_text);
             let citation = strict_citation(text);
             let number = (bare || marker)
                 .then(|| leading_note_number(&fold))
@@ -499,7 +483,7 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
             tail.push(line);
         }
         states.push(State {
-            last_terminated: terminated(lines.text(refs[last])),
+            last_terminated: super::sentence_ended(lines.text(refs[last])),
             tail,
             broken,
         });
@@ -530,7 +514,7 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
         let mut ended = false;
         for &line in &state.tail {
             taken.push(line);
-            if terminated(lines.text(line)) {
+            if super::sentence_ended(lines.text(line)) {
                 ended = true;
                 break;
             }
@@ -738,7 +722,7 @@ fn note_band(
         else {
             continue;
         };
-        if !previous.0 || terminated(&previous.2) {
+        if !previous.0 || super::sentence_ended(&previous.2) {
             continue;
         }
         let mut tail = None::<(f64, String)>;
@@ -830,7 +814,7 @@ fn font_role_strands(
             .collect::<Vec<_>>();
         if texts
             .iter()
-            .filter(|text| toc_leader_re().is_match(text))
+            .filter(|text| pdf_inspector::markdown::has_dot_leaders(text))
             .count()
             >= 3
             || texts

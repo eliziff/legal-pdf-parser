@@ -1,18 +1,10 @@
 use crate::structure::{is_note_symbol, label_prefix, scalar_suffix, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{line_font_size, union_bbox, Diagnostic, Line, Page, Region};
+use legal_pdf_core::{line_font_size, median, union_bbox, Diagnostic, Line, Page, Region};
 use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     sync::OnceLock,
 };
-
-fn p50(mut values: Vec<f64>) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrderRepair {
@@ -66,37 +58,27 @@ fn line_center_y(line: &Line) -> f64 {
     (line.bbox[1] + line.bbox[3]) / 2.0
 }
 
-/// A page's grid of short lines in rows and columns, read for its contents list: a contents
-/// page's titles and page numbers. Tables themselves are pdf-inspector's (legal_pdf_tables).
+/// A page's grid of short lines in rows and columns, figures in a fifth of its cells: a plain
+/// table a recognized page's line boxes measure. Tables themselves are pdf-inspector's
+/// (legal_pdf_tables).
 #[derive(Default)]
-pub(super) struct TableEvidence {
-    pub(super) lines: HashSet<usize>,
-    pub(super) contents: bool,
+struct TableEvidence {
     rows: usize,
     columns: usize,
     numeric_cells: usize,
     cells: usize,
-    top: f64,
 }
 
 impl TableEvidence {
-    pub(super) fn strong(&self) -> bool {
+    fn strong(&self) -> bool {
         self.rows >= 6 && self.columns >= 3 && self.numeric_cells * 5 >= self.cells
-    }
-
-    pub(super) fn continuation(&self) -> bool {
-        self.rows >= 6 && self.columns >= 2 && self.numeric_cells * 10 >= self.cells
-    }
-
-    pub(super) fn continuation_on_page(&self, page_height: f64) -> bool {
-        page_height > 0.0 && self.top <= page_height * 0.30 && self.continuation()
     }
 }
 
 /// Notes to a table: a line set just below where a table ends on the page that opens with a
 /// symbol mark ("*", "†", "a)") over words, and the lines set close under it.
 pub(super) fn table_note_lines(lines: &[Line], cells: &HashSet<usize>, ends: &[f64]) -> HashSet<usize> {
-    let line_height = p50(cells
+    let line_height = median(cells
         .iter()
         .map(|index| lines[*index].bbox[3] - lines[*index].bbox[1])
         .filter(|height| *height > 0.0)
@@ -155,7 +137,7 @@ impl legal_pdf_tables::TableLayout for TableReadings {
     /// A recognized page's lines are no measure of its white space, unless they stand in a plain
     /// grid of rows, columns and figures.
     fn white_space(&self, page: &Page) -> bool {
-        page.source != "ocr" || table_evidence(&page.lines, page.width).strong()
+        page.source != "ocr" || table_evidence(&page.lines).strong()
     }
 
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool> {
@@ -163,40 +145,8 @@ impl legal_pdf_tables::TableLayout for TableReadings {
     }
 }
 
-pub(super) fn contents_grid(lines: &[Line], page_width: f64) -> bool {
-    if page_width <= 0.0 {
-        return false;
-    }
-    let mut locators: Vec<_> = lines
-        .iter()
-        .filter_map(|line| {
-            let value = line.text.trim().parse::<u32>().ok()?;
-            (has_valid_bbox(line) && line.bbox[0] >= page_width * 0.72).then_some((line, value))
-        })
-        .filter(|(locator, _)| {
-            lines.iter().any(|peer| {
-                let overlap = locator.bbox[3].min(peer.bbox[3]) - locator.bbox[1].max(peer.bbox[1]);
-                let height = (locator.bbox[3] - locator.bbox[1]).min(peer.bbox[3] - peer.bbox[1]);
-                peer.bbox[0] < page_width * 0.68
-                    && peer.text.chars().any(char::is_alphabetic)
-                    && height > 0.0
-                    && overlap / height >= 0.5
-            })
-        })
-        .collect();
-    if locators.len() < 6 {
-        return false;
-    }
-    locators.sort_by(|(left, _), (right, _)| band_geometry_order(left, right));
-    let monotone = locators
-        .windows(2)
-        .filter(|pair| pair[0].1 <= pair[1].1)
-        .count();
-    monotone * 5 >= (locators.len() - 1) * 4
-}
-
-pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
-    let height = p50(lines
+fn table_evidence(lines: &[Line]) -> TableEvidence {
+    let height = median(lines
         .iter()
         .filter(|line| has_valid_bbox(line))
         .map(|line| line.bbox[3] - line.bbox[1])
@@ -224,7 +174,7 @@ pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
         .into_values()
         .filter(|row| {
             row.len() >= 2
-                && p50(row
+                && median(row
                     .iter()
                     .map(|index| lines[*index].text.trim().chars().count() as f64)
                     .collect())
@@ -248,28 +198,22 @@ pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
                 .is_some_and(|center| center >= bottom - height)
         });
     }
-    let contents = contents_grid(lines, page_width);
-    if !contents {
-        let mut prior = None;
-        dense_rows = dense_rows
-            .into_iter()
-            .take_while(|row| {
-                let center = row
-                    .iter()
-                    .map(|index| line_center_y(&lines[*index]))
-                    .min_by(f64::total_cmp)
-                    .unwrap_or(0.0);
-                let connected = prior.is_none_or(|value| center - value <= height * 6.0);
-                prior = Some(center);
-                connected
-            })
-            .collect();
-    }
+    let mut prior = None;
+    dense_rows = dense_rows
+        .into_iter()
+        .take_while(|row| {
+            let center = row
+                .iter()
+                .map(|index| line_center_y(&lines[*index]))
+                .min_by(f64::total_cmp)
+                .unwrap_or(0.0);
+            let connected = prior.is_none_or(|value| center - value <= height * 6.0);
+            prior = Some(center);
+            connected
+        })
+        .collect();
     if dense_rows.len() < 3 {
-        return TableEvidence {
-            contents,
-            ..TableEvidence::default()
-        };
+        return TableEvidence::default();
     }
     let mut columns: HashMap<i64, usize> = HashMap::new();
     for row in &dense_rows {
@@ -302,15 +246,7 @@ pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
                 })
         })
         .count();
-    let dense_lines: HashSet<_> = dense_rows.into_iter().flatten().collect();
     TableEvidence {
-        contents,
-        top: dense_lines
-            .iter()
-            .map(|index| lines[*index].bbox[1])
-            .min_by(f64::total_cmp)
-            .unwrap_or(0.0),
-        lines: dense_lines,
         rows: row_count,
         columns: column_count,
         numeric_cells,
@@ -318,8 +254,58 @@ pub(super) fn table_evidence(lines: &[Line], page_width: f64) -> TableEvidence {
     }
 }
 
-pub(super) fn column_model(lines: &[Line], page_width: f64) -> ColumnModel {
-    column_model_with_furniture(lines, page_width, false)
+/// Lines' words as pdf-inspector's text items, each carrying its line's slot (as its `mcid`).
+fn inspector_items(lines: &[Line]) -> Vec<pdf_inspector::TextItem> {
+    let height = lines.iter().map(|line| line.bbox[3]).filter(|y| y.is_finite()).fold(0.0, f64::max);
+    let (mut items, origin) = legal_pdf_tables::line_items(lines, 1, height);
+    for (item, (slot, _)) in items.iter_mut().zip(origin) {
+        item.mcid = Some(slot as i64);
+    }
+    items
+}
+
+/// The page's columns as pdf-inspector finds them in its words (`detect_columns`, a projection of
+/// the words across the page whose empty valleys are the gutters): two side by side, set apart at
+/// the gutter between them, a pair whose narrower is under half the wider's width being a body and
+/// its margin column (pdf-inspector's sidebar); more than two, a multi-column page.
+pub(super) fn column_model(lines: &[Line]) -> ColumnModel {
+    let regions = pdf_inspector::extractor::detect_columns(&inspector_items(lines), 1, false);
+    let [left, right, ..] = regions.as_slice() else {
+        return ColumnModel { kind: "single", split_x: 0.0, left_count: 0, right_count: 0 };
+    };
+    let split_x = f64::from(left.x_max + right.x_min) / 2.0;
+    let boxed = lines.iter().filter(|line| has_valid_bbox(line) && !line.exclude_from_body);
+    let left_count = boxed.clone().filter(|line| line_center_x(line) < split_x).count();
+    let right_count = boxed.count() - left_count;
+    let (left_width, right_width) = (left.x_max - left.x_min, right.x_max - right.x_min);
+    let kind = if regions.len() > 2 {
+        "multi_column"
+    } else if left_width.min(right_width) >= 0.5 * left_width.max(right_width) {
+        "two_column"
+    } else {
+        "margin_column"
+    };
+    ColumnModel { kind, split_x, left_count, right_count }
+}
+
+/// The lines in the order pdf-inspector reads their words (`group_into_lines_preserving_all_text`:
+/// column by column, banded where the columns change down the page, a newspaper's columns read
+/// through); a line it was not offered stays after the line it followed.
+fn inspected_order(lines: &[Line]) -> Vec<Line> {
+    let mut placed = vec![false; lines.len()];
+    let mut order = Vec::with_capacity(lines.len());
+    for line in pdf_inspector::extractor::group_into_lines_preserving_all_text(inspector_items(lines)) {
+        for slot in line.items.iter().filter_map(|item| item.mcid).map(|slot| slot as usize) {
+            if slot < lines.len() && !std::mem::replace(&mut placed[slot], true) {
+                order.push(slot);
+            }
+        }
+    }
+    for slot in (0..lines.len()).filter(|&slot| !placed[slot]) {
+        let at = (0..slot).rev().find_map(|prior| order.iter().position(|&placed| placed == prior)).map_or(0, |at| at + 1);
+        order.insert(at, slot);
+    }
+    order.into_iter().map(|slot| lines[slot].clone()).collect()
 }
 
 /// English and French function words counted in some lines: (english, french).
@@ -372,7 +358,7 @@ pub(super) fn translation_lines(pages: &[Page]) -> HashSet<String> {
     let models = pages
         .iter()
         .map(|page| {
-            let model = column_model(&page.lines, page.width);
+            let model = column_model(&page.lines);
             (model.kind == "two_column").then_some(model.split_x)
         })
         .collect::<Vec<_>>();
@@ -407,7 +393,7 @@ pub(super) fn translation_lines(pages: &[Page]) -> HashSet<String> {
         return HashSet::new();
     }
     let french_right = parallel.iter().filter(|(_, _, right)| *right).count() * 2 >= parallel.len();
-    let split = p50(parallel.iter().map(|(_, split, _)| *split).collect());
+    let split = median(parallel.iter().map(|(_, split, _)| *split).collect());
     let confirmed = parallel
         .iter()
         .filter(|(_, _, right)| *right == french_right)
@@ -543,158 +529,8 @@ pub(super) fn margin_note_model(
         .map(|(_, model)| model)
 }
 
-pub(super) fn column_model_with_furniture(
-    lines: &[Line],
-    page_width: f64,
-    ignore_centered_furniture: bool,
-) -> ColumnModel {
-    let single = ColumnModel {
-        kind: "single",
-        split_x: 0.0,
-        left_count: 0,
-        right_count: 0,
-    };
-    if page_width <= 0.0 || lines.is_empty() {
-        return single;
-    }
-    let boxed: Vec<&Line> = lines
-        .iter()
-        .filter(|line| {
-            has_valid_bbox(line)
-                && !line.exclude_from_body
-                && !matches!(line.region_type.as_str(), "header" | "footer")
-        })
-        .collect();
-    let centered_band = |line: &Line| {
-        let width_ratio = line_width(line) / page_width;
-        ignore_centered_furniture
-            && width_ratio <= 0.30
-            && (line_center_x(line) / page_width - 0.5).abs() <= 0.12
-    };
-    let inference_lines: Vec<&Line> = boxed
-        .iter()
-        .copied()
-        .filter(|line| !centered_band(line))
-        .collect();
-    let candidates: Vec<&Line> = inference_lines
-        .iter()
-        .copied()
-        .filter(|line| line_width(line) / page_width <= 0.55)
-        .collect();
-    if candidates.len() < 6
-        || (!inference_lines.is_empty()
-            && 1.0 - candidates.len() as f64 / inference_lines.len() as f64 > 0.40)
-    {
-        return single;
-    }
-    let mut centers: Vec<f64> = candidates.iter().map(|line| line_center_x(line)).collect();
-    centers.sort_by(f64::total_cmp);
-    centers
-        .windows(2)
-        .filter_map(|pair| {
-            let left = pair[0];
-            let right = pair[1];
-            let center_gap = pair[1] - pair[0];
-            let initial_split = (left + right) / 2.0;
-            if center_gap / page_width < 0.12
-                || !(0.25..=0.75).contains(&(initial_split / page_width))
-            {
-                return None;
-            }
-            let (left_lines, right_lines): (Vec<_>, Vec<_>) = candidates
-                .iter()
-                .copied()
-                .partition(|line| line_center_x(line) < initial_split);
-            if left_lines.len() < 3 || right_lines.len() < 3 {
-                return None;
-            }
-            let (split_x, gap, imbalance) = if ignore_centered_furniture {
-                let left_edge = left_lines
-                    .iter()
-                    .map(|line| line.bbox[2])
-                    .max_by(f64::total_cmp)
-                    .unwrap_or(initial_split);
-                let right_edge = right_lines
-                    .iter()
-                    .map(|line| line.bbox[0])
-                    .min_by(f64::total_cmp)
-                    .unwrap_or(initial_split);
-                if right_edge <= left_edge {
-                    return None;
-                }
-                (
-                    (left_edge + right_edge) / 2.0,
-                    right_edge - left_edge,
-                    left_lines.len().abs_diff(right_lines.len()),
-                )
-            } else {
-                (initial_split, center_gap, 0)
-            };
-            let split_ratio = (split_x / page_width * 10_000.0).round_ties_even() / 10_000.0;
-            let vertical_extent = |values: &[&Line]| {
-                (
-                    values
-                        .iter()
-                        .map(|line| line.bbox[1])
-                        .min_by(f64::total_cmp)
-                        .unwrap_or(0.0),
-                    values
-                        .iter()
-                        .map(|line| line.bbox[3])
-                        .max_by(f64::total_cmp)
-                        .unwrap_or(0.0),
-                )
-            };
-            let left_y = vertical_extent(&left_lines);
-            let right_y = vertical_extent(&right_lines);
-            let span = left_y.1.max(right_y.1) - left_y.0.min(right_y.0);
-            let overlap = left_y.1.min(right_y.1) - left_y.0.max(right_y.0);
-            if span <= 0.0 || overlap.max(0.0) / span < 0.30 {
-                return None;
-            }
-            let crossings = candidates
-                .iter()
-                .filter(|line| line.bbox[0] < split_x && line.bbox[2] > split_x)
-                .count();
-            let left_width = p50(left_lines
-                .iter()
-                .map(|line| line_width(line) / page_width)
-                .collect());
-            let right_width = p50(right_lines
-                .iter()
-                .map(|line| line_width(line) / page_width)
-                .collect());
-            let width_ratio = left_width.min(right_width) / left_width.max(right_width);
-            Some((
-                crossings,
-                imbalance,
-                gap,
-                ColumnModel {
-                    kind: if (crossings == 0 && (0.40..=0.60).contains(&split_ratio))
-                        || width_ratio >= 0.60
-                    {
-                        "two_column"
-                    } else {
-                        "margin_column"
-                    },
-                    split_x,
-                    left_count: left_lines.len(),
-                    right_count: right_lines.len(),
-                },
-            ))
-        })
-        .min_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then(left.1.cmp(&right.1))
-                .then_with(|| right.2.total_cmp(&left.2))
-        })
-        .map(|(_, _, _, model)| model)
-        .unwrap_or(single)
-}
-
-fn note_column_model(lines: &[Line], page_width: f64) -> ColumnModel {
-    let mut model = column_model(lines, page_width);
+fn note_column_model(lines: &[Line]) -> ColumnModel {
+    let mut model = column_model(lines);
     if model.kind != "two_column" {
         return model;
     }
@@ -722,72 +558,6 @@ fn geometry_order(lines: &mut [Line]) {
     lines.sort_by(|left, right| {
         line_center_y(left)
             .total_cmp(&line_center_y(right))
-            .then(line_center_x(left).total_cmp(&line_center_x(right)))
-            .then(left.bbox[0].total_cmp(&right.bbox[0]))
-            .then(left.id.cmp(&right.id))
-    });
-}
-
-pub(super) fn column_order(lines: &mut [Line], split_x: f64) {
-    let spans = |line: &Line| {
-        let width = line_width(line);
-        width > 0.0
-            && line.bbox[0] <= split_x - width * 0.20
-            && line.bbox[2] >= split_x + width * 0.20
-    };
-    let bounds = |right: bool| {
-        let mut values = lines
-            .iter()
-            .filter(|line| {
-                has_valid_bbox(line) && !spans(line) && (line_center_x(line) >= split_x) == right
-            })
-            .map(line_center_y);
-        let first = values.next()?;
-        Some(values.fold((first, first), |(top, bottom), value| {
-            (top.min(value), bottom.max(value))
-        }))
-    };
-    let Some((left, right)) = bounds(false).zip(bounds(true)) else {
-        geometry_order(lines);
-        return;
-    };
-    let overlap = (left.0.max(right.0), left.1.min(right.1));
-    let mut anchors: Vec<_> = lines
-        .iter()
-        .filter(|line| spans(line) && (overlap.0..=overlap.1).contains(&line_center_y(line)))
-        .map(line_center_y)
-        .collect();
-    anchors.sort_by(f64::total_cmp);
-    lines.sort_by(|left, right| {
-        let left_y = line_center_y(left);
-        let right_y = line_center_y(right);
-        let band = |y: f64| usize::from(y >= overlap.0) + usize::from(y > overlap.1);
-        let left_band = band(left_y);
-        let right_band = band(right_y);
-        let band_order = left_band.cmp(&right_band);
-        if band_order != std::cmp::Ordering::Equal || left_band != 1 {
-            return band_order
-                .then(left_y.total_cmp(&right_y))
-                .then(left.bbox[0].total_cmp(&right.bbox[0]))
-                .then(left.id.cmp(&right.id));
-        }
-        let left_anchor = spans(left);
-        let right_anchor = spans(right);
-        let left_segment = anchors.partition_point(|anchor| *anchor < left_y);
-        let right_segment = anchors.partition_point(|anchor| *anchor < right_y);
-        let left_column = usize::from(line_center_x(left) >= split_x);
-        let right_column = usize::from(line_center_x(right) >= split_x);
-        left_segment
-            .cmp(&right_segment)
-            .then(left_anchor.cmp(&right_anchor))
-            .then_with(|| {
-                if left_anchor {
-                    std::cmp::Ordering::Equal
-                } else {
-                    left_column.cmp(&right_column)
-                }
-            })
-            .then(left_y.total_cmp(&right_y))
             .then(line_center_x(left).total_cmp(&line_center_x(right)))
             .then(left.bbox[0].total_cmp(&right.bbox[0]))
             .then(left.id.cmp(&right.id))
@@ -873,7 +643,7 @@ fn hyphen_join_score(lines: &[Line]) -> (usize, usize) {
 
 fn y_regressions(lines: &[Line]) -> usize {
     let boxed: Vec<&Line> = lines.iter().filter(|line| has_valid_bbox(line)).collect();
-    let tolerance = p50(boxed
+    let tolerance = median(boxed
         .iter()
         .map(|line| (line.bbox[3] - line.bbox[1]).max(0.0))
         .collect());
@@ -895,19 +665,14 @@ pub(super) fn arbitrate_body_order(
     if has_table_caption(lines) {
         return OrderDecision::keep("table_grid");
     }
-    let mut model = column_model(lines, page_width);
-    if model.kind != "two_column" {
-        let alternative = column_model_with_furniture(lines, page_width, true);
-        if alternative.kind == "two_column" {
-            model = alternative;
-        }
-    }
+    let model = column_model(lines);
     if model.kind == "two_column" {
         let source_switches = column_switches(lines, model, page_width);
         let source_run = median_column_run(lines, model, page_width);
         let source_hyphens = hyphen_join_score(lines);
-        let mut challenger = lines.to_vec();
-        column_order(&mut challenger, model.split_x);
+        // The challenger: the lines in pdf-inspector's reading order; the source order stands unless
+        // it fixes the columns' interleaving and breaks no hyphenated word.
+        let challenger = inspected_order(lines);
         let challenger_switches = column_switches(&challenger, model, page_width);
         let challenger_hyphens = hyphen_join_score(&challenger);
         let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }
@@ -966,7 +731,7 @@ pub(super) fn arbitrate_body_order(
 }
 
 pub(super) fn repair_drop_caps(lines: &mut Vec<Line>) {
-    let body_size = p50(lines
+    let body_size = median(lines
         .iter()
         .map(line_font_size)
         .filter(|size| (4.0..=24.0).contains(size))
@@ -1059,7 +824,7 @@ pub(super) fn aligned_note_body_index(lines: &[Line], label_index: usize) -> Opt
         .map(|(index, _)| index)
 }
 
-pub(super) fn order_note_lines(lines: &mut Vec<Line>, page_width: f64) {
+pub(super) fn order_note_lines(lines: &mut Vec<Line>) {
     let mut tops: Vec<f64> = lines.iter().map(band_geometry_top).collect();
     for (label_index, label) in lines.iter().enumerate() {
         if !standalone_note_label(label) {
@@ -1069,7 +834,7 @@ pub(super) fn order_note_lines(lines: &mut Vec<Line>, page_width: f64) {
             tops[label_index] = tops[body_index];
         }
     }
-    let columns = note_column_model(lines, page_width);
+    let columns = note_column_model(lines);
     let mut keyed: Vec<_> = std::mem::take(lines).into_iter().zip(tops).collect();
     keyed.sort_by(|(left, left_top), (right, right_top)| {
         let left_column =
@@ -1090,8 +855,8 @@ pub(super) fn weave_note_columns(
     note: Vec<Line>,
     page_width: f64,
 ) -> Vec<Line> {
-    let note_columns = note_column_model(&note, page_width);
-    let body_model = column_model(&body, page_width);
+    let note_columns = note_column_model(&note);
+    let body_model = column_model(&body);
     let split_x = if note_columns.kind == "two_column" {
         note_columns.split_x
     } else if body_model.kind == "two_column" {
@@ -1161,9 +926,11 @@ pub(super) fn order_furniture(page: &mut Page) {
     }
 }
 
+/// contents: the page is a contents list's (contents_lists).
 pub(super) fn order_page(
     page: &mut Page,
     table_page: bool,
+    contents: bool,
     table_notes: &HashSet<usize>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -1181,7 +948,7 @@ pub(super) fn order_page(
         }
     }
     repair_drop_caps(&mut body);
-    let contents = table_page && !has_table_caption(&body) && contents_grid(&body, page.width);
+    let contents = table_page && contents && !has_table_caption(&body);
     let decision = if contents && y_regressions(&body) > 0 {
         geometry_order(&mut body);
         OrderDecision {
@@ -1218,7 +985,7 @@ pub(super) fn order_page(
         diagnostic.line_ids = body.iter().take(20).map(|line| line.id.clone()).collect();
         diagnostics.push(diagnostic);
     }
-    order_note_lines(&mut note, page.width);
+    order_note_lines(&mut note);
     let mut ordered = header;
     ordered.extend(weave_note_columns(body, note, page.width));
     ordered.extend(footer);

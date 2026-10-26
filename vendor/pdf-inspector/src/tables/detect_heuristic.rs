@@ -753,6 +753,15 @@ pub(crate) fn detect_tables_with_page_width(
             .collect();
         table.item_indices = original_indices.into_iter().collect();
         table.item_indices.sort_unstable();
+        table.item_cells = table
+            .item_cells
+            .iter()
+            .flat_map(|&(exp_idx, row, col)| {
+                merge_map[expand_map[exp_idx]]
+                    .iter()
+                    .map(move |&original| (original, row, col))
+            })
+            .collect();
         log::debug!(
             "  heuristic table: {}x{}, {} item indices",
             table.rows.len(),
@@ -1399,6 +1408,7 @@ fn detect_table_in_region(
     let mut cell_items: Vec<Vec<Vec<&TextItem>>> =
         vec![vec![Vec::new(); columns.len()]; rows.len()];
     let mut item_indices = Vec::new();
+    let mut item_cells = Vec::new();
 
     for (idx, item) in items {
         let col = find_column_index(&columns, item.x);
@@ -1410,6 +1420,7 @@ fn detect_table_in_region(
         if let (Some(col), Some(row)) = (col, row) {
             cell_items[row][col].push(item);
             item_indices.push(*idx);
+            item_cells.push((*idx, row, col));
         }
     }
 
@@ -1421,6 +1432,11 @@ fn detect_table_in_region(
     let item_indices: Vec<usize> = item_indices
         .into_iter()
         .filter(|idx| !excluded_items.contains(idx))
+        .collect();
+    let item_cells: Vec<(usize, usize, usize)> = item_cells
+        .into_iter()
+        .filter(|(idx, row, _)| !excluded_items.contains(idx) && *row >= first_table_row)
+        .map(|(idx, row, col)| (idx, row - first_table_row, col))
         .collect();
 
     // If we excluded rows, adjust the cell_items and rows
@@ -1588,7 +1604,7 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
-    Some(Table::new(columns, rows, cells, item_indices))
+    Some(Table::new(columns, rows, cells, item_indices).with_item_cells(item_cells))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -2607,6 +2623,9 @@ fn try_add_label_column(
         .fold(f32::INFINITY, f32::min);
 
     table.columns.insert(0, label_col_x);
+    for placed in &mut table.item_cells {
+        placed.2 += 1;
+    }
     for (row_idx, row_labels) in label_items_per_row.iter().enumerate() {
         let mut label_text = String::new();
         let mut last = None;
@@ -2616,6 +2635,7 @@ fn try_add_label_column(
         table.cells[row_idx].insert(0, label_text);
         for (idx, _) in row_labels {
             table.item_indices.push(*idx);
+            table.item_cells.push((*idx, row_idx, 0));
         }
     }
 }

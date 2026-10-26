@@ -8,9 +8,9 @@ use log::debug;
 
 /// Represents a column region on a page
 #[derive(Debug, Clone)]
-pub(crate) struct ColumnRegion {
-    pub(crate) x_min: f32,
-    pub(crate) x_max: f32,
+pub struct ColumnRegion {
+    pub x_min: f32,
+    pub x_max: f32,
 }
 
 /// Detect column boundaries on a page using a horizontal projection profile.
@@ -18,7 +18,7 @@ pub(crate) struct ColumnRegion {
 /// Builds an occupancy histogram across the page width and finds empty valleys
 /// (gutters) where no text exists. Validates valleys with vertical consistency
 /// checks to avoid false positives.
-pub(crate) fn detect_columns(
+pub fn detect_columns(
     items: &[TextItem],
     page: u32,
     page_has_table: bool,
@@ -1832,7 +1832,7 @@ pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
 /// Group text items into lines, with multi-column support
 /// Detect newspaper-style columns: independent text flows that should be read
 /// sequentially (all of col1, then col2) rather than Y-interleaved.
-pub(crate) fn is_newspaper_layout(
+pub fn is_newspaper_layout(
     per_column_lines: &[Vec<TextLine>],
     columns: &[ColumnRegion],
 ) -> bool {

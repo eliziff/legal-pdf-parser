@@ -10,6 +10,7 @@
 
 use super::{bold_char_share, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page};
+use legal_pdf_core::{dominant_face, flag_share, PageMeasure, ITALIC};
 use legal_structure_model::{enumerator_interpretations, parse_heading_ladder, EnumeratorInterpretation, HeadingAction};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -61,7 +62,7 @@ fn index_entry(text: &str) -> bool {
 /// A hearing's part, in capitals: "SUBMISSIONS BY MR. X", "RULING", "REASONS FOR JUDGMENT", "SENTENCE".
 fn hearing_part(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    capitals(text) && text.split_whitespace().count() <= 10
+    super::all_caps(text) && text.split_whitespace().count() <= 10
         && pattern(&RE, r"^(?:(?:REPLY|CLOSING|OPENING)\s+)?(?:SUBMISSIONS|STATEMENT|ARGUMENT|RULING|DECISION|JUDGMENT|SENTENCE|SENTENCING|(?:ORAL\s+)?REASONS\s+FOR\s+(?:JUDGMENT|RULING|SENTENCE|DECISION))\b").is_match(text)
 }
 
@@ -102,7 +103,7 @@ fn judge(text: &str) -> bool {
 /// "iv.", "B)", alone or before a title), a bracketed one ("(a)", "(1)"), a division word ("PART",
 /// "Section", "ARTICLE"), or a numeral before capitals ("V RECOMMENDATIONS", OCR having dropped the
 /// stop).
-fn numbered(text: &str) -> bool {
+pub(super) fn numbered(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
     super::heading_inline_re().is_match(text)
@@ -138,17 +139,21 @@ fn enumerator(text: &str) -> Option<(String, String)> {
 /// headings with): each enumerator in every family it can be read in ("C." a letter or a numeral), a
 /// skipped value read by its shortest jump, a restart at the top opening a new run, as the readers
 /// split them. An attachment (a schedule, an appendix, an exhibit) stands at the top and starts the
-/// ladder over. Each numbered text's level, and whether it opens a run; None where unnumbered.
-pub(super) fn ladder_levels(texts: &[&str]) -> Vec<Option<(usize, bool)>> {
+/// ladder over, as does every text `breaks` marks (a part of the document an unnumbered top heading
+/// opens: a judgment's reasons after its headnote). Each numbered text's depth on its run, and
+/// whether it opens a run; None where unnumbered.
+pub(super) fn ladder_levels(texts: &[&str], breaks: &[bool]) -> Vec<Option<(usize, bool)>> {
     let mut levels = vec![None; texts.len()];
     let numbered: Vec<(usize, Vec<EnumeratorInterpretation>, bool)> = texts.iter().enumerate().filter_map(|(k, text)| {
         let (value, punct) = enumerator(text)?;
         let readings = enumerator_interpretations(&value, &punct);
         (!readings.is_empty()).then(|| (k, readings, ATTACHMENTS.contains(&punct.as_str())))
     }).collect();
+    // Where a run starts over: at an attachment, or past a break since the numbered text before it.
+    let restarts = |n: usize| numbered[n].2 || n > 0 && (numbered[n - 1].0 + 1..=numbered[n].0).any(|k| breaks.get(k).copied().unwrap_or(false));
     let mut start = 0;
     while start < numbered.len() {
-        let end = (start + 1..numbered.len()).find(|&n| numbered[n].2).unwrap_or(numbered.len());
+        let end = (start + 1..numbered.len()).find(|&n| restarts(n)).unwrap_or(numbered.len());
         let run = &numbered[start..end];
         let readings = || run.iter().map(|(_, readings, _)| readings.as_slice());
         let mut sets: Vec<usize> = parse_heading_ladder(readings()).assignments.iter().enumerate()
@@ -170,11 +175,13 @@ pub(super) fn ladder_levels(texts: &[&str]) -> Vec<Option<(usize, bool)>> {
     levels
 }
 
-/// Heading levels once the headings are settled, walking them in reading order: a numbered heading
-/// at its level on the document's heading ladder (`ladder_levels`), the run of the ladder set under
-/// the unnumbered heading that opens it ("I. Introduction" under "Reasons for Judgment"); an
-/// unnumbered heading at the readers' step from the heading before it. A heading the document's
-/// own outline or contents placed (`placed`) keeps the level they gave it.
+/// Heading levels once the headings are settled, walking them in reading order. An unnumbered heading
+/// at the top of the readers' levels starts the ladder over (a judgment's reasons after its
+/// headnote). A numbered heading takes its depth on its run of the ladder (`ladder_levels`), set on
+/// the scale the run's placed headings show (the levels the document's own outline or contents gave
+/// them, by the offset most of them agree on), or else under the unnumbered heading that opens the
+/// run ("I. Introduction" under "Reasons for Judgment"). An unnumbered heading takes the readers'
+/// step from the heading before it; a placed heading keeps its level.
 fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: &HashMap<String, Option<String>>) -> Vec<(String, usize)> {
     let mut headings: Vec<Vec<&Line>> = Vec::new();
     for page in document {
@@ -200,27 +207,58 @@ fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: 
     let texts: Vec<String> = headings.iter()
         .map(|heading| heading.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" "))
         .collect();
-    let ladder = ladder_levels(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let enumerators: Vec<Option<(String, String)>> = refs.iter().map(|text| enumerator(text)).collect();
+    let numbered_heading: Vec<bool> = enumerators.iter().map(Option::is_some).collect();
+    let breaks: Vec<bool> = headings.iter().zip(&numbered_heading)
+        .map(|(heading, numbered)| !numbered && levels.get(&heading[0].id).is_some_and(|&level| level <= 1))
+        .collect();
+    let ladder = ladder_levels(&refs, &breaks);
+    // Each run's offset from its depths to the document's levels, by the placed headings in it.
+    let mut offsets: HashMap<usize, usize> = HashMap::new();
+    let mut run = 0;
+    let mut votes: HashMap<usize, HashMap<isize, usize>> = HashMap::new();
+    for (k, heading) in headings.iter().enumerate() {
+        if let Some((depth, opens)) = ladder[k] {
+            run += usize::from(opens);
+            if placed.contains_key(&heading[0].id) {
+                if let Some(&read) = levels.get(&heading[0].id) {
+                    *votes.entry(run).or_default().entry(read as isize - depth as isize).or_default() += 1;
+                }
+            }
+        }
+    }
+    for (run, counts) in votes {
+        let (offset, _) = counts.into_iter().max_by_key(|&(offset, count)| (count, std::cmp::Reverse(offset.abs()))).unwrap_or((0, 0));
+        offsets.insert(run, offset.max(0) as usize);
+    }
     let mut out = Vec::new();
-    // The level the current run of the ladder hangs from.
-    let mut base = 0;
+    // The level the current run of the ladder hangs from, where nothing in it was placed.
+    let (mut base, mut run) = (0, 0);
     let (mut prior_level, mut prior_read, mut prior_numbered): (Option<usize>, Option<usize>, bool) = (None, None, false);
-    for (heading, rung) in headings.iter().zip(ladder) {
+    for ((heading, rung), enumerator) in headings.iter().zip(ladder).zip(&enumerators) {
         // A line no reader levelled (one these rules raised) sits level with the heading before it.
         let read = levels.get(&heading[0].id).copied().or(prior_read).unwrap_or(1);
+        if let Some((_, true)) = rung {
+            run += 1;
+            // An attachment stands at the top whatever heads the part before it.
+            let attachment = enumerator.as_ref().is_some_and(|(_, word)| ATTACHMENTS.contains(&word.as_str()));
+            base = if prior_numbered || attachment { 0 } else { prior_level.unwrap_or(0) };
+        }
         let level = if placed.contains_key(&heading[0].id) {
             read
-        } else if let Some((step, opens)) = rung {
-            if opens {
-                base = if prior_numbered { 0 } else { prior_level.unwrap_or(0) };
-            }
-            base + step
+        } else if let Some((depth, _)) = rung {
+            offsets.get(&run).copied().unwrap_or(base) + depth
         } else {
             match (prior_level, prior_read) {
                 (Some(level), Some(before)) => (level + read).saturating_sub(before).max(1),
                 _ => read,
             }
         };
+        if std::env::var_os("LEGALPDF_LEVEL_TRACE").is_some() {
+            eprintln!("level\t{}\t{:?}\tread {read}\tplaced {}\tbase {base}\t-> {level}\t{}", heading[0].id, rung,
+                placed.contains_key(&heading[0].id), heading.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ").chars().take(60).collect::<String>());
+        }
         out.extend(heading.iter().map(|line| (line.id.clone(), level)));
         (prior_level, prior_read, prior_numbered) = (Some(level), Some(read), rung.is_some());
     }
@@ -252,75 +290,21 @@ fn closes(text: &str) -> bool {
     text.trim_end().ends_with(['.', ':', ';', '?', '!', ')', '”', '"'])
 }
 
-/// A word index's letter: "< A >", "- B -".
-fn index_letter(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^\s*(?:<\s*[A-Z0-9]\s*>|-\s*[A-Z]\s*-)\s*$").is_match(text)
-}
-
 /// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's
 /// numeral on its own line, not a sentence.
 fn bare_number(text: &str) -> bool {
     let numeral = text.trim().trim_end_matches(['.', ')']);
     crate::paragraphs::marker_only_re().is_match(text)
-        || !numeral.is_empty() && numeral.chars().all(|c| "IVXLCDM".contains(c))
-}
-
-fn capitals(text: &str) -> bool {
-    super::all_caps(text)
+        || numeral.chars().all(|c| c.is_ascii_uppercase()) && legal_pdf_core::roman_value(numeral).is_some()
 }
 
 fn words(text: &str) -> String {
     text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>().join(" ")
 }
 
-fn median(values: Vec<f64>) -> f64 {
-    super::median(values)
-}
-
-fn quantile(mut values: Vec<f64>, q: f64) -> f64 {
-    values.sort_by(f64::total_cmp);
-    if values.is_empty() { 0.0 } else { values[((values.len() - 1) as f64 * q).round() as usize] }
-}
-
 /// A line's type: its commonest face and half-point size, by characters.
-fn style(line: &Line) -> Option<(String, i64)> {
-    let mut chars: HashMap<(&str, i64), usize> = HashMap::new();
-    for span in &line.spans {
-        *chars.entry((span.font.as_str(), (span.size * 2.0).round() as i64)).or_default() += span.text.chars().count();
-    }
-    chars.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|((font, size), _)| (font.to_owned(), size))
-}
-
-/// The share of a line's characters carrying a span flag (italic 2).
-fn flagged(line: &Line, flag: u32) -> f64 {
-    let total: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
-    let set: usize = line.spans.iter().filter(|s| s.flags & flag != 0).map(|s| s.text.chars().count()).sum();
-    if total == 0 { 0.0 } else { set as f64 / total as f64 }
-}
-
-/// A page's measures for setting a line against it: its lines in reading order, its typical line
-/// height and type size, and its text block's edges.
-struct PageMeasure {
-    order: Vec<usize>,
-    height: f64,
-    size: f64,
-    left: f64,
-    right: f64,
-}
-
-impl PageMeasure {
-    fn of(page: &Page) -> PageMeasure {
-        let mut order: Vec<usize> = (0..page.lines.len()).collect();
-        order.sort_by_key(|&n| (page.lines[n].reading_order, n));
-        PageMeasure {
-            order,
-            height: median(page.lines.iter().map(|l| (l.bbox[3] - l.bbox[1]).max(0.1)).collect()).max(0.1),
-            size: median(page.lines.iter().filter_map(style).map(|(_, size)| size as f64).filter(|s| *s > 0.0).collect()),
-            left: quantile(page.lines.iter().map(|l| l.bbox[0]).collect(), 0.1),
-            right: quantile(page.lines.iter().map(|l| l.bbox[2]).collect(), 0.9),
-        }
-    }
+fn style(line: &Line) -> Option<(&str, i64)> {
+    dominant_face(line).map(|(face, size)| (face, (size * 2.0) as i64))
 }
 
 /// One heading as the readers left it and the page's regions will hold it: consecutive heading
@@ -349,10 +333,10 @@ fn not_a_heading(heading: &Heading, running: bool) -> bool {
         || label(text)
         // Nothing sets it off from the body: in the body's own type and case, on no centre, with
         // no space above it (90%: an address line, a party name, a turn of a transcript).
-        || (!numbered && heading.body_type && !capitals(text) && !heading.centred && heading.above < 1.0)
+        || (!numbered && heading.body_type && !super::all_caps(text) && !heading.centred && heading.above < 1.0)
         // Capitals alone in the body's own type set off a name or a caption, not a division
         // (93%: "SPROTT PRIVATE RESOURCE LENDING", "ET ENTRE :", a postal code).
-        || (!numbered && heading.body_type && capitals(text))
+        || (!numbered && heading.body_type && super::all_caps(text))
         // It sits nearer the line above than the text below, which a heading's text never does
         // (89%: a signature block's names, "INTENTIONALLY DELETED", a form's field).
         || (!numbered && !heading.larger && heading.below.is_some_and(|below| below > heading.above + 0.5))
@@ -380,9 +364,40 @@ fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, ab
             || (bold && numbered(text) && above >= 1.0))
 }
 
+/// An instrument's numbered captions: a clause's caption belongs to its clause, and a contract's
+/// numbers are its provisions, so a heading that opens on a number, letter or numeral ("1.1
+/// Definitions", "2. Purchase and Sale", "(a)") is the opening of a body unit. A division word's
+/// heading ("ARTICLE 1", "SCHEDULE A") stays a heading.
+pub(super) fn instrument_captions(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
+    for page in pages.iter_mut() {
+        let mut slot = 0;
+        while slot < page.lines.len() {
+            if page.lines[slot].region_type != "heading" {
+                slot += 1;
+                continue;
+            }
+            let block = page.lines[slot].block_index;
+            let end = (slot..page.lines.len())
+                .take_while(|&k| page.lines[k].region_type == "heading" && page.lines[k].block_index == block)
+                .last()
+                .unwrap_or(slot);
+            let text = page.lines[slot..=end].iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
+            let caption = enumerator(&text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
+            if caption {
+                for line in &mut page.lines[slot..=end] {
+                    primitives.headings.heading_levels.remove(&line.id);
+                    primitives.headings.navigation_parents.remove(&line.id);
+                    line.region_type = "body".to_owned();
+                }
+            }
+            slot = end + 1;
+        }
+    }
+}
+
 pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
-    let reading = primitives.reading_lines().clone();
-    let translation = primitives.translation_line_ids.clone();
+    let reading = primitives.contexts.reading_lines().clone();
+    let translation = primitives.contexts.translation_line_ids.clone();
     let (mut demoted, mut promoted, mut lifted_lines) = (Vec::new(), Vec::new(), Vec::new());
     super::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         let lines = || document.iter().flat_map(|page| &page.lines).filter(|line| !line.exclude_from_body);
@@ -400,7 +415,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
             } else if transcript && !index_entry(text) && examination(text) {
                 promoted.push((line.id.clone(), if witnesses { 2 } else { 1 }));
                 raised.insert(line.id.as_str());
-            } else if transcript && index_letter(text) {
+            } else if transcript && super::contents_lists::index_letter(text) {
                 // A word index's letters head its entries, under the index.
                 promoted.push((line.id.clone(), 2));
                 raised.insert(line.id.as_str());
@@ -420,13 +435,13 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
             let above = prior.filter(|prior| prior.page_index == line.page_index).map_or(3.0, |prior| {
                 (line.bbox[1] - prior.bbox[3]) / measures[&line.page_index].height
             });
-            if lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(primitives, line) >= 0.5, above) {
+            if lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(&primitives.stroke_bold, line) >= 0.5, above) {
                 lifted_lines.push(line.id.clone());
             }
         }
         // The document's body type is its commonest, by characters; a short line printed on three
         // pages or more is a running head.
-        let mut type_chars: HashMap<(String, i64), usize> = HashMap::new();
+        let mut type_chars: HashMap<(&str, i64), usize> = HashMap::new();
         let mut printed_on: HashMap<String, HashSet<usize>> = HashMap::new();
         for page in document.iter() {
             for line in &page.lines {
@@ -445,7 +460,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
             let mut slot = 0;
             while slot < measure.order.len() {
                 let first = &page.lines[measure.order[slot]];
-                let level = primitives.heading_levels.get(&first.id);
+                let level = primitives.headings.heading_levels.get(&first.id);
                 if first.region_type != "heading" || first.exclude_from_body {
                     slot += 1;
                     continue;
@@ -454,7 +469,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
                 while end < measure.order.len() {
                     let next = &page.lines[measure.order[end]];
                     if next.region_type != "heading" || next.exclude_from_body || next.block_index != first.block_index
-                        || primitives.heading_levels.get(&next.id) != level || numbered(next.text.trim())
+                        || primitives.headings.heading_levels.get(&next.id) != level || numbered(next.text.trim())
                     {
                         break;
                     }
@@ -462,17 +477,17 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
                 }
                 let members: Vec<&Line> = measure.order[slot..end].iter().map(|&n| &page.lines[n]).collect();
                 let last = members[members.len() - 1];
-                let bold = bold_char_share(primitives, first) >= 0.5;
+                let bold = bold_char_share(&primitives.stroke_bold, first) >= 0.5;
                 let underlined = !first.words.is_empty() && first.words.iter().filter(|w| w.underlined).count() * 2 > first.words.len();
                 let own = style(first);
-                let larger = measure.size > 0.0 && own.as_ref().is_some_and(|(_, size)| *size as f64 >= measure.size * 1.1);
+                let larger = measure.size > 0.0 && dominant_face(first).is_some_and(|(_, size)| size >= measure.size * 1.1);
                 let width = page.width.max(1.0);
                 let heading = Heading {
                     text: members.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" "),
                     above: slot.checked_sub(1).map_or(3.0, |prior| gap(&page.lines[measure.order[prior]], first)),
                     below: measure.order.get(end).map(|&n| gap(last, &page.lines[n])),
                     larger,
-                    body_type: own.is_some() && own == body && !bold && !underlined && !larger && flagged(first, 2) <= 0.5,
+                    body_type: own.is_some() && own == body && !bold && !underlined && !larger && flag_share(first, ITALIC).unwrap_or(0.0) <= 0.5,
                     centred: (((first.bbox[0] + first.bbox[2]) / 2.0 - width / 2.0) / width).abs() < 0.03
                         && (first.bbox[2] - first.bbox[0]) < (measure.right - measure.left).max(1.0) * 0.8,
                     lines: members,
@@ -480,7 +495,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
                 let text = heading.text.as_str();
                 let running = text.split_whitespace().count() <= 10 && printed_on.get(&words(text)).is_some_and(|pages| pages.len() >= 3);
                 // A heading the document's own outline or contents placed is the document's word.
-                if !heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.navigation_parents.contains_key(&line.id))
+                if !heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id))
                     && (not_a_heading(&heading, running) || (opinions <= 1 && judge(text)) || (transcript && turn_or_event(text)))
                 {
                     demoted.extend(heading.lines.iter().map(|line| line.id.clone()));
@@ -490,28 +505,30 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
         }
     });
     // A line a container claimed (contents, a table) stays the container's.
-    let promoted: HashMap<String, usize> = promoted.into_iter().filter(|(id, _)| !primitives.claimed(id)).collect();
-    let lifted_lines: HashSet<String> = lifted_lines.into_iter().filter(|id| !primitives.claimed(id)).collect();
+    let promoted: HashMap<String, usize> = promoted.into_iter().filter(|(id, _)| !primitives.claims.claimed(id)).collect();
+    let lifted_lines: HashSet<String> = lifted_lines.into_iter().filter(|id| !primitives.claims.claimed(id)).collect();
     let demoted: HashSet<String> = demoted.into_iter().collect();
     for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
         if let Some(&level) = promoted.get(&line.id) {
             line.region_type = "heading".to_owned();
-            primitives.heading_levels.insert(line.id.clone(), level);
+            primitives.headings.heading_levels.insert(line.id.clone(), level);
+            primitives.headings.sources.insert(line.id.clone(), "rules_promoted".to_owned());
         } else if lifted_lines.contains(&line.id) {
             // Levelled below, with the rest.
             line.region_type = "heading".to_owned();
+            primitives.headings.sources.insert(line.id.clone(), "rules_lifted".to_owned());
         } else if demoted.contains(&line.id) {
             line.region_type = "body".to_owned();
-            primitives.heading_levels.remove(&line.id);
+            primitives.headings.heading_levels.remove(&line.id);
         }
     }
     // Only once the headings are settled can their levels be read: each step is from the heading
     // before, and a numbering family's level is set where it first appears.
     let mut levels = Vec::new();
-    let current = primitives.heading_levels.clone();
-    let placed = primitives.navigation_parents.clone();
+    let current = primitives.headings.heading_levels.clone();
+    let placed = primitives.headings.navigation_parents.clone();
     super::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         levels.extend(numbering_levels(document, &current, &placed));
     });
-    primitives.heading_levels.extend(levels);
+    primitives.headings.heading_levels.extend(levels);
 }

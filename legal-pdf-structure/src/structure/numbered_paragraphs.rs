@@ -19,7 +19,7 @@ type PrintedLine<'a> = (&'a str, &'a str, u32, [f64; 4]);
 /// without a sentence's punctuation ("Ministerial delegate's testimony").
 fn heading_text(text: &str) -> bool {
     let text = text.trim();
-    legal_pdf_support::heading_text_plausible(text)
+    legal_pdf_core::layout_analysis().heading_text_plausible(text)
         || (text.starts_with(|c: char| c.is_alphabetic() && c.is_uppercase())
             && !text.ends_with(['.', ',', ';', ':'])
             && text.chars().count() <= 100
@@ -268,7 +268,7 @@ fn marginal_paragraph_plan<'a>(
                                 return false;
                             };
                             if legal_structure_model::enumerator_interpretations(prefix, ".").is_empty()
-                                || !legal_pdf_support::heading_text_plausible(text)
+                                || !legal_pdf_core::layout_analysis().heading_text_plausible(text)
                             {
                                 return false;
                             }
@@ -426,13 +426,12 @@ fn set_apart_number(
 ) -> Option<usize> {
     let (number, gap) = opening_number(page, line)?;
     let height = line.words[0].rect[3] - line.words[0].rect[1];
-    let mut spaces = line.words[1..]
+    let spaces = line.words[1..]
         .windows(2)
         .map(|pair| pair[1].rect[0] - pair[0].rect[2])
         .filter(|space| *space > 0.0)
         .collect::<Vec<_>>();
-    spaces.sort_by(f64::total_cmp);
-    let wider = spaces.len() >= 3 && gap > 1.2 * spaces[spaces.len() * 3 / 4];
+    let wider = spaces.len() >= 3 && gap > 1.2 * super::quantile(spaces, 0.75);
     (gap >= 0.75 * height
         || fixed
             .iter()
@@ -532,7 +531,7 @@ pub(super) fn candidates(
                 "header" | "footer" | "footnote" | "endnote" | "note"
             )
             && !quoted.contains(&line.id)
-            && !primitives.contents_line_ids.contains(&line.id)
+            && !primitives.claims.contents_line_ids.contains(&line.id)
     };
     let pages_original = pages;
     let pages = pages
@@ -577,7 +576,7 @@ pub(super) fn candidates(
     let mut groups = BTreeMap::<super::DocumentContext, Vec<Vec<String>>>::new();
     for paragraph in paragraphs {
         groups
-            .entry(primitives.reading_context(&paragraph.line_ids[0]))
+            .entry(primitives.contexts.reading_context(&paragraph.line_ids[0]))
             .or_default()
             .push(paragraph.line_ids);
     }
@@ -586,7 +585,7 @@ pub(super) fn candidates(
         let mut local = BTreeMap::<super::DocumentContext, Vec<PdfTextLine>>::new();
         for line in page.lines {
             local
-                .entry(primitives.reading_context(&line.id))
+                .entry(primitives.contexts.reading_context(&line.id))
                 .or_default()
                 .push(line);
         }
@@ -865,13 +864,13 @@ pub(super) fn foreign_numbered_paragraphs(
                 !line.exclude_from_body
                     && line.note_region_mode.is_empty()
                     && line.region_type == "body"
-                    && !primitives.table_cell_line_ids.contains(&line.id)
-                    && !primitives.contents_line_ids.contains(&line.id)
+                    && !primitives.claims.table_cell_line_ids.contains(&line.id)
+                    && !primitives.claims.contents_line_ids.contains(&line.id)
             })
             .collect::<Vec<_>>();
         lines.sort_by(|a, b| a.reading_order.cmp(&b.reading_order).then_with(|| a.id.cmp(&b.id)));
         for line in lines {
-            let context = primitives.document_context(&line.id);
+            let context = primitives.contexts.document_context(&line.id);
             let lines = body.entry(context).or_default();
             place.insert(line.id.as_str(), lines.len());
             text_of.insert(line.id.as_str(), line.text.as_str());
@@ -1040,5 +1039,5 @@ fn opens_item(text: &str) -> bool {
         !core.is_empty() && core.chars().count() <= 4
             && (core.chars().all(|c| c.is_ascii_digit() || c == '.') || core.chars().all(|c| matches!(c, 'a'..='z')) || core.chars().all(|c| matches!(c, 'A'..='Z')))
     };
-    item || legal_pdf_support::heading_text_plausible(text)
+    item || legal_pdf_core::layout_analysis().heading_text_plausible(text)
 }

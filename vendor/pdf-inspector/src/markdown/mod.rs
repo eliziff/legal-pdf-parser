@@ -14,14 +14,19 @@ mod heading;
 mod postprocess;
 mod preprocess;
 
-pub use convert::to_markdown_from_lines;
+pub use analysis::{calculate_font_stats, compute_heading_tiers, detect_header_level, has_dot_leaders, FontStats};
+pub use classify::{is_caption_line, is_list_item};
+pub use convert::{detect_overused_struct_heading_levels, to_markdown_from_lines};
+pub use furniture::strip_header_footer_lines;
+pub use postprocess::{document_vocabulary, join_decision, Join};
+pub use preprocess::merge_drop_caps;
 
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
+use classify::{format_list_item, is_code_like};
 use convert::{
     merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
     PositionedMarkdown,
@@ -2589,6 +2594,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: (0..detection_items.len()).collect(),
+            item_cells: Vec::new(),
             kind: crate::tables::TableKind::Data,
         };
 

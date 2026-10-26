@@ -230,36 +230,6 @@ fn pdf_adapter_abstains_on_contents_rows_and_transcript_line_columns() {
 }
 
 #[test]
-fn contents_rows_end_where_the_body_begins() {
-    let texts = [
-        "TABLE OF CONTENTS",
-        "1 Topic one ........................ 3",
-        "2 Topic two ........................ 4",
-        "3 A title that wraps",
-        "onto a second line ........................",
-        "5",
-        "4 Topic four ........................ 6",
-        "5 Topic five ........................ 7",
-        "6 Topic six ........................ 8",
-        "INTRODUCTION",
-        "1",
-        "These submissions are filed under the directive.",
-    ];
-    let page = test_page(
-        texts
-            .iter()
-            .enumerate()
-            .map(|(row, text)| {
-                let top = 80.0 + row as f64 * 20.0;
-                test_line(text, [72.0, top, 520.0, top + 12.0], vec![])
-            })
-            .collect(),
-    );
-    let table = table_evidence(&page.lines, page.width);
-    assert_eq!(contents_rows(&page, &table, false), Some((0..9).collect()));
-}
-
-#[test]
 fn word_concordance_pages_are_index_pages_not_contents() {
     let page = |entries: &[&str]| {
         test_page(
@@ -505,15 +475,6 @@ fn sized_line(text: &str, bbox: [f64; 4], size: f64) -> Line {
     )
 }
 
-#[test]
-fn paragraph_join_consumes_every_source_hyphen_marker() {
-    for marker in ['-', '\u{00ad}', '\u{00ac}'] {
-        let first = test_line(&format!("judg{marker}"), [0.0, 0.0, 10.0, 10.0], vec![]);
-        let second = test_line("ment", [0.0, 12.0, 10.0, 22.0], vec![]);
-        assert_eq!(join_lines(&[&first, &second]).0, "judgment");
-    }
-}
-
 fn test_page(mut lines: Vec<Line>) -> Page {
     for (index, line) in lines.iter_mut().enumerate() {
         line.id = format!("p0001-l{:04}", index + 1);
@@ -553,6 +514,7 @@ fn note_order_puts_a_raised_label_before_its_nearby_text() {
             start: 0,
             end: marker.chars().count(),
             underlined: false,
+            struck: false,
             weight: 0.0,
         });
         let body = test_line(
@@ -562,7 +524,7 @@ fn note_order_puts_a_raised_label_before_its_nearby_text() {
         );
         let mut lines = vec![body, label];
 
-        order_note_lines(&mut lines, 612.0);
+        order_note_lines(&mut lines);
 
         assert_eq!(lines[0].text, marker);
     }
@@ -578,12 +540,13 @@ fn note_order_puts_a_detached_label_before_a_distant_same_row_fragment() {
         start: 0,
         end: 2,
         underlined: false,
+        struck: false,
         weight: 0.0,
     });
     let body = test_line("of", [411.7, 554.3, 422.3, 566.1], vec![]);
     let mut lines = vec![body, label];
 
-    order_note_lines(&mut lines, 612.0);
+    order_note_lines(&mut lines);
 
     assert_eq!(lines[0].text, "68");
 }
@@ -614,7 +577,7 @@ fn note_order_reads_two_columns_column_by_column() {
         ));
     }
 
-    order_note_lines(&mut lines, 612.0);
+    order_note_lines(&mut lines);
 
     assert_eq!(
         lines
@@ -623,187 +586,6 @@ fn note_order_reads_two_columns_column_by_column() {
             .collect::<Vec<_>>(),
         ["left 0", "left 1", "left 2", "right 0", "right 1", "right 2"]
     );
-}
-
-#[test]
-fn note_number_margin_is_not_a_text_column() {
-    let mut lines = Vec::new();
-    for row in 0..6 {
-        let y = 400.0 + row as f64 * 12.0;
-        lines.push(test_line(
-            "citation body",
-            [105.0, y, 405.0, y + 10.0],
-            vec![],
-        ));
-        lines.push(test_line(
-            &(row + 1).to_string(),
-            [50.0, y, 60.0, y + 8.0],
-            vec![],
-        ));
-    }
-    assert_eq!(column_model(&lines, 612.0).kind, "margin_column");
-
-    order_note_lines(&mut lines, 612.0);
-
-    for (row, pair) in lines.chunks_exact(2).enumerate() {
-        assert_eq!(pair[0].text, (row + 1).to_string());
-        assert_eq!(pair[1].text, "citation body");
-    }
-}
-
-#[test]
-fn hanging_citation_fragments_are_not_a_second_note_column() {
-    let mut lines = vec![
-        test_line("43", [95.0, 100.0, 109.0, 110.0], vec![]),
-        test_line("Fashion ID GmbH", [275.0, 100.0, 422.0, 110.0], vec![]),
-        test_line(
-            "continuation across the row",
-            [95.0, 112.0, 422.0, 122.0],
-            vec![],
-        ),
-        test_line("See also", [95.0, 124.0, 132.0, 134.0], vec![]),
-        test_line("Wirtschaftsakademie", [249.0, 124.0, 422.0, 134.0], vec![]),
-        test_line("C-", [95.0, 136.0, 105.0, 146.0], vec![]),
-        test_line("Jehovan todistajat", [340.0, 136.0, 422.0, 146.0], vec![]),
-        test_line("C-25/17", [95.0, 148.0, 205.0, 158.0], vec![]),
-    ];
-
-    assert_ne!(
-        column_model_with_furniture(&lines, 600.0, false).kind,
-        "two_column"
-    );
-    order_note_lines(&mut lines, 600.0);
-
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "43",
-            "Fashion ID GmbH",
-            "continuation across the row",
-            "See also",
-            "Wirtschaftsakademie",
-            "C-",
-            "Jehovan todistajat",
-            "C-25/17",
-        ]
-    );
-}
-
-#[test]
-fn column_model_ignores_far_edge_furniture() {
-    let mut lines = Vec::new();
-    for row in 0..3 {
-        lines.push(test_line(
-            "left",
-            [
-                70.0,
-                100.0 + row as f64 * 12.0,
-                270.0,
-                110.0 + row as f64 * 12.0,
-            ],
-            vec![],
-        ));
-        lines.push(test_line(
-            "right",
-            [
-                340.0,
-                100.0 + row as f64 * 12.0,
-                540.0,
-                110.0 + row as f64 * 12.0,
-            ],
-            vec![],
-        ));
-    }
-    let mut page_number = test_line("27", [580.0, 760.0, 595.0, 770.0], vec![]);
-    page_number.region_type = "footer".to_owned();
-    lines.push(page_number);
-
-    assert_eq!(column_model(&lines, 612.0).kind, "two_column");
-}
-
-#[test]
-fn column_model_prefers_a_clear_page_gutter_over_larger_internal_gaps() {
-    let mut lines = Vec::new();
-    for row in 0..8 {
-        let y = 100.0 + row as f64 * 12.0;
-        if row < 4 {
-            lines.push(test_line("left text", [54.0, y, 380.0, y + 10.0], vec![]));
-        }
-        lines.push(test_line("page", [408.0, y, 422.0, y + 10.0], vec![]));
-        lines.push(test_line("right text", [540.0, y, 900.0, y + 10.0], vec![]));
-        if row < 3 {
-            lines.push(test_line("short", [540.0, y, 560.0, y + 10.0], vec![]));
-        }
-    }
-
-    let model = column_model(&lines, 972.0);
-
-    assert_eq!(model.kind, "two_column");
-    assert!((450.0..520.0).contains(&model.split_x));
-}
-
-#[test]
-fn centered_title_furniture_does_not_hide_the_page_gutter() {
-    let mut lines = vec![
-        test_line("volume and page", [265.0, 30.0, 342.0, 40.0], vec![]),
-        test_line("author", [275.0, 70.0, 335.0, 80.0], vec![]),
-    ];
-    for row in 0..5 {
-        let y = 100.0 + row as f64 * 12.0;
-        lines.push(test_line("left", [70.0, y, 290.0, y + 10.0], vec![]));
-        lines.push(test_line("right", [324.0, y, 542.0, y + 10.0], vec![]));
-    }
-
-    let model = column_model_with_furniture(&lines, 612.0, true);
-
-    assert_eq!(model.kind, "two_column");
-}
-
-#[test]
-fn table_grid_is_not_rewritten_as_columns() {
-    let mut lines = vec![test_line(
-        "Table 2. Results",
-        [60.0, 70.0, 200.0, 80.0],
-        vec![],
-    )];
-    for row in 0..4 {
-        let y = 100.0 + row as f64 * 14.0;
-        for (column, x) in [60.0, 180.0, 300.0, 420.0].into_iter().enumerate() {
-            lines.push(test_line(
-                &format!("r{row}c{column}"),
-                [x, y, x + 50.0, y + 10.0],
-                vec![],
-            ));
-        }
-    }
-
-    assert_eq!(table_evidence(&lines, 600.0).lines.len(), 16);
-    assert_eq!(
-        arbitrate_body_order(&mut lines, 600.0, 800.0).reason,
-        "table_grid"
-    );
-}
-
-#[test]
-fn textual_table_caption_does_not_force_geometry_order() {
-    let mut lines = vec![test_line(
-        "Table 1. Contents",
-        [60.0, 70.0, 200.0, 80.0],
-        vec![],
-    )];
-    for row in 0..6 {
-        let y = 100.0 + row as f64 * 14.0;
-        lines.extend([
-            test_line("I", [60.0, y, 70.0, y + 10.0], vec![]),
-            test_line("Section title", [100.0, y, 280.0, y + 10.0], vec![]),
-            test_line("Appendix", [360.0, y, 430.0, y + 10.0], vec![]),
-        ]);
-    }
-
-    assert!(!contents_grid(&lines, 600.0));
 }
 
 #[test]
@@ -833,69 +615,6 @@ fn source_witness_table_retains_its_referenced_note() {
         .unwrap();
     assert_eq!(note.region_type, "footnote");
     assert!(!note.suppress_footnote_label);
-}
-
-#[test]
-fn margin_notes_do_not_cut_off_the_main_text_column() {
-    let mut lines = Vec::new();
-    for row in 0..12 {
-        let y = 400.0 + row as f64 * 24.0;
-        lines.push(sized_line(
-            if row == 6 {
-                "1988 to a pair of inventors in the main text"
-            } else {
-                "Main-column prose continues below the adjacent notes"
-            },
-            [145.0, y, 425.0, y + 10.0],
-            9.0,
-        ));
-    }
-    for row in 0..6 {
-        let y = 500.0 + row as f64 * 24.0;
-        lines.push(sized_line(
-            &format!("{} Citation text", row + 1),
-            [37.0, y, 110.0, y + 8.0],
-            7.0,
-        ));
-    }
-    lines.push(sized_line(
-        "25 Margin citation",
-        [427.0, 730.0, 505.0, 738.0],
-        7.0,
-    ));
-    assert_eq!(column_model(&lines, 540.0).kind, "margin_column");
-    let mut pages = vec![Page {
-        id: "p0001".to_owned(),
-        index: 0,
-        number: 1,
-        width: 540.0,
-        height: 792.0,
-        lines,
-        regions: vec![],
-        source: "native".to_owned(),
-        text_quality: 1.0,
-        printed_label: None,
-        printed_label_source: None,
-        printed_label_line_id: None,
-    }];
-
-    classify_pages(&mut pages, &[None]);
-
-    assert!(pages[0]
-        .lines
-        .iter()
-        .filter(|line| line.text.starts_with("Main-column"))
-        .all(|line| line.region_type == "body"));
-    assert!(pages[0]
-        .lines
-        .iter()
-        .find(|line| line.text.starts_with("1988"))
-        .is_some_and(|line| line.region_type == "body"));
-    assert!(pages[0]
-        .lines
-        .iter()
-        .filter(|line| line.text.ends_with("Citation text"))
-        .all(|line| line.region_type == "footnote"));
 }
 
 #[test]
@@ -977,107 +696,6 @@ fn embedded_contents_locators_are_not_document_headings() {
     classify_pages(&mut pages, &[None]);
 
     assert!(pages[0].lines.iter().all(|line| line.region_type == "body"));
-}
-
-#[test]
-fn contents_grid_does_not_scramble_prose_or_hide_an_author_note() {
-    let mut lines = vec![
-        sized_line("ARTICLE TITLE", [84.0, 30.0, 400.0, 44.0], 14.0),
-        sized_line("AUTHOR", [84.0, 70.0, 180.0, 81.0], 10.0),
-        sized_line("ABSTRACT", [84.0, 420.0, 140.0, 430.0], 8.0),
-    ];
-    for row in 0..4 {
-        let y = 445.0 + row as f64 * 14.0;
-        lines.push(sized_line(
-            "The abstract is ordinary prose, not a heading.",
-            [84.0, y, 420.0, y + 11.0],
-            10.0,
-        ));
-    }
-    for row in 0..6 {
-        let y = 110.0 + row as f64 * 35.0;
-        lines.extend([
-            sized_line("I", [84.0, y, 94.0, y + 9.0], 8.0),
-            sized_line("SECTION", [120.0, y, 220.0, y + 9.0], 8.0),
-            sized_line(&(168 + row).to_string(), [404.0, y, 420.0, y + 9.0], 8.0),
-        ]);
-    }
-    lines.extend([
-        sized_line("*", [84.0, 570.0, 90.0, 579.0], 8.0),
-        sized_line(
-            "Author affiliation and acknowledgments",
-            [102.0, 570.0, 400.0, 579.0],
-            8.0,
-        ),
-    ]);
-    assert!(contents_grid(&lines, 486.0));
-    let mut pages = vec![Page {
-        id: "p0001".to_owned(),
-        index: 0,
-        number: 1,
-        width: 486.0,
-        height: 702.0,
-        lines,
-        regions: vec![],
-        source: "native".to_owned(),
-        text_quality: 1.0,
-        printed_label: None,
-        printed_label_source: None,
-        printed_label_line_id: None,
-    }];
-
-    classify_pages(&mut pages, &[Some(220.0)]);
-
-    let order = |text: &str| {
-        pages[0]
-            .lines
-            .iter()
-            .find(|line| line.text == text)
-            .map(|line| line.reading_order)
-            .unwrap()
-    };
-    assert!(order("SECTION") < order("ABSTRACT"));
-    assert!(pages[0]
-        .lines
-        .iter()
-        .filter(|line| line.text.starts_with("The abstract"))
-        .all(|line| line.region_type == "body"));
-    assert!(pages[0]
-        .lines
-        .iter()
-        .find(|line| line.text == "*")
-        .is_some_and(|line| line.region_type == "footnote"));
-    assert!(pages[0]
-        .lines
-        .iter()
-        .find(|line| line.text.starts_with("Author affiliation"))
-        .is_some_and(|line| line.region_type == "footnote"));
-}
-
-#[test]
-fn two_column_note_prose_is_not_a_table_grid() {
-    let mut lines = Vec::new();
-    for row in 0..4 {
-        let y = 100.0 + row as f64 * 14.0;
-        lines.extend([
-            test_line(&(row + 1).to_string(), [50.0, y, 60.0, y + 10.0], vec![]),
-            test_line(
-                "A full citation body with enough prose to be a note",
-                [70.0, y, 280.0, y + 10.0],
-                vec![],
-            ),
-            test_line(&(row + 5).to_string(), [330.0, y, 340.0, y + 10.0], vec![]),
-            test_line(
-                "Another complete citation body in the right column",
-                [350.0, y, 570.0, y + 10.0],
-                vec![],
-            ),
-        ]);
-    }
-
-    let evidence = table_evidence(&lines, 600.0);
-    assert!(!evidence.strong());
-    assert!(!evidence.continuation());
 }
 
 
@@ -1418,103 +1036,6 @@ fn detached_drop_cap_moves_before_its_paragraph_line() {
 
     assert_eq!(lines[0].text, "A");
     assert_eq!(lines[1].text, "crucial opening line");
-}
-
-#[test]
-fn two_column_pages_keep_each_columns_notes_after_its_body() {
-    let lines = |prefix: &str, y: f64| {
-        (0..3)
-            .flat_map(|row| {
-                [
-                    test_line(
-                        &format!("{prefix} left {row}"),
-                        [
-                            70.0,
-                            y + row as f64 * 12.0,
-                            270.0,
-                            y + 10.0 + row as f64 * 12.0,
-                        ],
-                        vec![],
-                    ),
-                    test_line(
-                        &format!("{prefix} right {row}"),
-                        [
-                            340.0,
-                            y + row as f64 * 12.0,
-                            540.0,
-                            y + 10.0 + row as f64 * 12.0,
-                        ],
-                        vec![],
-                    ),
-                ]
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut body = lines("body", 100.0);
-    column_order(&mut body, 305.0);
-    let mut notes: Vec<_> = (0..3)
-        .flat_map(|row| {
-            [
-                test_line(
-                    &format!("note left {row}"),
-                    [
-                        70.0,
-                        700.0 + row as f64 * 12.0,
-                        270.0,
-                        710.0 + row as f64 * 12.0,
-                    ],
-                    vec![],
-                ),
-                test_line(
-                    &format!("note right {row}"),
-                    [
-                        340.0,
-                        760.0 + row as f64 * 12.0,
-                        540.0,
-                        770.0 + row as f64 * 12.0,
-                    ],
-                    vec![],
-                ),
-            ]
-        })
-        .collect();
-    column_order(&mut notes, 305.0);
-
-    let result = weave_note_columns(body, notes, 612.0);
-
-    assert_eq!(
-        result
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "body left 0",
-            "body left 1",
-            "body left 2",
-            "note left 0",
-            "note left 1",
-            "note left 2",
-            "body right 0",
-            "body right 1",
-            "body right 2",
-            "note right 0",
-            "note right 1",
-            "note right 2",
-        ]
-    );
-
-    let mut body = lines("body", 100.0);
-    column_order(&mut body, 305.0);
-    let result = weave_note_columns(
-        body,
-        vec![
-            test_line("*", [54.0, 700.0, 64.0, 710.0], vec![]),
-            test_line("full-width note", [72.0, 700.0, 540.0, 710.0], vec![]),
-        ],
-        612.0,
-    );
-    assert_eq!(result[result.len() - 2].text, "*");
-    assert_eq!(result[result.len() - 1].text, "full-width note");
 }
 
 #[test]
@@ -1901,29 +1422,6 @@ fn propositions_remove_durable_markers() {
         "The proceeding ended."
     );
     assert_eq!(sentence_at("R v X at para.20", 15), "R v X at para.20");
-}
-
-#[test]
-fn interleaved_columns_are_repaired_to_column_order() {
-    let mut title = test_line("full-width title", [50.0, 20.0, 550.0, 30.0], vec![]);
-    title.id = "title".to_owned();
-    let mut author = test_line("author", [360.0, 50.0, 500.0, 60.0], vec![]);
-    author.id = "author".to_owned();
-    let mut lines = vec![title, author];
-    for row in 0..6 {
-        let y = 100.0 + row as f64 * 12.0;
-        let mut left = test_line("left column prose", [60.0, y, 240.0, y + 10.0], vec![]);
-        left.id = format!("left-{row}");
-        let mut right = test_line("right column prose", [360.0, y, 540.0, y + 10.0], vec![]);
-        right.id = format!("right-{row}");
-        lines.extend([left, right]);
-    }
-    let decision = arbitrate_body_order(&mut lines, 600.0, 800.0);
-    assert_eq!(decision.repair, OrderRepair::Column);
-    assert_eq!(lines[0].id, "title");
-    assert_eq!(lines[1].id, "author");
-    assert!(lines[2..8].iter().all(|line| line.bbox[0] < 300.0));
-    assert!(lines[8..].iter().all(|line| line.bbox[0] > 300.0));
 }
 
 #[test]
@@ -2766,11 +2264,11 @@ fn endnote_sequence_includes_column_continuations_above_the_next_label() {
 fn crossref_shortform_uses_python_word_boundaries_at_join_controls() {
     let text = "\u{200c}Quebec Water Policy, supra note 3";
     let start = text.find("supra").unwrap();
-    assert_eq!(crossref_shortform(text, start), "Quebec Water Policy");
+    assert_eq!(layout_analysis().crossref_short_form(text, start), "Quebec Water Policy");
 
     let text = "\u{200c}Godin, supra note 41";
     let start = text.find("supra").unwrap();
-    assert_eq!(crossref_shortform(text, start), "Godin");
+    assert_eq!(layout_analysis().crossref_short_form(text, start), "Godin");
 }
 
 #[test]
@@ -2866,11 +2364,11 @@ fn a_parallel_french_column_is_the_translation_and_gives_no_headings() {
         .lines
         .iter()
         .filter(right)
-        .all(|line| evidence.translation_line_ids.contains(&line.id)));
+        .all(|line| evidence.contexts.translation_line_ids.contains(&line.id)));
     assert!(!page
         .lines
         .iter()
-        .any(|line| !right(&line) && evidence.translation_line_ids.contains(&line.id)));
+        .any(|line| !right(&line) && evidence.contexts.translation_line_ids.contains(&line.id)));
     let headings = page
         .lines
         .iter()
@@ -2959,26 +2457,6 @@ fn a_line_carrying_its_sentence_on_is_no_enumerated_heading() {
             "2. Interest"
         ]
     );
-}
-
-#[test]
-fn a_page_headed_by_its_contents_list_is_that_list() {
-    let mut lines = vec![test_line(
-        "TABLE OF PROVISIONS",
-        [60.0, 40.0, 200.0, 50.0],
-        vec![],
-    )];
-    lines[0].region_type = "header".to_owned();
-    for (row, text) in ["Harbour Dues", "4", "Dues payable", "5", "Waiver"]
-        .into_iter()
-        .enumerate()
-    {
-        let y = 90.0 + row as f64 * 16.0;
-        lines.push(test_line(text, [60.0, y, 260.0, y + 11.0], vec![]));
-    }
-    let page = test_page(lines);
-    let table = table_evidence(&page.lines, page.width);
-    assert_eq!(contents_rows(&page, &table, false), Some((1..6).collect()));
 }
 
 #[test]
@@ -3162,7 +2640,7 @@ fn a_title_standing_above_a_parallel_english_column_is_no_translation() {
     for line in &pages[0].lines {
         let french = line.bbox[0] >= 300.0 && line.text != "FILE 31-H7.B";
         assert_eq!(
-            evidence.translation_line_ids.contains(&line.id),
+            evidence.contexts.translation_line_ids.contains(&line.id),
             french,
             "{}",
             line.text

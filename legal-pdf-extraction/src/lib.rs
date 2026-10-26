@@ -1,7 +1,7 @@
 use legal_pdf_core::{profile, PdfOcrProvider};
 use legal_pdf_extraction_processor as processor;
 
-pub use legal_pdf_extraction_processor::{recognize_pdf, Error, ExtractedPdf, Result};
+pub use legal_pdf_extraction_processor::{mark_rule_underlines, recognize_pdf, Error, ExtractedPdf, Result};
 
 pub fn extract_pdf(
     bytes: &[u8],
@@ -94,7 +94,7 @@ pub fn extract_pdf(
         })
         .unwrap_or_default();
     drop(document);
-    drop((rects, lines));
+    drop(lines);
     let mut extracted = profile::measure("extract.assemble", || {
         processor::assemble_pdf(
             bytes,
@@ -106,6 +106,7 @@ pub fn extract_pdf(
             ocr_pages,
         )
     })?;
+    processor::add_rect_regions(&mut extracted.pages, &page_geometries, &rects);
     extracted.metadata.embedded_page_labels = embedded_page_labels;
     extracted.outline = outline;
     for page in &mut extracted.pages {

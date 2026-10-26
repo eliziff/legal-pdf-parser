@@ -2,20 +2,20 @@
 //! names and its depth, for the bookmark reconciliation to find on that page. Ported from the Open
 //! Access Journals Database's contents-outline witness (`toc_outline_witness.py`): an entry is
 //! confirmed on its destination page, where its title is a heading already or a line that may
-//! become one, and its depth stands only where the list's own hierarchy is coherent.
+//! become one, and its depth stands only where the list's own hierarchy is coherent. The entries
+//! are the contents lists' own (`contents_lists`).
 //!
 //! Resolve within local list and pagination runs using neighboring confirmed body titles.
 //! Repeated titles remain unresolved unless local bounds or agreeing pagination witnesses
-//! identify one actual occurrence. Depth comes from the list's indents, or, where every entry starts at one indent, from the
-//! order in which its enumerator families first appear (PART I, then A., then 1.).
+//! identify one actual occurrence. Depth comes from the heading ladder where the entries are
+//! enumerated or all set at one indent, else from the list's indents.
 
 use super::bookmarks::normalize_title;
-use super::graph::contents_leader_re;
-use super::PdfPrimitiveEvidence;
-use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
-use regex::Regex;
+use super::contents_lists::{row_bands, row_of, Entry};
+use super::heading_rules::{ladder_levels, numbered};
+use super::Claims;
+use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// Indents within this many points are one tier.
 const INDENT_TOLERANCE: f64 = 6.0;
@@ -23,84 +23,14 @@ const INDENT_TOLERANCE: f64 = 6.0;
 const MAX_WRAPPED_ROWS: usize = 3;
 /// The deepest level a contents list sets.
 const MAX_LEVEL: usize = 6;
-
-/// A printed locator closing a row: a page number in arabic or roman figures.
-fn locator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^(?:p(?:age|p?\.)?\s*)?(\d{1,4}|[ivxlcdm]{1,7})$").expect("locator regex")
-    })
-}
-
-/// A leader and the locator after it, at a row's end.
-fn leader_tail_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?:\s*(?:\.\s?){2,}|\s*_{3,}|\s*\u{2026}+)\s*(\S{1,8})\s*$")
-            .expect("leader regex")
-    })
-}
-
-/// The enumerator family an entry's title opens with.
-pub(super) fn family(title: &str) -> &'static str {
-    static FAMILIES: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
-    let families = FAMILIES.get_or_init(|| {
-        [
-            ("unit", r"(?i)^(?:part|chapter|title|book|division)\b"),
-            ("roman", r"^[IVXLC]{1,6}[.)]\s"),
-            ("alpha", r"^[A-Z][.)]\s"),
-            ("numeric", r"^\d{1,3}[.)]\s"),
-            ("dotted", r"^\d{1,3}(?:\.\d{1,3})+\.?\s"),
-            ("lower", r"^\(?[a-z]{1,3}[.)]\s"),
-            ("paren", r"^\(\d{1,3}\)\s"),
-        ]
-        .into_iter()
-        .map(|(name, pattern)| (name, Regex::new(pattern).expect("family regex")))
-        .collect()
-    });
-    families
-        .iter()
-        .find(|(_, pattern)| pattern.is_match(title))
-        .map_or("", |(name, _)| name)
-}
-
-/// A row of the list: its lines read left to right as one text, where it starts, and the locator
-/// set apart at its end, if any.
-struct Row {
-    page_slot: usize,
-    left: f64,
-    title: String,
-    locator: Option<String>,
-}
-
-pub(super) fn row_bands<'a>(lines: &[&'a Line]) -> Vec<Vec<&'a Line>> {
-    // Adjacent lines sharing a baseline band are one row. Preserve column reading order.
-    let mut bands: Vec<Vec<&Line>> = Vec::new();
-    for line in lines {
-        let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
-        match bands.last_mut().filter(|band| {
-            let first = band[0];
-            let height = (first.bbox[3] - first.bbox[1]).max(1.0);
-            ((first.bbox[1] + first.bbox[3]) / 2.0 - middle).abs() <= height / 2.0
-        }) {
-            Some(band) => band.push(line),
-            None => bands.push(vec![line]),
-        }
-    }
-    for band in &mut bands {
-        band.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
-    }
-    bands
-}
-
 /// Contents subheadings use the list's own type size, independently of body prose.
-pub(super) fn retain_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
+pub(super) fn retain_headings(pages: &mut [Page], claims: &mut Claims) {
     for page in pages {
         let lines = page
             .lines
             .iter()
             .filter(|line| {
-                !line.exclude_from_body && primitives.contents_line_ids.contains(&line.id)
+                !line.exclude_from_body && claims.contents_line_ids.contains(&line.id)
             })
             .collect::<Vec<_>>();
         let size = super::median(
@@ -112,7 +42,7 @@ pub(super) fn retain_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveE
         );
         let mut headings = HashSet::new();
         for band in row_bands(&lines) {
-            if row_of(page, 0, band.clone()).locator.is_some() {
+            if row_of(band.clone()).locator.is_some() {
                 continue;
             }
             headings.extend(
@@ -131,19 +61,19 @@ pub(super) fn retain_headings(pages: &mut [Page], primitives: &mut PdfPrimitiveE
             .iter_mut()
             .filter(|line| headings.contains(&line.id))
         {
-            primitives.contents_line_ids.remove(&line.id);
+            claims.contents_line_ids.remove(&line.id);
             line.region_type = "heading".to_owned();
         }
     }
 }
 
 /// A printed marker or completed locator starts the next entry, even when prose geometry joined it.
-pub(super) fn group_rows(pages: &mut [Page], primitives: &PdfPrimitiveEvidence) {
+pub(super) fn group_rows(pages: &mut [Page], claims: &Claims) {
     for page in pages {
         if !page
             .lines
             .iter()
-            .any(|line| primitives.contents_line_ids.contains(&line.id))
+            .any(|line| claims.contents_line_ids.contains(&line.id))
         {
             continue;
         }
@@ -162,22 +92,20 @@ pub(super) fn group_rows(pages: &mut [Page], primitives: &PdfPrimitiveEvidence) 
         let mut groups = HashMap::new();
         for band in row_bands(&lines) {
             if band.iter().any(|line| {
-                line.region_type != "body" || !primitives.contents_line_ids.contains(&line.id)
+                line.region_type != "body" || !claims.contents_line_ids.contains(&line.id)
             }) {
                 open = false;
                 continue;
             }
-            let row = row_of(page, 0, band.clone());
+            let row = row_of(band.clone());
             let first = band[0].text.trim();
             let token = first.split_whitespace().next().unwrap_or("");
             let numeric = token.chars().any(|c| c.is_ascii_digit())
                 && token.chars().all(|c| c.is_ascii_digit() || c == '.');
-            let locator = band.len() == 1
-                && band[0].bbox[0] > page.width * 0.5
-                && locator_re().is_match(first);
+            let locator = band.len() == 1 && band[0].bbox[0] > page.width * 0.5 && row.locator.is_some();
             let marker = !locator
                 && (numeric
-                    || !family(&row.title).is_empty()
+                    || numbered(&row.title)
                     || band.len() > 1
                         && first.chars().count() == 1
                         && first.chars().all(char::is_alphabetic));
@@ -198,188 +126,44 @@ pub(super) fn group_rows(pages: &mut [Page], primitives: &PdfPrimitiveEvidence) 
     }
 }
 
-fn row_of(page: &Page, page_slot: usize, mut band: Vec<&Line>) -> Row {
-    let left = band[0].bbox[0];
-    // A locator alone at the row's right, apart from its title: in the page's right half, or a
-    // gap of its own away (a list set in a narrow column).
-    let apart = band.len() > 1 && {
-        let (last, before) = (band[band.len() - 1], band[band.len() - 2]);
-        let height = (last.bbox[3] - last.bbox[1]).max(1.0);
-        locator_re().is_match(last.text.trim())
-            && (last.bbox[0] > page.width * 0.5 || last.bbox[0] - before.bbox[2] >= 3.0 * height)
-    };
-    let (title_lines, locator) = if apart {
-        let last = band.pop().unwrap();
-        (band, Some(last.text.trim().to_owned()))
-    } else {
-        (band, None)
-    };
-    let mut title = title_lines
-        .iter()
-        .map(|line| line.text.trim())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut locator = locator;
-    if locator.is_none() && contents_leader_re().is_match(&title) {
-        if let Some(captures) = leader_tail_re().captures(&title) {
-            let found = captures[1].to_owned();
-            if locator_re().is_match(&found) {
-                let cut = captures.get(0).unwrap().start();
-                title.truncate(cut);
-                locator = Some(found);
-            }
-        }
-    }
-    let title = title
-        .trim_end_matches(|c: char| c == '.' || c == '_' || c == '\u{2026}' || c.is_whitespace())
-        .trim()
-        .to_owned();
-    Row {
-        page_slot,
-        left,
-        title,
-        locator,
-    }
-}
-
-fn rows_of(page: &Page, page_slot: usize, lines: &[&Line]) -> Vec<Row> {
-    row_bands(lines)
-        .into_iter()
-        .map(|band| row_of(page, page_slot, band))
-        .collect()
-}
-
-/// One entry of the list: its title, the locator it prints, where it starts and on which page of
-/// the list.
-struct Listed {
-    title: String,
-    locator: String,
-    left: f64,
-    page_slot: usize,
-}
-
-fn listed_entries(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<Listed> {
-    let mut entries = Vec::new();
-    for (page_slot, page) in pages.iter().enumerate() {
-        let grid = primitives.contents_pages.contains(&page.index);
-        let lines = page
-            .lines
-            .iter()
-            .filter(|line| {
-                !line.exclude_from_body
-                    && !matches!(line.region_type.as_str(), "header" | "footer")
-                    && line.region_type != "heading"
-                    && !line.text.trim().is_empty()
-                    && (grid || primitives.contents_line_ids.contains(&line.id))
-            })
-            .collect::<Vec<_>>();
-        if lines.is_empty() {
-            continue;
-        }
-        // Rows with no locator are a title wrapping onto the next row that has one; a row that is
-        // only a locator closes the title above it.
-        let mut pending = Vec::<Row>::new();
-        for mut row in rows_of(page, page_slot, &lines) {
-            if row.locator.is_none() && !pending.is_empty() && locator_re().is_match(&row.title) {
-                let last = pending.pop().unwrap();
-                row = Row { locator: Some(row.title), title: last.title, left: last.left, page_slot: last.page_slot };
-            }
-            match row.locator {
-                Some(locator) => {
-                    let (left, title) = match pending.first() {
-                        Some(first) => (
-                            first.left.min(row.left),
-                            pending
-                                .iter()
-                                .map(|row| row.title.as_str())
-                                .chain([row.title.as_str()])
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        ),
-                        None => (row.left, row.title.clone()),
-                    };
-                    pending.clear();
-                    if title.chars().any(char::is_alphabetic) {
-                        entries.push(Listed {
-                            title,
-                            locator,
-                            left,
-                            page_slot: row.page_slot,
-                        });
-                    }
-                }
-                None => {
-                    pending.push(row);
-                    if pending.len() > MAX_WRAPPED_ROWS {
-                        pending.remove(0);
-                    }
-                }
-            }
-        }
-    }
-    entries
-}
-
-/// The level of each entry: where most entries print an enumerator, their level on the heading
-/// ladder the headings themselves are levelled on (`heading_rules::ladder_levels`); else its
-/// indent's tier. A plain title under an enumerated list takes the first level.
-fn levels(entries: &[Listed]) -> Vec<usize> {
-    let rungs = super::heading_rules::ladder_levels(&entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>());
+/// The level of each entry: where most entries print an enumerator, or every entry starts at one
+/// indent, its level on the heading ladder the headings themselves are levelled on
+/// (`heading_rules::ladder_levels`), a plain title taking the first level; else its indent's tier.
+fn levels(entries: &[&Entry]) -> Vec<usize> {
+    let rungs = ladder_levels(&entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(), &[]);
+    let ladder = || -> Vec<usize> { rungs.iter().map(|rung| rung.map_or(1, |(level, _)| level.min(MAX_LEVEL))).collect() };
     if rungs.iter().filter(|rung| rung.is_some()).count() * 2 >= entries.len() {
-        return rungs.iter().map(|rung| rung.map_or(1, |(level, _)| level.min(MAX_LEVEL))).collect();
+        return ladder();
     }
     let mut tiers = entries.iter().map(|entry| entry.left).collect::<Vec<_>>();
     tiers.sort_by(f64::total_cmp);
     tiers.dedup_by(|a, b| (*a - *b).abs() <= INDENT_TOLERANCE);
-    if tiers.len() > 1 {
-        return entries
-            .iter()
-            .map(|entry| {
-                let tier = tiers
-                    .iter()
-                    .position(|tier| entry.left <= tier + INDENT_TOLERANCE)
-                    .unwrap_or(tiers.len() - 1);
-                (tier + 1).min(MAX_LEVEL)
-            })
-            .collect();
+    if tiers.len() < 2 {
+        return ladder();
     }
-    let mut order = Vec::<&str>::new();
     entries
         .iter()
         .map(|entry| {
-            let name = family(&entry.title);
-            if name.is_empty() {
-                return 1;
-            }
-            let at = order
-                .iter()
-                .position(|seen| *seen == name)
-                .unwrap_or_else(|| {
-                    order.push(name);
-                    order.len() - 1
-                });
-            (at + 1).min(MAX_LEVEL)
+            let tier = tiers.iter().position(|tier| entry.left <= tier + INDENT_TOLERANCE).unwrap_or(tiers.len() - 1);
+            (tier + 1).min(MAX_LEVEL)
         })
         .collect()
 }
 
-fn arabic(locator: &str) -> Option<i64> {
-    let digits = locator.trim_start_matches(|c: char| !c.is_ascii_digit());
-    digits.parse::<i64>().ok().filter(|_| !digits.is_empty())
+/// A locator's page number: its first run of figures ("p. 12", "12 - 14").
+fn arabic(locator: Option<&str>) -> Option<i64> {
+    let digits = locator?.trim_start_matches(|c: char| !c.is_ascii_digit());
+    digits.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
-
-#[derive(Clone)]
-struct Target { slot: usize }
-
 /// The page slot of every run of up to `MAX_WRAPPED_ROWS` lines set outside the contents and its
 /// furniture, by the run's normalized text, each start counted once and in reading order.
-fn titles_by_text(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashMap<String, Vec<usize>> {
+fn titles_by_text(pages: &[Page], claims: &Claims) -> HashMap<String, Vec<usize>> {
     let mut titles = HashMap::<String, Vec<usize>>::new();
     for (slot, page) in pages.iter().enumerate() {
         let norms = page.lines.iter().map(|line| {
             let outside = !(line.exclude_from_body || matches!(line.region_type.as_str(), "header" | "footer")
-                || primitives.contents_line_ids.contains(&line.id)
-                || primitives.contents_pages.contains(&page.index));
+                || claims.contents_line_ids.contains(&line.id)
+                || claims.contents_pages.contains(&page.index));
             outside.then(|| normalize_title(&line.text))
         }).collect::<Vec<_>>();
         for start in 0..norms.len() {
@@ -399,59 +183,66 @@ fn titles_by_text(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> HashMap<
 }
 
 /// Each local contents run uses its own confirmed destinations and pagination relationships.
-pub(super) fn contents_outline(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<PdfOutlineEntry> {
-    let listed = listed_entries(pages, primitives);
+pub(super) fn contents_outline(pages: &[Page], claims: &Claims) -> Vec<PdfOutlineEntry> {
+    // The entries listed on these pages, each with its page's slot among them.
+    let slots: HashMap<usize, usize> = pages.iter().enumerate().map(|(slot, page)| (page.index, slot)).collect();
+    let listed: Vec<(usize, &Entry)> = claims
+        .contents_entries
+        .iter()
+        .filter(|entry| entry.title.chars().any(char::is_alphabetic))
+        .filter_map(|entry| slots.get(&entry.page_index).map(|&slot| (slot, entry)))
+        .collect();
     if listed.is_empty() {
         return Vec::new();
     }
-    let titles = titles_by_text(pages, primitives);
+    let titles = titles_by_text(pages, claims);
     let mut result = Vec::new();
     let mut first = 0;
     while first < listed.len() {
         let mut last = first + 1;
         while last < listed.len() {
-            let previous = &listed[last - 1]; let current = &listed[last];
-            if current.page_slot > previous.page_slot + 1
-                || arabic(&previous.locator).zip(arabic(&current.locator)).is_some_and(|(a,b)| b < a) { break; }
+            let ((previous_slot, previous), (slot, current)) = (listed[last - 1], listed[last]);
+            if slot > previous_slot + 1
+                || arabic(previous.locator.as_deref()).zip(arabic(current.locator.as_deref())).is_some_and(|(a, b)| b < a)
+            {
+                break;
+            }
             last += 1;
         }
-        let entries = &listed[first..last];
-        let after = entries.iter().map(|entry| entry.page_slot).max().unwrap() + 1;
+        let entries: Vec<&Entry> = listed[first..last].iter().map(|(_, entry)| *entry).collect();
+        let after = listed[first..last].iter().map(|(slot, _)| *slot).max().unwrap() + 1;
         let hits = entries.iter().map(|entry| {
             let wanted = normalize_title(&entry.title);
             if wanted.chars().count() < 3 { return Vec::new(); }
-            titles.get(&wanted).map_or_else(Vec::new, |slots| slots.iter()
-                .filter(|slot| **slot >= after).map(|&slot| Target { slot }).collect())
-        }).collect::<Vec<_>>();
+            titles.get(&wanted).map_or_else(Vec::new, |slots| slots.iter().copied().filter(|slot| *slot >= after).collect())
+        }).collect::<Vec<Vec<usize>>>();
         // A unique printed title is a confirmed anchor. Offset agreement is local to neighbouring anchors.
-        let anchors = hits.iter().enumerate().filter_map(|(i,hits)|
-            (hits.len()==1).then(|| (i,hits[0].slot))).collect::<Vec<_>>();
-        let levels = levels(entries);
-        for (i,entry) in entries.iter().enumerate() {
-            let before = anchors.iter().rev().find(|(index,_)| *index < i);
-            let following = anchors.iter().find(|(index,_)| *index > i);
-            let offset = |anchor: &(usize,usize)| arabic(&entries[anchor.0].locator)
+        let anchors = hits.iter().enumerate().filter_map(|(i, hits)| (hits.len() == 1).then(|| (i, hits[0]))).collect::<Vec<_>>();
+        let levels = levels(&entries);
+        for (i, entry) in entries.iter().enumerate() {
+            let before = anchors.iter().rev().find(|(index, _)| *index < i);
+            let following = anchors.iter().find(|(index, _)| *index > i);
+            let offset = |anchor: &(usize, usize)| arabic(entries[anchor.0].locator.as_deref())
                 .map(|printed| pages[anchor.1].index as i64 - (printed - 1));
-            let agreed = match (before,following) {
-                (Some(left),Some(right)) => offset(left).filter(|value| Some(*value)==offset(right)),
-                (Some(left),None) => offset(left).filter(|value| anchors.iter().any(|other|
-                    other.0 < left.0 && offset(other)==Some(*value))),
-                (None,Some(right)) => offset(right).filter(|value| anchors.iter().any(|other|
-                    other.0 > right.0 && offset(other)==Some(*value))),
+            let agreed = match (before, following) {
+                (Some(left), Some(right)) => offset(left).filter(|value| Some(*value) == offset(right)),
+                (Some(left), None) => offset(left).filter(|value| anchors.iter().any(|other|
+                    other.0 < left.0 && offset(other) == Some(*value))),
+                (None, Some(right)) => offset(right).filter(|value| anchors.iter().any(|other|
+                    other.0 > right.0 && offset(other) == Some(*value))),
                 _ => None,
             };
-            let candidates = hits[i].iter().filter(|hit|
-                before.is_none_or(|(_,slot)| hit.slot >= *slot)
-                    && following.is_none_or(|(_,slot)| hit.slot <= *slot)
-                    && (hits[i].len()==1 || agreed.zip(arabic(&entry.locator)).is_none_or(|(offset,printed)|
-                        pages[hit.slot].index as i64 == printed - 1 + offset)))
+            let candidates = hits[i].iter().filter(|&&hit|
+                before.is_none_or(|(_, slot)| hit >= *slot)
+                    && following.is_none_or(|(_, slot)| hit <= *slot)
+                    && (hits[i].len() == 1 || agreed.zip(arabic(entry.locator.as_deref())).is_none_or(|(offset, printed)|
+                        pages[hit].index as i64 == printed - 1 + offset)))
                 .collect::<Vec<_>>();
-            let target = (candidates.len()==1).then(|| candidates[0]);
-            if let Some(target) = target {
-                result.push(PdfOutlineEntry { title: entry.title.clone(), level: levels[i], page_index: pages[target.slot].index });
+            if let [&target] = candidates.as_slice() {
+                result.push(PdfOutlineEntry { title: entry.title.clone(), level: levels[i], page_index: pages[target].index });
             }
         }
-        first=last;
+        first = last;
     }
     result
 }

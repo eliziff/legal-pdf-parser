@@ -14,7 +14,7 @@
 //! end and an indent open a paragraph; a line going on with a sentence or a hyphened word opens
 //! nothing.
 
-use legal_pdf_core::{line_font_size, Line, Page};
+use legal_pdf_core::{flag_share, line_font_size, median, quantile, Line, Page, BOLD, ITALIC};
 use regex::Regex;
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -52,9 +52,15 @@ fn noted_terminal_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?\\d{1,3}\\*?$").unwrap())
 }
 
-fn leader_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(\.\s*){4,}\s*\S{1,6}\s*$").unwrap())
+
+/// A contents entry's leader: dots running to the line's end or to the locator that ends it (dots
+/// inside a line are an ellipsis), or a rule before a locator (alone it is a form's blank).
+pub(crate) fn contents_leader_re() -> &'static Regex {
+    static LEADER: OnceLock<Regex> = OnceLock::new();
+    LEADER.get_or_init(|| {
+        Regex::new(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
+            .expect("contents leader regex")
+    })
 }
 
 fn size(line: &Line) -> f64 {
@@ -75,11 +81,6 @@ fn scanned(line: &Line) -> bool {
     line.ocr.is_some() || line.spans.is_empty() || line.cap_height > 0.0
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
-    values.sort_by(f64::total_cmp);
-    values.get(values.len() / 2).copied().unwrap_or(0.0)
-}
-
 fn width(line: &Line) -> f64 {
     line.bbox[2] - line.bbox[0]
 }
@@ -90,19 +91,7 @@ fn char_width(line: &Line) -> f64 {
 
 /// Shares of the line's visible characters set in bold and italic, when its spans say.
 fn font_shares(line: &Line) -> Option<(f64, f64)> {
-    let (mut total, mut bold, mut italic) = (0, 0, 0);
-    for span in &line.spans {
-        let count = span.text.trim().chars().count();
-        total += count;
-        let font = span.font.to_ascii_lowercase();
-        if span.flags & 16 != 0 || ["bold", "black", "heavy"].iter().any(|w| font.contains(w)) {
-            bold += count;
-        }
-        if span.flags & 2 != 0 || font.contains("ital") || font.contains("oblique") {
-            italic += count;
-        }
-    }
-    (total > 0).then(|| (bold as f64 / total as f64, italic as f64 / total as f64))
+    Some((flag_share(line, BOLD)?, flag_share(line, ITALIC)?))
 }
 
 fn first_word_width(line: &Line) -> f64 {
@@ -197,14 +186,13 @@ pub(crate) struct Measure {
 }
 
 pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> Measure {
-    let mut widths: Vec<f64> = pages
+    let widths: Vec<f64> = pages
         .iter()
         .flat_map(|page| page.lines.iter())
         .filter(|line| counted(line))
         .map(width)
         .collect();
-    widths.sort_by(f64::total_cmp);
-    let width = widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0);
+    let width = quantile(widths, 0.9);
     let scans = || {
         pages.iter().map(|page| {
             page.lines
@@ -245,15 +233,6 @@ impl Pitch {
                     .push(pitch);
             }
         }
-        let median = |mut values: Vec<f64>| {
-            values.sort_by(f64::total_cmp);
-            let n = values.len();
-            if n % 2 == 1 {
-                values[n / 2]
-            } else {
-                (values[n / 2 - 1] + values[n / 2]) / 2.0
-            }
-        };
         let all: Vec<f64> = samples.values().flatten().copied().collect();
         let mut lefts: HashMap<i64, (usize, f64)> = HashMap::new();
         for line in lines {
@@ -434,10 +413,10 @@ fn starts_paragraph(
         return Some("bullet");
     }
     // A contents entry ends at its leader and page number; its earlier lines wrap short of that column.
-    if leader_re().is_match(&a.text) {
+    if contents_leader_re().is_match(&a.text) {
         return Some("leader");
     }
-    if leader_re().is_match(&b.text) {
+    if contents_leader_re().is_match(&b.text) {
         return None;
     }
     let cw = char_width(a);

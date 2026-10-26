@@ -217,7 +217,7 @@ fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
 /// ([`strip_repeated_lines`]); shorter documents carry no repetition signal
 /// and fall back to per-page positional and typographic evidence
 /// ([`strip_edge_furniture`]).
-pub(crate) fn strip_header_footer_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
+pub fn strip_header_footer_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
     if lines.is_empty() {
         return lines;
     }

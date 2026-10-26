@@ -2,9 +2,9 @@ use crate::{Error, Result};
 use legal_pdf_core::model::{
     Diagnostic, Line, Page, PdfExtractionMetadata, PdfOutlineEntry, Span, Word,
 };
-use legal_pdf_core::{profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
+use legal_pdf_core::{median, profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
 use lopdf::{Document, Object, ObjectId};
-use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, TextItem, TextLine};
+use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, PdfRect, TextItem, TextLine};
 use pdf_inspector::PdfTypeResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -43,58 +43,14 @@ pub struct PageGeometry {
 
 pub type PageGeometryMap = BTreeMap<u32, (ObjectId, PageGeometry)>;
 
-fn number(value: &Object) -> Option<f64> {
-    match value {
-        Object::Integer(value) => Some(*value as f64),
-        Object::Real(value) => Some(f64::from(*value)),
-        _ => None,
-    }
-}
-
-fn inherited_object<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a Object> {
-    for _ in 0..32 {
-        let dictionary = doc.get_dictionary(id).ok()?;
-        if let Ok(value) = dictionary.get(key) {
-            return Some(value);
-        }
-        match dictionary.get(b"Parent") {
-            Ok(Object::Reference(parent)) => id = *parent,
-            _ => return None,
-        }
-    }
-    None
-}
-
-fn resolve_array<'a>(doc: &'a Document, value: &'a Object) -> Option<&'a [Object]> {
-    match value {
-        Object::Array(values) => Some(values),
-        Object::Reference(id) => match doc.get_object(*id).ok()? {
-            Object::Array(values) => Some(values),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
+/// The page's visible box and turn as pdf-inspector reads them (the CropBox clipped to the
+/// MediaBox, indirect values resolved, the turn snapped to a right angle), Letter where the page
+/// names none.
 fn page_geometry(doc: &Document, id: ObjectId) -> PageGeometry {
-    let bounds = inherited_object(doc, id, b"CropBox")
-        .or_else(|| inherited_object(doc, id, b"MediaBox"))
-        .and_then(|value| resolve_array(doc, value))
-        .and_then(|values| {
-            let mut numbers = values.iter().filter_map(number);
-            let (x0, y0, x1, y1) = (
-                numbers.next()?,
-                numbers.next()?,
-                numbers.next()?,
-                numbers.next()?,
-            );
-            Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
-        })
-        .unwrap_or([0.0, 0.0, 612.0, 792.0]);
-    let rotation = inherited_object(doc, id, b"Rotate")
-        .and_then(number)
-        .map_or(0, |value| value.round() as i32)
-        .rem_euclid(360);
+    let bounds = pdf_inspector::extractor::visible_page_box(doc, id).map_or([0.0, 0.0, 612.0, 792.0], |page| {
+        [f64::from(page.x0), f64::from(page.y0), f64::from(page.x1), f64::from(page.y1)]
+    });
+    let rotation = pdf_inspector::extractor::page_rotate(doc, id).degrees() as i32;
     let raw_width = (bounds[2] - bounds[0]).max(0.0);
     let raw_height = (bounds[3] - bounds[1]).max(0.0);
     let (width, height) = if matches!(rotation, 90 | 270) {
@@ -269,36 +225,19 @@ fn transform_item(item: &mut TextItem, geometry: PageGeometry) {
     item.height = (y1.min(geometry.height) - f64::from(item.y)).max(0.0) as f32;
 }
 
-/// Text set through a symbol-encoded font map extracts as private-use code points, U+F000 plus
-/// the character's byte. A text face's are its ASCII characters; Symbol's space, digits and
-/// punctuation are ASCII's too (a folio "- 5 -"); a dingbat face's are pictures and stay. One
-/// character for one, so the item's glyphs keep their places.
+/// The fidelity text is the font's own decoding: read its symbol-font private-use codes and
+/// misnamed math glyphs as pdf-inspector's presentation text does, glyph by glyph. One character
+/// for one, so the item's glyphs keep their places.
 fn unmap_symbol_text(item: &mut TextItem) {
-    let font = item.font.to_ascii_lowercase();
-    if ["wingding", "webding", "dingbat"].iter().any(|face| font.contains(face)) {
-        return;
-    }
-    let symbol = font.contains("symbol");
-    let ascii = |character: char| {
-        let code = u32::from(character);
-        let byte = char::from_u32(code.wrapping_sub(0xF000)).filter(|_| (0xF020..=0xF07E).contains(&code));
-        byte.filter(|byte| {
-            !symbol
-                || matches!(byte, ' ' | '!' | '#' | '%' | '&' | '(' | ')' | '+' | ',' | '-' | '.' | '/'
-                    | '0'..='9' | ':' | ';' | '<' | '=' | '>' | '?' | '[' | ']' | '_' | '{' | '|' | '}')
-        })
-        .unwrap_or(character)
+    let font = Some(item.font.as_str());
+    let clean = |text: &mut String| {
+        *text = pdf_inspector::extractor::clean_symbol_pua(std::mem::take(text), font).0;
     };
-    let unmap = |text: &mut String| {
-        if text.chars().any(|character| ('\u{f020}'..='\u{f07e}').contains(&character)) {
-            *text = text.chars().map(ascii).collect();
-        }
-    };
-    unmap(&mut item.text);
+    clean(&mut item.text);
     if let Some(fidelity) = item.fidelity.as_mut() {
-        unmap(&mut fidelity.text);
+        clean(&mut fidelity.text);
         for glyph in &mut fidelity.glyphs {
-            unmap(&mut glyph.text);
+            clean(&mut glyph.text);
         }
     }
 }
@@ -719,25 +658,6 @@ fn assemble_line(text_line: &TextLine) -> AssembledLine {
     }
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let middle = values.len() / 2;
-    let (_, right, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
-    let right = *right;
-    if values.len().is_multiple_of(2) {
-        let left = values[..middle]
-            .iter()
-            .copied()
-            .max_by(f64::total_cmp)
-            .unwrap();
-        (left + right) / 2.0
-    } else {
-        right
-    }
-}
-
 fn is_superscript(item: &TextItem, body_size: f64, baseline: f64, inline: bool) -> bool {
     let literal = item.text.trim().chars().all(|character| {
         matches!(
@@ -839,6 +759,10 @@ struct PositionedGlyph {
     start: usize,
     end: usize,
     bbox: [f64; 4],
+    /// Its run is underlined, as pdf-inspector reads the page's rules.
+    underlined: bool,
+    /// Its run is struck through, as pdf-inspector reads the page's rules.
+    struck: bool,
 }
 
 fn line_glyphs(
@@ -890,6 +814,8 @@ fn line_glyphs(
                     round3(f64::from(glyph.bbox[2])),
                     round3(page_height - f64::from(glyph.bbox[1])),
                 ],
+                underlined: item.is_underline,
+                struck: item.is_strikeout,
             });
         }
     }
@@ -927,20 +853,21 @@ fn line_words(
                 {
                     glyph_index += 1;
                 }
-                let mut boxes = glyphs[glyph_index..]
-                    .iter()
-                    .take_while(|glyph| glyph.start < end)
-                    .map(|glyph| glyph.bbox);
-                let Some(first) = boxes.next() else {
+                let covered: Vec<&PositionedGlyph> = glyphs[glyph_index..].iter().take_while(|glyph| glyph.start < end).collect();
+                let Some(first) = covered.first().map(|glyph| glyph.bbox) else {
                     return Vec::new();
                 };
+                let boxes = covered[1..].iter().map(|glyph| glyph.bbox);
+                let underlined = covered.iter().filter(|glyph| glyph.underlined).count() * 2 > covered.len();
+                let struck = covered.iter().filter(|glyph| glyph.struck).count() * 2 > covered.len();
                 words.push(Word {
                     id: format!("{id}-w{:03}", words.len() + 1),
                     text: text[begin..byte].to_owned(),
                     bbox: union_bbox(std::iter::once(first).chain(boxes)),
                     start,
                     end,
-                    underlined: false,
+                    underlined,
+                    struck,
                     weight: 0.0,
                 });
             }
@@ -1066,6 +993,89 @@ fn rule_regions(
             }
         })
         .collect()
+}
+
+/// Mark the words a horizontal rule on their page underlines: painted in the PDF, or drawn on a
+/// recognized page's image. A typeset word pdf-inspector read as underlined with its text stays
+/// underlined; the rule finds the underlines it misses.
+pub fn mark_rule_underlines(page: &mut Page) {
+    let rules = page
+        .regions
+        .iter()
+        .filter(|region| region.kind == "rule")
+        .map(|region| region.bbox)
+        .filter(|[x0, y0, x1, y1]| (y1 - y0).abs() <= 2.0 && (x1 - x0).abs() > 2.0)
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return;
+    }
+    for line in &mut page.lines {
+        let height = (line.bbox[3] - line.bbox[1]).max(1.0);
+        for word in &mut line.words {
+            word.underlined |= rules.iter().any(|rule| {
+                underlines(word.bbox, height, rule[0].min(rule[2]), rule[0].max(rule[2]), (rule[1] + rule[3]) / 2.0)
+            });
+        }
+    }
+}
+
+/// Whether a horizontal stroke from `start` to `end` at height `at` underlines a word box: set
+/// from a third of its line's height above the word's bottom to half below, across most of it.
+fn underlines(word: [f64; 4], line_height: f64, start: f64, end: f64, at: f64) -> bool {
+    let width = (word[2] - word[0]).max(1.0);
+    at >= word[3] - 0.3 * line_height
+        && at <= word[3] + 0.5 * line_height
+        && end.min(word[2]) - start.max(word[0]) >= 0.6 * width
+}
+
+/// Add each page's painted rectangles (`re`: filled cells and shading, boxes drawn as borders) as
+/// regions of kind `rect` after its rules, `bbox` the rectangle in page coordinates. A rectangle
+/// covering the whole page is its background, not a drawing on it, and a rectangle painted again
+/// where it already stands adds nothing: neither is kept.
+pub fn add_rect_regions(pages: &mut [Page], geometries: &PageGeometryMap, rects: &[PdfRect]) {
+    let mut by_page = HashMap::<u32, Vec<&PdfRect>>::new();
+    for rect in rects {
+        by_page.entry(rect.page).or_default().push(rect);
+    }
+    for page in pages {
+        let (Some(&(_, geometry)), Some(rects)) =
+            (geometries.get(&page.number), by_page.get(&page.number))
+        else {
+            continue;
+        };
+        let regions: Vec<_> = rects
+            .iter()
+            .filter_map(|rect| {
+                let (x1, y1) = transform_point(geometry, f64::from(rect.x), f64::from(rect.y));
+                let (x2, y2) = transform_point(
+                    geometry,
+                    f64::from(rect.x + rect.width),
+                    f64::from(rect.y + rect.height),
+                );
+                let (y1, y2) = (geometry.height - y1, geometry.height - y2);
+                let bbox = [x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)].map(round3);
+                let background = bbox[2] - bbox[0] >= page.width * 0.95 && bbox[3] - bbox[1] >= page.height * 0.95;
+                (bbox.iter().all(|value| value.is_finite()) && !background).then_some(bbox)
+            })
+            .fold(Vec::<[f64; 4]>::new(), |mut kept, bbox| {
+                if !kept.contains(&bbox) {
+                    kept.push(bbox);
+                }
+                kept
+            })
+            .into_iter()
+            .enumerate()
+            .map(|(index, bbox)| legal_pdf_core::model::Region {
+                id: format!("p{:04}-rect{:04}", page.number, index + 1),
+                page_index: page.index,
+                kind: "rect".to_owned(),
+                line_ids: Vec::new(),
+                bbox,
+                reading_order: 0,
+            })
+            .collect();
+        page.regions.extend(regions);
+    }
 }
 
 fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLine]) -> Option<f64> {
@@ -1293,6 +1303,7 @@ fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Lin
             start: word.start - shift,
             end: word.end - shift,
             underlined: false,
+            struck: false,
             weight: 0.0,
         })
         .collect();
@@ -1401,6 +1412,8 @@ fn layer_reads_well(lines: &[Line]) -> bool {
     !rejected && share <= 0.1
 }
 
+/// How much printable text a page holds; decoding garbage is pdf-inspector's verdict, folded in
+/// where the page is assembled.
 fn text_quality(lines: &[Line]) -> f64 {
     // Python's str.isprintable accepts Unicode L/M/N/P/S plus ASCII space,
     // and rejects every other separator/control/format/private/unassigned
@@ -1410,7 +1423,6 @@ fn text_quality(lines: &[Line]) -> f64 {
         PRINTABLE.get_or_init(|| Regex::new(r"[\p{L}\p{M}\p{N}\p{P}\p{S} ]").expect("valid regex"));
     let mut count = lines.len().saturating_sub(1);
     let mut printable_count = 0;
-    let mut replacements = 0;
     let mut trimmed = 0;
     let mut trailing_whitespace = 0;
     let mut has_text = false;
@@ -1421,7 +1433,6 @@ fn text_quality(lines: &[Line]) -> f64 {
         }
         for character in line.text.chars() {
             count += 1;
-            replacements += usize::from(character == '\u{fffd}');
             if character.is_whitespace() {
                 trailing_whitespace += usize::from(has_text);
             } else {
@@ -1431,13 +1442,9 @@ fn text_quality(lines: &[Line]) -> f64 {
             }
         }
     }
-    let count = count.max(1) as f64;
-    let replacement_share = replacements as f64 / count;
-    let printable_share = printable_count as f64 / count;
+    let printable_share = printable_count as f64 / count.max(1) as f64;
     let quantity = (trimmed as f64 / 100.0).min(1.0);
-    ((quantity * printable_share * (1.0 - (replacement_share * 20.0).min(1.0))).max(0.0) * 10_000.0)
-        .round_ties_even()
-        / 10_000.0
+    ((quantity * printable_share).max(0.0) * 10_000.0).round_ties_even() / 10_000.0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1454,20 +1461,12 @@ pub struct ExtractedPdf {
     pub image_regions: BTreeMap<usize, Vec<[f64; 4]>>,
 }
 
+/// The document as pdf-inspector loads it (bytes before the header dropped, bare struct names
+/// mended, broken containers repaired, encryption opened), its vast null arrays pruned.
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
-    if let Some(mut document) = Document::load_mem(bytes)
-        .ok()
-        .filter(|document| !document.is_encrypted() && !document.get_pages().is_empty())
-    {
-        document
-            .objects
-            .values_mut()
-            .for_each(prune_extraction_object);
-        return Ok(document);
-    }
-    pdf_inspector::load_document_from_mem(bytes)
-        .map(|value| value.0)
-        .map_err(Into::into)
+    let (mut document, _) = pdf_inspector::load_document_from_mem(bytes)?;
+    document.objects.values_mut().for_each(prune_extraction_object);
+    Ok(document)
 }
 
 pub fn page_geometries(document: &Document) -> PageGeometryMap {
@@ -1537,7 +1536,11 @@ pub fn assemble_pdf(
                 lines.push(line);
             }
         }
-        let quality = text_quality(&lines);
+        // A page pdf-inspector reads as decoding garbage holds no usable text, whatever prints.
+        let garbled = detection.ocr_reasons_by_page.get(&number).is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT)
+        });
+        let quality = if garbled { 0.0 } else { text_quality(&lines) };
         // A scan's invisible text layer that reads poorly is recognized again.
         if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) && !layer_reads_well(&lines) {
             weak_pages.insert(page_index);

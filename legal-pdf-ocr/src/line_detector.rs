@@ -30,12 +30,21 @@ impl LineDetector {
                 independent_pool,
             )?,
             side,
+            #[cfg(feature = "attribution")]
+            core_boxes: Vec::new(),
         }))
     }
 
     pub fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
         match self {
             Self::Indra(detector) => detector.lines(image),
+        }
+    }
+
+    #[cfg(feature = "attribution")]
+    pub(crate) fn core_boxes(&self) -> &[LineBox] {
+        match self {
+            Self::Indra(detector) => &detector.core_boxes,
         }
     }
 
@@ -64,6 +73,8 @@ impl LineDetector {
 pub(crate) struct IndraDetector {
     session: Session,
     side: usize,
+    #[cfg(feature = "attribution")]
+    core_boxes: Vec<LineBox>,
 }
 
 impl IndraDetector {
@@ -110,6 +121,10 @@ impl IndraDetector {
             height as usize,
         );
         xycut(&mut boxes);
+        #[cfg(feature = "attribution")]
+        {
+            self.core_boxes = boxes.clone();
+        }
         let boxes = crate::uncovered::recover_uncovered_lines(
             image.as_raw(),
             width as usize,

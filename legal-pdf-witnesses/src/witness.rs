@@ -1,6 +1,7 @@
 //! Every counted line's witnesses, read against its page and its document.
 
 use legal_pdf_core::model::{Line, Page};
+use legal_pdf_core::{flag_share, median, BOLD, ITALIC};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -273,28 +274,11 @@ fn counted(line: &Line) -> bool {
 }
 
 fn bold(line: &Line) -> Option<bool> {
-    let spans = line
-        .spans
-        .iter()
-        .filter(|span| !span.text.trim().is_empty())
-        .collect::<Vec<_>>();
-    (!spans.is_empty()).then(|| {
-        spans
-            .iter()
-            .all(|span| span.flags & 16 != 0 || span.font.to_lowercase().contains("bold"))
-    })
+    flag_share(line, BOLD).map(|share| share == 1.0)
 }
 
 fn italic(line: &Line) -> bool {
-    let spans = line
-        .spans
-        .iter()
-        .filter(|span| !span.text.trim().is_empty())
-        .collect::<Vec<_>>();
-    !spans.is_empty()
-        && spans
-            .iter()
-            .all(|span| span.flags & 2 != 0 || span.font.to_lowercase().contains("ital"))
+    flag_share(line, ITALIC) == Some(1.0)
 }
 
 pub(crate) fn size(line: &Line) -> f64 {
@@ -318,14 +302,6 @@ fn underlined(line: &Line) -> f32 {
     } else {
         marked as f32 / total as f32
     }
-}
-
-pub(crate) fn median(mut values: Vec<f64>) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
 }
 
 fn normal(text: &str) -> String {

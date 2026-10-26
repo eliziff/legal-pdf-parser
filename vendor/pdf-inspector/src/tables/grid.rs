@@ -422,6 +422,7 @@ pub(crate) fn recover_header_row(
     let mut header_cells: Vec<String> = vec![String::new(); num_cols];
     let mut mapped_count = 0;
     let mut header_indices = Vec::new();
+    let mut header_item_cells = Vec::new();
 
     for (idx, item) in header_items {
         if let Some(col) = find_column_index(&table.columns, item.x) {
@@ -433,6 +434,7 @@ pub(crate) fn recover_header_row(
                 header_cells[col].push_str(text);
                 mapped_count += 1;
                 header_indices.push(*idx);
+                header_item_cells.push((*idx, 0, col));
             }
         }
     }
@@ -447,6 +449,10 @@ pub(crate) fn recover_header_row(
     table.rows.insert(0, *header_y);
     table.cells.insert(0, header_cells);
     table.item_indices.extend(header_indices);
+    for placed in &mut table.item_cells {
+        placed.1 += 1;
+    }
+    table.item_cells.extend(header_item_cells);
 }
 
 #[cfg(test)]
@@ -686,6 +692,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -705,6 +712,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![0, 1],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -730,6 +738,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -751,6 +760,7 @@ mod tests {
             rows: vec![500.0, 480.0],
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -772,6 +782,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![1, 2],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -788,6 +799,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 

@@ -10,7 +10,7 @@ use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use super::cell_text::{cell_fragment, join_cell_items, push_cell_item};
-use super::detect_rects::{assign_items_to_grid, snap_edges};
+use super::detect_rects::{assign_items_to_grid_cells, snap_edges};
 
 const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
@@ -323,6 +323,12 @@ fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule])
         .collect();
     item_indices.sort_unstable();
     item_indices.dedup();
+    // The first row's token heads the table; every row below is its value.
+    let item_cells: Vec<(usize, usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(row, (_, items))| items.iter().map(move |(index, _)| (*index, 0, usize::from(row > 0))))
+        .collect();
 
     let x_min = rules
         .iter()
@@ -333,12 +339,15 @@ fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule])
         .map(|rule| rule.2)
         .fold(f32::NEG_INFINITY, f32::max);
     let split = x_min + (x_max - x_min) * 0.35;
-    Some(Table::new(
-        vec![x_min, split, x_max],
-        vec![rows[0].0],
-        vec![vec![header, value]],
-        item_indices,
-    ))
+    Some(
+        Table::new(
+            vec![x_min, split, x_max],
+            vec![rows[0].0],
+            vec![vec![header, value]],
+            item_indices,
+        )
+        .with_item_cells(item_cells),
+    )
 }
 
 fn build_text_anchor_table(
@@ -447,6 +456,7 @@ fn build_text_anchor_table(
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
     let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
+    let mut item_cells = Vec::new();
     let mut wide_items = 0usize;
     let mut measured_items = 0usize;
     let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
@@ -474,6 +484,7 @@ fn build_text_anchor_table(
                 item.text.trim(),
             );
             item_indices.push(*item_index);
+            item_cells.push((*item_index, row_index, column));
         }
     }
     item_indices.sort_unstable();
@@ -559,12 +570,15 @@ fn build_text_anchor_table(
         return None;
     }
 
-    Some(Table::new(
-        columns,
-        rows.iter().map(|(y, _)| *y).collect(),
-        cells,
-        item_indices,
-    ))
+    Some(
+        Table::new(
+            columns,
+            rows.iter().map(|(y, _)| *y).collect(),
+            cells,
+            item_indices,
+        )
+        .with_item_cells(item_cells),
+    )
 }
 
 fn detect_text_anchor_rule_tables(
@@ -874,6 +888,7 @@ fn build_dense_row_anchor_table(
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
     let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
+    let mut item_cells = Vec::new();
     let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
@@ -888,6 +903,7 @@ fn build_dense_row_anchor_table(
                 item.text.trim(),
             );
             item_indices.push(*item_index);
+            item_cells.push((*item_index, row_index, column));
         }
     }
     item_indices.sort_unstable();
@@ -908,12 +924,15 @@ fn build_dense_row_anchor_table(
         return None;
     }
 
-    Some(Table::new(
-        columns,
-        rows.iter().map(|(y, _)| *y).collect(),
-        cells,
-        item_indices,
-    ))
+    Some(
+        Table::new(
+            columns,
+            rows.iter().map(|(y, _)| *y).collect(),
+            cells,
+            item_indices,
+        )
+        .with_item_cells(item_cells),
+    )
 }
 
 /// Recover grids whose horizontal rules provide the outer x bounds while
@@ -976,7 +995,8 @@ fn build_open_edge_grid_table_for_rules(
         return None;
     }
 
-    let (body_cells, mut item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (body_cells, mut item_indices, body_item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges, page);
     let column_count = col_edges.len() - 1;
     let occupied_body_rows = body_cells
         .iter()
@@ -998,6 +1018,11 @@ fn build_open_edge_grid_table_for_rules(
     let mut header_cells = vec![String::new(); column_count];
     let mut header_last: Vec<Option<&TextItem>> = vec![None; column_count];
     let mut header_indices = Vec::new();
+    // The header row goes above the body rows.
+    let mut item_cells: Vec<(usize, usize, usize)> = body_item_cells
+        .into_iter()
+        .map(|(index, row, column)| (index, row + 1, column))
+        .collect();
     for (_, header_items) in &header_rows {
         for (item_index, item) in header_items {
             let center_x = item.x + item.width / 2.0;
@@ -1010,6 +1035,7 @@ fn build_open_edge_grid_table_for_rules(
                 item.text.trim(),
             );
             header_indices.push(*item_index);
+            item_cells.push((*item_index, 0, column));
         }
     }
     let mixed_rule_span_in_band = logical_rules.iter().any(|rule| {
@@ -1040,7 +1066,7 @@ fn build_open_edge_grid_table_for_rules(
     let mut rows = Vec::with_capacity(row_edges.len());
     rows.push(header_y);
     rows.extend_from_slice(&row_edges[..row_edges.len() - 1]);
-    Some(Table::new(col_edges, rows, cells, item_indices))
+    Some(Table::new(col_edges, rows, cells, item_indices).with_item_cells(item_cells))
 }
 
 fn build_open_edge_grid_tables(
@@ -1353,6 +1379,9 @@ fn detect_segment_grid_in_scope(
         for index in &mut table.item_indices {
             *index = scoped_indices[*index];
         }
+        for placed in &mut table.item_cells {
+            placed.0 = scoped_indices[placed.0];
+        }
     }
     tables
 }
@@ -1377,6 +1406,7 @@ fn refine_segment_grid_text_rows(
 
     let mut cell_items = vec![vec![Vec::new(); column_count]; anchored_rows.len()];
     let mut item_indices = Vec::new();
+    let mut item_cells = Vec::new();
     for (row_index, (_, row_items)) in anchored_rows.iter().enumerate() {
         for (item_index, item) in row_items {
             let center_x = item.x + item.width.max(0.0) / 2.0;
@@ -1388,6 +1418,7 @@ fn refine_segment_grid_text_rows(
             };
             cell_items[row_index][column].push(*item);
             item_indices.push(*item_index);
+            item_cells.push((*item_index, row_index, column));
         }
     }
 
@@ -1428,12 +1459,15 @@ fn refine_segment_grid_text_rows(
         cells.len(),
         dense_rows
     );
-    Some(Table::new(
-        table.columns.clone(),
-        anchored_rows.iter().map(|(y, _)| *y).collect(),
-        cells,
-        item_indices,
-    ))
+    Some(
+        Table::new(
+            table.columns.clone(),
+            anchored_rows.iter().map(|(y, _)| *y).collect(),
+            cells,
+            item_indices,
+        )
+        .with_item_cells(item_cells),
+    )
 }
 
 /// Detect tables from line segments on a given page.
@@ -2013,7 +2047,8 @@ fn detect_tables_from_lines_inner(
     );
 
     // Assign items to grid
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges_desc, page);
+    let (cells, item_indices, item_cells) =
+        assign_items_to_grid_cells(items, &col_edges, &row_edges_desc, page);
 
     // Require at least 2 non-empty rows
     let non_empty_rows = cells
@@ -2106,7 +2141,8 @@ fn detect_tables_from_lines_inner(
         row_edges_desc[..num_rows].to_vec(),
         cells,
         item_indices,
-    );
+    )
+    .with_item_cells(item_cells);
     let legacy_tables = if overlaps_multiple_tables(&legacy_table, &independent_segment_tables) {
         log::debug!(
             "detect_lines p{}: rejected page-wide grid spanning multiple independent segment grids",

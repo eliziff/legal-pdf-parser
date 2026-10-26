@@ -1990,6 +1990,7 @@ mod tests {
             start: 0,
             end: 10,
             underlined: false,
+            struck: false,
             weight: 0.0,
         });
         let prepared = PdfDocument::project(scanned, vec![], vec![], graph, pdf_summary());
@@ -2017,6 +2018,7 @@ mod tests {
             start: 0,
             end: 3,
             underlined: false,
+            struck: false,
             weight: 0.0,
         });
         let mut plain = source_line("plain", "[7] The tug may berth");

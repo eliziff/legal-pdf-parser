@@ -1,7 +1,7 @@
 //! Case captions from their opening metadata, aligned filing labels and party labels: claimed
 //! before any heading is read.
 
-use super::PdfPrimitiveEvidence;
+use super::{Claims, HeadingReading};
 use legal_pdf_core::{layout_analysis, line_font_size, Line, Page};
 use legal_pdf_headings::party_label;
 use std::collections::HashMap;
@@ -176,12 +176,12 @@ fn citation_title(line: &Line) -> Option<bool> {
 }
 
 /// Called within one constituent and language, after table and furniture classification.
-pub(super) fn classify(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) {
+pub(super) fn classify(pages: &mut [Page], claims: &Claims, headings: &mut HeadingReading) {
     let eligible = |line: &Line| {
         !line.exclude_from_body
             && line.note_region_mode.is_empty()
             && matches!(line.region_type.as_str(), "body" | "heading")
-            && !evidence.claimed(&line.id)
+            && !claims.claimed(&line.id)
     };
     let window = pages
         .iter()
@@ -410,7 +410,7 @@ pub(super) fn classify(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) 
         if let Some(&block) = assigned.get(&line.id) {
             line.region_type = "caption".to_owned();
             line.block_index = block;
-            evidence.heading_levels.remove(&line.id);
+            headings.heading_levels.remove(&line.id);
         }
     }
     // A caption set over party labels ("APPLICANT", "— Respondent"), on any page of the document,
@@ -427,12 +427,12 @@ pub(super) fn classify(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) 
             if line.exclude_from_body
                 || !line.note_region_mode.is_empty()
                 || !matches!(line.region_type.as_str(), "body" | "heading")
-                || evidence.claimed(&line.id)
+                || claims.claimed(&line.id)
             {
                 continue;
             }
             line.region_type = "caption".to_owned();
-            evidence.heading_levels.remove(&line.id);
+            headings.heading_levels.remove(&line.id);
         }
     }
 }

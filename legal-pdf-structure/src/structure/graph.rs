@@ -5,7 +5,6 @@ use super::{
 use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan, Span, Word};
 use legal_structure_model::structure_analysis;
 use legal_pdf_core::{Error, Result};
-use legal_pdf_support::{has_citation_signal, protected_citation_spans};
 use legal_structure_model::{
     CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, Derivation, DiagnosticSeverity,
     NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange, ScalarText,
@@ -250,15 +249,7 @@ fn heading_marker_re() -> &'static Regex {
     })
 }
 
-pub(super) fn contents_leader_re() -> &'static Regex {
-    static LEADER: OnceLock<Regex> = OnceLock::new();
-    // A leader runs to the line's end or to the locator that ends it: dots inside a line are an
-    // ellipsis. A rule is a leader only before a locator; alone it is a form's blank.
-    LEADER.get_or_init(|| {
-        Regex::new(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
-            .expect("contents leader regex")
-    })
-}
+pub(super) use crate::paragraphs::contents_leader_re;
 
 fn transcript_line_numbers(pages: &[Page]) -> HashSet<&str> {
     pages
@@ -283,7 +274,7 @@ fn line_number(line: &Line) -> Option<(f64, u32)> {
 /// A number the extraction read into its line is split off as a line of its own. Each is a
 /// line_label, outside the body, before any other reading of the page.
 pub(super) fn mark_line_numbers(pages: &mut [Page]) {
-    let mut lefts: Vec<f64> = pages
+    let lefts: Vec<f64> = pages
         .iter()
         .flat_map(|page| {
             let column = number_column(page, line_number);
@@ -293,8 +284,7 @@ pub(super) fn mark_line_numbers(pages: &mut [Page]) {
     if lefts.is_empty() {
         return;
     }
-    lefts.sort_by(f64::total_cmp);
-    let left = lefts[lefts.len() / 2];
+    let left = super::median(lefts);
     for page in pages.iter_mut() {
         let tolerance = page.width * 0.03;
         let mut found: Vec<(f64, u32, usize)> = page
@@ -504,7 +494,7 @@ fn wrapped_into(
         .filter(|indexed| indexed.range.end <= candidate.marker_range.start)
         .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).map(|(_, line)| *line))
         .find(|line| {
-            primitives.reading_context(&line.id) == context
+            primitives.contexts.reading_context(&line.id) == context
                 && item_text_line(line)
                 && !line.text.trim().is_empty()
         })
@@ -543,13 +533,13 @@ fn apart_end(
             .line_id
             .as_str(),
     )?;
-    let context = primitives.reading_context(&marker.id);
+    let context = primitives.contexts.reading_context(&marker.id);
     let (indexed, line) = index
         .overlapping_lines(candidate.range)
         .iter()
         .filter(|indexed| {
             indexed.range.end > candidate.content_start
-                && primitives.reading_context(&indexed.line_id) == context
+                && primitives.contexts.reading_context(&indexed.line_id) == context
         })
         .filter_map(|indexed| Some((indexed, by_line.get(indexed.line_id.as_str())?.1)))
         .find(|(_, line)| item_text_line(line) && !line.text.trim().is_empty())?;
@@ -576,7 +566,7 @@ fn layout_end(
             .line_id
             .as_str(),
     )?;
-    let context = primitives.reading_context(&marker.id);
+    let context = primitives.contexts.reading_context(&marker.id);
     let (left, _) = measures.get(&(context, marker.page_index))?;
     let offset = marker.bbox[0] - left;
     let mut previous: Option<&Line> = None;
@@ -584,7 +574,7 @@ fn layout_end(
     // Where the item's own lines wrap to, from the page's left edge.
     let mut hang = None;
     for indexed in index.overlapping_lines(candidate.range) {
-        if primitives.reading_context(&indexed.line_id) != context {
+        if primitives.contexts.reading_context(&indexed.line_id) != context {
             continue;
         }
         if indexed.range.end <= candidate.content_start {
@@ -657,10 +647,10 @@ fn sentence_list_items<'a>(
     let body = |line: &Line| {
         line.region_type == "body"
             && item_text_line(line)
-            && !primitives.table_cell_line_ids.contains(&line.id)
-            && !primitives.contents_line_ids.contains(&line.id)
-            && !primitives.contents_pages.contains(&line.page_index)
-            && !primitives.translation_line_ids.contains(&line.id)
+            && !primitives.claims.table_cell_line_ids.contains(&line.id)
+            && !primitives.claims.contents_line_ids.contains(&line.id)
+            && !primitives.claims.contents_pages.contains(&line.page_index)
+            && !primitives.contexts.translation_line_ids.contains(&line.id)
     };
     let source = |candidate: &StructureMarkerCandidate| {
         let context = context_at(index, primitives, candidate.marker_range.start);
@@ -670,7 +660,7 @@ fn sentence_list_items<'a>(
                 end: candidate.range.end,
             })
             .iter()
-            .filter(|indexed| primitives.reading_context(&indexed.line_id) == context)
+            .filter(|indexed| primitives.contexts.reading_context(&indexed.line_id) == context)
             .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).copied())
             .find(|(_, line)| body(line) && !line.text.trim().is_empty())
             .or_else(|| {
@@ -698,13 +688,13 @@ fn sentence_list_items<'a>(
                 && source(prior).zip(source(next)).is_some_and(
                     |((page, line), (next_page, next_line))| {
                         let left = measures
-                            .get(&(primitives.reading_context(&line.id), page.index))
+                            .get(&(primitives.contexts.reading_context(&line.id), page.index))
                             .map_or(0.0, |m| m.0);
                         let next_left = measures
-                            .get(&(primitives.reading_context(&next_line.id), next_page.index))
+                            .get(&(primitives.contexts.reading_context(&next_line.id), next_page.index))
                             .map_or(0.0, |m| m.0);
-                        primitives.reading_context(&line.id)
-                            == primitives.reading_context(&next_line.id)
+                        primitives.contexts.reading_context(&line.id)
+                            == primitives.contexts.reading_context(&next_line.id)
                             && (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
                                 <= page.width.max(next_page.width).max(1.0) * 0.008
                     },
@@ -730,8 +720,8 @@ fn sentence_list_items<'a>(
                         .find(|(_, line)| {
                             body(line)
                                 && !line.text.trim().is_empty()
-                                && primitives.reading_context(&line.id)
-                                    == primitives.reading_context(&marker.line_id)
+                                && primitives.contexts.reading_context(&line.id)
+                                    == primitives.contexts.reading_context(&marker.line_id)
                         })
                         .map(|(_, line)| line.text.as_str())
                 };
@@ -742,8 +732,8 @@ fn sentence_list_items<'a>(
                 let mut words = index.overlapping_lines(range).iter().filter_map(|indexed| {
                     let (_, line) = by_line.get(indexed.line_id.as_str())?;
                     (body(line)
-                        && primitives.reading_context(&line.id)
-                            == primitives.reading_context(&marker.line_id))
+                        && primitives.contexts.reading_context(&line.id)
+                            == primitives.contexts.reading_context(&marker.line_id))
                     .then(|| {
                         text.slice(
                             range.start.max(indexed.range.start)..range.end.min(indexed.range.end),
@@ -783,7 +773,7 @@ fn context_at(
 ) -> DocumentContext {
     index
         .line_at(at)
-        .map_or((0, false), |line| primitives.reading_context(&line.line_id))
+        .map_or((0, false), |line| primitives.contexts.reading_context(&line.line_id))
 }
 
 fn read_candidates(
@@ -801,7 +791,7 @@ fn read_candidates(
     // same citations it read from its own view, save one straddling a context boundary.
     let mut whole_citations: Vec<(usize, usize)> =
         legal_pdf_support::profile::measure("candidates.citations", || {
-            let mut found: Vec<(usize, usize)> = protected_citation_spans(text.value);
+            let mut found: Vec<(usize, usize)> = legal_pdf_core::layout_analysis().protected_citation_spans(text.value);
             found.extend(structure_analysis().citations(text.value).into_iter().map(|citation| {
                 (
                     text.scalar_at_byte(citation.core_range.start).expect("citation start"),
@@ -852,13 +842,13 @@ fn read_candidates(
             }
         }
     };
-    if primitives.reading_lines().is_empty() && primitives.translation_line_ids.is_empty() {
+    if primitives.contexts.reading_lines().is_empty() && primitives.contexts.translation_line_ids.is_empty() {
         read(text, 0, (0, false), None, None);
     } else {
         let mut readings = BTreeMap::<DocumentContext, Vec<&IndexedPdfLine>>::new();
         for line in &index.lines {
             readings
-                .entry(primitives.reading_context(&line.line_id))
+                .entry(primitives.contexts.reading_context(&line.line_id))
                 .or_default()
                 .push(line);
         }
@@ -925,7 +915,7 @@ impl PdfResolutionInput {
                 if let Some(body) = body.filter(|body| {
                     candidate.marker_range.end <= body.range.start
                         && body.range.start < candidate.range.end
-                        && primitives.reading_context(&body.line_id)
+                        && primitives.contexts.reading_context(&body.line_id)
                             == context_at(&index, primitives, candidate.marker_range.start)
                 }) {
                     candidate.content_start = body.range.start;
@@ -936,7 +926,7 @@ impl PdfResolutionInput {
         for page in pages {
             for line in page.lines.iter().filter(|line| item_text_line(line)) {
                 let bounds = measures
-                    .entry((primitives.reading_context(&line.id), page.index))
+                    .entry((primitives.contexts.reading_context(&line.id), page.index))
                     .or_insert((line.bbox[0], line.bbox[2]));
                 bounds.0 = bounds.0.min(line.bbox[0]);
                 bounds.1 = bounds.1.max(line.bbox[2]);
@@ -946,11 +936,11 @@ impl PdfResolutionInput {
         // quoted decision's own numbered paragraphs, which number nothing here.
         let quotations = primitives.foreign_numbered_line_ids.clone();
         let context = legal_pdf_witnesses::Context {
-            documents: Some(primitives.reading_lines()),
+            documents: Some(primitives.contexts.reading_lines()),
             quoted: None,
-            table_cells: Some(&primitives.table_cell_line_ids),
-            contents: Some(&primitives.contents_line_ids),
-            translation: Some(&primitives.translation_line_ids),
+            table_cells: Some(&primitives.claims.table_cell_line_ids),
+            contents: Some(&primitives.claims.contents_line_ids),
+            translation: Some(&primitives.contexts.translation_line_ids),
             layout: primitives.source_regions.as_ref(),
         };
         // Existing composition rules retain their counted-line feature population.
@@ -1021,7 +1011,7 @@ impl PdfResolutionInput {
                         .flatten()
                         .filter(|indexed| {
                             indexed.range.start > candidate.content_start
-                                && primitives.reading_context(&indexed.line_id) == context
+                                && primitives.contexts.reading_context(&indexed.line_id) == context
                         })
                         .find(|indexed| {
                             by_line
@@ -1058,8 +1048,8 @@ impl PdfResolutionInput {
                     !line.exclude_from_body
                         && line.note_region_mode.is_empty()
                         && line.region_type == "body"
-                }) && primitives.reading_context(&pair[0].id)
-                    == primitives.reading_context(&pair[1].id)
+                }) && primitives.contexts.reading_context(&pair[0].id)
+                    == primitives.contexts.reading_context(&pair[1].id)
                     && body_flow_edge(&pair[0], &pair[1])
                 {
                     flow_lines.insert(pair[0].id.as_str());
@@ -1118,7 +1108,7 @@ impl PdfResolutionInput {
                     .iter()
                     .copied()
                     .filter(|&slot| {
-                        citation_ranges[slot].0 == primitives.reading_context(&indexed.line_id)
+                        citation_ranges[slot].0 == primitives.contexts.reading_context(&indexed.line_id)
                             && indexed.range.start < citation_ranges[slot].2
                     })
                     .collect::<Vec<_>>();
@@ -1205,7 +1195,7 @@ impl PdfResolutionInput {
                 let candidate_lines = index
                     .overlapping_lines(candidate.range)
                     .iter()
-                    .filter(|line| primitives.reading_context(&line.line_id) == context)
+                    .filter(|line| primitives.contexts.reading_context(&line.line_id) == context)
                     .collect::<Vec<_>>();
                 // A running head, folio or print margin inside the range is the page's, not
                 // the item's; an item set wholly in them keeps them, and is excluded as furniture.
@@ -1231,7 +1221,7 @@ impl PdfResolutionInput {
                 let marker_lines = index
                     .overlapping_lines(candidate.marker_range)
                     .iter()
-                    .filter(|line| primitives.reading_context(&line.line_id) == context)
+                    .filter(|line| primitives.contexts.reading_context(&line.line_id) == context)
                     .collect::<Vec<_>>();
                 let marker_line = marker_lines.first().map(|indexed| indexed.line_id.as_str()).unwrap_or("");
                 let mut observations = Vec::new();
@@ -1322,7 +1312,7 @@ impl PdfResolutionInput {
                             .is_some_and(|(page, line)| {
                                 continues_prose(page, line)
                                     && !sentence_items.contains(candidate.id.as_str())
-                                    || candidate.label == "v." && has_citation_signal(&line.text)
+                                    || candidate.label == "v." && legal_pdf_core::layout_analysis().has_citation_signal(&line.text)
                             })
                     });
                 if marker_is_cross_reference
@@ -1333,7 +1323,7 @@ impl PdfResolutionInput {
                 }
                 let table_or_form = marker_lines.iter().any(|indexed| {
                     primitives
-                        .table_cell_line_ids
+                        .claims.table_cell_line_ids
                         .contains(indexed.line_id.as_str())
                         || by_line
                             .get(indexed.line_id.as_str())
@@ -1352,8 +1342,8 @@ impl PdfResolutionInput {
                     by_line
                         .get(indexed.line_id.as_str())
                         .is_some_and(|(page, line)| {
-                            primitives.contents_pages.contains(&page.index)
-                                || primitives.contents_line_ids.contains(&line.id)
+                            primitives.claims.contents_pages.contains(&page.index)
+                                || primitives.claims.contents_line_ids.contains(&line.id)
                                 || contents_row(&line.text)
                         })
                 });
@@ -1381,8 +1371,8 @@ impl PdfResolutionInput {
                         .is_some_and(|(_, line)| {
                             matches!(line.region_type.as_str(), "header" | "footer")
                                 || (line.exclude_from_body
-                                    && !primitives.table_cell_line_ids.contains(&line.id)
-                                    && !primitives.table_note_line_ids.contains(&line.id))
+                                    && !primitives.claims.table_cell_line_ids.contains(&line.id)
+                                    && !primitives.claims.table_note_line_ids.contains(&line.id))
                         })
                 });
                 if furniture {
@@ -1601,10 +1591,10 @@ pub(super) fn native_graph_parts(
             |test: &dyn Fn(&String) -> bool| !line_ids.is_empty() && line_ids.iter().all(test);
         let numbered = |id: &String| labelled.contains(id.as_str());
         let listed = |id: &String| {
-            primitives.contents_line_ids.contains(id)
+            primitives.claims.contents_line_ids.contains(id)
                 || index
                     .line(id)
-                    .is_some_and(|line| primitives.contents_pages.contains(&line.page_index))
+                    .is_some_and(|line| primitives.claims.contents_pages.contains(&line.page_index))
         };
         // Nearly all of it listed: a stray line the paragraph reader took in (a folio it did not
         // know for one) does not undo a list.
@@ -1612,7 +1602,7 @@ pub(super) fn native_graph_parts(
         let in_list = line_ids.iter().filter(|id| listed(id)).count();
         if counted > 0 && in_list * 5 >= counted * 4 {
             Some("contents")
-        } else if all(&|id| primitives.translation_line_ids.contains(id)) {
+        } else if all(&|id| primitives.contexts.translation_line_ids.contains(id)) {
             Some("translation")
         } else {
             None
@@ -1735,7 +1725,7 @@ pub(super) fn native_graph_parts(
     }
     // A table, its rows and their cells, addressed as a word processor's are. A blank
     // cell is an empty range where its text would stand.
-    for (slot, table) in primitives.tables.iter().enumerate() {
+    for (slot, table) in primitives.claims.tables.iter().enumerate() {
         let table_id = format!("table:{}", slot + 1);
         let line_ids: Vec<String> = table.line_ids().into_iter().cloned().collect();
         let range = index
@@ -1761,14 +1751,31 @@ pub(super) fn native_graph_parts(
         let mut cursor = range.start;
         for (row_slot, row) in table.rows.iter().enumerate() {
             let row_id = format!("{table_id}/row:{}", row_slot + 1);
-            let cells: Vec<StructureNode> = row
-                .cells
-                .iter()
-                .map(|cell| {
-                    let line_ids = cell.line_ids();
-                    let ranges = source_membership(cell
-                        .parts
+            // Cells a row places in one column are one cell's text: one node, so one id.
+            let mut columns: Vec<(usize, Vec<&_>)> = Vec::new();
+            for cell in &row.cells {
+                match columns.iter_mut().find(|(column, _)| *column == cell.column) {
+                    Some((_, same)) => same.push(cell),
+                    None => columns.push((cell.column, vec![cell])),
+                }
+            }
+            let cells: Vec<StructureNode> = columns
+                .into_iter()
+                .map(|(_, same)| {
+                    let cell = same[0];
+                    let mut line_ids: Vec<String> = Vec::new();
+                    for one in &same {
+                        for id in one.line_ids() {
+                            if !line_ids.contains(&id) {
+                                line_ids.push(id);
+                            }
+                        }
+                    }
+                    let row_span = same.iter().map(|one| one.row_span).max().unwrap_or(1);
+                    let column_span = same.iter().map(|one| one.column_span).max().unwrap_or(1);
+                    let ranges = source_membership(same
                         .iter()
+                        .flat_map(|one| one.parts.iter())
                         .filter_map(|part| match part.chars {
                             Some((start, end)) => index.global_range(&part.line_id, start, end),
                             None => index.line(&part.line_id).map(|line| line.range),
@@ -1795,8 +1802,8 @@ pub(super) fn native_graph_parts(
                     node.label = Some(node.id.clone());
                     node.row = Some(row_slot + 1);
                     node.column = Some(cell.column + 1);
-                    node.row_span = (cell.row_span > 1).then_some(cell.row_span);
-                    node.column_span = (cell.column_span > 1).then_some(cell.column_span);
+                    node.row_span = (row_span > 1).then_some(row_span);
+                    node.column_span = (column_span > 1).then_some(column_span);
                     node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
                     node.line_ids = line_ids;
                     node

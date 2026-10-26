@@ -5,8 +5,7 @@
 //! Copyright (c) 2025 Vectify AI; MIT License, reproduced in `mod.rs`. Coordinates follow the
 //! upstream convention: y grows upward, so a block's top edge is above its bottom edge.
 
-use legal_pdf_core::model::{Line, Span};
-use regex::Regex;
+use legal_pdf_core::model::{Line, Span, BOLD, ITALIC};
 use std::sync::OnceLock;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
@@ -247,21 +246,6 @@ impl CharStats {
     }
 }
 
-fn bold_font() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i-u)(bold|timesb)").expect("bold font"))
-}
-
-fn italic_font() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i-u)(ital|it\z|i[1-9][0-9]*\z|obliq)").expect("italic font"))
-}
-
-fn subset_prefix() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Z]{6}\+").expect("subset prefix"))
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct FlashSpan {
     pub(super) rect: Rect,
@@ -274,10 +258,10 @@ pub(super) struct FlashSpan {
 
 impl FlashSpan {
     pub(super) fn of(span: &Span, height: f64) -> FlashSpan {
-        let mut font_name = span.font.as_str();
-        if subset_prefix().is_match(font_name) {
-            font_name = &font_name[7..];
-        }
+        // Flash reads bold and italic from the face's name as PyMuPDF's flags miss them; the
+        // extraction's flags already carry pdf-inspector's reading of the name, descriptor and
+        // strokes, and its face names carry no subset tag.
+        let font_name = span.font.as_str();
         let font_name = match font_name.to_lowercase().as_str() {
             "timesnewroman" | "times-new-roman" | "timesroman" | "times-roman" | "timesnew"
             | "times-new" => "Times".to_owned(),
@@ -296,8 +280,8 @@ impl FlashSpan {
                 height,
             ),
             stats: CharStats::of(trim_unicode_ws(&span.text)),
-            bold: span.flags & 16 != 0 || bold_font().is_match(&font_name),
-            italic: span.flags & 2 != 0 || italic_font().is_match(&font_name),
+            bold: span.flags & BOLD != 0,
+            italic: span.flags & ITALIC != 0,
             font_name,
             size: span.size,
         }

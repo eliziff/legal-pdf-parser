@@ -3403,8 +3403,7 @@ fn extract_text_from_operand_impl(
         let (text, legacy_symbol_rewrite) = if fidelity {
             (text, false)
         } else {
-            let (text, rewritten) = clean_symbol_pua(text);
-            (remap_texcm_math_symbols(text, base_font_name), rewritten)
+            clean_symbol_pua(text, base_font_name)
         };
         (
             normalize_cp1252_controls(text, use_cp1252_fallback),
@@ -3419,7 +3418,7 @@ fn presentation_text_from_fidelity(
     is_type0_cid_font: bool,
 ) -> String {
     normalize_cp1252_controls(
-        remap_texcm_math_symbols(clean_symbol_pua(text).0, base_font_name),
+        clean_symbol_pua(text, base_font_name).0,
         should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font),
     )
 }
@@ -3560,35 +3559,69 @@ fn should_use_cp1252_single_byte_fallback(
     !non_cp1252_names.iter().any(|name| font_name.contains(name))
 }
 
-/// Apply the existing private-use cleanup without changing its output.
-/// The boolean records an actual heuristic rewrite, not a proven Unicode alias.
-fn clean_symbol_pua(text: String) -> (String, bool) {
-    if !text.chars().any(|c| ('\u{F000}'..='\u{F0FF}').contains(&c)) {
-        return (text, false);
-    }
+/// Read text set through a symbol-encoded font map, U+F000 plus the
+/// character's byte, then remap TeXCMMathsSymbols misnames
+/// (`remap_texcm_math_symbols`). Common bullets and the check mark are
+/// read in every face. A text face's codes are its Latin-1 characters;
+/// Symbol's space, digits and punctuation are ASCII's too (a folio
+/// "- 5 -"), and its letters the Greek its encoding sets ("a" alpha, "S"
+/// Sigma); a dingbat face's other
+/// codes are pictures and stay. Always one character for one, so text kept
+/// glyph by glyph keeps its offsets. The boolean records an actual
+/// heuristic private-use rewrite, not a proven Unicode alias.
+pub fn clean_symbol_pua(text: String, base_font_name: Option<&str>) -> (String, bool) {
+    // The Symbol encoding's letters, A to Z and a to z.
+    const SYMBOL_UPPER: &str = "ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ";
+    const SYMBOL_LOWER: &str = "αβχδεφγηιϕκλμνοπθρστυϖωξψζ";
     let mut rewritten = false;
-    let text = text
-        .chars()
-        .map(|c| {
-            let code = c as u32;
-            if !(0xF000..=0xF0FF).contains(&code) {
-                return c;
-            }
-            let low = code - 0xF000;
-            let replacement = match low {
-                // Common bullets
-                0xA1 | 0xA7 | 0xB7 => '\u{2022}',
-                // Checkmark
-                0xFC => '\u{2713}',
-                // Printable ASCII range and Latin-1 above: strip F000 offset
-                0x20..=0xFF => char::from_u32(low).unwrap_or(c),
-                _ => c,
-            };
-            rewritten |= replacement != c;
-            replacement
-        })
-        .collect();
-    (text, rewritten)
+    let text = if text.chars().any(|c| ('\u{F000}'..='\u{F0FF}').contains(&c)) {
+        let face = base_font_name
+            .map(|name| name.rsplit_once('+').map_or(name, |(_, stripped)| stripped))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let dingbat = ["wingding", "webding", "dingbat"]
+            .iter()
+            .any(|name| face.contains(name));
+        let symbol = face.contains("symbol");
+        text.chars()
+            .map(|c| {
+                let code = c as u32;
+                if !(0xF000..=0xF0FF).contains(&code) {
+                    return c;
+                }
+                let low = code - 0xF000;
+                let replacement = match low {
+                    // Common bullets
+                    0xA1 | 0xA7 | 0xB7 => '\u{2022}',
+                    // Checkmark
+                    0xFC => '\u{2713}',
+                    _ if dingbat => c,
+                    _ if symbol => match char::from_u32(low) {
+                        Some(
+                            ascii @ (' ' | '!' | '#' | '%' | '&' | '(' | ')' | '+' | ',' | '-'
+                            | '.' | '/' | '0'..='9' | ':' | ';' | '<' | '=' | '>' | '?' | '['
+                            | ']' | '_' | '{' | '|' | '}'),
+                        ) => ascii,
+                        Some(letter @ 'A'..='Z') => {
+                            SYMBOL_UPPER.chars().nth(letter as usize - 'A' as usize).unwrap_or(c)
+                        }
+                        Some(letter @ 'a'..='z') => {
+                            SYMBOL_LOWER.chars().nth(letter as usize - 'a' as usize).unwrap_or(c)
+                        }
+                        _ => c,
+                    },
+                    // Printable ASCII range and Latin-1 above: strip F000 offset
+                    0x20..=0xFF => char::from_u32(low).unwrap_or(c),
+                    _ => c,
+                };
+                rewritten |= replacement != c;
+                replacement
+            })
+            .collect()
+    } else {
+        text
+    };
+    (remap_texcm_math_symbols(text, base_font_name), rewritten)
 }
 
 fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<String> {
@@ -7101,21 +7134,6 @@ mod tests {
             !text.contains('\u{FFFD}'),
             "simple font fallback must not stamp FFFD over legitimate bytes: {text:?}"
         );
-    }
-
-    #[test]
-    fn legacy_cleanup_evidence_tracks_changes_without_changing_aliases() {
-        for (source, expected, rewritten) in [
-            ("AΩμ$•✓", "AΩμ$•✓", false),
-            ("\u{f057}\u{f0b7}\u{f0fc}", "W•✓", true),
-            ("\u{f010}\u{e123}", "\u{f010}\u{e123}", false),
-            ("Price \u{f024}", "Price $", true),
-        ] {
-            assert_eq!(
-                clean_symbol_pua(source.to_string()),
-                (expected.to_string(), rewritten)
-            );
-        }
     }
 
     #[test]

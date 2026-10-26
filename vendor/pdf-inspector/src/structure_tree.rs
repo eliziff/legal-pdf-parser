@@ -181,7 +181,7 @@ impl StructRole {
         }
     }
 
-    fn from_name(name: &str) -> Self {
+    pub fn from_name(name: &str) -> Self {
         match name {
             "Document" => Self::Document,
             "Part" => Self::Part,

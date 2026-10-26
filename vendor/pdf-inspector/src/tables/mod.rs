@@ -59,7 +59,7 @@ use crate::types::TextItem;
 ///
 /// Uses rect X positions as column boundaries to directly construct a `Table`,
 /// bypassing heuristic detection. Splits merged multi-number items first.
-pub(crate) fn try_build_rect_guided_table(
+pub fn try_build_rect_guided_table(
     items: &[TextItem],
     cluster_rects: &[(f32, f32, f32, f32)],
 ) -> Option<Table> {
@@ -149,6 +149,7 @@ pub(crate) fn try_build_rect_guided_table(
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
     let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; n_cols]; n_rows];
     let mut used_indices: Vec<usize> = Vec::new();
+    let mut item_cells: Vec<(usize, usize, usize)> = Vec::new();
 
     // Compute max X to exclude legend text beyond the table area
     let col_spacing = if col_boundaries.len() >= 2 {
@@ -181,6 +182,7 @@ pub(crate) fn try_build_rect_guided_table(
                 item.text.trim(),
             );
             used_indices.push(*orig_idx);
+            item_cells.push((*orig_idx, r, c));
         }
     }
 
@@ -209,12 +211,7 @@ pub(crate) fn try_build_rect_guided_table(
     used_indices.sort_unstable();
     used_indices.dedup();
 
-    Some(Table::new(
-        col_boundaries,
-        row_boundaries,
-        cells,
-        used_indices,
-    ))
+    Some(Table::new(col_boundaries, row_boundaries, cells, used_indices).with_item_cells(item_cells))
 }
 
 /// Canonical lowercase roman numeral for `n` (the i/v/x/l/c range).
@@ -1543,6 +1540,10 @@ pub struct Table {
     pub cells: Vec<Vec<String>>,
     /// Items that belong to this table
     pub item_indices: Vec<usize>,
+    /// The cell each placed item was assigned to, as `(item index, row, col)`
+    /// into `cells`, recorded by the detector that placed it. Empty when the
+    /// detector does not record placement.
+    pub item_cells: Vec<(usize, usize, usize)>,
     /// Data table vs TOC. Set by `Table::new` from `cells`.
     pub kind: TableKind,
 }
@@ -1565,8 +1566,15 @@ impl Table {
             rows,
             cells,
             item_indices,
+            item_cells: Vec::new(),
             kind,
         }
+    }
+
+    /// The table with the cell each placed item was assigned to.
+    pub fn with_item_cells(mut self, item_cells: Vec<(usize, usize, usize)>) -> Self {
+        self.item_cells = item_cells;
+        self
     }
 }
 
@@ -1729,6 +1737,7 @@ mod tests {
                 vec!["Cell 1".into(), "Cell 2".into()],
             ],
             item_indices: vec![],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 
@@ -2511,6 +2520,7 @@ mod tests {
                 vec!["3".into(), "5/2".into(), "Item C".into(), "300".into()],
             ],
             item_indices: vec![],
+            item_cells: Vec::new(),
             kind: TableKind::Data,
         };
 

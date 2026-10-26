@@ -1,5 +1,5 @@
 use crate::LegalDocument;
-use legal_pdf_core::model::{Footnote, Paragraph, SourceTextSpan};
+use legal_pdf_core::model::{Footnote, Paragraph, ScalarRange, SourceTextSpan};
 use legal_structure_model::DocumentStructure;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::ScalarText;
@@ -220,6 +220,42 @@ fn retain_authority_mapping(mapping: &Value, start: usize, end: usize, removed: 
         "sourceEnd":source+end-original,"lineId":mapping["lineId"]})
 }
 
+/// The hyphens each text splits a word with, as UTF-16 deletions of the hyphen and the line break
+/// after it: where pdf-inspector's join_decision reads the word as one, the document writing it
+/// whole elsewhere (its vocabulary, the broken pairs aside). Only witnessed deletions; nothing is
+/// inserted or replaced.
+fn split_word_deletions(texts: &[&str]) -> Vec<Vec<ScalarRange>> {
+    use pdf_inspector::markdown::{document_vocabulary, join_decision, Join};
+    let (words, hyphenated) = document_vocabulary(&texts.join(" ").replace("-\n", "- ").replace('\n', " "));
+    texts.iter().map(|text| {
+        let characters = text.char_indices().collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        let (mut at, mut utf16, mut counted_byte) = (0, 0, 0);
+        while at < characters.len() {
+            let (byte, character) = characters[at];
+            if character != '-' || at == 0 || !characters[at - 1].1.is_alphabetic() { at += 1; continue; }
+            let first = characters[..at].iter().rev().take_while(|(_, c)| c.is_alphabetic()).count();
+            let mut next = at + 1;
+            while next < characters.len() && matches!(characters[next].1, ' ' | '\n' | '\r') { next += 1; }
+            let gap = &characters[at + 1..next];
+            let broken = gap.is_empty() || gap.iter().any(|(_, c)| *c == '\n');
+            let second = characters[next..].iter().take_while(|(_, c)| c.is_alphabetic()).count();
+            if !broken || second < 2 || at >= first + 1 && characters[at - first - 1].1 == '-' { at += 1; continue; }
+            let end_byte = characters.get(next + second).map_or(text.len(), |(byte, _)| *byte);
+            let (before, after) = (&text[characters[at - first].0..byte], &text[characters[next].0..end_byte]);
+            if join_decision(before, after, &words, &hyphenated) != Join::Plain { at += 1; continue; }
+            utf16 += text[counted_byte..byte].encode_utf16().count();
+            let end = characters[next].0;
+            let length = text[byte..end].encode_utf16().count();
+            removed.push(ScalarRange { start: utf16, end: utf16 + length });
+            utf16 += length;
+            counted_byte = end;
+            at = next;
+        }
+        removed
+    }).collect()
+}
+
 /// A word a hyphen splits where no compound is written ("Companies' Cr-editors Arrangement Act",
 /// "Cred-⏎itors") is one word when the document writes it whole elsewhere ("Creditors"): a line
 /// break's hyphen, or a recognizer's, read into the text. The hyphen goes, with a line break after
@@ -227,7 +263,7 @@ fn retain_authority_mapping(mapping: &Value, start: usize, end: usize, removed: 
 /// or that the document never writes whole, keeps it. The note markers' offsets move with the text.
 fn join_split_words(units: &mut [Value]) {
     let texts=units.iter().map(|unit|unit["text"].as_str().unwrap()).collect::<Vec<_>>();
-    let edits=legal_pdf_core::text_normalization::split_word_deletions(&texts);
+    let edits=split_word_deletions(&texts);
     for (unit, edits) in units.iter_mut().zip(edits) {
         if edits.is_empty() { continue; }
         let text=unit["text"].as_str().unwrap();
