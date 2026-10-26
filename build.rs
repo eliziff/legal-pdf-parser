@@ -244,7 +244,7 @@ fn main() {
             root.join("legal-pdf-core/src/model.rs"),
             root.join("legal-pdf-core/src/lib.rs"),
         ];
-        for name in ["structure", "tables", "support"] {
+        for name in ["structure", "headings", "tables", "support"] {
             reader.extend(crate_inputs(&root, name));
         }
         reader.extend(inspector_inputs(&root, &[]));

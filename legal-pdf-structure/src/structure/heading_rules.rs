@@ -262,11 +262,6 @@ fn numbered_paragraph(text: &str) -> bool {
     pattern(&RE, r"^\s*(?:\[\d{1,4}\]|\d{1,4}(?:\.\d{1,3})*[.)]?\s+\S|\d{1,4}\s*\(\d{1,3}\)|\([a-z0-9]{1,4}\)\s)").is_match(text)
 }
 
-/// A line closing what came before it: a sentence's end, a colon, a closing bracket or quote.
-fn closes(text: &str) -> bool {
-    text.trim_end().ends_with(['.', ':', ';', '?', '!', ')', '”', '"'])
-}
-
 /// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's
 /// numeral on its own line, not a sentence.
 fn bare_number(text: &str) -> bool {
@@ -324,21 +319,17 @@ fn not_a_heading(heading: &Heading, running: bool) -> bool {
         || (!numbered && heading.lines.len() == 1 && running)
 }
 
-/// Whether a line the readers left in the body is a heading, by the three ways the gold's missed
-/// headings show themselves: a heading by the engine's grammar for a judgment's text between a
-/// closed sentence and a numbered paragraph ("Standard of Review", "Discussion" before "[3] Section
-/// 204 …"), a bold line opening its own block before a numbered paragraph ("(d) The Reasonable
-/// Steps Requirement" before "[101]"), a bold numbered line with space above it ("G.
-/// DISPOSITION"). A speaker's turn or a label is never one.
+/// Whether a line the readers left in the body is a heading, by the two ways the gold's missed
+/// headings show themselves: a bold line opening its own block before a numbered paragraph ("(d)
+/// The Reasonable Steps Requirement" before "[101]"), a bold numbered line with space above it ("G.
+/// DISPOSITION"). A speaker's turn or a label is never one. (A plain line between a closed sentence
+/// and a numbered paragraph read by the judgment grammar cost more headings than it found.)
 fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, above: f64) -> bool {
     let text = line.text.trim();
     let before_paragraph = next.is_some_and(|next| numbered_paragraph(&next.text));
     let own_block = prior.is_none_or(|prior| prior.page_index != line.page_index || prior.block_index != line.block_index);
-    let heads = next.is_some_and(|next| legal_pdf_core::layout_analysis().heading_between(text, &next.text));
     !label(text) && legal_structure_model::transcript::speaker_label(text).is_none()
-        && ((prior.is_none_or(|prior| closes(&prior.text)) && before_paragraph && heads)
-            || (bold && before_paragraph && own_block)
-            || (bold && numbered(text) && above >= 1.0))
+        && ((bold && before_paragraph && own_block) || (bold && numbered(text) && above >= 1.0))
 }
 
 /// The headings' one decision, over what every reader read: the lines the whole document raises (a
