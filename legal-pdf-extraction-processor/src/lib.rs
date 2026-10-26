@@ -1,4 +1,5 @@
 mod error;
+mod extract;
 mod outline;
 mod page_labels;
 mod pdf;
@@ -8,6 +9,7 @@ pub use outline::embedded_outline;
 pub use page_labels::embedded_page_labels;
 
 pub use error::{Error, Result};
+pub use extract::extract_pdf;
 pub use pdf::{
     add_rect_regions, assemble_pdf, mark_rule_underlines, load_extraction_document, page_geometries, recognize_pdf, ExtractedPdf,
 };
