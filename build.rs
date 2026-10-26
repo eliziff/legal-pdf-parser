@@ -142,7 +142,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     // joins, heading tiers, tables).
     document.extend(inspector_inputs(root, &[]));
     document.extend(crate_inputs(root, "structure"));
-    document.extend(crate_inputs(root, "headings"));
     document.extend(crate_inputs(root, "tables"));
     document.extend(crate_inputs(root, "witnesses"));
     document.push(root.join("legal-pdf-witnesses/data"));
@@ -185,7 +184,6 @@ fn main() {
         (enabled("LANGUAGE"), "language"),
         (enabled("OCR"), "ocr"),
         (pdf, "structure"),
-        (pdf, "headings"),
         (pdf, "tables"),
         (pdf, "witnesses"),
         (pdf, "support"),
@@ -246,7 +244,7 @@ fn main() {
             root.join("legal-pdf-core/src/model.rs"),
             root.join("legal-pdf-core/src/lib.rs"),
         ];
-        for name in ["structure", "headings", "tables", "support"] {
+        for name in ["structure", "tables", "support"] {
             reader.extend(crate_inputs(&root, name));
         }
         reader.extend(inspector_inputs(&root, &[]));
