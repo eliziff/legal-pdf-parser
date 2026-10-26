@@ -134,10 +134,11 @@ pub(super) fn has_table_caption(lines: &[Line]) -> bool {
 pub(super) struct TableReadings;
 
 impl legal_pdf_tables::TableLayout for TableReadings {
-    /// A recognized page's lines are no measure of its white space, unless they stand in a plain
-    /// grid of rows, columns and figures.
+    /// A page's white space reads as a table only where its lines stand in a plain grid of rows,
+    /// columns and figures: justified prose and a note's label beside its text are gaps between
+    /// words, not columns.
     fn white_space(&self, page: &Page) -> bool {
-        page.source != "ocr" || table_evidence(&page.lines).strong()
+        table_evidence(&page.lines).strong()
     }
 
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool> {
