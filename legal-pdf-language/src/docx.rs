@@ -321,10 +321,6 @@ static SUPRA: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("literal DOCX supra regex")
 });
-static NUMBERED_SUPRA: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(supra)[^\n\r\u{2028}\u{2029}]{0,40}?[0-9]+")
-        .expect("literal numbered supra regex")
-});
 static NUMBERING_RESTART: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<w:numRestart\b").expect("literal DOCX numbering regex"));
 static PARAGRAPH: LazyLock<Regex> =
@@ -533,24 +529,6 @@ fn analyze_supras(xml: &str) -> Result<SupraAnalysis> {
         }
     }
     Ok(analysis)
-}
-
-fn contains_numbered_supra(xml: &str) -> Result<bool> {
-    for paragraph in PARAGRAPH.find_iter(xml) {
-        let mut visible = String::new();
-        for text in TEXT.captures_iter(paragraph.as_str()) {
-            visible.push_str(&xml_text(text.get(1).unwrap().as_str())?);
-        }
-        if NUMBERED_SUPRA.captures_iter(&visible).any(|capture| {
-            let whole = capture.get(0).unwrap();
-            let word = capture.get(1).unwrap();
-            javascript_iu_word_bounded(&visible, word.start(), word.end())
-                && javascript_iu_word_bounded(&visible, word.start(), whole.end())
-        }) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String, Vec<u8>)>> {
@@ -1348,17 +1326,6 @@ fn convert_safe_paragraphs(xml: &str, names: &HashMap<usize, String>) -> Result<
     }
     output.push_str(&xml[cursor..]);
     Ok((output, converted))
-}
-
-pub fn has_docx_supra_references(bytes: &[u8]) -> Result<bool> {
-    let files = read_docx_files(bytes, Some(&["word/footnotes.xml"]))?;
-    if let Some(xml) = docx_part(&files, "word/footnotes.xml") {
-        if contains_numbered_supra(&xml)? {
-            return Ok(true);
-        }
-    }
-    let files = read_docx_files(bytes, Some(&["word/document.xml"]))?;
-    docx_part(&files, "word/document.xml").map_or(Ok(false), |xml| contains_numbered_supra(&xml))
 }
 
 pub fn fix_docx_supra_cross_references(bytes: &[u8]) -> Result<DocxSupraCleanup> {

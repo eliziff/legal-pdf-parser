@@ -45,7 +45,7 @@ pub fn install_structure_analysis(analysis: &'static dyn legal_structure_model::
 #[cfg(feature = "language")]
 pub use legal_pdf_language::{
     analyze_docx_bytes, analyze_docx_drafting_bytes, docx_text, docx_to_toa_text_units,
-    fix_docx_supra_cross_references, has_docx_supra_references, DocxSupraCleanup,
+    fix_docx_supra_cross_references, DocxSupraCleanup,
     MAX_DOCX_SUPRA_BYTES,
 };
 #[cfg(feature = "ocr")]
@@ -57,7 +57,7 @@ pub use legal_pdf_ocr::{
 pub use legal_pdf_ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_support::{
-    to_alr_payload, to_toa_text_units, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
+    PdfLookupNote, PdfLookupPage, PdfLookupProposition,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup,
 };
 #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
