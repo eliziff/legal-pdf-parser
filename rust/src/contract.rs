@@ -1,7 +1,7 @@
 use crate::engine::{parse_pdf, ParseOptions};
 #[cfg(feature = "ocr")]
 use crate::IndraOptions;
-#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+#[cfg(feature = "ppdoc")]
 use crate::PPDocOptions;
 use crate::{Error, PdfLookupRequest, PdfStructureLookup, Result};
 #[cfg(feature = "ocr")]
@@ -42,10 +42,10 @@ pub struct PdfRequest {
     #[cfg(not(feature = "ocr"))]
     #[serde(default, deserialize_with = "present")]
     ocr: Option<serde::de::IgnoredAny>,
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     #[serde(default, deserialize_with = "present")]
     layout: Option<LayoutRequest>,
-    #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
+    #[cfg(not(feature = "ppdoc"))]
     #[serde(default, deserialize_with = "present")]
     layout: Option<serde::de::IgnoredAny>,
 }
@@ -68,7 +68,7 @@ enum OcrRequest {
     },
 }
 
-#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+#[cfg(feature = "ppdoc")]
 #[derive(Deserialize)]
 #[serde(tag = "provider", deny_unknown_fields)]
 enum LayoutRequest {
@@ -166,11 +166,11 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
         ));
     }
 
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     if let Some(LayoutRequest::Ppdoc { settings }) = &request.layout {
         options.ppdoc = Some(settings.clone());
     }
-    #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
+    #[cfg(not(feature = "ppdoc"))]
     if request.layout.is_some() {
         return Err(Error::Message(
             "layout requires a legalpdf binary built with a layout feature".to_owned(),

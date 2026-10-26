@@ -8,7 +8,7 @@ use legal_pdf_structure::{
     status, validate_document, validate_pdf_components, StructureIdentity, StructureOutput,
 };
 use legal_pdf_support::{profile, PdfDocument};
-#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+#[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use legal_structure_model::{DetectionProfile, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{Deserialize, Serialize};
@@ -311,7 +311,7 @@ pub(crate) struct ParseOptions {
     /// Zero-based pages eligible for OCR. Native extraction still inspects the
     /// complete PDF so physical page numbering stays authoritative.
     pub ocr_pages: Option<Vec<usize>>,
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     pub ppdoc: Option<PPDocOptions>,
 }
 
@@ -330,7 +330,7 @@ impl Default for ParseOptions {
             #[cfg(feature = "ocr")]
             ocr: None,
             ocr_pages: None,
-            #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+            #[cfg(feature = "ppdoc")]
             ppdoc: None,
         }
     }
@@ -583,21 +583,14 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     let options = ParseOptions {
         cache_dir: Some(cache_dir.to_owned()),
         ocr: recognizer.then(|| OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())),
-        #[cfg(feature = "ppdoc-full")]
-        ppdoc: std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK").map(|pack| {
-            // LEGALPDF_PPDOC_BACKEND: cpu (default), directml, cuda, openvino; LEGALPDF_PPDOC_DEVICE its device.
-            let backend = std::env::var("LEGALPDF_PPDOC_BACKEND").ok()
-                .and_then(|name| legal_pdf_core::OrtBackend::parse(&name))
-                .unwrap_or_default();
-            PPDocOptions {
-                model_pack: Some(PathBuf::from(&pack)),
-                runtime: std::env::var_os("LEGALPDF_ONNXRUNTIME").map(PathBuf::from),
-                threads: std::env::var("LEGALPDF_PPDOC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
-                backend,
-                device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
-                cpu_fallback: backend != legal_pdf_core::OrtBackend::Cpu,
-                ..PPDocOptions::default()
-            }
+        #[cfg(feature = "ppdoc")]
+        // The product's layout model (OpenVINO), on the same pack and runtime: LEGALPDF_PPDOC_DEVICE its device.
+        ppdoc: std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK").map(|pack| PPDocOptions {
+            model_pack: Some(PathBuf::from(&pack)),
+            runtime: std::env::var_os("LEGALPDF_OPENVINO_RUNTIME").map(PathBuf::from),
+            threads: std::env::var("LEGALPDF_PPDOC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
+            ..PPDocOptions::default()
         }),
         ..ParseOptions::default()
     };
@@ -605,7 +598,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     let providers = Providers {
         ocr_identity: ocr.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned())),
         ocr,
-        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+        #[cfg(feature = "ppdoc")]
         ppdoc: options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()?,
     };
     recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
@@ -883,15 +876,15 @@ pub(crate) fn parse_pdf(
         .map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
     #[cfg(not(feature = "ocr"))]
     let ocr_identity: Option<(String, String)> = None;
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || {
         options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()
     })?;
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     let ppdoc_identity = ppdoc_prepared
         .as_ref()
         .map(|provider| provider.identity().to_owned());
-    #[cfg(not(any(feature = "ppdoc-full", feature = "ppdoc-openvino")))]
+    #[cfg(not(feature = "ppdoc"))]
     let ppdoc_identity: Option<String> = None;
     let ocr_identity = if let Some(supplied) = &options.supplied_ocr {
         Some(("supplied".to_owned(), supplied.identity(&source_hash)?))
@@ -921,7 +914,7 @@ pub(crate) fn parse_pdf(
         ocr_identity,
         #[cfg(feature = "ocr")]
         ocr: ocr_prepared.take(),
-        #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+        #[cfg(feature = "ppdoc")]
         ppdoc: ppdoc_prepared.take(),
     };
     let extracted = recognized_extraction(bytes, &source_hash, options, cache_root.as_deref(), providers, progress)?;
@@ -948,7 +941,7 @@ struct Providers {
     ocr_identity: Option<(String, String)>,
     #[cfg(feature = "ocr")]
     ocr: Option<PreparedOcrProvider>,
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     ppdoc: Option<legal_pdf_support::PreparedPPDoc>,
 }
 
@@ -1067,7 +1060,7 @@ fn recognized_extraction(
     #[cfg(not(feature = "ocr"))]
     let rasters = BTreeMap::new();
     finish_recognition(&mut extracted.pages, rasters);
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
         options
             .ppdoc
@@ -1076,7 +1069,7 @@ fn recognized_extraction(
             .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
             .transpose()
     })?;
-    #[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
+    #[cfg(feature = "ppdoc")]
     if let Some(provider) = ppdoc.as_mut() {
         extracted
             .diagnostics
