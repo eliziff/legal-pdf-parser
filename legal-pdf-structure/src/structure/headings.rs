@@ -1173,9 +1173,7 @@ pub(super) fn apply_text_fidelity_headings(
         decisions
     };
     if let Some(source_regions) = &primitives.source_regions {
-        if !legal_pdf_core::model::ablated("demote_false_headings") {
-            demote_false_headings(pages, &decisions, source_regions);
-        }
+        demote_false_headings(pages, &decisions, source_regions);
     }
     let mut heading_levels = decisions
         .iter()
@@ -1445,143 +1443,6 @@ pub(super) fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPr
     }
 }
 
-/// Every heading of the document, read once, after every container has claimed its lines (line
-/// labels, furniture, tables and their notes, contents, captions, notes) and quotations are read:
-/// in each reading context, the native readers (a source's own tags, numbering ladders, capitals,
-/// type size) except inside a quotation, then the typography of the whole document (PageIndex
-/// Flash) with every heading's depth, then the document's bookmarks or printed contents list.
-/// A heading's type, strongest first: its size in half points, then bold, capitals and italic.
-type HeadingType = (i64, bool, bool, bool);
-
-/// Headings set apart by type alone, and every unnumbered heading's depth by its type. A block of up
-/// to four body lines no reader took is a heading where its type sets it off from the running text
-/// it stands above: bold throughout, or larger than the body's type and never smaller, opening on a
-/// capital or a number, ending no clause, and neither the opening words of a paragraph run on just
-/// below it, nor a citation, nor one of twenty such blocks on a page. Then each heading in reading
-/// order sits a level under the nearest heading before it set in stronger type, level with one in
-/// the same type; a numbered or tagged heading keeps the level it was given. Parallel texts keep
-/// their own stacks.
-fn styled_headings(document: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
-    let stroke_bold = primitives.stroke_bold.clone();
-    let bold = |line: &Line| bold_char_share(&stroke_bold, line);
-    let kind = |line: &Line| -> HeadingType {
-        ((line_font_size(line) * 2.0).round() as i64, bold(line) >= 0.5, all_caps(line.text.trim()),
-            flag_share(line, legal_pdf_core::ITALIC).unwrap_or(0.0) >= 0.5)
-    };
-    let body_size = median(document.iter().flat_map(|page| &page.lines)
-        .filter(|line| line.region_type == "body" && !line.exclude_from_body)
-        .map(line_font_size).filter(|size| *size > 0.0).collect());
-    let analysis = layout_analysis();
-    let mut raised = Vec::new();
-    for (page_slot, page) in document.iter().enumerate() {
-        if primitives.claims.contents_pages.contains(&page.index) {
-            continue;
-        }
-        // The page's blocks of open body lines, in reading order.
-        let mut blocks: Vec<Vec<usize>> = Vec::new();
-        for slot in legal_pdf_core::PageMeasure::of(page).order {
-            let line = &page.lines[slot];
-            if line.region_type != "body" || line.exclude_from_body || !line.note_region_mode.is_empty()
-                || primitives.claims.claimed(&line.id) || primitives.quotations.scopes.contains_key(&line.id)
-            {
-                continue;
-            }
-            match blocks.last_mut() {
-                Some(block) if page.lines[block[block.len() - 1]].block_index == line.block_index => block.push(slot),
-                _ => blocks.push(vec![slot]),
-            }
-        }
-        let mut found = Vec::new();
-        for (k, block) in blocks.iter().enumerate() {
-            let Some(next) = blocks.get(k + 1).map(|next| &page.lines[next[0]]) else { continue };
-            let lines: Vec<&Line> = block.iter().map(|&slot| &page.lines[slot]).collect();
-            let (first, last) = (lines[0], lines[lines.len() - 1]);
-            let text = lines.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
-            let size = line_font_size(first);
-            let strong = lines.iter().all(|line| bold(line) >= 0.95) || (body_size > 0.0 && size >= body_size * 1.15);
-            let ends = text.trim_end_matches(|c: char| c.is_whitespace() || "\"')]\u{201d}\u{2019}".contains(c)).chars().last();
-            let runs_on = next.text.trim_start().starts_with(char::is_lowercase) && next.bbox[1] - last.bbox[3] < 0.5 * size.max(1.0);
-            let (top, bottom, left, right) = (first.bbox[1], last.bbox[3], lines.iter().map(|l| l.bbox[0]).fold(f64::INFINITY, f64::min),
-                lines.iter().map(|l| l.bbox[2]).fold(f64::NEG_INFINITY, f64::max));
-            let running = blocks.iter().enumerate().filter(|(j, other)| *j != k && other.len() >= 2).map(|(_, other)| other);
-            // Running text in the next column, level with it: a column's line, not a heading.
-            let beside = running.clone().flat_map(|other| other.iter().map(|&slot| &page.lines[slot]))
-                .any(|line| line.bbox[1] < bottom && top < line.bbox[3] && (line.bbox[2] < left || line.bbox[0] > right));
-            // Indented under the margin of the running text above or below it, off the page's centre:
-            // quoted matter, whose titles are the quoted document's.
-            let margin = running.flat_map(|other| other.iter().map(|&slot| &page.lines[slot]))
-                .filter(|line| line.bbox[0] < right && left < line.bbox[2]).map(|line| line.bbox[0]).fold(f64::INFINITY, f64::min);
-            let indented = margin.is_finite() && left > margin + 1.5 * size.max(page.height / 80.0)
-                && ((left + right) / 2.0 - page.width / 2.0).abs() >= 0.05 * page.width;
-            if lines.len() <= 4
-                && !beside
-                && !indented
-                && text.chars().count() <= 300
-                && strong
-                && size >= body_size - 0.5
-                && kind(first) != kind(next)
-                && bold(next) < 0.5
-                && text.chars().find(|c| c.is_alphanumeric()).is_some_and(|c| c.is_uppercase() || c.is_numeric())
-                && !matches!(ends, Some(',' | ';'))
-                && !text.starts_with(['"', '\u{201c}', '\u{2018}'])
-                && !runs_on
-                && !analysis.has_citation_signal(&text)
-            {
-                found.extend(block.iter().map(|&slot| (page_slot, slot)));
-            }
-        }
-        if found.len() < 20 {
-            raised.extend(found);
-        }
-    }
-    for (page_slot, slot) in raised {
-        let line = &mut document[page_slot].lines[slot];
-        heading_source_trace(line, "type");
-        line.region_type = "heading".to_owned();
-    }
-    let translation = &primitives.contexts.translation_line_ids;
-    let levels = &mut primitives.headings.heading_levels;
-    let mut stacks: [Vec<(HeadingType, usize)>; 2] = [Vec::new(), Vec::new()];
-    for page in document.iter() {
-        let mut previous: Option<&Line> = None;
-        for slot in legal_pdf_core::PageMeasure::of(page).order {
-            let line = &page.lines[slot];
-            if line.region_type != "heading" || line.exclude_from_body {
-                previous = None;
-                continue;
-            }
-            // A heading's further lines stand at its first line's level.
-            if let Some(prior) = previous.filter(|prior| prior.block_index == line.block_index) {
-                if let (false, Some(&level)) = (levels.contains_key(&line.id), levels.get(&prior.id)) {
-                    levels.insert(line.id.clone(), level);
-                }
-                previous = Some(line);
-                continue;
-            }
-            previous = Some(line);
-            let own = kind(line);
-            let stack = &mut stacks[usize::from(translation.contains(&line.id))];
-            let level = match levels.get(&line.id) {
-                Some(&level) => {
-                    while stack.last().is_some_and(|(_, top)| *top >= level) {
-                        stack.pop();
-                    }
-                    level
-                }
-                None => {
-                    while stack.last().is_some_and(|(top, _)| *top <= own) {
-                        stack.pop();
-                    }
-                    let level = stack.last().map_or(1, |(_, top)| top + 1);
-                    levels.insert(line.id.clone(), level);
-                    level
-                }
-            };
-            stack.push((own, level));
-        }
-    }
-}
-
 /// Each heading line's source: the first pass after which it reads as a heading.
 pub(super) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass: &str) {
     for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
@@ -1589,6 +1450,11 @@ pub(super) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass:
     }
 }
 
+/// Every heading of the document, read once, after every container has claimed its lines (line
+/// labels, furniture, tables and their notes, contents, captions, notes) and quotations are read:
+/// in each reading context, the native readers (a source's own tags, numbering ladders, capitals,
+/// type size) except inside a quotation, then the typography of the whole document (PageIndex
+/// Flash) with every heading's depth, then the document's bookmarks or printed contents list.
 pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &mut PdfPrimitiveEvidence) {
     stamp(pages, &mut primitives.headings.sources, "layout");
     legal_pdf_support::profile::measure("prepare.native_headings", || {
@@ -1605,9 +1471,7 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             {
                 return;
             }
-            if !legal_pdf_core::model::ablated("demote_prose_heading_tags") {
-                demote_prose_heading_tags(document, primitives);
-            }
+            demote_prose_heading_tags(document, primitives);
             contents::retain_headings(document, &mut primitives.claims);
             levels.extend(apply_text_fidelity_headings(document, 0.0, primitives));
         });
@@ -1615,9 +1479,34 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
     });
     stamp(pages, &mut primitives.headings.sources, "native");
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
-        let reading = primitives.contexts.reading_line_ids.clone();
-        let translation = primitives.contexts.translation_line_ids.clone();
-        constituents::within_document_contexts(pages, &reading, &translation, |document| styled_headings(document, primitives));
+        let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids)
+            .chain(&primitives.claims.table_note_line_ids).cloned().collect::<HashSet<_>>();
+        let excluded = |id: &str| claimed.contains(id);
+        let stroke_bold = primitives.stroke_bold.clone();
+        let bold = |id: &str| stroke_bold.get(id).copied();
+        let numbered = |text: &str| enumerated(text);
+        let translation = |id: &str| primitives.contexts.translation_line_ids.contains(id);
+        constituents::within_document_contexts(
+            pages,
+            &primitives.contexts.reading_line_ids,
+            &primitives.contexts.translation_line_ids,
+            |document| {
+                legal_pdf_headings::reconcile_styled_headings(
+                    document,
+                    legal_pdf_headings::HeadingEvidence {
+                        quotation: document.iter().flat_map(|page| &page.lines)
+                            .any(|line| primitives.quotations.scopes.contains_key(&line.id)),
+                        levels: &mut primitives.headings.heading_levels,
+                        excluded: &excluded,
+                        translation: &translation,
+                        contents_pages: &primitives.claims.contents_pages,
+                        numbered: &numbered,
+                        source_regions: primitives.source_regions.as_ref(),
+                        bold: &bold,
+                    },
+                );
+            },
+        );
     });
     stamp(pages, &mut primitives.headings.sources, "styled");
     legal_pdf_support::profile::measure("prepare.bookmarks", || {

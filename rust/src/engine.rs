@@ -435,6 +435,7 @@ fn derive_extracted(
             &extracted.pages,
             &extracted.separators,
             &extracted.outline,
+            std::env::var("LEGALPDF_ABLATE").ok(),
         ))
         .ok()?;
         Some(
