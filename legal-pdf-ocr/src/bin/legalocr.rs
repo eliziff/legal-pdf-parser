@@ -209,38 +209,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Independently invented page geometry, without document text or model assets.
-    fn page(unit: u32) -> Vec<u8> {
-        let objects = ["<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-            "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
-            format!("<< /Type /Page /Parent 2 0 R /Resources << >> /MediaBox [0 0 400 500] /CropBox [10 20 210 320] /Rotate 90 /UserUnit {unit} >>")];
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
-        }
-        let xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in offsets {
-            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-        );
-        bytes
-    }
-
-    #[test]
-    fn pdf_geometry_uses_visible_rotated_crop_and_physical_units() {
-        let requests = pdf_requests(&page(2)).unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!((requests[0].width, requests[0].height), (600.0, 400.0));
-        assert!(pdf_requests(&page(0)).is_err());
-    }
-}

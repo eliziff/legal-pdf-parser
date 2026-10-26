@@ -994,18 +994,6 @@ pub(super) fn order_page(
     diagnostics
 }
 
-#[cfg(test)]
-pub(super) fn order_pages(pages: &mut [Page]) -> Vec<Diagnostic> {
-    pages
-        .iter_mut()
-        .flat_map(|page| {
-            let table_page = has_table_caption(&page.lines)
-                || !legal_pdf_tables::document_tables(std::slice::from_ref(page), &HashSet::new(), &TableReadings).0.is_empty();
-            order_page(page, table_page, &HashSet::new())
-        })
-        .collect()
-}
-
 /// Whether a transcript's line opens a unit of its own: a speaker's turn, or a line in capitals
 /// (an examination's "BY MR. JONES:", "EXHIBIT NO. 3", "--- Upon resuming").
 fn opens_turn(line: &Line) -> bool {

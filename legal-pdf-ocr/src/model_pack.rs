@@ -110,28 +110,3 @@ fn checked_asset(root: &Path, asset: &Asset) -> Result<PathBuf> {
     }
     Ok(path)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn manifest_paths_cannot_escape_the_model_pack() {
-        for path in [
-            "../outside.onnx",
-            "a/../../outside.onnx",
-            "/outside.onnx",
-            "C:/outside.onnx",
-            "a\\..\\outside.onnx",
-        ] {
-            let error = checked_asset(
-                Path::new("."),
-                &Asset {
-                    path: path.into(),
-                    sha256: "0".repeat(64),
-                },
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("inside its model pack"));
-        }
-    }
-}

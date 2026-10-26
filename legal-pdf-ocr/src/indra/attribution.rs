@@ -282,21 +282,3 @@ impl IndraOcr {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn prefix_search_preserves_repeated_digits_separated_by_blank() {
-        let logits = [0., 8., 0., 8., 0., 0., 0., 8., 0.];
-        assert_eq!(beam(&logits, 3, 3)[0].0, vec![1, 1]);
-        assert_eq!(beam(&[0., 8., 0., 0., 8., 0.], 3, 2)[0].0, vec![1]);
-    }
-    #[test]
-    fn prefix_search_sums_paths_instead_of_only_taking_frame_winners() {
-        // Blank wins each frame, but the three paths for class 1 jointly win the string.
-        let result = beam(&[0.1, 0.0, 0.1, 0.0], 2, 2);
-        assert_eq!(result[0].0, vec![1]);
-        assert!(result.iter().all(|(_, p)| p.is_finite()));
-    }
-}

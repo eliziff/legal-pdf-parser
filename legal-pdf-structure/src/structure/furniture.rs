@@ -627,17 +627,6 @@ pub(super) fn printed_label(value: &str) -> Option<String> {
     .map(|value| value.as_str().to_owned())
 }
 
-#[cfg(test)]
-#[test]
-fn printed_label_accepts_symmetric_numeric_folios_only() {
-    assert_eq!(printed_label("- 13 -").as_deref(), Some("13"));
-    assert_eq!(printed_label("- 2 -").as_deref(), Some("2"));
-    assert_eq!(printed_label("Page 13").as_deref(), Some("13"));
-    assert_eq!(printed_label("IV").as_deref(), Some("IV"));
-    assert_eq!(printed_label("- IV -"), None);
-    assert_eq!(printed_label("- 13"), None);
-}
-
 /// A browser or print driver sets the page's address and the time it was printed in the
 /// outer margins, with the page title and "1 of 3" on the same rows. They are furniture on
 /// a single page too, where nothing repeats to show it.

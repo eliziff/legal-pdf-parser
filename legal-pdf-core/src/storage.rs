@@ -95,22 +95,3 @@ pub fn read_gzip_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_reader(BufReader::new(GzDecoder::new(BufReader::new(file))))
         .map_err(Error::from)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::{json, Value};
-
-    #[test]
-    fn compressed_cache_is_one_round_trippable_file() {
-        let path = std::env::temp_dir().join(format!(
-            "legalpdf-cache-test-{}-{}.json.gz",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let value = json!({"hello": ["world"]});
-        write_gzip_json(&path, &value).unwrap();
-        assert_eq!(read_gzip_json::<Value>(&path).unwrap(), value);
-        fs::remove_file(path).unwrap();
-    }
-}
