@@ -902,38 +902,6 @@ pub(super) fn heading_trace(line: &Line, decision: &HeadingDecision, why: &str) 
     }
 }
 
-/// A line in capitals that names a party of a caption: a corporate name, a party label, or a name
-/// between the caption's connectives ("BETWEEN:", "AND:", "- AND -", "AMONG:").
-pub(super) fn caption_party(page: &Page, slot: usize) -> bool {
-    static CORPORATE: OnceLock<Regex> = OnceLock::new();
-    static CONNECTIVE: OnceLock<Regex> = OnceLock::new();
-    let corporate = CORPORATE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:inc|ltd|ltée|limited|limitée|corp|corporation|co|company|llp|lp|ulc|llc|s\.e\.c|gp|partnership|trust|bank|credit union)\.?,?$").unwrap()
-    });
-    let connective = CONNECTIVE.get_or_init(|| {
-        Regex::new(r"(?i)^[\-\u{2013}\u{2014}\s]*(?:between|and|among|et|entre|c\.|v\.|vs\.?)[\-\u{2013}\u{2014}\s:]*$").unwrap()
-    });
-    let text = page.lines[slot].text.trim();
-    if corporate.is_match(text) || party_label().is_match(text) {
-        return true;
-    }
-    let neighbour = |step: isize| {
-        let mut at = slot as isize + step;
-        while at >= 0 && (at as usize) < page.lines.len() {
-            let line = &page.lines[at as usize];
-            if !line.text.trim().is_empty() {
-                return Some(line);
-            }
-            at += step;
-        }
-        None
-    };
-    [neighbour(-1), neighbour(1)].into_iter().flatten().any(|line| {
-        let near = line.text.trim();
-        connective.is_match(near) || party_label().is_match(near)
-    })
-}
-
 /// A page whose text was recognized from its image: lines with recognition evidence or no spans,
 /// or a text layer set in one face throughout with no bold or italic (a recognizer writes one
 /// generic face and sizes its boxes; a typeset page changes face or weight somewhere).
@@ -1058,65 +1026,7 @@ pub(super) fn apply_text_fidelity_headings(
             }
         }
     }
-    let toc_leader = contents_leader_re();
     let mut capitalised = Vec::new();
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        if primitives.claims.contents_pages.contains(&page.index) {
-            continue;
-        }
-        // A page carrying a contents list is read below the list: its entries are no headings.
-        let listed = page
-            .lines
-            .iter()
-            .filter(|line| toc_leader.is_match(&line.text))
-            .take(5)
-            .count()
-            >= 5;
-        let list_bottom = page
-            .lines
-            .iter()
-            .filter(|line| primitives.claims.contents_line_ids.contains(&line.id))
-            .map(|line| line.bbox[3])
-            .max_by(f64::total_cmp);
-        if listed && list_bottom.is_none() {
-            continue;
-        }
-        let mut lines = [Vec::new(), Vec::new()];
-        for (line_slot, line) in page.lines.iter().enumerate() {
-            if listed && list_bottom.is_some_and(|bottom| line.bbox[1] < bottom) {
-                continue;
-            }
-            let text = line.text.trim();
-            let letters = text
-                .chars()
-                .filter(|character| character.is_alphabetic())
-                .count();
-            if line.region_type == "body"
-                && !line.exclude_from_body
-                && heading_source_eligible(primitives, line)
-                && (8..=70).contains(&text.chars().count())
-                && letters >= 4
-                && !text.chars().any(char::is_lowercase)
-                && !text.ends_with(['.', '?', '!', ';', ':', ','])
-                && layout_analysis().heading_text_plausible(title_after_enumerator(text))
-                && !caption_party(page, line_slot)
-            {
-                lines[usize::from(primitives.contexts.translation_line_ids.contains(&line.id))]
-                    .push(line_slot);
-            }
-        }
-        // The page cap belongs to each parallel sequence, not their combined line count.
-        for lines in lines {
-            if lines.len() >= 20 {
-                continue;
-            }
-            for line_slot in lines {
-                heading_source_trace(&page.lines[line_slot], "caps");
-                page.lines[line_slot].region_type = "heading".to_owned();
-                capitalised.push((page_slot, line_slot));
-            }
-        }
-    }
 
     for (page_slot, page) in pages.iter_mut().enumerate() {
         if primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
