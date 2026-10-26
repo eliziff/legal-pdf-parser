@@ -41,10 +41,7 @@ const BACKFILL_MAX_TITLE: usize = 100;
 /// A bookmark title is found on at most this many consecutive lines.
 const MAX_TITLE_LINES: usize = 4;
 
-const CONTENT_UNITS: &[&str] = &[
-    "chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix", "unit", "lesson",
-    "章", "部", "节", "篇", "卷", "第章", "第部", "第节", "第篇", "第卷",
-];
+const CONTENT_UNITS: &[&str] = &["chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix"];
 const ROMAN_EXCLUDED: &[&str] = &["di", "div", "li", "liv", "mi", "mix", "xi"];
 
 #[derive(Debug, Clone)]
@@ -55,16 +52,10 @@ struct Entry {
     page: usize,
 }
 
+/// A bookmark named for its page alone ("12", "Page 12").
 fn generic_title() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^(?:(?:page|slide|folie|document\s+page)\s*)?\d+$").expect("generic title")
-    })
-}
-
-fn latex_span() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\$.*?\$").expect("latex span"))
+    RE.get_or_init(|| Regex::new(r"(?i)^(?:page\s*)?\d+$").expect("generic title"))
 }
 
 /// A numbering label left over beside a title: "1", "a", "part4", "tab12".
@@ -79,10 +70,8 @@ fn label_remainder() -> &'static Regex {
 }
 
 fn tokens(title: &str) -> Vec<String> {
-    let lowered = latex_span()
-        .replace_all(&title.to_lowercase(), "")
-        .into_owned();
-    lowered
+    title
+        .to_lowercase()
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
@@ -130,95 +119,20 @@ fn title_template(title: &str) -> String {
         .collect()
 }
 
-/// An upper bound on `similarity`, as difflib's `real_quick_ratio` and `quick_ratio`: matched
-/// characters can number no more than the shorter string, nor than the characters both hold.
-fn similarity_bound(a: &str, b: &str) -> f64 {
-    let (left, right) = (a.chars().count(), b.chars().count());
-    if left + right == 0 {
-        return 1.0;
+/// How nearly two normalized titles are one, as the share of their character pairs they hold in
+/// common (Dice's coefficient): a recognizer's slip or a dropped word leaves it high.
+fn similarity(a: &str, b: &str) -> f64 {
+    let pairs = |text: &str| text.chars().collect::<Vec<_>>().windows(2).map(|pair| (pair[0], pair[1])).collect::<Vec<_>>();
+    let (left, right) = (pairs(a), pairs(b));
+    if left.is_empty() || right.is_empty() {
+        return f64::from(u8::from(a == b));
     }
-    if 2.0 * left.min(right) as f64 / ((left + right) as f64) < REPAIR_SIMILARITY {
-        return 0.0;
+    let mut counts = HashMap::<(char, char), usize>::new();
+    for pair in &right {
+        *counts.entry(*pair).or_default() += 1;
     }
-    let mut counts = HashMap::<char, isize>::new();
-    for character in b.chars() {
-        *counts.entry(character).or_default() += 1;
-    }
-    let common = a.chars().filter(|character| {
-        counts.get_mut(character).is_some_and(|count| {
-            *count -= 1;
-            *count >= 0
-        })
-    });
-    2.0 * common.count() as f64 / (left + right) as f64
-}
-
-/// `difflib.SequenceMatcher(None, a, b).ratio()`.
-pub(super) fn similarity(a: &str, b: &str) -> f64 {
-    let a = a.chars().collect::<Vec<_>>();
-    let b = b.chars().collect::<Vec<_>>();
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let mut b2j = HashMap::<char, Vec<usize>>::new();
-    for (j, character) in b.iter().enumerate() {
-        b2j.entry(*character).or_default().push(j);
-    }
-    if b.len() >= 200 {
-        let limit = b.len() / 100 + 1;
-        b2j.retain(|_, indexes| indexes.len() <= limit);
-    }
-    let longest = |alo: usize, ahi: usize, blo: usize, bhi: usize| {
-        let (mut besti, mut bestj, mut bestsize) = (alo, blo, 0);
-        let mut j2len = HashMap::<usize, usize>::new();
-        for i in alo..ahi {
-            let mut next = HashMap::new();
-            for &j in b2j.get(&a[i]).map_or(&[][..], Vec::as_slice) {
-                if j < blo {
-                    continue;
-                }
-                if j >= bhi {
-                    break;
-                }
-                let k = j
-                    .checked_sub(1)
-                    .and_then(|prior| j2len.get(&prior))
-                    .copied()
-                    .unwrap_or(0)
-                    + 1;
-                next.insert(j, k);
-                if k > bestsize {
-                    (besti, bestj, bestsize) = (i + 1 - k, j + 1 - k, k);
-                }
-            }
-            j2len = next;
-        }
-        while besti > alo && bestj > blo && a[besti - 1] == b[bestj - 1] {
-            (besti, bestj, bestsize) = (besti - 1, bestj - 1, bestsize + 1);
-        }
-        while besti + bestsize < ahi
-            && bestj + bestsize < bhi
-            && a[besti + bestsize] == b[bestj + bestsize]
-        {
-            bestsize += 1;
-        }
-        (besti, bestj, bestsize)
-    };
-    let mut matched = 0;
-    let mut queue = vec![(0, a.len(), 0, b.len())];
-    while let Some((alo, ahi, blo, bhi)) = queue.pop() {
-        let (i, j, k) = longest(alo, ahi, blo, bhi);
-        if k > 0 {
-            matched += k;
-            if alo < i && blo < j {
-                queue.push((alo, i, blo, j));
-            }
-            if i + k < ahi && j + k < bhi {
-                queue.push((i + k, ahi, j + k, bhi));
-            }
-        }
-    }
-    2.0 * matched as f64 / (a.len() + b.len()) as f64
+    let common = left.iter().filter(|pair| counts.get_mut(*pair).is_some_and(|count| *count > 0 && { *count -= 1; true })).count();
+    2.0 * common as f64 / (left.len() + right.len()) as f64
 }
 
 /// Entries must walk forward through the document; levels are re-stacked over the survivors.
@@ -363,10 +277,7 @@ fn same_title(found: &str, title: &str, heading: bool) -> bool {
         return true;
     }
     if heading {
-        return found.ends_with(title)
-            || title.ends_with(found)
-            || (similarity_bound(found, title) >= REPAIR_SIMILARITY
-                && similarity(found, title) >= REPAIR_SIMILARITY);
+        return found.ends_with(title) || title.ends_with(found) || similarity(found, title) >= REPAIR_SIMILARITY;
     }
     // Body lines carry the title whole, or with a numbering label only one side prints.
     let labelled = |long: &str, short: &str| {
