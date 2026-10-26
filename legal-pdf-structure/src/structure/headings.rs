@@ -1448,13 +1448,14 @@ pub(super) fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPr
 /// in each reading context, the native readers (a source's own tags, numbering ladders, capitals,
 /// type size) except inside a quotation, then the typography of the whole document (PageIndex
 /// Flash) with every heading's depth, then the document's bookmarks or printed contents list.
-pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &mut PdfPrimitiveEvidence) {
-    // Each heading line's source: the first of these passes after which it reads as a heading.
-    fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass: &str) {
-        for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
-            sources.entry(line.id.clone()).or_insert_with(|| pass.to_owned());
-        }
+/// Each heading line's source: the first pass after which it reads as a heading.
+pub(super) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass: &str) {
+    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
+        sources.entry(line.id.clone()).or_insert_with(|| pass.to_owned());
     }
+}
+
+pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &mut PdfPrimitiveEvidence) {
     stamp(pages, &mut primitives.headings.sources, "layout");
     legal_pdf_support::profile::measure("prepare.native_headings", || {
         let reading = primitives.contexts.reading_lines().clone();
@@ -1518,10 +1519,6 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         bookmarks::reconcile_bookmarks(pages, &merged, primitives, authored);
     });
     stamp(pages, &mut primitives.headings.sources, "outline");
-    // Then what the whole document says of its headings: a transcript's witnesses and examinations,
-    // and the lines that never head a division.
-    legal_pdf_support::profile::measure("prepare.heading_rules", || heading_rules::read(pages, primitives));
-    stamp(pages, &mut primitives.headings.sources, "rules");
 }
 
 /// Bold on a recognized page, read from its strokes: a scan's text layer names no bold face, and a

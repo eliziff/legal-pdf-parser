@@ -695,6 +695,7 @@ fn classify_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnos
     };
     let diagnostics = classify_pages_with_source(pages, separators, &mut evidence);
     read_headings(pages, &[], &mut evidence);
+    heading_rules::read(pages, &mut evidence, false);
     build_regions(pages);
     diagnostics
 }
@@ -1342,12 +1343,16 @@ fn prepare_reader(
     Ok((primitives, diagnostics))
 }
 
-/// The decisions that rest on the readers' pages.
+/// The decisions that rest on the readers' pages: the headings' one decision (an instrument's numbered
+/// captions among its vetoes), then the printed page labels and the regions.
 fn prepare_composed(
     pages: &mut [Page],
-    primitives: PdfPrimitiveEvidence,
+    mut primitives: PdfPrimitiveEvidence,
     mut diagnostics: Vec<Diagnostic>,
+    instrument: bool,
 ) -> PdfPreparation {
+    legal_pdf_support::profile::measure("compose.heading_rules", || heading_rules::read(pages, &mut primitives, instrument));
+    stamp(pages, &mut primitives.headings.sources, "rules");
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
@@ -1365,10 +1370,6 @@ fn derive_prepared(
     mut prepared: PdfPreparation,
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    // The document's type, where known (the caller's profile): an instrument numbers its provisions.
-    if identity.profile == Some(legal_structure_model::DetectionProfile::Instrument) {
-        heading_rules::instrument_captions(pages, &mut prepared.primitives);
-    }
     legal_pdf_support::profile::measure("derive.note_regions", || {
         constituents::within_document_contexts(
             pages,
@@ -1697,7 +1698,9 @@ pub fn derive_cached(
             }
         }
     };
-    let prepared = prepare_composed(pages, primitives, diagnostics);
+    // The document's type, where known (the caller's profile): an instrument numbers its provisions.
+    let instrument = identity.profile == Some(legal_structure_model::DetectionProfile::Instrument);
+    let prepared = prepare_composed(pages, primitives, diagnostics, instrument);
     derive_prepared(pages, prepared, identity)
 }
 

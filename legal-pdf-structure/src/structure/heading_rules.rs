@@ -341,38 +341,13 @@ fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, ab
             || (bold && numbered(text) && above >= 1.0))
 }
 
-/// An instrument's numbered captions: a clause's caption belongs to its clause, and a contract's
-/// numbers are its provisions, so a heading that opens on a number, letter or numeral ("1.1
-/// Definitions", "2. Purchase and Sale", "(a)") is the opening of a body unit. A division word's
-/// heading ("ARTICLE 1", "SCHEDULE A") stays a heading.
-pub(super) fn instrument_captions(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
-    for page in pages.iter_mut() {
-        let mut slot = 0;
-        while slot < page.lines.len() {
-            if page.lines[slot].region_type != "heading" {
-                slot += 1;
-                continue;
-            }
-            let block = page.lines[slot].block_index;
-            let end = (slot..page.lines.len())
-                .take_while(|&k| page.lines[k].region_type == "heading" && page.lines[k].block_index == block)
-                .last()
-                .unwrap_or(slot);
-            let text = page.lines[slot..=end].iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
-            let caption = enumerator(&text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
-            if caption {
-                for line in &mut page.lines[slot..=end] {
-                    primitives.headings.heading_levels.remove(&line.id);
-                    primitives.headings.navigation_parents.remove(&line.id);
-                    line.region_type = "body".to_owned();
-                }
-            }
-            slot = end + 1;
-        }
-    }
-}
-
-pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
+/// The headings' one decision, over what every reader read: the lines the whole document raises (a
+/// transcript's witnesses, examinations and parts), the body lines it lifts, the headings it
+/// lowers, then every heading's level. `instrument`: the document numbers its provisions (the
+/// caller's profile), so a heading opening on a number, letter or numeral ("1.1 Definitions", "2.
+/// Purchase and Sale", "(a)") is a clause's caption, the opening of its body unit, whatever placed
+/// it; a division word's ("ARTICLE 1", "SCHEDULE A") stays a heading.
+pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, instrument: bool) {
     let reading = primitives.contexts.reading_lines().clone();
     let translation = primitives.contexts.translation_line_ids.clone();
     let (mut demoted, mut promoted, mut lifted_lines) = (Vec::new(), Vec::new(), Vec::new());
@@ -471,8 +446,9 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
                 };
                 let text = heading.text.as_str();
                 let running = text.split_whitespace().count() <= 10 && printed_on.get(&words(text)).is_some_and(|pages| pages.len() >= 3);
+                let caption = instrument && enumerator(text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
                 // A heading the document's own outline or contents placed is the document's word.
-                if !heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id))
+                if caption || !heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id))
                     && (not_a_heading(&heading, running) || (opinions <= 1 && judge(text)) || (transcript && turn_or_event(text)))
                 {
                     demoted.extend(heading.lines.iter().map(|line| line.id.clone()));
@@ -497,6 +473,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence) {
         } else if demoted.contains(&line.id) {
             line.region_type = "body".to_owned();
             primitives.headings.heading_levels.remove(&line.id);
+            primitives.headings.navigation_parents.remove(&line.id);
         }
     }
     // Only once the headings are settled can their levels be read: each step is from the heading
