@@ -1,7 +1,7 @@
 use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
 use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
-use legal_pdf_extraction::{extract_pdf, recognize_pdf, ExtractedPdf};
+use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 use legal_pdf_structure::{
@@ -494,7 +494,7 @@ fn finish_recognition(
         }));
     }
     for page in pages {
-        legal_pdf_extraction::mark_rule_underlines(page);
+        legal_pdf_extraction_processor::mark_rule_underlines(page);
     }
 }
 

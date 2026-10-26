@@ -19,7 +19,7 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
 default = []
-pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:legal-pdf-witnesses", "dep:serde", "dep:serde_json", "dep:sha2"]
+pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:legal-pdf-witnesses", "dep:serde", "dep:serde_json", "dep:sha2"]
 language = ["dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr", "legal-pdf-ocr/ocr"]
 indra = ["ocr"]
@@ -44,7 +44,7 @@ required-features = ["cli"]
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
 legal-structure-tagger = { path = "../legal-structure/tagger", features = ["onnx"], optional = true }
-legal-pdf-extraction = { path = "legal-pdf-extraction", optional = true }
+legal-pdf-extraction-processor = { path = "legal-pdf-extraction-processor", optional = true }
 legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", optional = true }

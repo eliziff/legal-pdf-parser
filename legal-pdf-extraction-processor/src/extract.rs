@@ -1,7 +1,9 @@
-use legal_pdf_core::{profile, PdfOcrProvider};
-use legal_pdf_extraction_processor as processor;
+//! A PDF's extraction, whole: its pages' text and geometry by pdf-inspector, its page labels, outline
+//! and tagged structure roles, assembled with any recognition into the extracted document.
 
-pub use legal_pdf_extraction_processor::{mark_rule_underlines, recognize_pdf, Error, ExtractedPdf, Result};
+use crate as processor;
+use crate::{ExtractedPdf, Result};
+use legal_pdf_core::{profile, PdfOcrProvider};
 
 pub fn extract_pdf(
     bytes: &[u8],

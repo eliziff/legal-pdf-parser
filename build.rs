@@ -112,7 +112,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
         "../legal-structure/layout/src/stats.rs",
     ]);
     extraction.extend(inspector_inputs(root, NOT_EXTRACTION));
-    extraction.extend(crate_inputs(root, "extraction"));
     extraction.extend(crate_inputs(root, "extraction-processor"));
     let mut recognition = paths(&[
         "legal-pdf-core/Cargo.toml",
@@ -182,7 +181,6 @@ fn main() {
     }
     for (active, name) in [
         (pdf || enabled("LANGUAGE"), "core"),
-        (pdf, "extraction"),
         (pdf, "extraction-processor"),
         (enabled("LANGUAGE"), "language"),
         (enabled("OCR"), "ocr"),
