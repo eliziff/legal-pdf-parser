@@ -22,9 +22,7 @@ use headings::*;
 use line_roles::*;
 use text::*;
 pub use graph::PdfTextIndex;
-use graph::{
-    contents_leader_re, map_note_pairs, native_graph_parts, PdfResolutionInput,
-};
+use graph::{map_note_pairs, native_graph_parts, PdfResolutionInput};
 use legal_pdf_core::model::{
     DetachedReference, Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
     ParagraphAnchor, PdfOutlineEntry, Span, Word,
