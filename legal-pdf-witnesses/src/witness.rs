@@ -187,10 +187,11 @@ pattern!(
     address,
     r"(?i)(?:\b(?:tel(?:ephone)?|phone|fax|facsimile|cell)\b\.?\s*(?:no\.?)?\s*:?\s*[+(]?\d|\bp\.?\s?o\.?\s+box\b|\bdocex\b|[\w.+-]+@[\w-]+\.\w|\bsuite\s+\d|^\d{1,5}[a-z]?\s+[\w' -]+\s+(?:street|st|road|rd|avenue|ave|drive|dr|boulevard|blvd|lane|way|place|crescent|court)\b|\b[a-z]\d[a-z]\s?\d[a-z]\d\b)"
 );
-pattern!(
-    party,
-    r"(?i)\b(?:applicants?|respondents?|appellants?|plaintiffs?|defendants?|petitioners?|claimants?|accused|interven[eo]rs?)\W*$"
-);
+/// A line ending on a party's role.
+fn party() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(&format!(r"(?i)\b(?:{})\W*$", legal_structure_model::PARTY_ROLES)).expect("witness pattern"))
+}
 pattern!(
     citation,
     r"\s(?:v\.?|vs\.?)\s+[A-Z]|\[\d{4}\]\s*\w|\(\d{4}\),?\s+\d+\s+[A-Z]|\b\d+\s+[A-Z][A-Za-z.]{1,12}\s+\d+\b|\bS\.?C\.?R\.?\b|\bR\.S\.[A-Z]"

@@ -914,7 +914,7 @@ pub(super) fn caption_party(page: &Page, slot: usize) -> bool {
         Regex::new(r"(?i)^[\-\u{2013}\u{2014}\s]*(?:between|and|among|et|entre|c\.|v\.|vs\.?)[\-\u{2013}\u{2014}\s:]*$").unwrap()
     });
     let text = page.lines[slot].text.trim();
-    if corporate.is_match(text) || legal_pdf_headings::party_label().is_match(text) {
+    if corporate.is_match(text) || party_label().is_match(text) {
         return true;
     }
     let neighbour = |step: isize| {
@@ -930,7 +930,7 @@ pub(super) fn caption_party(page: &Page, slot: usize) -> bool {
     };
     [neighbour(-1), neighbour(1)].into_iter().flatten().any(|line| {
         let near = line.text.trim();
-        connective.is_match(near) || legal_pdf_headings::party_label().is_match(near)
+        connective.is_match(near) || party_label().is_match(near)
     })
 }
 

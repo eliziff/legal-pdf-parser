@@ -9,9 +9,8 @@
 //! page break, a numbering restart or a change of type alone opens none. A constituent carries
 //! no label: it is never a pinpoint's target.
 
-use super::{arabic_page_number, bookmarks, graph::PdfTextIndex};
+use super::{arabic_page_number, bookmarks, graph::PdfTextIndex, party_label};
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
-use legal_pdf_headings::party_label;
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
