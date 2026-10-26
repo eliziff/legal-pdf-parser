@@ -4,215 +4,6 @@
 
 use super::*;
 
-pub(super) fn standalone_reference(text: &str) -> Option<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(?:\d{1,4}|[*\u{2020}\u{2021}\u{00a7}\u{00b6}#])$").unwrap())
-        .is_match(text)
-        .then(|| normalize_label(text))
-}
-
-pub(super) fn detached_reference_target(
-    reference_index: usize,
-    lines: &[Line],
-    body_size: f64,
-) -> Option<(usize, usize)> {
-    let reference = &lines[reference_index];
-    let reference_x = (reference.bbox[0] + reference.bbox[2]) / 2.0;
-    lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            if index == reference_index
-                || line.exclude_from_body
-                || matches!(line.region_type.as_str(), "header" | "footer")
-                || line_font_size(line) < body_size * 0.80
-            {
-                return None;
-            }
-            let y_distance = (line.bbox[1] - reference.bbox[1]).abs();
-            if y_distance > ((line.bbox[3] - line.bbox[1]) * 0.20).max(2.0) {
-                return None;
-            }
-            let (distance, offset) = line
-                .spans
-                .iter()
-                .flat_map(|span| [(span.bbox[0], span.start), (span.bbox[2], span.end)])
-                .map(|(x, offset)| ((reference_x - x).abs(), offset))
-                .min_by(|left, right| left.0.total_cmp(&right.0).then(right.1.cmp(&left.1)))?;
-            (distance <= body_size.max(6.0)).then_some((
-                (
-                    distance,
-                    y_distance,
-                    line.source_index.abs_diff(reference.source_index),
-                ),
-                index,
-                offset,
-            ))
-        })
-        .min_by(|left, right| {
-            left.0
-                 .0
-                .total_cmp(&right.0 .0)
-                .then(left.0 .1.total_cmp(&right.0 .1))
-                .then(left.0 .2.cmp(&right.0 .2))
-        })
-        .map(|(_, index, offset)| (index, offset))
-}
-
-pub(super) fn associate_detached_references(pages: &mut [Page], separators: &[Option<f64>]) {
-    for (page, separator) in pages.iter_mut().zip(separators) {
-        let body_size = median(
-            page.lines
-                .iter()
-                .filter(|line| {
-                    !matches!(line.region_type.as_str(), "header" | "footer")
-                        && line.bbox[1] < page.height * 0.75
-                })
-                .map(line_font_size)
-                .filter(|size| (7.0..=20.0).contains(size))
-                .collect(),
-        );
-        let body_size = if body_size > 0.0 { body_size } else { 10.0 };
-        let note_cut = separator.unwrap_or(page.height * 0.88);
-        // The oracle consumes accepted markers one at a time. Preserve that
-        // mutation order so a consumed row cannot become a later host.
-        for marker_index in 0..page.lines.len() {
-            let Some(label) = standalone_reference(page.lines[marker_index].text.trim()) else {
-                continue;
-            };
-            let size = line_font_size(&page.lines[marker_index]);
-            if page.lines[marker_index].exclude_from_body
-                || matches!(
-                    page.lines[marker_index].region_type.as_str(),
-                    "header" | "footer"
-                )
-                || !(0.0 < size && size <= body_size * 0.75)
-                || page.lines[marker_index].bbox[1] >= note_cut
-            {
-                continue;
-            }
-            let Some((host_index, offset)) =
-                detached_reference_target(marker_index, &page.lines, body_size)
-            else {
-                continue;
-            };
-            let source_line_id = page.lines[marker_index].id.clone();
-            let selected_text = page.lines[marker_index].text.trim().to_owned();
-            page.lines[host_index]
-                .detached_references
-                .push(DetachedReference {
-                    note_id: label,
-                    selected_text,
-                    start_offset: offset,
-                    end_offset: offset,
-                    source_line_id,
-                });
-            page.lines[marker_index].exclude_from_body = true;
-        }
-        associate_spliced_markers(page, note_cut);
-    }
-}
-
-pub(super) fn orphaned_marker(line: &Line) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    !line.spans.is_empty()
-        && RE
-            .get_or_init(|| Regex::new(r"^\d{1,4}$").unwrap())
-            .is_match(&line.text)
-}
-
-pub(super) fn spliced_marker_host(marker: &Line, host: Option<&Line>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    if orphaned_marker(host) || marker.block_index != host.block_index {
-        return false;
-    }
-    let marker_height = marker.bbox[3] - marker.bbox[1];
-    let host_height = host.bbox[3] - host.bbox[1];
-    if marker_height <= 0.0 || host_height <= 0.0 {
-        return false;
-    }
-    let overlap = marker.bbox[3].min(host.bbox[3]) - marker.bbox[1].max(host.bbox[1]);
-    if overlap.max(0.0) / marker_height < 0.5
-        || marker.bbox[0] < host.bbox[0] - 12.0
-        || marker.bbox[0] > host.bbox[2] + 12.0
-    {
-        return false;
-    }
-    if marker.spans.iter().all(|span| span.superscript) {
-        return true;
-    }
-    let marker_size = line_font_size(marker);
-    let host_size = line_font_size(host);
-    marker_size > 0.0
-        && host_size >= 1.25 * marker_size
-        && marker.bbox[3] <= host.bbox[3] - 0.25 * host_height
-}
-
-pub(super) fn associate_spliced_markers(page: &mut Page, note_cut: f64) {
-    let eligible: Vec<usize> = page
-        .lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            (!matches!(line.region_type.as_str(), "header" | "footer") && !line.exclude_from_body)
-                .then_some(index)
-        })
-        .collect();
-    if eligible.len() < 2 {
-        return;
-    }
-    let mut claims = Vec::<(usize, usize)>::new();
-    for (position, marker_index) in eligible.iter().copied().enumerate() {
-        let marker = &page.lines[marker_index];
-        if !orphaned_marker(marker) || marker.bbox[1] >= note_cut {
-            continue;
-        }
-        let previous = position
-            .checked_sub(1)
-            .and_then(|index| eligible.get(index))
-            .copied();
-        let next = eligible.get(position + 1).copied();
-        let previous_ok = spliced_marker_host(marker, previous.map(|index| &page.lines[index]));
-        let next_ok = spliced_marker_host(marker, next.map(|index| &page.lines[index]));
-        if previous_ok == next_ok {
-            continue;
-        }
-        claims.push((
-            marker_index,
-            if previous_ok {
-                previous.unwrap()
-            } else {
-                next.unwrap()
-            },
-        ));
-    }
-    let mut host_counts = HashMap::<usize, usize>::new();
-    for (_, host) in &claims {
-        *host_counts.entry(*host).or_default() += 1;
-    }
-    for (marker_index, host_index) in claims {
-        if host_counts.get(&host_index) != Some(&1) {
-            continue;
-        }
-        let value = normalize_label(page.lines[marker_index].text.trim());
-        let selected_text = page.lines[marker_index].text.trim().to_owned();
-        let source_line_id = page.lines[marker_index].id.clone();
-        let offset = page.lines[host_index].text.chars().count();
-        page.lines[host_index]
-            .detached_references
-            .push(DetachedReference {
-                note_id: value,
-                selected_text,
-                start_offset: offset,
-                end_offset: offset,
-                source_line_id,
-            });
-        page.lines[marker_index].exclude_from_body = true;
-    }
-}
-
 /// "Notes", "Footnotes", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
 /// is a sentence's word wrapped ("... on the information or indictment, / note").
 pub(super) fn endnote_heading(text: &str) -> bool {
@@ -300,7 +91,6 @@ pub(super) fn classify_line_roles(
         !matches!(line.region_type.as_str(), "header" | "footer")
             && !line.exclude_from_body
             && !evidence.claims.table_cell_line_ids.contains(&line.id)
-            && !evidence.claims.table_note_line_ids.contains(&line.id)
     }));
     let mut expected_endnote: Option<u32> = None;
     let mut continuing_size: Option<f64> = None;
@@ -311,13 +101,6 @@ pub(super) fn classify_line_roles(
             .iter()
             .enumerate()
             .filter(|(_, line)| evidence.claims.table_cell_line_ids.contains(&line.id))
-            .map(|(slot, _)| slot)
-            .collect::<HashSet<_>>();
-        let table_notes = page
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| evidence.claims.table_note_line_ids.contains(&line.id))
             .map(|(slot, _)| slot)
             .collect::<HashSet<_>>();
         if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page.index)) {
@@ -337,7 +120,6 @@ pub(super) fn classify_line_roles(
                         !matches!(line.region_type.as_str(), "header" | "footer")
                             && !line.exclude_from_body
                             && !table_cells.contains(index)
-                            && !table_notes.contains(index)
                             && page.height * 0.10 <= line.bbox[1]
                             && line.bbox[1] <= page.height * 0.75
                     })
@@ -354,7 +136,6 @@ pub(super) fn classify_line_roles(
             .filter(|(index, line)| {
                 !line.exclude_from_body
                     && !table_cells.contains(index)
-                    && !table_notes.contains(index)
                     && line_width(line) >= page.width * 0.30
                     && line
                         .text
@@ -391,9 +172,8 @@ pub(super) fn classify_line_roles(
             page.lines
                 .iter()
                 .enumerate()
-                .filter(|(index, line)| {
+                .filter(|(_, line)| {
                     paragraph_candidates.contains(&line.id)
-                        && !table_notes.contains(index)
                         && !separator.is_some_and(|cut| line.bbox[1] >= cut - tolerance)
                         && !has_prior_reference(page, line.text.trim(), line.bbox[1])
                         && !evidence
@@ -430,19 +210,12 @@ pub(super) fn classify_line_roles(
                 suppress.push(index);
                 continue;
             }
-            if (matches!(line.region_type.as_str(), "header" | "footer")
-                && !table_notes.contains(&index))
-                || line.exclude_from_body
-            {
+            if matches!(line.region_type.as_str(), "header" | "footer") || line.exclude_from_body {
                 continue;
             }
             let Some(prefix) = label_prefix(&line.text) else {
                 continue;
             };
-            if table_notes.contains(&index) {
-                candidates.push((index, prefix, true));
-                continue;
-            }
             let typographic = label_is_typographic(line, &prefix, line_sizes[index], body_size)
                 || (standalone_note_label(line)
                     && aligned_note_body_index(&page.lines, index).is_some_and(|body| {
@@ -783,7 +556,6 @@ pub(super) fn classify_line_roles(
                     .enumerate()
                     .filter(|(index, line)| {
                         !table_cells.contains(index)
-                            && !table_notes.contains(index)
                             && !line.exclude_from_body
                             && !matches!(line.region_type.as_str(), "header" | "footer")
                             && line.bbox[1] >= cut - tolerance
@@ -890,9 +662,6 @@ pub(super) fn classify_line_roles(
             if endnote_heading(&line.text) {
                 line.region_type = "heading".to_owned();
                 line.note_region_mode.clear();
-            } else if table_notes.contains(&index) {
-                line.region_type = "footnote".to_owned();
-                line.note_region_mode = "footnote".to_owned();
             } else if table_cells.contains(&index) {
                 line.region_type = "body".to_owned();
                 line.note_region_mode.clear();

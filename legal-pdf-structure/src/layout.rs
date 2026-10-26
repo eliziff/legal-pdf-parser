@@ -1,4 +1,4 @@
-use crate::structure::{is_note_symbol, label_prefix, scalar_suffix, MAX_SYMBOL_LABEL_LEN};
+use crate::structure::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
 use legal_pdf_core::{line_font_size, median, union_bbox, Diagnostic, Line, Page, Region};
 use regex::Regex;
 use std::{
@@ -73,54 +73,6 @@ impl TableEvidence {
     fn strong(&self) -> bool {
         self.rows >= 6 && self.columns >= 3 && self.numeric_cells * 5 >= self.cells
     }
-}
-
-/// Notes to a table: a line set just below where a table ends on the page that opens with a
-/// symbol mark ("*", "†", "a)") over words, and the lines set close under it.
-pub(super) fn table_note_lines(lines: &[Line], cells: &HashSet<usize>, ends: &[f64]) -> HashSet<usize> {
-    let line_height = median(cells
-        .iter()
-        .map(|index| lines[*index].bbox[3] - lines[*index].bbox[1])
-        .filter(|height| *height > 0.0)
-        .collect());
-    if ends.is_empty() || line_height <= 0.0 {
-        return HashSet::new();
-    }
-    let anchors: Vec<_> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let prefix = label_prefix(&line.text)?;
-            let symbolic = prefix.label.chars().all(|character| !character.is_ascii_digit());
-            let tail = scalar_suffix(&line.text, prefix.end);
-            (symbolic
-                && tail.chars().filter(|character| character.is_alphabetic()).count() >= 4
-                && !cells.contains(&index)
-                && ends.iter().any(|bottom| line.bbox[1] > *bottom && line.bbox[1] <= bottom + line_height * 3.0))
-                .then_some(index)
-        })
-        .collect();
-    let mut notes: HashSet<_> = anchors.iter().copied().collect();
-    for anchor in anchors {
-        let mut bottom = lines[anchor].bbox[3];
-        let mut following: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter(|(index, line)| *index != anchor && line.bbox[1] >= lines[anchor].bbox[1])
-            .collect();
-        following.sort_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]));
-        for (index, line) in following {
-            if line.bbox[1] - bottom > line_height * 1.6
-                || cells.contains(&index)
-                || has_table_caption(std::slice::from_ref(line))
-            {
-                break;
-            }
-            notes.insert(index);
-            bottom = bottom.max(line.bbox[3]);
-        }
-    }
-    notes
 }
 
 pub(super) fn has_table_caption(lines: &[Line]) -> bool {
@@ -932,17 +884,15 @@ pub(super) fn order_page(
     page: &mut Page,
     table_page: bool,
     contents: bool,
-    table_notes: &HashSet<usize>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut header = Vec::new();
     let mut body = Vec::new();
     let mut note = Vec::new();
     let mut footer = Vec::new();
-    for (index, line) in std::mem::take(&mut page.lines).into_iter().enumerate() {
+    for line in std::mem::take(&mut page.lines) {
         match line.region_type.as_str() {
             "header" => header.push(line),
-            "footnote" if table_notes.contains(&index) => body.push(line),
             "footnote" => note.push(line),
             "footer" => footer.push(line),
             _ => body.push(line),

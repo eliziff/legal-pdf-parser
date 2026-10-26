@@ -1229,8 +1229,7 @@ impl PdfResolutionInput {
                         .is_some_and(|(_, line)| {
                             matches!(line.region_type.as_str(), "header" | "footer")
                                 || (line.exclude_from_body
-                                    && !primitives.claims.table_cell_line_ids.contains(&line.id)
-                                    && !primitives.claims.table_note_line_ids.contains(&line.id))
+                                    && !primitives.claims.table_cell_line_ids.contains(&line.id))
                         })
                 });
                 if furniture {

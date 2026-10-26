@@ -378,7 +378,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             let above = prior.filter(|prior| prior.page_index == line.page_index).map_or(3.0, |prior| {
                 (line.bbox[1] - prior.bbox[3]) / measures[&line.page_index].height
             });
-            if lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(&primitives.stroke_bold, line) >= 0.5, above) {
+            if lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(line) >= 0.5, above) {
                 lifted_lines.push(line.id.clone());
             }
         }
@@ -420,7 +420,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 }
                 let members: Vec<&Line> = measure.order[slot..end].iter().map(|&n| &page.lines[n]).collect();
                 let last = members[members.len() - 1];
-                let bold = bold_char_share(&primitives.stroke_bold, first) >= 0.5;
+                let bold = bold_char_share(first) >= 0.5;
                 let underlined = !first.words.is_empty() && first.words.iter().filter(|w| w.underlined).count() * 2 > first.words.len();
                 let own = style(first);
                 let larger = measure.size > 0.0 && dominant_face(first).is_some_and(|(_, size)| size >= measure.size * 1.1);
