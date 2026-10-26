@@ -1173,7 +1173,9 @@ pub(super) fn apply_text_fidelity_headings(
         decisions
     };
     if let Some(source_regions) = &primitives.source_regions {
-        demote_false_headings(pages, &decisions, source_regions);
+        if !legal_pdf_core::model::ablated("demote_false_headings") {
+            demote_false_headings(pages, &decisions, source_regions);
+        }
     }
     let mut heading_levels = decisions
         .iter()
@@ -1603,7 +1605,9 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             {
                 return;
             }
-            demote_prose_heading_tags(document, primitives);
+            if !legal_pdf_core::model::ablated("demote_prose_heading_tags") {
+                demote_prose_heading_tags(document, primitives);
+            }
             contents::retain_headings(document, &mut primitives.claims);
             levels.extend(apply_text_fidelity_headings(document, 0.0, primitives));
         });
