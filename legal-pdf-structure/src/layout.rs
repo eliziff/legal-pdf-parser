@@ -947,7 +947,9 @@ pub(super) fn order_page(
             _ => body.push(line),
         }
     }
-    repair_drop_caps(&mut body);
+    if !legal_pdf_core::model::ablated("repair_drop_caps") {
+        repair_drop_caps(&mut body);
+    }
     let contents = table_page && contents && !has_table_caption(&body);
     let decision = if contents && y_regressions(&body) > 0 {
         geometry_order(&mut body);
