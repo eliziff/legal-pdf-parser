@@ -14,7 +14,7 @@
 //! end and an indent open a paragraph; a line going on with a sentence or a hyphened word opens
 //! nothing.
 
-use legal_pdf_core::{flag_share, line_font_size, median, quantile, Line, Page, BOLD, ITALIC};
+use legal_pdf_core::{flag_share, line_font_size, upper_median as median, quantile, Line, Page, BOLD, ITALIC};
 use regex::Regex;
 use std::{collections::HashMap, sync::OnceLock};
 

@@ -235,8 +235,8 @@ fn column(places: &[Place], pages: &[Page], supported: &[usize]) -> (f64, BTreeM
         all.push(x);
         by_page.entry(places[k].page).or_default().push(x);
     }
-    let document = legal_pdf_core::median(all);
-    (document, by_page.into_iter().map(|(p, xs)| (p, legal_pdf_core::median(xs))).collect())
+    let document = legal_pdf_core::upper_median(all);
+    (document, by_page.into_iter().map(|(p, xs)| (p, legal_pdf_core::upper_median(xs))).collect())
 }
 
 /// What a candidate line fits: the values its own garbled token or a re-reading could be, or any value.

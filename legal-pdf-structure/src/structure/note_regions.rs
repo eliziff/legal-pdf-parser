@@ -326,7 +326,7 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
         if notes[source].len() < 3 || body[source].is_empty() {
             return None;
         }
-        let (note, body) = (super::median(notes[source].clone()), super::median(body[source].clone()));
+        let (note, body) = (legal_pdf_core::upper_median(notes[source].clone()), legal_pdf_core::upper_median(body[source].clone()));
         (note < body - 0.5).then_some(note)
     })
 }

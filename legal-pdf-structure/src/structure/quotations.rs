@@ -530,7 +530,7 @@ fn quotation(
 ) -> bool {
     // A centred block (an address, a title) or one reaching into the right half of the page (a
     // table's columns) is no quotation.
-    let centre = super::median(block.iter().map(|row| (row.bbox[0] + row.bbox[2]) / 2.0).collect());
+    let centre = legal_pdf_core::upper_median(block.iter().map(|row| (row.bbox[0] + row.bbox[2]) / 2.0).collect());
     let lefts = block.iter().map(|row| row.bbox[0]);
     let spread = lefts.clone().fold(f64::MIN, f64::max) - lefts.fold(f64::MAX, f64::min);
     let centred = block.len() >= 3
