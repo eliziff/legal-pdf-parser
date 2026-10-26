@@ -26,10 +26,9 @@ indra = ["ocr"]
 fast-allocator = ["dep:mimalloc"]
 profiling = ["pdf", "legal-pdf-support/profiling"]
 allocation-profiling = ["profiling", "legal-pdf-support/allocation-profiling"]
-ppdoc-openvino = ["pdf", "legal-pdf-support/ppdoc-openvino"]
-ppdoc-full = ["pdf", "legal-pdf-support/ppdoc"]
+ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
 tagger = ["pdf", "dep:legal-structure-tagger", "legal-pdf-core/ort-runtime"]
-full = ["language", "indra", "ppdoc-full", "tagger"]
+full = ["language", "indra", "ppdoc", "tagger"]
 # The command-line tools, which run this checkout's structure engine.
 cli = ["pdf", "legal-pdf-core/structure-analysis"]
 

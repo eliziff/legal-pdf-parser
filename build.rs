@@ -227,12 +227,8 @@ fn main() {
             ("DOCUMENT", true, vec![]),
             (
                 "LAYOUT",
-                enabled("PPDOC_FULL") || enabled("PPDOC_OPENVINO"),
-                features
-                    .iter()
-                    .filter(|name| ["PPDOC_FULL", "PPDOC_OPENVINO"].contains(&name.as_str()))
-                    .cloned()
-                    .collect(),
+                enabled("PPDOC"),
+                features.iter().filter(|name| name.as_str() == "PPDOC").cloned().collect(),
             ),
         ]
         .into_iter()

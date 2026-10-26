@@ -4,19 +4,9 @@ use crate::ppdoc_postprocess::{
 };
 use image::{imageops, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
-pub use legal_pdf_core::OrtBackend as PPDocBackend;
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
-#[cfg(feature = "ppdoc")]
-use libloading::Library;
-#[cfg(feature = "ppdoc")]
-use ort::{
-    session::{builder::GraphOptimizationLevel, Session, SessionInputValue},
-    value::Tensor,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-#[cfg(feature = "ppdoc")]
-use std::ffi::{c_char, c_void, CStr};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -27,15 +17,14 @@ const PACK_FORMAT: &str = "legalpdf.ppdoc-lite-model/1";
 #[serde(default, deny_unknown_fields)]
 pub struct PPDocOptions {
     pub model_pack: Option<PathBuf>,
+    /// The OpenVINO C runtime library.
     pub runtime: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub threads: usize,
     pub threshold: f32,
     pub render_dpi: u16,
-    pub onednn: bool,
-    pub backend: PPDocBackend,
+    /// The OpenVINO device ("CPU", "GPU"); the runtime's own choice where none is named.
     pub device: Option<String>,
-    pub cpu_fallback: bool,
     pub expected_identity: Option<String>,
 }
 
@@ -48,10 +37,7 @@ impl Default for PPDocOptions {
             threads: 0,
             threshold: 0.10,
             render_dpi: 72,
-            onednn: false,
-            backend: PPDocBackend::Cpu,
             device: None,
-            cpu_fallback: false,
             expected_identity: None,
         }
     }
@@ -83,8 +69,8 @@ struct ModelManifest {
     backend: String,
     file: String,
     sha256: String,
+    /// A Paddle pack's parameter file, which OpenVINO cannot read.
     params: Option<String>,
-    params_sha256: Option<String>,
     #[serde(default)]
     files: Vec<CompanionManifest>,
     inputs: Vec<String>,
@@ -176,9 +162,6 @@ struct ModelPack {
     manifest: Manifest,
     model: PathBuf,
     model_sha256: String,
-    #[cfg(feature = "ppdoc")]
-    params: Option<PathBuf>,
-    params_sha256: Option<String>,
     companion_sha256: Vec<String>,
 }
 
@@ -258,12 +241,9 @@ impl ModelPack {
                 )))
             }
         }
-        if !matches!(
-            manifest.model.backend.as_str(),
-            "onnx" | "paddle" | "openvino"
-        ) {
+        if !matches!(manifest.model.backend.as_str(), "onnx" | "openvino") || manifest.model.params.is_some() {
             return Err(Error::Message(format!(
-                "unsupported PPdoc backend: {}",
+                "OpenVINO requires an ONNX or OpenVINO IR model pack, not {}",
                 manifest.model.backend
             )));
         }
@@ -321,53 +301,17 @@ impl ModelPack {
                 "OpenVINO IR model packs require a hash-checked companion file".to_owned(),
             ));
         }
-        let (params, params_sha256) = match (
-            manifest.model.params.as_deref(),
-            manifest.model.params_sha256.as_deref(),
-        ) {
-            (Some(file), Some(expected)) => {
-                let path = pack_file(&root, file, "parameter")?;
-                let actual = provider_asset_sha256(&path)?;
-                if actual != expected.to_ascii_lowercase() {
-                    return Err(Error::Message(format!(
-                        "PPdoc parameter hash mismatch: expected {expected}, found {actual}"
-                    )));
-                }
-                (Some(path), Some(actual))
-            }
-            (None, None) if matches!(manifest.model.backend.as_str(), "onnx" | "openvino") => {
-                (None, None)
-            }
-            _ => {
-                return Err(Error::Message(
-                    "Paddle model packs require params and params_sha256".to_owned(),
-                ))
-            }
-        };
-        #[cfg(not(feature = "ppdoc"))]
-        let _ = params;
         Ok(Self {
             manifest,
             model,
             model_sha256,
-            #[cfg(feature = "ppdoc")]
-            params,
-            params_sha256,
             companion_sha256,
         })
     }
 }
 
-enum Backend {
-    #[cfg(feature = "ppdoc")]
-    Onnx(Session),
-    #[cfg(feature = "ppdoc")]
-    Paddle(PaddleSession),
-    OpenVino(OpenVinoSession),
-}
-
 pub struct PPDocLayout {
-    backend: Backend,
+    session: OpenVinoSession,
     pack: ModelPack,
     threshold: f32,
     render_dpi: u16,
@@ -415,28 +359,8 @@ impl PPDocLayout {
             "PPdoc model pack",
         )?;
         let pack = ModelPack::load(&pack_path)?;
-        let native_openvino = options.backend == PPDocBackend::OpenVino;
-        #[cfg(not(feature = "ppdoc"))]
-        if !native_openvino || pack.manifest.model.backend == "paddle" {
-            return Err(Error::Message(
-                "this thin build supports only direct OpenVINO inference; rebuild with --features ppdoc-full for ONNX, Paddle, or GPU execution providers"
-                    .to_owned(),
-            ));
-        }
-        if pack.manifest.model.backend == "openvino" && !native_openvino {
-            return Err(Error::Message(
-                "OpenVINO IR model packs require --backend openvino".to_owned(),
-            ));
-        }
-        let (runtime_variable, runtime_label) = if pack.manifest.model.backend == "paddle" {
-            ("LEGALPDF_PPDOC_RUNTIME", "Paddle runtime library")
-        } else if native_openvino {
-            ("LEGALPDF_OPENVINO_RUNTIME", "OpenVINO C runtime library")
-        } else {
-            ("LEGALPDF_ONNXRUNTIME", "ONNX Runtime library")
-        };
-        let runtime = required_path(&options.runtime, runtime_variable, runtime_label)?;
-        let runtime = canonical_file(&runtime, runtime_label)?;
+        let runtime = required_path(&options.runtime, "LEGALPDF_OPENVINO_RUNTIME", "OpenVINO C runtime library")?;
+        let runtime = canonical_file(&runtime, "OpenVINO C runtime library")?;
         let cache_dir = options
             .cache_dir
             .clone()
@@ -447,33 +371,10 @@ impl PPDocLayout {
                 fs::canonicalize(&path).map_err(|source| Error::io(&path, source))
             })
             .transpose()?;
-        if pack.manifest.model.backend == "paddle"
-            && (options.backend != PPDocBackend::Cpu
-                || options.device.is_some()
-                || options.cpu_fallback)
-        {
-            return Err(Error::Message(
-                "PPdoc accelerator options require an ONNX model pack".to_owned(),
-            ));
+        let device = options.device.as_deref().unwrap_or("default").trim().to_owned();
+        if device.is_empty() {
+            return Err(Error::Message("OpenVINO device cannot be empty".to_owned()));
         }
-        if native_openvino && pack.manifest.model.backend == "paddle" {
-            return Err(Error::Message(
-                "OpenVINO requires an ONNX or OpenVINO IR model pack".to_owned(),
-            ));
-        }
-        if native_openvino && options.cpu_fallback {
-            return Err(Error::Message(
-                "native OpenVINO does not use ONNX Runtime CPU fallback".to_owned(),
-            ));
-        }
-        if options.backend == PPDocBackend::Cpu && options.cpu_fallback {
-            return Err(Error::Message(
-                "PPdoc CPU fallback only applies to accelerator backends".to_owned(),
-            ));
-        }
-        let device = options
-            .backend
-            .normalized_device(options.device.as_deref())?;
         let threshold = options.threshold.max(
             pack.manifest
                 .postprocess
@@ -481,21 +382,17 @@ impl PPDocLayout {
                 .unwrap_or_default(),
         );
         let identity = format!(
-            "ppdoc-lite-rust-v5:variant={}:model_backend={}:execution_backend={}:device={}:fallback={}:model={}:companions={}:params={}:runtime={}:onednn={}:threshold={:.6}:render_dpi={}:input={}:interpolation={}",
+            "ppdoc-lite-rust-v5:variant={}:model_backend={}:execution_backend=openvino:device={}:fallback=none:model={}:companions={}:params=none:runtime={}:onednn=false:threshold={:.6}:render_dpi={}:input={}:interpolation={}",
             pack.manifest.variant_id,
             pack.manifest.model.backend,
-            options.backend.name(),
             device,
-            if options.cpu_fallback { "cpu" } else { "none" },
             pack.model_sha256,
             if pack.companion_sha256.is_empty() {
                 "none".to_owned()
             } else {
                 pack.companion_sha256.join(",")
             },
-            pack.params_sha256.as_deref().unwrap_or("none"),
             provider_asset_sha256(&runtime)?,
-            options.onednn,
             threshold,
             options.render_dpi,
             pack.manifest.model.inputs.join(","),
@@ -530,68 +427,9 @@ impl PPDocLayout {
             threshold,
             identity,
         } = prepared;
-        let native_openvino = options.backend == PPDocBackend::OpenVino;
-        #[cfg(feature = "ppdoc")]
-        let backend = if pack.manifest.model.backend == "paddle" {
-            Backend::Paddle(PaddleSession::new(
-                &runtime,
-                &pack.model,
-                pack.params.as_deref().expect("Paddle params validated"),
-                options.threads,
-                options.onednn,
-            )?)
-        } else if native_openvino {
-            Backend::OpenVino(OpenVinoSession::new(
-                &runtime,
-                &pack.model,
-                &device,
-                options.threads,
-                cache_dir.as_deref(),
-            )?)
-        } else {
-            let environment_global_threads = legal_pdf_core::init_ort_runtime(&runtime, None)?;
-            let mut builder = Session::builder()
-                .map_err(ort_error)?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(ort_error)?;
-            if environment_global_threads.is_some() {
-                builder = builder.with_independent_thread_pool().map_err(ort_error)?;
-            }
-            if options.threads > 0 {
-                builder = builder
-                    .with_intra_threads(options.threads)
-                    .map_err(ort_error)?;
-            }
-            builder = builder.with_inter_threads(1).map_err(ort_error)?;
-            if options.backend == PPDocBackend::DirectMl {
-                builder = builder
-                    .with_memory_pattern(false)
-                    .and_then(|builder| builder.with_parallel_execution(false))
-                    .map_err(ort_error)?;
-            }
-            let providers = options.backend.providers(&device);
-            if !providers.is_empty() {
-                builder = builder
-                    .with_execution_providers(providers)
-                    .map_err(ort_error)?;
-                if !options.cpu_fallback {
-                    builder = builder
-                        .with_config_entry("session.disable_cpu_ep_fallback", "1")
-                        .map_err(ort_error)?;
-                }
-            }
-            Backend::Onnx(builder.commit_from_file(&pack.model).map_err(ort_error)?)
-        };
-        #[cfg(not(feature = "ppdoc"))]
-        let backend = Backend::OpenVino(OpenVinoSession::new(
-            &runtime,
-            &pack.model,
-            &device,
-            options.threads,
-            cache_dir.as_deref(),
-        )?);
+        let session = OpenVinoSession::new(&runtime, &pack.model, &device, options.threads, cache_dir.as_deref())?;
         Ok(Self {
-            backend,
+            session,
             pack,
             threshold,
             render_dpi: options.render_dpi,
@@ -637,43 +475,18 @@ impl PPDocLayout {
             target_height as f32 / image.height() as f32,
             target_width as f32 / image.width() as f32,
         ];
-        let (values, width, count) = match &mut self.backend {
-            #[cfg(feature = "ppdoc")]
-            Backend::Paddle(session) => session.run(
-                &pixels,
-                target_height,
-                target_width,
-                &im_shape_values,
-                &scale_values,
-                self.pack.manifest.model.detections_per_image,
-                self.pack.manifest.model.output_width,
-            )?,
-            #[cfg(feature = "ppdoc")]
-            Backend::Onnx(session) => run_onnx(
-                session,
-                &self.pack.manifest.model,
-                &self.pack.manifest.postprocess.model_nms,
-                self.pack.manifest.labels.len(),
-                self.threshold,
-                pixels,
-                target_height,
-                target_width,
-                im_shape_values,
-                scale_values,
-            )?,
-            Backend::OpenVino(session) => run_openvino(
-                session,
-                &self.pack.manifest.model,
-                &self.pack.manifest.postprocess.model_nms,
-                self.pack.manifest.labels.len(),
-                self.threshold,
-                pixels,
-                target_height,
-                target_width,
-                im_shape_values,
-                scale_values,
-            )?,
-        };
+        let (values, width, count) = run_openvino(
+            &mut self.session,
+            &self.pack.manifest.model,
+            &self.pack.manifest.postprocess.model_nms,
+            self.pack.manifest.labels.len(),
+            self.threshold,
+            pixels,
+            target_height,
+            target_width,
+            im_shape_values,
+            scale_values,
+        )?;
         Ok(postprocess(
             &values,
             width,
@@ -910,136 +723,6 @@ fn run_openvino(
     ))
 }
 
-#[cfg(feature = "ppdoc")]
-fn run_onnx(
-    session: &mut Session,
-    model: &ModelManifest,
-    model_nms: &ModelNmsManifest,
-    class_count: usize,
-    threshold: f32,
-    pixels: Vec<f32>,
-    target_height: usize,
-    target_width: usize,
-    im_shape_values: [f32; 2],
-    scale_values: [f32; 2],
-) -> Result<(Vec<f32>, usize, usize)> {
-    let image_tensor = Tensor::from_array((
-        [1, 3, target_height, target_width],
-        pixels.into_boxed_slice(),
-    ))
-    .map_err(ort_error)?;
-    let im_shape = Tensor::from_array(([1, 2], im_shape_values.to_vec().into_boxed_slice()))
-        .map_err(ort_error)?;
-    let scale_factor = Tensor::from_array(([1, 2], scale_values.to_vec().into_boxed_slice()))
-        .map_err(ort_error)?;
-    let mut image_tensor = Some(image_tensor);
-    let mut im_shape = Some(im_shape);
-    let mut scale_factor = Some(scale_factor);
-    let mut values: Vec<(String, SessionInputValue<'_>)> = Vec::new();
-    for name in &model.inputs {
-        let value = match input_kind(&model.inputs, name) {
-            ModelInput::Image => image_tensor.take().expect("unique input").into(),
-            ModelInput::Shape => im_shape.take().expect("unique input").into(),
-            ModelInput::Scale => scale_factor.take().expect("unique input").into(),
-        };
-        values.push((name.clone(), value));
-    }
-    let outputs = session.run(values).map_err(ort_error)?;
-    let boxes_name = &model.outputs["boxes"];
-    let (shape, values) = outputs
-        .get(boxes_name)
-        .ok_or_else(|| Error::Message(format!("PPdoc output is missing {boxes_name}")))?
-        .try_extract_tensor::<f32>()
-        .map_err(ort_error)?;
-    let contract = model.outputs.get("contract").map(String::as_str);
-    if contract == Some("ppyoloe_raw") {
-        let scores_name = &model.outputs["scores"];
-        let (scores_shape, scores) = outputs
-            .get(scores_name)
-            .ok_or_else(|| Error::Message(format!("PPdoc output is missing {scores_name}")))?
-            .try_extract_tensor::<f32>()
-            .map_err(ort_error)?;
-        if shape.len() != 3
-            || scores_shape.len() != 3
-            || shape[0] != 1
-            || scores_shape[0] != 1
-            || shape[2] != 4
-            || scores_shape[1] != class_count as i64
-            || shape[1] != scores_shape[2]
-        {
-            return Err(Error::Message(format!(
-                "PPdoc PP-YOLOE outputs have unexpected shapes: boxes={shape:?}, scores={scores_shape:?}"
-            )));
-        }
-        let query_count = usize::try_from(shape[1]).unwrap_or(0);
-        let decoded = decode_ppyoloe_raw(
-            values,
-            scores,
-            query_count,
-            class_count,
-            model.detections_per_image,
-            model_nms,
-            threshold,
-        )?;
-        let count = decoded.len() / 7;
-        return Ok((decoded, 7, count));
-    }
-    if contract == Some("rtdetr_raw") {
-        let logits_name = &model.outputs["logits"];
-        let (logits_shape, logits) = outputs
-            .get(logits_name)
-            .ok_or_else(|| Error::Message(format!("PPdoc output is missing {logits_name}")))?
-            .try_extract_tensor::<f32>()
-            .map_err(ort_error)?;
-        if shape.len() != 3
-            || logits_shape.len() != 3
-            || shape[0] != 1
-            || logits_shape[0] != 1
-            || shape[2] != 4
-            || shape[1] != logits_shape[1]
-            || logits_shape[2] != class_count as i64
-        {
-            return Err(Error::Message(format!(
-                "PPdoc raw outputs have unexpected shapes: boxes={shape:?}, logits={logits_shape:?}"
-            )));
-        }
-        let query_count = usize::try_from(shape[1]).unwrap_or(0);
-        let image_height = (im_shape_values[0] / scale_values[0] + 0.5).floor();
-        let image_width = (im_shape_values[1] / scale_values[1] + 0.5).floor();
-        let decoded = decode_rtdetr_raw(
-            values,
-            logits,
-            query_count,
-            class_count,
-            model.detections_per_image,
-            image_width,
-            image_height,
-        )?;
-        return Ok((
-            decoded,
-            7,
-            model.detections_per_image.min(query_count * class_count),
-        ));
-    }
-    let requested_count = if let Some(counts_name) = model.outputs.get("counts") {
-        let output = outputs
-            .get(counts_name)
-            .ok_or_else(|| Error::Message(format!("PPdoc output is missing {counts_name}")))?;
-        Some(
-            if let Ok((_, counts)) = output.try_extract_tensor::<i32>() {
-                counts.first().copied().unwrap_or(0).max(0) as usize
-            } else {
-                let (_, counts) = output.try_extract_tensor::<i64>().map_err(ort_error)?;
-                usize::try_from(counts.first().copied().unwrap_or(0).max(0)).unwrap_or(0)
-            },
-        )
-    } else {
-        None
-    };
-    let (width, count) = decoded_output_dimensions(shape, values.len(), requested_count)?;
-    Ok((values.to_vec(), width, count))
-}
-
 fn decoded_output_dimensions(
     shape: &[i64],
     value_count: usize,
@@ -1206,197 +889,6 @@ fn decode_rtdetr_raw(
         ]);
     }
     Ok(decoded)
-}
-
-#[cfg(feature = "ppdoc")]
-type PaddleCreate = unsafe extern "C" fn(*const c_char, *const c_char, i32, i32) -> *mut c_void;
-#[cfg(feature = "ppdoc")]
-type PaddleRun = unsafe extern "C" fn(
-    *mut c_void,
-    *const f32,
-    i32,
-    i32,
-    *const f32,
-    *const f32,
-    *mut f32,
-    usize,
-    *mut usize,
-    *mut i32,
-) -> i32;
-#[cfg(feature = "ppdoc")]
-type PaddleLastError = unsafe extern "C" fn() -> *const c_char;
-#[cfg(feature = "ppdoc")]
-type PaddleDestroy = unsafe extern "C" fn(*mut c_void);
-
-#[cfg(feature = "ppdoc")]
-struct PaddleFunctions {
-    run: PaddleRun,
-    last_error: PaddleLastError,
-    destroy: PaddleDestroy,
-}
-
-#[cfg(feature = "ppdoc")]
-struct PaddleSession {
-    handle: *mut c_void,
-    functions: PaddleFunctions,
-    _library: Library,
-}
-
-#[cfg(feature = "ppdoc")]
-impl PaddleSession {
-    fn new(
-        runtime: &Path,
-        model: &Path,
-        params: &Path,
-        threads: usize,
-        onednn: bool,
-    ) -> Result<Self> {
-        // SAFETY: The library is retained for the lifetime of all copied function pointers.
-        let library = unsafe { load_library(runtime) }.map_err(|error| {
-            Error::Message(format!(
-                "could not load Paddle runtime library {}: {error}",
-                runtime.display()
-            ))
-        })?;
-        // Windows Paddle accepts narrow paths. Reject interior NULs rather than truncating them.
-        let model = std::ffi::CString::new(model.to_string_lossy().as_bytes())
-            .map_err(|_| Error::Message("Paddle model path contains a NUL byte".to_owned()))?;
-        let params = std::ffi::CString::new(params.to_string_lossy().as_bytes())
-            .map_err(|_| Error::Message("Paddle parameter path contains a NUL byte".to_owned()))?;
-        // SAFETY: Signatures match the versioned C ABI in ppdoc_paddle.h.
-        unsafe {
-            let abi: unsafe extern "C" fn() -> i32 =
-                paddle_symbol(&library, b"ppdoc_paddle_abi_version\0", runtime)?;
-            if abi() != 1 {
-                return Err(Error::Message("unsupported PPdoc Paddle ABI".to_owned()));
-            }
-            let create: PaddleCreate = paddle_symbol(&library, b"ppdoc_paddle_create\0", runtime)?;
-            let last_error: PaddleLastError =
-                paddle_symbol(&library, b"ppdoc_paddle_last_error\0", runtime)?;
-            let handle = create(
-                model.as_ptr(),
-                params.as_ptr(),
-                i32::try_from(threads).unwrap_or(i32::MAX),
-                i32::from(onednn),
-            );
-            if handle.is_null() {
-                return Err(paddle_error(
-                    last_error,
-                    "could not create Paddle predictor",
-                ));
-            }
-            Ok(Self {
-                handle,
-                functions: PaddleFunctions {
-                    run: paddle_symbol(&library, b"ppdoc_paddle_run\0", runtime)?,
-                    last_error,
-                    destroy: paddle_symbol(&library, b"ppdoc_paddle_destroy\0", runtime)?,
-                },
-                _library: library,
-            })
-        }
-    }
-
-    fn run(
-        &mut self,
-        pixels: &[f32],
-        target_height: usize,
-        target_width: usize,
-        im_shape: &[f32; 2],
-        scale_factor: &[f32; 2],
-        detections_per_image: usize,
-        output_width: usize,
-    ) -> Result<(Vec<f32>, usize, usize)> {
-        let mut boxes = vec![0.0; detections_per_image * output_width];
-        let mut length = 0;
-        let mut count = 0;
-        // SAFETY: all buffers remain live and correctly sized for this synchronous call.
-        let status = unsafe {
-            (self.functions.run)(
-                self.handle,
-                pixels.as_ptr(),
-                i32::try_from(target_height)
-                    .map_err(|_| Error::Message("PPdoc target height is too large".to_owned()))?,
-                i32::try_from(target_width)
-                    .map_err(|_| Error::Message("PPdoc target width is too large".to_owned()))?,
-                im_shape.as_ptr(),
-                scale_factor.as_ptr(),
-                boxes.as_mut_ptr(),
-                boxes.len(),
-                &mut length,
-                &mut count,
-            )
-        };
-        if status != 0 {
-            return Err(paddle_error(
-                self.functions.last_error,
-                "Paddle inference failed",
-            ));
-        }
-        if length > boxes.len() || length % output_width != 0 {
-            return Err(Error::Message(format!(
-                "Paddle returned an invalid decoded-box length: {length}"
-            )));
-        }
-        boxes.truncate(length);
-        Ok((
-            boxes,
-            output_width,
-            usize::try_from(count.max(0))
-                .unwrap_or(0)
-                .min(length / output_width),
-        ))
-    }
-}
-
-#[cfg(feature = "ppdoc")]
-impl Drop for PaddleSession {
-    fn drop(&mut self) {
-        // SAFETY: handle was created by this live library and is destroyed exactly once.
-        unsafe { (self.functions.destroy)(self.handle) };
-    }
-}
-
-#[cfg(feature = "ppdoc")]
-unsafe fn paddle_symbol<T: Copy>(library: &Library, name: &[u8], path: &Path) -> Result<T> {
-    // SAFETY: The caller supplies the C declaration matching this exported symbol.
-    unsafe { library.get::<T>(name) }
-        .map(|symbol| *symbol)
-        .map_err(|error| {
-            Error::Message(format!(
-                "Paddle runtime library {} is missing {}: {error}",
-                path.display(),
-                String::from_utf8_lossy(name).trim_end_matches('\0')
-            ))
-        })
-}
-
-#[cfg(feature = "ppdoc")]
-fn paddle_error(last_error: PaddleLastError, fallback: &str) -> Error {
-    // SAFETY: the ABI returns a thread-local NUL-terminated string valid until the next call.
-    let message = unsafe {
-        let pointer = last_error();
-        (!pointer.is_null())
-            .then(|| CStr::from_ptr(pointer).to_string_lossy().into_owned())
-            .filter(|value| !value.is_empty())
-    };
-    Error::Message(format!(
-        "PPdoc Paddle inference failed: {}",
-        message.as_deref().unwrap_or(fallback)
-    ))
-}
-
-#[cfg(all(feature = "ppdoc", windows))]
-unsafe fn load_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
-    use libloading::os::windows::{Library as WindowsLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
-    // SAFETY: Forwarded to the caller; altered search also resolves sibling Paddle DLLs.
-    unsafe { WindowsLibrary::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(Into::into)
-}
-
-#[cfg(all(feature = "ppdoc", not(windows)))]
-unsafe fn load_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
-    // SAFETY: Forwarded to the caller.
-    unsafe { Library::new(path) }
 }
 
 const INTER_RESIZE_COEF_SCALE: f32 = 2048.0;
@@ -1666,10 +1158,6 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|source| Error::io(path, source))
 }
 
-#[cfg(feature = "ppdoc")]
-fn ort_error(error: ort::Error) -> Error {
-    Error::Message(format!("PPdoc ONNX inference failed: {error}"))
-}
 
 #[cfg(test)]
 mod tests {

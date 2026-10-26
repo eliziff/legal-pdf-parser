@@ -60,6 +60,6 @@ pub use legal_pdf_support::{
     PdfLookupNote, PdfLookupPage, PdfLookupProposition,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup,
 };
-#[cfg(any(feature = "ppdoc-full", feature = "ppdoc-openvino"))]
-pub use legal_pdf_support::{PPDocBackend, PPDocDetection, PPDocLayout, PPDocOptions};
+#[cfg(feature = "ppdoc")]
+pub use legal_pdf_support::{PPDocDetection, PPDocLayout, PPDocOptions};
 
