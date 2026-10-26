@@ -3,32 +3,8 @@
 
 use super::*;
 
-pub(super) fn standalone_enumerator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s*$",
-        )
-        .unwrap()
-    })
-}
-
-pub(super) fn inline_enumerator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3}|\d{1,2}(?:\.\d{1,2}){1,3})([.)])\s+(\S.*)$",
-        )
-        .unwrap()
-    })
-}
-
-pub(super) fn standalone_enumerator(text: &str) -> bool {
-    standalone_enumerator_re().is_match(text)
-}
-
-/// A heading's enumerator, alone on its line: as [`standalone_enumerator_re`], and a decimal
-/// section number ("1.1", "2.3.1") with no period after it.
+/// A heading's enumerator, alone on its line ("IV.", "(a)" aside, "b)", "12."), or a decimal
+/// section number ("1.1", "2.3.1") with or without a period after it.
 pub(super) fn heading_standalone_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -39,8 +15,8 @@ pub(super) fn heading_standalone_re() -> &'static Regex {
     })
 }
 
-/// A heading's enumerator with its title on the line: as [`inline_enumerator_re`], and a decimal
-/// section number with no period after it ("1.1 Definitions").
+/// A heading's enumerator with its title on the line: as [`heading_standalone_re`], the title after
+/// it ("IV. Analysis", "1.1 Definitions").
 pub(super) fn heading_inline_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -59,6 +35,11 @@ pub(super) fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str,
         (None, None) => ("", ""),
     };
     (value, punct, capture.get(5).map_or("", |m| m.as_str()).trim())
+}
+
+/// Whether a line opens on a heading's enumerator, alone or before its title.
+pub(super) fn enumerated(text: &str) -> bool {
+    heading_inline_re().is_match(text) || heading_standalone_re().is_match(text)
 }
 
 /// The title after a leading enumerator, or the whole text.

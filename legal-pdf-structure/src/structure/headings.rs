@@ -202,8 +202,7 @@ pub(super) fn continues_prose(page: &Page, line: &Line) -> bool {
                 && line.bbox[1] - prior.bbox[3] < height * 0.5
                 && !sentence_ended(text)
                 && !text.ends_with([':', '\u{201d}', '"'])
-                && !standalone_enumerator(text)
-                && !inline_enumerator_re().is_match(text)
+                && !enumerated(text)
         })
 }
 
@@ -336,11 +335,7 @@ pub(super) fn wrapped_heading_continuations(
     if !has_valid_bbox(heading) || capitals && !caps_head {
         return Vec::new();
     }
-    let mut title = inline_enumerator_re()
-        .captures(heading_text)
-        .map_or(heading_text, |capture| capture.get(3).unwrap().as_str())
-        .trim()
-        .to_owned();
+    let mut title = title_after_enumerator(heading_text).to_owned();
     let heading_size = line_font_size(heading);
     let heading_height = (heading.bbox[3] - heading.bbox[1]).max(1.0);
     let centre_tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
@@ -648,8 +643,8 @@ pub(super) fn heading_style_corroborated(text: &str) -> bool {
     {
         return true;
     }
-    if let Some(capture) = inline_enumerator_re().captures(text) {
-        if layout_analysis().heading_text_plausible(capture.get(3).unwrap().as_str()) && !text.ends_with('.') {
+    if let Some(capture) = heading_inline_re().captures(text) {
+        if layout_analysis().heading_text_plausible(heading_enumerator(&capture).2) && !text.ends_with('.') {
             return true;
         }
     }
@@ -1152,22 +1147,9 @@ pub(super) fn apply_text_fidelity_headings(
                 .map(|candidate| candidate.interpretations.as_slice())
                 .collect::<Vec<_>>();
             // Reuse the same restart-aware ladder independently for each parallel sequence.
-            let mut sets = parse_heading_ladder(interpretations.iter().copied())
-                .assignments
-                .iter()
-                .enumerate()
-                .filter(|(_, assignment)| {
-                    assignment.action == HeadingAction::IllegalRestart
-                        && assignment.level == Some(1)
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            sets.insert(0, 0);
-            sets.push(own.len());
-            for set in sets.windows(2) {
-                let parsed = parse_heading_ladder(interpretations[set[0]..set[1]].iter().copied());
+            for (start, parsed) in parse_heading_runs(&interpretations) {
                 let clean = parsed.status == HeadingLadderStatus::ParsedClean;
-                decisions.extend(own[set[0]..set[1]].iter().zip(&parsed.assignments).map(
+                decisions.extend(own[start..].iter().zip(&parsed.assignments).map(
                     |(candidate, assignment)| {
                         let family = parsed.families.get(assignment.family);
                         let coherent = family.is_some_and(coherent_heading_family);
@@ -1501,8 +1483,7 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         let excluded = |id: &str| claimed.contains(id);
         let stroke_bold = primitives.stroke_bold.clone();
         let bold = |id: &str| stroke_bold.get(id).copied();
-        let numbered =
-            |text: &str| inline_enumerator_re().is_match(text) || standalone_enumerator(text);
+        let numbered = |text: &str| enumerated(text);
         let translation = |id: &str| primitives.contexts.translation_line_ids.contains(id);
         constituents::within_document_contexts(
             pages,

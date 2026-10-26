@@ -37,7 +37,7 @@ use legal_pdf_core::model::{NotePairClaim, NotePairKind};
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
 use legal_structure_model::{
     enumerator_interpretations, normalize_decimal_digit, normalize_note_symbol,
-    parse_heading_ladder, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
+    parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
     HeadingFamilyStats, HeadingLadderStatus, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 #[cfg(test)]
