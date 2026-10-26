@@ -4,18 +4,19 @@ use legal_pdf_core::model::{
 };
 use legal_structure_model::{Derivation, DocumentStructure, NodeKind, StructureNode};
 use legal_structure_model::{
-    document_fingerprint, normalize_compact_numbered_section_locator, utf16_len,
-    DocumentFingerprint, ScalarText,
+    document_fingerprint, normalize_compact_numbered_section_locator, serialization_sha256, utf16_len,
+    DigestWriter, DocumentFingerprint, ScalarText,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Map;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+#[cfg(test)]
+use sha2::Sha256;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
 use std::sync::{Arc, OnceLock};
 use unicode_normalization::UnicodeNormalization;
 
@@ -140,26 +141,6 @@ struct ProjectionFootnote {
     confidence: f64,
     provenance: String,
     warnings: Vec<String>,
-}
-
-#[derive(Default)]
-struct DigestWriter(Sha256);
-
-impl Write for DigestWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialization_sha256(value: &impl Serialize) -> String {
-    let mut writer = DigestWriter::default();
-    serde_json::to_writer(&mut writer, value).expect("fingerprint serialization");
-    format!("{:x}", writer.0.finalize())
 }
 
 fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {

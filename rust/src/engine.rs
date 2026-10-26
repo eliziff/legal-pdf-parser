@@ -16,7 +16,6 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -1080,26 +1079,8 @@ fn recognized_extraction(
     Ok(extracted)
 }
 
-#[derive(Debug, Default)]
-struct DigestWriter {
-    digest: Sha256,
-}
-
-impl Write for DigestWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.digest.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn serialization_sha256(value: &impl Serialize) -> Result<String> {
-    let mut writer = DigestWriter::default();
-    serde_json::to_writer(&mut writer, value)?;
-    Ok(format!("{:x}", writer.digest.finalize()))
+    Ok(legal_structure_model::serialization_sha256(value))
 }
 
 fn structure_examples(document: &LegalDocument) -> Value {
