@@ -25,55 +25,6 @@ pub(super) fn normalize_furniture(text: &str) -> String {
     normalized
 }
 
-/// Recognition reads a running head a little differently page to page ("of the united
-/// states.", "of the united sta#es."). A reading joins the commonest repeated reading of
-/// the same edge within a fifth of its characters; position alignment then decides.
-pub(super) fn join_recognized_readings(
-    candidates: &mut HashMap<(u8, String), Vec<FurnitureHit>>,
-    recognized: &HashSet<(u8, String)>,
-) {
-    fn distance(a: &[char], b: &[char]) -> usize {
-        let mut row: Vec<usize> = (0..=b.len()).collect();
-        for (i, x) in a.iter().enumerate() {
-            let mut diagonal = row[0];
-            row[0] = i + 1;
-            for (j, y) in b.iter().enumerate() {
-                let above = row[j + 1];
-                row[j + 1] = (diagonal + usize::from(x != y)).min(row[j] + 1).min(above + 1);
-                diagonal = above;
-            }
-        }
-        row[b.len()]
-    }
-    let mut keys: Vec<&(u8, String)> = recognized.iter().collect();
-    keys.sort_by(|a, b| candidates[*b].len().cmp(&candidates[*a].len()).then(a.cmp(b)));
-    let mut anchors: Vec<((u8, String), Vec<char>)> = Vec::new();
-    let mut moves = Vec::new();
-    for key in keys {
-        let chars: Vec<char> = key.1.chars().collect();
-        let limit = chars.len() / 5;
-        let anchor = (chars.len() >= 6)
-            .then(|| {
-                anchors.iter().find(|(anchor, text)| {
-                    anchor.0 == key.0
-                        && text.len().abs_diff(chars.len()) <= limit
-                        && distance(text, &chars) <= limit
-                })
-            })
-            .flatten();
-        match anchor {
-            Some((anchor, _)) => moves.push((key.clone(), anchor.clone())),
-            None if candidates[key].len() >= 2 => anchors.push((key.clone(), chars)),
-            None => {}
-        }
-    }
-    for (from, to) in moves {
-        if let Some(hits) = candidates.remove(&from) {
-            candidates.entry(to).or_default().extend(hits);
-        }
-    }
-}
-
 pub(super) fn compact_note_line(text: &str) -> bool {
     let Some(prefix) = line_start_label_prefix(text) else {
         return false;
@@ -389,7 +340,6 @@ pub(super) fn edge_furniture(pages: &[Page]) -> HashSet<(usize, usize)> {
 
 pub(super) fn mark_repeated_furniture(pages: &mut [Page]) {
     let mut candidates: HashMap<(u8, String), Vec<FurnitureHit>> = HashMap::new();
-    let mut recognized = HashSet::new();
     legal_pdf_support::profile::measure("furniture.candidates", || {
         for (page_slot, page) in pages.iter().enumerate() {
             for (line_slot, line) in page.lines.iter().enumerate() {
@@ -401,9 +351,6 @@ pub(super) fn mark_repeated_furniture(pages: &mut [Page]) {
                 };
                 let normalized = normalize_furniture(&line.text);
                 if !normalized.is_empty() {
-                    if line.source == "ocr" {
-                        recognized.insert((top, normalized.clone()));
-                    }
                     candidates
                         .entry((top, normalized))
                         .or_default()
@@ -418,7 +365,6 @@ pub(super) fn mark_repeated_furniture(pages: &mut [Page]) {
             }
         }
     });
-    join_recognized_readings(&mut candidates, &recognized);
     // Preserve the old engine's two-page/parity behavior, but cap the witness
     // at four pages as Text-Fidelity does once alignment is also required.
     let minimum = 4_usize.min(2_usize.max(((pages.len() as f64) * 0.35).ceil() as usize));
