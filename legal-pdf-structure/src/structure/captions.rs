@@ -1,9 +1,8 @@
 //! Case captions from their opening metadata, aligned filing labels and party labels: claimed
 //! before any heading is read.
 
-use super::{Claims, HeadingReading};
+use super::{party_label, Claims, HeadingReading};
 use legal_pdf_core::{layout_analysis, line_font_size, Line, Page};
-use legal_pdf_headings::party_label;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

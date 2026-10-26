@@ -32,24 +32,7 @@ use legal_pdf_core::layout_analysis;
 use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-
-pub fn party_label() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        let ordinal = r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|\d+(?:st|nd|rd|th))";
-        let role = format!(
-            r"(?:{ordinal}(?:\s*(?:,|and|&|to)\s*{ordinal})*\s+)?(?:named\s+)?(?:applicants?|respondents?|appellants?|appellees?|plaintiffs?|defendants?|petitioners?|claimants?|complainants?|prosecutors?|accused|interven[eo]rs?|amic(?:us|i)\s+curiae|(?:notice|third|interested|intervening|affected)\s+(?:part(?:y|ies)|persons?))"
-        );
-        // A label stands on its own line, or past a column gap after the party's name.
-        Regex::new(&format!(
-            r"(?i)(?:^[\-\u{{2013}}\u{{2014}}\u{{2015}}\u{{2026}}.\s]*|\s{{3,}})(?:the\s+)?{role}(?:\s*(?:/|,|and|&|\()\s*(?:the\s+)?{role})*[\s.,:;)]*$"
-        ))
-        .expect("party label")
-    })
-}
 
 /// A heading wrapped onto the next line keeps one block: the same type, set at the
 /// line's leading, the first line ending no sentence and the second opening no numbered heading.

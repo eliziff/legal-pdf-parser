@@ -80,7 +80,7 @@ fn turn_or_event(text: &str) -> bool {
 /// "WHEREAS", a caption's connectives, contact details, a placeholder.
 fn label(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    legal_pdf_headings::party_label().is_match(text) || pattern(&RE, concat!(
+    super::party_label().is_match(text) || pattern(&RE, concat!(
         r"(?i)^\W*(?:appearances?|comparutions?|a\s*p\s*p\s*e\s*a\s*r\s*a\s*n\s*c\s*e\s*s|solicitors?\s+of\s+record|counsel(?:\s+of\s+record)?",
         r"|procureurs?(?:\s+inscrits?(?:\s+aux?\s+dossiers?)?)?|also\s+present|parties\s+present\b.*|written\s+representations\s+by",
         r"|(?:the\s+)?(?:additional\s+)?(?:borrowers?|lenders?|guarantors?|monitor|covenantors?",

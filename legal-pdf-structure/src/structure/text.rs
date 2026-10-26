@@ -37,6 +37,21 @@ pub(super) fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str,
     (value, punct, capture.get(5).map_or("", |m| m.as_str()).trim())
 }
 
+/// A party's role set as a label, on its own line or past a column gap after the party's name ("—
+/// Respondent", "ACME LTD.      Plaintiff", "First and Second Defendants").
+pub(super) fn party_label() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let ordinal = r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|\d+(?:st|nd|rd|th))";
+        let roles = legal_pdf_core::model::PARTY_ROLES;
+        let role = format!(r"(?:{ordinal}(?:\s*(?:,|and|&|to)\s*{ordinal})*\s+)?(?:named\s+)?(?:{roles})");
+        Regex::new(&format!(
+            r"(?i)(?:^[\-\u{{2013}}\u{{2014}}\u{{2015}}\u{{2026}}.\s]*|\s{{3,}})(?:the\s+)?{role}(?:\s*(?:/|,|and|&|\()\s*(?:the\s+)?{role})*[\s.,:;)]*$"
+        ))
+        .expect("party label")
+    })
+}
+
 /// Whether a line opens on a heading's enumerator, alone or before its title.
 pub(super) fn enumerated(text: &str) -> bool {
     heading_inline_re().is_match(text) || heading_standalone_re().is_match(text)
