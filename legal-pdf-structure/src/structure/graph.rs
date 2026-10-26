@@ -284,7 +284,7 @@ pub(super) fn mark_line_numbers(pages: &mut [Page]) {
     if lefts.is_empty() {
         return;
     }
-    let left = super::median(lefts);
+    let left = legal_pdf_core::upper_median(lefts);
     for page in pages.iter_mut() {
         let tolerance = page.width * 0.03;
         let mut found: Vec<(f64, u32, usize)> = page
@@ -628,142 +628,6 @@ fn layout_end(
         }
     }
     None
-}
-
-/// A list's lead-in belongs to its sibling sequence, including siblings on later pages.
-fn sentence_list_items<'a>(
-    index: &PdfTextIndex,
-    text: &ScalarText<'_>,
-    by_line: &HashMap<&str, (&Page, &Line)>,
-    measures: &BodyMeasures,
-    run: &'a StructureCandidateRun,
-    ended: &HashSet<String>,
-    primitives: &PdfPrimitiveEvidence,
-) -> HashSet<&'a str> {
-    let mut listed = HashSet::new();
-    if !run.consecutive {
-        return listed;
-    }
-    let body = |line: &Line| {
-        line.region_type == "body"
-            && item_text_line(line)
-            && !primitives.claims.table_cell_line_ids.contains(&line.id)
-            && !primitives.claims.contents_line_ids.contains(&line.id)
-            && !primitives.claims.contents_pages.contains(&line.page_index)
-            && !primitives.contexts.translation_line_ids.contains(&line.id)
-    };
-    let source = |candidate: &StructureMarkerCandidate| {
-        let context = context_at(index, primitives, candidate.marker_range.start);
-        index
-            .overlapping_lines(ScalarRange {
-                start: candidate.content_start,
-                end: candidate.range.end,
-            })
-            .iter()
-            .filter(|indexed| primitives.contexts.reading_context(&indexed.line_id) == context)
-            .filter_map(|indexed| by_line.get(indexed.line_id.as_str()).copied())
-            .find(|(_, line)| body(line) && !line.text.trim().is_empty())
-            .or_else(|| {
-                index
-                    .line_at(candidate.marker_range.start)
-                    .and_then(|indexed| by_line.get(indexed.line_id.as_str()).copied())
-                    .filter(|(_, line)| body(line))
-            })
-    };
-    let mut siblings = BTreeMap::<_, Vec<_>>::new();
-    for candidate in &run.markers {
-        siblings
-            .entry((candidate.parent_candidate_id.as_deref(), candidate.level))
-            .or_default()
-            .push(candidate);
-    }
-    for siblings in siblings.values() {
-        let mut active = false;
-        for pair in siblings.windows(2) {
-            let (prior, next) = (pair[0], pair[1]);
-            let connected = !ended.contains(&prior.id)
-                && prior.range.end >= next.marker_range.start
-                && !prior.label.starts_with('[')
-                && !next.label.starts_with('[')
-                && source(prior).zip(source(next)).is_some_and(
-                    |((page, line), (next_page, next_line))| {
-                        let left = measures
-                            .get(&(primitives.contexts.reading_context(&line.id), page.index))
-                            .map_or(0.0, |m| m.0);
-                        let next_left = measures
-                            .get(&(primitives.contexts.reading_context(&next_line.id), next_page.index))
-                            .map_or(0.0, |m| m.0);
-                        primitives.contexts.reading_context(&line.id)
-                            == primitives.contexts.reading_context(&next_line.id)
-                            && (line.bbox[0] - left - (next_line.bbox[0] - next_left)).abs()
-                                <= page.width.max(next_page.width).max(1.0) * 0.008
-                    },
-                );
-            if !connected {
-                active = false;
-                continue;
-            }
-            if !active {
-                let Some(marker) = index.line_at(prior.marker_range.start) else {
-                    continue;
-                };
-                let prefix = text
-                    .slice(marker.range.start..prior.marker_range.start)
-                    .unwrap_or("");
-                let lead_in = if prefix.chars().any(char::is_alphabetic) {
-                    Some(prefix)
-                } else {
-                    index.lines[..index.line_slots[&marker.line_id]]
-                        .iter()
-                        .rev()
-                        .filter_map(|indexed| by_line.get(indexed.line_id.as_str()))
-                        .find(|(_, line)| {
-                            body(line)
-                                && !line.text.trim().is_empty()
-                                && primitives.contexts.reading_context(&line.id)
-                                    == primitives.contexts.reading_context(&marker.line_id)
-                        })
-                        .map(|(_, line)| line.text.as_str())
-                };
-                let range = ScalarRange {
-                    start: prior.content_start,
-                    end: prior.range.end.min(next.marker_range.start),
-                };
-                let mut words = index.overlapping_lines(range).iter().filter_map(|indexed| {
-                    let (_, line) = by_line.get(indexed.line_id.as_str())?;
-                    (body(line)
-                        && primitives.contexts.reading_context(&line.id)
-                            == primitives.contexts.reading_context(&marker.line_id))
-                    .then(|| {
-                        text.slice(
-                            range.start.max(indexed.range.start)..range.end.min(indexed.range.end),
-                        )
-                        .unwrap_or("")
-                        .trim()
-                    })
-                    .filter(|tail| !tail.is_empty())
-                });
-                let first = words.next().unwrap_or("");
-                let last = words.next_back().unwrap_or(first);
-                let clause = first.starts_with(char::is_lowercase)
-                    || last.ends_with([',', ';'])
-                    || last.split_whitespace().next_back().is_some_and(|word| {
-                        matches!(
-                            word.trim_matches(|c: char| !c.is_alphabetic())
-                                .to_lowercase()
-                                .as_str(),
-                            "and" | "or"
-                        )
-                    });
-                active = clause && lead_in.is_some_and(legal_pdf_witnesses::list_lead_in);
-            }
-            if active {
-                listed.insert(prior.id.as_str());
-                listed.insert(next.id.as_str());
-            }
-        }
-    }
-    listed
 }
 
 fn context_at(
@@ -1140,8 +1004,6 @@ impl PdfResolutionInput {
         };
         let mut evidence = Vec::new();
         for run in &runs {
-            let sentence_items =
-                sentence_list_items(&index, &text, &by_line, &measures, run, &ended, primitives);
             let mut list_candidates = HashSet::new();
             if !matches!(run.grammar, CandidateGrammar::Numeric) {
                 let marker_sources = run
@@ -1278,9 +1140,6 @@ impl PdfResolutionInput {
                 if list_candidates.contains(candidate.id.as_str()) && item_words {
                     add_observation(&mut observations, CandidateObservationV2::ListItemLayout);
                 }
-                if sentence_items.contains(candidate.id.as_str()) {
-                    add_observation(&mut observations, CandidateObservationV2::ListItemSyntax);
-                }
                 let marker_is_cross_reference = marker_lines.iter().any(|indexed| {
                     let local = ScalarRange {
                         start: candidate
@@ -1311,7 +1170,6 @@ impl PdfResolutionInput {
                             .get(indexed.line_id.as_str())
                             .is_some_and(|(page, line)| {
                                 continues_prose(page, line)
-                                    && !sentence_items.contains(candidate.id.as_str())
                                     || candidate.label == "v." && legal_pdf_core::layout_analysis().has_citation_signal(&line.text)
                             })
                     });

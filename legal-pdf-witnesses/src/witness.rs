@@ -1,7 +1,7 @@
 //! Every counted line's witnesses, read against its page and its document.
 
 use legal_pdf_core::model::{Line, Page};
-use legal_pdf_core::{flag_share, median, BOLD, ITALIC};
+use legal_pdf_core::{flag_share, upper_median as median, BOLD, ITALIC};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
