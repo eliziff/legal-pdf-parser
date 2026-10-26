@@ -11,7 +11,7 @@
 use super::{bold_char_share, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{dominant_face, flag_share, PageMeasure, ITALIC};
-use legal_structure_model::{enumerator_interpretations, parse_heading_ladder, EnumeratorInterpretation, HeadingAction};
+use legal_structure_model::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -106,8 +106,7 @@ fn judge(text: &str) -> bool {
 pub(super) fn numbered(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
-    super::heading_inline_re().is_match(text)
-        || super::heading_standalone_re().is_match(text)
+    super::enumerated(text)
         || pattern(&RE, concat!(
             r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\b",
             r"|\(\s*(?:\d{1,3}|[a-zA-Z]{1,2}|[ivxlc]{1,6})\s*\)(?:\s|$)|[IVXLC]{1,4}\s+[A-Z])"
@@ -155,17 +154,9 @@ pub(super) fn ladder_levels(texts: &[&str], breaks: &[bool]) -> Vec<Option<(usiz
     while start < numbered.len() {
         let end = (start + 1..numbered.len()).find(|&n| restarts(n)).unwrap_or(numbered.len());
         let run = &numbered[start..end];
-        let readings = || run.iter().map(|(_, readings, _)| readings.as_slice());
-        let mut sets: Vec<usize> = parse_heading_ladder(readings()).assignments.iter().enumerate()
-            .filter(|(_, assignment)| assignment.action == HeadingAction::IllegalRestart && assignment.level == Some(1))
-            .map(|(n, _)| n)
-            .collect();
-        sets.insert(0, 0);
-        sets.push(run.len());
-        sets.dedup();
-        for set in sets.windows(2) {
-            let parsed = parse_heading_ladder(run[set[0]..set[1]].iter().map(|(_, readings, _)| readings.as_slice()));
-            for (n, ((k, _, attachment), assignment)) in run[set[0]..set[1]].iter().zip(&parsed.assignments).enumerate() {
+        let readings = run.iter().map(|(_, readings, _)| readings.as_slice()).collect::<Vec<_>>();
+        for (first, parsed) in parse_heading_runs(&readings) {
+            for (n, ((k, _, attachment), assignment)) in run[first..].iter().zip(&parsed.assignments).enumerate() {
                 let level = if *attachment { Some(1) } else { assignment.level };
                 levels[*k] = level.map(|level| (level, n == 0));
             }
@@ -265,20 +256,6 @@ fn numbering_levels(document: &[Page], levels: &HashMap<String, usize>, placed: 
     out
 }
 
-/// A title's words: past its number, every word but the small ones capitalised (or all in
-/// capitals), two at least, and no sentence's end: "Standard of Review", "Rational Connection".
-fn title_case(text: &str) -> bool {
-    static NUMBER: OnceLock<Regex> = OnceLock::new();
-    const SMALL: [&str; 26] = ["a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "by", "with", "at", "from", "as",
-        "de", "du", "des", "la", "le", "les", "et", "à", "en", "v", "vs"];
-    let text = text.trim();
-    let rest = pattern(&NUMBER, r"^\s*(?:\(?[0-9ivxlcIVXLCa-zA-Z]{1,6}[.)]|\[\d+\])\s*").replace(text, "");
-    let big: Vec<&str> = rest.split_whitespace().filter(|word| word.chars().any(char::is_alphabetic))
-        .filter(|word| !SMALL.contains(&word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase().as_str())).collect();
-    big.len() >= 2 && big.iter().all(|word| word.trim_start_matches(['(', '“', '"', '\'']).starts_with(char::is_uppercase))
-        && !text.ends_with(['.', ';', ','])
-}
-
 /// A line opening a numbered paragraph or clause: "[45]", "131. Pour les motifs", "16 (1) La", "(a) the".
 fn numbered_paragraph(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -348,18 +325,18 @@ fn not_a_heading(heading: &Heading, running: bool) -> bool {
 }
 
 /// Whether a line the readers left in the body is a heading, by the three ways the gold's missed
-/// headings show themselves (each rule's share of its catches that are headings beside it; a
-/// heading pays above about three in ten): a title between a closed sentence and a numbered
-/// paragraph ("Standard of Review" before "[3] Section 204 …"; 58%), a bold line opening its own
-/// block before a numbered paragraph ("(d) The Reasonable Steps Requirement" before "[101]"; 35%),
-/// a bold numbered line with space above it ("G. DISPOSITION"; 32%). A speaker's turn or a label
-/// is never one.
+/// headings show themselves: a heading by the engine's grammar for a judgment's text between a
+/// closed sentence and a numbered paragraph ("Standard of Review", "Discussion" before "[3] Section
+/// 204 …"), a bold line opening its own block before a numbered paragraph ("(d) The Reasonable
+/// Steps Requirement" before "[101]"), a bold numbered line with space above it ("G.
+/// DISPOSITION"). A speaker's turn or a label is never one.
 fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, above: f64) -> bool {
     let text = line.text.trim();
     let before_paragraph = next.is_some_and(|next| numbered_paragraph(&next.text));
     let own_block = prior.is_none_or(|prior| prior.page_index != line.page_index || prior.block_index != line.block_index);
+    let heads = next.is_some_and(|next| legal_pdf_core::layout_analysis().heading_between(text, &next.text));
     !label(text) && legal_structure_model::transcript::speaker_label(text).is_none()
-        && ((prior.is_none_or(|prior| closes(&prior.text)) && before_paragraph && title_case(text))
+        && ((prior.is_none_or(|prior| closes(&prior.text)) && before_paragraph && heads)
             || (bold && before_paragraph && own_block)
             || (bold && numbered(text) && above >= 1.0))
 }

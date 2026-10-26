@@ -1378,9 +1378,6 @@ impl PdfResolutionInput {
                 if furniture {
                     add_observation(&mut observations, CandidateObservationV2::Furniture);
                 }
-                if composed("numbered_paragraph", marker_line) {
-                    add_observation(&mut observations, CandidateObservationV2::ComposedParagraph);
-                }
                 if composed("list_item", marker_line) {
                     add_observation(&mut observations, CandidateObservationV2::ComposedListItem);
                 }

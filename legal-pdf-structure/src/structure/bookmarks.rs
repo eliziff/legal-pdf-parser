@@ -17,7 +17,7 @@
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use super::{
-    continues_prose, has_dot_leader, inline_enumerator_re, standalone_enumerator, DocumentContext,
+    continues_prose, enumerated, has_dot_leader, DocumentContext,
     PdfPrimitiveEvidence,
 };
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
@@ -611,7 +611,7 @@ pub(super) fn reconcile_bookmarks(
             };
             let numbered = |slot: usize, page: &Page| {
                 let text = page.lines[slot].text.trim();
-                inline_enumerator_re().is_match(text) || standalone_enumerator(text)
+                enumerated(text)
             };
             let mut start = anchor.lines[0];
             if !numbered(start, page) {

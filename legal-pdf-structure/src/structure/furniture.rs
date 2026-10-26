@@ -495,7 +495,7 @@ pub(super) fn mark_repeated_furniture(pages: &mut [Page]) {
                 .enumerate()
                 .filter(|(_, label)| {
                     let paragraph = standalone_paragraph_number(&label.text);
-                    (standalone_enumerator(&label.text) || paragraph)
+                    (heading_standalone_re().is_match(&label.text) || paragraph)
                         && page.lines.iter().enumerate().any(|(body_index, body)| {
                             (!paragraph || !repeated.contains(&(page_slot, body_index)))
                                 && aligned_note_body(label, body)
