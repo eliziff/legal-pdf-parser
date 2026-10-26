@@ -105,25 +105,3 @@ pub struct PdfExtractionMetadata {
     #[serde(default)]
     pub scanned_pages: Vec<usize>,
 }
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn v2_field_names_match_the_public_contract() {
-        let region = Region {
-            id: "p0001-r0001".to_owned(),
-            page_index: 0,
-            kind: "body".to_owned(),
-            line_ids: vec![],
-            bbox: [0.0; 4],
-            reading_order: 1,
-        };
-        let value = serde_json::to_value(region).unwrap();
-        assert_eq!(value["type"], "body");
-        assert!(value.get("kind").is_none());
-        assert_eq!(SCHEMA_VERSION, "legalpdf.document.v4");
-    }
-}

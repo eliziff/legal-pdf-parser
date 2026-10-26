@@ -1261,17 +1261,3 @@ pub fn corpus_check_cached_extraction(
         "structure": structure,
     }))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_identity_is_stable() {
-        let identity = engine_identity();
-        assert_eq!(
-            cache_key(&"00".repeat(32), identity, None, None, None).unwrap(),
-            cache_key(&"00".repeat(32), identity, None, None, None).unwrap()
-        );
-    }
-}

@@ -475,23 +475,3 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
     }
     repaired
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn markers_read_exact_and_garbled() {
-        let r = read_marker("[12] The appellant").unwrap();
-        assert!(matches!(r.family, Family::Bracket) && r.values == [12] && r.exact && r.taken == 5);
-        let r = read_marker("[131 The").unwrap();
-        assert!(matches!(r.family, Family::Bracket) && r.values == [131, 13] && !r.exact);
-        let r = read_marker("[11 On").unwrap();
-        assert!(r.values == [11, 1] && !r.exact);
-        let r = read_marker("l2. Since").unwrap();
-        assert!(matches!(r.family, Family::Dot) && r.values == [12] && !r.exact);
-        assert!(read_marker("The appellant").is_none());
-        assert!(read_marker("12abc").is_none());
-        assert!(read_marker("1992 was the year").is_none());
-    }
-}

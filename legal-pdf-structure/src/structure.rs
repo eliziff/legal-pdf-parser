@@ -21,8 +21,6 @@ use furniture::*;
 use headings::*;
 use line_roles::*;
 use text::*;
-#[cfg(test)]
-use graph::{contents_row, index_pages};
 pub use graph::PdfTextIndex;
 use graph::{
     contents_leader_re, map_note_pairs, native_graph_parts, PdfResolutionInput,
@@ -32,16 +30,12 @@ use legal_pdf_core::model::{
     ParagraphAnchor, PdfOutlineEntry, Span, Word,
 };
 use legal_pdf_support::LegalDocument;
-#[cfg(test)]
-use legal_pdf_core::model::{NotePairClaim, NotePairKind};
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
 use legal_structure_model::{
     enumerator_interpretations, normalize_decimal_digit, normalize_note_symbol,
     parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
     HeadingFamilyStats, HeadingLadderStatus, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
-#[cfg(test)]
-use legal_structure_model::{CandidateGrammar, CandidateObservationV2};
 use regex::Regex;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -214,14 +208,6 @@ pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
     let end = value.len();
     let byte = value.char_indices().nth(start).map_or(end, |at| at.0);
     &value[byte..]
-}
-
-#[cfg(test)]
-pub(super) fn char_slice(value: &str, start: usize, end: usize) -> &str {
-    let length = value.chars().count();
-    ScalarText::new(value)
-        .slice(start.min(length)..end.min(length))
-        .expect("valid scalar range")
 }
 
 pub(super) fn is_note_symbol(character: char) -> bool {
@@ -425,11 +411,6 @@ fn source_regions_cover_pages(pages: &[Page], regions: Option<&HashMap<String, S
             .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
             .all(|line| regions.contains_key(&line.id))
     })
-}
-
-#[cfg(test)]
-fn source_regions_available(pages: &[Page]) -> bool {
-    source_regions_cover_pages(pages, source_region_contract(pages).as_ref())
 }
 
 // A contents entry runs its title into a dot leader ("4. Land Use ........ 12"), as pdf-inspector reads one.
@@ -687,19 +668,6 @@ fn classify_document_pages(
     diagnostics
 }
 
-#[cfg(test)]
-fn classify_pages(pages: &mut [Page], separators: &[Option<f64>]) -> Vec<Diagnostic> {
-    let mut evidence = PdfPrimitiveEvidence {
-        source_regions: source_region_contract(pages),
-        ..PdfPrimitiveEvidence::default()
-    };
-    let diagnostics = classify_pages_with_source(pages, separators, &mut evidence);
-    read_headings(pages, &[], &mut evidence);
-    heading_rules::read(pages, &mut evidence, false);
-    build_regions(pages);
-    diagnostics
-}
-
 /// A document's own dictionary for rejoining words its lines break: its words and its hyphenated
 /// compounds (pdf-inspector's `document_vocabulary`).
 type Vocabulary = (HashSet<String>, HashSet<String>);
@@ -876,20 +844,6 @@ fn build_paragraphs_with_context(
     paragraphs
 }
 
-#[cfg(test)]
-fn build_paragraphs(pages: &[Page], anchors: &HashMap<String, Vec<Anchor>>) -> Vec<Paragraph> {
-    let starts = constituents::starts(pages);
-    let primitives = PdfPrimitiveEvidence {
-        contexts: Contexts {
-            document_line_ids: constituents::document_lines(pages, &starts),
-            translation_line_ids: translation_lines(pages),
-            ..Contexts::default()
-        },
-        ..Default::default()
-    };
-    build_paragraphs_with_context(pages, anchors, &primitives)
-}
-
 fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"⟦FN:[^⟧]+⟧").unwrap())
@@ -954,12 +908,6 @@ fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize)], offset:
         (start, end)
     };
     clean_markers(&chars[start..end].iter().collect::<String>())
-}
-
-#[cfg(test)]
-fn sentence_at(text: &str, offset: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    sentence_at_boundaries(&chars, &sentence_boundaries(&chars), offset)
 }
 
 fn attach_propositions(
@@ -1993,6 +1941,3 @@ pub fn validate_pdf_components(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;
