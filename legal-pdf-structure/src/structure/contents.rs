@@ -15,7 +15,7 @@ use super::contents_lists::{row_bands, row_of, Entry};
 use super::heading_rules::{ladder_levels, numbered};
 use super::Claims;
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Indents within this many points are one tier.
 const INDENT_TOLERANCE: f64 = 6.0;
@@ -23,50 +23,6 @@ const INDENT_TOLERANCE: f64 = 6.0;
 const MAX_WRAPPED_ROWS: usize = 3;
 /// The deepest level a contents list sets.
 const MAX_LEVEL: usize = 6;
-/// Contents subheadings use the list's own type size, independently of body prose.
-pub(super) fn retain_headings(pages: &mut [Page], claims: &mut Claims) {
-    for page in pages {
-        let lines = page
-            .lines
-            .iter()
-            .filter(|line| {
-                !line.exclude_from_body && claims.contents_line_ids.contains(&line.id)
-            })
-            .collect::<Vec<_>>();
-        let size = super::median(
-            lines
-                .iter()
-                .map(|line| legal_pdf_core::line_font_size(line))
-                .filter(|size| *size > 0.0)
-                .collect(),
-        );
-        let mut headings = HashSet::new();
-        for band in row_bands(&lines) {
-            if row_of(band.clone()).locator.is_some() {
-                continue;
-            }
-            headings.extend(
-                band.iter()
-                    .filter(|line| {
-                        size > 0.0
-                            && legal_pdf_core::line_font_size(line)
-                                >= size * super::FONT_HEADING_SIZE_RATIO
-                            && line.region_type == "heading"
-                    })
-                    .map(|line| line.id.clone()),
-            );
-        }
-        for line in page
-            .lines
-            .iter_mut()
-            .filter(|line| headings.contains(&line.id))
-        {
-            claims.contents_line_ids.remove(&line.id);
-            line.region_type = "heading".to_owned();
-        }
-    }
-}
-
 /// A printed marker or completed locator starts the next entry, even when prose geometry joined it.
 pub(super) fn group_rows(pages: &mut [Page], claims: &Claims) {
     for page in pages {

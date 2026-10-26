@@ -48,7 +48,6 @@ const HARD_DIAGNOSTICS: &[&str] = &[
 ];
 pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 const MAX_FONT_HEADING_CHARS: usize = 180;
-const FONT_HEADING_SIZE_RATIO: f64 = 1.18;
 
 /// A document or embedded reading and its parallel sequence; primary text is (0, false).
 pub(super) type DocumentContext = (usize, bool);

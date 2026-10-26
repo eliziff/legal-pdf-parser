@@ -251,13 +251,6 @@ fn heading_marker_re() -> &'static Regex {
 
 pub(super) use crate::paragraphs::contents_leader_re;
 
-fn transcript_line_numbers(pages: &[Page]) -> HashSet<&str> {
-    pages
-        .iter()
-        .flat_map(|page| line_labels(page).map(|line| line.id.as_str()))
-        .collect()
-}
-
 /// The page's transcript line numbers, as `mark_line_numbers` claimed them.
 pub(super) fn line_labels<'a>(page: &'a Page) -> impl Iterator<Item = &'a Line> + 'a {
     page.lines.iter().filter(|line| line.region_type == "line_label")
@@ -903,8 +896,6 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let transcript_line_numbers = transcript_line_numbers(pages);
-        let index_pages = index_pages(pages);
         let mut flow_lines = HashSet::new();
         for page in pages {
             for pair in page.lines.windows(2) {
@@ -1207,21 +1198,6 @@ impl PdfResolutionInput {
                 });
                 if contents {
                     add_observation(&mut observations, CandidateObservationV2::ContentsRow);
-                }
-                if marker_lines
-                    .iter()
-                    .any(|line| index_pages.contains(&line.page_index))
-                {
-                    add_observation(&mut observations, CandidateObservationV2::IndexRow);
-                }
-                if marker_lines
-                    .iter()
-                    .any(|line| transcript_line_numbers.contains(line.line_id.as_str()))
-                {
-                    add_observation(
-                        &mut observations,
-                        CandidateObservationV2::TranscriptLineNumber,
-                    );
                 }
                 let furniture = marker_lines.iter().any(|indexed| {
                     by_line

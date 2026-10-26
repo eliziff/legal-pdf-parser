@@ -1378,7 +1378,6 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
                 return;
             }
             demote_prose_heading_tags(document, primitives);
-            contents::retain_headings(document, &mut primitives.claims);
             levels.extend(apply_text_fidelity_headings(document, 0.0, primitives));
         });
         primitives.headings.heading_levels = levels;
