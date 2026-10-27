@@ -1314,21 +1314,6 @@ fn derive_prepared(
         pages,
         &prepared.primitives.contexts.constituent_starts,
     ));
-    // The engine's inputs, for the structure gold to replay engine changes without parsing
-    // (legal-structure's replay example).
-    if let Ok(path) = std::env::var("LEGALPDF_RESOLVER_DUMP") {
-        let dump = json!({
-            "document_id": identity.document_id,
-            "source_sha256": identity.source_sha256,
-            "text": resolution.index.text(),
-            "nodes": nodes,
-            "runs": resolution.runs,
-            "evidence": resolution.evidence,
-            "note_pairs": note_pairs,
-            "diagnostics": graph_diagnostics,
-        });
-        let _ = std::fs::write(&path, dump.to_string());
-    }
     let source_fragments = resolution.index.source_fragments();
     let pages: &[Page] = pages;
     let document_id = identity.document_id.clone();
