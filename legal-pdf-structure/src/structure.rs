@@ -41,8 +41,7 @@ use legal_pdf_core::model::{
 use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
 use legal_structure_model::{
-    enumerator_interpretations, parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
-    HeadingFamilyStats, HeadingLadderStatus, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
+    enumerator_interpretations, parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 use regex::Regex;
 use serde_json::json;
@@ -190,6 +189,11 @@ pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
     &value[byte..]
 }
 
+/// Whether a page layout model labelled the line: its region is one of the model's.
+pub(super) fn layout_labelled(line: &Line) -> bool {
+    line.region_id.contains("-ppdoc-r")
+}
+
 /// The pages as the readers leave them, before any composed decision: what a document's
 /// compositions never change, cached by its input pages and the readers' code.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -215,7 +219,7 @@ fn prepare_reader(
     // A page layout model's labels (docling: text, paragraph_title, doc_title, footnote, header,
     // footer, table ...) in the stage's region vocabulary: its text is body, its titles headings.
     for page in pages.iter_mut() {
-        for line in page.lines.iter_mut().filter(|line| line.region_id.contains("-ppdoc-r")) {
+        for line in page.lines.iter_mut().filter(|line| layout_labelled(line)) {
             line.region_type = match line.region_type.as_str() {
                 "text" => "body".to_owned(),
                 "paragraph_title" | "doc_title" => "heading".to_owned(),

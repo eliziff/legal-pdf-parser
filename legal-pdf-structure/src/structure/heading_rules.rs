@@ -378,7 +378,8 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             let above = prior.filter(|prior| prior.page_index == line.page_index).map_or(3.0, |prior| {
                 (line.bbox[1] - prior.bbox[3]) / measures[&line.page_index].height
             });
-            if lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(line) >= 0.5, above) {
+            // A layout model's reading of a line stands: its words lift only a line none read.
+            if !super::layout_labelled(line) && lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(line) >= 0.5, above) {
                 lifted_lines.push(line.id.clone());
             }
         }

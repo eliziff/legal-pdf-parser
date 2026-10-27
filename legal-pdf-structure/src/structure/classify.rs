@@ -40,16 +40,6 @@ pub(super) fn source_region_contract(pages: &[Page]) -> Option<HashMap<String, S
     (!regions.is_empty()).then_some(regions)
 }
 
-pub(super) fn source_regions_cover_pages(pages: &[Page], regions: Option<&HashMap<String, String>>) -> bool {
-    regions.is_some_and(|regions| {
-        pages
-            .iter()
-            .flat_map(|page| &page.lines)
-            .filter(|line| !line.exclude_from_body && !line.text.trim().is_empty())
-            .all(|line| regions.contains_key(&line.id))
-    })
-}
-
 // A contents entry runs its title into a dot leader ("4. Land Use ........ 12"), as pdf-inspector reads one.
 
 pub(super) fn classify_pages_with_source(

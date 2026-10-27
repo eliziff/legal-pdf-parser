@@ -31,7 +31,7 @@ use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
 use legal_pdf_core::layout_analysis;
 use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
-use outline::{body_headings, candidate_fonts, stands_alone, Candidate, Context};
+use outline::{candidate_fonts, stands_alone, Candidate, Context};
 use std::collections::{HashMap, HashSet};
 
 /// A heading wrapped onto the next line keeps one block: the same type, set at the
@@ -634,21 +634,9 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     let context = Context {
         doc: &doc,
         blocks: &blocks,
-        pages: &flash_pages,
         positions: &positions,
         centered: &centered,
     };
-    candidates.sort_by(|left, right| context.order(left.block, right.block));
-    for block in body_headings(&context, &candidates, &neighbors) {
-        if eligible[block] {
-            proposed.push(block);
-            candidates.push(Candidate {
-                block,
-                kind: 0,
-                level: None,
-            });
-        }
-    }
     candidates.sort_by(|left, right| context.order(left.block, right.block));
     let proposed = proposed.into_iter().collect::<HashSet<_>>();
     // Every candidate's fonts, read once for all the proposed headings they are compared with.

@@ -65,13 +65,6 @@ pub(super) fn title_after_enumerator(text: &str) -> &str {
         .unwrap_or(text.trim())
 }
 
-/// A title set in capitals: the typographic evidence a recognized page keeps when it loses bold
-/// and size.
-pub(super) fn caps_title(text: &str) -> bool {
-    let title = title_after_enumerator(text);
-    title.chars().filter(|c| c.is_alphabetic()).count() >= 4 && all_caps(title) && !sentence_ended(title)
-}
-
 /// "[12]" alone on its line; four digits would be a bracketed year.
 pub(super) fn standalone_paragraph_number(text: &str) -> bool {
     text.trim()
