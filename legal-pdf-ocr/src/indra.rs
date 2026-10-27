@@ -42,27 +42,6 @@ const BLANK_LABEL: usize = 0;
 /// at 0.95 and more; a signature, a seal's lettering or a speckle at less.
 pub(crate) const RECOVERED_CONFIDENCE: f64 = 0.95;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IndraLayout {
-    #[default]
-    Indra,
-}
-
-impl IndraLayout {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "indra" => Some(Self::Indra),
-            _ => None,
-        }
-    }
-    fn name(self) -> &'static str {
-        match self {
-            Self::Indra => "indra",
-        }
-    }
-}
-
 pub use legal_pdf_core::OrtBackend as IndraBackend;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +90,6 @@ pub struct IndraOptions {
     #[serde(skip, default = "default_input_height")]
     pub input_height: usize,
     pub tier: IndraTier,
-    pub layout: IndraLayout,
     /// Omitted selects a CPU/GPU plan from this machine's capabilities.
     pub backend: Option<IndraBackend>,
     pub device: Option<String>,
@@ -132,7 +110,6 @@ impl Default for IndraOptions {
             width_bucket: 0,
             input_height: 32,
             tier: IndraTier::Balanced,
-            layout: IndraLayout::Indra,
             backend: None,
             device: None,
             cpu_arena: true,
@@ -503,7 +480,7 @@ impl IndraOcr {
         }
         let layout_identity = provider_asset_sha256(&pack.detector)?;
         let identity=format!("indra-native-v1:backend={}:device={device}:model={}:codec={}:runtime={}:layout={}:layout-model={layout_identity}:side={}:orientation={}:tier={}:dpi={}:batch={}:bucket={}:workers={}:threads={}:layout-workers={}:cpu-arena={}",
-            plan.backend.name(),provider_asset_sha256(&pack.model)?,provider_asset_sha256(&pack.codec)?,provider_asset_sha256(&runtime)?,options.layout.name(),pack.detector_side,
+            plan.backend.name(),provider_asset_sha256(&pack.model)?,provider_asset_sha256(&pack.codec)?,provider_asset_sha256(&runtime)?,"indra",pack.detector_side,
             pack.orientation.as_deref().map(provider_asset_sha256).transpose()?.unwrap_or_default(),
             options.tier.name(),options.dpi,plan.batch_size,plan.width_bucket,plan.workers,plan.threads,plan.layout_workers,options.cpu_arena);
         Ok(PreparedIndra {

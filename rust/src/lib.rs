@@ -51,7 +51,7 @@ pub use legal_pdf_language::{
 #[cfg(feature = "ocr")]
 pub use legal_pdf_ocr::{
     IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics,
-    IndraLayout, IndraOcr, IndraOptions, IndraTier,
+    IndraOcr, IndraOptions, IndraTier,
 };
 #[cfg(feature = "ocr")]
 pub use legal_pdf_ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord};

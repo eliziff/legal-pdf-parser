@@ -1,5 +1,5 @@
 use legal_pdf_core::{Error, Result};
-use legal_pdf_ocr::{IndraBackend, IndraLayout, IndraOcr, IndraOptions, IndraTier, OcrPageRequest};
+use legal_pdf_ocr::{IndraBackend, IndraOcr, IndraOptions, IndraTier, OcrPageRequest};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -83,10 +83,6 @@ fn run() -> Result<()> {
                 }
             }
             Some("--repeat") => repeat = number()?,
-            Some("--layout") => {
-                options.layout = IndraLayout::parse(&text)
-                    .ok_or_else(|| Error::Message("unknown line detector".into()))?
-            }
             Some("--workers") => options.workers = number()?,
             Some("--threads") => options.threads = number()?,
             Some("--layout-workers") => options.layout_workers = number()?,

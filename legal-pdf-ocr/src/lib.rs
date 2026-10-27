@@ -16,7 +16,7 @@ mod uncovered;
 
 #[cfg(feature = "ocr")]
 pub use indra::{
-    IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics, IndraLayout,
+    IndraBackend, IndraBatchDiagnostics, IndraBatchPerformance, IndraImageDiagnostics,
     IndraOcr, IndraOptions, IndraTier,
 };
 pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
