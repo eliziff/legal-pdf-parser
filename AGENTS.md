@@ -1,5 +1,10 @@
 # Legal PDF parser agent rules
 
+- The structure stage's map (what runs in which order, which module decides what, and how to
+  measure a change) heads `legal-pdf-structure/src/structure.rs`; each module's own header says
+  what it decides from which evidence. Notes are read in `structure/notes/`, headings in
+  `structure/headings/`, the graph in `structure/graph/`.
+
 - For ordinary Rust edits, run `cargo quick`. Do not run `cargo build`,
   `cargo run`, `cargo test`, or a corpus replay after each change.
 - Batch source changes behind metadata checks. Link the executable or test

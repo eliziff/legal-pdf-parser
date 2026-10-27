@@ -11,9 +11,9 @@
 //! enumerated or all set at one indent, else from the list's indents.
 
 use super::bookmarks::normalize_title;
-use super::contents_lists::{row_bands, row_of, Entry};
-use super::heading_rules::{ladder_levels, numbered};
-use super::Claims;
+use crate::structure::contents_lists::{row_bands, row_of, Entry};
+use super::rules::{ladder_levels, numbered};
+use crate::structure::Claims;
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use std::collections::HashMap;
 
@@ -24,7 +24,7 @@ const MAX_WRAPPED_ROWS: usize = 3;
 /// The deepest level a contents list sets.
 const MAX_LEVEL: usize = 6;
 /// A printed marker or completed locator starts the next entry, even when prose geometry joined it.
-pub(super) fn group_rows(pages: &mut [Page], claims: &Claims) {
+pub(crate) fn group_rows(pages: &mut [Page], claims: &Claims) {
     for page in pages {
         if !page
             .lines
@@ -139,7 +139,7 @@ fn titles_by_text(pages: &[Page], claims: &Claims) -> HashMap<String, Vec<usize>
 }
 
 /// Each local contents run uses its own confirmed destinations and pagination relationships.
-pub(super) fn contents_outline(pages: &[Page], claims: &Claims) -> Vec<PdfOutlineEntry> {
+pub(crate) fn contents_outline(pages: &[Page], claims: &Claims) -> Vec<PdfOutlineEntry> {
     // The entries listed on these pages, each with its page's slot among them.
     let slots: HashMap<usize, usize> = pages.iter().enumerate().map(|(slot, page)| (page.index, slot)).collect();
     let listed: Vec<(usize, &Entry)> = claims

@@ -333,7 +333,7 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
 
 /// Settle one logical document's notes, with separators aligned to these page slots.
 /// Returns how many lines changed.
-pub(super) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>]) -> usize {
+pub(crate) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>]) -> usize {
     let claims = {
         let lines = DocumentLines::new(pages);
         let mut claims = BTreeMap::<LineRef, &'static str>::new();

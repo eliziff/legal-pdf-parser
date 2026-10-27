@@ -111,7 +111,7 @@ pub(super) fn classify_pages_with_source(
             &evidence.contexts.translation_line_ids,
             |document| {
                 crate::paragraphs::segment_paragraphs(document);
-                contents::group_rows(document, &evidence.claims);
+                headings::contents::group_rows(document, &evidence.claims);
             },
         );
         legal_pdf_tables::part_cell_paragraphs(pages, &evidence.claims.tables);
