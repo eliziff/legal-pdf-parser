@@ -789,9 +789,7 @@ impl PdfResolutionInput {
                 bounds.1 = bounds.1.max(line.bbox[2]);
             }
         }
-        // Every run owns its reading context; quoted text is not foreign to its own run, except a
-        // quoted decision's own numbered paragraphs, which number nothing here.
-        let quotations = primitives.foreign_numbered_line_ids.clone();
+        // Every run owns its reading context; quoted text is not foreign to its own run.
         let context = legal_pdf_witnesses::Context {
             documents: Some(primitives.contexts.reading_lines()),
             quoted: None,
@@ -912,9 +910,6 @@ impl PdfResolutionInput {
                 }
             }
         }
-        let (layout_runs, layout_evidence) = legal_pdf_support::profile::measure("candidates.printed_paragraphs", ||
-            super::numbered_paragraphs::candidates(&index, pages, primitives, &quotations));
-        runs.extend(layout_runs);
         // A quoted decision's own numbers (`foreign_numbered_paragraphs`) number nothing here,
         // whichever source read them as a run.
         if !primitives.foreign_numbered_line_ids.is_empty() {
@@ -936,10 +931,6 @@ impl PdfResolutionInput {
             }
             runs.retain(|run| !run.markers.is_empty());
         }
-        let layout_evidence = layout_evidence
-            .iter()
-            .map(|item| (item.candidate_id.as_str(), item))
-            .collect::<HashMap<_, _>>();
         // Project context-scoped citation ranges back onto their own source lines.
         // Citations by where they start, each with the furthest end so far, so a line finds the
         // ones overlapping it without reading every citation.
@@ -1214,14 +1205,10 @@ impl PdfResolutionInput {
                 if composed("list_item", marker_line) {
                     add_observation(&mut observations, CandidateObservationV2::ComposedListItem);
                 }
-                let layout = layout_evidence.get(candidate.id.as_str());
-                if let Some(layout) = layout {
-                    observations.extend(layout.observations.iter().copied());
-                }
                 evidence.push(CandidateEvidenceV2 {
                     candidate_id: candidate.id.clone(),
-                    page_indexes: layout.map_or(page_indexes, |item| item.page_indexes.clone()),
-                    line_ids: layout.map_or(line_ids, |item| item.line_ids.clone()),
+                    page_indexes,
+                    line_ids,
                     observations,
                 });
             }
