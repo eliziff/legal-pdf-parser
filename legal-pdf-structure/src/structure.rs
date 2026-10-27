@@ -21,6 +21,9 @@ use furniture::*;
 use headings::*;
 use line_roles::*;
 use text::*;
+pub(crate) use legal_structure_model::text::{
+    is_note_symbol, label_prefix, line_start_label_prefix, normalize_label, LabelPrefix, MAX_SYMBOL_LABEL_LEN,
+};
 pub use graph::PdfTextIndex;
 use graph::{map_note_pairs, native_graph_parts, PdfResolutionInput};
 use legal_pdf_core::model::{
@@ -30,8 +33,7 @@ use legal_pdf_core::model::{
 use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
 use legal_structure_model::{
-    enumerator_interpretations, normalize_decimal_digit, normalize_note_symbol,
-    parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
+    enumerator_interpretations, parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, HeadingAction,
     HeadingFamilyStats, HeadingLadderStatus, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
 };
 use regex::Regex;
@@ -46,18 +48,10 @@ const HARD_DIAGNOSTICS: &[&str] = &[
     "FOOTNOTE_REGION_UNCERTAIN",
     "TEXT_QUALITY_LOW",
 ];
-pub(super) const MAX_SYMBOL_LABEL_LEN: usize = 8;
 const MAX_FONT_HEADING_CHARS: usize = 180;
 
 /// A document or embedded reading and its parallel sequence; primary text is (0, false).
 pub(super) type DocumentContext = (usize, bool);
-
-#[derive(Debug, Clone)]
-pub(super) struct LabelPrefix {
-    pub(super) label: String,
-    start: usize,
-    pub(super) end: usize,
-}
 
 /// What the document's containers claim for the whole document, so that no heading, note or
 /// paragraph reading takes a line back: its contents lists and its tables.
@@ -178,19 +172,6 @@ pub struct StructureOutput {
     pub heading_sources: HashMap<String, String>,
 }
 
-fn normalize_label(value: &str) -> String {
-    let translated: String = value
-        .trim()
-        .chars()
-        .map(|character| {
-            normalize_decimal_digit(character).unwrap_or_else(|| normalize_note_symbol(character))
-        })
-        .collect();
-    translated
-        .parse::<u64>()
-        .map_or(translated, |number| number.to_string())
-}
-
 pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
     if value.is_ascii() {
         return &value[start.min(value.len())..];
@@ -198,89 +179,6 @@ pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
     let end = value.len();
     let byte = value.char_indices().nth(start).map_or(end, |at| at.0);
     &value[byte..]
-}
-
-pub(super) fn is_note_symbol(character: char) -> bool {
-    matches!(
-        character,
-        '*' | '∗' | '\u{f02a}' | '†' | '‡' | '§' | '¶' | '#'
-    )
-}
-
-fn line_start_label_prefix(text: &str) -> Option<LabelPrefix> {
-    let leading = text
-        .chars()
-        .take_while(|character| character.is_whitespace())
-        .count();
-    let trimmed = text.trim_start();
-    let symbols: String = trimmed
-        .chars()
-        .take(MAX_SYMBOL_LABEL_LEN)
-        .take_while(|character| is_note_symbol(*character))
-        .collect();
-    let token = if symbols.is_empty() {
-        trimmed
-            .chars()
-            .take(4)
-            .take_while(char::is_ascii_digit)
-            .collect()
-    } else {
-        symbols
-    };
-    if token.is_empty() {
-        return None;
-    }
-    let token_chars = token.chars().count();
-    let remainder = scalar_suffix(trimmed, token_chars);
-    let embedded_endnote = format!("endnote {token}");
-    let embedded_chars = embedded_endnote.chars().count();
-    if remainder
-        .get(..embedded_endnote.len())
-        .is_some_and(|value| value.eq_ignore_ascii_case(&embedded_endnote))
-    {
-        return Some(LabelPrefix {
-            label: normalize_label(&token),
-            start: leading,
-            end: leading + token_chars + embedded_chars,
-        });
-    }
-    let mut remainder_chars = remainder.chars();
-    let valid_boundary = match remainder_chars.next() {
-        Some(character) if character.is_whitespace() => true,
-        Some(character) if ".)],:;-".contains(character) => remainder_chars
-            .next()
-            .is_none_or(|next| next.is_whitespace()),
-        _ => false,
-    };
-    if !valid_boundary {
-        return None;
-    }
-    let label = normalize_label(&token);
-    Some(LabelPrefix {
-        label,
-        start: leading,
-        end: leading + token_chars,
-    })
-}
-
-pub(super) fn label_prefix(text: &str) -> Option<LabelPrefix> {
-    if let Some(prefix) = line_start_label_prefix(text) {
-        return Some(prefix);
-    }
-    let leading = text
-        .chars()
-        .take_while(|character| character.is_whitespace())
-        .count();
-    let stripped = text.trim();
-    let pure = ((1..=MAX_SYMBOL_LABEL_LEN).contains(&stripped.chars().count())
-        && stripped.chars().all(is_note_symbol))
-        || ((1..=4).contains(&stripped.chars().count())
-            && stripped.chars().all(|character| character.is_ascii_digit()));
-    pure.then(|| LabelPrefix {
-        label: normalize_label(stripped),
-        start: leading,
-        end: leading + stripped.chars().count(),
-    })
 }
 
 fn label_spans<'a>(line: &'a Line, prefix: &'a LabelPrefix) -> impl Iterator<Item = &'a Span> {
