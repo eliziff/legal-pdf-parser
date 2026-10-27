@@ -842,3 +842,76 @@ pub(super) fn infer_note_region_modes(pages: &mut [Page]) {
         prior_note_page = !footnote_indexes.is_empty();
     }
 }
+
+pub(super) fn label_spans<'a>(line: &'a Line, prefix: &'a LabelPrefix) -> impl Iterator<Item = &'a Span> {
+    line.spans
+        .iter()
+        .filter(|span| span.start < prefix.end && span.end > prefix.start)
+}
+
+/// A label set above or smaller than the rest of its own line, as a note label is.
+pub(super) fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64) -> bool {
+    let height = line.bbox[3] - line.bbox[1];
+    label_spans(line, prefix).any(|span| {
+        span.superscript
+            || (line_size > 0.0 && span.size > 0.0 && span.size <= line_size * 0.75)
+            || (line_size > 0.0
+                && span.size > 0.0
+                && span.size * 1.25 <= line_size
+                && height > 0.0
+                && span.bbox[3] <= line.bbox[3] - 0.25 * height)
+    })
+}
+
+pub(super) fn label_is_typographic(line: &Line, prefix: &LabelPrefix, line_size: f64, body_size: f64) -> bool {
+    let label_size = label_spans(line, prefix)
+        .filter_map(|span| (span.size > 0.0).then_some(span.size))
+        .min_by(f64::total_cmp)
+        .unwrap_or(line_size);
+    label_is_raised(line, prefix, line_size) || (label_size > 0.0 && label_size <= body_size * 0.75)
+}
+
+/// Whether the line just above `index`, in its type and at its leading, ends on a counted
+/// enactment's noun ("s", "c", "art") still waiting for its number.
+pub(super) fn reference_wrapped_onto(lines: &[Line], sizes: &[f64], index: usize) -> bool {
+    let line = &lines[index];
+    let height = line.bbox[3] - line.bbox[1];
+    lines
+        .iter()
+        .zip(sizes)
+        .filter(|(above, size)| {
+            (**size - sizes[index]).abs() <= 0.5
+                && above.bbox[3] <= line.bbox[1] + height * 0.5
+                && line.bbox[1] - above.bbox[3] < height * 0.6
+                && above.bbox[0] < line.bbox[2]
+                && line.bbox[0] < above.bbox[2]
+        })
+        .max_by(|(left, _), (right, _)| left.bbox[3].total_cmp(&right.bbox[3]))
+        .and_then(|(above, _)| above.text.split_whitespace().last())
+        .is_some_and(|word| {
+            matches!(
+                word.trim_end_matches('.'),
+                "c" | "ch" | "s" | "ss" | "art" | "arts"
+            )
+        })
+}
+
+/// Text-Fidelity's native-PDF body-font estimator: the largest rounded font
+/// bucket carrying at least ten percent of the supplied character mass. Smaller
+/// quote/note fonts can be common without redefining the body face, while
+/// headings normally lack enough mass to become a substantial bucket.
+pub(super) fn body_font_size<'a>(lines: impl IntoIterator<Item = &'a Line>) -> f64 {
+    let mut mass = HashMap::<i64, usize>::new();
+    for line in lines {
+        let size = line_font_size(line);
+        if size > 0.0 {
+            *mass.entry((size * 100.0).round() as i64).or_default() += line.text.chars().count();
+        }
+    }
+    let total: usize = mass.values().sum();
+    mass.into_iter()
+        .filter(|(_, chars)| total > 0 && chars.saturating_mul(10) >= total)
+        .map(|(size, _)| size as f64 / 100.0)
+        .max_by(f64::total_cmp)
+        .unwrap_or(0.0)
+}
