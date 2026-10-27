@@ -24,8 +24,6 @@ pub(super) struct HeadingCandidate {
     page_slot: usize,
     line_slot: usize,
     joined_line_slot: Option<usize>,
-    text_plausible: bool,
-    requires_sequence: bool,
     interpretations: Vec<EnumeratorInterpretation>,
 }
 
@@ -47,17 +45,11 @@ pub(super) fn heading_title_plausible(line: &Line, text: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct HeadingDecision {
     page_slot: usize,
     line_slot: usize,
     joined_line_slot: Option<usize>,
-    text_plausible: bool,
     level: Option<usize>,
-    action: HeadingAction,
-    ladder_clean: bool,
-    coherent_family: bool,
-    footnote_suspect: bool,
 }
 
 pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
@@ -90,8 +82,6 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
                         page_slot,
                         line_slot,
                         joined_line_slot: None,
-                        text_plausible: true,
-                        requires_sequence: true,
                         interpretations,
                     });
                 }
@@ -112,8 +102,6 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
                         page_slot,
                         line_slot,
                         joined_line_slot: None,
-                        text_plausible: true,
-                        requires_sequence: false,
                         interpretations,
                     });
                 }
@@ -159,8 +147,6 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
                     page_slot,
                     line_slot,
                     joined_line_slot: Some(follower_slot),
-                    text_plausible: true,
-                    requires_sequence: false,
                     interpretations,
                 });
             }
@@ -263,41 +249,6 @@ pub(super) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
         return true;
     }
     bracket_excess(previous_text) > 0 && closes_before_opening(current_text)
-}
-
-pub(super) fn has_body_flow(
-    page: &Page,
-    line_slot: usize,
-    structural: &HashSet<(usize, usize)>,
-    page_slot: usize,
-    translation: &HashSet<String>,
-) -> bool {
-    [
-        ("incoming", line_slot.checked_sub(1)),
-        ("outgoing", line_slot.checked_add(1)),
-    ]
-    .into_iter()
-    .any(|(direction, neighbor_slot)| {
-        let Some(neighbor_slot) = neighbor_slot.filter(|index| *index < page.lines.len()) else {
-            return false;
-        };
-        if structural.contains(&(page_slot, neighbor_slot))
-            || page.lines[neighbor_slot].region_type != "body"
-            || translation.contains(&page.lines[line_slot].id)
-                != translation.contains(&page.lines[neighbor_slot].id)
-        {
-            return false;
-        }
-        if direction == "incoming" {
-            body_flow_edge(&page.lines[neighbor_slot], &page.lines[line_slot])
-        } else {
-            body_flow_edge(&page.lines[line_slot], &page.lines[neighbor_slot])
-        }
-    })
-}
-
-pub(super) fn coherent_heading_family(family: &HeadingFamilyStats) -> bool {
-    family.count >= 2 && family.violations == 0 && family.level_votes.len() == 1
 }
 
 /// The lines an enumerated heading's title wraps onto: set in its type, flush under it or centred
@@ -618,286 +569,6 @@ pub(super) fn date_line(text: &str) -> bool {
     .is_match(text.trim())
 }
 
-pub(super) fn heading_style_corroborated(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() || text.chars().count() > 120 || layout_analysis().has_citation_signal(text) {
-        return false;
-    }
-    if text
-        .chars()
-        .find(|character| character.is_alphabetic())
-        .is_some_and(char::is_lowercase)
-    {
-        return false;
-    }
-    if text
-        .chars()
-        .filter(|character| character.is_alphabetic())
-        .count()
-        >= 4
-        && all_caps(text)
-    {
-        return true;
-    }
-    if let Some(capture) = heading_inline_re().captures(text) {
-        if layout_analysis().heading_text_plausible(heading_enumerator(&capture).2) && !text.ends_with('.') {
-            return true;
-        }
-    }
-    let words = text
-        .split_whitespace()
-        .filter(|word| word.chars().any(char::is_alphabetic))
-        .count();
-    (1..=9).contains(&words) && titlecase_ratio(text) >= 0.60 && !sentence_ended(text)
-}
-
-pub(super) fn caps_warble(text: &str) -> bool {
-    let (mut letters, mut uppercase, mut lowercase) = (0_usize, 0_usize, false);
-    for character in text.chars().filter(|character| character.is_alphabetic()) {
-        letters += 1;
-        uppercase += usize::from(character.is_uppercase());
-        lowercase |= character.is_lowercase();
-    }
-    uppercase > 0 && lowercase && uppercase as f64 / letters as f64 >= 0.65
-}
-
-pub(super) fn bilateral_body_geometry(page: &Page, line_slot: usize) -> bool {
-    let line = &page.lines[line_slot];
-    let height = (line.bbox[3] - line.bbox[1]).max(1.0);
-    [line_slot.checked_sub(1), line_slot.checked_add(1)]
-        .into_iter()
-        .all(|neighbor_slot| {
-            let Some(neighbor_slot) = neighbor_slot.filter(|index| *index < page.lines.len())
-            else {
-                return false;
-            };
-            let neighbor = &page.lines[neighbor_slot];
-            if neighbor.region_type != "body" {
-                return false;
-            }
-            let neighbor_height = (neighbor.bbox[3] - neighbor.bbox[1]).max(1.0);
-            let gap = if neighbor_slot < line_slot {
-                line.bbox[1] - neighbor.bbox[3]
-            } else {
-                neighbor.bbox[1] - line.bbox[3]
-            };
-            (line.bbox[0] - neighbor.bbox[0]).abs() <= 10.0
-                && -height * 0.5 <= gap
-                && gap <= (height * 1.4).max(14.0)
-                && (0.75..=1.35).contains(&(height / neighbor_height))
-        })
-}
-
-pub(super) fn demote_false_headings(
-    pages: &mut [Page],
-    decisions: &[HeadingDecision],
-    source_regions: &HashMap<String, String>,
-) {
-    let mut by_line = HashMap::<(usize, usize), &HeadingDecision>::new();
-    for decision in decisions {
-        by_line.insert((decision.page_slot, decision.line_slot), decision);
-        if let Some(line) = decision.joined_line_slot {
-            by_line.insert((decision.page_slot, line), decision);
-        }
-    }
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        for line_slot in 0..page.lines.len() {
-            if page.lines[line_slot].region_type != "heading" {
-                continue;
-            }
-            if source_regions
-                .get(&page.lines[line_slot].id)
-                .is_some_and(|region| legal_pdf_core::is_heading_role(region))
-            {
-                continue;
-            }
-            if !source_regions
-                .get(&page.lines[line_slot].id)
-                .is_some_and(|region| {
-                    matches!(region.as_str(), "paragraph_title" | "doc_title" | "heading")
-                })
-            {
-                continue;
-            }
-            let text = page.lines[line_slot].text.trim();
-            if caps_warble(text) {
-                continue;
-            }
-            let decision = by_line.get(&(page_slot, line_slot));
-            if decision.is_some_and(|decision| decision.coherent_family) {
-                continue;
-            }
-            let style = heading_style_corroborated(text);
-            let grammar_negative = decision.map_or(!style, |decision| {
-                !style
-                    || matches!(
-                        decision.action,
-                        HeadingAction::IllegalRestart | HeadingAction::Violation
-                    )
-            });
-            if !grammar_negative {
-                continue;
-            }
-            let words = text
-                .split_whitespace()
-                .filter(|word| word.chars().any(char::is_alphabetic))
-                .count();
-            let starts_lowercase = text
-                .chars()
-                .find(|character| character.is_alphabetic())
-                .is_some_and(char::is_lowercase);
-            let terminal = words >= 4 && sentence_ended(text);
-            let long_prose = words >= 12 || text.chars().count() > 110;
-            let prose_case = words >= 4 && titlecase_ratio(text) < 0.45;
-            let citation = layout_analysis().has_citation_signal(text);
-            let strong_prose = terminal || long_prose || prose_case || citation;
-            if !strong_prose {
-                continue;
-            }
-            let flow = [line_slot.checked_sub(1), line_slot.checked_add(1)]
-                .into_iter()
-                .any(|neighbor_slot| {
-                    let Some(neighbor_slot) =
-                        neighbor_slot.filter(|index| *index < page.lines.len())
-                    else {
-                        return false;
-                    };
-                    if page.lines[neighbor_slot].region_type != "body" {
-                        return false;
-                    }
-                    if neighbor_slot < line_slot {
-                        body_flow_edge(&page.lines[neighbor_slot], &page.lines[line_slot])
-                    } else {
-                        body_flow_edge(&page.lines[line_slot], &page.lines[neighbor_slot])
-                    }
-                });
-            let soft_hyphen_flow = [line_slot.checked_sub(1), line_slot.checked_add(1)]
-                .into_iter()
-                .any(|neighbor_slot| {
-                    let Some(neighbor_slot) =
-                        neighbor_slot.filter(|index| *index < page.lines.len())
-                    else {
-                        return false;
-                    };
-                    if page.lines[neighbor_slot].region_type != "body" {
-                        return false;
-                    }
-                    let (previous, current) = if neighbor_slot < line_slot {
-                        (&page.lines[neighbor_slot], &page.lines[line_slot])
-                    } else {
-                        (&page.lines[line_slot], &page.lines[neighbor_slot])
-                    };
-                    hyphen_fragment_tail(&previous.text) && hyphen_continuation(&current.text)
-                });
-            let independent_shape = starts_lowercase || long_prose || prose_case || citation;
-            let broader_continuity = bilateral_body_geometry(page, line_slot)
-                || soft_hyphen_flow
-                || (terminal && independent_shape);
-            if (flow && starts_lowercase) || broader_continuity {
-                page.lines[line_slot].region_type = "body".to_owned();
-            }
-        }
-    }
-}
-
-/// Long local prose establishes body type; sparse pages use their own document's prior.
-pub(super) fn heading_body_sizes(
-    pages: &[Page],
-    fallback: f64,
-    primitives: &PdfPrimitiveEvidence,
-) -> Vec<f64> {
-    let prose = |line: &Line| {
-        !line.exclude_from_body
-            && line.note_region_mode.is_empty()
-            && matches!(line.region_type.as_str(), "text" | "body")
-            && !primitives.claims.contents_pages.contains(&line.page_index)
-            && !primitives.claims.claimed(&line.id)
-            && primitives
-                .source_regions
-                .as_ref()
-                .and_then(|regions| regions.get(&line.id))
-                .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
-    };
-    let document = if source_regions_cover_pages(pages, primitives.source_regions.as_ref()) {
-        body_font_size(
-            pages
-                .iter()
-                .flat_map(|page| &page.lines)
-                .filter(|line| prose(line)),
-        )
-    } else {
-        0.0
-    };
-    let measure = crate::paragraphs::document_measure(pages, prose);
-    pages
-        .iter()
-        .map(|page| {
-            let local = if page.lines.iter().any(|line| line_font_size(line) > 0.0) {
-                let paragraphs = crate::paragraphs::paragraph_indices(page, prose, measure);
-                let mut chars = HashMap::<usize, usize>::new();
-                for (line, paragraph) in page.lines.iter().zip(&paragraphs) {
-                    if let Some(paragraph) = paragraph {
-                        *chars.entry(*paragraph).or_default() += line.text.chars().count();
-                    }
-                }
-                body_font_size(page.lines.iter().zip(&paragraphs).filter_map(
-                    |(line, paragraph)| {
-                        paragraph
-                            .filter(|id| chars[id] > MAX_FONT_HEADING_CHARS)
-                            .map(|_| line)
-                    },
-                ))
-            } else {
-                0.0
-            };
-            if local > 0.0 {
-                return local;
-            }
-            if document > 0.0 {
-                return document;
-            }
-            if fallback > 0.0 {
-                return fallback;
-            }
-            let page_body = median(
-                page.lines
-                    .iter()
-                    .filter(|line| {
-                        prose(line)
-                            && page.height * 0.10 <= line.bbox[1]
-                            && line.bbox[1] <= page.height * 0.75
-                    })
-                    .map(line_font_size)
-                    .filter(|size| (4.0..=24.0).contains(size))
-                    .collect(),
-            );
-            if page_body > 0.0 {
-                page_body
-            } else {
-                10.0
-            }
-        })
-        .collect()
-}
-
-/// With LEGALPDF_HEADING_TRACE set, each enumerated heading candidate's fate on stderr.
-pub(super) fn heading_trace(line: &Line, decision: &HeadingDecision, why: &str) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_HEADING_TRACE").is_some()) {
-        let text: String = line.text.trim().chars().take(48).collect();
-        eprintln!(
-            "htrace\t{}\t{}\t{why}\t{:?}\t{:?}\tclean={}\tcoherent={}\tplausible={}\t{text}",
-            line.page_index,
-            line.id,
-            decision.action,
-            decision.level,
-            decision.ladder_clean,
-            decision.coherent_family,
-            decision.text_plausible
-        );
-    }
-}
-
 /// A page whose text was recognized from its image: lines with recognition evidence or no spans,
 /// or a text layer set in one face throughout with no bold or italic (a recognizer writes one
 /// generic face and sizes its boxes; a typeset page changes face or weight somewhere).
@@ -943,7 +614,9 @@ pub(super) fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence
     let mut found = Vec::new();
     for (slot, line) in page.lines.iter().enumerate() {
         let text = line.text.trim();
+        // A layout model's reading of a line stands: the typography stands in only where none read it.
         if line.region_type != "body"
+            || layout_labelled(line)
             || line.exclude_from_body
             || !line.note_region_mode.is_empty()
             || !heading_source_eligible(primitives, line)
@@ -991,10 +664,8 @@ pub(super) fn heading_source_trace(line: &Line, why: &str) {
 
 pub(super) fn apply_text_fidelity_headings(
     pages: &mut [Page],
-    body_size: f64,
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
-    let body_sizes = heading_body_sizes(pages, body_size, primitives);
     // Type (size and weight) is the typography reader's; these are the text's own signs.
     for page in pages.iter_mut() {
         let listed_top = page
@@ -1054,33 +725,17 @@ pub(super) fn apply_text_fidelity_headings(
                 .collect::<Vec<_>>();
             // Reuse the same restart-aware ladder independently for each parallel sequence.
             for (start, parsed) in parse_heading_runs(&interpretations) {
-                let clean = parsed.status == HeadingLadderStatus::ParsedClean;
-                decisions.extend(own[start..].iter().zip(&parsed.assignments).map(
-                    |(candidate, assignment)| {
-                        let family = parsed.families.get(assignment.family);
-                        let coherent = family.is_some_and(coherent_heading_family);
-                        HeadingDecision {
-                            page_slot: candidate.page_slot,
-                            line_slot: candidate.line_slot,
-                            joined_line_slot: candidate.joined_line_slot,
-                            text_plausible: candidate.text_plausible
-                                && (!candidate.requires_sequence || coherent),
-                            level: assignment.level,
-                            action: assignment.action,
-                            ladder_clean: clean,
-                            coherent_family: coherent,
-                            footnote_suspect: family.is_some_and(|family| family.footnote_suspect),
-                        }
-                    },
-                ));
+                decisions.extend(own[start..].iter().zip(&parsed.assignments).map(|(candidate, assignment)| HeadingDecision {
+                    page_slot: candidate.page_slot,
+                    line_slot: candidate.line_slot,
+                    joined_line_slot: candidate.joined_line_slot,
+                    level: assignment.level,
+                }));
             }
         }
         decisions.sort_by_key(|decision| (decision.page_slot, decision.line_slot));
         decisions
     };
-    if let Some(source_regions) = &primitives.source_regions {
-        demote_false_headings(pages, &decisions, source_regions);
-    }
     let mut heading_levels = decisions
         .iter()
         .flat_map(|decision| {
@@ -1144,55 +799,9 @@ pub(super) fn apply_text_fidelity_headings(
         if !heading_source_eligible(primitives, &pages[page_slot].lines[target_slot]) {
             continue;
         }
-        let target_is_heading = pages[page_slot].lines[target_slot].region_type == "heading";
-        let trace = |why: &str| {
-            heading_trace(&pages[page_slot].lines[target_slot], decision, why);
-        };
-        let caps = caps_title(&pages[page_slot].lines[target_slot].text);
-        if !target_is_heading {
-            if !decision.ladder_clean && !decision.coherent_family && !caps {
-                trace("ladder");
-                continue;
-            }
-            if !decision.text_plausible {
-                trace("text");
-                continue;
-            }
-            if matches!(
-                decision.action,
-                HeadingAction::IllegalRestart | HeadingAction::Violation
-            ) {
-                trace("action");
-                continue;
-            }
-            let titled = decision.joined_line_slot.is_some()
-                && heading_style_corroborated(&pages[page_slot].lines[target_slot].text);
-            if (decision.footnote_suspect && !titled) || decision.level.unwrap_or(0) == 0 {
-                trace("footnote-or-level");
-                continue;
-            }
-            let page = &pages[page_slot];
-            if has_body_flow(
-                page,
-                target_slot,
-                &structural,
-                page_slot,
-                &primitives.contexts.translation_line_ids,
-            ) {
-                trace("body-flow");
-                continue;
-            }
-            let target = &page.lines[target_slot];
-            let body_size = body_sizes[page_slot];
-            let visual = bold_char_share(target) >= 0.60
-                || (body_size > 0.0 && line_font_size(target) >= body_size * 1.02);
-            if !visual && !decision.coherent_family && !caps {
-                trace("visual");
-                continue;
-            }
+        if pages[page_slot].lines[target_slot].region_type != "heading" {
+            continue;
         }
-        trace(if target_is_heading { "kept" } else { "taken" });
-        pages[page_slot].lines[target_slot].region_type = "heading".to_owned();
         if target_slot != marker_slot && marker_slot < pages[page_slot].lines.len() {
             let block = pages[page_slot].lines[target_slot].block_index;
             pages[page_slot].lines[marker_slot].region_type = "heading".to_owned();
@@ -1378,7 +987,7 @@ pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
                 return;
             }
             demote_prose_heading_tags(document, primitives);
-            levels.extend(apply_text_fidelity_headings(document, 0.0, primitives));
+            levels.extend(apply_text_fidelity_headings(document, primitives));
         });
         primitives.headings.heading_levels = levels;
     });
