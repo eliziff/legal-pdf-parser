@@ -11,7 +11,6 @@
 //! 0.91 F1, the gold's contents found 97% of the time.
 
 use super::bookmarks::normalize_title;
-use super::graph::index_pages;
 use legal_pdf_core::{layout_analysis, Line, Page};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -409,4 +408,48 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
         continuing = accepted || unlocated;
     }
     lists
+}
+
+/// Word-index and concordance pages: short headwords in alphabetical order, each
+/// followed by an occurrence count or `page:line` / `page/line` locators.
+pub(crate) fn index_pages(pages: &[Page]) -> HashSet<usize> {
+    static COUNTED: OnceLock<Regex> = OnceLock::new();
+    static HEADWORD: OnceLock<Regex> = OnceLock::new();
+    let counted = COUNTED.get_or_init(|| {
+        Regex::new(r"\[\d{1,3}\]\s+\d{1,4}[:/]\d{1,3}").expect("index entry regex")
+    });
+    let headword = HEADWORD.get_or_init(|| {
+        Regex::new(
+            r"^\s*(\S+(?:\s\S+){0,2}?)\s+(?:[\[(]\d{1,3}[\])]\s*$|(?:[\[(]\d{1,3}[\])]\s+)?\d{1,4}[:/]\d{1,3}(?:[\s,;]|$))",
+        )
+        .expect("index headword regex")
+    });
+    pages
+        .iter()
+        .filter_map(|page| {
+            let text = page
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let headwords = page
+                .lines
+                .iter()
+                .filter_map(|line| headword.captures(&line.text))
+                .map(|capture| {
+                    capture[1]
+                        .trim_start_matches(['\'', '"', '\u{2018}', '\u{201c}'])
+                        .to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            let ascending = headwords
+                .windows(2)
+                .filter(|pair| pair[0] <= pair[1])
+                .count();
+            (counted.find_iter(&text).take(5).count() >= 5
+                || headwords.len() >= 5 && ascending * 5 >= (headwords.len() - 1) * 4)
+                .then_some(page.index)
+        })
+        .collect()
 }
