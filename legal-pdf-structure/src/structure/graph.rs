@@ -1,3 +1,8 @@
+//! The structure graph from the read pages: the text index every range points into
+//! (`text_index`), a transcript's line numbers (`line_numbers`), the structure candidates (numbering
+//! runs, citations and each line's witnesses, `PdfResolutionInput`), the graph's nodes (`nodes`), and
+//! each node's membership and context for the outline (`contexts`).
+
 use super::{
     arabic_page_number, body_flow_edge, continues_prose, scalar_suffix, sentence_ended,
     starts_note_or_list, DocumentContext, PdfPrimitiveEvidence,
@@ -21,6 +26,8 @@ mod line_numbers;
 pub(crate) use line_numbers::*;
 mod nodes;
 pub(crate) use nodes::*;
+mod contexts;
+pub(crate) use contexts::*;
 
 type BodyMeasures = HashMap<(DocumentContext, usize), (f64, f64)>;
 

@@ -16,7 +16,7 @@
 //! - constituent documents and parallel translations keep separate anchors and bookmark frames;
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
-use super::{
+use crate::structure::{
     continues_prose, enumerated, has_dot_leader, DocumentContext,
     PdfPrimitiveEvidence,
 };
@@ -83,7 +83,7 @@ fn roman(token: &str) -> Option<u32> {
 }
 
 /// Lowercased, LaTeX dropped, punctuation stripped, roman numerals as digits.
-pub(super) fn normalize_title(title: &str) -> String {
+pub(crate) fn normalize_title(title: &str) -> String {
     tokens(title)
         .into_iter()
         .map(|token| {
@@ -156,7 +156,7 @@ fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
 }
 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
-pub(super) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
     let entries = validate(outline, pages);
     let authorities = entries
         .iter()
@@ -289,7 +289,7 @@ fn same_title(found: &str, title: &str, heading: bool) -> bool {
 
 /// Whether a document's bookmarks outline its divisions at all (not generic titles, one numbered
 /// template, or too few).
-pub(super) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
+pub(crate) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
     classify(&validate(outline, pages), pages) != Tier::Ignore
 }
 
@@ -297,7 +297,7 @@ pub(super) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
 /// bookmarks name confirms theirs; one they do not name stands after the entry before it, at its
 /// listed level counted from the nearest entry before it that both name (its own listed level
 /// where none does).
-pub(super) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
+pub(crate) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
     let mut merged = bookmarks.to_vec();
     let mut cursor: Option<usize> = None;
     let mut anchor: Option<(usize, usize)> = None;
@@ -320,7 +320,7 @@ pub(super) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutline
 }
 
 /// `authored`: the outline holds the document's own bookmarks, not only its printed contents.
-pub(super) fn reconcile_bookmarks(
+pub(crate) fn reconcile_bookmarks(
     pages: &mut [Page],
     outline: &[PdfOutlineEntry],
     primitives: &mut PdfPrimitiveEvidence,

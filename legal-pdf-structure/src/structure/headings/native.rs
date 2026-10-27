@@ -1,11 +1,10 @@
-//! The document's headings as its own readers read them: a source's heading tags (demoted where
-//! they tag prose), the numbered and typeset headings on each page (Text-Fidelity's readers, with
-//! their wrapped lines), then the typography of the whole document (PageIndex Flash), its bookmarks
-//! or printed contents list, and the whole-document rules (heading_rules).
+//! The headings each page's own readers read: a source's heading tags (demoted where they tag
+//! prose), the numbered headings the ladder levels and the lines their titles wrap onto, and on a
+//! recognized page a title-case line set apart.
 
 use super::*;
 
-pub(super) fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
+pub(crate) fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &Line) -> bool {
     !primitives.claims.claimed(&line.id)
         // A blank to fill in ("CACR ____", "DATED ____") makes the line a form's field.
         && !line.text.contains("___")
@@ -20,7 +19,7 @@ pub(super) fn heading_source_eligible(primitives: &PdfPrimitiveEvidence, line: &
             })
 }
 
-pub(super) struct HeadingCandidate {
+pub(crate) struct HeadingCandidate {
     page_slot: usize,
     line_slot: usize,
     joined_line_slot: Option<usize>,
@@ -28,7 +27,7 @@ pub(super) struct HeadingCandidate {
 }
 
 /// A title set apart in bold may name a case by its parties; one in body type may not.
-pub(super) fn heading_title_plausible(line: &Line, text: &str) -> bool {
+pub(crate) fn heading_title_plausible(line: &Line, text: &str) -> bool {
     // A title has a word; "F. R." is a name's initials.
     let worded = text.split_whitespace().any(|word| {
         word.chars()
@@ -45,14 +44,14 @@ pub(super) fn heading_title_plausible(line: &Line, text: &str) -> bool {
     }
 }
 
-pub(super) struct HeadingDecision {
+pub(crate) struct HeadingDecision {
     page_slot: usize,
     line_slot: usize,
     joined_line_slot: Option<usize>,
     level: Option<usize>,
 }
 
-pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
+pub(crate) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEvidence) -> Vec<HeadingCandidate> {
     let inline = heading_inline_re();
     let standalone = heading_standalone_re();
     let mut candidates = Vec::new();
@@ -158,7 +157,7 @@ pub(super) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
 /// A line set at its paragraph's leading under a full line that ends no sentence carries
 /// that sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no enumerator.
 /// A title above it stops short of its column's edge.
-pub(super) fn continues_prose(page: &Page, line: &Line) -> bool {
+pub(crate) fn continues_prose(page: &Page, line: &Line) -> bool {
     let height = line.bbox[3] - line.bbox[1];
     page.lines
         .iter()
@@ -195,7 +194,7 @@ pub(super) fn continues_prose(page: &Page, line: &Line) -> bool {
 /// A long numbered line running the full column whose sentence the next line, at its leading,
 /// finishes ("1. IAEA, Safety Standards Series, Geological Disposal Facilities for" /
 /// "Radioactive Waste, Vienna, 2011.") opens a paragraph or an entry, not a heading.
-pub(super) fn carries_a_sentence_on(page: &Page, slot: usize) -> bool {
+pub(crate) fn carries_a_sentence_on(page: &Page, slot: usize) -> bool {
     let line = &page.lines[slot];
     let Some(next) = page.lines.get(slot + 1) else {
         return false;
@@ -228,11 +227,11 @@ pub(super) fn carries_a_sentence_on(page: &Page, slot: usize) -> bool {
 }
 
 /// The share of a line's characters its face sets bold.
-pub(super) fn bold_char_share(line: &Line) -> f64 {
+pub(crate) fn bold_char_share(line: &Line) -> f64 {
     flag_share(line, BOLD).unwrap_or(0.0)
 }
 
-pub(super) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
+pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     let previous_text = previous.text.trim();
     let current_text = current.text.trim();
     if previous_text.is_empty() || current_text.is_empty() {
@@ -260,7 +259,7 @@ pub(super) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
 /// least eight letters of them, and continues only in capitals and only on evidence that the
 /// next line is its continuation (`continues_capitals_title`): a stamp ("CMD 25-M35#"), a date
 /// under a title, or names and addresses stacked line by line are no wrapped title.
-pub(super) fn wrapped_heading_continuations(
+pub(crate) fn wrapped_heading_continuations(
     page: &Page,
     heading_slot: usize,
     structural: &HashSet<(usize, usize)>,
@@ -397,7 +396,7 @@ pub(super) fn wrapped_heading_continuations(
 /// and stands apart: what precedes it and what follows the line are set further off than its
 /// leading or on another alignment. A date carries on a title only when the words run on into
 /// it ("ORDERS FOR JUNE 18 THROUGH" / "JUNE 29, 2020").
-pub(super) fn continues_capitals_title(
+pub(crate) fn continues_capitals_title(
     page: &Page,
     heading_slot: usize,
     above_slot: usize,
@@ -493,7 +492,7 @@ pub(super) fn continues_capitals_title(
 }
 
 /// A word a title's line can break after or open on: an article, a conjunction or a preposition.
-pub(super) fn run_on_word(word: &str) -> bool {
+pub(crate) fn run_on_word(word: &str) -> bool {
     const WORDS: &[&str] = &[
         "A",
         "AN",
@@ -549,7 +548,7 @@ pub(super) fn run_on_word(word: &str) -> bool {
 
 /// Whether a title's words run on past its line: it breaks after a run-on word, a comma, a dash,
 /// a slash or an ampersand, or inside a bracket.
-pub(super) fn title_runs_on(title: &str) -> bool {
+pub(crate) fn title_runs_on(title: &str) -> bool {
     let title = title.trim_end();
     title.ends_with([',', '-', '\u{2013}', '\u{2014}', '/', '&'])
         || title.split_whitespace().last().is_some_and(run_on_word)
@@ -557,7 +556,7 @@ pub(super) fn title_runs_on(title: &str) -> bool {
 }
 
 /// A line that is only a date: "10 JUNE 2026", "DATED 11 JUNE 2026", "June 29, 2020", "1/4/2025".
-pub(super) fn date_line(text: &str) -> bool {
+pub(crate) fn date_line(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre)";
@@ -572,7 +571,7 @@ pub(super) fn date_line(text: &str) -> bool {
 /// A page whose text was recognized from its image: lines with recognition evidence or no spans,
 /// or a text layer set in one face throughout with no bold or italic (a recognizer writes one
 /// generic face and sizes its boxes; a typeset page changes face or weight somewhere).
-pub(super) fn recognized_page(page: &Page) -> bool {
+pub(crate) fn recognized_page(page: &Page) -> bool {
     let body: Vec<&Line> = page.lines.iter().filter(|line| !line.exclude_from_body).collect();
     if body.is_empty() {
         return false;
@@ -594,7 +593,7 @@ pub(super) fn recognized_page(page: &Page) -> bool {
 /// On a recognized page, a short title-case line set apart above a full body line: a heading the
 /// page's lost bold and size would have shown. Never one in a run of short lines (a table, a
 /// caption, an address).
-pub(super) fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence) -> Vec<usize> {
+pub(crate) fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence) -> Vec<usize> {
     let measure = page
         .lines
         .iter()
@@ -654,7 +653,7 @@ pub(super) fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence
 }
 
 /// With LEGALPDF_HEADING_TRACE set, a heading taken by a rule other than the enumerated ladder.
-pub(super) fn heading_source_trace(line: &Line, why: &str) {
+pub(crate) fn heading_source_trace(line: &Line, why: &str) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("LEGALPDF_HEADING_TRACE").is_some()) {
         let text: String = line.text.trim().chars().take(48).collect();
@@ -662,7 +661,7 @@ pub(super) fn heading_source_trace(line: &Line, why: &str) {
     }
 }
 
-pub(super) fn apply_text_fidelity_headings(
+pub(crate) fn apply_text_fidelity_headings(
     pages: &mut [Page],
     primitives: &PdfPrimitiveEvidence,
 ) -> HashMap<String, usize> {
@@ -836,7 +835,7 @@ pub(super) fn apply_text_fidelity_headings(
 /// The heading tags a document puts on so many of its tagged lines that they mark its body (every
 /// numbered paragraph tagged H2), as pdf-inspector reads them
 /// (`detect_overused_struct_heading_levels`: a level on over 15% of 20 tagged lines or more).
-pub(super) fn overused_heading_tags(pages: &[Page], regions: &HashMap<String, String>) -> HashSet<String> {
+pub(crate) fn overused_heading_tags(pages: &[Page], regions: &HashMap<String, String>) -> HashSet<String> {
     use pdf_inspector::structure_tree::StructRole;
     use pdf_inspector::types::TextLine;
     let mut roles: HashMap<u32, HashMap<i64, StructRole>> = HashMap::new();
@@ -866,7 +865,7 @@ pub(super) fn overused_heading_tags(pages: &[Page], regions: &HashMap<String, St
 /// A mislabelled PDF paragraph style can tag every line of ordinary prose as Hn: a heading tag on
 /// so many lines that it marks the body (`overused_heading_tags`), or on long paragraphs that end
 /// their sentences, in the prose's own type.
-pub(super) fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) {
+pub(crate) fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPrimitiveEvidence) {
     let Some(regions) = evidence.source_regions.as_ref() else {
         return;
     };
@@ -956,75 +955,4 @@ pub(super) fn demote_prose_heading_tags(pages: &mut [Page], evidence: &mut PdfPr
             }
         }
     }
-}
-
-/// Each heading line's source: the first pass after which it reads as a heading.
-pub(super) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass: &str) {
-    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
-        sources.entry(line.id.clone()).or_insert_with(|| pass.to_owned());
-    }
-}
-
-/// Every heading of the document, read once, after every container has claimed its lines (line
-/// labels, furniture, tables and their notes, contents, captions, notes) and quotations are read:
-/// in each reading context, the native readers (a source's own tags, numbering ladders, capitals,
-/// type size) except inside a quotation, then the typography of the whole document (PageIndex
-/// Flash) with every heading's depth, then the document's bookmarks or printed contents list.
-pub(super) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &mut PdfPrimitiveEvidence) {
-    stamp(pages, &mut primitives.headings.sources, "layout");
-    legal_pdf_support::profile::measure("prepare.native_headings", || {
-        let reading = primitives.contexts.reading_lines().clone();
-        let translation = primitives.contexts.translation_line_ids.clone();
-        let mut levels = HashMap::new();
-        constituents::within_document_contexts(pages, &reading, &translation, |document| {
-            // A quotation's titles and labels structure only it: the typography reader below
-            // reads them.
-            if document
-                .iter()
-                .flat_map(|page| &page.lines)
-                .any(|line| primitives.quotations.scopes.contains_key(&line.id))
-            {
-                return;
-            }
-            demote_prose_heading_tags(document, primitives);
-            levels.extend(apply_text_fidelity_headings(document, primitives));
-        });
-        primitives.headings.heading_levels = levels;
-    });
-    stamp(pages, &mut primitives.headings.sources, "native");
-    legal_pdf_support::profile::measure("prepare.styled_headings", || {
-        let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids).cloned().collect::<HashSet<_>>();
-        let excluded = |id: &str| claimed.contains(id);
-        let numbered = |text: &str| enumerated(text);
-        let translation = |id: &str| primitives.contexts.translation_line_ids.contains(id);
-        constituents::within_document_contexts(
-            pages,
-            &primitives.contexts.reading_line_ids,
-            &primitives.contexts.translation_line_ids,
-            |document| {
-                legal_pdf_headings::reconcile_styled_headings(
-                    document,
-                    legal_pdf_headings::HeadingEvidence {
-                        quotation: document.iter().flat_map(|page| &page.lines)
-                            .any(|line| primitives.quotations.scopes.contains_key(&line.id)),
-                        levels: &mut primitives.headings.heading_levels,
-                        excluded: &excluded,
-                        translation: &translation,
-                        contents_pages: &primitives.claims.contents_pages,
-                        numbered: &numbered,
-                        source_regions: primitives.source_regions.as_ref(),
-                    },
-                );
-            },
-        );
-    });
-    stamp(pages, &mut primitives.headings.sources, "styled");
-    legal_pdf_support::profile::measure("prepare.bookmarks", || {
-        // The document's own bookmarks and its printed contents list, read together.
-        let authored = bookmarks::usable(outline, pages.len());
-        let listed = contents::contents_outline(pages, &primitives.claims);
-        let merged = bookmarks::merge_outlines(if authored { outline } else { &[] }, &listed);
-        bookmarks::reconcile_bookmarks(pages, &merged, primitives, authored);
-    });
-    stamp(pages, &mut primitives.headings.sources, "outline");
 }

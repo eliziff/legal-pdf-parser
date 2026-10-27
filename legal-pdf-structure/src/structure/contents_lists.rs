@@ -10,7 +10,7 @@
 //! contents throughout. Measured on the structure gold (batches 5-7): contents lines 0.89 / 0.96 /
 //! 0.91 F1, the gold's contents found 97% of the time.
 
-use super::bookmarks::normalize_title;
+use super::headings::bookmarks::normalize_title;
 use legal_pdf_core::{layout_analysis, Line, Page};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -377,7 +377,7 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
                 let mut since = listed[0];
                 for &r in &listed {
                     let between: Vec<&Row> = rows[since..r].iter().filter(|row| row.locator.is_none() && !row.title.is_empty()).collect();
-                    let wraps = if super::heading_rules::numbered(&rows[r].title) { 0 } else { between.len().min(3) };
+                    let wraps = if super::headings::rules::numbered(&rows[r].title) { 0 } else { between.len().min(3) };
                     let (apart, wrapped) = between.split_at(between.len() - wraps);
                     for row in apart {
                         lists.entries.push(Entry { title: row.title.clone(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });

@@ -1,17 +1,44 @@
-//! Shared structure derivation for aligned page and line evidence.
+//! The structure stage: a PDF's extracted pages and lines in, its paragraphs, notes, headings and
+//! structure graph out. It runs in three phases, each a function below; every step names the
+//! module that decides it.
+//!
+//! **Readers** (`prepare_reader`, cached by the input pages): what each line is, read once.
+//! 1. A layout model's labels in the stage's vocabulary (`layout_labelled` lines).
+//! 2. A transcript's line numbers (`graph::mark_line_numbers`), markers printed apart joined to
+//!    their lines (`crate::layout::join_detached_markers`).
+//! 3. Each document of a packet (`constituents`) classified page by page (`classify`): furniture,
+//!    parallel languages, tables (`legal_pdf_tables`), contents lists (`contents_lists`), the note
+//!    band (`notes::band`), reading order, captions (`captions`); paragraphs segmented
+//!    (`crate::paragraphs`).
+//! 4. The note band corrected over the whole document (`notes::lanes`).
+//! 5. Quotations (`quotations`), a quoted decision's numbered paragraphs (`numbered_paragraphs`),
+//!    each line's reading context.
+//! 6. Headings (`headings`: the page readers, the document's typography, its bookmarks and
+//!    contents list).
+//!
+//! **Composed decisions** (`prepare_composed`): the whole-document heading rules and levels
+//! (`headings::rules`), printed page labels (`furniture`), regions from the lines' roles.
+//!
+//! **Derivation** (`derive_prepared`): note modes (`notes`), label dropouts repaired (the engine's
+//! `numbering_repair`), the text index and structure candidates (`graph`: citations, numbering
+//! runs, witnesses), notes paired (`note_pairing`, the engine's pairer), paragraphs joined
+//! (`joining`), propositions and cross-references (`note_context`), and the structure graph
+//! resolved and its outline assembled (`graph`, `legal_pdf_witnesses`).
+//!
+//! Measure a change on the structure gold with `experiments/legal-structure-gold/grade/prove.ps1`
+//! (with `STRUCTURE_GOLD_ORACLE_LAYOUT=1` as an arm, as a perfect layout model reads), the PDF
+//! footnote benchmark with `experiments/footnote-gold/score.py`, and provider text with the A2AJ
+//! census (`a2aj_corpus`).
 
-mod bookmarks;
 mod captions;
 mod constituents;
-mod contents;
 mod contents_lists;
 mod furniture;
 mod graph;
 mod headings;
-mod heading_rules;
-mod line_roles;
+mod notes;
+use notes::*;
 mod note_pairing;
-mod note_regions;
 mod quotations;
 mod numbered_paragraphs;
 mod text;
@@ -27,7 +54,6 @@ pub use diagnostics::*;
 use crate::layout::*;
 use furniture::*;
 use headings::*;
-use line_roles::*;
 use text::*;
 pub(crate) use legal_structure_model::text::{
     is_note_symbol, label_prefix, line_start_label_prefix, normalize_label, LabelPrefix, MAX_SYMBOL_LABEL_LEN,
@@ -280,7 +306,7 @@ fn prepare_reader(
                         }
                     }
                 }
-                changed += note_regions::correct_note_regions(document, &separators);
+                changed += notes::lanes::correct_note_regions(document, &separators);
                 for (page, line) in excluded {
                     document[page].lines[line].exclude_from_body = false;
                 }
@@ -312,7 +338,7 @@ fn prepare_composed(
     mut diagnostics: Vec<Diagnostic>,
     instrument: bool,
 ) -> PdfPreparation {
-    legal_pdf_support::profile::measure("compose.heading_rules", || heading_rules::read(pages, &mut primitives, instrument));
+    legal_pdf_support::profile::measure("compose.heading_rules", || headings::rules::read(pages, &mut primitives, instrument));
     stamp(pages, &mut primitives.headings.sources, "rules");
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
@@ -404,7 +430,7 @@ fn derive_prepared(
                 &note_pairs,
                 graph_diagnostics,
                 &mut |nodes| {
-                    let contexts = outline_contexts(
+                    let contexts = graph::outline_contexts(
                         nodes,
                         &document_id,
                         &prepared.primitives.quotations,
@@ -449,159 +475,6 @@ fn derive_prepared(
         structure_graph,
         heading_sources,
     })
-}
-
-/// Settle each node's exact membership and role, and give the context its outline lives in: the
-/// constituent document holding it, and its quotation, note, table cell or parallel text.
-fn outline_contexts(
-    nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
-    quotes: &quotations::Reading,
-    index: &PdfTextIndex,
-    primitives: &PdfPrimitiveEvidence,
-) -> Vec<legal_pdf_witnesses::OutlineContext> {
-    use legal_structure_model::PrimaryRole;
-    let translation = &primitives.contexts.translation_line_ids;
-    // Establish exact membership before comparing containers. An envelope may cross
-    // intervening columns, notes, quotations, or constituent documents.
-    for node in nodes.iter_mut() {
-        if node.ranges.is_empty() { node.ranges.push(node.range); }
-        if let Some(marker) = node.marker_range {
-            node.ranges.push(marker);
-        }
-        node.ranges.sort_by_key(|range| (range.start, range.end));
-        let mut merged: Vec<legal_structure_model::ScalarRange> = Vec::new();
-        for range in node.ranges.drain(..) {
-            if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
-                last.end = last.end.max(range.end);
-            } else {
-                merged.push(range);
-            }
-        }
-        node.ranges = merged;
-        // Keep owned source fragments when the envelope spans intervening columns.
-        if node.kind != NodeKind::Page && !node.line_ids.is_empty() {
-            let mut source = node
-                .line_ids
-                .iter()
-                .filter_map(|id| index.line(id).map(|line| line.range))
-                .collect::<Vec<_>>();
-            if let Some(marker) = node.marker_range {
-                let ids = index.line_ids(marker);
-                if let Some(first) = ids.first() {
-                    let context = primitives.contexts.reading_context(first);
-                    source.extend(
-                        ids.iter()
-                            .filter(|id| primitives.contexts.reading_context(id) == context)
-                            .filter_map(|id| index.line(id))
-                            .map(|line| ScalarRange {
-                                start: marker.start.max(line.range.start),
-                                end: marker.end.min(line.range.end),
-                            })
-                            .filter(|part| part.start < part.end),
-                    );
-                }
-            }
-            let source = graph::source_membership(source);
-            let mut owned = Vec::new();
-            let mut at = 0;
-            for range in &node.ranges {
-                while at < source.len() && source[at].end <= range.start {
-                    at += 1;
-                }
-                for part in source[at..]
-                    .iter()
-                    .take_while(|part| part.start < range.end)
-                {
-                    let start = range.start.max(part.start);
-                    let end = range.end.min(part.end);
-                    if start < end {
-                        owned.push(ScalarRange { start, end });
-                    }
-                }
-            }
-            node.ranges = owned;
-        }
-        let mut seen_lines = HashSet::new();
-        node.line_ids = node.ranges.iter().flat_map(|range| index.line_ids(*range))
-            .filter(|id| seen_lines.insert(id.clone())).collect();
-        node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
-        if let (Some(first), Some(last)) = (node.ranges.first(), node.ranges.last()) {
-            node.range.start = first.start;
-            node.range.end = last.end;
-        }
-        if let Some(start) = &mut node.content_start {
-            if let Some(part) = node.ranges.iter().find(|part| *start < part.end) {
-                *start = (*start).max(part.start);
-            }
-        }
-    }
-    let constituents = nodes.iter().filter(|node| node.grammar.as_deref().is_some_and(|grammar| grammar.starts_with("constituent_")))
-        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
-    let cells = nodes.iter().filter(|node| matches!(node.kind, NodeKind::Cell | NodeKind::Footnote | NodeKind::Endnote))
-        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
-    let contains = |outer: &[legal_structure_model::ScalarRange], inner: &[legal_structure_model::ScalarRange]| {
-        !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
-            range.start <= part.start && part.end <= range.end))
-    };
-    nodes
-        .iter_mut()
-        .map(|node| {
-            if node.kind == NodeKind::Heading {
-                node.role = Some(PrimaryRole::Heading);
-                node.heading_range = (node.ranges.len() == 1).then_some(node.range);
-            } else if matches!(
-                node.kind,
-                NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose
-            ) {
-                node.role.get_or_insert(PrimaryRole::Text);
-            }
-            let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| {
-                holders
-                    .iter()
-                    .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-                    .min_by_key(|(_, ranges)| {
-                        ranges
-                            .iter()
-                            .map(|range| range.end - range.start)
-                            .sum::<usize>()
-                    })
-                    .map(|(id, _)| id.clone())
-            };
-            // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
-            // belonging to its quotation or note: it names only its document.
-            let unit = node.kind != NodeKind::Page;
-            let quotation = if node.kind == NodeKind::Quote {
-                quotes
-                    .introductions
-                    .get(&node.id)
-                    .and_then(|id| quotes.scopes.get(id))
-                    .cloned()
-            } else {
-                node.line_ids
-                    .first()
-                    .filter(|_| unit)
-                    .and_then(|id| quotes.scopes.get(id))
-                    .filter(|id| {
-                        node.line_ids
-                            .iter()
-                            .all(|line| quotes.scopes.get(line) == Some(*id))
-                    })
-                    .cloned()
-            };
-            let translated = unit
-                && !node.line_ids.is_empty()
-                && node.line_ids.iter().all(|id| translation.contains(id));
-            let container = smallest(&cells)
-                .filter(|_| unit)
-                .map(|id| format!("object:{id}"))
-                .or_else(|| translated.then(|| "translation".to_owned()));
-            (
-                smallest(&constituents).unwrap_or_else(|| document_id.to_owned()),
-                quotation,
-                container,
-            )
-        })
-        .collect()
 }
 
 pub fn derive(

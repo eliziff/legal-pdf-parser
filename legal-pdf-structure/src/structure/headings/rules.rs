@@ -8,7 +8,7 @@
 //! headings; the demotions raise headings F1 from 0.507 to 0.597, and the promotions, chosen on
 //! batches 5 and 6, add 0.017 on batch 7.
 
-use super::{bold_char_share, PdfPrimitiveEvidence};
+use crate::structure::{bold_char_share, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{dominant_face, flag_share, PageMeasure, ITALIC};
 use legal_structure_model::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
@@ -62,7 +62,7 @@ fn index_entry(text: &str) -> bool {
 /// A hearing's part, in capitals: "SUBMISSIONS BY MR. X", "RULING", "REASONS FOR JUDGMENT", "SENTENCE".
 fn hearing_part(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    super::all_caps(text) && text.split_whitespace().count() <= 10
+    crate::structure::all_caps(text) && text.split_whitespace().count() <= 10
         && pattern(&RE, r"^(?:(?:REPLY|CLOSING|OPENING)\s+)?(?:SUBMISSIONS|STATEMENT|ARGUMENT|RULING|DECISION|JUDGMENT|SENTENCE|SENTENCING|(?:ORAL\s+)?REASONS\s+FOR\s+(?:JUDGMENT|RULING|SENTENCE|DECISION))\b").is_match(text)
 }
 
@@ -80,7 +80,7 @@ fn turn_or_event(text: &str) -> bool {
 /// "WHEREAS", a caption's connectives, contact details, a placeholder.
 fn label(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    super::party_label().is_match(text) || pattern(&RE, concat!(
+    crate::structure::party_label().is_match(text) || pattern(&RE, concat!(
         r"(?i)^\W*(?:appearances?|comparutions?|a\s*p\s*p\s*e\s*a\s*r\s*a\s*n\s*c\s*e\s*s|solicitors?\s+of\s+record|counsel(?:\s+of\s+record)?",
         r"|procureurs?(?:\s+inscrits?(?:\s+aux?\s+dossiers?)?)?|also\s+present|parties\s+present\b.*|written\s+representations\s+by",
         r"|(?:the\s+)?(?:additional\s+)?(?:borrowers?|lenders?|guarantors?|monitor|covenantors?",
@@ -103,10 +103,10 @@ fn judge(text: &str) -> bool {
 /// "iv.", "B)", alone or before a title), a bracketed one ("(a)", "(1)"), a division word ("PART",
 /// "Section", "ARTICLE"), or a numeral before capitals ("V RECOMMENDATIONS", OCR having dropped the
 /// stop).
-pub(super) fn numbered(text: &str) -> bool {
+pub(crate) fn numbered(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
-    super::enumerated(text)
+    crate::structure::enumerated(text)
         || pattern(&RE, concat!(
             r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\b",
             r"|\(\s*(?:\d{1,3}|[a-zA-Z]{1,2}|[ivxlc]{1,6})\s*\)(?:\s|$)|[IVXLC]{1,4}\s+[A-Z])"
@@ -126,8 +126,8 @@ fn enumerator(text: &str) -> Option<(String, String)> {
     if let Some(found) = pattern(&DIVISION, r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
         return Some((found[2].to_owned(), found[1].to_lowercase()));
     }
-    if let Some(capture) = super::heading_inline_re().captures(text).or_else(|| super::heading_standalone_re().captures(text)) {
-        let (value, punct, _) = super::heading_enumerator(&capture);
+    if let Some(capture) = crate::structure::heading_inline_re().captures(text).or_else(|| crate::structure::heading_standalone_re().captures(text)) {
+        let (value, punct, _) = crate::structure::heading_enumerator(&capture);
         return Some((value.to_owned(), punct.to_owned()));
     }
     pattern(&BRACKETED, r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
@@ -141,7 +141,7 @@ fn enumerator(text: &str) -> Option<(String, String)> {
 /// ladder over, as does every text `breaks` marks (a part of the document an unnumbered top heading
 /// opens: a judgment's reasons after its headnote). Each numbered text's depth on its run, and
 /// whether it opens a run; None where unnumbered.
-pub(super) fn ladder_levels(texts: &[&str], breaks: &[bool]) -> Vec<Option<(usize, bool)>> {
+pub(crate) fn ladder_levels(texts: &[&str], breaks: &[bool]) -> Vec<Option<(usize, bool)>> {
     let mut levels = vec![None; texts.len()];
     let numbered: Vec<(usize, Vec<EnumeratorInterpretation>, bool)> = texts.iter().enumerate().filter_map(|(k, text)| {
         let (value, punct) = enumerator(text)?;
@@ -305,10 +305,10 @@ fn not_a_heading(heading: &Heading, running: bool) -> bool {
         || label(text)
         // Nothing sets it off from the body: in the body's own type and case, on no centre, with
         // no space above it (90%: an address line, a party name, a turn of a transcript).
-        || (!numbered && heading.body_type && !super::all_caps(text) && !heading.centred && heading.above < 1.0)
+        || (!numbered && heading.body_type && !crate::structure::all_caps(text) && !heading.centred && heading.above < 1.0)
         // Capitals alone in the body's own type set off a name or a caption, not a division
         // (93%: "SPROTT PRIVATE RESOURCE LENDING", "ET ENTRE :", a postal code).
-        || (!numbered && heading.body_type && super::all_caps(text))
+        || (!numbered && heading.body_type && crate::structure::all_caps(text))
         // It sits nearer the line above than the text below, which a heading's text never does
         // (89%: a signature block's names, "INTENTIONALLY DELETED", a form's field).
         || (!numbered && !heading.larger && heading.below.is_some_and(|below| below > heading.above + 0.5))
@@ -338,11 +338,11 @@ fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, ab
 /// caller's profile), so a heading opening on a number, letter or numeral ("1.1 Definitions", "2.
 /// Purchase and Sale", "(a)") is a clause's caption, the opening of its body unit, whatever placed
 /// it; a division word's ("ARTICLE 1", "SCHEDULE A") stays a heading.
-pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, instrument: bool) {
+pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, instrument: bool) {
     let reading = primitives.contexts.reading_lines().clone();
     let translation = primitives.contexts.translation_line_ids.clone();
     let (mut demoted, mut promoted, mut lifted_lines) = (Vec::new(), Vec::new(), Vec::new());
-    super::constituents::within_document_contexts(pages, &reading, &translation, |document| {
+    crate::structure::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         let lines = || document.iter().flat_map(|page| &page.lines).filter(|line| !line.exclude_from_body);
         // A judge's name heads their reasons only where the judgment gives several opinions.
         let opinions = lines().filter(|line| judge(line.text.trim())).count();
@@ -358,7 +358,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             } else if transcript && !index_entry(text) && examination(text) {
                 promoted.push((line.id.clone(), if witnesses { 2 } else { 1 }));
                 raised.insert(line.id.as_str());
-            } else if transcript && super::contents_lists::index_letter(text) {
+            } else if transcript && crate::structure::contents_lists::index_letter(text) {
                 // A word index's letters head its entries, under the index.
                 promoted.push((line.id.clone(), 2));
                 raised.insert(line.id.as_str());
@@ -379,7 +379,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 (line.bbox[1] - prior.bbox[3]) / measures[&line.page_index].height
             });
             // A layout model's reading of a line stands: its words lift only a line none read.
-            if !super::layout_labelled(line) && lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(line) >= 0.5, above) {
+            if !crate::structure::layout_labelled(line) && lifted(line, prior, sequence.get(k + 1).copied(), bold_char_share(line) >= 0.5, above) {
                 lifted_lines.push(line.id.clone());
             }
         }
@@ -473,7 +473,7 @@ pub(super) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
     let mut levels = Vec::new();
     let current = primitives.headings.heading_levels.clone();
     let placed = primitives.headings.navigation_parents.clone();
-    super::constituents::within_document_contexts(pages, &reading, &translation, |document| {
+    crate::structure::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         levels.extend(numbering_levels(document, &current, &placed));
     });
     primitives.headings.heading_levels.extend(levels);
