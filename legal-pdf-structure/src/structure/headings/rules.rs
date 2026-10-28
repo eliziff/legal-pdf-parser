@@ -352,7 +352,8 @@ fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, ab
 
 /// The headings' one decision, over what every reader read: the lines the whole document raises (a
 /// transcript's witnesses, examinations and parts), the body lines it lifts, the headings it
-/// lowers, the marginal notes it sets apart, then every heading's level. A heading opening on a
+/// lowers, the document's title and the marginal notes it sets apart as their own regions, then every
+/// heading's level. A heading opening on a
 /// number, letter or numeral ("1.1 Definitions", "2. Purchase and Sale") over its clause's terms
 /// ("(a) ...") is the clause's caption, the opening of its body unit, whatever placed it, as is
 /// every such heading where the document numbers its provisions (`instrument`, the caller's
@@ -360,7 +361,8 @@ fn lifted(line: &Line, prior: Option<&Line>, next: Option<&Line>, bold: bool, ab
 pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, instrument: bool) {
     let reading = primitives.contexts.reading_lines().clone();
     let translation = primitives.contexts.translation_line_ids.clone();
-    let (mut demoted, mut promoted, mut lifted_lines, mut marginal) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Lines set apart from the headings as regions of their own: a title, a marginal note.
+    let (mut demoted, mut promoted, mut lifted_lines, mut set_apart) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     crate::structure::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         let lines = || document.iter().flat_map(|page| &page.lines).filter(|line| !line.exclude_from_body);
         // A transcript (its lines numbered) reads by witnesses and their examinations.
@@ -398,7 +400,11 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             // A layout model's reading of a line stands: its words lift only a line none read.
             let next = sequence.get(k + 1).copied();
             if !crate::structure::layout_labelled(line) && lifted(line, prior, next, bold_char_share(line) >= 0.5, above) {
-                if marginal_note(line.text.trim(), next) && !primitives.quotations.scopes.contains_key(&line.id) { &mut marginal } else { &mut lifted_lines }.push(line.id.clone());
+                if marginal_note(line.text.trim(), next) && !primitives.quotations.scopes.contains_key(&line.id) {
+                    set_apart.push((line.id.clone(), "marginal_note"));
+                } else {
+                    lifted_lines.push(line.id.clone());
+                }
             }
         }
         // The document's body type is its commonest, by characters.
@@ -409,6 +415,17 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             }
         }
         let body = type_chars.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|(style, _)| style);
+        // Where the document's body opens: its first full line of prose. The first heading before it,
+        // centred in capitals or larger type, or set larger in mixed case, is the document's title
+        // (on the structure gold, three in five so set are; centred in the body's type and size, or
+        // larger in capitals at the side, it is more often a heading).
+        let place: HashMap<&str, usize> = sequence.iter().enumerate().map(|(k, line)| (line.id.as_str(), k)).collect();
+        let opens = sequence.iter().position(|line| {
+            let measure = &measures[&line.page_index];
+            matches!(line.region_type.as_str(), "body" | "text") && line.text.trim().chars().count() >= 60
+                && line.bbox[2] - line.bbox[0] >= 0.85 * (measure.right - measure.left)
+        });
+        let mut titled = false;
         for page in document.iter() {
             let measure = &measures[&page.index];
             let gap = |upper: &Line, lower: &Line| ((lower.bbox[1] - upper.bbox[3]) / measure.height).clamp(-3.0, 3.0);
@@ -445,10 +462,22 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                     lines: members,
                 };
                 let text = heading.text.as_str();
+                if !titled && opens.is_none_or(|opens| place.get(first.id.as_str()).is_some_and(|&at| at < opens)) {
+                    titled = true;
+                    let width = page.width.max(1.0);
+                    let centred = (((first.bbox[0] + first.bbox[2]) / 2.0 - width / 2.0) / width).abs() < 0.03
+                        && first.bbox[2] - first.bbox[0] < 0.8 * (measure.right - measure.left);
+                    let caps = crate::structure::all_caps(text);
+                    if centred && (caps || larger) || larger && !caps {
+                        set_apart.extend(heading.lines.iter().map(|line| (line.id.clone(), "title")));
+                        slot = end;
+                        continue;
+                    }
+                }
                 let next = measure.order.get(end).map(|&n| &page.lines[n]);
                 // In a quotation, a statute's notes head the passage quoted (a judgment setting out its law).
                 if marginal_note(text, next) && !heading.lines.iter().any(|line| primitives.quotations.scopes.contains_key(&line.id)) {
-                    marginal.extend(heading.lines.iter().map(|line| line.id.clone()));
+                    set_apart.extend(heading.lines.iter().map(|line| (line.id.clone(), "marginal_note")));
                     slot = end;
                     continue;
                 }
@@ -477,7 +506,7 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
     let lifted_lines: HashSet<String> = lifted_lines.into_iter()
         .filter(|id| !primitives.claims.claimed(id)).collect();
     let demoted: HashMap<String, &str> = demoted.into_iter().collect();
-    let marginal: HashSet<String> = marginal.into_iter().filter(|id| !primitives.claims.claimed(id)).collect();
+    let set_apart: HashMap<String, &str> = set_apart.into_iter().filter(|(id, _)| !primitives.claims.claimed(id)).collect();
     let trail = &mut primitives.headings.trail;
     for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
         if let Some(&level) = promoted.get(&line.id) {
@@ -488,13 +517,8 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             // Levelled below, with the rest.
             line.region_type = "heading".to_owned();
             super::mark(trail, &line.id, true, "rules_lift");
-        } else if marginal.contains(&line.id) {
-            line.region_type = "marginal_note".to_owned();
-            primitives.headings.heading_levels.remove(&line.id);
-            primitives.headings.navigation_parents.remove(&line.id);
-            super::mark(trail, &line.id, false, "marginal_note");
-        } else if let Some(why) = demoted.get(&line.id) {
-            line.region_type = "body".to_owned();
+        } else if let Some((region, why)) = set_apart.get(&line.id).map(|&region| (region, region)).or_else(|| demoted.get(&line.id).map(|&why| ("body", why))) {
+            line.region_type = region.to_owned();
             primitives.headings.heading_levels.remove(&line.id);
             primitives.headings.navigation_parents.remove(&line.id);
             super::mark(trail, &line.id, false, why);
