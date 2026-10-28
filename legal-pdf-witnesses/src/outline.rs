@@ -52,6 +52,7 @@ fn outline_region(node: &StructureNode, container: Option<NodeKind>) -> Option<R
             node.role,
             Some(
                 PrimaryRole::Caption
+                    | PrimaryRole::Title
                     | PrimaryRole::Headnote
                     | PrimaryRole::Judges
                     | PrimaryRole::Counsel

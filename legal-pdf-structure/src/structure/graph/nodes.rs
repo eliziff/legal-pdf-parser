@@ -221,8 +221,13 @@ pub(crate) fn native_graph_parts(
                 Error::Message(format!("paragraph {} has no indexed lines", paragraph.id))
             })?;
         let heading = paragraph.region_type == "heading";
-        let caption = paragraph.region_type == "caption";
-        let marginal = paragraph.region_type == "marginal_note";
+        // A region of its own, not the body's: a caption, a marginal note, the document's title.
+        let region_role = match paragraph.region_type.as_str() {
+            "caption" => Some(legal_structure_model::PrimaryRole::Caption),
+            "marginal_note" => Some(legal_structure_model::PrimaryRole::MarginalNote),
+            "title" => Some(legal_structure_model::PrimaryRole::Title),
+            _ => None,
+        };
         let mut node = StructureNode::new(
             paragraph.id.clone(),
             if heading {
@@ -232,18 +237,14 @@ pub(crate) fn native_graph_parts(
             },
             range,
             ORIGIN,
-            if heading || caption || marginal {
+            if heading || region_role.is_some() {
                 Derivation::Heuristic
             } else {
                 Derivation::Native
             },
             None,
         );
-        if caption {
-            node.role = Some(legal_structure_model::PrimaryRole::Caption);
-        } else if marginal {
-            node.role = Some(legal_structure_model::PrimaryRole::MarginalNote);
-        }
+        node.role = region_role;
         node.ranges = source_membership(paragraph.line_ids.iter()
             .filter_map(|id| index.line(id).map(|line| line.range)).collect());
         node.label = heading.then(|| node.ranges.iter().map(|part|
