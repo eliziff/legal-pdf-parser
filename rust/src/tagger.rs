@@ -22,8 +22,12 @@ fn configured() -> Result<Option<&'static Mutex<Tagger>>> {
         return Err(Error::Message(error.clone()));
     }
     let loaded = (|| -> std::result::Result<Tagger, String> {
-        if let Some(runtime) = std::env::var_os("LEGALPDF_ONNX_RUNTIME").filter(|r| !r.is_empty()) {
-            // Idempotent for the path the OCR provider chose; an error names the conflict.
+        // The runtime the OCR provider is configured with (LEGALPDF_ONNXRUNTIME) serves the tagger
+        // too; LEGALPDF_ONNX_RUNTIME names one where no provider is. Idempotent for the path
+        // already initialized; an error names the conflict.
+        if let Some(runtime) = ["LEGALPDF_ONNX_RUNTIME", "LEGALPDF_ONNXRUNTIME"].iter()
+            .find_map(|name| std::env::var_os(name).filter(|r| !r.is_empty()))
+        {
             legal_pdf_core::init_ort_runtime(Path::new(&runtime), None).map_err(|e| e.to_string())?;
         }
         let threads = std::env::var("LEGALPDF_TAGGER_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(2);
