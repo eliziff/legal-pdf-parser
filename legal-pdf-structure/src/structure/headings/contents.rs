@@ -82,10 +82,28 @@ pub(crate) fn group_rows(pages: &mut [Page], claims: &Claims) {
     }
 }
 
-/// The level of each entry: where most entries print an enumerator, or every entry starts at one
-/// indent, its level on the heading ladder the headings themselves are levelled on
-/// (`heading_rules::ladder_levels`), a plain title taking the first level; else its indent's tier.
+/// The level of each entry: where most entries print a range ("[18] - [43]"), one deeper than the
+/// entries before it whose ranges hold its own (a part's paragraphs hold its sections'); where most
+/// print an enumerator, or every entry starts at one indent, its level on the heading ladder the
+/// headings themselves are levelled on (`heading_rules::ladder_levels`), a plain title taking the
+/// first level; else its indent's tier.
 fn levels(entries: &[&Entry]) -> Vec<usize> {
+    let ranges: Vec<Option<(i64, i64)>> = entries.iter().map(|entry| {
+        let (first, last) = entry.locator.as_deref()?.split_once('-')?;
+        Some((first.parse().ok()?, last.parse().ok()?)).filter(|(first, last)| first <= last)
+    }).collect();
+    if ranges.iter().flatten().count() * 4 >= entries.len() * 3 {
+        let mut open: Vec<(i64, i64)> = Vec::new();
+        return ranges.iter().map(|range| {
+            if let Some((first, last)) = *range {
+                while open.last().is_some_and(|&(start, end)| first < start || last > end) {
+                    open.pop();
+                }
+                open.push((first, last));
+            }
+            open.len().clamp(1, MAX_LEVEL)
+        }).collect();
+    }
     let rungs = ladder_levels(&entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(), &[]);
     let ladder = || -> Vec<usize> { rungs.iter().map(|rung| rung.map_or(1, |(level, _)| level.min(MAX_LEVEL))).collect() };
     if rungs.iter().filter(|rung| rung.is_some()).count() * 2 >= entries.len() {

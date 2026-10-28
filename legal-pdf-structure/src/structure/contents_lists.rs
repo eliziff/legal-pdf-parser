@@ -3,7 +3,8 @@
 //! contents page sets its entries' locators (page numbers, paragraph numbers, ranges) in one column
 //! at the right of their titles, climbing down the page; rows are read by their geometry, so a
 //! locator the extraction reads apart from its title, or files as a page number, still stands with
-//! its row. A list of citations is a table of authorities, not contents. Where nothing names the
+//! its row; a paragraph range printed alone under its title ("INTRODUCTION" / "[1] - [17]") is
+//! that title's. A list of citations is a table of authorities, not contents. Where nothing names the
 //! page contents and a table reader took its lines, or where it prints no locators at all, the list
 //! stands only when its titles recur later in the document, in order, on later pages, or point to
 //! where they recur (its locators the page labels or the paragraph numbers there). A word index is
@@ -20,21 +21,34 @@ fn pattern(cell: &'static OnceLock<Regex>, source: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(source).expect("contents list regex"))
 }
 
-/// A locator alone, its value and as printed: "12", "xiv", "p. 3", "[18] - [43]", "1 to 27".
+/// A locator alone, its value and its place as printed ("12", "xiv", a range "18-43"): "12", "xiv",
+/// "p. 3", "[18] - [43]", "1 to 27".
 fn locator(text: &str) -> Option<(u32, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-–]|to)\s*\[?\d{1,4}\]?)?\s*$")
+    pattern(&RE, r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
-        .map(|found| (value(&found[1]), found[1].to_owned()))
+        .map(|found| (value(&found[1]), place(&found)))
 }
 
 /// A locator after a leader at a title's end ("Overview ........ 3"), or after a tab or a wide
 /// space the title is typeset with ("Introduction\u{2003}3"): where the title ends, and the locator.
 fn leader_locator(text: &str) -> Option<(usize, u32, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-–]|to)\s*\[?\d{1,4}\]?)?\s*$")
+    pattern(&RE, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
-        .map(|found| (found.get(0).map_or(text.len(), |all| all.start()), value(&found[1]), found[1].to_owned()))
+        .map(|found| (found.get(0).map_or(text.len(), |all| all.start()), value(&found[1]), place(&found)))
+}
+
+/// A locator's place as printed: its first value, and the last where it gives a range ("18-43").
+fn place(found: &regex::Captures) -> String {
+    found.get(2).map_or_else(|| found[1].to_owned(), |last| format!("{}-{}", &found[1], last.as_str()))
+}
+
+/// A paragraph range alone on its row ("[18] - [43]"): the locator of the title on the row above,
+/// wherever it is set.
+fn paragraph_range(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    pattern(&RE, r"^\s*\[\d{1,4}\]\s*(?:[-–]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
 }
 
 /// A page's or a list's own title: the parser's contents titles ("TABLE OF CONTENTS", "TABLE OF
@@ -72,6 +86,8 @@ pub(super) struct Row<'a> {
     pub(super) text: String,
     pub(super) title: String,
     pub(super) locator: Option<(u32, f64, String)>,
+    /// Its locator was printed alone on the row below it (`paragraph_range`).
+    pub(super) stacked: bool,
 }
 
 /// A row read from the lines sharing its baseline band, left to right: its locator alone in the
@@ -83,24 +99,24 @@ pub(super) fn row_of(lines: Vec<&Line>) -> Row<'_> {
     if lines.len() > 1 {
         if let Some((value, token)) = locator(&last.text) {
             let title = join(&lines[..lines.len() - 1]);
-            return Row { locator: Some((value, last.bbox[2], token)), title, text, lines };
+            return Row { stacked: false, locator: Some((value, last.bbox[2], token)), title, text, lines };
         }
     }
     if let Some((end, value, token)) = leader_locator(&text) {
         let title = text[..end].trim_end_matches(|c: char| c == '.' || c == '_' || c == '\u{2026}' || c.is_whitespace()).to_owned();
-        return Row { locator: Some((value, last.bbox[2], token)), title, text, lines };
+        return Row { stacked: false, locator: Some((value, last.bbox[2], token)), title, text, lines };
     }
     let height = (last.bbox[3] - last.bbox[1]).max(1.0);
     if let [.., before, word] = last.words.as_slice() {
         if word.bbox[0] - before.bbox[2] >= 3.0 * height {
             if let (Some((value, token)), Some(title)) = (locator(&word.text), text.strip_suffix(word.text.trim())) {
                 let title = title.trim_end().to_owned();
-                return Row { locator: Some((value, last.bbox[2], token)), title, text, lines };
+                return Row { stacked: false, locator: Some((value, last.bbox[2], token)), title, text, lines };
             }
         }
     }
     let alone = (lines.len() == 1).then(|| locator(&last.text)).flatten();
-    Row { locator: alone.map(|(value, token)| (value, last.bbox[2], token)), title: if lines.len() == 1 && locator(&text).is_some() { String::new() } else { text.clone() }, text, lines }
+    Row { stacked: false, locator: alone.map(|(value, token)| (value, last.bbox[2], token)), title: if lines.len() == 1 && locator(&text).is_some() { String::new() } else { text.clone() }, text, lines }
 }
 
 /// Lines in one baseline band are one row: the bands of `lines` in their order, each read left to
@@ -132,8 +148,10 @@ fn rows(page: &Page) -> Vec<Row<'_>> {
     for band in row_bands(&lines) {
         let row = row_of(band);
         if let (Some(found), Some(prior)) = (row.locator.clone().filter(|_| row.title.is_empty()), rows.last_mut()) {
-            if prior.locator.is_none() && prior.lines[0].bbox[0] < row.lines[0].bbox[0] && locator(&prior.text).is_none() {
+            let stacked = paragraph_range(&row.text);
+            if prior.locator.is_none() && (stacked || prior.lines[0].bbox[0] < row.lines[0].bbox[0]) && locator(&prior.text).is_none() {
                 prior.locator = Some(found);
+                prior.stacked = stacked;
                 prior.lines.extend(row.lines);
                 continue;
             }
@@ -317,7 +335,7 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
         let right = |r: usize| rows[r].locator.as_ref().map_or(0.0, |(_, right, _)| *right);
         let number = |r: usize| rows[r].locator.as_ref().map_or(0, |(value, _, _)| *value);
         let entries: Vec<usize> = (0..rows.len())
-            .filter(|&r| rows[r].locator.is_some() && rows[r].lines[0].bbox[0] + 0.15 * width < right(r))
+            .filter(|&r| rows[r].locator.is_some() && (rows[r].stacked || rows[r].lines[0].bbox[0] + 0.15 * width < right(r)))
             .collect();
         // Named contents above the list, or in the page's running head.
         let headed = rows.iter().take(entries.first().map_or(4, |&first| first + 1).max(4)).any(|row| contents_title(&row.text))
@@ -437,6 +455,8 @@ pub(crate) fn index_pages(pages: &[Page]) -> HashSet<usize> {
                 .lines
                 .iter()
                 .filter_map(|line| headword.captures(&line.text))
+                // A headword is a word: a paragraph range ("[1] - [17]") is no entry of an index.
+                .filter(|capture| capture[1].chars().any(char::is_alphabetic))
                 .map(|capture| {
                     capture[1]
                         .trim_start_matches(['\'', '"', '\u{2018}', '\u{201c}'])
