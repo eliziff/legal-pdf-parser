@@ -13,7 +13,8 @@
 //!    that demote what is no heading, promote a transcript's parts, lift lines set apart, and level
 //!    every heading.
 //!
-//! `stamp` records which reader first made each line a heading.
+//! Each line's heading trail records every pass and rule that made it a heading or took that away
+//! (`mark`, `stamp`): a parse's rows carry it, so each one's catches can be counted on the gold.
 
 use super::*;
 
@@ -23,10 +24,25 @@ mod native;
 pub(crate) use native::*;
 pub(crate) mod rules;
 
-/// Each heading line's source: the first pass after which it reads as a heading.
-pub(crate) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass: &str) {
-    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
-        sources.entry(line.id.clone()).or_insert_with(|| pass.to_owned());
+/// Whether a trail leaves its line a heading: its last mark is a "+".
+pub(crate) fn heads(trail: &str) -> bool {
+    trail.rfind(['+', '-']).is_some_and(|at| trail[at..].starts_with('+'))
+}
+
+/// A line made a heading (`heading`) or taken from the headings by `why`.
+pub(crate) fn mark(trail: &mut HashMap<String, String>, id: &str, heading: bool, why: &str) {
+    let marks = trail.entry(id.to_owned()).or_default();
+    marks.push(if heading { '+' } else { '-' });
+    marks.push_str(why);
+}
+
+/// After a pass: every line it made a heading, or took from them, that no rule marked.
+pub(crate) fn stamp(pages: &[Page], trail: &mut HashMap<String, String>, pass: &str) {
+    for line in pages.iter().flat_map(|page| &page.lines) {
+        let now = line.region_type == "heading";
+        if now != trail.get(&line.id).is_some_and(|marks| heads(marks)) {
+            mark(trail, &line.id, now, pass);
+        }
     }
 }
 
@@ -36,7 +52,7 @@ pub(crate) fn stamp(pages: &[Page], sources: &mut HashMap<String, String>, pass:
 /// type size) except inside a quotation, then the typography of the whole document (PageIndex
 /// Flash) with every heading's depth, then the document's bookmarks or printed contents list.
 pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], primitives: &mut PdfPrimitiveEvidence) {
-    stamp(pages, &mut primitives.headings.sources, "layout");
+    stamp(pages, &mut primitives.headings.trail, "layout");
     legal_pdf_support::profile::measure("prepare.native_headings", || {
         let reading = primitives.contexts.reading_lines().clone();
         let translation = primitives.contexts.translation_line_ids.clone();
@@ -51,12 +67,16 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             {
                 return;
             }
-            demote_prose_heading_tags(document, primitives);
-            levels.extend(apply_text_fidelity_headings(document, primitives));
+            if !legal_structure_model::ablated("native_tag_demote") {
+                demote_prose_heading_tags(document, primitives);
+            }
+            if !legal_structure_model::ablated("native") {
+                levels.extend(apply_text_fidelity_headings(document, primitives));
+            }
         });
         primitives.headings.heading_levels = levels;
     });
-    stamp(pages, &mut primitives.headings.sources, "native");
+    stamp(pages, &mut primitives.headings.trail, "native");
     legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids).cloned().collect::<HashSet<_>>();
         let excluded = |id: &str| claimed.contains(id);
@@ -67,6 +87,9 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             &primitives.contexts.reading_line_ids,
             &primitives.contexts.translation_line_ids,
             |document| {
+                if legal_structure_model::ablated("styled") {
+                    return;
+                }
                 legal_pdf_headings::reconcile_styled_headings(
                     document,
                     legal_pdf_headings::HeadingEvidence {
@@ -83,13 +106,16 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             },
         );
     });
-    stamp(pages, &mut primitives.headings.sources, "styled");
+    stamp(pages, &mut primitives.headings.trail, "styled");
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks and its printed contents list, read together.
+        if legal_structure_model::ablated("outline") {
+            return;
+        }
         let authored = bookmarks::usable(outline, pages.len());
         let listed = contents::contents_outline(pages, &primitives.claims);
         let merged = bookmarks::merge_outlines(if authored { outline } else { &[] }, &listed);
         bookmarks::reconcile_bookmarks(pages, &merged, primitives, authored);
     });
-    stamp(pages, &mut primitives.headings.sources, "outline");
+    stamp(pages, &mut primitives.headings.trail, "outline");
 }

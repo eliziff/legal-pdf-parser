@@ -156,10 +156,10 @@ struct HeadingReading {
     heading_levels: HashMap<String, usize>,
     #[serde(default)]
     navigation_parents: HashMap<String, Option<String>>,
-    /// The reader that first made each heading line one (`read_headings`' passes), for a reader
-    /// after the parser to weigh each heading by where it came from.
+    /// Each line's heading trail: every pass or rule that made it a heading ("+styled") or took
+    /// that away ("-demote_body_type"), in order (`headings::mark`, `headings::stamp`).
     #[serde(default)]
-    sources: HashMap<String, String>,
+    trail: HashMap<String, String>,
 }
 
 /// What the readers read of a document, each group written by one reader and read by the ones
@@ -201,8 +201,7 @@ pub struct StructureOutput {
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
     pub structure_graph: DocumentStructure,
-    /// Each heading line the stage leaves, and the reader that made it a heading ("later" where a
-    /// step after the heading readers did).
+    /// Each line some heading pass or rule touched, and its heading trail ("+styled-demote_label").
     pub heading_sources: HashMap<String, String>,
 }
 
@@ -339,7 +338,7 @@ fn prepare_composed(
     instrument: bool,
 ) -> PdfPreparation {
     legal_pdf_support::profile::measure("compose.heading_rules", || headings::rules::read(pages, &mut primitives, instrument));
-    stamp(pages, &mut primitives.headings.sources, "rules");
+    stamp(pages, &mut primitives.headings.trail, "rules");
     diagnostics.extend(legal_pdf_support::profile::measure(
         "prepare.printed_labels",
         || assign_printed_page_labels(pages),
@@ -459,15 +458,14 @@ fn derive_prepared(
         .map_err(|error| Error::Message(error.to_string()))?;
     structure_graph.profile = identity.profile;
     structure_graph.source_fragments = source_fragments;
-    let heading_sources = pages
-        .iter()
-        .flat_map(|page| &page.lines)
-        .filter(|line| line.region_type == "heading")
-        .map(|line| {
-            let source = prepared.primitives.headings.sources.get(&line.id).cloned().unwrap_or_else(|| "later".to_owned());
-            (line.id.clone(), source)
-        })
-        .collect();
+    let mut heading_sources = std::mem::take(&mut prepared.primitives.headings.trail);
+    // A step after the heading passes that made a heading of a line.
+    for line in pages.iter().flat_map(|page| &page.lines).filter(|line| line.region_type == "heading") {
+        let trail = heading_sources.entry(line.id.clone()).or_default();
+        if !headings::heads(trail) {
+            trail.push_str("+later");
+        }
+    }
     Ok(StructureOutput {
         paragraphs,
         footnotes,

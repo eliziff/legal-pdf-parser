@@ -9,10 +9,9 @@
 //! - The native ladder supplies numbered headings and their depth; unresolved numbered blocks
 //!   can still be read by typography. Flash's numbered, labeled, chapter and caption detectors
 //!   are not ported.
-//! - The keyword tables are not ported except the introduction keywords: the section and
-//!   abstract tables index academic and medical papers.
-//! - A heading the native rules already accepted is kept; only new candidates face the
-//!   font-distance rejection.
+//! - The keyword tables are not ported: they index academic and medical papers. Nor is the
+//!   font-distance rejection, which read no better on the structure gold.
+//! - A heading the native rules already accepted is kept.
 //! - Native line boxes rise to the font's ascent; Flash's glyph boxes stop near the capitals.
 //! - A new heading is in the page's own type size or larger, opens with a capital or a number,
 //!   and does not sit beside running text. Inside a quotation, a bold provision label or an
@@ -28,10 +27,10 @@ mod outline;
 mod stats;
 
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
-use legal_pdf_core::layout_analysis;
+use legal_pdf_core::{ablated, layout_analysis};
 use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
-use outline::{candidate_fonts, stands_alone, Candidate, Context};
+use outline::{Candidate, Context};
 use std::collections::{HashMap, HashSet};
 
 /// A heading wrapped onto the next line keeps one block: the same type, set at the
@@ -46,6 +45,9 @@ fn join_wrapped_headings(
     translation: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, usize, usize)> {
     let mut joined_lines = Vec::new();
+    if ablated("flash_join") {
+        return joined_lines;
+    }
     let parenthetical = |text: &str| {
         let text = text.trim();
         text.starts_with('(') && text.ends_with(')')
@@ -111,56 +113,6 @@ fn join_wrapped_headings(
         }
     }
     joined_lines
-}
-
-/// The introduction section names upstream's `introduction_dict` lists.
-const INTRODUCTION: &[&str] = &[
-    "introduction",
-    "introductions",
-    "introducción",
-    "introdução",
-    "einleitung",
-    "introduzione",
-    "inledningen",
-    "esittely",
-    "indledningen",
-    "pendahuluan",
-    "giriş",
-    "introducerea",
-    "introducció",
-    "úvod",
-    "wstęp",
-    "inleiding",
-    "inngangur",
-    "sissejuhatus",
-    "ievads",
-    "įvadas",
-    "bevezetés",
-    "giới thiệu",
-    "εισαγωγή",
-    "简介",
-    "簡介",
-    "序章",
-    "소개",
-    "введение",
-    "вступ",
-    "увядзенне",
-    "въведение",
-];
-
-fn introduction(block: &FlashBlock) -> bool {
-    let tokens = block.tokens();
-    let words = tokens
-        .iter()
-        .take_while(|token| token.kind == 2)
-        .map(|token| token.text.to_lowercase())
-        .collect::<Vec<_>>();
-    if words.is_empty() || !INTRODUCTION.contains(&words.join(" ").as_str()) {
-        return false;
-    }
-    // The whole block, or all but a closing punctuation mark.
-    tokens.len() == words.len()
-        || (tokens.len() == words.len() + 1 && matches!(tokens[words.len()].kind, 3 | 4 | 5))
 }
 
 /// Bold or capitals can set a title apart even below the body text's size.
@@ -348,18 +300,12 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             for index in slot..end {
                 flash.add_line(flash_lines[page_slot][index].clone());
             }
-            let lines = &page.lines[slot..end];
-            let first = line.text.trim();
             let heading = line.region_type == "heading";
             blocks.push(Block {
                 flash,
                 page: page_slot,
                 line_slots: (slot..end).collect(),
                 heading,
-                numbered: lines
-                    .iter()
-                    .any(|line| evidence.levels.contains_key(&line.id))
-                    || (evidence.numbered)(first),
                 is_body: false,
                 translation: (evidence.translation)(&line.id),
                 fontless: line.spans.is_empty(),
@@ -597,16 +543,9 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             if !eligible[block] {
                 continue;
             }
-            let rows = blocks[block].flash.line_count();
-            let kind = if rows <= 2
-                && !blocks[block].numbered
-                && neighbors[page_index][position].body_crossed
-                && introduction(&blocks[block].flash)
-            {
-                Some(11)
-            } else if type_candidates[block] {
+            let kind = if type_candidates[block] && !ablated("flash_type") {
                 Some(12)
-            } else if scan.candidate(position) {
+            } else if !ablated("flash_scan") && scan.candidate(position) {
                 Some(0)
             } else {
                 None
@@ -639,23 +578,6 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     };
     candidates.sort_by(|left, right| context.order(left.block, right.block));
     let proposed = proposed.into_iter().collect::<HashSet<_>>();
-    // Every candidate's fonts, read once for all the proposed headings they are compared with.
-    let fonts = std::cell::OnceCell::new();
-    let rejected = (0..candidates.len())
-        .filter(|index| {
-            let candidate = &candidates[*index];
-            proposed.contains(&candidate.block) && candidate.kind == 0 && {
-                let block = &blocks[candidate.block];
-                let near = &neighbors[block.page][positions[candidate.block]];
-                let gap = near.body_below.map(|slot| {
-                    block.flash.rect.bottom
-                        - blocks[flash_pages[block.page].blocks[slot]].flash.rect.top
-                });
-                let fonts = fonts.get_or_init(|| candidate_fonts(&context, &candidates));
-                stands_alone(&context, &candidates, fonts, *index, gap)
-            }
-        })
-        .collect::<HashSet<_>>();
     // A heading of a few stray characters ("l ¦ I") holds no section.
     let stray = |candidate: &Candidate| {
         matches!(candidate.kind, 0 | 12) && blocks[candidate.block].flash.stats.info_weight() <= 3.0
@@ -669,7 +591,7 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
     let accepted = candidates
         .iter()
         .enumerate()
-        .filter(|(index, candidate)| !rejected.contains(index) && !stray(candidate))
+        .filter(|(_, candidate)| !stray(candidate))
         .map(|(_, candidate)| candidate.clone())
         .collect::<Vec<_>>();
 
