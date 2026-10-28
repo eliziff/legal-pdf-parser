@@ -82,7 +82,7 @@ pub(super) fn build_paragraphs_with_context(
             .collect();
         let mut seen = HashSet::new();
         for region in &page.regions {
-            if !matches!(region.kind.as_str(), "body" | "heading" | "caption") {
+            if !matches!(region.kind.as_str(), "body" | "heading" | "caption" | "marginal_note") {
                 continue;
             }
             let lines: Vec<&Line> = region
