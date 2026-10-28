@@ -237,11 +237,14 @@ pub(super) fn classify_document_pages(
     contents_pages.retain(|page| !authority_pages.contains(page));
     evidence.claims.contents_line_ids.extend(contents_line_ids);
     evidence.claims.contents_pages.extend(contents_pages);
-    legal_pdf_support::profile::measure("classify.captions", || {
-        constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
-            captions::classify(document, &evidence.claims, &mut evidence.headings);
+    // LEGALPDF_ABLATE=captions leaves the caption reader out, for its measure under the tagger.
+    if !legal_structure_model::ablated("captions") {
+        legal_pdf_support::profile::measure("classify.captions", || {
+            constituents::within_document_contexts(pages, &HashMap::new(), &translation, |document| {
+                captions::classify(document, &evidence.claims, &mut evidence.headings);
+            });
         });
-    });
+    }
     evidence.contexts.translation_line_ids.extend(translation);
     diagnostics
 }

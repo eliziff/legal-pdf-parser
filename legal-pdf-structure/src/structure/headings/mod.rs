@@ -68,6 +68,10 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             {
                 return;
             }
+            // LEGALPDF_ABLATE=native leaves the native readers out, for their measure under the tagger.
+            if legal_structure_model::ablated("native") {
+                return;
+            }
             demote_prose_heading_tags(document, primitives);
             levels.extend(apply_text_fidelity_headings(document, primitives));
         });

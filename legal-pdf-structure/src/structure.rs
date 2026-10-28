@@ -317,7 +317,11 @@ fn prepare_reader(
     primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || {
         if legal_structure_model::ablated("quotations") { quotations::Reading::default() } else { quotations::read(pages, &primitives) }
     });
-    for group in legal_pdf_support::profile::measure("reader.sequence", || numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives)) {
+    // LEGALPDF_ABLATE=sequence leaves the quoted-paragraph sequence reader out, for its measure under the tagger.
+    let sequences = legal_pdf_support::profile::measure("reader.sequence", || {
+        if legal_structure_model::ablated("sequence") { Vec::new() } else { numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives) }
+    });
+    for group in sequences {
         if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
             eprintln!("sequence\tquoted paragraph\t{}\t{} lines", group[0], group.len());
         }
