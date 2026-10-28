@@ -119,6 +119,17 @@ pub(super) fn row_of(lines: Vec<&Line>) -> Row<'_> {
     Row { stacked: false, locator: alone.map(|(value, token)| (value, last.bbox[2], token)), title: if lines.len() == 1 && locator(&text).is_some() { String::new() } else { text.clone() }, text, lines }
 }
 
+/// A row naming the contents, in any of its cells (a bilingual page's two titles share a row).
+fn names_contents(row: &Row) -> bool {
+    contents_title(&row.text) || row.lines.iter().any(|line| contents_title(&line.text))
+}
+
+/// A row's first cell of words, left to right: its title where a number or another column shares
+/// its row.
+fn own_title<'a>(row: &'a Row) -> &'a str {
+    row.lines.iter().map(|line| line.text.trim()).find(|text| text.chars().any(char::is_alphabetic)).unwrap_or("")
+}
+
 /// Lines in one baseline band are one row: the bands of `lines` in their order, each read left to
 /// right.
 pub(super) fn row_bands<'a>(lines: &[&'a Line]) -> Vec<Vec<&'a Line>> {
@@ -338,7 +349,7 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
             .filter(|&r| rows[r].locator.is_some() && (rows[r].stacked || rows[r].lines[0].bbox[0] + 0.15 * width < right(r)))
             .collect();
         // Named contents above the list, or in the page's running head.
-        let headed = rows.iter().take(entries.first().map_or(4, |&first| first + 1).max(4)).any(|row| contents_title(&row.text))
+        let headed = rows.iter().take(entries.first().map_or(4, |&first| first + 1).max(4)).any(|row| names_contents(row))
             || page.lines.iter().any(|line| line.region_type == "header" && contents_title(&line.text));
         let column = entries.iter().map(|&r| right(r))
             .max_by_key(|&edge| entries.iter().filter(|&&r| (right(r) - edge).abs() <= 0.015 * width).count());
@@ -359,10 +370,13 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
                 && (headed || agreed || claimed * 2 < listed.len() || echoed(&titles, slot, &recurrences))
         };
         // A list printing no locators: its titles recur later as the document's own parts, under a
-        // contents title or six of them running together.
-        let titled_rows: Vec<&str> = rows.iter().skip(1).filter(|row| row.text.split_whitespace().count() <= 15).map(|row| row.text.as_str()).collect();
+        // contents title (on its first page) or six of them running together. A row's title is its
+        // first cell of words: a statute's table of provisions sets each section's number before
+        // it, and a bilingual one the other language's entry beside it.
+        let listing = || rows.iter().skip_while(move |row| headed && !names_contents(row)).skip(usize::from(headed));
+        let titled_rows: Vec<&str> = listing().map(own_title).filter(|title| title.split_whitespace().count() <= 15).collect();
         let run = if accepted { None } else { recurring_run(&rows, slot, pages, &recurrences) };
-        let unlocated = !accepted && (run.is_some() || headed && titled_rows.len() >= 5 && echoed(&titled_rows, slot, &recurrences));
+        let unlocated = !accepted && (run.is_some() || (headed || continuing) && titled_rows.len() >= 5 && echoed(&titled_rows, slot, &recurrences));
         // Entries mostly citations, their locators in one column whatever their order: a table of
         // authorities (its locators are the paragraphs citing each authority, not its place).
         let cites = |r: usize| citation(&rows[r].text) || r > 0 && citation(&format!("{} {}", rows[r - 1].text, rows[r].text));
@@ -377,7 +391,7 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
             // The list runs from its first entry (with up to two short rows above it: a column's
             // header, a wrapped title) to its last.
             let mut top = listed[0];
-            while top > 0 && top + 2 > listed[0] && rows[top - 1].text.split_whitespace().count() <= 12 && !contents_title(&rows[top - 1].text) {
+            while top > 0 && top + 2 > listed[0] && rows[top - 1].text.split_whitespace().count() <= 12 && !names_contents(&rows[top - 1]) {
                 top -= 1;
             }
             let last = listed[listed.len() - 1];
@@ -416,9 +430,13 @@ pub(super) fn read(pages: &[Page], table_lines: &HashSet<String>, embedded: &[Op
                 lists.entries.push(Entry { title: row.title.clone(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });
             }
         } else if unlocated {
-            for row in rows.iter().skip_while(|row| !contents_title(&row.text)).skip(1) {
+            for row in listing() {
                 lists.contents.extend(row.lines.iter().filter(|line| !matches!(line.region_type.as_str(), "header" | "footer")).map(|line| line.id.clone()));
-                lists.entries.push(Entry { title: row.title.clone(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });
+                // A row opening on its own number lists a provision ("1 | Short title"), which heads
+                // nothing; an unnumbered row a part or a group ("Short Title", "PART I").
+                if locator(&row.lines[0].text).is_none() {
+                    lists.entries.push(Entry { title: own_title(row).to_owned(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });
+                }
             }
         } else if authorities {
             lists.authorities.extend(ids(&rows[entries[0]..=entries[entries.len() - 1]]));

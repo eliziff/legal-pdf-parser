@@ -293,17 +293,25 @@ pub(crate) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
     classify(&validate(outline, pages), pages) != Tier::Ignore
 }
 
+/// Whether a document's own bookmarks set out every level of it, so that a heading they do not
+/// name is none: one tree walking forward through the pages (not a bilingual act's two, the
+/// second starting over at its first page).
+pub(crate) fn complete(outline: &[PdfOutlineEntry], pages: usize) -> bool {
+    let entries = validate(outline, pages);
+    entries.len() * 10 >= outline.len() * 9 && classify(&entries, pages) == Tier::Full
+}
+
 /// The document's bookmarks and its printed contents list as one outline. A listed entry the
-/// bookmarks name confirms theirs; one they do not name stands after the entry before it, at its
-/// listed level counted from the nearest entry before it that both name (its own listed level
-/// where none does).
+/// bookmarks name, whatever numbering label one side prints ("1 Short Title" / "Short Title"),
+/// confirms theirs; one they do not name stands after the entry before it, at its listed level
+/// counted from the nearest entry before it that both name (its own listed level where none does).
 pub(crate) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
     let mut merged = bookmarks.to_vec();
     let mut cursor: Option<usize> = None;
     let mut anchor: Option<(usize, usize)> = None;
     for entry in listed {
         let title = normalize_title(&entry.title);
-        if let Some(at) = merged.iter().position(|bookmark| normalize_title(&bookmark.title) == title) {
+        if let Some(at) = merged.iter().position(|bookmark| same_title(&normalize_title(&bookmark.title), &title, false)) {
             cursor = Some(at);
             anchor = Some((entry.level, merged[at].level));
             continue;
@@ -319,12 +327,13 @@ pub(crate) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutline
     merged
 }
 
-/// `authored`: the outline holds the document's own bookmarks, not only its printed contents.
+/// `complete`: the document's own bookmarks set out every level (`complete`), so a heading the
+/// outline does not name is none.
 pub(crate) fn reconcile_bookmarks(
     pages: &mut [Page],
     outline: &[PdfOutlineEntry],
     primitives: &mut PdfPrimitiveEvidence,
-    authored: bool,
+    complete: bool,
 ) -> bool {
     let mut entries = validate(outline, pages.len());
     let tier = classify(&entries, pages.len());
@@ -691,7 +700,7 @@ pub(crate) fn reconcile_bookmarks(
     let mut unnamed = HashSet::<usize>::new();
     let mut groups = HashMap::<usize, Vec<usize>>::new();
     for unit in detected {
-        if authored && tier == Tier::Full && opened(unit) {
+        if complete && opened(unit) {
             unnamed.insert(unit);
             continue;
         }
