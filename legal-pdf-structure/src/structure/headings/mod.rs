@@ -115,7 +115,7 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         let authored = bookmarks::usable(outline, pages.len());
         let listed = contents::contents_outline(pages, &primitives.claims);
         let merged = bookmarks::merge_outlines(if authored { outline } else { &[] }, &listed);
-        bookmarks::reconcile_bookmarks(pages, &merged, primitives, authored);
+        bookmarks::reconcile_bookmarks(pages, &merged, primitives, bookmarks::complete(outline, pages.len()));
     });
     stamp(pages, &mut primitives.headings.trail, "outline");
 }
