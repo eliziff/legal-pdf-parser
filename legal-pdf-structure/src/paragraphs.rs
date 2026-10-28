@@ -182,6 +182,10 @@ pub(crate) struct Measure {
     /// The median blank between two scanned lines stacked in one column, counted up to 1.25 line
     /// heights: a paragraph's own leading, not the space between paragraphs.
     gap: f64,
+    /// The median distance between the centres of two scanned lines stacked in one column, counted
+    /// from a quarter to 1.75 line heights: the line pitch, which a scan's text layer can set
+    /// closer than its boxes are tall (boxes overlapping the next line's).
+    pitch: f64,
 }
 
 pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> Measure {
@@ -213,7 +217,20 @@ pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) 
             })
             .collect(),
     );
-    Measure { width, height: line_height, gap }
+    let centre = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
+    let pitch = median(
+        scans()
+            .flat_map(|lines| {
+                lines
+                    .windows(2)
+                    .filter(|pair| pair[1].bbox[0] < pair[0].bbox[2] && pair[0].bbox[0] < pair[1].bbox[2])
+                    .map(|pair| centre(pair[1]) - centre(pair[0]))
+                    .filter(|advance| (0.25 * line_height..=1.75 * line_height).contains(advance))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    );
+    Measure { width, height: line_height, gap, pitch }
 }
 
 impl Pitch {
@@ -271,11 +288,11 @@ impl Pitch {
     /// Are two lines on one row? A scan's boxes swell and overlap their neighbours, so there its
     /// lines share a row when their centres are within half the document's line pitch.
     fn same_row(&self, a: &Line, b: &Line) -> bool {
-        if !self.scan || self.measure.height <= 0.0 {
+        if !self.scan || self.measure.pitch <= 0.0 {
             return same_row(a, b);
         }
         let centre = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
-        (centre(a) - centre(b)).abs() < 0.5 * (self.measure.height + self.measure.gap)
+        (centre(a) - centre(b)).abs() < 0.5 * self.measure.pitch
     }
 
     /// Does a column of the page start within `tolerance` of `x`?

@@ -5,7 +5,7 @@ use super::*;
 pub(crate) fn marker_alone() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:\(?(?:\d{1,3}(?:\.\d{1,3}){0,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})[.)]|\(\s*(?:\d{1,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})\s*\)|[•·▪◦●○■□➢✓\-–—*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$")
+        Regex::new(r"^\s*(?:\(?(?:\d{1,3}(?:\.\d{1,3}){0,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})[.)]|\(\s*(?:\d{1,3}|[A-Za-z]{1,2}|[ivxlc]{1,6}|[IVXLC]{1,6})\s*\)|\[\s*\d{1,4}\s*\]|[•·▪◦●○■□➢✓\-–—*\u{f0b7}\u{f0a7}\u{f0d8}])\s*$")
             .expect("detached marker regex")
     })
 }
@@ -20,7 +20,7 @@ pub(crate) fn decimal_alone() -> &'static Regex {
     })
 }
 
-/// A numbering marker printed on a line of its own ("11.", "(a)", "•", "3.05") belongs to the
+/// A numbering marker printed on a line of its own ("11.", "(a)", "[12]", "•", "3.05") belongs to the
 /// line that carries its text: the nearest line to its right on the same row, within six line
 /// heights. A bare decimal joins only words (a letter, bracket or quote first), never a table's
 /// next figure. The marker joins the front of that line, which keeps its identity; the marker's
