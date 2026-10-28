@@ -339,6 +339,10 @@ pub(super) fn edge_furniture(pages: &[Page]) -> HashSet<(usize, usize)> {
 }
 
 pub(super) fn mark_repeated_furniture(pages: &mut [Page]) {
+    // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
+    if legal_structure_model::ablated("furniture") {
+        return;
+    }
     let mut candidates: HashMap<(u8, String), Vec<FurnitureHit>> = HashMap::new();
     legal_pdf_support::profile::measure("furniture.candidates", || {
         for (page_slot, page) in pages.iter().enumerate() {
