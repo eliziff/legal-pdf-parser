@@ -222,6 +222,7 @@ pub(crate) fn native_graph_parts(
             })?;
         let heading = paragraph.region_type == "heading";
         let caption = paragraph.region_type == "caption";
+        let marginal = paragraph.region_type == "marginal_note";
         let mut node = StructureNode::new(
             paragraph.id.clone(),
             if heading {
@@ -231,7 +232,7 @@ pub(crate) fn native_graph_parts(
             },
             range,
             ORIGIN,
-            if heading || caption {
+            if heading || caption || marginal {
                 Derivation::Heuristic
             } else {
                 Derivation::Native
@@ -240,6 +241,8 @@ pub(crate) fn native_graph_parts(
         );
         if caption {
             node.role = Some(legal_structure_model::PrimaryRole::Caption);
+        } else if marginal {
+            node.role = Some(legal_structure_model::PrimaryRole::MarginalNote);
         }
         node.ranges = source_membership(paragraph.line_ids.iter()
             .filter_map(|id| index.line(id).map(|line| line.range)).collect());
