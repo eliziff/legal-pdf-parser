@@ -313,7 +313,10 @@ fn prepare_reader(
         );
         changed
     });
-    primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || quotations::read(pages, &primitives));
+    // LEGALPDF_ABLATE=quotations leaves the quotation reader out, for its measure under the tagger.
+    primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || {
+        if legal_structure_model::ablated("quotations") { quotations::Reading::default() } else { quotations::read(pages, &primitives) }
+    });
     for group in legal_pdf_support::profile::measure("reader.sequence", || numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives)) {
         if std::env::var_os("LEGALPDF_SEQUENCE_TRACE").is_some() {
             eprintln!("sequence\tquoted paragraph\t{}\t{} lines", group[0], group.len());
