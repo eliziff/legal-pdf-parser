@@ -360,7 +360,6 @@ pub(crate) fn apply_text_fidelity_headings(
                 continue;
             }
             if line.region_type == "body"
-                && !legal_structure_model::ablated("native_contents_heading")
                 && !line.exclude_from_body
                 && contents_heading(&line.text)
                 && listed_top.is_some_and(|top| line.bbox[3] <= top)
@@ -371,7 +370,7 @@ pub(crate) fn apply_text_fidelity_headings(
         }
     }
     for page in pages.iter_mut() {
-        if legal_structure_model::ablated("native_title_case") || primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
+        if primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
             continue;
         }
         for line_slot in title_case_headings(page, primitives) {

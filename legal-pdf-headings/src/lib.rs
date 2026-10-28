@@ -27,7 +27,7 @@ mod outline;
 mod stats;
 
 use detect::{is_body_paragraph, neighbor_map, Block, FlashPage, Scan};
-use legal_pdf_core::{ablated, layout_analysis};
+use legal_pdf_core::layout_analysis;
 use legal_pdf_core::model::Page;
 use model::{x_aligned_center_close, FlashBlock, FlashLine};
 use outline::{Candidate, Context};
@@ -45,9 +45,6 @@ fn join_wrapped_headings(
     translation: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, usize, usize)> {
     let mut joined_lines = Vec::new();
-    if ablated("flash_join") {
-        return joined_lines;
-    }
     let parenthetical = |text: &str| {
         let text = text.trim();
         text.starts_with('(') && text.ends_with(')')
@@ -543,9 +540,9 @@ pub fn reconcile_styled_headings(pages: &mut [Page], evidence: HeadingEvidence) 
             if !eligible[block] {
                 continue;
             }
-            let kind = if type_candidates[block] && !ablated("flash_type") {
+            let kind = if type_candidates[block] {
                 Some(12)
-            } else if !ablated("flash_scan") && scan.candidate(position) {
+            } else if scan.candidate(position) {
                 Some(0)
             } else {
                 None

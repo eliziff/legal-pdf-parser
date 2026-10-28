@@ -333,7 +333,7 @@ fn not_a_heading(heading: &Heading) -> Option<&'static str> {
         ("demote_wrapped", !numbered && heading.lines.len() > 1),
     ]
     .into_iter()
-    .find(|&(rule, holds)| holds && !legal_structure_model::ablated(rule))
+    .find(|&(_, holds)| holds)
     .map(|(rule, _)| rule)
 }
 
@@ -455,7 +455,6 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 let terms = next.is_some_and(over_terms);
                 let caption = (instrument || terms) && enumerator(text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
                 // A heading the document's own outline or contents placed is the document's word.
-                use legal_structure_model::ablated;
                 let placed = heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id));
                 let why = if caption {
                     Some("demote_caption")
@@ -463,9 +462,9 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                     None
                 } else {
                     not_a_heading(&heading)
-                        .or_else(|| (!ablated("demote_turn") && transcript && turn_or_event(text)).then_some("demote_turn"))
+                        .or_else(|| (transcript && turn_or_event(text)).then_some("demote_turn"))
                 };
-                if let Some(why) = why.filter(|_| !ablated("rules_demote")) {
+                if let Some(why) = why {
                     demoted.extend(heading.lines.iter().map(|line| (line.id.clone(), why)));
                 }
                 slot = end;
@@ -474,9 +473,9 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
     });
     // A line a container claimed (contents, a table) stays the container's.
     let promoted: HashMap<String, usize> = promoted.into_iter()
-        .filter(|(id, _)| !legal_structure_model::ablated("rules_promote") && !primitives.claims.claimed(id)).collect();
+        .filter(|(id, _)| !primitives.claims.claimed(id)).collect();
     let lifted_lines: HashSet<String> = lifted_lines.into_iter()
-        .filter(|id| !legal_structure_model::ablated("rules_lift") && !primitives.claims.claimed(id)).collect();
+        .filter(|id| !primitives.claims.claimed(id)).collect();
     let demoted: HashMap<String, &str> = demoted.into_iter().collect();
     let marginal: HashSet<String> = marginal.into_iter().filter(|id| !primitives.claims.claimed(id)).collect();
     let trail = &mut primitives.headings.trail;
@@ -507,9 +506,7 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
     let current = primitives.headings.heading_levels.clone();
     let placed = primitives.headings.navigation_parents.clone();
     crate::structure::constituents::within_document_contexts(pages, &reading, &translation, |document| {
-        if !legal_structure_model::ablated("rules_levels") {
-            levels.extend(numbering_levels(document, &current, &placed));
-        }
+        levels.extend(numbering_levels(document, &current, &placed));
     });
     primitives.headings.heading_levels.extend(levels);
 }

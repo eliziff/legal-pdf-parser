@@ -67,12 +67,8 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             {
                 return;
             }
-            if !legal_structure_model::ablated("native_tag_demote") {
-                demote_prose_heading_tags(document, primitives);
-            }
-            if !legal_structure_model::ablated("native") {
-                levels.extend(apply_text_fidelity_headings(document, primitives));
-            }
+            demote_prose_heading_tags(document, primitives);
+            levels.extend(apply_text_fidelity_headings(document, primitives));
         });
         primitives.headings.heading_levels = levels;
     });
@@ -87,9 +83,6 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
             &primitives.contexts.reading_line_ids,
             &primitives.contexts.translation_line_ids,
             |document| {
-                if legal_structure_model::ablated("styled") {
-                    return;
-                }
                 legal_pdf_headings::reconcile_styled_headings(
                     document,
                     legal_pdf_headings::HeadingEvidence {
@@ -109,9 +102,6 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
     stamp(pages, &mut primitives.headings.trail, "styled");
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks and its printed contents list, read together.
-        if legal_structure_model::ablated("outline") {
-            return;
-        }
         let authored = bookmarks::usable(outline, pages.len());
         let listed = contents::contents_outline(pages, &primitives.claims);
         let merged = bookmarks::merge_outlines(if authored { outline } else { &[] }, &listed);
