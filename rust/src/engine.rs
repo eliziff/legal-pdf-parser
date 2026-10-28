@@ -604,18 +604,15 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
 }
 
-/// What the structure gold's inputs are made by: the extraction, recognition and layout code of
-/// this build and the models the environment names. Inputs are cached under it, so a build never
-/// grades another build's pages.
+/// What the structure gold's inputs are keyed by: the extraction code and the models the
+/// environment names. Work after extraction never re-extracts the gold; recognition is cached on
+/// its own, and a change to it that should reach the inputs bumps the version here.
 #[doc(hidden)]
 pub fn gold_inputs_identity() -> String {
     let models = ["LEGALPDF_INDRA_MODEL_PACK", "LEGALPDF_ONNXRUNTIME", "LEGALPDF_PPDOC_MODEL_PACK"].map(|name| std::env::var(name).ok());
     let identity = serialization_sha256(&(
-        "legalpdf.gold-inputs.v1",
+        "legalpdf.gold-inputs.v2",
         env!("LEGAL_PDF_EXTRACTION_SHA256"),
-        env!("LEGAL_PDF_OCR_SHA256"),
-        env!("LEGAL_PDF_RASTER_SHA256"),
-        env!("LEGAL_PDF_LAYOUT_SHA256"),
         models,
     ))
     .unwrap_or_default();
