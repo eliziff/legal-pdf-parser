@@ -126,13 +126,6 @@ pub(crate) fn enumerator(text: &str) -> Option<(String, String)> {
     pattern(&BRACKETED, r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
 }
 
-/// The places a heading's enumerator can hold, (family, ordinal), in every family it reads in.
-pub(crate) fn ordinals(text: &str) -> Vec<(String, u32)> {
-    enumerator(text).map_or_else(Vec::new, |(value, punct)| {
-        enumerator_interpretations(&value, &punct).into_iter().map(|(family, ordinal, _)| (family, ordinal)).collect()
-    })
-}
-
 /// The levels a run of headings' (or a contents list's entries') enumerators take on the engine's
 /// heading ladder (`parse_heading_ladder`, the Text-Fidelity grammar the readers level numbered
 /// headings with): each enumerator in every family it can be read in ("C." a letter or a numeral), a

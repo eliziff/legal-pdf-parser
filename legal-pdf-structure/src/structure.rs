@@ -313,10 +313,7 @@ fn prepare_reader(
         );
         changed
     });
-    // LEGALPDF_ABLATE=quotations leaves the quotation reader out, for its measure under the tagger.
-    primitives.quotations = legal_pdf_support::profile::measure("reader.quotations", || {
-        if legal_structure_model::ablated("quotations") { quotations::Reading::default() } else { quotations::read(pages, &primitives) }
-    });
+    primitives.quotations = quotations::Reading::default();
     // LEGALPDF_ABLATE=sequence leaves the quoted-paragraph sequence reader out, for its measure under the tagger.
     let sequences = legal_pdf_support::profile::measure("reader.sequence", || {
         if legal_structure_model::ablated("sequence") { Vec::new() } else { numbered_paragraphs::foreign_numbered_paragraphs(pages, &primitives) }
