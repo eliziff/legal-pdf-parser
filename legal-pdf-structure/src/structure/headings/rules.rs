@@ -112,7 +112,7 @@ const ATTACHMENTS: [&str; 5] = ["schedule", "appendix", "annex", "exhibit", "ann
 /// A heading's enumerator as the ladder reads it, (value, punctuation): from the parser's own heading
 /// patterns, a bracketed one ("(a)" read as "a" in brackets), or a division word's numeral ("PART IV",
 /// "ARTICLE 5"), the word standing for the punctuation so that each word counts its own family.
-fn enumerator(text: &str) -> Option<(String, String)> {
+pub(crate) fn enumerator(text: &str) -> Option<(String, String)> {
     static DIVISION: OnceLock<Regex> = OnceLock::new();
     static BRACKETED: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
@@ -124,6 +124,13 @@ fn enumerator(text: &str) -> Option<(String, String)> {
         return Some((value.to_owned(), punct.to_owned()));
     }
     pattern(&BRACKETED, r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
+}
+
+/// The places a heading's enumerator can hold, (family, ordinal), in every family it reads in.
+pub(crate) fn ordinals(text: &str) -> Vec<(String, u32)> {
+    enumerator(text).map_or_else(Vec::new, |(value, punct)| {
+        enumerator_interpretations(&value, &punct).into_iter().map(|(family, ordinal, _)| (family, ordinal)).collect()
+    })
 }
 
 /// The levels a run of headings' (or a contents list's entries') enumerators take on the engine's

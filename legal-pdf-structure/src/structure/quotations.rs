@@ -10,6 +10,7 @@
 //! A quotation runs on over a page break and keeps its own headings, numbered paragraphs and lists;
 //! deeper insets are read against that passage's margins.
 
+use super::headings::rules::ordinals;
 use super::{DocumentContext, PdfPrimitiveEvidence};
 use legal_pdf_core::{layout_analysis, BOLD, ITALIC};
 use legal_pdf_core::model::{Line, Page, Span};
@@ -394,9 +395,13 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
             let middle = (row.bbox[1] + row.bbox[3]) / 2.0;
             middle < 0.1 * height || middle > 0.9 * height
         };
+        // The last place each numbering family of the document's own headings reached: a block
+        // opening with the next ("IV." after "III.") is the document's next part, not an extract.
+        let mut reached = HashMap::<String, u32>::new();
         let mut start = 0;
         while start < rows.len() {
             if !set_in(&rows[start]) {
+                own_heading(&mut reached, rows[start]);
                 start += 1;
                 continue;
             }
@@ -446,7 +451,11 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
                     last_line: last.text(),
                 })
             });
-            if quotation(&block, introduction.as_ref(), &body, justified, &measure) {
+            let continues = opens_with_heading(&block)
+                && ordinals(&block[0].text()).iter().any(|(family, n)| *n > 1 && reached.get(family) == Some(&(n - 1)));
+            if continues || !quotation(&block, introduction.as_ref(), &body, justified, &measure) {
+                own_heading(&mut reached, block[0]);
+            } else {
                 let id = format!("quotation:{}", block[0].lines[0].id);
                 if let Some(introduction) = &introduction {
                     quoted
@@ -468,6 +477,13 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
         }
     }
     quoted
+}
+
+/// Where a row opens one of the document's own headings, the places its numbering reaches.
+fn own_heading(reached: &mut HashMap<String, u32>, row: &Row<'_>) {
+    if opens_with_heading(&[row]) {
+        reached.extend(ordinals(&row.text()));
+    }
 }
 
 fn opens_with_heading(block: &[&Row<'_>]) -> bool {
