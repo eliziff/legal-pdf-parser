@@ -1,16 +1,15 @@
 //! PageIndex Flash's heading depth and outline stack.
 //!
 //! Ported from VectifyAI/PageIndex `pageindex/flash/outline_assembly/style_context.py`
-//! (`compare_heading_depth`, `_apply_heading_to_state`), `selection.py` (`find_parent_heading`,
-//! the font-distance rule of `should_reject_heading`) at 6d23caf416858f2ca136840305d1f479a86f6ef7.
+//! (`compare_heading_depth`, `_apply_heading_to_state`) and `selection.py` (`find_parent_heading`)
+//! at 6d23caf416858f2ca136840305d1f479a86f6ef7.
 //! Copyright (c) 2025 Vectify AI; MIT License, reproduced in `mod.rs`.
 
 use super::detect::Block;
 use super::stats::DocStats;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 
-/// Upstream types: 0 plain, 1 numbered, 11 introduction; 2 is a PDF Hn, 12 set apart by type.
+/// Upstream types: 0 plain, 1 numbered; 2 is a PDF Hn, 12 set apart by type.
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub(super) block: usize,
@@ -45,9 +44,6 @@ impl Context<'_> {
                 (Some(left), Some(right)) if left < right => 1,
                 _ => -1,
             };
-        }
-        if a.kind == 11 && b.level == Some(1) {
-            return -1;
         }
         let (left, right) = (&self.blocks[a.block].flash, &self.blocks[b.block].flash);
         let styles_known = !self.blocks[a.block].fontless && !self.blocks[b.block].fontless;
@@ -104,68 +100,4 @@ impl Context<'_> {
         None
     }
 
-}
-
-/// The font-distance rule of upstream `should_reject_heading`: a plain heading whose first-line
-/// font style no other candidate shares within 0.9pt stands alone and is no heading, unless it
-/// is in capitals close above the body it heads.
-/// Each candidate's fonts for [`stands_alone`]: the style (font and weight, as a number standing
-/// for its name) and size of each distinct style key among its first line's lettered spans.
-pub(super) fn candidate_fonts(context: &Context<'_>, candidates: &[Candidate]) -> Vec<Vec<(usize, f64)>> {
-    let mut styles = HashMap::new();
-    candidates
-        .iter()
-        .map(|candidate| {
-            let flash = &context.blocks[candidate.block].flash;
-            let mut seen = HashSet::new();
-            let mut entries = Vec::new();
-            if let Some(line) = flash.lines.first() {
-                for span in &line.spans {
-                    if span.stats.letters() == 0 || span.font_name.is_empty() {
-                        continue;
-                    }
-                    if seen.insert(span.style_key()) {
-                        let next = styles.len();
-                        entries.push((*styles.entry(span.font_style()).or_insert(next), span.size));
-                    }
-                }
-            }
-            entries
-        })
-        .collect()
-}
-
-pub(super) fn stands_alone(
-    context: &Context<'_>,
-    candidates: &[Candidate],
-    fonts: &[Vec<(usize, f64)>],
-    index: usize,
-    body_below_gap: Option<f64>,
-) -> bool {
-    let own = &fonts[index];
-    // Missing font evidence cannot establish an isolated font style.
-    if own.is_empty() {
-        return false;
-    }
-    let mut distance = f64::INFINITY;
-    for (other_index, other) in fonts.iter().enumerate() {
-        if other_index == index {
-            continue;
-        }
-        for &(style, size) in other {
-            for &(own_style, own_size) in own {
-                if own_style == style {
-                    distance = distance.min((own_size - size).abs());
-                }
-            }
-        }
-    }
-    if distance <= 0.9 {
-        return false;
-    }
-    if distance.is_infinite() {
-        return true;
-    }
-    let flash = &context.blocks[candidates[index].block].flash;
-    !(flash.caps_heavy() && body_below_gap.is_some_and(|gap| gap < 5.0 * flash.rect.height()))
 }

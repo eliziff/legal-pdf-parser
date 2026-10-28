@@ -132,12 +132,6 @@ pub(crate) fn heading_candidates(pages: &[Page], primitives: &PdfPrimitiveEviden
             // "v." alone between two parties' names is the style of cause's versus.
             let versus = value == "v" && punct == ".";
             let interpretations = enumerator_interpretations(value, punct);
-            if !(!versus
-                && heading_title_plausible(&page.lines[follower_slot], text)
-                && !interpretations.is_empty())
-            {
-                heading_source_trace(&page.lines[follower_slot], if interpretations.is_empty() { "standalone-noint" } else { "standalone-implausible" });
-            }
             if !versus
                 && heading_title_plausible(&page.lines[follower_slot], text)
                 && !interpretations.is_empty()
@@ -250,311 +244,6 @@ pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     bracket_excess(previous_text) > 0 && closes_before_opening(current_text)
 }
 
-/// The lines an enumerated heading's title wraps onto: set in its type, flush under it or centred
-/// beneath it, at its leading, with the body resuming further down. A title can run to
-/// several lines, end in a question, and name a decision ("... 2021 ABCA 273, 30" /
-/// "Alta. L.R. (7th) 1 (...)") when the whole title still reads as one.
-///
-/// A line in capitals that no enumerator announces (`capitals`) is a title only in words, at
-/// least eight letters of them, and continues only in capitals and only on evidence that the
-/// next line is its continuation (`continues_capitals_title`): a stamp ("CMD 25-M35#"), a date
-/// under a title, or names and addresses stacked line by line are no wrapped title.
-pub(crate) fn wrapped_heading_continuations(
-    page: &Page,
-    heading_slot: usize,
-    structural: &HashSet<(usize, usize)>,
-    page_slot: usize,
-    primitives: &PdfPrimitiveEvidence,
-    capitals: bool,
-) -> Vec<usize> {
-    const MAX_WRAPPED_LINES: usize = 3;
-    let heading = &page.lines[heading_slot];
-    let heading_text = heading.text.trim();
-    let letters = heading_text
-        .chars()
-        .filter(|character| character.is_alphabetic())
-        .count();
-    let caps_head = (capitals || heading_text.split_whitespace().count() >= 2)
-        && letters >= 8
-        && !heading_text.chars().any(char::is_lowercase)
-        && !heading_text.ends_with(['.', '?', '!', ';', ':']);
-    if !has_valid_bbox(heading) || capitals && !caps_head {
-        return Vec::new();
-    }
-    let mut title = title_after_enumerator(heading_text).to_owned();
-    let heading_size = line_font_size(heading);
-    let heading_height = (heading.bbox[3] - heading.bbox[1]).max(1.0);
-    let centre_tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
-    let mut wrapped = Vec::new();
-    let mut previous_slot = heading_slot;
-    let mut previous = heading;
-    let native_role = |line: &Line| {
-        primitives
-            .source_regions
-            .as_ref()
-            .and_then(|regions| regions.get(&line.id))
-            .filter(|role| legal_pdf_core::is_heading_role(role))
-    };
-    for slot in heading_slot + 1..page.lines.len().min(heading_slot + 1 + MAX_WRAPPED_LINES) {
-        let continuation = &page.lines[slot];
-        let continuation_text = continuation.text.trim();
-        let continuation_size = line_font_size(continuation);
-        let continuation_height = (continuation.bbox[3] - continuation.bbox[1]).max(1.0);
-        let x0_delta = continuation.bbox[0] - heading.bbox[0];
-        let internal_gap = continuation.bbox[1] - previous.bbox[3];
-        let joined = format!("{title} {continuation_text}");
-        let cited = layout_analysis().has_citation_signal(&joined);
-        let same_size = if heading_size > 0.0 && continuation_size > 0.0 {
-            (continuation_size - heading_size).abs() <= (heading_size * 0.02).max(0.1)
-        } else {
-            // Without font spans, the measured line heights below are the size witness.
-            heading.spans.is_empty() && continuation.spans.is_empty()
-        };
-        let continues = !structural.contains(&(page_slot, slot))
-            && primitives.contexts.translation_line_ids.contains(&heading.id)
-                == primitives.contexts.translation_line_ids.contains(&continuation.id)
-            && native_role(heading) == native_role(continuation)
-            && !continuation.exclude_from_body
-            && !primitives.claims.claimed(&continuation.id)
-            && primitives
-                .source_regions
-                .as_ref()
-                .and_then(|regions| regions.get(&continuation.id))
-                .is_none_or(|region| {
-                    matches!(region.as_str(), "text" | "body" | "block_quote")
-                        || legal_pdf_core::is_heading_region(region)
-                })
-            && matches!(continuation.region_type.as_str(), "body" | "heading")
-            && (1..=12).contains(&continuation_text.split_whitespace().count())
-            // A title's line opens on a word; a caption's bracket column (")", "§") is no title.
-            && continuation_text.starts_with(|character: char| {
-                character.is_alphanumeric() || "(['\"\u{2018}\u{201c}".contains(character)
-            })
-            && !(caps_head && continuation_text.chars().any(char::is_lowercase))
-            && (!sentence_ended(continuation_text) || continuation_text.ends_with('?') || cited)
-            && !starts_note_or_list(continuation_text)
-            && (!cited || heading_title_plausible(heading, &joined))
-            && has_valid_bbox(continuation)
-            && same_size
-            && (bold_char_share(continuation) - bold_char_share(heading)).abs() <= 0.1
-            && (continuation_height - heading_height).abs() <= heading_height * 0.05
-            && ((-3.0..=48.0_f64.max(heading_height * 1.75)).contains(&x0_delta)
-                || (line_center_x(continuation) - line_center_x(heading)).abs()
-                    <= centre_tolerance)
-            && (-heading_height * 0.2..=(heading_height * 0.8).max(6.0)).contains(&internal_gap)
-            && (!capitals
-                || continues_capitals_title(page, heading_slot, previous_slot, slot, &title));
-        if !continues {
-            break;
-        }
-        wrapped.push(slot);
-        title = joined;
-        previous_slot = slot;
-        previous = continuation;
-        if continuation_text.ends_with('?') {
-            break;
-        }
-    }
-    // The body resumes below the title's last line, further than the title's own leading, or
-    // in lower case under a title in capitals.
-    while let Some(&last) = wrapped.last() {
-        let line = &page.lines[last];
-        let above = if last == heading_slot + 1 {
-            heading
-        } else {
-            &page.lines[last - 1]
-        };
-        let resumed = page.lines.get(last + 1).is_some_and(|following| {
-            following.region_type == "body"
-                && !following.exclude_from_body
-                && !primitives.claims.claimed(&following.id)
-                && primitives
-                    .source_regions
-                    .as_ref()
-                    .and_then(|regions| regions.get(&following.id))
-                    .is_none_or(|region| matches!(region.as_str(), "text" | "body"))
-                && has_valid_bbox(following)
-                && (following.bbox[1] - line.bbox[1]
-                    >= line.bbox[1] - above.bbox[1]
-                        + ((line.bbox[3] - line.bbox[1]) * 0.5).max(8.0)
-                    || caps_head && following.text.chars().any(char::is_lowercase))
-        });
-        if resumed {
-            break;
-        }
-        wrapped.pop();
-    }
-    wrapped
-}
-
-/// Whether the line at `slot` carries on the title in capitals that ends at `above_slot`. Lines
-/// stacked at one leading are each complete (counsel's names, an address, a date under a title)
-/// unless the words run on across the break ("... COURT OF APPEAL FOR" / "ALBERTA"), the line
-/// above was full (its next word would not fit within the title's or the page's widest line),
-/// the lines are centred on one axis as a caption is ("IN THE UNITED STATES DISTRICT COURT" /
-/// "FOR THE SOUTHERN DISTRICT OF TEXAS" / "HOUSTON DIVISION"), or the title closes at the line
-/// and stands apart: what precedes it and what follows the line are set further off than its
-/// leading or on another alignment. A date carries on a title only when the words run on into
-/// it ("ORDERS FOR JUNE 18 THROUGH" / "JUNE 29, 2020").
-pub(crate) fn continues_capitals_title(
-    page: &Page,
-    heading_slot: usize,
-    above_slot: usize,
-    slot: usize,
-    title: &str,
-) -> bool {
-    let above = &page.lines[above_slot];
-    let line = &page.lines[slot];
-    let text = line.text.trim();
-    let runs_on = title_runs_on(title);
-    if date_line(text) {
-        return runs_on;
-    }
-    let first_word = text.split_whitespace().next().unwrap_or_default();
-    if runs_on || text.starts_with('(') || run_on_word(first_word) {
-        return true;
-    }
-    let tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
-    let flush_left = (above.bbox[0] - line.bbox[0]).abs() <= 3.0;
-    let flush_right = (above.bbox[2] - line.bbox[2]).abs() <= 3.0;
-    let centred = (line_center_x(above) - line_center_x(line)).abs() <= tolerance;
-    if centred && !flush_left && !flush_right {
-        return true;
-    }
-    let width = |candidate: &Line| candidate.bbox[2] - candidate.bbox[0];
-    let size = line_font_size(line);
-    let first_word_width = line.words.first().map_or_else(
-        || width(line) * first_word.chars().count() as f64 / text.chars().count().max(1) as f64,
-        |word| word.bbox[2] - word.bbox[0],
-    );
-    let needed = width(above) + size * 0.25 + first_word_width;
-    let same_type = |candidate: &Line| {
-        has_valid_bbox(candidate) && (line_font_size(candidate) - size).abs() <= 0.3
-    };
-    let shares_axis = |candidate: &Line| {
-        if flush_left {
-            (candidate.bbox[0] - above.bbox[0]).abs() <= 3.0
-        } else if flush_right {
-            (candidate.bbox[2] - above.bbox[2]).abs() <= 3.0
-        } else {
-            (line_center_x(candidate) - line_center_x(above)).abs() <= tolerance
-        }
-    };
-    let full_within = |measure: Option<f64>| {
-        measure.is_some_and(|measure| measure >= width(above) - 1.0 && needed > measure)
-    };
-    // The title's measure is set by its other lines, down to one leading below this one; the
-    // page's by any line but the one above.
-    let leading = line.bbox[1] - above.bbox[1];
-    let title_measure = page
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(other, candidate)| {
-            (heading_slot..=heading_slot + 4).contains(other)
-                && *other != above_slot
-                && *other != slot
-                && candidate.bbox[1] <= line.bbox[1] + leading + 2.0
-                && same_type(candidate)
-                && shares_axis(candidate)
-        })
-        .map(|(_, candidate)| width(candidate))
-        .max_by(f64::total_cmp);
-    let page_measure = page
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(other, candidate)| *other != above_slot && same_type(candidate))
-        .map(|(_, candidate)| width(candidate))
-        .max_by(f64::total_cmp);
-    if full_within(title_measure) || full_within(page_measure) {
-        return true;
-    }
-    // The title closes at this line when it stands apart: what precedes its first line and what
-    // follows this one are set further off than its leading or on another alignment.
-    let apart = |near: &Line, edge: &Line| {
-        (near.bbox[1] - edge.bbox[1]).abs()
-            >= leading + ((edge.bbox[3] - edge.bbox[1]) * 0.5).max(8.0)
-            || (near.bbox[0] - edge.bbox[0]).abs() > 3.0
-                && (near.bbox[2] - edge.bbox[2]).abs() > 3.0
-                && (line_center_x(near) - line_center_x(edge)).abs() > 3.0
-    };
-    let first = &page.lines[heading_slot];
-    page.lines[..heading_slot]
-        .iter()
-        .rev()
-        .find(|candidate| has_valid_bbox(candidate) && candidate.bbox[3] <= first.bbox[1] + 1.0)
-        .is_none_or(|preceding| apart(preceding, first))
-        && page.lines[slot + 1..]
-            .iter()
-            .find(|candidate| has_valid_bbox(candidate) && candidate.bbox[1] >= line.bbox[3] - 1.0)
-            .is_none_or(|below| apart(below, line))
-}
-
-/// A word a title's line can break after or open on: an article, a conjunction or a preposition.
-pub(crate) fn run_on_word(word: &str) -> bool {
-    const WORDS: &[&str] = &[
-        "A",
-        "AN",
-        "THE",
-        "AND",
-        "OR",
-        "NOR",
-        "BUT",
-        "OF",
-        "FOR",
-        "TO",
-        "IN",
-        "ON",
-        "AT",
-        "BY",
-        "WITH",
-        "FROM",
-        "INTO",
-        "UPON",
-        "UNDER",
-        "OVER",
-        "THROUGH",
-        "BETWEEN",
-        "AGAINST",
-        "ABOUT",
-        "AS",
-        "V",
-        "VS",
-        "VERSUS",
-        "INCLUDING",
-        "REGARDING",
-        "CONCERNING",
-        "WITHIN",
-        "WITHOUT",
-        "&",
-        "DE",
-        "DU",
-        "DES",
-        "LA",
-        "LE",
-        "LES",
-        "ET",
-        "EN",
-        "AU",
-        "AUX",
-        "POUR",
-        "SUR",
-        "PAR",
-    ];
-    let word = word.trim_end_matches('.').to_uppercase();
-    WORDS.contains(&word.as_str())
-}
-
-/// Whether a title's words run on past its line: it breaks after a run-on word, a comma, a dash,
-/// a slash or an ampersand, or inside a bracket.
-pub(crate) fn title_runs_on(title: &str) -> bool {
-    let title = title.trim_end();
-    title.ends_with([',', '-', '\u{2013}', '\u{2014}', '/', '&'])
-        || title.split_whitespace().last().is_some_and(run_on_word)
-        || bracket_excess(title) > 0
-}
-
 /// A line that is only a date: "10 JUNE 2026", "DATED 11 JUNE 2026", "June 29, 2020", "1/4/2025".
 pub(crate) fn date_line(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -652,15 +341,6 @@ pub(crate) fn title_case_headings(page: &Page, primitives: &PdfPrimitiveEvidence
     found
 }
 
-/// With LEGALPDF_HEADING_TRACE set, a heading taken by a rule other than the enumerated ladder.
-pub(crate) fn heading_source_trace(line: &Line, why: &str) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_HEADING_TRACE").is_some()) {
-        let text: String = line.text.trim().chars().take(48).collect();
-        eprintln!("hsrc	{}	{}	{why}	{text}", line.page_index, line.id);
-    }
-}
-
 pub(crate) fn apply_text_fidelity_headings(
     pages: &mut [Page],
     primitives: &PdfPrimitiveEvidence,
@@ -674,15 +354,13 @@ pub(crate) fn apply_text_fidelity_headings(
             .map(|line| line.bbox[1])
             .min_by(f64::total_cmp);
         for line in &mut page.lines {
-            if line.region_type == "heading" {
-                heading_source_trace(line, "upstream");
-            }
             // A line a container claimed is no heading, whatever its source tagged it.
             if matches!(line.region_type.as_str(), "body" | "heading") && primitives.claims.claimed(&line.id) {
                 line.region_type = "body".to_owned();
                 continue;
             }
             if line.region_type == "body"
+                && !legal_structure_model::ablated("native_contents_heading")
                 && !line.exclude_from_body
                 && contents_heading(&line.text)
                 && listed_top.is_some_and(|top| line.bbox[3] <= top)
@@ -692,16 +370,12 @@ pub(crate) fn apply_text_fidelity_headings(
             }
         }
     }
-    let mut capitalised = Vec::new();
-
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        if primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
+    for page in pages.iter_mut() {
+        if legal_structure_model::ablated("native_title_case") || primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
             continue;
         }
         for line_slot in title_case_headings(page, primitives) {
-            heading_source_trace(&page.lines[line_slot], "title");
             page.lines[line_slot].region_type = "heading".to_owned();
-            capitalised.push((page_slot, line_slot));
         }
     }
 
@@ -754,40 +428,6 @@ pub(crate) fn apply_text_fidelity_headings(
                 .map(|line| (line.id.clone(), level))
         })
         .collect::<HashMap<_, _>>();
-    let structural: HashSet<(usize, usize)> = decisions
-        .iter()
-        .flat_map(|decision| {
-            [
-                Some((decision.page_slot, decision.line_slot)),
-                decision
-                    .joined_line_slot
-                    .map(|line| (decision.page_slot, line)),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        .collect();
-
-    // A title in capitals can wrap ("ON APPEAL FROM THE COURT OF APPEAL FOR" / "ALBERTA").
-    for (page_slot, line_slot) in capitalised {
-        if structural.contains(&(page_slot, line_slot))
-            || pages[page_slot].lines[line_slot].region_type != "heading"
-        {
-            continue;
-        }
-        let block = pages[page_slot].lines[line_slot].block_index;
-        for continuation_slot in wrapped_heading_continuations(
-            &pages[page_slot],
-            line_slot,
-            &structural,
-            page_slot,
-            primitives,
-            true,
-        ) {
-            pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
-            pages[page_slot].lines[continuation_slot].block_index = block;
-        }
-    }
     for decision in &decisions {
         let page_slot = decision.page_slot;
         let marker_slot = decision.line_slot;
@@ -805,21 +445,6 @@ pub(crate) fn apply_text_fidelity_headings(
             let block = pages[page_slot].lines[target_slot].block_index;
             pages[page_slot].lines[marker_slot].region_type = "heading".to_owned();
             pages[page_slot].lines[marker_slot].block_index = block;
-        }
-        for continuation_slot in wrapped_heading_continuations(
-            &pages[page_slot],
-            target_slot,
-            &structural,
-            page_slot,
-            primitives,
-            false,
-        ) {
-            let block = pages[page_slot].lines[target_slot].block_index;
-            pages[page_slot].lines[continuation_slot].region_type = "heading".to_owned();
-            pages[page_slot].lines[continuation_slot].block_index = block;
-            if let Some(level) = decision.level {
-                heading_levels.insert(pages[page_slot].lines[continuation_slot].id.clone(), level);
-            }
         }
     }
     let accepted = pages

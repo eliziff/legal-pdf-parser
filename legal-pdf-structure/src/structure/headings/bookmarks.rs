@@ -389,7 +389,8 @@ pub(crate) fn reconcile_bookmarks(
     let mut last = HashMap::<DocumentContext, (usize, usize)>::new();
     for (index, entry) in entries.iter().enumerate() {
         let title = normalize_title(&entry.title);
-        let Some(&target) = slot_of_page.get(&(entry.page - 1)) else {
+        // A title of no words ("-----") names no line.
+        let Some(&target) = slot_of_page.get(&(entry.page - 1)).filter(|_| title.chars().count() >= 2) else {
             continue;
         };
         let window = [Some(target), target.checked_add(1), target.checked_sub(1)];
@@ -404,7 +405,7 @@ pub(crate) fn reconcile_bookmarks(
                     if order > 0 && contents_pages.contains(&page.index) {
                         return None;
                     }
-                    (0..page.lines.len()).find_map(|start| {
+                    (0..page.lines.len()).filter(|&start| !norms[page_slot][start].is_empty()).find_map(|start| {
                         let block = page.lines[start].block_index;
                         let mut joined = String::new();
                         let mut heading = true;

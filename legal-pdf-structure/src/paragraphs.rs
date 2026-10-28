@@ -177,8 +177,6 @@ pub(crate) struct Measure {
     /// column, not its full-width title; a brief's text measure, not the short lines of its page
     /// of counsel.
     width: f64,
-    /// A scanned line's median box height.
-    height: f64,
     /// The median blank between two scanned lines stacked in one column, counted up to 1.25 line
     /// heights: a paragraph's own leading, not the space between paragraphs.
     gap: f64,
@@ -230,7 +228,7 @@ pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) 
             })
             .collect(),
     );
-    Measure { width, height: line_height, gap, pitch }
+    Measure { width, gap, pitch }
 }
 
 impl Pitch {
