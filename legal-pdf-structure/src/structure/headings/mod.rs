@@ -5,13 +5,14 @@
 //! 1. `native`: each page's own readers, per reading context outside quotations (a source's heading
 //!    tags, the numbering ladder's headings and their wrapped titles, title-case lines on
 //!    recognized pages).
-//! 2. The typography of the whole document (PageIndex Flash, the `legal-pdf-headings` crate), with
-//!    every heading's depth.
-//! 3. `bookmarks` and `contents`: the document's bookmarks and printed contents list, merged into
+//! 2. `bookmarks` and `contents`: the document's bookmarks and printed contents list, merged into
 //!    one outline and reconciled with the lines they name.
-//! 4. `rules` (a composed decision, after the readers' state is cached): the whole-document rules
+//! 3. `rules` (a composed decision, after the readers' state is cached): the whole-document rules
 //!    that demote what is no heading, promote a transcript's parts, lift lines set apart, and level
 //!    every heading.
+//!
+//! The structure tagger (the engine's fast ML tier) reads these as its tier 0 and re-labels the
+//! regions; the typography reader that stood here (a PageIndex Flash port) read no better under it.
 //!
 //! Each line's heading trail records every pass and rule that made it a heading or took that away
 //! (`mark`, `stamp`): a parse's rows carry it, so each one's catches can be counted on the gold.
@@ -73,35 +74,6 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         primitives.headings.heading_levels = levels;
     });
     stamp(pages, &mut primitives.headings.trail, "native");
-    // LEGALPDF_ABLATE=styled leaves the typography reader out, for the measure of what it adds
-    // under the tagger.
-    if !legal_structure_model::ablated("styled") { legal_pdf_support::profile::measure("prepare.styled_headings", || {
-        let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids).cloned().collect::<HashSet<_>>();
-        let excluded = |id: &str| claimed.contains(id);
-        let numbered = |text: &str| enumerated(text);
-        let translation = |id: &str| primitives.contexts.translation_line_ids.contains(id);
-        constituents::within_document_contexts(
-            pages,
-            &primitives.contexts.reading_line_ids,
-            &primitives.contexts.translation_line_ids,
-            |document| {
-                legal_pdf_headings::reconcile_styled_headings(
-                    document,
-                    legal_pdf_headings::HeadingEvidence {
-                        quotation: document.iter().flat_map(|page| &page.lines)
-                            .any(|line| primitives.quotations.scopes.contains_key(&line.id)),
-                        levels: &mut primitives.headings.heading_levels,
-                        excluded: &excluded,
-                        translation: &translation,
-                        contents_pages: &primitives.claims.contents_pages,
-                        numbered: &numbered,
-                        source_regions: primitives.source_regions.as_ref(),
-                    },
-                );
-            },
-        );
-    }); }
-    stamp(pages, &mut primitives.headings.trail, "styled");
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks and its printed contents list, read together.
         let authored = bookmarks::usable(outline, pages.len());
