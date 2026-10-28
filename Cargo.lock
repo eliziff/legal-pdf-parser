@@ -992,15 +992,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "legal-pdf-extraction"
-version = "0.1.0"
-dependencies = [
- "legal-pdf-core",
- "legal-pdf-extraction-processor",
- "pdf-inspector",
-]
-
-[[package]]
 name = "legal-pdf-extraction-processor"
 version = "0.1.0"
 dependencies = [
@@ -1057,7 +1048,7 @@ name = "legal-pdf-parser"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
- "legal-pdf-extraction",
+ "legal-pdf-extraction-processor",
  "legal-pdf-language",
  "legal-pdf-ocr",
  "legal-pdf-structure",
@@ -1082,6 +1073,7 @@ dependencies = [
  "legal-pdf-tables",
  "legal-pdf-witnesses",
  "legal-structure-model",
+ "pdf-inspector",
  "regex",
  "serde",
  "serde_json",
@@ -1096,7 +1088,7 @@ dependencies = [
  "legal-pdf-core",
  "legal-structure-model",
  "libloading",
- "ort",
+ "pdf-inspector",
  "regex",
  "serde",
  "serde_json",
@@ -1136,6 +1128,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "legal-structure-features"
+version = "0.1.0"
+dependencies = [
+ "legal-structure",
+ "legal-structure-model",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "unicode-normalization",
 ]
 
@@ -1159,6 +1163,7 @@ dependencies = [
  "diff-match-patch-rs 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "legal-pdf-core",
  "legal-structure",
+ "legal-structure-features",
  "legal-structure-model",
  "ort",
  "regex",
