@@ -48,6 +48,25 @@ pub struct PdfRequest {
     #[cfg(not(feature = "ppdoc"))]
     #[serde(default, deserialize_with = "present")]
     layout: Option<serde::de::IgnoredAny>,
+    /// The structure tagger over the parse (the fast ML tier), as `ocr` and `layout` name their
+    /// providers: `{"provider": "gru", "settings": {"model_pack": DIR, "threads": N}}`.
+    #[cfg(feature = "tagger")]
+    #[serde(default, deserialize_with = "present")]
+    tagger: Option<TaggerRequest>,
+    #[cfg(not(feature = "tagger"))]
+    #[serde(default, deserialize_with = "present")]
+    tagger: Option<serde::de::IgnoredAny>,
+}
+
+#[cfg(feature = "tagger")]
+#[derive(Deserialize)]
+#[serde(tag = "provider", deny_unknown_fields)]
+enum TaggerRequest {
+    #[serde(rename = "gru")]
+    Gru {
+        #[serde(default)]
+        settings: crate::tagger::TaggerOptions,
+    },
 }
 
 #[cfg(feature = "ocr")]
@@ -174,6 +193,16 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     if request.layout.is_some() {
         return Err(Error::Message(
             "layout requires a legalpdf binary built with a layout feature".to_owned(),
+        ));
+    }
+    #[cfg(feature = "tagger")]
+    if let Some(TaggerRequest::Gru { settings }) = &request.tagger {
+        options.tagger = Some(settings.clone());
+    }
+    #[cfg(not(feature = "tagger"))]
+    if request.tagger.is_some() {
+        return Err(Error::Message(
+            "tagger requires a legalpdf binary built with the tagger feature".to_owned(),
         ));
     }
     Ok(options)

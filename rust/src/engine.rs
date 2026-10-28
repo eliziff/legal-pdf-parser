@@ -312,6 +312,10 @@ pub(crate) struct ParseOptions {
     pub ocr_pages: Option<Vec<usize>>,
     #[cfg(feature = "ppdoc")]
     pub ppdoc: Option<PPDocOptions>,
+    /// The structure tagger the request names; none where the parse is tier 0 alone (or
+    /// LEGALPDF_TAGGER_MODEL names one, for the structure gold's grader).
+    #[cfg(feature = "tagger")]
+    pub tagger: Option<crate::tagger::TaggerOptions>,
 }
 
 impl Default for ParseOptions {
@@ -331,6 +335,8 @@ impl Default for ParseOptions {
             ocr_pages: None,
             #[cfg(feature = "ppdoc")]
             ppdoc: None,
+            #[cfg(feature = "tagger")]
+            tagger: None,
         }
     }
 }
@@ -399,12 +405,15 @@ fn cache_key(
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
     semantic_profile: Option<DetectionProfile>,
+    tagger_identity: Option<&str>,
 ) -> Result<String> {
     let value = json!({
         "source_sha256": source_hash,
         "schema_version": SCHEMA_VERSION,
         "parser_version": PARSER_VERSION,
         "engine_code": identity,
+        "tagger_provider": tagger_identity.map(|_| "gru"),
+        "tagger_identity": tagger_identity,
         "ocr_provider": ocr_provider.map(|provider| provider.0),
         "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
         "ocr_source_sha256": ocr_provider
@@ -500,12 +509,19 @@ fn finish_recognition(
 
 /// A recognized extraction's structure, checked and projected as the document consumers read;
 /// `pages`, where given, receives the pages as the structure stage left them.
+/// The tagger a parse runs: the request's, where the build carries one.
+#[cfg(feature = "tagger")]
+type TaggerChoice<'a> = Option<&'a crate::tagger::TaggerOptions>;
+#[cfg(not(feature = "tagger"))]
+type TaggerChoice<'a> = Option<&'a ()>;
+
 fn derive_document(
     mut extracted: ExtractedPdf,
     source_hash: &str,
     key: &str,
     cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
+    #[cfg_attr(not(feature = "tagger"), allow(unused_variables))] tagger: TaggerChoice<'_>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
     let document_id = format!("doc-{}", &source_hash[..20]);
@@ -518,7 +534,7 @@ fn derive_document(
     // nodes: regions, starts, markers and heading levels from the model, parents by the
     // hierarchy rule (legal-structure-tagger).
     #[cfg(feature = "tagger")]
-    profile::measure("derive_document.tagger", || crate::tagger::retag(&mut derived.structure_graph, &extracted.pages, source_hash))?;
+    profile::measure("derive_document.tagger", || crate::tagger::retag(&mut derived.structure_graph, &extracted.pages, source_hash, tagger))?;
     profile::measure("build.validate_document", || {
         validate_pdf_components(
             &document_id,
@@ -652,7 +668,7 @@ pub fn gold_structure_document(
     source_hash: &str,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    derive_document(extracted, source_hash, "structure-gold", None, None, pages)
+    derive_document(extracted, source_hash, "structure-gold", None, None, None, pages)
 }
 
 fn build_document(
@@ -888,6 +904,10 @@ pub(crate) fn parse_pdf(
     } else {
         ocr_identity
     };
+    #[cfg(feature = "tagger")]
+    let tagger_identity = crate::tagger::identity(options.tagger.as_ref())?;
+    #[cfg(not(feature = "tagger"))]
+    let tagger_identity: Option<String> = None;
     let key = cache_key(
         &source_hash,
         identity,
@@ -897,6 +917,7 @@ pub(crate) fn parse_pdf(
         ppdoc_identity.as_deref(),
         options.ocr_pages.as_deref(),
         options.profile,
+        tagger_identity.as_deref(),
     )?;
     if let Some(root) = &cache_root {
         if let Some(cached) = cached_document(root, &key, &source_hash) {
@@ -915,7 +936,11 @@ pub(crate) fn parse_pdf(
         ppdoc: ppdoc_prepared.take(),
     };
     let extracted = recognized_extraction(bytes, &source_hash, options, cache_root.as_deref(), providers, progress)?;
-    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, None)?;
+    #[cfg(feature = "tagger")]
+    let tagger = options.tagger.as_ref();
+    #[cfg(not(feature = "tagger"))]
+    let tagger = None;
+    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, tagger, None)?;
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
         let cache_path = parse_cache_root(root)
