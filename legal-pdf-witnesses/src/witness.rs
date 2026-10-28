@@ -248,19 +248,28 @@ pub fn list_lead_in(text: &str) -> bool {
         .is_some_and(|word| LEAD_WORDS.contains(&word.to_lowercase().as_str()))
 }
 
+/// The patterns as one set, each line read once for all of them: (marker families, line flags).
+fn sets() -> &'static (regex::RegexSet, regex::RegexSet) {
+    static SETS: OnceLock<(regex::RegexSet, regex::RegexSet)> = OnceLock::new();
+    SETS.get_or_init(|| {
+        let set = |patterns: &[&Regex]| regex::RegexSet::new(patterns.iter().map(|re| re.as_str())).expect("witness patterns");
+        (
+            set(&[bullet(), paren_num(), paren_letter(), paren_roman(), decimal(), num(), num_bare(), letter(), roman(), word_marker()]),
+            set(&[court(), address(), party(), citation(), defined(), leader(), form_number(), bare()]),
+        )
+    })
+}
+
 fn families(text: &str) -> [bool; 10] {
-    [
-        bullet().is_match(text),
-        paren_num().is_match(text),
-        paren_letter().is_match(text),
-        paren_roman().is_match(text),
-        decimal().is_match(text),
-        num().is_match(text),
-        num_bare().is_match(text),
-        letter().is_match(text),
-        roman().is_match(text),
-        word_marker().is_match(text),
-    ]
+    let matched = sets().0.matches(text);
+    std::array::from_fn(|n| matched.matched(n))
+}
+
+/// The line's flags, in the set's order: a court, an address, a party's role, a citation, a defined
+/// term, a contents leader, a form's number, a bare marker.
+fn line_flags(text: &str) -> [bool; 8] {
+    let matched = sets().1.matches(text);
+    std::array::from_fn(|n| matched.matched(n))
 }
 
 fn family(text: &str) -> Option<usize> {
@@ -561,6 +570,8 @@ fn witness_rows(
         let prev_text = prev.map_or("", |(_, o)| o.text.trim());
         let prev_end = prev_text.chars().last().unwrap_or(' ');
         let marks = families(text);
+        let [court, address, party, citation, defined, leader, form_number, bare] = line_flags(text);
+        let lexical = lexicon.read(text);
         let own = style(l);
         let recognized = page.source != "native" || l.spans.is_empty();
         let layout = context
@@ -636,18 +647,18 @@ fn witness_rows(
             flag(matches!(prev_end, '-' | '\u{2013}' | '\u{2014}')),
             flag(next.is_some_and(|(_, o)| o.text.trim_start().starts_with(char::is_lowercase))),
             flag(list_lead_in(prev_text)),
-            flag(court().is_match(text)),
-            flag(address().is_match(text)),
-            flag(party().is_match(text)),
-            flag(citation().is_match(text)),
-            flag(defined().is_match(text)),
-            flag(leader().is_match(text)),
-            flag(lexicon.form_title(text)),
-            flag(form_number().is_match(text)),
-            flag(lexicon.court(text)),
-            flag(lexicon.boilerplate(text)),
+            flag(court),
+            flag(address),
+            flag(party),
+            flag(citation),
+            flag(defined),
+            flag(leader),
+            flag(lexical.form_title),
+            flag(form_number),
+            flag(lexical.court),
+            flag(lexical.boilerplate),
             flag(marks.iter().any(|m| *m)),
-            flag(bare().is_match(text)),
+            flag(bare),
             flag(marks[0]),
             flag(marks[1]),
             flag(marks[2]),

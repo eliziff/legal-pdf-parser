@@ -20,8 +20,16 @@ struct Words {
 pub struct Lexicon {
     pub text: String,
     titles: HashSet<String>,
+    /// Each court's name between spaces, as a line's words are read for it.
     courts: Vec<String>,
     boilerplate: HashSet<String>,
+}
+
+/// What the lexicon says of one line: a form's title, a court's name, a line printed across forms.
+pub struct Reading {
+    pub form_title: bool,
+    pub court: bool,
+    pub boilerplate: bool,
 }
 
 pub fn normal(text: &str) -> String {
@@ -33,21 +41,16 @@ pub fn normal(text: &str) -> String {
 }
 
 impl Lexicon {
-    /// The line is a form's title.
-    pub fn form_title(&self, text: &str) -> bool {
+    /// The line read once against the lexicon: a form's title, a court the forms come from (named
+    /// anywhere in it, word for word), a line printed across many forms.
+    pub fn read(&self, text: &str) -> Reading {
         let key = normal(text);
-        !key.is_empty() && self.titles.contains(&key)
-    }
-
-    /// The line names a court the forms come from.
-    pub fn court(&self, text: &str) -> bool {
-        let key = format!(" {} ", normal(text));
-        self.courts.iter().any(|court| key.contains(&format!(" {court} ")))
-    }
-
-    /// The line is printed across many forms.
-    pub fn boilerplate(&self, text: &str) -> bool {
-        self.boilerplate.contains(&normal(text))
+        let spaced = format!(" {key} ");
+        Reading {
+            form_title: !key.is_empty() && self.titles.contains(&key),
+            court: self.courts.iter().any(|court| spaced.contains(court.as_str())),
+            boilerplate: self.boilerplate.contains(&key),
+        }
     }
 }
 
@@ -61,7 +64,7 @@ pub fn lexicon() -> &'static Lexicon {
         let words: Words = serde_json::from_str(&text).unwrap_or_default();
         Lexicon {
             titles: words.form_titles.into_iter().collect(),
-            courts: words.courts,
+            courts: words.courts.iter().map(|court| format!(" {court} ")).collect(),
             boilerplate: words.form_boilerplate.into_iter().collect(),
             text,
         }
