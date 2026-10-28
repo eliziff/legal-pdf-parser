@@ -73,7 +73,9 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
         primitives.headings.heading_levels = levels;
     });
     stamp(pages, &mut primitives.headings.trail, "native");
-    legal_pdf_support::profile::measure("prepare.styled_headings", || {
+    // LEGALPDF_ABLATE=styled leaves the typography reader out, for the measure of what it adds
+    // under the tagger.
+    if !legal_structure_model::ablated("styled") { legal_pdf_support::profile::measure("prepare.styled_headings", || {
         let claimed = primitives.claims.contents_line_ids.iter().chain(&primitives.claims.table_cell_line_ids).cloned().collect::<HashSet<_>>();
         let excluded = |id: &str| claimed.contains(id);
         let numbered = |text: &str| enumerated(text);
@@ -98,7 +100,7 @@ pub(crate) fn read_headings(pages: &mut [Page], outline: &[PdfOutlineEntry], pri
                 );
             },
         );
-    });
+    }); }
     stamp(pages, &mut primitives.headings.trail, "styled");
     legal_pdf_support::profile::measure("prepare.bookmarks", || {
         // The document's own bookmarks and its printed contents list, read together.
