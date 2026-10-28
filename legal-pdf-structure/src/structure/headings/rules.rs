@@ -399,7 +399,8 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
             });
             // A layout model's reading of a line stands: its words lift only a line none read.
             let next = sequence.get(k + 1).copied();
-            if !crate::structure::layout_labelled(line) && lifted(line, prior, next, bold_char_share(line) >= 0.5, above) {
+            // LEGALPDF_ABLATE=lifts leaves the lifts out, for their measure under the tagger.
+            if !crate::structure::layout_labelled(line) && !legal_structure_model::ablated("lifts") && lifted(line, prior, next, bold_char_share(line) >= 0.5, above) {
                 if marginal_note(line.text.trim(), next) && !primitives.quotations.scopes.contains_key(&line.id) {
                     set_apart.push((line.id.clone(), "marginal_note"));
                 } else {
@@ -485,9 +486,11 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 let caption = (instrument || terms) && enumerator(text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
                 // A heading the document's own outline or contents placed is the document's word.
                 let placed = heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id));
+                // LEGALPDF_ABLATE=demotions leaves the five demotion gates out, for their measure
+                // under the tagger.
                 let why = if caption {
                     Some("demote_caption")
-                } else if placed {
+                } else if placed || legal_structure_model::ablated("demotions") {
                     None
                 } else {
                     not_a_heading(&heading)

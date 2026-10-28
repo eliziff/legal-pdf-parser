@@ -370,7 +370,8 @@ pub(crate) fn apply_text_fidelity_headings(
         }
     }
     for page in pages.iter_mut() {
-        if primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) {
+        // LEGALPDF_ABLATE=titlecase leaves the recognized pages' title-case reader out.
+        if primitives.claims.contents_pages.contains(&page.index) || !recognized_page(page) || legal_structure_model::ablated("titlecase") {
             continue;
         }
         for line_slot in title_case_headings(page, primitives) {
