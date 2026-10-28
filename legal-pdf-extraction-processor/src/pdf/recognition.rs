@@ -76,15 +76,16 @@ pub(crate) fn reindex_source_lines(pages: &mut [Page]) {
     }
 }
 
-/// The share of a page's words that are recognition noise, and whether any word carries a
-/// recognizer's reject mark ("~NSC", "~A~K~ROUP~~"). A word is noise when it holds a symbol no
-/// prose writes inside a word, letters between digits or a number running into letters outside an
-/// ordinal ("2Q02", "41ho"; "C-36", "T2P", "2nd" and "1601-06131" are words), three of one letter
-/// in a row, no vowel in three letters or more, or a capital inside lower case.
-pub(crate) fn recognition_noise(lines: &[Line]) -> (f64, bool) {
+/// How much of a page's text is recognition noise: the share of its words that are noise, a word
+/// carrying a recognizer's reject mark ("~NSC", "~A~K~ROUP~~") weighing five. A word is noise when
+/// it holds a symbol no prose writes inside a word, letters between digits or a number running
+/// into letters outside an ordinal ("2Q02", "41ho"; "C-36", "T2P", "2nd" and "1601-06131" are
+/// words), three of one letter in a row, no vowel in three letters or more, or a capital inside
+/// lower case. One measure, read wherever a layer and a recognition are weighed.
+pub(crate) fn recognition_noise(lines: &[Line]) -> f64 {
     let mut words = 0usize;
     let mut noise = 0usize;
-    let mut rejected = false;
+    let mut rejects = 0usize;
     for word in lines.iter().flat_map(|line| line.text.split_whitespace()) {
         let word = word.trim_matches(|character: char| !character.is_alphanumeric() && character != '~');
         if word.is_empty() {
@@ -93,7 +94,7 @@ pub(crate) fn recognition_noise(lines: &[Line]) -> (f64, bool) {
         words += 1;
         let characters: Vec<char> = word.chars().collect();
         let reject = word.contains('~') && characters.iter().any(|character| character.is_alphanumeric());
-        rejected |= reject;
+        rejects += usize::from(reject);
         let symbol = reject || characters.iter().any(|character| "{}|^`<>\\".contains(*character));
         let letters = characters.iter().filter(|character| character.is_alphabetic()).count();
         let digits = characters.iter().filter(|character| character.is_ascii_digit()).count();
@@ -111,29 +112,22 @@ pub(crate) fn recognition_noise(lines: &[Line]) -> (f64, bool) {
             two[0].is_lowercase() && two[1].is_uppercase() && !(at == 1 && matches!(characters[0], 'M' | 'D' | 'O')));
         noise += usize::from(symbol || mixed || tripled || voiceless || inner_capital);
     }
-    (if words == 0 { 1.0 } else { noise as f64 / words as f64 }, rejected)
+    if words == 0 { 1.0 } else { (noise + 4 * rejects) as f64 / words as f64 }
 }
 
-/// How poorly a page reads, for choosing between its text layer and its recognition: the share
-/// of its words that are recognition noise (a reject mark weighing five such words), and the share
-/// of its words of four letters or more that the other reading of the document never writes.
+/// How poorly a page reads, for choosing between its text layer and its recognition: its
+/// recognition noise, and the share of its words of four letters or more that the other reading
+/// of the document never writes.
 pub(crate) fn reading_score(lines: &[Line], other: &HashSet<String>) -> f64 {
     let words = lines.iter().flat_map(|line| line.text.split(|c: char| !c.is_alphabetic()))
         .filter(|word| word.chars().count() >= 4).collect::<Vec<_>>();
     let foreign = words.iter().filter(|word| !other.contains(&word.to_lowercase())).count();
-    // A recognizer's reject mark ("2014 ~NSC 4326") is a word it knows it misread.
-    let rejected = lines.iter().flat_map(|line| line.text.split_whitespace())
-        .filter(|word| word.contains('~') && word.chars().any(char::is_alphanumeric)).count();
-    let total = lines.iter().map(|line| line.text.split_whitespace().count()).sum::<usize>().max(1);
-    recognition_noise(lines).0 + 4.0 * rejected as f64 / total as f64
-        + if words.is_empty() { 0.0 } else { foreign as f64 / words.len() as f64 }
+    recognition_noise(lines) + if words.is_empty() { 0.0 } else { foreign as f64 / words.len() as f64 }
 }
 
-/// Whether a page's text reads as recognized prose: no reject mark, and at most one word in ten
-/// is noise.
+/// Whether a page's text reads as recognized prose: at most one word in ten is noise.
 pub(crate) fn layer_reads_well(lines: &[Line]) -> bool {
-    let (share, rejected) = recognition_noise(lines);
-    !rejected && share <= 0.1
+    recognition_noise(lines) <= 0.1
 }
 
 /// How much printable text a page holds; decoding garbage is pdf-inspector's verdict, folded in
@@ -272,14 +266,23 @@ pub fn recognize_pdf(
         // A page that has a text layer of its own keeps it unless its recognition reads measurably
         // better by the same measure: noise words, and words the other reading never writes
         // anywhere in the document ("Arangement" where the layer writes "Arrangement" throughout;
-        // "IPJTRODUCTION" where the recognition writes "INTRODUCTION").
+        // "IPJTRODUCTION" where the recognition writes "INTRODUCTION"). Both readings are measured
+        // against the same ground: the words of the pages not recognized, which they share, and the
+        // other reading of the pages that were; a vocabulary of the recognized pages alone would
+        // call every word of a long document's layer foreign.
         let vocabulary = |lines: &mut dyn Iterator<Item = &Line>| lines
             .flat_map(|line| line.text.split(|c: char| !c.is_alphabetic()).filter(|word| !word.is_empty())
                 .map(str::to_lowercase).collect::<Vec<_>>())
             .collect::<HashSet<_>>();
-        let layer_words = vocabulary(&mut pages.iter().filter(|page| page.source == "native")
-            .flat_map(|page| page.lines.iter().filter(|line| line.source == "native")));
-        let recognized_words = vocabulary(&mut recognized.iter().flat_map(|(_, lines, _)| lines.iter()));
+        let recognized_pages: HashSet<usize> = recognized.iter().map(|(page_index, _, _)| *page_index).collect();
+        let layer = |page: &&Page| page.source == "native";
+        let common = vocabulary(&mut pages.iter().enumerate().filter(|(index, page)| layer(page) && !recognized_pages.contains(index))
+            .flat_map(|(_, page)| page.lines.iter().filter(|line| line.source == "native")));
+        let mut layer_words = common.clone();
+        layer_words.extend(vocabulary(&mut pages.iter().enumerate().filter(|(index, page)| layer(page) && recognized_pages.contains(index))
+            .flat_map(|(_, page)| page.lines.iter().filter(|line| line.source == "native"))));
+        let mut recognized_words = common;
+        recognized_words.extend(vocabulary(&mut recognized.iter().flat_map(|(_, lines, _)| lines.iter())));
         for (page_index, lines, separator_y) in recognized {
             let page = &mut pages[page_index];
             if lines.is_empty() {

@@ -380,6 +380,7 @@ fn quotation_rows(rows: &[Row<'_>], ordered_pages: &[&Page]) -> Reading {
                     .count()
                 >= 6 * full_margin_rows.len();
 
+        // Set in from the body's left margin.
         let set_in = |row: &Row| {
             let size = body.size(row);
             size > 0.0 && row.bbox[0] - measure(row).0 >= 1.5 * size
