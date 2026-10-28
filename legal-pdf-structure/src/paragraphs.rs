@@ -460,14 +460,23 @@ fn starts_paragraph(
     }
     if pitch.scan {
         // A scan's paragraph opens where a sentence ended and the next line is set in from the
-        // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure; a
-        // short line by itself ends none, as recognition loses lines' ends.
+        // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure, or
+        // where a line well short of the measure ends a sentence and the next opens one (on the
+        // structure gold's scans, 86% of such pairs open a paragraph; recognition loses some
+        // lines' ends, so a short line ending no sentence opens one only across a blank).
         let mut lefts = block.iter().map(|line| line.bbox[0]).collect::<Vec<_>>();
         lefts.sort_by(f64::total_cmp);
         let flush = lefts[lefts.len() / 4];
         let ended = terminal || noted_terminal_re().is_match(a.text.trim());
-        return (ended && b.bbox[0] >= flush + (0.018 * pitch.measure.width).max(3.0))
-            .then_some("sentence-indent");
+        let opens = b.text.trim_start().chars().next().is_some_and(|c| c.is_uppercase() || c.is_ascii_digit());
+        let short = pitch.measure.width > 0.0 && width(a) < 0.75 * pitch.measure.width && width(b) >= 0.6 * pitch.measure.width;
+        if ended && b.bbox[0] >= flush + (0.018 * pitch.measure.width).max(3.0) {
+            return Some("sentence-indent");
+        }
+        if short && opens && (ended || b.bbox[1] - a.bbox[3] > 0.3 * height(a).max(height(b))) {
+            return Some("short-line");
+        }
+        return None;
     }
     let marker = bullet_re().is_match(&a.text)
         || enumerator_re().is_match(&a.text)
