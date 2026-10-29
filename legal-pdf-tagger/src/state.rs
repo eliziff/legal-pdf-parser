@@ -159,49 +159,20 @@ pub struct Unit {
     pub document_type: Option<String>,
 }
 
-/// The documents whose numbered body units are provisions.
-const INSTRUMENTS: [&str; 2] = ["contract", "legislation"];
-
-/// The documents that set out others' instruments.
-const QUOTING: [&str; 3] = ["judgment", "submission", "article"];
-
-/// Each unit's region as scored: the region of its first typed line, except that in an authored
-/// gold a body unit (text or list item) opening with a printed number or letter (not a bullet) in
-/// a document typed contract or legislation is a provision. The page pass is never asked which
-/// body units are provisions; it follows from the document's type and the unit's number, which
-/// two authorings agree on far more often than on that call. A provision the page pass read in a
-/// judgment, submission or article is an instrument set out in it, a quote; elsewhere (a schedule
-/// split from its contract, a practice direction) it stands. A gold with no document types (the
-/// tagger's decoded one) keeps its regions as given.
+/// Each unit's region as scored: the region of its first typed line, as the gold stores it. What a
+/// numbered body unit is by the document's type (a provision in a contract or legislation, a quote
+/// in a judgment, submission or article) is written into the gold by its postcorrections
+/// (experiments/legal-structure-gold/postcorrect.py), so training and grading read the same gold.
 ///
-/// STRUCTURE_GOLD_PROVISION_HEADINGS=N scores a consumer's reading instead: an instrument's
-/// provisions at depth N or shallower are its headings (a PDF export's outline of a contract).
+/// STRUCTURE_GOLD_PROVISION_HEADINGS=N scores a consumer's reading instead: provisions at depth N
+/// or shallower are headings (a PDF export's outline of a contract).
 pub fn regions(gold: &Gold) -> Vec<&str> {
     static AS_HEADINGS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let as_headings = *AS_HEADINGS.get_or_init(|| std::env::var("STRUCTURE_GOLD_PROVISION_HEADINGS").ok().and_then(|v| v.parse().ok()));
-    let typed = gold.units.iter().any(|u| u.document_type.is_some());
-    let texts: HashMap<&str, Vec<char>> = gold.lines.iter()
-        .map(|l| (l.id.as_str(), l.corrected.as_deref().unwrap_or(&l.text).chars().collect()))
-        .collect();
-    let printed = |span: &SourceSpan| texts.get(span.line_id.as_str())
-        .and_then(|t| t.get(span.start..span.end.min(t.len())))
-        .is_some_and(|marker| marker.iter().any(|c| c.is_alphanumeric()));
-    let (mut instrument, mut quoting) = (false, false);
     gold.units.iter().map(|unit| {
-        if let Some(kind) = &unit.document_type {
-            instrument = INSTRUMENTS.contains(&kind.as_str());
-            quoting = QUOTING.contains(&kind.as_str());
-        }
         let region = gold.typed[unit.lines[0]].region.as_str();
-        if !typed || !matches!(region, "text" | "list_item" | "provision") {
-            return region;
-        }
-        let numbered = unit.lines.iter().any(|&n| gold.typed[n].markers.iter().flatten().any(printed));
-        match (instrument, numbered, region) {
-            (true, true, _) if as_headings.is_some_and(|deepest| unit.depth.is_some_and(|depth| depth <= deepest)) => "heading",
-            (true, true, _) => "provision",
-            (true, false, "provision") => "text",
-            (false, _, "provision") if quoting => "quote",
+        match as_headings {
+            Some(deepest) if region == "provision" && unit.depth.is_some_and(|depth| depth <= deepest) => "heading",
             _ => region,
         }
     }).collect()
