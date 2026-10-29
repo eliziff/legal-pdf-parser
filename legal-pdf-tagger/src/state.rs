@@ -490,7 +490,8 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
         });
     }
     // Documents: the first block opens the source's own; each unit holding a document start opens
-    // another under it.
+    // another under it. Each is of the type the document pass gave its first unit (the source's own
+    // takes the type given before any start).
     let opened: Vec<usize> = (0..units.len())
         .filter(|&u| !parts[u].is_empty() && units[u].starts_document)
         .collect();
@@ -498,16 +499,18 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
         .iter()
         .filter_map(|found| found.first().map(|spans| &spans[0]))
         .min_by_key(|s| at(s));
-    if let (false, Some(start)) = (opened.is_empty(), start) {
+    if let Some(start) = start {
         let root = format!("document:{}", anchor(start));
-        let mut openings = vec![start.clone()];
+        let first_type = units.iter().take(opened.first().copied().unwrap_or(units.len()).max(1))
+            .find_map(|u| u.document_type.clone());
+        let mut openings = vec![(start.clone(), first_type)];
         openings.extend(
             opened
                 .iter()
-                .map(|&u| parts[u][0][0].clone())
-                .filter(|s| s != start),
+                .map(|&u| (parts[u][0][0].clone(), units[u].document_type.clone()))
+                .filter(|(s, _)| s != start),
         );
-        for opening in openings {
+        for (opening, kind) in openings {
             let parent = if &opening == start {
                 Value::Null
             } else {
@@ -516,7 +519,7 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
             annotations.push(FrameAnnotation {
                 id: format!("document:{}", anchor(&opening)), kind: "document".into(), line_ids: vec![opening.line_id.clone()],
                 spans: vec![opening],
-                attributes: attributes(json!({"kind": null, "parent": parent, "relationship": null, "title": [], "facets": {}})),
+                attributes: attributes(json!({"kind": kind, "parent": parent, "relationship": null, "title": [], "facets": {}})),
             });
         }
     }
