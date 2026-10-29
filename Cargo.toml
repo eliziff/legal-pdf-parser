@@ -11,10 +11,13 @@ exclude = ["vendor/pdf-inspector"]
 default-members = ["."]
 resolver = "2"
 
+# legal-structure is a repository of its own, pinned here; a checkout beside it overrides the pin with a [patch] in
+# its own Cargo configuration (as Beaver's does), never by a path into another repository.
 [workspace.dependencies]
-legal-structure = { path = "../legal-structure" }
-legal-layout = { path = "../legal-structure/layout" }
-legal-structure-model = { path = "../legal-structure/model" }
+legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "eed179ceb3ed5666e981ff77f300f774b872ba4f" }
+legal-layout = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "eed179ceb3ed5666e981ff77f300f774b872ba4f" }
+legal-structure-model = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "eed179ceb3ed5666e981ff77f300f774b872ba4f" }
+legal-structure-features = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "eed179ceb3ed5666e981ff77f300f774b872ba4f" }
 pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
@@ -27,7 +30,7 @@ fast-allocator = ["dep:mimalloc"]
 profiling = ["pdf", "legal-pdf-support/profiling"]
 allocation-profiling = ["profiling", "legal-pdf-support/allocation-profiling"]
 ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
-tagger = ["pdf", "dep:legal-structure-tagger", "legal-pdf-core/ort-runtime"]
+tagger = ["pdf", "dep:legal-pdf-tagger", "legal-pdf-core/ort-runtime"]
 full = ["language", "indra", "ppdoc", "tagger"]
 # The command-line tools, which run this checkout's structure engine.
 cli = ["pdf", "legal-pdf-core/structure-analysis"]
@@ -43,7 +46,7 @@ required-features = ["cli"]
 
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
-legal-structure-tagger = { path = "../legal-structure/tagger", features = ["onnx"], optional = true }
+legal-pdf-tagger = { path = "legal-pdf-tagger", features = ["onnx"], optional = true }
 legal-pdf-extraction-processor = { path = "legal-pdf-extraction-processor", optional = true }
 legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }

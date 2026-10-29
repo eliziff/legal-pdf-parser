@@ -7,7 +7,7 @@
 use crate::{Error, Result};
 use legal_pdf_core::model::Page;
 use legal_structure_model::DocumentStructure;
-use legal_structure_tagger::onnx::Tagger;
+use legal_pdf_tagger::onnx::Tagger;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 

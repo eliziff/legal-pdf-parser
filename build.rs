@@ -17,19 +17,47 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// legal-layout's sources are keyed by the names they had as a sibling checkout ("../legal-structure/layout/…"), so the
+/// stage hashes stay what the caches were keyed by; they are read from wherever Cargo has the crate, which
+/// legal-structure-model says through its `links` metadata.
+const LAYOUT_KEY: &str = "../legal-structure/layout";
+const LAYOUT_SOURCES: &str = "DEP_LEGAL_STRUCTURE_MODEL_LAYOUT";
+
+fn layout_sources() -> PathBuf {
+    PathBuf::from(env::var_os(LAYOUT_SOURCES).expect("legal-structure-model publishes legal-layout's sources"))
+}
+
+/// The file an input names, and back: the key a file is hashed under.
+fn source_of(root: &Path, input: &Path) -> PathBuf {
+    match input.strip_prefix(root.join(LAYOUT_KEY)) {
+        Ok(rest) => layout_sources().join(rest),
+        Err(_) => input.to_owned(),
+    }
+}
+
+fn key_of(root: &Path, file: &Path) -> PathBuf {
+    match env::var_os(LAYOUT_SOURCES).map(PathBuf::from) {
+        Some(layout) => file.strip_prefix(&layout).map_or_else(|_| file.to_owned(), |rest| root.join(LAYOUT_KEY).join(rest)),
+        None => file.to_owned(),
+    }
+}
+
 fn fingerprint(root: &Path, inputs: &[PathBuf], features: &[String]) -> String {
     let mut paths = Vec::new();
     for input in inputs {
-        println!("cargo:rerun-if-changed={}", input.display());
-        files(input, &mut paths);
+        let source = source_of(root, input);
+        println!("cargo:rerun-if-changed={}", source.display());
+        let mut found = Vec::new();
+        files(&source, &mut found);
+        paths.extend(found.into_iter().map(|file| (key_of(root, &file), file)));
     }
     paths.sort();
     paths.dedup();
     let mut digest = Sha256::new();
-    for path in paths {
-        let relative = path
+    for (key, path) in paths {
+        let relative = key
             .strip_prefix(root)
-            .unwrap_or(&path)
+            .unwrap_or(&key)
             .to_string_lossy()
             .replace('\\', "/");
         digest.update(relative.as_bytes());
