@@ -14,10 +14,10 @@ resolver = "2"
 # legal-structure is a repository of its own, pinned here; a checkout beside it overrides the pin with a [patch] in
 # its own Cargo configuration (as Beaver's does), never by a path into another repository.
 [workspace.dependencies]
-legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "3b9722bb2ae7b27795e3b92c4351c9bb5c76207b" }
-legal-layout = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "3b9722bb2ae7b27795e3b92c4351c9bb5c76207b" }
-legal-structure-model = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "3b9722bb2ae7b27795e3b92c4351c9bb5c76207b" }
-legal-structure-features = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "3b9722bb2ae7b27795e3b92c4351c9bb5c76207b" }
+legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "0c36e16c4921efeb907450a9fc13e793aa6df5ad" }
+legal-layout = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "0c36e16c4921efeb907450a9fc13e793aa6df5ad" }
+legal-structure-model = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "0c36e16c4921efeb907450a9fc13e793aa6df5ad" }
+legal-structure-features = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "0c36e16c4921efeb907450a9fc13e793aa6df5ad" }
 pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
