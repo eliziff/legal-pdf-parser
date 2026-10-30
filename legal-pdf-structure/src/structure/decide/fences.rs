@@ -2,12 +2,14 @@
 //! the order the lines read in. Each fence takes only the lines no fence before it took, in this
 //! order: a transcript's line numbers; the furniture and folios at the pages' edges; then each
 //! page's columns, read on the words the fences left; the parallel translation's lines; the
-//! contents lists and tables of authorities (their title a heading); the tables' cells. Then the
+//! contents lists (their title a heading; a table of authorities' lines left to the body); the
+//! tables' cells. Then the
 //! note separator clear of the tables and the band under it, whose table cells are its notes' where
 //! a note label stands in it; the body's type; each line's constituent document, and each
 //! document's own furniture; whether each document is a transcript, and the lines beside its number
-//! column, which no table holds; the reading order page by page; the quotations a document's own
-//! count does not hold; the reading contexts; and each line's continuation of the line before it.
+//! column, whose testimony no table holds; the reading order page by page; the quotations a
+//! document's own count does not hold, each with the editorial lines set under it; the reading
+//! contexts; and each line's continuation of the line before it.
 
 use super::*;
 use legal_pdf_tables::PageItems;
@@ -57,8 +59,6 @@ pub(crate) enum Rule {
     SectionHead,
     /// A contents list's or word index's line (`contents_lists::read`, pdf-inspector's contents).
     Contents,
-    /// A table of authorities' line.
-    Authorities,
     /// The row naming a contents list.
     ContentsTitle,
     /// A cell of a table (`document_tables`).
@@ -89,10 +89,8 @@ pub(crate) enum Rule {
     Ladder,
     /// A count of titles alone, one under the other: contents.
     TitleOnly,
-    /// A statute's note over the one provision it names.
+    /// A statute's note beside or over the one provision it names.
     MarginalNote,
-    /// A caption over more than one provision: a heading.
-    CaptionHeading,
     /// A line the document's bookmarks or contents list name.
     Anchor,
     /// A line after the opening of bookmarks naming every heading, that they do not name.
@@ -122,7 +120,6 @@ impl Rule {
             Self::PageNumber => "page_number",
             Self::SectionHead => "section_head",
             Self::Contents => "contents",
-            Self::Authorities => "authorities",
             Self::ContentsTitle => "contents_title",
             Self::Grid => "grid",
             Self::NoteBand => "note_band",
@@ -139,7 +136,6 @@ impl Rule {
             Self::Ladder => "ladder",
             Self::TitleOnly => "title_only",
             Self::MarginalNote => "marginal_note",
-            Self::CaptionHeading => "caption_heading",
             Self::Anchor => "anchor",
             Self::Unnamed => "unnamed",
             Self::FrontMatter => "front_matter",
@@ -160,7 +156,8 @@ pub(crate) enum Continuation {
     Reference,
     /// A full line ending no sentence whose sentence this line finishes (`carries_a_sentence_onto`).
     Sentence,
-    /// Set at its paragraph's leading under a full line ending no sentence (`continues_prose_among`).
+    /// Set at its paragraph's leading under the line before it, a full line ending no sentence
+    /// (`continues_prose_from`).
     Prose,
 }
 
@@ -186,6 +183,9 @@ pub(crate) struct Fences {
     /// Each constituent document is a transcript, by document: its lines are numbered, or a tenth
     /// of them or more (twenty or more) open on a speaker's label.
     pub(crate) transcripts: Vec<bool>,
+    /// Each transcript whose lines are testimony throughout, by document: a tenth of them or more
+    /// (twenty or more) open on a speaker's label, or its line numbers stand on half its pages.
+    pub(crate) testimony: Vec<bool>,
     /// A transcript's line beside its number column: on a row holding a line number.
     pub(crate) numbered_row: Vec<bool>,
     /// Each page's printed label and the slot of the line printing it, by page slot.
@@ -207,8 +207,8 @@ pub(crate) struct Fences {
     pub(crate) separators: Vec<Option<f64>>,
     /// Under its page's note separator, and no line label, furniture or folio.
     pub(crate) band: Vec<bool>,
-    /// Each page's band holds a note label no reason suppresses, by page slot: every line of it is
-    /// a note's.
+    /// Each page's band holds a note label no reason suppresses, by page slot: its table cells are
+    /// its notes', no table's.
     pub(crate) noted: Vec<bool>,
     /// The body's type: the commonest face (an index into the evidence's faces) and half-point size
     /// of the lines no fence took outside the note band, by characters.
@@ -244,6 +244,11 @@ impl Fences {
     /// Whether the slot's constituent document is a transcript.
     pub(crate) fn transcript(&self, slot: Slot) -> bool {
         self.transcripts.get(usize::from(self.document[slot.index()])).copied().unwrap_or(false)
+    }
+
+    /// Whether the slot's constituent document is a transcript's testimony throughout (`testimony`).
+    pub(crate) fn testimony(&self, slot: Slot) -> bool {
+        self.testimony.get(usize::from(self.document[slot.index()])).copied().unwrap_or(false)
     }
 
     /// The fences, contexts and reading order of the document's pages, measured (`evidence`), its
@@ -355,8 +360,20 @@ impl Fences {
             fences.read_document_furniture(pages, slots, evidence, &rows);
         }
         fences.read_transcripts(slots, evidence);
-        // A transcript's line beside its number column is no table's.
-        let freed: Vec<usize> = (0..count).filter(|&slot| fences.numbered_row[slot] && fences.role[slot] == Role::Table).collect();
+        // A transcript's testimony beside its number column, read as a grid (a speaker's turn in
+        // one of its cells), is no table's; a table the transcript sets among its numbered lines
+        // stays one.
+        let mut spoken = vec![false; count];
+        for table in &fences.tables {
+            let lines: Vec<Slot> = table.line_ids().into_iter().filter_map(|id| slots.of_id(id)).collect();
+            if lines.iter().any(|slot| fences.numbered_row[slot.index()] && evidence.words[slot.index()] & WORD_SPEAKER != 0) {
+                for slot in lines {
+                    spoken[slot.index()] = true;
+                }
+            }
+        }
+        let freed: Vec<usize> =
+            (0..count).filter(|&slot| fences.numbered_row[slot] && fences.role[slot] == Role::Table && spoken[slot]).collect();
         voided |= !freed.is_empty();
         for slot in freed {
             fences.free_cell(slot);
@@ -385,9 +402,10 @@ impl Fences {
         fences
     }
 
-    /// Folios, running heads and feet and the lines on their rows (`furniture::read`); each page's
-    /// printed label from its furniture (`page_label_among`), its line the page's label; the
-    /// folios' offset; and the edge lines naming their page's sections.
+    /// Folios, running heads and feet and the lines on their rows (`furniture::read`); the folios'
+    /// offset, tallied over every label each page's furniture prints; each page's printed label
+    /// from its furniture (`page_label`), its line the page's label; and the edge lines naming their
+    /// page's sections.
     fn read_furniture(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView], rows: &[&Rows]) {
         let found = legal_pdf_support::profile::measure("prepare.furniture", || {
             furniture::read(views, rows, |slot| evidence.line_number[slot.index()])
@@ -397,13 +415,19 @@ impl Fences {
                 self.edge[slot.index()] = Some(edge);
             }
         }
+        let labels: Vec<Vec<(String, usize)>> =
+            pages.iter().enumerate().map(|(page_slot, page)| self.printed_labels(page, slots, page_slot)).collect();
+        // Each page counts each offset its labels print once: a record that prints its own page
+        // beside the page of the transcript it files counts both.
         let mut offsets: HashMap<i64, usize> = HashMap::new();
-        for (page_slot, page) in pages.iter().enumerate() {
-            let folio = self.page_label(page, slots, page_slot);
-            if let Some(printed) = folio.as_ref().and_then(|(_, label)| label.parse::<i64>().ok()) {
-                *offsets.entry(printed - i64::from(page.number)).or_default() += 1;
+        for (page, labels) in pages.iter().zip(&labels) {
+            let mut printed: Vec<i64> =
+                labels.iter().filter_map(|(label, _)| label.parse::<i64>().ok()).map(|number| number - i64::from(page.number)).collect();
+            printed.sort_unstable();
+            printed.dedup();
+            for offset in printed {
+                *offsets.entry(offset).or_default() += 1;
             }
-            self.folios.push(folio);
         }
         let folios: usize = offsets.values().sum();
         self.folio_offset = offsets
@@ -411,44 +435,53 @@ impl Fences {
             .max_by_key(|&(offset, pages)| (pages, std::cmp::Reverse(offset.abs())))
             .filter(|&(_, pages)| pages >= 2 && pages * 2 >= folios)
             .map(|(offset, _)| offset);
+        self.folios = pages
+            .iter()
+            .zip(&labels)
+            .enumerate()
+            .map(|(page_slot, (page, labels))| self.page_label(page, slots, page_slot, labels))
+            .collect();
         self.section_heads = furniture::section_heads(views, rows)
             .into_iter()
             .filter(|(slot, _, _)| self.role[slot.index()] == Role::Open)
             .collect();
     }
 
-    /// The page's printed label from its furniture (`page_label_among`), the line printing it the
-    /// page's label; none where its furniture prints none, or prints labels that conflict.
-    fn page_label(&mut self, page: &Page, slots: &Slots, page_slot: usize) -> Option<(Slot, String)> {
+    /// The labels the page's furniture prints (`page_labels_among`), by the line printing each.
+    fn printed_labels(&self, page: &Page, slots: &Slots, page_slot: usize) -> Vec<(String, usize)> {
         let range = slots.on(page_slot);
         let furniture = range
             .clone()
             .map(Slot)
             .filter(|slot| self.role[slot.index()] == Role::Furniture)
             .filter_map(|slot| Some(((slot.0 - range.start) as usize, self.edge[slot.index()]?)));
-        match page_label_among(page, furniture) {
-            Ok(Some((label, line))) => {
-                let slot = slots.at(page_slot, line);
-                self.role[slot.index()] = Role::PageLabel;
-                self.rule[slot.index()] = Rule::Folio;
-                Some((slot, label))
-            }
-            Ok(None) => None,
-            Err(candidates) => {
-                let mut diagnostic = Diagnostic::info(
-                    "PRINTED_PAGE_LABEL_AMBIGUOUS",
-                    "Conflicting header/footer page labels were left unresolved.",
-                    Some(page.index),
-                );
-                diagnostic.line_ids = candidates.iter().map(|(_, line)| page.lines[*line].id.clone()).collect();
-                diagnostic.details.insert(
-                    "candidates".to_owned(),
-                    json!(candidates.iter().map(|(label, _)| label).collect::<Vec<_>>()),
-                );
-                self.diagnostics.push(diagnostic);
-                None
-            }
-        }
+        page_labels_among(page, furniture)
+    }
+
+    /// The page's printed label among those its furniture prints (`labels`), the line printing it
+    /// the page's label: the one label, or where they differ the one on the folios' offset; none
+    /// where its furniture prints none, or prints labels that differ and none on the offset.
+    fn page_label(&mut self, page: &Page, slots: &Slots, page_slot: usize, labels: &[(String, usize)]) -> Option<(Slot, String)> {
+        let first = labels.first()?;
+        let agree = labels.iter().all(|(label, _)| label.eq_ignore_ascii_case(&first.0));
+        let on_offset = |(label, _): &&(String, usize)| {
+            self.folio_offset.is_some_and(|offset| label.parse::<i64>().is_ok_and(|number| number - i64::from(page.number) == offset))
+        };
+        let Some((label, line)) = (if agree { Some(first) } else { labels.iter().find(on_offset) }) else {
+            let mut diagnostic = Diagnostic::info(
+                "PRINTED_PAGE_LABEL_AMBIGUOUS",
+                "Conflicting header/footer page labels, none on the folios' offset, were left unresolved.",
+                Some(page.index),
+            );
+            diagnostic.line_ids = labels.iter().map(|(_, line)| page.lines[*line].id.clone()).collect();
+            diagnostic.details.insert("candidates".to_owned(), json!(labels.iter().map(|(label, _)| label).collect::<Vec<_>>()));
+            self.diagnostics.push(diagnostic);
+            return None;
+        };
+        let slot = slots.at(page_slot, *line);
+        self.role[slot.index()] = Role::PageLabel;
+        self.rule[slot.index()] = Rule::Folio;
+        Some((slot, label.clone()))
     }
 
     /// Each constituent document's own furniture, read over its own lines as a document of its own
@@ -478,28 +511,44 @@ impl Fences {
         }
         for (page_slot, page) in pages.iter().enumerate().filter(|(page_slot, _)| gained[*page_slot]) {
             if self.folios[page_slot].is_none() {
-                self.folios[page_slot] = self.page_label(page, slots, page_slot);
+                let labels = self.printed_labels(page, slots, page_slot);
+                self.folios[page_slot] = self.page_label(page, slots, page_slot, &labels);
             }
         }
     }
 
-    /// Which constituent documents are transcripts (`transcripts`), and each transcript's lines
-    /// beside its number column (`numbered_row`).
+    /// Which constituent documents are transcripts (`transcripts`) and which of them are testimony
+    /// throughout (`testimony`), and each transcript's lines beside its number column
+    /// (`numbered_row`).
     fn read_transcripts(&mut self, slots: &Slots, evidence: &Evidence) {
         let count = slots.len();
         let documents = usize::from(self.document.iter().copied().max().unwrap_or(0)) + 1;
         let (mut numbered, mut speakers, mut lines) = (vec![0usize; documents], vec![0usize; documents], vec![0usize; documents]);
+        // Each document's pages, and those printing its line numbers: (count, last page met).
+        let (mut pages, mut numbered_pages) = (vec![(0usize, usize::MAX); documents], vec![(0usize, usize::MAX); documents]);
+        let meet = |met: &mut (usize, usize), page: usize| {
+            if met.1 != page {
+                *met = (met.0 + 1, page);
+            }
+        };
         for slot in 0..count {
             let document = usize::from(self.document[slot]);
+            let page = slots.page(Slot(slot as u32));
+            meet(&mut pages[document], page);
             if evidence.line_number[slot] {
                 numbered[document] += 1;
+                meet(&mut numbered_pages[document], page);
             } else {
                 lines[document] += 1;
                 speakers[document] += usize::from(evidence.words[slot] & WORD_SPEAKER != 0);
             }
         }
-        self.transcripts = (0..documents)
-            .map(|document| numbered[document] > 0 || speakers[document] >= 20 && speakers[document] * 10 >= lines[document])
+        let spoken = |document: usize| speakers[document] >= 20 && speakers[document] * 10 >= lines[document];
+        self.transcripts = (0..documents).map(|document| numbered[document] > 0 || spoken(document)).collect();
+        // A contents page's locators or a table's row numbers read as line numbers make a document a
+        // transcript, not its testimony.
+        self.testimony = (0..documents)
+            .map(|document| spoken(document) || numbered_pages[document].0 * 2 >= pages[document].0.max(1))
             .collect();
         self.numbered_row = vec![false; count];
         for page_slot in 0..evidence.pages.len() {
@@ -559,8 +608,8 @@ impl Fences {
         }
     }
 
-    /// The contents lists and tables of authorities (`contents_lists::read`), pdf-inspector's
-    /// contents among them, each from its first entry to its last; the row naming a list, its
+    /// The contents lists (`contents_lists::read`), pdf-inspector's contents among them, each from
+    /// its first entry to its last, a table of authorities' lines aside; the row naming a list, its
     /// heading; the pages wholly contents. Returns the lines the lists read as contents (a table
     /// more than half of whose lines they hold is that list).
     fn read_contents(
@@ -608,19 +657,21 @@ impl Fences {
         for &slot in &lists.contents {
             listed_contents[slot.index()] = true;
         }
-        for slot in listed.iter().filter_map(|id| slots.of_id(id)).chain(lists.contents.iter().copied()) {
-            self.set(slot, Role::Contents, Rule::Contents);
-        }
+        // A table of authorities is no contents list, whatever its leaders and locators: its lines
+        // are the body's, as its pages are no contents pages.
+        let mut authority_pages = vec![false; pages.len()];
+        let mut authority = vec![false; slots.len()];
         for &slot in &lists.authorities {
-            self.set(slot, Role::Contents, Rule::Authorities);
+            authority[slot.index()] = true;
+            authority_pages[slots.page(slot)] = true;
+        }
+        for slot in listed.iter().filter_map(|id| slots.of_id(id)).chain(lists.contents.iter().copied()) {
+            if !authority[slot.index()] {
+                self.set(slot, Role::Contents, Rule::Contents);
+            }
         }
         for &slot in &lists.titles {
             self.set(slot, Role::Heading, Rule::ContentsTitle);
-        }
-        // A page of a table of authorities is no contents page, whatever its leaders and locators.
-        let mut authority_pages = vec![false; pages.len()];
-        for &slot in &lists.authorities {
-            authority_pages[slots.page(slot)] = true;
         }
         self.contents_pages = pages
             .iter()
@@ -796,7 +847,7 @@ impl Fences {
                     Some(Continuation::Reference)
                 } else if carries_a_sentence_onto(page, prior_at, at, body) {
                     Some(Continuation::Sentence)
-                } else if continues_prose_among(page, line, body) {
+                } else if continues_prose_from(page, prior_at, at, body) {
                     Some(Continuation::Prose)
                 } else {
                     None

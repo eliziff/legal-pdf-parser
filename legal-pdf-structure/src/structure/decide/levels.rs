@@ -134,8 +134,8 @@ pub(crate) fn anchors(
     let mut found: Vec<Option<(Vec<Slot>, bool)>> = vec![None; entries.len()];
     for (index, entry) in entries.iter().enumerate() {
         let title = normalize_title(&entry.title);
-        // A title of no words ("-----") names no line.
-        let Some(target) = slot_of_page(entry.page - 1).filter(|_| title.chars().count() >= 2) else {
+        // A title of no words ("-----", "2.1") names no line.
+        let Some(target) = slot_of_page(entry.page - 1).filter(|_| title.chars().count() >= 2 && title.chars().any(char::is_alphabetic)) else {
             continue;
         };
         let window = [Some(target), target.checked_add(1), target.checked_sub(1)];
@@ -241,6 +241,24 @@ pub(crate) fn anchors(
             })
         })
         .collect();
+    // A marker alone on the line over a found title is its heading's first line ("II." over
+    // "Background Facts").
+    for (lines, _) in found.iter_mut().flatten() {
+        let first = lines[0];
+        let page = slots.page(first);
+        let at = (fences.place[first.index()] - slots.on(page).start) as usize;
+        if let Some(&before) = at.checked_sub(1).map(|before| &order(page)[before]) {
+            if role[before.index()] == Role::Open
+                && !claimed[before.index()]
+                && context(before) == context(first)
+                && together(before, first)
+                && marker_alone(evidence, before, text(before))
+            {
+                claimed[before.index()] = true;
+                lines.insert(0, before);
+            }
+        }
+    }
     let contexts: Vec<(u16, bool)> = found.iter().map(|hit| hit.as_ref().map_or((0, false), |(lines, _)| context(lines[0]))).collect();
     // The frame: every bookmark of a full set, a skeleton's chapters.
     let framed = |entry: &Entry| tier == Tier::Full || entry.level == 1;
@@ -350,10 +368,14 @@ pub(crate) fn heading_levels(
             continue;
         }
         let texts: Vec<String> = units.iter().map(|unit| unit.iter().map(|&slot| text(slot)).collect::<Vec<_>>().join(" ")).collect();
+        // A numbered title is set as its title's line is, whatever its number's type.
         let looks: Vec<Look> = units
             .iter()
             .zip(&texts)
-            .map(|(unit, text)| look_of(pages, slots, evidence, fences, geometry, unit[0], text, &mut families).0)
+            .map(|(unit, joined)| {
+                let first = if unit.len() > 1 && marker_alone(evidence, unit[0], text(unit[0])) { unit[1] } else { unit[0] };
+                look_of(pages, slots, evidence, fences, geometry, first, joined, &mut families).0
+            })
             .collect();
         let given = |unit: &[Slot]| usize::from(decision.given[unit[0].index()]);
         let mut ranked: Vec<(Look, usize)> = Vec::new();

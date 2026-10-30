@@ -8,9 +8,13 @@
 //! A block is one printed paragraph or unit: it starts where a unit opens (its marker and the line
 //! beside it one start), where a heading, title or marginal note starts (its wrapped lines going on
 //! with it), at each note's label, at each contents entry, where the role or the reading context
-//! changes, and where the page's geometry parts two paragraphs (`paragraphs_of`) and no
-//! continuation carries the line on from the one before. A table's cell holds its own blocks: a
-//! paragraph never runs from one cell into the next, though a cell may hold several.
+//! changes, in a document's front (its first two pages, and its lines before its first unit) at
+//! each line of its caption standing on its own (a field and the value on its row, a label, a
+//! court's name, a jurat) and at the line after such a line or a party's role or a date where that
+//! line does not go on from it, and where the page's geometry parts two paragraphs
+//! (`paragraphs_of`) and no continuation carries the line on from the one before. A table's cell
+//! holds its own blocks: a paragraph never runs from one cell into the next, though a cell may hold
+//! several.
 
 use super::*;
 use crate::paragraphs::{measure_of, paragraphs_of, Measure};
@@ -143,6 +147,12 @@ pub(crate) fn write(
     trail
 }
 
+/// Whether two lines of a page stand on one row.
+fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
+    let row = evidence.row(slots, a);
+    row != u32::MAX && slots.page(a) == slots.page(b) && evidence.row(slots, b) == row
+}
+
 /// Each line's block, by slot (none for a line label, folio or furniture, which keeps its own),
 /// numbered on each page after the page's own blocks.
 fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<Option<usize>> {
@@ -169,6 +179,33 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
         }
     }
     let measures: Vec<((u16, bool), Measure)> = lines_of.iter().map(|(key, lines)| (*key, measure_of(lines))).collect();
+    // Each document's front: its first page, and the place of its first unit in the reading order.
+    let documents = usize::from(fences.document.iter().copied().max().unwrap_or(0)) + 1;
+    let (mut opening, mut first_unit) = (vec![usize::MAX; documents], vec![u32::MAX; documents]);
+    for (place, &slot) in fences.order.iter().enumerate() {
+        let document = usize::from(fences.document[slot.index()]);
+        opening[document] = opening[document].min(slots.page(slot));
+        if decision.unit[slot.index()].is_some() {
+            first_unit[document] = first_unit[document].min(place as u32);
+        }
+    }
+    // A caption's line of front matter (`Rule::FrontMatter`) in its document's front: a field, a
+    // label, a court's name or a jurat, which stands on its own (`opens`), or one of those, a
+    // party's role or a date, after which the next line stands on its own (`closes`). A signature,
+    // an author's line or a lead-in's colon is no heading, and still the paragraph's it stands in.
+    let caption = |slot: Slot, bits: u32| {
+        let at = slot.index();
+        let document = usize::from(fences.document[at]);
+        decision.rule[at] == Rule::FrontMatter
+            && (slots.page(slot) < opening[document].saturating_add(2) || fences.place[at] < first_unit[document])
+            && (evidence.words[at] & bits != 0 || bits & WORD_FIELD != 0 && crate::paragraphs::field_label(slots.line(pages, slot)))
+    };
+    let opens = |slot: Slot| {
+        caption(slot, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT)
+            && evidence.words[slot.index()] & WORD_PARTY == 0
+            && fences.continues[slot.index()].is_none()
+    };
+    let closes = |slot: Slot| caption(slot, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT | WORD_PARTY | WORD_DATE);
     let mut blocks = vec![None; count];
     let mut paragraph = vec![None; count];
     let mut entry = vec![None; count];
@@ -207,12 +244,14 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
             }
             let start = previous.is_none_or(|prior| {
                 let before = prior.index();
+                let free = !decision.joined[at] && fences.continues[at].is_none();
                 class(role[before]) != kind
                     || fences.ctx[before] != fences.ctx[at]
                     || match kind {
                         Class::Body => {
                             decision.unit[at].is_some()
-                                || !decision.joined[at] && paragraph[at] != paragraph[before] && fences.continues[at].is_none()
+                                || (opens(slot) || closes(prior) && free) && !decision.joined[at] && !same_row(evidence, slots, prior, slot)
+                                || free && paragraph[at] != paragraph[before]
                         }
                         Class::Heading | Class::Title | Class::MarginalNote => !decision.joined[at],
                         Class::Note => evidence.label[at].is_some(),

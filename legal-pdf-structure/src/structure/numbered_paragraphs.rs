@@ -25,7 +25,7 @@ pub(super) fn paragraph_number(text: &str) -> Option<usize> {
 /// the number's line (at `start`) through to the line before the next numbered one (at
 /// `next_label`), the next line that opens an enumerated item, heading or set-apart passage of its
 /// own, or the first line that does not go on with the paragraph of the line before it
-/// (`goes_on`).
+/// (`goes_on`); and the editorial lines set directly under it (`editorial_line`).
 pub(super) fn passage_end<'a>(
     start: usize,
     next_label: usize,
@@ -36,7 +36,25 @@ pub(super) fn passage_end<'a>(
     while end < next_label && goes_on(end) && !opens_item(text(end)) {
         end += 1;
     }
+    while end < next_label && editorial_line(text(end)) {
+        end += 1;
+    }
     end
+}
+
+/// A quotation's editorial line, wholly in square brackets or an ellipsis alone: "[Emphasis
+/// added]", "[Citations have been omitted.]", "[…]", "…", ". . .". A bracketed paragraph number is
+/// none.
+pub(super) fn editorial_line(text: &str) -> bool {
+    let text = text.trim();
+    let bracketed = text.starts_with('[')
+        && text.trim_end_matches(['.', ',', ';']).ends_with(']')
+        && text[1..].find(']').is_some_and(|close| close + 2 >= text.trim_end_matches(['.', ',', ';']).len())
+        && bracket_label(text).is_none();
+    let ellipsis = !text.is_empty()
+        && text.chars().all(|c| matches!(c, '.' | '\u{2026}' | '[' | ']' | '(' | ')') || c.is_whitespace())
+        && (text.contains('\u{2026}') || text.matches('.').count() >= 3);
+    bracketed || ellipsis
 }
 
 /// Which of a reading's bracketed numbers, in order, are the document's own: the members of the
