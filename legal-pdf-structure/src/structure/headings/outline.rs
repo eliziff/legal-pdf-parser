@@ -51,6 +51,8 @@ struct Candidate<'a> {
     page: usize,
     /// Its numbering, every family it reads in: (family, ordinal).
     numbers: Vec<(String, u32)>,
+    /// Set apart from the body's own type: another face, size or weight, capitals, a division's word.
+    set_apart: bool,
 }
 
 /// The numbering family of an enumerator's value and punctuation: arabic, roman, letter, by case.
@@ -151,8 +153,16 @@ pub(crate) fn decide(
             end += 1;
         }
         let lines: Vec<&Line> = sequence[k..end].to_vec();
+        // A line running its column's measure on into the next line of its block opens a paragraph,
+        // a provision or a list's item: its text goes on, as a title's does not.
+        let last = lines[lines.len() - 1];
+        let (last_width, _) = columns[&last.page_index].place(last, slots[last.id.as_str()]);
+        if last_width >= 0.85 && sequence.get(end).is_some_and(|next| next.page_index == last.page_index && next.block_index == last.block_index) {
+            k = end;
+            continue;
+        }
         let text = lines.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
-       let measure = &measures[&first.page_index];
+        let measure = &measures[&first.page_index];
         let (column_width, column_centre) = columns[&first.page_index].place(first, slots[first.id.as_str()]);
         let placement = if column_centre.abs() < 0.04 && column_width < 0.8 {
             2
@@ -176,7 +186,6 @@ pub(crate) fn decide(
             style.as_ref().map_or_else(String::new, |(face, _)| face.clone()), size, bold, italic, caps, lined, placement,
             enumerated.as_ref().map_or_else(String::new, |(value, punctuation)| family(value, punctuation)),
         );
-        let last = lines[lines.len() - 1];
         let next = sequence.get(end).copied();
         let after = sequence.get(end + 1).copied();
         let above = k.checked_sub(1).map(|j| sequence[j]).filter(|prior| prior.page_index == first.page_index)
@@ -197,15 +206,16 @@ pub(crate) fn decide(
         let mut own = -1.5;
         own += if voted { 2.5 } else { 0.0 };
         own += if bold || larger || lined || (caps && !body_type) { 1.0 } else { 0.0 };
-        own -= if body_type && enumerated.is_none() && !caps { 1.5 } else { 0.0 };
-        own += if division_word { 1.5 } else if enumerated.is_some() { 0.75 } else { 0.0 };
+        // A number in the body's own type numbers the body (its paragraphs, provisions, items).
+        own -= if body_type && !caps && !division_word { 1.5 } else { 0.0 };
+        own += if division_word { 1.5 } else if enumerated.is_some() && !body_type { 0.75 } else { 0.0 };
         own += if opens_prose { 1.0 } else { 0.0 };
         own -= if fields_follow { 0.75 } else { 0.0 };
         own += if above >= 0.8 { 0.5 } else { 0.0 };
         own -= if text.ends_with(':') { 1.0 } else { 0.0 };
         own -= if words > 12 { 1.0 } else { 0.0 };
         own -= if lines.len() > 1 && enumerated.is_none() { 0.5 } else { 0.0 };
-       candidates.push(Candidate { lines, look, own, placed, vetoed, voted, page: first.page_index, numbers });
+        candidates.push(Candidate { lines, look, own, placed, vetoed, voted, page: first.page_index, numbers, set_apart: !body_type || caps || division_word });
         k = end;
     }
 
@@ -226,7 +236,9 @@ pub(crate) fn decide(
         let voted = group.iter().filter(|candidate| candidate.voted).count() as f64 / group.len() as f64;
         let pages = group.iter().map(|candidate| candidate.page).collect::<HashSet<_>>().len();
         let mut signs = 0.0;
-        if let Some(steps) = counts_on(&group) {
+        // Numbering that counts on marks a division only where the group stands apart from the body:
+        // the body's own paragraphs and items count on too.
+        if let Some(steps) = counts_on(&group).filter(|_| group[0].set_apart) {
             signs += 1.5 * (steps - 0.5);
         }
         signs += if pages >= 2 { 0.5 } else { 0.0 };
