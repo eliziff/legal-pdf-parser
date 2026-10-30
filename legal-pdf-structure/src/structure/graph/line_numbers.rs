@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// The page's transcript line numbers, as `mark_line_numbers` claimed them.
+/// The page's transcript line numbers, as the decision wrote them.
 pub(crate) fn line_labels<'a>(page: &'a Page) -> impl Iterator<Item = &'a Line> + 'a {
     page.lines.iter().filter(|line| line.region_type == "line_label")
 }
@@ -16,9 +16,10 @@ pub(crate) fn line_number(line: &Line) -> Option<(f64, u32)> {
 /// A transcript's printed line numbers, decided for the whole document. A page whose numbers
 /// count 1 to 15 down one column shows where the column stands; on every page, the numbers set
 /// there that count up are its line numbers too (a short last page, numbers every fifth line).
-/// A number the extraction read into its line is split off as a line of its own. Each is a
-/// line_label, outside the body, before any other reading of the page.
-pub(crate) fn mark_line_numbers(pages: &mut [Page]) {
+/// A number the extraction read into its line is split off as a line of its own, and each is held
+/// out of the body. Returns each page's line numbers, as slots of its lines once split.
+pub(crate) fn split_line_numbers(pages: &mut [Page]) -> Vec<Vec<usize>> {
+    let mut numbers = vec![Vec::new(); pages.len()];
     let lefts: Vec<f64> = pages
         .iter()
         .flat_map(|page| {
@@ -27,10 +28,10 @@ pub(crate) fn mark_line_numbers(pages: &mut [Page]) {
         })
         .collect();
     if lefts.is_empty() {
-        return;
+        return numbers;
     }
     let left = legal_pdf_core::upper_median(lefts);
-    for page in pages.iter_mut() {
+    for (page, numbers) in pages.iter_mut().zip(&mut numbers) {
         let tolerance = page.width * 0.03;
         let mut found: Vec<(f64, u32, usize)> = page
             .lines
@@ -47,22 +48,26 @@ pub(crate) fn mark_line_numbers(pages: &mut [Page]) {
         }
         let mut slots: Vec<usize> = found.into_iter().map(|(_, _, slot)| slot).collect();
         slots.sort_unstable();
-        for &slot in slots.iter().rev() {
-            if arabic_page_number(&page.lines[slot].text).is_none() {
-                let number = split_line_number(&mut page.lines[slot]);
-                let id = page.lines[slot].id.clone();
-                for region in &mut page.regions {
-                    if let Some(at) = region.line_ids.iter().position(|line_id| *line_id == id) {
-                        region.line_ids.insert(at, number.id.clone());
-                    }
+        let fused: Vec<bool> = slots.iter().map(|&slot| arabic_page_number(&page.lines[slot].text).is_none()).collect();
+        for (&slot, _) in slots.iter().zip(&fused).rev().filter(|(_, fused)| **fused) {
+            let number = split_line_number(&mut page.lines[slot]);
+            let id = page.lines[slot].id.clone();
+            for region in &mut page.regions {
+                if let Some(at) = region.line_ids.iter().position(|line_id| *line_id == id) {
+                    region.line_ids.insert(at, number.id.clone());
                 }
-                page.lines.insert(slot, number);
-            } else {
-                page.lines[slot].region_type = "line_label".to_owned();
-                page.lines[slot].exclude_from_body = true;
             }
+            page.lines.insert(slot, number);
+        }
+        // Each number split off before a line moves the lines after it down one.
+        let mut moved = 0;
+        for (&slot, &fused) in slots.iter().zip(&fused) {
+            numbers.push(slot + moved);
+            page.lines[slot + moved].exclude_from_body = true;
+            moved += usize::from(fused);
         }
     }
+    numbers
 }
 
 /// A line's printed transcript line number where the extraction read it into the line it numbers
@@ -100,8 +105,6 @@ pub(crate) fn split_line_number(line: &mut Line) -> Line {
         .take(1)
         .collect();
     number.detached_references.clear();
-    number.region_type = "line_label".to_owned();
-    number.exclude_from_body = true;
     line.text = chars[cut..].iter().collect();
     line.bbox[0] = line.words[1].bbox[0];
     line.words.remove(0);

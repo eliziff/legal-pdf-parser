@@ -9,11 +9,11 @@
 //! page break, a numbering restart or a change of type alone opens none. A constituent carries
 //! no label: it is never a pinpoint's target.
 
-use super::{arabic_page_number, graph::PdfTextIndex, headings, party_label};
+use super::{arabic_page_number, graph::PdfTextIndex, headings, party_label, PageView, Slot};
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const ORIGIN: &str = "legalpdf.pdf-structure.v2";
@@ -117,31 +117,20 @@ fn content(line: &Line) -> bool {
             >= 3
 }
 
-pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
-    let mut ordered = pages.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|page| page.index);
+/// Where each constituent document opens, read over the pages' lines (`views`) that `set_aside`
+/// leaves as body.
+pub(super) fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+    let mut ordered = views.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|view| view.page.index);
     // Each body line, with its page and its place on that page.
     let body = ordered
         .iter()
         .enumerate()
-        .flat_map(|(page, sheet)| {
-            let mut lines = sheet
-                .lines
+        .flat_map(|(page, view)| {
+            let mut lines = view
                 .iter()
-                .filter(|line| {
-                    line.note_region_mode.is_empty()
-                        && !line.exclude_from_body
-                        && !matches!(
-                            line.region_type.to_ascii_lowercase().as_str(),
-                            "header"
-                                | "footer"
-                                | "footnote"
-                                | "endnote"
-                                | "table"
-                                | "table_cell"
-                                | "contents"
-                        )
-                })
+                .filter(|(slot, _)| !set_aside(*slot))
+                .map(|(_, line)| line)
                 .collect::<Vec<_>>();
             lines.sort_by(|left, right| {
                 left.reading_order
@@ -239,32 +228,27 @@ pub(super) fn starts(pages: &[Page]) -> Vec<Start> {
         .collect()
 }
 
-/// Package bookmarks supply opening pages before the readers calibrate each document.
-pub(super) fn bookmarked_starts(pages: &[Page], outline: &[PdfOutlineEntry]) -> Vec<Start> {
-    let by_index = pages
+/// Package bookmarks supply opening pages before the readers calibrate each document; a line
+/// `set_aside` holds (a transcript's line number, furniture, a note) opens none.
+pub(super) fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+    let by_index = views
         .iter()
-        .map(|page| (page.index, page))
+        .map(|view| (view.page.index, view))
         .collect::<HashMap<_, _>>();
-    headings::bookmarks::package_targets(outline, pages.len())
+    headings::bookmarks::package_targets(outline, views.len())
         .into_iter()
         .filter_map(|(page, kind)| {
-            let line = by_index
+            let (_, line) = by_index
                 .get(&page)?
-                .lines
                 .iter()
-                .filter(|line| {
-                    !line.exclude_from_body
-                        && line.note_region_mode.is_empty()
-                        && !matches!(
-                            line.region_type.as_str(),
-                            "header" | "footer" | "footnote" | "endnote"
-                        )
+                .filter(|(slot, line)| {
+                    !set_aside(*slot)
                         // Version stamps contain letters but supply no word of an opening.
                         && line.text.split(|c: char| !c.is_alphanumeric()).any(|word| {
                             !word.is_empty() && word.chars().all(char::is_alphabetic)
                         })
                 })
-                .min_by(|a, b| {
+                .min_by(|(_, a), (_, b)| {
                     a.reading_order
                         .cmp(&b.reading_order)
                         .then_with(|| a.id.cmp(&b.id))
@@ -278,18 +262,17 @@ pub(super) fn bookmarked_starts(pages: &[Page], outline: &[PdfOutlineEntry]) -> 
 }
 
 /// A visible opening wins over a bookmark, including an exhibit's preceding certificate page.
-pub(super) fn reconcile_starts(pages: &[Page], bookmarked: &mut Vec<Start>) {
-    let mut lexical = starts(pages);
+pub(super) fn reconcile_starts(views: &[PageView], bookmarked: &mut Vec<Start>, set_aside: impl Fn(Slot) -> bool) {
+    let mut lexical = starts(views, set_aside);
     if bookmarked.is_empty() {
         *bookmarked = lexical;
         return;
     }
-    let positions = pages
+    let positions = views
         .iter()
-        .flat_map(|page| {
-            page.lines
-                .iter()
-                .map(move |line| (line.id.as_str(), (page.index, line.reading_order)))
+        .flat_map(|view| {
+            view.iter()
+                .map(move |(_, line)| (line.id.as_str(), (view.page.index, line.reading_order)))
         })
         .collect::<HashMap<_, _>>();
     let lexical_pages = lexical
@@ -314,23 +297,26 @@ pub(super) fn reconcile_starts(pages: &[Page], bookmarked: &mut Vec<Start>) {
     *bookmarked = lexical;
 }
 
-/// The same openings scope inference and the final constituent nodes.
-pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String, usize> {
+/// The constituent document each line reads in (1 for the first opening `starts` names, 0 for the
+/// packet's own, which is left out), page by page in reading order: a line of the page's furniture
+/// (`furniture`) or its folio before the opening still belongs to the document on that page.
+pub(super) fn documents(views: &[PageView], starts: &[Start], furniture: impl Fn(Slot) -> bool) -> Vec<(Slot, usize)> {
     if starts.is_empty() {
-        return HashMap::new();
+        return Vec::new();
     }
     let starts = starts
         .iter()
         .enumerate()
         .map(|(slot, start)| (start.line_id.as_str(), slot + 1))
         .collect::<HashMap<_, _>>();
-    let mut ordered = pages.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|page| page.index);
+    let mut ordered = views.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|view| view.page.index);
     let mut document = 0;
-    let mut documents = HashMap::new();
-    for page in ordered {
-        let mut lines = page.lines.iter().collect::<Vec<_>>();
-        lines.sort_by(|left, right| {
+    let mut documents = Vec::new();
+    for view in ordered {
+        let page = view.page;
+        let mut lines = view.iter().collect::<Vec<_>>();
+        lines.sort_by(|(_, left), (_, right)| {
             left.reading_order
                 .cmp(&right.reading_order)
                 .then_with(|| left.id.cmp(&right.id))
@@ -338,115 +324,26 @@ pub(super) fn document_lines(pages: &[Page], starts: &[Start]) -> HashMap<String
         // A footer painted before the opening still belongs to the document on this page.
         if let Some(first) = lines
             .iter()
-            .position(|line| starts.contains_key(line.id.as_str()))
+            .position(|(_, line)| starts.contains_key(line.id.as_str()))
         {
-            if lines[..first].iter().all(|line| {
-                line.exclude_from_body
-                    || matches!(line.region_type.as_str(), "header" | "footer")
+            if lines[..first].iter().all(|&(slot, line)| {
+                furniture(slot)
                     || (arabic_page_number(&line.text).is_some()
                         && (line.bbox[3] < page.height * 0.15 || line.bbox[1] > page.height * 0.85))
             }) {
-                document = starts[lines[first].id.as_str()];
+                document = starts[lines[first].1.id.as_str()];
             }
         }
-        for line in lines {
+        for (slot, line) in lines {
             if let Some(&start) = starts.get(line.id.as_str()) {
                 document = start;
             }
             if document != 0 {
-                documents.insert(line.id.clone(), document);
+                documents.push((slot, document));
             }
         }
     }
     documents
-}
-
-/// Run the existing readers on logical documents, including each parallel sequence.
-/// Lines move into page views and back; their text, ids, anchors and physical positions stay put.
-pub(super) fn within_document_contexts(
-    pages: &mut [Page],
-    documents: &HashMap<String, usize>,
-    translation: &HashSet<String>,
-    mut read: impl FnMut(&mut [Page]),
-) {
-    if translation.is_empty() && documents.is_empty() {
-        read(pages);
-        return;
-    }
-    #[derive(Default)]
-    struct Reading {
-        pages: Vec<Page>,
-        positions: Vec<(usize, Vec<usize>)>,
-    }
-    let mut readings = BTreeMap::<(usize, bool), Reading>::new();
-    let mut ordered = (0..pages.len()).collect::<Vec<_>>();
-    ordered.sort_by_key(|&slot| pages[slot].index);
-    for page_slot in ordered {
-        let page = &mut pages[page_slot];
-        for (slot, line) in std::mem::take(&mut page.lines).into_iter().enumerate() {
-            let context = (
-                documents.get(&line.id).copied().unwrap_or(0),
-                translation.contains(&line.id),
-            );
-            let reading = readings.entry(context).or_default();
-            if reading
-                .positions
-                .last()
-                .is_none_or(|(prior, _)| *prior != page_slot)
-            {
-                reading.pages.push(Page {
-                    id: page.id.clone(),
-                    index: page.index,
-                    number: page.number,
-                    width: page.width,
-                    height: page.height,
-                    lines: Vec::new(),
-                    // Initial classification also needs the page's painted table rules.
-                    regions: page
-                        .regions
-                        .iter()
-                        .filter(|region| region.kind == "rule")
-                        .cloned()
-                        .collect(),
-                    source: page.source.clone(),
-                    text_quality: page.text_quality,
-                    printed_label: page.printed_label.clone(),
-                    printed_label_source: page.printed_label_source.clone(),
-                    printed_label_line_id: page.printed_label_line_id.clone(),
-                });
-                reading.positions.push((page_slot, Vec::new()));
-            }
-            reading.pages.last_mut().unwrap().lines.push(line);
-            reading.positions.last_mut().unwrap().1.push(slot);
-        }
-    }
-    let mut restored = (0..pages.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-    for (context, mut reading) in readings {
-        read(&mut reading.pages);
-        for (page, (page_slot, slots)) in reading.pages.into_iter().zip(reading.positions) {
-            restored[page_slot].extend(
-                page.lines
-                    .into_iter()
-                    .zip(slots)
-                    .map(|(line, slot)| (slot, context, line)),
-            );
-        }
-    }
-    for (page, mut lines) in pages.iter_mut().zip(restored) {
-        lines.sort_by_key(|(slot, _, _)| *slot);
-        // Block ids are page-local. Separate readers must not produce colliding groups.
-        let mut blocks = HashMap::new();
-        page.lines = lines
-            .into_iter()
-            .enumerate()
-            .map(|(slot, (_, context, mut line))| {
-                let next = blocks.len();
-                line.block_index = *blocks.entry((context, line.block_index)).or_insert(next);
-                line.reading_order = slot + 1;
-                line
-            })
-            .collect();
-    }
 }
 
 pub(super) fn constituents(

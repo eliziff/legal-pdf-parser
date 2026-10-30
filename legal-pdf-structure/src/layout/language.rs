@@ -43,33 +43,32 @@ pub(crate) fn column_language((english, french): (usize, usize), minimum: usize)
 /// numbers and contents repeat the English column's, which is the one read. A document
 /// is parallel when some page holds an English column beside a French one; then the
 /// French side of every page is the translation wherever its own words are French.
-pub(crate) fn translation_lines(pages: &[Page]) -> HashSet<String> {
-    let body = |line: &&Line| {
-        has_valid_bbox(line)
-            && !line.exclude_from_body
-            && !matches!(line.region_type.as_str(), "header" | "footer")
-    };
-    let models = pages
+/// `models` are the pages' column models, by view; lines `set_aside` holds (a transcript's line
+/// numbers, furniture) are no column's text.
+pub(crate) fn translation_lines(
+    views: &[PageView],
+    models: &[ColumnModel],
+    set_aside: impl Fn(Slot) -> bool,
+) -> Vec<Slot> {
+    let body = |&(slot, line): &(Slot, &Line)| has_valid_bbox(line) && !set_aside(slot);
+    let splits = models
         .iter()
-        .map(|page| {
-            let model = column_model(&page.lines);
-            (model.kind == "two_column").then_some(model.split_x)
-        })
+        .map(|model| (model.kind == "two_column").then_some(model.split_x))
         .collect::<Vec<_>>();
     let side = |line: &Line, split: f64| {
         (line.bbox[2] <= split || line.bbox[0] >= split).then(|| line_center_x(line) >= split)
     };
     // Pages whose two columns are confidently one language each, and which side is French.
-    let parallel = pages
+    let parallel = views
         .iter()
-        .zip(&models)
-        .filter_map(|(page, split)| {
+        .zip(&splits)
+        .filter_map(|(view, split)| {
             let split = (*split)?;
             let votes = |right: bool| {
                 language_votes(
-                    page.lines
-                        .iter()
+                    view.iter()
                         .filter(body)
+                        .map(|(_, line)| line)
                         .filter(|line| side(line, split) == Some(right)),
                 )
             };
@@ -77,14 +76,14 @@ pub(crate) fn translation_lines(pages: &[Page]) -> HashSet<String> {
                 column_language(votes(false), 8),
                 column_language(votes(true), 8),
             ) {
-                (Some(false), Some(true)) => Some((page.index, split, true)),
-                (Some(true), Some(false)) => Some((page.index, split, false)),
+                (Some(false), Some(true)) => Some((view.page.index, split, true)),
+                (Some(true), Some(false)) => Some((view.page.index, split, false)),
                 _ => None,
             }
         })
         .collect::<Vec<_>>();
     if parallel.is_empty() {
-        return HashSet::new();
+        return Vec::new();
     }
     let french_right = parallel.iter().filter(|(_, _, right)| *right).count() * 2 >= parallel.len();
     let split = median(parallel.iter().map(|(_, split, _)| *split).collect());
@@ -93,42 +92,41 @@ pub(crate) fn translation_lines(pages: &[Page]) -> HashSet<String> {
         .filter(|(_, _, right)| *right == french_right)
         .map(|(index, _, _)| *index)
         .collect::<HashSet<_>>();
-    let mut translation = HashSet::new();
-    for (page, page_split) in pages.iter().zip(&models) {
+    let mut translation = Vec::new();
+    for (view, page_split) in views.iter().zip(&splits) {
         let split = page_split.unwrap_or(split);
-        let mut french = page
-            .lines
+        let mut french = view
             .iter()
             .filter(body)
-            .filter(|line| side(line, split) == Some(french_right))
+            .filter(|(_, line)| side(line, split) == Some(french_right))
             .collect::<Vec<_>>();
         // What stands apart above the English column, a cover page's file number or a
         // memo's title, is no part of the translation beside it.
-        let english_top = page
-            .lines
+        let english_top = view
             .iter()
             .filter(body)
-            .filter(|line| (line_center_x(line) >= split) != french_right)
-            .map(|line| line.bbox[1])
+            .filter(|(_, line)| (line_center_x(line) >= split) != french_right)
+            .map(|(_, line)| line.bbox[1])
             .min_by(f64::total_cmp);
         if let Some(top) = english_top {
-            french.sort_by(|a, b| a.bbox[1].total_cmp(&b.bbox[1]));
+            french.sort_by(|(_, a), (_, b)| a.bbox[1].total_cmp(&b.bbox[1]));
             let apart = french
                 .windows(2)
                 .filter(|pair| {
-                    let height = pair[0].bbox[3] - pair[0].bbox[1];
-                    pair[0].bbox[3] <= top && pair[1].bbox[1] - pair[0].bbox[3] >= height * 2.0
+                    let (above, below) = (pair[0].1, pair[1].1);
+                    let height = above.bbox[3] - above.bbox[1];
+                    above.bbox[3] <= top && below.bbox[1] - above.bbox[3] >= height * 2.0
                 })
-                .map(|pair| pair[0].bbox[3])
+                .map(|pair| pair[0].1.bbox[3])
                 .max_by(f64::total_cmp);
             if let Some(cut) = apart {
-                french.retain(|line| line.bbox[3] > cut);
+                french.retain(|(_, line)| line.bbox[3] > cut);
             }
         }
-        if confirmed.contains(&page.index)
-            || column_language(language_votes(french.iter().copied()), 3) == Some(true)
+        if confirmed.contains(&view.page.index)
+            || column_language(language_votes(french.iter().map(|(_, line)| *line)), 3) == Some(true)
         {
-            translation.extend(french.into_iter().map(|line| line.id.clone()));
+            translation.extend(french.into_iter().map(|(slot, _)| slot));
         }
     }
     translation

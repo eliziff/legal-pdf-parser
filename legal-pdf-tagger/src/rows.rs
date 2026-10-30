@@ -208,8 +208,9 @@ pub fn document(pages: &[Page], candidate: &State, pieces: &[Piece], tier0: &[La
     let off_grid: Vec<usize> = pages.iter().map(|page| off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
     let looks = Looks::tally(pages);
     let mut look_ids = Vec::new();
-    // The reader that made each heading line one, where the pages carry it (regions of kind
-    // "heading_source", id "heading-source:<reader>").
+    // The rule that made each heading line one, or took the line from the headings ("+anchor",
+    // "-marginal_note"), where the pages carry it (regions of kind "heading_source", id
+    // "heading-source:<trail>").
     let sources: HashMap<&str, &str> = pages
         .iter()
         .flat_map(|page| &page.regions)

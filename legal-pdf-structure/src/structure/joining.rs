@@ -68,10 +68,10 @@ pub(super) fn join_lines(lines: &[&Line], vocabulary: &Vocabulary) -> (String, V
 pub(super) fn build_paragraphs_with_context(
     pages: &[Page],
     anchors: &HashMap<String, Vec<Anchor>>,
-    primitives: &PdfPrimitiveEvidence,
+    decided: &Decided,
 ) -> Vec<Paragraph> {
     let vocabulary = vocabulary(pages);
-    let context = |id: &str| primitives.contexts.reading_context(id);
+    let context = |id: &str| decided.reading_context(id);
     let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
     let mut tails = HashMap::<DocumentContext, usize>::new();
     for page in pages {

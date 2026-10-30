@@ -15,7 +15,7 @@
 //! as a short line before a wider blank does; a line going on with a sentence or a hyphened word
 //! opens nothing.
 
-use legal_pdf_core::{flag_share, line_font_size, upper_median as median, quantile, Line, Page, BOLD, ITALIC};
+use legal_pdf_core::{flag_share, line_font_size, upper_median as median, quantile, Line, BOLD, ITALIC};
 use regex::Regex;
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -123,7 +123,7 @@ fn first_word_width(line: &Line) -> f64 {
 
 /// A form's or a signature block's field label ("Per:", "Name:", "Title:", "Email:"): the value
 /// set beside or under it belongs with it, whatever the layout says.
-fn field_label(line: &Line) -> bool {
+pub(crate) fn field_label(line: &Line) -> bool {
     let text = line.text.trim();
     text.ends_with(':')
         && text.chars().count() <= 24
@@ -165,7 +165,7 @@ struct Pitch {
     by_size: HashMap<i64, f64>,
     any: f64,
     edges: Vec<f64>,
-    /// The document's measure and leading (`document_measure`).
+    /// The document's measure and leading (`measure_of`).
     measure: Measure,
     /// Most of the page's lines are scanned: it is read by its leading alone.
     scan: bool,
@@ -189,19 +189,16 @@ pub(crate) struct Measure {
     pitch: f64,
 }
 
-pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) -> Measure {
-    let widths: Vec<f64> = pages
-        .iter()
-        .flat_map(|page| page.lines.iter())
-        .filter(|line| counted(line))
-        .map(width)
-        .collect();
-    let width = quantile(widths, 0.9);
+/// The measures a document's counted lines show (`pages`: each page's, in their order on it): the
+/// width most of them reach, and on a scan its line height, paragraph gap and line pitch.
+pub(crate) fn measure_of(pages: &[Vec<&Line>]) -> Measure {
+    let width = quantile(pages.iter().flatten().map(|line| width(line)).collect(), 0.9);
     let scans = || {
-        pages.iter().map(|page| {
-            page.lines
+        pages.iter().map(|lines| {
+            lines
                 .iter()
-                .filter(|line| counted(line) && scanned(line) && height(line) > 0.0)
+                .copied()
+                .filter(|line| scanned(line) && height(line) > 0.0)
                 .collect::<Vec<_>>()
         })
     };
@@ -586,10 +583,6 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     full && (!terminal_re().is_match(a.text.trim()) || lower)
 }
 
-fn in_body(line: &Line) -> bool {
-    line.region_type == "body" && !line.exclude_from_body && line.note_region_mode.is_empty()
-}
-
 /// With LEGALPDF_PARAGRAPH_TRACE set, each break names its rule on stderr: the page, the line
 /// that opens the new block or paragraph, its first characters.
 fn trace(line: &Line, kind: &str, reason: &str) {
@@ -600,34 +593,24 @@ fn trace(line: &Line, kind: &str, reason: &str) {
     }
 }
 
-/// Read paragraph boundaries without changing source block indices. Classification can use
-/// the same geometry before assigning roles that the final paragraph reader uses afterward.
-pub(crate) fn paragraph_indices(
-    page: &Page,
-    counted: impl Fn(&Line) -> bool,
-    measure: Measure,
-) -> Vec<Option<usize>> {
-    let mut next = page
-        .lines
-        .iter()
-        .map(|line| line.block_index)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let body: Vec<&Line> = page.lines.iter().filter(|line| counted(line)).collect();
+/// Each of a page's `lines` (in reading order) `counted` holds numbered by its printed paragraph,
+/// from 0 in order; none for the others, which part the runs of counted lines.
+pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
+    let mut next = 0;
+    let body: Vec<&Line> = lines.iter().zip(counted).filter(|(_, counted)| **counted).map(|(line, _)| *line).collect();
     let pitch = Pitch::of(&body, measure);
-    let mut assigned = vec![None; page.lines.len()];
+    let mut assigned = vec![None; lines.len()];
     let mut start = 0;
-    while start < page.lines.len() {
-        if !counted(&page.lines[start]) {
+    while start < lines.len() {
+        if !counted[start] {
             start += 1;
             continue;
         }
         let mut end = start + 1;
-        while end < page.lines.len() && counted(&page.lines[end]) {
+        while end < lines.len() && counted[end] {
             end += 1;
         }
-        let run = &page.lines[start..end];
+        let run = &lines[start..end];
         // LEGALPDF_LAYOUT_UNITS=on: where a page layout model has given every line a region, the
         // regions are the paragraphs: a block starts where the region changes and nowhere else.
         let layout_units = layout_units_mode() && run.iter().all(|line| !line.region_id.is_empty());
@@ -640,13 +623,13 @@ pub(crate) fn paragraph_indices(
                     }
                     trace(&run[k], "block", "layout-region");
                 } else {
-                    match starts_block(&run[k - 1], &run[k], &pitch) {
+                    match starts_block(run[k - 1], run[k], &pitch) {
                         None => continue,
-                        Some(reason) => trace(&run[k], "block", reason),
+                        Some(reason) => trace(run[k], "block", reason),
                     }
                 }
             }
-            let block: Vec<&Line> = run[block_start..k].iter().collect();
+            let block: Vec<&Line> = run[block_start..k].to_vec();
             assigned[start + block_start] = Some(next);
             let indented = indents_first_lines(&block);
             for j in 1..block.len() {
@@ -666,19 +649,6 @@ pub(crate) fn paragraph_indices(
         start = end;
     }
     assigned
-}
-
-/// Give each printed paragraph of body text its own block index.
-pub(crate) fn segment_paragraphs(pages: &mut [Page]) {
-    let measure = document_measure(pages, in_body);
-    for page in pages {
-        let assigned = paragraph_indices(page, in_body, measure);
-        for (line, block) in page.lines.iter_mut().zip(assigned) {
-            if let Some(block) = block {
-                line.block_index = block;
-            }
-        }
-    }
 }
 
 /// Whether a page layout model's regions, when present on every line, define the paragraphs.

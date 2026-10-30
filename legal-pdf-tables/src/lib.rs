@@ -25,8 +25,8 @@ pub trait TableLayout {
     /// (`Some(true)`, `Some(false)`, `None`), on at least `minimum` telling words.
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool>;
     /// Whether the page's white space can be read for tables set without rules: not a recognized
-    /// page's, unless its lines stand in a plain grid.
-    fn white_space(&self, page: &Page) -> bool;
+    /// page's, unless the lines its items (`page_items`) offer stand in a plain grid.
+    fn white_space(&self, page: &Page, items: &PageItems) -> bool;
 }
 
 /// Points within which rule positions coincide and rule ends meet.
@@ -164,14 +164,24 @@ fn cell_of(page: &Page, column: usize, mut pieces: Vec<Piece>) -> TableCell {
 /// A word no word of the line stands for: the line read whole.
 pub const WHOLE: usize = usize::MAX;
 
-fn text_items(page: &Page) -> (Vec<TextItem>, Vec<(usize, usize)>) {
+/// Lines' words as pdf-inspector's text items, with the (line, word) each was read from.
+#[derive(Debug)]
+pub struct PageItems {
+    pub items: Vec<TextItem>,
+    /// The line's slot and the word's index for each item; `WHOLE` for a line read whole.
+    pub origin: Vec<(usize, usize)>,
+}
+
+/// A page's words as text items on the page's own number (its index + 1), the number its rules
+/// and filled rectangles are read on: the one reading of the page its table readers share.
+pub fn page_items(page: &Page) -> PageItems {
     line_items(&page.lines, page.index as u32 + 1, page.height)
 }
 
 /// Lines' words as pdf-inspector's text items (points, y up, on page `number`), with the (line,
-/// word) each was read from, so its readers read our pages, recognized ones too. Running heads and
-/// footers, and lines the parser has set aside, are not offered.
-pub fn line_items(lines: &[Line], number: u32, height: f64) -> (Vec<TextItem>, Vec<(usize, usize)>) {
+/// word) each was read from, so its readers read our pages, recognized ones too. Lines the parser
+/// holds out of the body (a transcript's line numbers) are not offered.
+pub fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems {
     let (mut items, mut origin) = (Vec::new(), Vec::new());
     // Each word as its span sets it: face, weight, slant and pitch; a recognized line's by its
     // strokes alone.
@@ -205,7 +215,6 @@ pub fn line_items(lines: &[Line], number: u32, height: f64) -> (Vec<TextItem>, V
     };
     for (slot, line) in lines.iter().enumerate() {
         if line.exclude_from_body
-            || matches!(line.region_type.as_str(), "header" | "footer")
             || line.text.trim().is_empty()
             || !line.bbox.iter().all(|value| value.is_finite())
         {
@@ -232,20 +241,19 @@ pub fn line_items(lines: &[Line], number: u32, height: f64) -> (Vec<TextItem>, V
             origin.push((slot, at));
         }
     }
-    (items, origin)
+    PageItems { items, origin }
 }
 
 /// Clears the underline and strike read under the words of a table drawn with rules or filled
 /// cells, as pdf-inspector clears them (suppress_table_underlines): the table's rulings, not the
-/// words'.
-pub fn clear_table_underlines(page: &mut Page) {
-    if !page.lines.iter().flat_map(|line| &line.words).any(|word| word.underlined || word.struck) {
+/// words'. The page's items (`page_items`) are cleared with its words.
+pub fn clear_table_underlines(page: &mut Page, items: &mut PageItems) {
+    if !items.items.iter().any(|item| item.is_underline || item.is_strikeout) {
         return;
     }
-    let (mut items, origin) = text_items(page);
-    let marked: Vec<bool> = items.iter().map(|item| item.is_underline || item.is_strikeout).collect();
-    pdf_inspector::extractor::suppress_table_underlines(&mut items, &rects(page), &rules(page), page.index as u32 + 1);
-    for ((item, marked), (line, word)) in items.iter().zip(marked).zip(origin) {
+    let marked: Vec<bool> = items.items.iter().map(|item| item.is_underline || item.is_strikeout).collect();
+    pdf_inspector::extractor::suppress_table_underlines(&mut items.items, &rects(page), &rules(page), page.index as u32 + 1);
+    for ((item, marked), &(line, word)) in items.items.iter().zip(marked).zip(&items.origin) {
         if marked && !item.is_underline && !item.is_strikeout && word != WHOLE {
             let word = &mut page.lines[line].words[word];
             word.underlined = false;
@@ -453,10 +461,12 @@ fn two_column_list(table: &PdfTable) -> bool {
 /// A page's tables, and the lines of the contents lists pdf-inspector read there as tables.
 fn page_tables(
     page: &Page,
-    translation: &HashSet<String>,
+    items: &PageItems,
+    translated: &dyn Fn(&str) -> bool,
     layout: &dyn TableLayout,
 ) -> (Vec<PdfTable>, Vec<String>) {
-    let (items, origin) = text_items(page);
+    let offered = items;
+    let PageItems { items, origin } = items;
     if items.len() < 6 {
         return (Vec::new(), Vec::new());
     }
@@ -474,7 +484,7 @@ fn page_tables(
         table
     };
     // Filled cell grids first, each on items no grid before it took.
-    let (grids, hints) = detect_tables_from_rects(&items, &rects(page), number);
+    let (grids, hints) = detect_tables_from_rects(items, &rects(page), number);
     for table in grids {
         if table.item_indices.iter().any(|k| claimed.contains(k)) {
             continue;
@@ -485,7 +495,7 @@ fn page_tables(
     // Ruled tables where no grid was found.
     let rules = rules(page);
     if claimed.is_empty() && !rules.is_empty() {
-        for table in detect_tables_from_lines(&items, &rules, number) {
+        for table in detect_tables_from_lines(items, &rules, number) {
             claimed.extend(table.item_indices.iter().copied());
             found.push(table);
         }
@@ -510,7 +520,7 @@ fn page_tables(
             }
         }
     }
-    if layout.white_space(page) {
+    if layout.white_space(page, offered) {
         let rest: Vec<usize> = (0..items.len()).filter(|k| !claimed.contains(k)).collect();
         let free: Vec<TextItem> = rest.iter().map(|&k| items[k].clone()).collect();
         let mut sizes: Vec<f32> = free.iter().map(|item| item.font_size).collect();
@@ -531,8 +541,8 @@ fn page_tables(
     let mut tables: Vec<PdfTable> = found
         .iter()
         .filter(|table| table.kind == TableKind::Data)
-        .filter_map(|table| converted(page, &origin, table))
-        .filter(|table| !table.line_ids().into_iter().any(|id| translation.contains(id)))
+        .filter_map(|table| converted(page, origin, table))
+        .filter(|table| !table.line_ids().into_iter().any(|id| translated(id)))
         .filter(|table| !bilingual_columns(page, table, layout))
         .filter(|table| !two_column_list(table))
         .collect();
@@ -587,17 +597,20 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
 }
 
 /// Every table in the document, a table cut off by a page break joined to its continuation,
-/// in reading order; and the lines of the contents lists pdf-inspector read as tables.
+/// in reading order; and the lines of the contents lists pdf-inspector read as tables. Each page
+/// is read on its items (`page_items`, one per page) and its own rules and filled rectangles. A
+/// table holding a line `translated` names (by id) is a text beside its translation.
 pub fn document_tables(
     pages: &[Page],
-    translation: &HashSet<String>,
+    items: &[PageItems],
+    translated: &dyn Fn(&str) -> bool,
     layout: &dyn TableLayout,
 ) -> (Vec<PdfTable>, HashSet<String>) {
     let mut tables: Vec<PdfTable> = Vec::new();
     let mut contents = HashSet::new();
     let mut previous_last: Option<usize> = None;
-    for page in pages {
-        let (found, listed) = page_tables(page, translation, layout);
+    for (page, items) in pages.iter().zip(items) {
+        let (found, listed) = page_tables(page, items, translated, layout);
         contents.extend(listed);
         let empty_band = |from: f64, to: f64| {
             !page.lines.iter().any(|line| {
@@ -682,105 +695,4 @@ pub fn document_tables(
             .filter(|index| empty_band(tables[*index].bottom, page.height * 0.88));
     }
     (tables, contents)
-}
-
-/// Puts each table's lines on the page in row order, cell by cell, where its first line
-/// stood, and renumbers the page's reading order.
-pub fn order_table_lines(page: &mut Page, tables: &[PdfTable]) {
-    let keys: HashMap<&str, (usize, usize)> = tables
-        .iter()
-        .enumerate()
-        .flat_map(|(table, value)| {
-            value
-                .line_ids()
-                .into_iter()
-                .enumerate()
-                .map(move |(at, id)| (id.as_str(), (table, at)))
-        })
-        .collect();
-    if !page
-        .lines
-        .iter()
-        .any(|line| keys.contains_key(line.id.as_str()))
-    {
-        return;
-    }
-    let lines = std::mem::take(&mut page.lines);
-    let mut held: HashMap<usize, Vec<(usize, Line)>> = HashMap::new();
-    let mut order: Vec<Result<Line, usize>> = Vec::with_capacity(lines.len());
-    for line in lines {
-        match keys.get(line.id.as_str()).copied() {
-            Some((table, at)) => {
-                let slot = held.entry(table).or_default();
-                if slot.is_empty() {
-                    order.push(Err(table));
-                }
-                slot.push((at, line));
-            }
-            None => order.push(Ok(line)),
-        }
-    }
-    for entry in order {
-        match entry {
-            Ok(line) => page.lines.push(line),
-            Err(table) => {
-                let mut cells = held.remove(&table).unwrap_or_default();
-                cells.sort_by_key(|(at, _)| *at);
-                page.lines.extend(cells.into_iter().map(|(_, line)| line));
-            }
-        }
-    }
-    for (index, line) in page.lines.iter_mut().enumerate() {
-        line.reading_order = index + 1;
-    }
-}
-
-/// Each cell's text is a block of its own: a paragraph never runs from one cell into the next,
-/// though a cell may hold several.
-pub fn part_cell_paragraphs(pages: &mut [Page], tables: &[PdfTable]) {
-    // A line parted between cells reads with the first of them.
-    let mut cells: HashMap<&str, usize> = HashMap::new();
-    for (cell, value) in tables
-        .iter()
-        .flat_map(|table| &table.rows)
-        .flat_map(|row| &row.cells)
-        .enumerate()
-    {
-        for part in &value.parts {
-            cells.entry(part.line_id.as_str()).or_insert(cell);
-        }
-    }
-    for page in pages {
-        let mut next = page
-            .lines
-            .iter()
-            .map(|line| line.block_index)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let mut prior: Option<(usize, usize)> = None;
-        for line in &mut page.lines {
-            let Some(&cell) = cells.get(line.id.as_str()) else {
-                prior = None;
-                continue;
-            };
-            if prior
-                .is_none_or(|(prior_cell, block)| prior_cell != cell || block != line.block_index)
-            {
-                next += 1;
-            }
-            prior = Some((cell, line.block_index));
-            line.block_index = next;
-            line.note_region_mode.clear();
-        }
-    }
-}
-
-/// Line ids of every table's cells.
-pub fn table_line_ids(tables: &[PdfTable]) -> HashSet<String> {
-    tables
-        .iter()
-        .flat_map(PdfTable::line_ids)
-        .cloned()
-        .collect()
 }

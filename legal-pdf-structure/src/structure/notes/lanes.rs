@@ -4,8 +4,10 @@
 //! reroute and the note band closure) and `note_band_witness.py` (the printed separator's band and
 //! the font-role strands).
 //!
-//! Every lane proposes; the claims are applied together once all have spoken, an earlier lane's
-//! claim reserving its line from the later ones, so a weaker witness never overrides a stronger.
+//! The lanes read a document's lines as the note band left them (`LaneLines`) and write nothing
+//! (`note_promotions`). Every lane proposes; the claims are taken together once all have spoken, an
+//! earlier lane's claim reserving its line from the later ones, so a weaker witness never
+//! overrides a stronger.
 //! Each lane needs two independent witnesses before it retypes a line, and a declined line is a
 //! miss, never a misplacement. The document's own state carries across pages: the note label
 //! ladder, the layout prior over every page whose notes end their band, and the bridge from one
@@ -16,7 +18,7 @@ use legal_pdf_core::{
     model::{Line, Page},
 };
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 const SEPARATOR_Y_TOLERANCE: f64 = 0.006;
@@ -27,7 +29,7 @@ const CLOSURE_MIN_PRIOR_RATIO: f64 = 0.5;
 const CLOSURE_MAX_TAIL_LINES: usize = 12;
 
 /// A line, by its page and its place among the page's lines.
-type LineRef = (usize, usize);
+pub(crate) type LineRef = (usize, usize);
 
 fn marker_start_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -212,62 +214,77 @@ fn dense(labels: &[i64]) -> bool {
             .all(|pair| (1..=MAX_NUMERIC_LABEL_STEP).contains(&(pair[1] - pair[0])))
 }
 
+/// A note's line: the note band's.
+pub(crate) const LANE_NOTE: u8 = 1;
+/// A body line whose role may still change: no heading, running head, folio, table's cell, or line
+/// the reading holds out of the body.
+pub(crate) const LANE_BODY: u8 = 1 << 1;
+/// A running head or foot, or a folio.
+pub(crate) const LANE_FURNITURE: u8 = 1 << 2;
+/// A numbered paragraph's label, as the note band read it.
+pub(crate) const LANE_PARAGRAPH: u8 = 1 << 3;
+
+/// A document's lines as the lanes read them: its pages, each page's lines of the document in
+/// reading order (page slot, the lines' places on the page), each page's first slot, and each
+/// line's `LANE_*` flags by slot.
+pub(crate) struct LaneLines<'a> {
+    pub(crate) pages: &'a [Page],
+    pub(crate) order: &'a [(usize, Vec<usize>)],
+    pub(crate) starts: &'a [usize],
+    pub(crate) flags: &'a [u8],
+}
+
 struct DocumentLines<'a> {
     pages: &'a [Page],
     /// Each page's lines in reading order: (page slot, line slots).
-    order: Vec<(usize, Vec<usize>)>,
+    order: &'a [(usize, Vec<usize>)],
+    starts: &'a [usize],
+    flags: &'a [u8],
     /// Native font sizes and recognized glyph heights are distinct measurements.
     note_sizes: [Option<f64>; 2],
 }
 
 impl<'a> DocumentLines<'a> {
-    fn new(pages: &'a [Page]) -> Self {
-        let mut slots = (0..pages.len()).collect::<Vec<_>>();
-        slots.sort_by_key(|slot| pages[*slot].index);
-        let order = slots
-            .into_iter()
-            .map(|slot| {
-                let mut lines = (0..pages[slot].lines.len()).collect::<Vec<_>>();
-                lines.sort_by_key(|line| pages[slot].lines[*line].reading_order);
-                (slot, lines)
-            })
-            .collect();
-        Self {
-            pages,
-            order,
-            note_sizes: note_type_sizes(pages),
-        }
+    fn new(lines: LaneLines<'a>) -> Self {
+        let LaneLines { pages, order, starts, flags } = lines;
+        let mut document = Self { pages, order, starts, flags, note_sizes: [None; 2] };
+        document.note_sizes = note_type_sizes(&document);
+        document
     }
 
-    fn text(&self, (page, line): LineRef) -> &str {
-        self.pages[page].lines[line].text.trim()
+    fn line(&self, (page, line): LineRef) -> &'a Line {
+        &self.pages[page].lines[line]
     }
 
-    fn region(&self, (page, line): LineRef) -> &str {
-        &self.pages[page].lines[line].region_type
+    fn flagged(&self, (page, line): LineRef, flag: u8) -> bool {
+        self.flags[self.starts[page] + line] & flag != 0
     }
 
-    fn is_note(&self, (page, line): LineRef) -> bool {
-        let line = &self.pages[page].lines[line];
-        !line.exclude_from_body && line.region_type.contains("note")
+    fn text(&self, line: LineRef) -> &'a str {
+        self.line(line).text.trim()
+    }
+
+    fn furniture(&self, line: LineRef) -> bool {
+        self.flagged(line, LANE_FURNITURE)
+    }
+
+    fn is_note(&self, line: LineRef) -> bool {
+        self.flagged(line, LANE_NOTE)
     }
 
     /// A line whose label may still change: a body line, not a heading, a running head, a folio,
-    /// a table's cell or a line the page leaves out. The caller supplies table and contents
-    /// exclusions through the existing source-exclusion flag for this reading.
-    fn mutable(&self, (page, line): LineRef) -> bool {
-        let line = &self.pages[page].lines[line];
-        line.region_type == "body" && !line.exclude_from_body
+    /// a table's cell or a line the reading holds out.
+    fn mutable(&self, line: LineRef) -> bool {
+        self.flagged(line, LANE_BODY)
     }
 
-    fn paragraph_label(&self, (page, line): LineRef) -> bool {
-        let line = &self.pages[page].lines[line];
-        line.paragraph_label_candidate && bare_label(&line.text).is_some()
+    fn paragraph_label(&self, line: LineRef) -> bool {
+        self.flagged(line, LANE_PARAGRAPH) && bare_label(&self.line(line).text).is_some()
     }
 
-    fn y_ratio(&self, (page, line): LineRef) -> f64 {
-        let page = &self.pages[page];
-        let line = &page.lines[line];
+    fn y_ratio(&self, at: LineRef) -> f64 {
+        let page = &self.pages[at.0];
+        let line = self.line(at);
         if page.height > 0.0 {
             (line.bbox[1] + line.bbox[3]) / 2.0 / page.height
         } else {
@@ -278,16 +295,16 @@ impl<'a> DocumentLines<'a> {
     /// A line set larger than the document's note type, where that type is known: body text a
     /// band below a rule must not take (a statute's sections under their heading's rule, with the
     /// small source notes between them).
-    fn body_type(&self, (page, line): LineRef) -> bool {
-        let line = &self.pages[page].lines[line];
+    fn body_type(&self, at: LineRef) -> bool {
+        let line = self.line(at);
         let size = note_text_size(line);
         self.note_sizes[usize::from(line.spans.is_empty())]
             .is_some_and(|note| size > note + 0.6)
     }
 
     /// The line set in the document's note type.
-    fn matches_note_type(&self, (page, line): LineRef) -> bool {
-        let line = &self.pages[page].lines[line];
+    fn matches_note_type(&self, at: LineRef) -> bool {
+        let line = self.line(at);
         let size = note_text_size(line);
         self.note_sizes[usize::from(line.spans.is_empty())]
             .is_some_and(|note| size > 0.0 && (size - note).abs() <= 0.6)
@@ -304,21 +321,19 @@ fn note_text_size(line: &Line) -> f64 {
 
 /// The document's note type, smaller than its body's. Learn font sizes and recognized glyph
 /// heights separately over the whole document, never borrowing one measurement for the other.
-fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
+fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
     let mut notes = [Vec::new(), Vec::new()];
     let mut body = [Vec::new(), Vec::new()];
-    for line in pages.iter().flat_map(|page| &page.lines) {
-        if line.exclude_from_body {
-            continue;
-        }
+    for at in lines.order.iter().flat_map(|(page, places)| places.iter().map(move |place| (*page, *place))) {
+        let line = lines.line(at);
         let size = note_text_size(line);
         if size <= 0.0 {
             continue;
         }
         let source = usize::from(line.spans.is_empty());
-        if line.region_type.contains("note") {
+        if lines.is_note(at) {
             notes[source].push(size);
-        } else if line.region_type == "body" {
+        } else if lines.flagged(at, LANE_BODY | LANE_PARAGRAPH) {
             body[source].push(size);
         }
     }
@@ -331,39 +346,20 @@ fn note_type_sizes(pages: &[Page]) -> [Option<f64>; 2] {
     })
 }
 
-/// Settle one logical document's notes, with separators aligned to these page slots.
-/// Returns how many lines changed.
-pub(crate) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>]) -> usize {
-    let claims = {
-        let lines = DocumentLines::new(pages);
-        let mut claims = BTreeMap::<LineRef, &'static str>::new();
-        let rerouted = post_footnote_reroute(&lines);
-        let closed = band_closure(&lines, &rerouted);
-        for line in rerouted.iter().chain(&closed) {
-            claims.entry(*line).or_insert("footnote");
-        }
-        let reserved = claims.keys().copied().collect::<HashSet<_>>();
-        let band = note_band(&lines, separators, &reserved);
-        for line in band.promoted.iter().map(|promotion| promotion.line) {
-            claims.entry(line).or_insert("footnote");
-        }
-        let reserved = claims.keys().copied().collect::<HashSet<_>>();
-        let strands = font_role_strands(&lines, separators, &reserved, &band);
-        for line in strands {
-            claims.entry(line).or_insert("footnote");
-        }
-        claims
-    };
-    let mut changed = 0;
-    for ((page, line), region) in claims {
-        let line = &mut pages[page].lines[line];
-        if line.region_type != region {
-            line.region_type = region.to_owned();
-            line.note_region_mode = region.to_owned();
-            changed += 1;
-        }
-    }
-    changed
+/// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
+/// separators aligned to its page slots: each by its page slot and its place on the page, in order.
+pub(crate) fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
+    let lines = DocumentLines::new(lines);
+    let mut claims = BTreeSet::<LineRef>::new();
+    let rerouted = post_footnote_reroute(&lines);
+    let closed = band_closure(&lines, &rerouted);
+    claims.extend(rerouted.iter().chain(&closed));
+    let reserved = claims.iter().copied().collect::<HashSet<_>>();
+    let band = note_band(&lines, separators, &reserved);
+    claims.extend(band.promoted.iter().map(|promotion| promotion.line));
+    let reserved = claims.iter().copied().collect::<HashSet<_>>();
+    claims.extend(font_role_strands(&lines, separators, &reserved, &band));
+    claims.into_iter().collect()
 }
 
 /// Text lines after a page's first note line that carry note evidence of their own: a note's
@@ -372,7 +368,7 @@ pub(crate) fn correct_note_regions(pages: &mut [Page], separators: &[Option<f64>
 /// the chain, so the body below a page's notes inherits nothing.
 fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
     let mut claims = Vec::new();
-    for (page, slots) in &lines.order {
+    for (page, slots) in lines.order {
         let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
         let Some(first_note) = refs.iter().position(|line| lines.is_note(*line)) else {
             continue;
@@ -459,7 +455,7 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
         broken: bool,
     }
     let mut states = Vec::new();
-    for (page, slots) in &lines.order {
+    for (page, slots) in lines.order {
         let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
         let note = |line: &LineRef| lines.is_note(*line) || rerouted.contains(line);
         let Some(last) = refs.iter().rposition(note) else {
@@ -472,8 +468,7 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
             if note(&line) || text.is_empty() {
                 continue;
             }
-            let region = lines.region(line);
-            if matches!(region, "header" | "footer") || page_label_re().is_match(text) {
+            if lines.furniture(line) || page_label_re().is_match(text) {
                 continue;
             }
             if !lines.mutable(line) {
@@ -555,7 +550,7 @@ fn note_band(
     };
     let mut states = HashMap::<usize, (bool, f64, String)>::new();
     let mut deferred = Vec::<(usize, Vec<Candidate>)>::new();
-    for (page, slots) in &lines.order {
+    for (page, slots) in lines.order {
         let Some(separator) = separators.get(*page).copied().flatten() else {
             continue;
         };
@@ -783,7 +778,7 @@ fn font_role_strands(
     let mut ladder_last = None::<i64>;
     let mut claims = Vec::new();
     let mut claimed = HashSet::new();
-    for (page, slots) in &lines.order {
+    for (page, slots) in lines.order {
         let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
         let advance = |label: i64, last: &mut Option<i64>| {
             if last.is_none_or(|last| label > last) {
@@ -882,8 +877,7 @@ fn font_role_strands(
                     continue;
                 }
                 let bottom_terminal = refs[position..].iter().all(|line| {
-                    matches!(lines.region(*line), "header" | "footer")
-                        || lines.text(*line).is_empty()
+                    lines.furniture(*line) || lines.text(*line).is_empty()
                 });
                 let position_ok = rule.is_some() || bottom_terminal;
                 let adjacent_note = (start > 0 && lines.is_note(refs[start - 1]))

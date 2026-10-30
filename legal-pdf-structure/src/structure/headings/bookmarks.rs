@@ -1,4 +1,5 @@
-//! The document's own bookmarks reconciled with the headings found in its text.
+//! The document's own bookmarks as an outline of it: which to trust, how deep each sits, and how a
+//! bookmark's title is matched with the lines that print it (`decide::anchors` finds them).
 //!
 //! Validation, tiering, title normalization and the bookmark-frame merges are ported from
 //! VectifyAI/PageIndex `pageindex/flash/embedded_toc.py` (`validate_bookmarks`,
@@ -16,18 +17,16 @@
 //! - constituent documents and parallel translations keep separate anchors and bookmark frames;
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
-use crate::structure::{
-    continues_prose, enumerated, has_dot_leader, DocumentContext,
-    PdfPrimitiveEvidence,
-};
-use legal_pdf_core::model::{Page, PdfOutlineEntry};
-use legal_pdf_witnesses::PACKAGE_UNITS;
+use legal_pdf_core::model::PdfOutlineEntry;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+/// Words that number the constituents of a filed package.
+const PACKAGE_UNITS: &[&str] = &["tab", "exhibit", "schedule", "appendix", "annex", "attachment"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
+pub(crate) enum Tier {
     Ignore,
     Skeleton,
     Full,
@@ -35,25 +34,24 @@ enum Tier {
 
 /// Same-page titles at or above this similarity refer to the same section.
 const REPAIR_SIMILARITY: f64 = 0.7;
-/// A detected title recurring this often is a running label; one longer than this is a lead.
-const BACKFILL_DUP_MIN: usize = 3;
-const BACKFILL_MAX_TITLE: usize = 100;
+/// A title longer than this is a lead, not a heading.
+pub(crate) const BACKFILL_MAX_TITLE: usize = 100;
 /// A bookmark title is found on at most this many consecutive lines.
-const MAX_TITLE_LINES: usize = 4;
+pub(crate) const MAX_TITLE_LINES: usize = 4;
 
 const CONTENT_UNITS: &[&str] = &["chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix"];
 const ROMAN_EXCLUDED: &[&str] = &["di", "div", "li", "liv", "mi", "mix", "xi"];
 
 #[derive(Debug, Clone)]
-struct Entry {
-    title: String,
-    level: usize,
+pub(crate) struct Entry {
+    pub(crate) title: String,
+    pub(crate) level: usize,
     /// One-based physical page.
-    page: usize,
+    pub(crate) page: usize,
 }
 
 /// A bookmark named for its page alone ("12", "Page 12").
-fn generic_title() -> &'static Regex {
+pub(crate) fn generic_title() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)^(?:page\s*)?\d+$").expect("generic title"))
 }
@@ -136,7 +134,7 @@ fn similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Entries must walk forward through the document; levels are re-stacked over the survivors.
-fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
+pub(crate) fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
     let mut kept = Vec::new();
     let mut last_page = 0;
     for entry in outline {
@@ -201,7 +199,7 @@ pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<
         .collect()
 }
 
-fn restack(entries: &mut [Entry]) {
+pub(crate) fn restack(entries: &mut [Entry]) {
     let mut stack = Vec::<usize>::new();
     for entry in entries {
         while stack.last().is_some_and(|level| *level >= entry.level) {
@@ -212,7 +210,7 @@ fn restack(entries: &mut [Entry]) {
     }
 }
 
-fn classify(entries: &[Entry], pages: usize) -> Tier {
+pub(crate) fn classify(entries: &[Entry], pages: usize) -> Tier {
     if entries.len() < 3 {
         return Tier::Ignore;
     }
@@ -261,15 +259,7 @@ fn classify(entries: &[Entry], pages: usize) -> Tier {
     }
 }
 
-/// The source lines a bookmark's title was found on.
-#[derive(Debug, Clone)]
-struct Anchor {
-    page_slot: usize,
-    lines: Vec<usize>,
-    existing: bool,
-}
-
-fn same_title(found: &str, title: &str, heading: bool) -> bool {
+pub(crate) fn same_title(found: &str, title: &str, heading: bool) -> bool {
     if found.is_empty() || title.is_empty() {
         return false;
     }
@@ -325,491 +315,6 @@ pub(crate) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutline
         cursor = Some(at);
     }
     merged
-}
-
-/// `complete`: the document's own bookmarks set out every level (`complete`), so a heading the
-/// outline does not name is none.
-pub(crate) fn reconcile_bookmarks(
-    pages: &mut [Page],
-    outline: &[PdfOutlineEntry],
-    primitives: &mut PdfPrimitiveEvidence,
-    complete: bool,
-) -> bool {
-    let mut entries = validate(outline, pages.len());
-    let tier = classify(&entries, pages.len());
-    if tier == Tier::Ignore {
-        return false;
-    }
-    let slot_of_page = pages
-        .iter()
-        .enumerate()
-        .map(|(slot, page)| (page.index, slot))
-        .collect::<HashMap<_, _>>();
-    let contents_pages = pages
-        .iter()
-        .filter(|page| {
-            primitives.claims.contents_pages.contains(&page.index)
-                || page
-                    .lines
-                    .iter()
-                    .any(|line| primitives.claims.contents_line_ids.contains(&line.id))
-        })
-        .map(|page| page.index)
-        .collect::<HashSet<_>>();
-    // A bookmark on a contents page holds no other: its subtree rises a level.
-    let mut holder: Option<usize> = None;
-    for entry in &mut entries {
-        if holder.is_some_and(|level| entry.level <= level) {
-            holder = None;
-        }
-        if holder.is_some() {
-            entry.level -= 1;
-        } else if contents_pages.contains(&(entry.page - 1)) {
-            holder = Some(entry.level);
-        }
-    }
-    restack(&mut entries);
-    let promotes = 2 * entries
-        .iter()
-        .filter(|entry| entry.title.chars().count() > BACKFILL_MAX_TITLE)
-        .count()
-        < entries.len();
-
-    let norms = pages
-        .iter()
-        .map(|page| {
-            page.lines
-                .iter()
-                .map(|line| normalize_title(&line.text))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let eligible = |page: &Page, slot: usize| {
-        let line = &page.lines[slot];
-        !line.exclude_from_body
-            && line.note_region_mode.is_empty()
-            && matches!(line.region_type.as_str(), "body" | "heading")
-            && !primitives.claims.claimed(&line.id)
-            && !primitives.quotations.scopes.contains_key(&line.id)
-            && !has_dot_leader(&line.text)
-    };
-    let mut claimed = HashSet::<(usize, usize)>::new();
-    let mut anchors = vec![None::<Anchor>; entries.len()];
-    let mut last = HashMap::<DocumentContext, (usize, usize)>::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let title = normalize_title(&entry.title);
-        // A title of no words ("-----") names no line.
-        let Some(&target) = slot_of_page.get(&(entry.page - 1)).filter(|_| title.chars().count() >= 2) else {
-            continue;
-        };
-        let window = [Some(target), target.checked_add(1), target.checked_sub(1)];
-        // A title read whole wins over one read as a fragment of a longer heading.
-        let found = [true, false].into_iter().find_map(|whole| {
-            window
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .find_map(|(order, page_slot)| {
-                    let page = pages.get(page_slot)?;
-                    if order > 0 && contents_pages.contains(&page.index) {
-                        return None;
-                    }
-                    (0..page.lines.len()).filter(|&start| !norms[page_slot][start].is_empty()).find_map(|start| {
-                        let block = page.lines[start].block_index;
-                        let mut joined = String::new();
-                        let mut heading = true;
-                        for end in start..(start + MAX_TITLE_LINES).min(page.lines.len()) {
-                            if claimed.contains(&(page_slot, end))
-                                || !eligible(page, end)
-                                || primitives.contexts.document_context(&page.lines[end].id)
-                                    != primitives.contexts.document_context(&page.lines[start].id)
-                            {
-                                return None;
-                            }
-                            joined.push_str(&norms[page_slot][end]);
-                            // One detected heading, not several read together.
-                            heading &= page.lines[end].region_type == "heading"
-                                && page.lines[end].block_index == block;
-                            let matched = if whole {
-                                joined == title
-                            } else {
-                                same_title(&joined, &title, heading)
-                            };
-                            if matched {
-                                return Some(Anchor {
-                                    page_slot,
-                                    lines: (start..=end).collect(),
-                                    existing: heading,
-                                });
-                            }
-                        }
-                        None
-                    })
-                })
-        });
-        let Some(anchor) = found else {
-            continue;
-        };
-        let position = (anchor.page_slot, anchor.lines[0]);
-        let context =
-            primitives.contexts.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id);
-        if last.get(&context).is_some_and(|last| position <= *last) {
-            continue;
-        }
-        if !anchor.existing {
-            let page = &pages[anchor.page_slot];
-            let first = &page.lines[anchor.lines[0]];
-            let end = *anchor.lines.last().unwrap();
-            let text = anchor
-                .lines
-                .iter()
-                .map(|slot| page.lines[*slot].text.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let carried_on = page.lines.get(end + 1).is_some_and(|next| {
-                next.region_type == "body"
-                    && next.block_index == page.lines[end].block_index
-                    && next.text.trim_start().starts_with(char::is_lowercase)
-            });
-            // A SKELETON frame inserts deeper bookmarks only within its chapters.
-            let chaptered = tier == Tier::Full
-                || entries
-                    .iter()
-                    .any(|chapter| chapter.level == 1 && chapter.page <= entry.page);
-            if !promotes
-                || !chaptered
-                || generic_title().is_match(&entry.title)
-                || text.ends_with(',')
-                || text.starts_with(char::is_lowercase)
-                || continues_prose(page, first)
-                || carried_on
-            {
-                continue;
-            }
-        }
-        last.insert(context, position);
-        claimed.extend(anchor.lines.iter().map(|slot| (anchor.page_slot, *slot)));
-        anchors[index] = Some(anchor);
-    }
-    if anchors.iter().all(Option::is_none) {
-        return false;
-    }
-    // A confirmed title places its bookmark in its document and parallel sequence. Unanchored
-    // entries retain the PDF's primary frame and supply no authority over another context.
-    let entry_contexts = anchors
-        .iter()
-        .map(|anchor| {
-            anchor.as_ref().map_or((0, false), |anchor| {
-                primitives.contexts.document_context(&pages[anchor.page_slot].lines[anchor.lines[0]].id)
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Similar headings may guide discovery, but only a title actually present in the body
-    // supplies a confirmed navigation relationship to the attachment predictor.
-    let confirmed = anchors.iter().zip(&entries).map(|(anchor, entry)| {
-        anchor.as_ref().is_some_and(|anchor| {
-            let page = &pages[anchor.page_slot];
-            let found = anchor.lines.iter().map(|&slot| normalize_title(&page.lines[slot].text)).collect::<String>();
-            same_title(&found, &normalize_title(&entry.title), false)
-        })
-    }).collect::<Vec<_>>();
-
-    // An anchored title is a heading of its own. Within a heading it cuts only where a numbered
-    // heading starts; otherwise it takes the whole heading.
-    let levels = &primitives.headings.heading_levels;
-    for anchor in anchors.iter_mut().flatten() {
-        let page = &mut pages[anchor.page_slot];
-        let block = page.lines[anchor.lines[0]].block_index;
-        if anchor.existing {
-            let same = |slot: usize, page: &Page| {
-                page.lines[slot].region_type == "heading"
-                    && page.lines[slot].block_index == block
-                    && primitives.contexts.document_context(&page.lines[slot].id)
-                        == primitives.contexts.document_context(&page.lines[anchor.lines[0]].id)
-                    && levels.get(&page.lines[slot].id)
-                        == levels.get(&page.lines[anchor.lines[0]].id)
-            };
-            let numbered = |slot: usize, page: &Page| {
-                let text = page.lines[slot].text.trim();
-                enumerated(text)
-            };
-            let mut start = anchor.lines[0];
-            if !numbered(start, page) {
-                while start > 0 && same(start - 1, page) {
-                    start -= 1;
-                }
-            }
-            let mut end = *anchor.lines.last().unwrap();
-            while end + 1 < page.lines.len() && same(end + 1, page) && !numbered(end + 1, page) {
-                end += 1;
-            }
-            anchor.lines = (start..=end).collect();
-        }
-        let fresh = page
-            .lines
-            .iter()
-            .map(|line| line.block_index)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        for slot in &anchor.lines {
-            let line = &mut page.lines[*slot];
-            line.region_type = "heading".to_owned();
-            line.block_index = fresh;
-        }
-    }
-
-    // Heading units, as regions will group them, in reading order.
-    struct Unit {
-        position: (usize, usize),
-        line_ids: Vec<String>,
-        text: String,
-        level: Option<usize>,
-        context: DocumentContext,
-    }
-    let mut units = Vec::<Unit>::new();
-    let mut unit_at = HashMap::<(usize, usize), usize>::new();
-    for (page_slot, page) in pages.iter().enumerate() {
-        for (slot, line) in page.lines.iter().enumerate() {
-            if line.region_type != "heading" || primitives.quotations.scopes.contains_key(&line.id)
-            {
-                continue;
-            }
-            let continues = slot > 0
-                && page.lines[slot - 1].region_type == "heading"
-                && page.lines[slot - 1].block_index == line.block_index
-                && primitives.contexts.reading_context(&page.lines[slot - 1].id)
-                    == primitives.contexts.reading_context(&line.id)
-                && levels.get(&page.lines[slot - 1].id) == levels.get(&line.id);
-            if !continues {
-                units.push(Unit {
-                    position: (page_slot, slot),
-                    line_ids: Vec::new(),
-                    text: String::new(),
-                    level: None,
-                    context: primitives.contexts.document_context(&line.id),
-                });
-            }
-            let unit = units.last_mut().expect("unit");
-            unit.line_ids.push(line.id.clone());
-            unit.text = format!("{} {}", unit.text, line.text.trim())
-                .trim()
-                .to_owned();
-            if let Some(level) = levels.get(&line.id) {
-                unit.level = Some(unit.level.map_or(*level, |prior: usize| prior.min(*level)));
-            }
-            unit_at.insert((page_slot, slot), units.len() - 1);
-        }
-    }
-    let entry_unit = anchors
-        .iter()
-        .map(|anchor| {
-            anchor
-                .as_ref()
-                .and_then(|anchor| unit_at.get(&(anchor.page_slot, anchor.lines[0])).copied())
-        })
-        .collect::<Vec<_>>();
-    let promoted = anchors
-        .iter()
-        .zip(&entry_unit)
-        .filter_map(|(anchor, unit)| anchor.as_ref().filter(|anchor| !anchor.existing).and(*unit))
-        .collect::<HashSet<_>>();
-
-    // The frame: every bookmark (FULL), or the top-level ones (SKELETON). Deeper SKELETON entries
-    // found as existing headings stay detected; ones found in body text are inserted.
-    let framed = |entry: &Entry| tier == Tier::Full || entry.level == 1;
-    let mut frame_units = HashMap::<usize, usize>::new();
-    let mut levels_out = HashMap::<usize, Option<usize>>::new();
-    {
-        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
-        for (index, entry) in entries.iter().enumerate() {
-            let Some(unit) = entry_unit[index].filter(|_| framed(entry)) else {
-                continue;
-            };
-            let stack = stacks.entry(entry_contexts[index]).or_default();
-            while stack.last().is_some_and(|level| *level >= entry.level) {
-                stack.pop();
-            }
-            stack.push(entry.level);
-            frame_units.insert(index, unit);
-            levels_out.insert(unit, Some(stack.len()));
-        }
-    }
-    let inserted = entries
-        .iter()
-        .enumerate()
-        .filter(|(index, entry)| {
-            !framed(entry) && entry_unit[*index].is_some_and(|unit| promoted.contains(&unit))
-        })
-        .map(|(index, _)| index)
-        .collect::<HashSet<_>>();
-    let parents = {
-        let mut stacks = HashMap::<DocumentContext, Vec<usize>>::new();
-        entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let stack = stacks.entry(entry_contexts[index]).or_default();
-                while stack
-                    .last()
-                    .is_some_and(|prior| entries[*prior].level >= entry.level)
-                {
-                    stack.pop();
-                }
-                let parents = stack.clone();
-                stack.push(index);
-                parents
-            })
-            .collect::<Vec<_>>()
-    };
-    // Where each frame entry opens: its heading, else the top of its page.
-    let frame = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| framed(entry))
-        .map(|(index, entry)| {
-            let opens = frame_units
-                .get(&index)
-                .map(|unit| units[*unit].position)
-                .unwrap_or((
-                    slot_of_page
-                        .get(&(entry.page - 1))
-                        .copied()
-                        .unwrap_or(usize::MAX),
-                    0,
-                ));
-            (index, opens)
-        })
-        .collect::<Vec<_>>();
-
-    let detected = (0..units.len())
-        .filter(|unit| !levels_out.contains_key(unit) && !promoted.contains(unit))
-        .collect::<Vec<_>>();
-    let mut title_counts = HashMap::<(DocumentContext, String), usize>::new();
-    for unit in &detected {
-        *title_counts
-            .entry((units[*unit].context, normalize_title(&units[*unit].text)))
-            .or_default() += 1;
-    }
-    // Bookmarks that set out every level of the document name its headings: a heading found in
-    // the body after their first entry, in their document, that none names is no heading.
-    let opened = |unit: usize| {
-        frame.iter().any(|(index, opens)| entry_contexts[*index] == units[unit].context && *opens <= units[unit].position)
-    };
-    let mut unnamed = HashSet::<usize>::new();
-    let mut groups = HashMap::<usize, Vec<usize>>::new();
-    for unit in detected {
-        if complete && opened(unit) {
-            unnamed.insert(unit);
-            continue;
-        }
-        let key = (units[unit].context, normalize_title(&units[unit].text));
-        if tier == Tier::Full
-            && (!key.1.is_empty() && title_counts[&key] >= BACKFILL_DUP_MIN
-                || units[unit].text.chars().count() > BACKFILL_MAX_TITLE)
-        {
-            levels_out.insert(unit, None);
-            continue;
-        }
-        let mut active = None;
-        for (index, opens) in frame
-            .iter()
-            .filter(|(index, _)| entry_contexts[*index] == units[unit].context)
-        {
-            if *opens > units[unit].position {
-                break;
-            }
-            active = Some(*index);
-        }
-        // Under the nearest frame entry found in the text; headings before the frame, or under
-        // none found, keep their own levels.
-        let anchor = active.and_then(|index| {
-            std::iter::once(index)
-                .chain(parents[index].iter().rev().copied())
-                .find(|candidate| frame_units.contains_key(candidate))
-        });
-        if let Some(anchor) = anchor {
-            groups.entry(anchor).or_default().push(unit);
-        }
-    }
-    // A numbered frame heading places the detected ladder around itself: a bookmark set can
-    // omit a sibling ("III. Facts" between bookmarked "II." and "IV."), which then stays one.
-    for (anchor, members) in &groups {
-        let base = levels_out[&frame_units[anchor]].expect("frame level");
-        let top = members
-            .iter()
-            .filter_map(|unit| units[*unit].level)
-            .min()
-            .unwrap_or(1);
-        let own = units[frame_units[anchor]].level;
-        for unit in members {
-            let level = match (units[*unit].level, own) {
-                (Some(level), Some(own)) => (base + level).saturating_sub(own).max(1),
-                (Some(level), None) => base + level + 1 - top,
-                (None, _) => base + 1,
-            };
-            levels_out.insert(*unit, Some(level));
-        }
-    }
-    let mut inserted = inserted.into_iter().collect::<Vec<_>>();
-    inserted.sort_unstable();
-    for index in inserted {
-        let unit = entry_unit[index].expect("inserted unit");
-        let parent = parents[index]
-            .iter()
-            .rev()
-            .find_map(|parent| {
-                entry_unit[*parent].and_then(|unit| levels_out.get(&unit).copied().flatten())
-            })
-            .or_else(|| {
-                // Else the chapter whose pages it falls in.
-                frame
-                    .iter()
-                    .filter(|(index, _)| entry_contexts[*index] == units[unit].context)
-                    .take_while(|(_, opens)| opens.0 <= units[unit].position.0)
-                    .last()
-                    .and_then(|(chapter, _)| frame_units.get(chapter))
-                    .and_then(|unit| levels_out.get(unit).copied().flatten())
-            });
-        levels_out.insert(unit, Some(parent.map_or(1, |level| level + 1)));
-    }
-
-    for (index, anchor) in anchors.iter().enumerate().filter(|(index, _)| confirmed[*index]) {
-        let Some(anchor) = anchor else { continue; };
-        let parent = parents[index].iter().rev().find(|&&parent| confirmed[parent])
-            .and_then(|&parent| anchors[parent].as_ref())
-            .map(|parent| pages[parent.page_slot].lines[parent.lines[0]].id.clone());
-        for &slot in &anchor.lines {
-            primitives.headings.navigation_parents.insert(pages[anchor.page_slot].lines[slot].id.clone(), parent.clone());
-        }
-    }
-
-    let levels = &mut primitives.headings.heading_levels;
-    for (unit, level) in levels_out {
-        for line_id in &units[unit].line_ids {
-            if primitives
-                .source_regions
-                .as_ref()
-                .and_then(|regions| regions.get(line_id))
-                .is_some_and(|role| role != "H" && legal_pdf_core::is_heading_role(role))
-            {
-                continue;
-            }
-            match level {
-                Some(level) => levels.insert(line_id.clone(), level),
-                None => levels.remove(line_id),
-            };
-        }
-    }
-    for (position, unit) in &unit_at {
-        if unnamed.contains(unit) {
-            let line = &mut pages[position.0].lines[position.1];
-            levels.remove(&line.id);
-            line.region_type = "body".to_owned();
-        }
-    }
-    true
 }
 
 // PageIndex license, for the code ported above:

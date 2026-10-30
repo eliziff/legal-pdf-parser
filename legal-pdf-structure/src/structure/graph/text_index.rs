@@ -110,25 +110,32 @@ impl PdfTextIndex {
             .and_then(|slot| self.lines.get(*slot))
     }
 
-    pub(crate) fn line_at(&self, at: usize) -> Option<&IndexedPdfLine> {
+    /// The place among the index's lines of the line holding the scalar `at`.
+    pub(crate) fn position_at(&self, at: usize) -> Option<usize> {
         let slot = self
             .lines
             .partition_point(|line| line.range.start <= at)
             .checked_sub(1)?;
-        self.lines.get(slot).filter(|line| {
+        self.lines.get(slot).is_some_and(|line| {
             (line.range.start <= at && at < line.range.end)
                 || (line.range.start == line.range.end && line.range.start == at)
         })
+        .then_some(slot)
     }
 
-    pub(crate) fn overlapping_lines(&self, range: ScalarRange) -> &[IndexedPdfLine] {
+    /// The places among the index's lines of the lines a range overlaps.
+    pub(crate) fn overlapping(&self, range: ScalarRange) -> std::ops::Range<usize> {
         let start = self
             .lines
             .partition_point(|line| line.range.end <= range.start);
         let end = self
             .lines
             .partition_point(|line| line.range.start < range.end);
-        &self.lines[start.min(end)..end]
+        start.min(end)..end
+    }
+
+    pub(crate) fn overlapping_lines(&self, range: ScalarRange) -> &[IndexedPdfLine] {
+        &self.lines[self.overlapping(range)]
     }
 
     pub(crate) fn page_range(&self, page_index: usize) -> Option<ScalarRange> {

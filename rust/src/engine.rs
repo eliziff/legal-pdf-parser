@@ -381,7 +381,6 @@ fn engine_identity() -> &'static Value {
             "ocr_renderer": if cfg!(feature = "ocr") { "hayro 0.7.1" } else { "disabled" },
             "engine_source_sha256": env!("LEGAL_PDF_ENGINE_SHA256"),
             "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
-            "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })
 }
@@ -393,7 +392,6 @@ fn document_identity() -> &'static Value {
             "document_source_sha256": env!("LEGAL_PDF_DOCUMENT_SHA256"),
             "extraction_source_sha256": env!("LEGAL_PDF_EXTRACTION_SHA256"),
             "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
-            "compositions_sha256": legal_pdf_witnesses::compositions_sha256(),
         })
     })
 }
@@ -548,8 +546,9 @@ fn derive_document(
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
         pages.clone_from(&extracted.pages);
-        // For a reader after the parser: each heading line's source, as regions of kind
-        // "heading_source" (id "heading-source:<reader>") on these pages only.
+        // Each heading line's trail, and that of each line a rule took from the headings: the rule
+        // that decided it ("+anchor", "-marginal_note"), as regions of kind "heading_source" (id
+        // "heading-source:<trail>") on these pages only.
         for page in pages.iter_mut() {
             let mut by_source: BTreeMap<&str, Vec<String>> = BTreeMap::new();
             for line in &page.lines {

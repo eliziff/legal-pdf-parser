@@ -12,9 +12,9 @@
 
 use super::bookmarks::normalize_title;
 use crate::structure::contents_lists::{row_bands, row_of, Entry};
-use super::rules::{ladder_levels, numbered};
-use crate::structure::Claims;
-use legal_pdf_core::model::{Page, PdfOutlineEntry};
+use super::rules::numbered;
+use crate::structure::decide::ladder_levels;
+use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use std::collections::HashMap;
 
 /// Indents within this many points are one tier.
@@ -23,63 +23,42 @@ const INDENT_TOLERANCE: f64 = 6.0;
 const MAX_WRAPPED_ROWS: usize = 3;
 /// The deepest level a contents list sets.
 const MAX_LEVEL: usize = 6;
-/// A printed marker or completed locator starts the next entry, even when prose geometry joined it.
-pub(crate) fn group_rows(pages: &mut [Page], claims: &Claims) {
-    for page in pages {
-        if !page
-            .lines
-            .iter()
-            .any(|line| claims.contents_line_ids.contains(&line.id))
-        {
+
+/// Each contents line's entry, numbered from 0 in order, of a page `width` wide whose `lines` (in
+/// reading order) `listed` names as contents: a printed marker or a completed locator starts the
+/// next entry, a row without one goes on with the entry its locator left open, and a row holding
+/// another line closes it.
+pub(crate) fn entry_rows(width: f64, lines: &[&Line], listed: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
+    let mut entries = vec![None; lines.len()];
+    let mut next: Option<usize> = None;
+    let mut open = false;
+    let places: Vec<usize> = (0..lines.len()).collect();
+    for band in row_bands(&places, |at| lines[at].bbox) {
+        if band.iter().any(|&at| !listed(at)) {
+            open = false;
             continue;
         }
-        let lines = page
-            .lines
-            .iter()
-            .filter(|line| !line.exclude_from_body)
-            .collect::<Vec<_>>();
-        let mut block = page
-            .lines
-            .iter()
-            .map(|line| line.block_index)
-            .max()
-            .unwrap_or(0);
-        let mut open = false;
-        let mut groups = HashMap::new();
-        for band in row_bands(&lines) {
-            if band.iter().any(|line| {
-                line.region_type != "body" || !claims.contents_line_ids.contains(&line.id)
-            }) {
-                open = false;
-                continue;
-            }
-            let row = row_of(band.clone());
-            let first = band[0].text.trim();
-            let token = first.split_whitespace().next().unwrap_or("");
-            let numeric = token.chars().any(|c| c.is_ascii_digit())
-                && token.chars().all(|c| c.is_ascii_digit() || c == '.');
-            let locator = band.len() == 1 && band[0].bbox[0] > page.width * 0.5 && row.locator.is_some();
-            let marker = !locator
-                && (numeric
-                    || numbered(&row.title)
-                    || band.len() > 1
-                        && first.chars().count() == 1
-                        && first.chars().all(char::is_alphabetic));
-            let continues = !marker && open;
-            if !continues {
-                block += 1;
-            }
-            for line in &band {
-                groups.insert(line.id.clone(), block);
-            }
-            open = row.locator.is_none() && !locator;
+        let row = row_of(band.iter().map(|&at| lines[at]).collect());
+        let first = lines[band[0]].text.trim();
+        let token = first.split_whitespace().next().unwrap_or("");
+        let numeric = token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().all(|c| c.is_ascii_digit() || c == '.');
+        let locator = band.len() == 1 && lines[band[0]].bbox[0] > width * 0.5 && row.locator.is_some();
+        let marker = !locator
+            && (numeric
+                || numbered(&row.title)
+                || band.len() > 1
+                    && first.chars().count() == 1
+                    && first.chars().all(char::is_alphabetic));
+        if marker || !open {
+            next = Some(next.map_or(0, |entry| entry + 1));
         }
-        for line in &mut page.lines {
-            if let Some(&block) = groups.get(&line.id) {
-                line.block_index = block;
-            }
+        for &at in &band {
+            entries[at] = next;
         }
+        open = row.locator.is_none() && !locator;
     }
+    entries
 }
 
 /// The level of each entry: where most entries print a range ("[18] - [43]"), one deeper than the
@@ -131,14 +110,11 @@ fn arabic(locator: Option<&str>) -> Option<i64> {
 }
 /// The page slot of every run of up to `MAX_WRAPPED_ROWS` lines set outside the contents and its
 /// furniture, by the run's normalized text, each start counted once and in reading order.
-fn titles_by_text(pages: &[Page], claims: &Claims) -> HashMap<String, Vec<usize>> {
+fn titles_by_text(pages: &[Page], outside: &impl Fn(usize, usize) -> bool) -> HashMap<String, Vec<usize>> {
     let mut titles = HashMap::<String, Vec<usize>>::new();
     for (slot, page) in pages.iter().enumerate() {
-        let norms = page.lines.iter().map(|line| {
-            let outside = !(line.exclude_from_body || matches!(line.region_type.as_str(), "header" | "footer")
-                || claims.contents_line_ids.contains(&line.id)
-                || claims.contents_pages.contains(&page.index));
-            outside.then(|| normalize_title(&line.text))
+        let norms = page.lines.iter().enumerate().map(|(at, line)| {
+            outside(slot, at).then(|| normalize_title(&line.text))
         }).collect::<Vec<_>>();
         for start in 0..norms.len() {
             let mut joined = String::new();
@@ -156,12 +132,17 @@ fn titles_by_text(pages: &[Page], claims: &Claims) -> HashMap<String, Vec<usize>
     titles
 }
 
-/// Each local contents run uses its own confirmed destinations and pagination relationships.
-pub(crate) fn contents_outline(pages: &[Page], claims: &Claims) -> Vec<PdfOutlineEntry> {
+/// The contents lists' `entries` as the document's outline, each local run of entries placed by
+/// its own confirmed destinations and pagination, a title found only on the lines `outside` holds
+/// (by page slot and line slot): no line label, furniture, or contents list's line or page.
+pub(crate) fn contents_outline_among(
+    pages: &[Page],
+    entries: &[Entry],
+    outside: impl Fn(usize, usize) -> bool,
+) -> Vec<PdfOutlineEntry> {
     // The entries listed on these pages, each with its page's slot among them.
     let slots: HashMap<usize, usize> = pages.iter().enumerate().map(|(slot, page)| (page.index, slot)).collect();
-    let listed: Vec<(usize, &Entry)> = claims
-        .contents_entries
+    let listed: Vec<(usize, &Entry)> = entries
         .iter()
         .filter(|entry| entry.title.chars().any(char::is_alphabetic))
         .filter_map(|entry| slots.get(&entry.page_index).map(|&slot| (slot, entry)))
@@ -169,7 +150,7 @@ pub(crate) fn contents_outline(pages: &[Page], claims: &Claims) -> Vec<PdfOutlin
     if listed.is_empty() {
         return Vec::new();
     }
-    let titles = titles_by_text(pages, claims);
+    let titles = titles_by_text(pages, &outside);
     let mut result = Vec::new();
     let mut first = 0;
     while first < listed.len() {

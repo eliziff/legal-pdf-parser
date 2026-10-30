@@ -57,14 +57,6 @@ pub(super) fn enumerated(text: &str) -> bool {
     heading_inline_re().is_match(text) || heading_standalone_re().is_match(text)
 }
 
-/// The title after a leading enumerator, or the whole text.
-pub(super) fn title_after_enumerator(text: &str) -> &str {
-    heading_inline_re()
-        .captures(text.trim())
-        .map(|capture| heading_enumerator(&capture).2)
-        .unwrap_or(text.trim())
-}
-
 /// "[12]" alone on its line; four digits would be a bracketed year.
 pub(super) fn standalone_paragraph_number(text: &str) -> bool {
     text.trim()
@@ -128,21 +120,6 @@ pub(super) fn starts_note_or_list(text: &str) -> bool {
         .unwrap()
     })
     .is_match(text)
-}
-
-pub(super) fn titlecase_ratio(text: &str) -> f64 {
-    let mut words = 0;
-    let titlecase = text
-        .split_whitespace()
-        .filter(|word| word.chars().any(char::is_alphabetic))
-        .inspect(|_| words += 1)
-        .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
-        .count();
-    if words == 0 {
-        0.0
-    } else {
-        titlecase as f64 / words as f64
-    }
 }
 
 pub(super) fn contents_heading(text: &str) -> bool {
