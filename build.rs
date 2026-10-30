@@ -62,7 +62,14 @@ fn fingerprint(root: &Path, inputs: &[PathBuf], features: &[String]) -> String {
             .replace('\\', "/");
         digest.update(relative.as_bytes());
         digest.update([0]);
-        digest.update(fs::read(path).unwrap());
+        // A file's line endings are the checkout's, not the code's: a working tree with CRLF and a
+        // git archive with LF read the same.
+        let bytes = fs::read(path).unwrap();
+        let lf: Vec<u8> = bytes.iter().enumerate()
+            .filter(|&(k, &b)| !(b == b'\r' && bytes.get(k + 1) == Some(&b'\n')))
+            .map(|(_, &b)| b)
+            .collect();
+        digest.update(lf);
         digest.update([0]);
     }
     for feature in features {
