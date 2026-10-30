@@ -111,6 +111,11 @@ pub(crate) fn decide(
         }
     }
     let body = type_chars.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|(style, _)| style);
+    // A transcript's pages of testimony: those holding a speaker's turn.
+    let testimony: HashSet<usize> = sequence.iter()
+        .filter(|line| legal_structure_model::transcript::speaker_label(line.text.trim()).is_some())
+        .map(|line| line.page_index)
+        .collect();
     let width = |line: &Line| {
         let measure = &measures[&line.page_index];
         (line.bbox[2] - line.bbox[0]) / (measure.right - measure.left).max(1.0)
@@ -140,6 +145,11 @@ pub(crate) fn decide(
         // A title wrapping onto the lines under it: same page and block, same type, short, no
         // number of its own, the line before ending no sentence.
         let mut end = k + 1;
+        // A number printed on a line of its own ("III.", "12") is one with the line it numbers, the
+        // heading's title or the paragraph's first line, whatever their types.
+        if bare_number(first.text.trim()) && sequence.get(end).is_some_and(|next| next.page_index == first.page_index && eligible(next)) {
+            end += 1;
+        }
         while end < sequence.len() && end - k < 3 {
             let next = sequence[end];
             let prior = sequence[end - 1];
@@ -198,7 +208,12 @@ pub(crate) fn decide(
         });
         let voted = lines.iter().any(|line| line.region_type == "heading");
         let placed = lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id));
-        let vetoed = (text.ends_with(['.', ',', ';']) && !bare_number(&text))
+        // What another reading of the document already holds is no heading: a numbered
+        // paragraph's label (the paragraph reader's), a transcript's testimony (a page of its
+        // speakers' turns: the transcript rules raise its headings).
+        let vetoed = lines.iter().any(|line| line.paragraph_label_candidate)
+            || (transcript && testimony.contains(&first.page_index))
+            || (text.ends_with(['.', ',', ';']) && !bare_number(&text))
             || label(&text)
             || (transcript && turn_or_event(&text))
             || date_line(&text)
