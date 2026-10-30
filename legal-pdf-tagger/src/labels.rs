@@ -6,7 +6,6 @@
 //! gold's own labels decode to the gold: `selfcheck labels` must read 1.0 on every layer.
 use crate::alignment::Alignment;
 use crate::state::{block_id, Gold, State};
-use legal_structure::{LayoutAnalysis};
 use crate::{SourceSpan};
 use regex::Regex;
 use serde_json::Value;
@@ -688,7 +687,7 @@ fn leading_marker(text: &[char]) -> Option<(usize, usize)> {
         return None;
     }
     let token: String = text[start..i].iter().collect();
-    legal_structure::STRUCTURE_ANALYSIS.numbering_marker(token.trim(), None).map(|_| (start, i))
+    legal_pdf_core::layout_analysis().numbering_marker(token.trim(), None).map(|_| (start, i))
 }
 
 /// Labels decoded into the gold's own form over a frame's pieces in its reading order. A piece that
