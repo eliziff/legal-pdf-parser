@@ -22,6 +22,7 @@ pub(crate) mod bookmarks;
 pub(crate) mod contents;
 mod native;
 pub(crate) use native::*;
+mod outline;
 pub(crate) mod rules;
 
 /// Whether a trail leaves its line a heading: its last mark is a "+".
