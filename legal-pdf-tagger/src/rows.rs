@@ -142,9 +142,8 @@ fn text_shape(text: &str) -> [f64; 15] {
 /// Each piece's own marker as the engine's numbering grammar reads the parser block opening on it:
 /// whether it has one, its ordinal and prefix depth, and its family name. Per candidate piece.
 fn markers(candidate: &State, pieces: &[Piece], tier0: &[Label]) -> (Vec<[f64; 3]>, Vec<String>) {
-    use legal_structure::LayoutAnalysis;
     let locate = Locator::new(pieces);
-    let mut marker_of: HashMap<usize, legal_structure::layout::NumberingMarker> = HashMap::new();
+    let mut marker_of: HashMap<usize, legal_structure_model::NumberingMarker> = HashMap::new();
     for group in &candidate.groups {
         let Some(k) = group.spans.first().and_then(|s| candidate.index.get(&s.line_id).and_then(|&n| locate.at(n, s.start))) else { continue };
         let spans: Vec<crate::SourceSpan> = serde_json::from_value(group.attributes.get("marker").cloned().unwrap_or_default()).unwrap_or_default();
@@ -153,7 +152,7 @@ fn markers(candidate: &State, pieces: &[Piece], tier0: &[Label]) -> (Vec<[f64; 3
             chars[s.start.min(chars.len())..s.end.min(chars.len())].iter().collect::<String>()
         })).collect::<Vec<_>>().join(" ");
         if !text.trim().is_empty() {
-            if let Some(marker) = legal_structure::STRUCTURE_ANALYSIS.numbering_marker(text.trim(), None) {
+            if let Some(marker) = legal_pdf_core::layout_analysis().numbering_marker(text.trim(), None) {
                 marker_of.entry(k).or_insert(marker);
             }
         }

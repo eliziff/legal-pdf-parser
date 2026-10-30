@@ -9,7 +9,6 @@ description = "The structure tagger's labels over a parse: pieces, features, lab
 diff-match-patch-rs = "0.5.1"
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-structure = { workspace = true }
-legal-structure-features = { workspace = true }
 legal-structure-model = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

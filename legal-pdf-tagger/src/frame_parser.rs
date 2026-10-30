@@ -1,6 +1,6 @@
 //! A parser structure as the grader's frame: blocks and annotations over its source lines.
 use crate::{FrameAnnotation, FrameBlock, FrameLine, FrameLink, FrameLinks, SourceSpan};
-use legal_structure::{DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText};
+use legal_structure_model::{DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
