@@ -10,7 +10,7 @@
 
 use crate::structure::{bold_char_share, PdfPrimitiveEvidence};
 use legal_pdf_core::model::{Line, Page};
-use legal_pdf_core::{dominant_face, PageMeasure};
+use legal_pdf_core::{dominant_face, flag_share, PageMeasure, ITALIC};
 use legal_structure_model::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -277,11 +277,57 @@ fn marginal_note(text: &str, next: Option<&Line>) -> bool {
         && !numbered(text) && !crate::structure::all_caps(text) && text.split_whitespace().count() <= 12
 }
 
+/// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's
+/// numeral on its own line, not a sentence.
+fn bare_number(text: &str) -> bool {
+    let numeral = text.trim().trim_end_matches(['.', ')']);
+    crate::paragraphs::marker_only_re().is_match(text)
+        || numeral.chars().all(|c| c.is_ascii_uppercase()) && legal_pdf_core::roman_value(numeral).is_some()
+}
+
+/// A line's type: its commonest face and half-point size, by characters.
+fn style(line: &Line) -> Option<(&str, i64)> {
+    dominant_face(line).map(|(face, size)| (face, (size * 2.0) as i64))
+}
+
 /// One heading as the readers left it and the page's regions will hold it: consecutive heading
 /// lines of one page, one layout block and one level.
 struct Heading<'a> {
     lines: Vec<&'a Line>,
     text: String,
+    /// Blank space over its first line and under its last, in the page's line heights; under is
+    /// unknown at the foot of a page, where what it heads goes on overleaf.
+    above: f64,
+    below: Option<f64>,
+    larger: bool,
+    /// Set in the body's own type: its face and size, not bold, italic or underlined.
+    body_type: bool,
+}
+
+/// Whether the heading is none, by the five ways the gold's false headings fail to be one. Each
+/// rule's share of its catches that are not headings, of all it catches, is noted beside it.
+fn not_a_heading(heading: &Heading) -> Option<&'static str> {
+    let text = heading.text.as_str();
+    let numbered = numbered(text);
+    let caps = crate::structure::all_caps(text);
+    [
+        // It ends a sentence or a clause, unless it is a heading's number alone (97%: "A.   Yes.",
+        // "MCCARTHY TÉTRAULT S.E.N.C.R.L., s.r.l.", a term of an order).
+        ("demote_sentence", text.ends_with(['.', ',', ';']) && !bare_number(text)),
+        ("demote_label", label(text)),
+        // Capitals alone in the body's own type set off a name or a caption, not a division
+        // (93%: "SPROTT PRIVATE RESOURCE LENDING", "ET ENTRE :", a postal code).
+        ("demote_caps_body", !numbered && heading.body_type && caps),
+        // It sits nearer the line above than the text below, which a heading's text never does
+        // (89%: a signature block's names, "INTENTIONALLY DELETED", a form's field).
+        ("demote_nearer_above", !numbered && !heading.larger && heading.below.is_some_and(|below| below > heading.above + 0.5)),
+        // An unnumbered heading wrapping over lines is a party block, an address or a title page's
+        // caption (91%; the long titles of a patent or a ruling's events are the misses).
+        ("demote_wrapped", !numbered && heading.lines.len() > 1),
+    ]
+    .into_iter()
+    .find(|&(_, holds)| holds)
+    .map(|(rule, _)| rule)
 }
 
 /// Whether a line the readers left in the body is a heading, by the two ways the gold's missed
@@ -355,6 +401,14 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 }
             }
         }
+        // The document's body type is its commonest, by characters.
+        let mut type_chars: HashMap<(&str, i64), usize> = HashMap::new();
+        for line in document.iter().flat_map(|page| &page.lines) {
+            if let Some(style) = style(line) {
+                *type_chars.entry(style).or_default() += line.text.trim().chars().count();
+            }
+        }
+        let body = type_chars.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|(style, _)| style);
         // Where the document's body opens: its first full line of prose. The first heading before it,
         // centred in capitals or larger type, or set larger in mixed case, is the document's title
         // (on the structure gold, three in five so set are; centred in the body's type and size, or
@@ -368,6 +422,7 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
         let mut titled = false;
         for page in document.iter() {
             let measure = &measures[&page.index];
+            let gap = |upper: &Line, lower: &Line| ((lower.bbox[1] - upper.bbox[3]) / measure.height).clamp(-3.0, 3.0);
             let mut slot = 0;
             while slot < measure.order.len() {
                 let first = &page.lines[measure.order[slot]];
@@ -387,8 +442,19 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                     end += 1;
                 }
                 let members: Vec<&Line> = measure.order[slot..end].iter().map(|&n| &page.lines[n]).collect();
+                let last = members[members.len() - 1];
+                let bold = bold_char_share(first) >= 0.5;
+                let underlined = !first.words.is_empty() && first.words.iter().filter(|w| w.underlined).count() * 2 > first.words.len();
+                let own = style(first);
                 let larger = measure.size > 0.0 && dominant_face(first).is_some_and(|(_, size)| size >= measure.size * 1.1);
-                let heading = Heading { text: members.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" "), lines: members };
+                let heading = Heading {
+                    text: members.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" "),
+                    above: slot.checked_sub(1).map_or(3.0, |prior| gap(&page.lines[measure.order[prior]], first)),
+                    below: measure.order.get(end).map(|&n| gap(last, &page.lines[n])),
+                    larger,
+                    body_type: own.is_some() && own == body && !bold && !underlined && !larger && flag_share(first, ITALIC).unwrap_or(0.0) <= 0.5,
+                    lines: members,
+                };
                 let text = heading.text.as_str();
                 if !titled && opens.is_none_or(|opens| place.get(first.id.as_str()).is_some_and(|&at| at < opens)) {
                     titled = true;
@@ -413,14 +479,15 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
                 let caption = (instrument || terms) && enumerator(text).is_some_and(|(_, punctuation)| !punctuation.chars().any(char::is_alphabetic));
                 // A heading the document's own outline or contents placed is the document's word.
                 let placed = heading.lines.iter().any(|line| raised.contains(line.id.as_str()) || primitives.headings.navigation_parents.contains_key(&line.id));
-                // (The five typographic demotion gates that stood here read as null under the
-                // structure tagger once the typography reader was gone, and went with it.)
+                // LEGALPDF_ABLATE=demotions leaves the five demotion gates out, for their measure
+                // under the tagger.
                 let why = if caption {
                     Some("demote_caption")
-                } else if !placed && transcript && turn_or_event(text) {
-                    Some("demote_turn")
-                } else {
+                } else if placed || legal_structure_model::ablated("demotions") {
                     None
+                } else {
+                    not_a_heading(&heading)
+                        .or_else(|| (transcript && turn_or_event(text)).then_some("demote_turn"))
                 };
                 if let Some(why) = why {
                     demoted.extend(heading.lines.iter().map(|line| (line.id.clone(), why)));
