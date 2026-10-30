@@ -347,8 +347,12 @@ pub(crate) fn read(pages: &mut [Page], primitives: &mut PdfPrimitiveEvidence, in
     let mut outline_levels: Vec<(String, usize)> = Vec::new();
     crate::structure::constituents::within_document_contexts(pages, &reading, &translation, |document| {
         let lines = || document.iter().flat_map(|page| &page.lines).filter(|line| !line.exclude_from_body);
-        // A transcript (its lines numbered) reads by witnesses and their examinations.
-        let transcript = document.iter().any(|page| page.lines.iter().any(|line| line.region_type == "line_label"));
+        // A transcript (its lines numbered, or its testimony's lines opening on a speaker's label,
+        // "Q.", "A.", "MR. SMITH:", after the question's number where it carries one) reads by
+        // witnesses and their examinations.
+        let speakers = lines().filter(|line| legal_structure_model::transcript::speaker_label(line.text.trim()).is_some()).count();
+        let transcript = document.iter().any(|page| page.lines.iter().any(|line| line.region_type == "line_label"))
+            || speakers >= 20 && speakers * 10 >= lines().count();
         let witnesses = transcript && lines().any(|line| witness(line.text.trim()));
         let mut raised = HashSet::new();
         for line in lines() {
