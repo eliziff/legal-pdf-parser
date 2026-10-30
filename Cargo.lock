@@ -1009,6 +1009,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-headings"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "regex",
+ "unicode-properties",
+]
+
+[[package]]
 name = "legal-pdf-language"
 version = "0.1.0"
 dependencies = [
@@ -1063,6 +1072,7 @@ name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-pdf-headings",
  "legal-pdf-support",
  "legal-pdf-tables",
  "legal-pdf-witnesses",
