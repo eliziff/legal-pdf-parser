@@ -6,6 +6,7 @@ license = "MIT"
 description = "Every body line's witnesses, read against its page and its document, and the decisions composed over them"
 
 [dependencies]
+aho-corasick = "1"
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-structure-model = { workspace = true }
 regex = "1.11"

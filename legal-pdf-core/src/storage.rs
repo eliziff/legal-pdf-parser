@@ -4,7 +4,7 @@ use flate2::{Compression, GzBuilder};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,8 +90,10 @@ pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })
 }
 
+/// The JSON is inflated whole and parsed from memory: serde_json reads a reader a byte at a time.
 pub fn read_gzip_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = io(path, File::open(path))?;
-    serde_json::from_reader(BufReader::new(GzDecoder::new(BufReader::new(file))))
-        .map_err(Error::from)
+    let mut json = Vec::new();
+    io(path, GzDecoder::new(BufReader::new(file)).read_to_end(&mut json))?;
+    serde_json::from_slice(&json).map_err(Error::from)
 }

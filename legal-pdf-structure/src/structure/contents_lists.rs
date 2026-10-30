@@ -251,7 +251,8 @@ fn agreement(
 fn opening(text: &str) -> String {
     static TAIL: OnceLock<Regex> = OnceLock::new();
     let text = pattern(&TAIL, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})\s*\S{1,8}\s*$").replace(text.trim(), "");
-    let words: Vec<String> = text.split_whitespace().map(normalize_title).filter(|word| !word.is_empty()).collect();
+    // Six words decide it: an enumerator to skip and five after it.
+    let words: Vec<String> = text.split_whitespace().map(normalize_title).filter(|word| !word.is_empty()).take(6).collect();
     let skip = usize::from(words.len() > 2 && words[0].chars().all(|c| c.is_ascii_digit()));
     if words.len() < skip + 2 {
         return String::new();
