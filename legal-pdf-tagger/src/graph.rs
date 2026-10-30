@@ -442,5 +442,5 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
     // The producer assembled the graph before the retag: every node the tagger adds gets its
     // level, extent and rendered membership the same way (the outline's literal projection needs
     // a level on every node with a role).
-    legal_structure::assemble_in_place(structure)
+    legal_structure_model::assemble_in_place(structure)
 }
