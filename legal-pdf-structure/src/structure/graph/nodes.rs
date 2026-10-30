@@ -244,9 +244,14 @@ pub(crate) fn native_graph_parts(
         node.label = heading.then(|| node.ranges.iter().map(|part|
             text.slice(part.start..part.end).expect("indexed heading part must be in bounds")
         ).collect::<Vec<_>>().join(" "));
+        // A heading's printed number: before its title on its first line, or that whole line where
+        // the number stands alone over its title ("II." over "Background Facts").
         if let Some(first) = node.ranges.first().filter(|_| heading) {
             let line = text.slice(first.start..first.end).expect("indexed heading part must be in bounds");
-            if let Some(found) = heading_marker_re().captures(line).and_then(|c| c.get(1)) {
+            let marker = heading_marker_re()
+                .captures(line)
+                .or_else(|| (node.ranges.len() > 1).then(|| heading_marker_alone_re().captures(line)).flatten());
+            if let Some(found) = marker.and_then(|c| c.get(1)) {
                 node.marker_range = Some(ScalarRange {
                     start: first.start + line[..found.start()].chars().count(),
                     end: first.start + line[..found.end()].chars().count(),

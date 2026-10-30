@@ -1,7 +1,12 @@
 //! Which lines are notes, read in each document and language once the runs stand: each page's note
-//! band (`read_band`), every line of a band holding a note label (`Fences::noted`), then the lanes
-//! that take more of the document's lines for notes against it (`note_promotions`), then each
-//! page's notes settled as footnotes or endnotes.
+//! band (`read_band`); every line under the separator, from the band's cut, of a page whose band
+//! reads a note (the band read one there; or two band labels count on by one, or one is the note
+//! the document expects next once the band has read one, and then only a line set in a note's
+//! type); then the lanes that take more of the document's lines for notes against it
+//! (`note_promotions`); then each page's notes settled as footnotes or endnotes, the lines taken
+//! beside the band's in an endnote run the body never refers to given back (`verified_endnotes`).
+//! A page's first note line with no label goes on with the page before's last note, unless it is a
+//! line taken beside the band's on a page the band read no note on.
 //!
 //! Two of the band's inputs come from the fences and the runs. A line whose number continues a
 //! counted run of the body, set in the body's type, is a numbered paragraph's, never a note's,
@@ -126,6 +131,10 @@ impl Notes {
             ..Self::default()
         };
         let mut lane_flags = vec![0u8; count];
+        // The lines taken beside the band's notes under the separator, and the pages the band read
+        // a note on, by page slot.
+        let mut added = vec![false; count];
+        let mut read = vec![false; pages.len()];
         for (key, (lines_of, order)) in groups {
             let lines = BandLines { sizes: &evidence.size, labels: &evidence.label, flags: &flags, body_size: body_sizes[&key] };
             let views = PageView::of_slots(pages, slots, &lines_of);
@@ -157,17 +166,50 @@ impl Notes {
                 }
             }
             notes.diagnostics.extend(reading.diagnostics);
-            // Every line of a band holding a note label is a note's: its notes heading and an endnote
-            // page's running head aside.
+            // Each page whose band reads a note: the band read one there, or two of its labels count
+            // on by one, or one is the note the document's notes expect next once the band has read
+            // one; whether the band read one there, and where the band begins on it, the band's cut,
+            // else the separator.
+            let mut noted: HashMap<usize, (bool, Option<f64>)> = HashMap::new();
+            let mut seen = false;
+            for (band, page_reading) in band_pages.iter().zip(&reading.pages) {
+                let values: Vec<u32> = band
+                    .view
+                    .lines
+                    .iter()
+                    .filter(|slot| fences.band[slot.index()] && matches!(fences.role[slot.index()], Role::Open | Role::Table))
+                    .filter_map(|slot| evidence.label[slot.index()].filter(|label| label.suppress == 0 && label.value > 0))
+                    .map(|label| label.value)
+                    .collect();
+                let page = slots.page(band.view.slot(0));
+                if page_reading.noted
+                    || seen && values.contains(&page_reading.next_label)
+                    || values.iter().any(|value| values.contains(&(value + 1)))
+                {
+                    noted.insert(page, (page_reading.noted, page_reading.cut));
+                }
+                read[page] = page_reading.noted;
+                seen |= page_reading.noted;
+            }
+            // Every line under the separator, and under the band's cut, of a page whose band reads
+            // a note is a note's: its notes heading and an endnote page's running head aside. On a
+            // page the band read no note on, only a line set in a note's type, smaller than the
+            // body's (a map's labels and a column of the body under a stray rule are none).
+            let body = lines.body_size;
             for &slot in &lines_of {
                 let at = slot.index();
+                let Some(&(read_here, cut)) = noted.get(&slots.page(slot)) else { continue };
+                let typed = read_here || body > 0.0 && evidence.size[at] > 0.0 && evidence.size[at] < body * 0.90;
                 if fences.band[at]
-                    && fences.noted[slots.page(slot)]
+                    && typed
+                    && cut.is_none_or(|cut| slots.line(pages, slot).bbox[1] >= cut - separator_tolerance(&pages[slots.page(slot)]))
                     && fences.role[at] == Role::Open
                     && !notes.heading[at]
                     && !notes.running_head[at]
+                    && notes.note[at].is_none()
                 {
-                    notes.note[at].get_or_insert(NoteKind::Footnote);
+                    notes.note[at] = Some(NoteKind::Footnote);
+                    added[at] = true;
                 }
             }
             // The lanes read the band's notes, and take only the body lines it left open: no
@@ -198,7 +240,22 @@ impl Notes {
                 notes.note[starts[page] + place].get_or_insert(NoteKind::Footnote);
             }
             notes.settle_kinds(pages, slots, &band_pages);
-            notes.segment(pages, slots, &order);
+            // The lines taken beside the band's own notes in an endnote run the body never refers
+            // to are the body's; the band's own and the lanes' stand.
+            let mut held: Vec<Vec<(usize, NoteKind)>> = band_pages
+                .iter()
+                .map(|band| band.view.iter().filter_map(|(slot, _)| Some((band.view.place(slot), notes.note[slot.index()]?))).collect())
+                .collect();
+            verified_endnotes(&band_pages, &lines, &mut held);
+            for (band, held) in band_pages.iter().zip(&held) {
+                for &slot in &band.view.lines {
+                    let place = band.view.place(slot);
+                    if added[slot.index()] && !held.iter().any(|(kept, _)| *kept == place) {
+                        notes.note[slot.index()] = None;
+                    }
+                }
+            }
+            notes.segment(pages, slots, &order, &added, &read);
         }
         notes
     }
@@ -247,10 +304,12 @@ impl Notes {
     }
 
     /// Each page's note lines of a document and language (`order`: each page's lines in reading
-    /// order, by place), and whether their first goes on with the last note of the page before: it
-    /// opens with no label, or the page before ended its notes saying they continue, or its own
-    /// first note line says so ("(Footnote continued…)").
-    fn segment(&mut self, pages: &[Page], slots: &Slots, order: &[(usize, Vec<usize>)]) {
+    /// order, by place), and whether their first goes on with the last note of the page before: the
+    /// page before ended its notes saying they continue, or its own first note line says so
+    /// ("(Footnote continued…)"), or it opens with no label, unless it is a line taken beside the
+    /// band's under the separator (`added`, by slot) on a page the band read no note on (`read`, by
+    /// page slot).
+    fn segment(&mut self, pages: &[Page], slots: &Slots, order: &[(usize, Vec<usize>)], added: &[bool], read: &[bool]) {
         // The page index of the last page with notes, and whether its last note line says it goes on.
         let mut previous: Option<(usize, bool)> = None;
         for (page, places) in order {
@@ -261,9 +320,8 @@ impl Notes {
             };
             let index = pages[*page].index;
             let first_text = &slots.line(pages, first).text;
-            let continued = previous.is_some_and(|(prior, said)| {
-                prior + 1 == index && (said || label_prefix(first_text).is_none() || continued_note(first_text))
-            });
+            let unlabelled = label_prefix(first_text).is_none() && (!added[first.index()] || read[*page]);
+            let continued = previous.is_some_and(|(prior, said)| prior + 1 == index && (said || unlabelled || continued_note(first_text)));
             previous = Some((index, continued_note(&slots.line(pages, last).text)));
             self.segments.push(NoteSegment { lines, continued });
         }

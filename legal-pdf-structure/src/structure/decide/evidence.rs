@@ -153,14 +153,15 @@ impl<'a> PageView<'a> {
 
 /// A page's rows, lines sharing a baseline band (`contents_lists::row_bands`): each line's row, top
 /// row 0 (`u32::MAX` for a line with no text or box, or set on its side); the number of rows; and
-/// whether its first and last rows stand apart from the rest by at least one and a half of the
-/// page's typical step from row to row (frame rows: where a running head or foot sits outside the
-/// edge bands).
+/// how many of its first and of its last rows stand apart from the rest by at least one and a half
+/// of the page's typical step from row to row (frame rows: where a running head or foot sits
+/// outside the edge bands): its first or last row alone, or a stack of two in the page's fifth at
+/// that edge ("RSA 2000" over "Section 1 | OIL AND GAS CONSERVATION ACT | Chapter O-6").
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Rows {
     pub(crate) of: Vec<u32>,
     pub(crate) count: u32,
-    pub(crate) frame: [bool; 2],
+    pub(crate) frame: [u32; 2],
 }
 
 pub(crate) fn page_rows(page: &Page) -> Rows {
@@ -185,13 +186,23 @@ pub(crate) fn page_rows(page: &Page) -> Rows {
     }
     let steps: Vec<f64> = tops.windows(2).map(|pair| pair[1] - pair[0]).filter(|step| *step > page.height * 0.002).collect();
     let step = if steps.is_empty() { page.height * 0.02 } else { median(steps) };
-    let apart = |gap: Option<f64>| gap.is_some_and(|gap| gap >= 1.5 * step);
+    let apart = |gap: f64| gap >= 1.5 * step;
     let count = tops.len();
-    let frame = [
-        apart((count > 1).then(|| tops[1] - tops[0])),
-        apart((count > 1).then(|| tops[count - 1] - tops[count - 2])),
-    ];
-    Rows { of, count: count as u32, frame }
+    let top = if count > 1 && apart(tops[1] - tops[0]) {
+        1
+    } else if count > 3 && apart(tops[2] - tops[1]) && tops[1] < page.height * 0.2 {
+        2
+    } else {
+        0
+    };
+    let bottom = if count > 1 && apart(tops[count - 1] - tops[count - 2]) {
+        1
+    } else if count > 3 && apart(tops[count - 2] - tops[count - 3]) && tops[count - 2] > page.height * 0.8 {
+        2
+    } else {
+        0
+    };
+    Rows { of, count: count as u32, frame: [top, bottom] }
 }
 
 /// The source's own reading of a line, before anything else reads it: a tagged PDF's heading (its
@@ -381,6 +392,9 @@ pub(crate) const WORD_HISTORY: u32 = 1 << 21;
 /// A division's word and its numeral, letter or roman numeral opening the line ("PART IV",
 /// "ARTICLE 5", "SCHEDULE A", "CHAPITRE 2": `division_word`). A section's number is no division's.
 pub(crate) const WORD_DIVISION: u32 = 1 << 22;
+/// A court's name and nothing else (`court_name`): "IN THE SUPREME COURT OF THE NORTHWEST
+/// TERRITORIES", "Federal Court", "COUR SUPÉRIEURE".
+pub(crate) const WORD_COURT: u32 = 1 << 23;
 
 /// A citation on a line, as the citation grammar reads the window holding the line: its byte range
 /// in the line's text, and that of the citation itself without its signal and style; a span the
@@ -507,6 +521,36 @@ fn division_word(text: &str) -> bool {
     })
 }
 
+/// A court's name and nothing else, as a caption's header prints it: "IN THE COURT OF APPEAL FOR
+/// SASKATCHEWAN", "THE CONSTITUTIONAL COURT OF SOUTH AFRICA", "ONTARIO SUPERIOR COURT OF JUSTICE",
+/// "SUPERIOR COURT OF JUSTICE - ONTARIO", "Cour d'appel du Québec". It opens in capitals, each
+/// word of the name is capitalized but for its connectives, and the words before the court's are
+/// its name's ("ON APPEAL FROM THE COURT OF APPEAL", "JUDGES OF THE COURT" name none); a line going
+/// on after the name ("THE COURT ORDERS:", "the Court of Appeal's reasons", "Court of Appeal,"), a
+/// statute's title ("THE COURT OF KING'S BENCH ACT") and the word alone name none.
+fn court_name(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    const NAME: &str = r"[\p{Lu}(][\p{L}'’.&,()-]*";
+    const JOIN: &str = r"(?i:of|for|the|and|de|du|des|la|le|d'|d’|l'|l’)";
+    const FRENCH: &str = r"(?i:sup[ée]rieure|supr[êe]me|f[ée]d[ée]rale|provinciale|municipale|d['’]appel)";
+    let text = text.trim();
+    let lower = text.to_lowercase();
+    let before = lower.split("cour").next().unwrap_or("");
+    text.starts_with(char::is_uppercase)
+        && text.split_whitespace().count() >= 2
+        && !text.ends_with([',', ';', ':'])
+        && !before.split_whitespace().any(|word| matches!(word, "from" | "on" | "to" | "by" | "of" | "at" | "and" | "et"))
+        && !lower.split_whitespace().next_back().is_some_and(|word| matches!(word, "act" | "rules" | "regulations" | "loi"))
+        && RE
+            .get_or_init(|| {
+                Regex::new(&format!(
+                    r"^(?:(?:IN|In)\s+)?(?:(?:THE|The)\s+)?(?:{NAME}\s+){{0,5}}(?:COURT|Court)(?:\s+(?i:of|for)\s+(?:{JOIN}\s+|{NAME}\s*)+)?(?:\s*[-–—]\s*{NAME}(?:\s+{NAME})*)?\s*$|^(?:(?:LA|La)\s+)?(?:COUR|Cour)(?:\s+(?:{FRENCH}|{JOIN}|{NAME}))+\s*$"
+                ))
+                .unwrap()
+            })
+            .is_match(text)
+}
+
 /// The lexicon a line's words match (`WORD_*`), the citation title aside.
 fn lexicon(line: &Line) -> u32 {
     let text = line.text.trim();
@@ -533,6 +577,7 @@ fn lexicon(line: &Line) -> u32 {
         (WORD_INDEX_LETTER, contents_lists::index_letter(text)),
         (WORD_HISTORY, legal_structure_model::statute::history_note(text)),
         (WORD_DIVISION, division_word(text)),
+        (WORD_COURT, court_name(text)),
     ]
     .into_iter()
     .filter(|(_, holds)| *holds)

@@ -5,8 +5,8 @@
 //! (`contexts`), and the outline its units hang in (`outline`).
 
 use super::{
-    arabic_page_number, sentence_ended, starts_note_or_list, Decided, DocumentContext, Evidence, Place, Role, Rule, Run,
-    Runs, Slot, Slots,
+    arabic_page_number, sentence_ended, starts_note_or_list, Decided, DocumentContext, Evidence, Member, Place, Role, Rule,
+    Run, Runs, Slot, Slots,
 };
 use legal_pdf_core::model::{Line, NotePairClaim, NotePairKind, Page, Paragraph, PdfSourceSpan, Span, Word};
 use legal_pdf_core::{Error, Result};
@@ -41,17 +41,20 @@ pub(super) struct PdfResolutionInput {
     pub(super) citation_spans: BTreeMap<String, Vec<PdfSourceSpan>>,
 }
 
-/// A heading's printed number before its title: "1.", "1.1", "I.", "(a)", "ii.", a bare "1", or a
-/// numbered word ("PART 1", "Section 1.01"). A number alone on its line is no marker of a title.
+/// A heading's printed number: "1.", "1.1", "I.", "(a)", "ii.", a bare "1", or a numbered word
+/// ("PART 1", "Section 1.01").
+const HEADING_MARKER: &str = r"((?i:PART|PARTIE|ARTICLE|SECTION|CHAPTER|CHAPITRE|SCHEDULE|ANNEXE|GC)\s+[0-9IVXLC]{1,6}(?:\.[0-9]{1,3})*\.?|\(?[0-9]{1,3}(?:\.[0-9]{1,3})*[.)]?|\(?[IVXLCivxlc]{1,6}[.)]|\(?[A-Za-z][.)])";
+
+/// A heading's printed number before its title on its line.
 fn heading_marker_re() -> &'static Regex {
     static MARKER: OnceLock<Regex> = OnceLock::new();
-    MARKER.get_or_init(|| {
-        Regex::new(concat!(
-            r"^\s*((?i:PART|PARTIE|ARTICLE|SECTION|CHAPTER|CHAPITRE|SCHEDULE|ANNEXE|GC)\s+[0-9IVXLC]{1,6}(?:\.[0-9]{1,3})*\.?",
-            r"|\(?[0-9]{1,3}(?:\.[0-9]{1,3})*[.)]?|\(?[IVXLCivxlc]{1,6}[.)]|\(?[A-Za-z][.)])\s+\S"
-        ))
-        .expect("heading marker regex")
-    })
+    MARKER.get_or_init(|| Regex::new(&format!(r"^\s*{HEADING_MARKER}\s+\S")).expect("heading marker regex"))
+}
+
+/// A heading's printed number alone on its line, its title on the lines under it.
+fn heading_marker_alone_re() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| Regex::new(&format!(r"^\s*{HEADING_MARKER}\s*$")).expect("heading marker regex"))
 }
 
 /// A body line that can carry a numbered item's text: not a running head or folio, nor a note.
@@ -210,10 +213,10 @@ fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
 
 impl PdfResolutionInput {
     /// The structure candidates of the decided pages (their lines in reading order): each numbering
-    /// run the decision read (`read`), placed in the text index; a list item's and a subsection's
-    /// text ended where the numbered paragraphs resume, where a heading stands or where the page's
-    /// layout ends it; each marker's lines and what they show; the unit the decision lets it open;
-    /// and each line's citations (`evidence`).
+    /// run the decision read (`read`, ended and parted where the numbered paragraphs resume),
+    /// placed in the text index; a subsection's text ended where a heading stands, and a numbered
+    /// paragraph's or list item's where the page's layout ends it; each marker's lines and what they
+    /// show; the unit the decision lets it open; and each line's citations (`evidence`).
     pub(super) fn from_decision(pages: &[Page], slots: &Slots, evidence: &Evidence, read: &Runs, decided: &Decided) -> Self {
         let index = PdfTextIndex::from_pages(pages);
         let (runs, candidate_evidence, roles, citation_spans) = {
@@ -273,19 +276,29 @@ impl PdfResolutionInput {
                 })
                 .collect();
             placed.sort_by_key(|(run, _)| (run.range.start, grammar_rank(run.grammar), run.range.end));
-            // The unit each marker opens: its run's, where the decision left its line a unit's text.
+            // The unit each marker opens: its run's, where the decision left its line a unit's text
+            // and read the marker by this run (a marker two runs read opens one unit).
+            let other_reading = |r: usize, member: &Member| {
+                decided.reading(member.slot).is_some_and(|(run, at)| {
+                    run as usize != r && read.runs[run as usize].members[at as usize].marker[0] == member.marker[0]
+                })
+            };
             let roles: Vec<CandidateRoleV2> = read
                 .runs
                 .iter()
-                .flat_map(|run| run.members.iter().map(move |member| (run, member)))
-                .map(|(run, member)| {
-                    let role = member.kind.filter(|_| opens_units(decided.role(member.slot), decided.rule(member.slot), run));
-                    CandidateRoleV2 {
-                        candidate_id: member.id.clone(),
-                        role,
-                        rule: if role.is_none() && member.kind.is_some() { ResolutionRuleV2::DirectExclusion } else { member.rule },
-                        counted: member.counted,
-                    }
+                .enumerate()
+                .flat_map(|(r, run)| run.members.iter().map(move |member| (r, run, member)))
+                .map(|(r, run, member)| {
+                    let other = other_reading(r, member);
+                    let role = member
+                        .kind
+                        .filter(|_| !other && opens_units(decided.role(member.slot), decided.rule(member.slot), run));
+                    let rule = match (role, member.kind) {
+                        (None, Some(_)) if other => ResolutionRuleV2::ConflictingRoles,
+                        (None, Some(_)) => ResolutionRuleV2::DirectExclusion,
+                        _ => member.rule,
+                    };
+                    CandidateRoleV2 { candidate_id: member.id.clone(), role, rule, counted: member.counted }
                 })
                 .collect();
             let mut measures = BodyMeasures::new();
@@ -294,31 +307,15 @@ impl PdfResolutionInput {
                 bounds.0 = bounds.0.min(line.bbox[0]);
                 bounds.1 = bounds.1.max(line.bbox[2]);
             }
-            // Each reading's numbered paragraphs keep a count separate from enclosing text.
-            let mut paragraph_starts = BTreeMap::<DocumentContext, Vec<usize>>::new();
-            for candidate in placed
-                .iter()
-                .filter(|(run, _)| run.grammar == CandidateGrammar::Numeric && run.rooted && run.consecutive)
-                .flat_map(|(run, _)| &run.markers)
-                .filter(|candidate| lines.marker(candidate).is_some_and(|at| item_text_line(lines.lines[at].1)))
-            {
-                paragraph_starts
-                    .entry(lines.context_at(candidate.marker_range.start))
-                    .or_default()
-                    .push(candidate.range.start);
-            }
-            for starts in paragraph_starts.values_mut() {
-                starts.sort_unstable();
-            }
-            // A list item or a subsection ends where the numbered paragraphs resume; only a numbered
-            // provision may hold them. A section's and its subsections' extent is otherwise their
+            // The runs come ended and parted where the numbered paragraphs resume (`Runs::read`). A
+            // provision's marker other than a top-level section's or division's ends at a heading
+            // the decision set inside it; a section's and its subsections' extent is otherwise their
             // grammar's; a numbered paragraph's or list item's ends where the layout ends it.
             let mut ended = HashSet::new();
             for (run, _) in &mut placed {
                 let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
                 for candidate in &mut run.markers {
                     let context = lines.context_at(candidate.marker_range.start);
-                    let paragraph_starts = paragraph_starts.get(&context).map_or(&[][..], |starts| starts.as_slice());
                     let label = candidate.label.trim_start_matches('(').to_lowercase();
                     let provision = hierarchy
                         && candidate.parent_candidate_id.is_none()
@@ -326,20 +323,13 @@ impl PdfResolutionInput {
                             || ["part", "section", "article", "division", "chapter", "schedule"]
                                 .iter()
                                 .any(|word| label.starts_with(word)));
-                    if run.grammar != CandidateGrammar::Numeric && !provision {
-                        let next = paragraph_starts.partition_point(|start| *start <= candidate.range.start);
-                        if let Some(&end) = paragraph_starts.get(next).filter(|end| **end < candidate.range.end) {
-                            candidate.range.end = end.max(candidate.content_start);
-                        }
-                        // Nor does a heading belong to one.
-                        if hierarchy {
-                            if let Some(heading) = index.overlapping(candidate.range).find(|&at| {
-                                index.lines[at].range.start > candidate.content_start
-                                    && lines.contexts[at] == context
-                                    && lines.lines[at].1.region_type == "heading"
-                            }) {
-                                candidate.range.end = index.lines[heading].range.start;
-                            }
+                    if hierarchy && !provision {
+                        if let Some(heading) = index.overlapping(candidate.range).find(|&at| {
+                            index.lines[at].range.start > candidate.content_start
+                                && lines.contexts[at] == context
+                                && lines.lines[at].1.region_type == "heading"
+                        }) {
+                            candidate.range.end = index.lines[heading].range.start;
                         }
                     }
                     if hierarchy {
@@ -376,8 +366,7 @@ impl PdfResolutionInput {
                     });
                 }
             }
-            // A list ends where the layout ended one of its items, or a numbered paragraph began,
-            // before its next item.
+            // A list ends where the layout ended one of its items before its next item.
             let runs: Vec<StructureCandidateRun> = placed
                 .into_iter()
                 .flat_map(|(run, _)| {
@@ -388,12 +377,8 @@ impl PdfResolutionInput {
                     for candidate in run.markers {
                         let continued = parts.last().is_some_and(|part| {
                             let prior = part.markers.last().expect("a part has an item");
-                            let context = lines.context_at(prior.marker_range.start);
-                            let paragraph_starts = paragraph_starts.get(&context).map_or(&[][..], |starts| starts.as_slice());
-                            let between = paragraph_starts.partition_point(|start| *start <= prior.range.start);
                             !ended.contains(&prior.id)
-                                && lines.context_at(candidate.marker_range.start) == context
-                                && paragraph_starts.get(between).is_none_or(|start| *start >= candidate.range.start)
+                                && lines.context_at(candidate.marker_range.start) == lines.context_at(prior.marker_range.start)
                         });
                         match parts.last_mut() {
                             Some(part) if continued => {
@@ -409,6 +394,9 @@ impl PdfResolutionInput {
                                 markers: vec![candidate],
                             }),
                         }
+                    }
+                    if let [part] = parts.as_mut_slice() {
+                        part.id = run.id;
                     }
                     parts
                 })

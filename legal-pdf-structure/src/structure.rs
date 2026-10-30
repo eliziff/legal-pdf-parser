@@ -128,6 +128,11 @@ impl<'a> Decided<'a> {
         self.decision.rule[slot.index()]
     }
 
+    /// The reading of the slot's opening marker that may open its unit: its run and member.
+    pub(super) fn reading(&self, slot: Slot) -> Option<(u32, u32)> {
+        self.decision.reading[slot.index()]
+    }
+
     /// The line's constituent document and language.
     pub(super) fn document_context(&self, id: &str) -> DocumentContext {
         self.slot(id).map_or((0, false), |slot| {

@@ -15,8 +15,9 @@
 //! 10. `Band::holds`: the lines the band holds; a notes heading, a table's cell, furniture, a
 //!     source's heading and a numbered paragraph's line are none of them.
 //!
-//! The band then gives back the endnote runs the body never refers to (`verify_endnotes`). It reads
-//! a document's lines (`BandLines`) on its pages (`BandPage`) and writes nothing (`read_band`).
+//! The band then gives back the endnote runs the body never refers to (`verify_endnotes`), and says
+//! of each page whether it read a note there and where its band begins. It reads a document's lines
+//! (`BandLines`) on its pages (`BandPage`) and writes nothing (`read_band`).
 //! A line a page layout model labelled keeps that label's reading of note or text under
 //! LEGALPDF_ABLATE=layout_notes.
 
@@ -67,7 +68,8 @@ pub(crate) struct BandPage<'a> {
 
 /// What the band reads of a document: each note line and its kind; the lines whose number it read
 /// as a numbered paragraph's; the labels it read as no note's; an endnote page's running heads; the
-/// notes headings; and the warnings of a band drawn on weak geometry.
+/// notes headings; what it read of each page (`BandPageReading`, by the pages' order); and the
+/// warnings of a band drawn on weak geometry.
 #[derive(Debug, Default)]
 pub(crate) struct BandReading {
     pub(crate) notes: Vec<(Slot, NoteKind)>,
@@ -75,7 +77,18 @@ pub(crate) struct BandReading {
     pub(crate) suppressed: Vec<Slot>,
     pub(crate) running_heads: Vec<Slot>,
     pub(crate) headings: Vec<Slot>,
+    pub(crate) pages: Vec<BandPageReading>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+}
+
+/// What the band read of a page: whether it read a note there (once the endnote runs the body
+/// never refers to are given back), where its band begins across the page, and the label the
+/// document's next note takes by the notes read before the page.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BandPageReading {
+    pub(crate) noted: bool,
+    pub(crate) cut: Option<f64>,
+    pub(crate) next_label: u32,
 }
 
 /// A page with its lines' measures, each by its line's place on the page: the document's lines on it
@@ -787,6 +800,7 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
     let mut next_label = 1;
     for (band, sheet) in pages.iter().zip(&sheets) {
         let page = sheet.page;
+        found.pages.push(BandPageReading { next_label, ..BandPageReading::default() });
         run.enter(page.index);
         let reading = page_reading(sheet, band.separator, lines.body_size);
         let paragraph = paragraph_labels(sheet, &reading, run.expected);
@@ -810,6 +824,7 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
         found.running_heads.extend(heads.iter().map(|&place| sheet.view.slot(place)));
         let furniture = |place: usize| sheet.furniture(place) || heads.contains(&place);
         let cut = note_cut(sheet, &reading, &labels, band.contents, endnote_page, &continuation, &run, &furniture, &mut found.diagnostics);
+        found.pages.last_mut().expect("the page's reading").cut = cut;
         let columns = margin.map_or(facts.columns, |(model, _)| model);
         let band = Band {
             endnote_page,
@@ -846,8 +861,17 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
         notes.push(page_notes);
     }
     verify_endnotes(&sheets, &mut notes);
-    for (sheet, page_notes) in sheets.iter().zip(notes) {
+    for ((sheet, page_notes), page) in sheets.iter().zip(notes).zip(&mut found.pages) {
+        page.noted = !page_notes.is_empty();
         found.notes.extend(page_notes.into_iter().map(|(place, kind)| (sheet.view.slot(place), kind)));
     }
     found
+}
+
+/// The endnote runs among a document's notes (`notes`: each page's note lines by place, with their
+/// kind, by the pages' order) that the body never refers to, given back (`verify_endnotes`): the
+/// notes kept.
+pub(crate) fn verified_endnotes(pages: &[BandPage], lines: &BandLines, notes: &mut [Vec<(usize, NoteKind)>]) {
+    let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
+    verify_endnotes(&sheets, notes);
 }

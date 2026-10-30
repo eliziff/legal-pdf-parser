@@ -3,10 +3,15 @@
 //! (the engine's `repair_label_dropouts`, which restores paragraph and item numbers too), and the
 //! lines it rewrites are measured again. Each context's lines then read as one text, its fenced
 //! lines (line labels, folios, furniture, contents) left out: the engine reads its counts of
-//! numbers, letters and bullets and its provision ladder there, with the ladder's refinements on.
-//! What each marker's line shows is read from the evidence and the fences, never from a role a
-//! reader wrote, and the engine resolves each marker to the unit it opens and says whether its
-//! number counts. Every place a run names is a line's slot and a place in its text.
+//! numbers, letters and bullets and its provision ladder there, with the instrument grammar's
+//! refinements (its contents column, regnal heads, repeated subsections). A list's item and a
+//! subsection end where the
+//! context's numbered paragraphs resume, and a list parts there, before anything is resolved. What
+//! each marker's line shows is read from the evidence and the fences, never from a role a reader
+//! wrote: a transcript's question number beside its line-number column is a marker like any other,
+//! the column itself being line labels the view leaves out. The engine resolves each marker to the
+//! unit it opens and says whether its number counts. Every place a run names is a line's slot and a
+//! place in its text.
 
 use super::*;
 use legal_pdf_core::model::Word;
@@ -37,12 +42,14 @@ pub(crate) struct Run {
     pub(crate) members: Vec<Member>,
 }
 
-/// A marker of a run: its candidate's id, label and the grammar's reading of it; the line it opens
-/// and the line on its row carrying its text, where it stands alone on its own; the member it hangs
-/// from (by its place in the run) and its depth; the value it counts; where its marker begins and
-/// ends, where its text begins and where the grammar ends it; whether its number counts, the unit
-/// it opens and the rule that says so; what its lines show; whether its text is prose, and whether
-/// that text is shaped as a title.
+/// A marker of a run: its candidate's id, label and the grammar's reading of it; the line it opens,
+/// the line on its row carrying its text where it stands alone on its own, and the line carrying
+/// its text where none follows it on its own line (that line beside it, else the next line of its
+/// context that no other marker opens: "ARTICLE 31" over "PENSION PLAN"); the member it hangs from
+/// (by its place in the run) and its depth; the value it counts; where its marker begins and ends,
+/// where its text begins and where the grammar ends it; whether its number counts, the unit it
+/// opens and the rule that says so; what its lines show; whether its text is prose, whether that
+/// text is shaped as a title, and whether it has three words or more (eight letters or more).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Member {
     pub(crate) id: String,
@@ -50,6 +57,7 @@ pub(crate) struct Member {
     pub(crate) grammar_value: String,
     pub(crate) slot: Slot,
     pub(crate) beside: Option<Slot>,
+    pub(crate) text: Option<Slot>,
     pub(crate) parent: Option<u32>,
     pub(crate) level: u16,
     pub(crate) value: u32,
@@ -62,6 +70,7 @@ pub(crate) struct Member {
     pub(crate) observations: Vec<CandidateObservationV2>,
     pub(crate) carries_prose: bool,
     pub(crate) title_shaped: bool,
+    pub(crate) worded: bool,
 }
 
 /// The document's numbering runs, and the lines whose markers the repair rewrote, with their text and
@@ -229,21 +238,99 @@ fn label_value(label: &str) -> u32 {
     })
 }
 
-/// What each line of a reading context shows of a marker on it.
+/// The runs as they read before any is resolved, so that the engine and the graph read one extent
+/// for each marker: in the view, a list's item, and a provision's that numbers no top-level section
+/// or division, ends where the numbered paragraphs resume (each marker of a rooted, consecutive
+/// count of numbers outside the note band and not set smaller than the body's type, as a page's
+/// notes under no rule are), and a list parts where a numbered paragraph opens between two of its
+/// items.
+fn part_at_paragraphs(runs: Vec<StructureCandidateRun>, view: &View, evidence: &Evidence, fences: &Fences) -> Vec<StructureCandidateRun> {
+    let body_type = |at: usize| fences.body.is_none_or(|(_, body)| evidence.half_points[at] == 0 || evidence.half_points[at] >= body);
+    let mut starts: Vec<usize> = runs
+        .iter()
+        .filter(|run| run.grammar == CandidateGrammar::Numeric && run.rooted && run.consecutive)
+        .flat_map(|run| &run.markers)
+        .filter(|candidate| {
+            let at = view.place(candidate.marker_range.start).slot.index();
+            !fences.band[at] && body_type(at)
+        })
+        .map(|candidate| candidate.range.start)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.is_empty() {
+        return runs;
+    }
+    let next_start = |after: usize| starts.get(starts.partition_point(|start| *start <= after)).copied();
+    let mut parted = Vec::with_capacity(runs.len());
+    for mut run in runs {
+        if run.grammar != CandidateGrammar::Numeric {
+            let hierarchy = run.grammar == CandidateGrammar::Hierarchy;
+            for candidate in &mut run.markers {
+                let label = candidate.label.trim_start_matches('(').to_lowercase();
+                let provision = hierarchy
+                    && candidate.parent_candidate_id.is_none()
+                    && (label.starts_with(|c: char| c.is_ascii_digit())
+                        || ["part", "section", "article", "division", "chapter", "schedule"].iter().any(|word| label.starts_with(word)));
+                if !provision {
+                    if let Some(end) = next_start(candidate.range.start).filter(|end| *end < candidate.range.end) {
+                        candidate.range.end = end.max(candidate.content_start);
+                    }
+                }
+            }
+        }
+        if run.grammar != CandidateGrammar::Enumerator {
+            parted.push(run);
+            continue;
+        }
+        let mut parts: Vec<StructureCandidateRun> = Vec::new();
+        for candidate in std::mem::take(&mut run.markers) {
+            match parts.last_mut() {
+                Some(part)
+                    if next_start(part.markers.last().expect("a part has an item").range.start)
+                        .is_none_or(|start| start >= candidate.range.start) =>
+                {
+                    part.range.end = part.range.end.max(candidate.range.end);
+                    part.markers.push(candidate);
+                }
+                _ => parts.push(StructureCandidateRun {
+                    id: format!("{}.{}", run.id, parts.len() + 1),
+                    grammar: run.grammar,
+                    range: candidate.range,
+                    rooted: run.rooted,
+                    consecutive: run.consecutive,
+                    markers: vec![candidate],
+                }),
+            }
+        }
+        if let [part] = parts.as_mut_slice() {
+            part.id.clone_from(&run.id);
+        }
+        parted.extend(parts);
+    }
+    parted
+}
+
+/// What each line of a reading context shows of a marker on it: the context's view, the pages'
+/// measures, and the lines a marker of the view opens (`marked`, by slot).
 struct Lines<'a> {
     pages: &'a [Page],
     slots: &'a Slots,
     evidence: &'a Evidence,
     fences: &'a Fences,
+    geometry: &'a Geometry<'a>,
     view: &'a View,
+    marked: &'a HashSet<Slot>,
 }
 
 /// A marker read on a line, and what the line shows of it.
 struct Reading {
     beside: Option<Slot>,
+    text: Option<Slot>,
     observations: Vec<CandidateObservationV2>,
     carries_prose: bool,
     title_shaped: bool,
+    worded: bool,
 }
 
 impl Lines<'_> {
@@ -257,9 +344,20 @@ impl Lines<'_> {
         })
     }
 
+    /// Whether a line fills its column's measure (85% of it or more).
+    fn fills(&self, slot: Slot) -> bool {
+        let page = self.slots.page(slot);
+        let (_, columns) = self.geometry.page(page);
+        columns.place(self.slots.line(self.pages, slot), (slot.0 - self.slots.on(page).start) as usize).0 >= 0.85
+    }
+
     /// What the lines of a run's marker show of it: its own line's lexicon, typography and
     /// geometry, the text after it, and the run around it (`aligned`: a sibling of its level stands
-    /// at its margin).
+    /// at its margin). Its text is prose where it runs on (with the line before or after it in the
+    /// body's flow, the line after it going on with it, or its line filling its column), or where
+    /// three words or more of it are no title's (over twelve words, ending a sentence or on a
+    /// comma, semicolon or colon, or opening in lower case): "ARTICLE 8" over "TERMINATION OF
+    /// FORBEARANCE PERIOD" heads.
     fn read(&self, run: &StructureCandidateRun, candidate: &StructureMarkerCandidate, aligned: bool) -> Reading {
         let (evidence, fences) = (self.evidence, self.fences);
         let start = self.view.place(candidate.marker_range.start);
@@ -267,30 +365,40 @@ impl Lines<'_> {
         let at = slot.index();
         let line = self.slots.line(self.pages, slot);
         let beside = self.beside(slot);
-        // The marker's text: after it on its line, else on the line beside it, else on the next; by
-        // its line's index among the view's lines.
+        // The marker's text: after it on its line, else on the line beside it, else on the next
+        // where no other marker opens that; by its line's index among the view's lines.
         let index = self.view.line_at(candidate.marker_range.start);
         let content = self.view.place(candidate.content_start);
         let own = (content.slot == slot).then(|| text_from(self.pages, self.slots, content)).filter(|tail| !tail.trim().is_empty());
-        let next = (index + 1 < self.view.lines.len()).then_some(index + 1);
+        let next = (index + 1 < self.view.lines.len())
+            .then_some(index + 1)
+            .filter(|&next| !self.marked.contains(&self.view.lines[next].0));
         let text_index = if own.is_some() {
             Some(index)
         } else if let Some(beside) = beside {
-            next.filter(|&next| self.view.lines[next].0 == beside)
+            (index + 1 < self.view.lines.len() && self.view.lines[index + 1].0 == beside)
+                .then_some(index + 1)
                 .or_else(|| self.view.lines.iter().position(|&(line, _, _)| line == beside))
                 .or(next)
         } else {
             next
         };
         let text_line = text_index.map(|text| self.view.lines[text].0);
-        let tail = own.or_else(|| text_line.map(|text| text_from(self.pages, self.slots, Place { slot: text, offset: 0 }))).unwrap_or("");
+        let text = text_line.filter(|_| own.is_none());
+        let tail = own.or_else(|| text.map(|text| text_from(self.pages, self.slots, Place { slot: text, offset: 0 }))).unwrap_or("");
         let letters = tail.chars().filter(|c| c.is_alphabetic()).count();
-        // The text's line runs on with the line before or after it in the body's flow.
-        let flows = text_index.is_some_and(|text| {
+        // The text's line runs on: with the line before or after it in the body's flow, the line
+        // after it going on with it, or its line filling its column.
+        let runs_on = text_index.is_some_and(|text| {
             self.view.lines[text..].iter().take(2).any(|&(line, _, _)| fences.continues[line.index()] == Some(Continuation::Flow))
+                || self.view.lines.get(text + 1).is_some_and(|&(after, _, _)| fences.continues[after.index()].is_some())
+                || self.fills(self.view.lines[text].0)
         });
-        let carries_prose = letters >= 8 && (flows || tail.split_whitespace().take(3).count() == 3);
-        let title_shaped = text_line.is_some_and(|text| evidence.title_shaped[text.index()]);
+        // A marker standing alone with no text of its own reads as its own line does; a text opening
+        // in lower case is a list's item or a sentence's, no title.
+        let title_shaped = evidence.title_shaped[text_line.unwrap_or(slot).index()] && !tail.trim_start().starts_with(char::is_lowercase);
+        let worded = letters >= 8 && tail.split_whitespace().take(3).count() == 3;
+        let carries_prose = letters >= 8 && runs_on || worded && !title_shaped;
         let mut observations = Vec::new();
         let mut observe = |observation: CandidateObservationV2| {
             if !observations.contains(&observation) {
@@ -328,19 +436,14 @@ impl Lines<'_> {
         if fences.context(slot).quotation != 0 {
             observe(CandidateObservationV2::Quotation);
         }
-        if fences.numbered_row[at] {
-            observe(CandidateObservationV2::TranscriptLineNumber);
-        }
-        // A list's item as its line reads: a marker whose line opens on neither a capital nor a
-        // digit, unless a "(n)" with text after it.
-        let first = line.text.trim_start().chars().next();
-        let paren_number = evidence.marker[at].is_some_and(|marker| evidence.families[usize::from(marker.family)] == "():1");
-        if evidence.marker[at].is_some_and(|marker| marker.only || !paren_number)
-            && first.is_some_and(|c| !c.is_uppercase() && !c.is_ascii_digit())
-        {
+        // A list's item as its line reads it: a marker of a list's family (`UnitRole::of_family`:
+        // never "[12]", "(2)", "3." or "A.") that is a bullet, or whose text, after it or on the
+        // line carrying it, opens in lower case.
+        let bullet = !candidate.label.chars().any(char::is_alphanumeric);
+        if UnitRole::of_family(&candidate.label) == UnitRole::Item && (bullet || tail.trim_start().starts_with(char::is_lowercase)) {
             observe(CandidateObservationV2::ComposedListItem);
         }
-        Reading { beside, observations, carries_prose, title_shaped }
+        Reading { beside, text, observations, carries_prose, title_shaped, worded }
     }
 }
 
@@ -392,6 +495,7 @@ impl Runs {
             })
             .collect();
         let evidence: &Evidence = evidence;
+        let geometry = Geometry::of(pages);
         // Each context's lines in reading order, its fenced lines left out.
         let mut by_context: Vec<Vec<Slot>> = vec![Vec::new(); fences.contexts.len()];
         for &slot in &fences.order {
@@ -408,7 +512,10 @@ impl Runs {
             if found.is_empty() {
                 continue;
             }
-            let shown = Lines { pages, slots, evidence, fences, view: &view };
+            let found = part_at_paragraphs(found, &view, evidence, fences);
+            let marked: HashSet<Slot> =
+                found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
+            let shown = Lines { pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
             let readings: Vec<Vec<Reading>> = found
                 .iter()
                 .map(|run| {
@@ -464,6 +571,7 @@ impl Runs {
                             grammar_value: candidate.grammar_value.clone(),
                             slot: marker[0].slot,
                             beside: reading.beside,
+                            text: reading.text,
                             parent: candidate
                                 .parent_candidate_id
                                 .as_ref()
@@ -480,6 +588,7 @@ impl Runs {
                             observations: reading.observations,
                             carries_prose: reading.carries_prose,
                             title_shaped: reading.title_shaped,
+                            worded: reading.worded,
                         }
                     })
                     .collect();

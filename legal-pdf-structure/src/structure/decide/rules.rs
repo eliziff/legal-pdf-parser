@@ -63,14 +63,16 @@ impl<'a> Geometry<'a> {
     }
 }
 
-/// What each line is, by slot: its role, the rule that gave it, the unit it opens, whether it goes
-/// on with the line above it in one heading, caption or unit, the level a rule gives it (0 for
-/// none) and its heading level once read (0 for none), the anchor naming it (an index among the
-/// anchors, plus one; 0 for none); and the disagreements of strong rules.
+/// What each line is, by slot: its role, the rule that gave it, the reading of its opening marker
+/// that may open its unit (`readings`) and the unit it opens, whether it goes on with the line above
+/// it in one heading, caption or unit, the level a rule gives it (0 for none) and its heading level
+/// once read (0 for none), the anchor naming it (an index among the anchors, plus one; 0 for none);
+/// and the disagreements of strong rules.
 #[derive(Debug, Default)]
 pub(crate) struct Decision {
     pub(crate) role: Vec<Role>,
     pub(crate) rule: Vec<Rule>,
+    pub(crate) reading: Vec<Option<(u32, u32)>>,
     pub(crate) unit: Vec<Option<Opening>>,
     pub(crate) joined: Vec<bool>,
     pub(crate) given: Vec<u8>,
@@ -79,6 +81,28 @@ pub(crate) struct Decision {
     pub(crate) anchors: Vec<OutlineAnchor>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     conflicts: Vec<(Rule, Rule, Slot)>,
+}
+
+/// The one reading of each line's opening marker that may open its unit, as (run, member) indexes,
+/// by slot: of the counted, unquoted markers on the line that resolve to a unit, the one standing
+/// first on it; where runs read that one marker, the first run's (a count of numbers before the
+/// provision ladder: the engine has already read an order's count inside a numbered paragraph as
+/// a list).
+fn readings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
+    let mut chosen: Vec<Option<(u32, u32)>> = vec![None; count];
+    for (r, run) in runs.runs.iter().enumerate() {
+        for (k, member) in run.members.iter().enumerate() {
+            if !member.counted || member.kind.is_none() || quoted(member) {
+                continue;
+            }
+            let at = member.slot.index();
+            let better = chosen[at].is_none_or(|(r0, k0)| member.marker[0].offset < runs.runs[r0 as usize].members[k0 as usize].marker[0].offset);
+            if better {
+                chosen[at] = Some((r as u32, k as u32));
+            }
+        }
+    }
+    chosen
 }
 
 /// Body text, a list's item or a quotation: what the residual reads as prose.
@@ -164,6 +188,7 @@ impl Decision {
         let mut decision = Self {
             role: fences.role.clone(),
             rule: fences.rule.clone(),
+            reading: readings(runs, count),
             unit: vec![None; count],
             joined: vec![false; count],
             given: vec![0; count],
@@ -174,7 +199,6 @@ impl Decision {
         let geometry = Geometry::of(pages);
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
         let mut sequences = Sequences { lines: vec![Vec::new(); fences.contexts.len()], at: vec![u32::MAX; count] };
-        let mut testimony = vec![false; pages.len()];
         // Each document a transcript of whose witnesses are named.
         let mut witnesses = vec![false; fences.transcripts.len()];
         let mut examinations = Vec::new();
@@ -195,9 +219,6 @@ impl Decision {
                 previous
             };
             let line = text(slot);
-            if words & WORD_SPEAKER != 0 {
-                testimony[slots.page(slot)] = true;
-            }
             if transcript && words & WORD_WITNESS != 0 {
                 witnesses[usize::from(fences.document[at])] = true;
             }
@@ -241,13 +262,17 @@ impl Decision {
                 decision.given[at] = 2;
                 continue;
             }
+            // A transcript's line going on from the one before is no heading; a question its number
+            // opens ("11 Q. Maybe jot in huge letters" after "BY MR. RUBY:") opens its unit.
             if words & WORD_HISTORY != 0 {
                 deferred.push((slot, Rule::HistoryLine));
             } else if beside_numbers
                 && (line.starts_with(char::is_lowercase) || previous.is_some_and(|previous| !sentence_ended(text(previous))))
             {
-                deferred.push((slot, Rule::TranscriptLine));
-            } else if front_matter(pages, slots, evidence, slot) {
+                if decision.reading[at].is_none() {
+                    deferred.push((slot, Rule::TranscriptLine));
+                }
+            } else if front_matter(pages, slots, evidence, fences, slot) {
                 deferred.push((slot, Rule::FrontMatter));
             }
         }
@@ -280,17 +305,18 @@ impl Decision {
                         && place <= fences.place[slot.index()]
                 })
         };
-        weigh(pages, slots, evidence, fences, &sequences, &geometry, &testimony, &unnamed, &mut decision);
+        weigh(pages, slots, evidence, fences, &sequences, &geometry, &unnamed, &mut decision);
         decision.title(pages, slots, evidence, fences, &sequences, &geometry);
-        // A counted marker no rule settled opens the unit its run reads; every other line is body,
-        // or a quotation's.
-        for (r, run) in runs.runs.iter().enumerate() {
-            for member in run.members.iter().filter(|member| member.counted && !quoted(member)) {
-                let (Some(kind), at) = (member.kind, member.slot.index()) else { continue };
-                let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
-                if decision.unit[at].is_none() && decision.fill(member.slot, role, Rule::Opener) {
-                    decision.unit[at] = Some((r as u32, kind));
-                }
+        // A counted marker no rule settled opens the unit its reading reads, the line carrying its
+        // text going on with it; every other line is body, or a quotation's.
+        for at in 0..count {
+            let Some((r, k)) = decision.reading[at] else { continue };
+            let member = &runs.runs[r as usize].members[k as usize];
+            let Some(kind) = member.kind else { continue };
+            let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
+            if decision.unit[at].is_none() && decision.fill(member.slot, role, Rule::Opener) {
+                decision.unit[at] = Some((r, kind));
+                decision.join(member.text, role, Rule::Opener);
             }
         }
         for at in 0..count {
@@ -307,21 +333,18 @@ impl Decision {
     }
 
     /// The rules each run settles: a quotation's numbers open nothing; three or more titles alone,
-    /// one under the next, are contents; a counted marker carrying prose opens its unit; one
-    /// before a title alone heads its division where a division's word opens it, and opens its
+    /// one under the next, are contents; a counted marker carrying prose opens its unit, by its
+    /// line's one reading (`readings`); one before a title alone heads its division where a
+    /// division's word opens it, and opens its
     /// clause with the caption as its first line in an instrument, or over its clause's terms
     /// ("(a)", "(3)"); outside an instrument, a count of titles alone between the text's paragraphs
     /// is a heading ladder.
     fn read_runs(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sequences: &Sequences) {
         let place = |slot: Slot| sequences.at[slot.index()];
-        // The lines a counted marker opens a unit on.
-        let mut opener = vec![false; slots.len()];
-        for member in runs.members().filter(|member| member.counted && member.kind.is_some() && !quoted(member)) {
-            opener[member.slot.index()] = true;
-        }
-        // The last place of a member's own lines: its line, the line beside it, its text's line.
+        // The last place of a member's own lines: its line, the line carrying its text, its text's
+        // place.
         let end = |member: &Member| {
-            [Some(member.slot), member.beside, Some(member.content.slot)]
+            [Some(member.slot), member.text, Some(member.content.slot)]
                 .into_iter()
                 .flatten()
                 .map(place)
@@ -329,13 +352,13 @@ impl Decision {
                 .max()
                 .unwrap_or(u32::MAX)
         };
-        let text_line = |member: &Member| member.beside.or((member.content.slot != member.slot).then_some(member.content.slot));
         for run in &runs.runs {
             for member in run.members.iter().filter(|member| quoted(member)) {
                 self.claim(member.slot, Role::Quote, Rule::QuotedNumber);
             }
         }
-        // Titles alone, each directly over the next (a division's line between them aside); a
+        // Titles alone, each directly over the next (a division's line between them aside), none of
+        // three words or more (a statute's "118 [Repealed, 2014, c. 38, s. 17]" is its provision); a
         // transcript's line beside its number column is none.
         for run in &runs.runs {
             let lines = &sequences.lines[usize::from(run.ctx)];
@@ -343,6 +366,7 @@ impl Decision {
                 member.counted
                     && member.title_shaped
                     && !member.carries_prose
+                    && !member.worded
                     && !quoted(member)
                     && self.open(member.slot)
                     && !fences.numbered_row[member.slot.index()]
@@ -370,7 +394,7 @@ impl Decision {
             for (first, last) in stretches {
                 for k in first..last {
                     let member = &run.members[k];
-                    for slot in [Some(member.slot), text_line(member)].into_iter().flatten() {
+                    for slot in [Some(member.slot), member.text].into_iter().flatten() {
                         self.claim(slot, Role::Contents, Rule::TitleOnly);
                     }
                     if k + 1 < last {
@@ -385,7 +409,10 @@ impl Decision {
             let lines = &sequences.lines[usize::from(run.ctx)];
             for (k, member) in run.members.iter().enumerate() {
                 let at = member.slot.index();
-                let Some(kind) = member.kind.filter(|_| member.counted && !quoted(member)) else { continue };
+                if self.reading[at] != Some((r as u32, k as u32)) {
+                    continue;
+                }
+                let Some(kind) = member.kind else { continue };
                 if self.rule[at] == Rule::HistoryHeading || self.rule[at] == Rule::TitleOnly {
                     continue;
                 }
@@ -393,12 +420,12 @@ impl Decision {
                     let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
                     if self.claim(member.slot, role, Rule::Opener) {
                         self.unit[at] = Some((r as u32, kind));
-                        self.join(text_line(member), role, Rule::Opener);
+                        self.join(member.text, role, Rule::Opener);
                     }
                 } else if member.title_shaped && self.open(member.slot) {
                     if evidence.words[at] & WORD_DIVISION != 0 {
                         self.claim(member.slot, Role::Heading, Rule::DivisionHeading);
-                        self.join(text_line(member), Role::Heading, Rule::DivisionHeading);
+                        self.join(member.text, Role::Heading, Rule::DivisionHeading);
                         continue;
                     }
                     // A caption opens its clause where text, not another title, follows it: in an
@@ -411,13 +438,11 @@ impl Decision {
                         });
                     let next = (from != u32::MAX).then(|| lines.get(from as usize + 1).copied()).flatten();
                     let over_terms = next.is_some_and(|next| self.role[next.index()] != Role::Heading && subsection(slots.line(pages, next).text.trim()));
+                    // The clause's text after its caption is the clause's, set apart from it where the
+                    // page parts them ("2.2 / Landlord's Work" over "The Landlord shall perform").
                     if (evidence.instrument || over_terms) && followed && self.claim(member.slot, Role::Body, Rule::Caption) {
                         self.unit[at] = Some((r as u32, kind));
-                        self.join(text_line(member), Role::Body, Rule::Caption);
-                        // The clause's first line of text goes on with its caption.
-                        if let Some(next) = next.filter(|next| !opener[next.index()] && self.unit[next.index()].is_none()) {
-                            self.join(Some(next), Role::Body, Rule::Caption);
-                        }
+                        self.join(member.text, Role::Body, Rule::Caption);
                     }
                 }
             }
@@ -458,7 +483,7 @@ impl Decision {
             return;
         }
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
-        let title_line = |member: &Member| member.beside.or((member.content.slot != member.slot).then_some(member.content.slot)).unwrap_or(member.slot);
+        let title_line = |member: &Member| member.text.unwrap_or(member.slot);
         let listed = |line: &str| {
             line.ends_with([',', ';']) || line.rsplit(char::is_whitespace).next().is_some_and(|word| matches!(word, "and" | "or"))
         };
@@ -484,14 +509,15 @@ impl Decision {
 
     /// A statute's marginal notes, in each reading context holding its spine (three or more
     /// counted provisions, rooted and consecutive, opening prose): one or two short lines shaped
-    /// as a note directly over an opener (a subsection's too), or in the page's margin column
-    /// level with it, are a caption. A caption over exactly one opener of its depth before the
-    /// next caption, set as most such captions of its look (bold, size, centring) are, is the
-    /// opener's marginal note; any other is a heading. A caption's twin on its row in the other
-    /// language's column reads as it does.
+    /// as a note directly over an opener (a subsection's too; its second line may go on in lower
+    /// case, "Endorsements" over "on writ"), or in the page's margin column level with it, are a
+    /// caption. A caption level with its opener's first line beside it, or over exactly one
+    /// opener of its depth before the next caption and set as most such captions of its look
+    /// (bold, size, centring) are, is the opener's marginal note; any other is left to the lines
+    /// still open. A caption's twin on its row in the other language's column reads as it does.
     fn marginal_notes(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sequences: &Sequences) {
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
-        let mut decided: Vec<(Slot, Role)> = Vec::new();
+        let mut decided: Vec<Slot> = Vec::new();
         for (ctx, lines) in sequences.lines.iter().enumerate() {
             if fences.contexts[ctx].quotation != 0 {
                 continue;
@@ -519,6 +545,14 @@ impl Decision {
                     && evidence.words[slot.index()] & WORD_DIVISION == 0
                     && !fences.numbered_row[slot.index()]
             };
+            // A note's line wrapped under its first: open, short, going on in lower case.
+            let wrapped = |slot: Slot| {
+                self.open(slot)
+                    && fences.continues[slot.index()] == Some(Continuation::Flow)
+                    && text(slot).starts_with(char::is_lowercase)
+                    && (1..=16).contains(&text(slot).split_whitespace().count())
+                    && !fences.numbered_row[slot.index()]
+            };
             // Each caption: its lines, top first, and the opener under it.
             let mut captions: Vec<(Vec<Slot>, usize)> = Vec::new();
             for (k, &(at, _, opener)) in openers.iter().enumerate() {
@@ -530,9 +564,13 @@ impl Decision {
                     if let Some(upper) = above(2).filter(|&slot| shaped(slot) && fences.continues[first.index()].is_some()) {
                         caption.insert(0, upper);
                     }
-                    if fences.continues[caption[0].index()].is_some() {
-                        caption.clear();
+                } else if let Some(lower) = above(1).filter(|&slot| wrapped(slot)) {
+                    if let Some(upper) = above(2).filter(|&slot| shaped(slot)) {
+                        caption = vec![upper, lower];
                     }
+                }
+                if caption.first().is_some_and(|first| fences.continues[first.index()].is_some()) {
+                    caption.clear();
                 }
                 if caption.is_empty() {
                     caption = self.margin_caption(pages, slots, fences, opener, &shaped);
@@ -569,33 +607,43 @@ impl Decision {
                     None => groups.push((key, 1, usize::from(one))),
                 }
             }
-            for ((caption, _), &one) in captions.iter().zip(&governs) {
+            // A caption level with its opener's first line, beside it in a margin, is its note: a
+            // heading stands over its provision, not beside it.
+            let beside = |caption: Slot, opener: Slot| {
+                let (note, line) = (slots.line(pages, caption), slots.line(pages, opener));
+                let row = evidence.row(slots, caption);
+                let level = row != u32::MAX && row == evidence.row(slots, opener)
+                    || (note.bbox[1] - line.bbox[1]).abs() <= (line.bbox[3] - line.bbox[1]).max(1.0);
+                level && (note.bbox[2] <= line.bbox[0] || note.bbox[0] >= line.bbox[2])
+            };
+            for ((caption, opener), &one) in captions.iter().zip(&governs) {
                 let key = look(caption[0]);
                 let share = groups.iter().find(|(seen, _, _)| *seen == key).map_or(0.0, |(_, members, ones)| *ones as f64 / *members as f64);
-                let (role, rule) = if one && share >= 0.6 { (Role::MarginalNote, Rule::MarginalNote) } else { (Role::Heading, Rule::CaptionHeading) };
+                if !(beside(caption[0], openers[*opener].2) || one && share >= 0.6) {
+                    continue;
+                }
                 for (k, &slot) in caption.iter().enumerate() {
-                    if self.claim(slot, role, rule) {
+                    if self.claim(slot, Role::MarginalNote, Rule::MarginalNote) {
                         self.joined[slot.index()] = k > 0;
-                        decided.push((slot, role));
+                        decided.push(slot);
                     }
                 }
             }
         }
-        // A caption's twin in the other language's column, on its row.
-        for (slot, role) in decided {
+        // A note's twin in the other language's column, on its row.
+        for slot in decided {
             let page = slots.page(slot);
             let row = evidence.row(slots, slot);
             if row == u32::MAX {
                 continue;
             }
-            let rule = self.rule[slot.index()];
             for twin in slots.on(page).map(Slot) {
                 if fences.translation[twin.index()] != fences.translation[slot.index()]
                     && evidence.row(slots, twin) == row
                     && self.open(twin)
                     && legal_structure_model::statute::marginal_note_shaped(text(twin))
                 {
-                    self.claim(twin, role, rule);
+                    self.claim(twin, Role::MarginalNote, Rule::MarginalNote);
                 }
             }
         }
@@ -716,14 +764,26 @@ fn quoted(member: &Member) -> bool {
 /// Front matter no heading is: a label (counsel, a party's role, contact details, "WHEREAS"), a
 /// jurat, a date, a signature, the line naming who gives the reasons ("MARTLAND J.—",
 /// "Fitzpatrick J.:"), a field's label with its blank, its value or another line on its row, a
-/// lead-in's colon after a joining word.
-fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, slot: Slot) -> bool {
+/// lead-in's colon after a joining word, a court's name heading its document's first two pages or
+/// standing over its parties (a party's role, a field or a label within the twelve lines after it).
+fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, slot: Slot) -> bool {
     let words = evidence.words[slot.index()];
     let line = slots.line(pages, slot);
     let text = line.text.trim();
+    let court = || {
+        let document = fences.document[slot.index()];
+        let opening = fences.order.iter().find(|first| fences.document[first.index()] == document).map_or(0, |first| slots.page(*first));
+        let place = fences.place[slot.index()] as usize;
+        slots.page(slot) < opening + 2
+            || fences.order[place + 1..]
+                .iter()
+                .take(12)
+                .any(|next| evidence.words[next.index()] & (WORD_PARTY | WORD_FIELD | WORD_LABEL) != 0)
+    };
     if words & (WORD_LABEL | WORD_PARTY | WORD_JURAT | WORD_DATE | WORD_SIGNATURE | WORD_AUTHOR) != 0
         || text.strip_suffix(':').is_some_and(legal_structure_model::judgment::signature_line)
         || joining_colon(text)
+        || words & WORD_COURT != 0 && court()
     {
         return true;
     }

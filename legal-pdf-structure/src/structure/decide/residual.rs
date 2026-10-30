@@ -4,16 +4,25 @@
 //! its look unless its own words or place say otherwise.
 //!
 //! A candidate is a short open line, or a few such lines set as one (a title wrapping), that ends no
-//! sentence and goes on with no line before it. A look is one face, size, weight, slant, case and
+//! sentence and goes on with no line before it. A marker alone on its line ("II.", "12", "ARTICLE
+//! 31") is one candidate with the line it numbers, and is weighed with it: the pair is a paragraph's
+//! where that text runs its column's measure, goes on into the next line or ends a sentence, and a
+//! marker with no such line heads nothing. A look is one face, size, weight, slant, case and
 //! underline, one place on the line (flush, indented, centred in its column) and one numbering
 //! family. What says a line opens a division: its source tags it a heading or a layout model a
-//! title, it is set off the body's type, it numbers a division, space stands over it, and prose or
-//! an opening unit follows it. What says it does not: it is a label, a speaker's turn, a date, it
-//! ends on a colon, it runs long, or short lines follow it as a block's fields do. What a look shows
-//! together: it recurs over pages, and sources tag most of it.
+//! title, it is set apart from the body's type (bold, larger, underlined, in capitals, or italic at
+//! the body's size; a scan's line with no face read measured so), it numbers a division, space
+//! stands over it, and prose or an opening unit follows it. What says it does not: it is a label, a
+//! speaker's turn, a date, it ends on a colon, it runs long, or short lines follow it as a block's
+//! fields do. What a look shows together: it recurs over pages, sources tag most of it, and a large
+//! look little set apart from the body's type is the body's.
 //!
 //! Each line scores its own evidence as log-odds; in a look of two or more it takes half its own and
 //! half the look's, with the look's own signs added.
+//!
+//! A quotation's editorial line ("[Emphasis added]", an ellipsis alone) is no heading, wherever it
+//! stands, and a transcript's testimony has its own words' and its outline's headings, never the
+//! residual's.
 //!
 //! A line its source or a layout model reads as a heading carries that reading as its strongest
 //! sign, so three ways such a reading fails are vetoes of their own for it: an unnumbered heading
@@ -75,9 +84,33 @@ fn family(value: &str, punctuation: &str) -> String {
     format!("{kind}{punctuation}")
 }
 
+/// How a line's type stands against the body's: the body's own (its face and size, neither bold,
+/// italic, underlined nor larger than the page's type); larger than the page's type; and set apart
+/// from the body (bold, larger, underlined, in capitals, or italic at the body's size or larger). A
+/// smaller size or another face alone sets nothing apart: a quotation's, a note's or a running
+/// head's type is no heading's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Typeset {
+    pub(crate) body: bool,
+    pub(crate) larger: bool,
+    pub(crate) set_apart: bool,
+}
+
+/// The median of the positive values.
+fn positive_median(mut values: Vec<f64>) -> f64 {
+    values.retain(|value| *value > 0.0);
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
 /// The look of a heading or candidate whose first line is `first` and whose text, its lines joined,
-/// is `text`, and whether its type is the body's own (its face and size, neither bold, italic,
-/// underlined nor larger than the page's type).
+/// is `text`, and how its type stands against the body's (`Typeset`). A line no face was read for
+/// (a scan's recognition) is set in the body's type unless it measures otherwise: larger where its
+/// height reads a size 1.1 times its page's, bold where its strokes are 1.2 times as thick as its
+/// page's.
 pub(crate) fn look_of(
     pages: &[Page],
     slots: &Slots,
@@ -87,7 +120,7 @@ pub(crate) fn look_of(
     first: Slot,
     text: &str,
     families: &mut Families,
-) -> (Look, bool) {
+) -> (Look, Typeset) {
     let at = first.index();
     let page = slots.page(first);
     let line = slots.line(pages, first);
@@ -101,21 +134,49 @@ pub(crate) fn look_of(
         0
     };
     let look = evidence.look[at];
-    let (bold, italic, underlined) = (look & LOOK_BOLD != 0, look & LOOK_ITALIC != 0, look & LOOK_UNDERLINED != 0);
-    let larger = measure.size > 0.0 && f64::from(evidence.half_points[at]) / 2.0 >= measure.size * 1.1;
-    let body_type = fences.body == Some((evidence.face[at], evidence.half_points[at])) && !bold && !underlined && !larger && !italic;
+    let (mut bold, italic, underlined) = (look & LOOK_BOLD != 0, look & LOOK_ITALIC != 0, look & LOOK_UNDERLINED != 0);
+    let faceless = evidence.face[at] == u16::MAX;
+    let (larger, smaller) = if faceless {
+        let on_page = slots.on(page);
+        let size = positive_median(on_page.clone().map(|slot| evidence.size[slot as usize]).collect());
+        let weight = positive_median(on_page.map(|slot| f64::from(evidence.weight[slot as usize])).collect());
+        bold |= weight > 0.0 && f64::from(evidence.weight[at]) >= weight * 1.2;
+        (size > 0.0 && evidence.size[at] >= size * 1.1, size > 0.0 && evidence.size[at] < size * 0.95)
+    } else {
+        let size = f64::from(evidence.half_points[at]) / 2.0;
+        let smaller = match fences.body {
+            Some((_, body)) => evidence.half_points[at] < body,
+            None => measure.size > 0.0 && size < measure.size * 0.95,
+        };
+        (measure.size > 0.0 && size >= measure.size * 1.1, smaller)
+    };
+    let in_body_face = faceless || fences.body == Some((evidence.face[at], evidence.half_points[at]));
+    let caps = all_caps(text);
+    let typeset = Typeset {
+        body: in_body_face && !bold && !underlined && !larger && !italic,
+        larger,
+        set_apart: bold || larger || underlined || caps || italic && !smaller,
+    };
     let family = headings::rules::enumerator(text).map_or_else(String::new, |(value, punctuation)| family(&value, &punctuation));
     let look = Look {
         face: evidence.face[at],
         size: evidence.half_points[at],
         bold,
         italic,
-        caps: all_caps(text),
+        caps,
         underlined,
         place,
         family: families.id(family),
     };
-    (look, body_type)
+    (look, typeset)
+}
+
+/// A marker standing alone on its line: a number and nothing else ("III.", "12", "(b)"), or a
+/// division's word and its number ("ARTICLE 31", "PART IV").
+pub(crate) fn marker_alone(evidence: &Evidence, slot: Slot, text: &str) -> bool {
+    headings::rules::bare_number(text)
+        || evidence.marker[slot.index()].is_some_and(|marker| marker.only)
+        || evidence.words[slot.index()] & WORD_DIVISION != 0 && text.trim_end_matches('.').split_whitespace().count() == 2
 }
 
 /// Two lines a blank of most of a line parts, or on two pages: two blocks.
@@ -125,20 +186,24 @@ pub(crate) fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: S
 }
 
 /// A candidate: its lines (places in its context's lines), its look, its own evidence as log-odds,
-/// whether a word or its place bars it, whether its source tags it a heading, and its page.
+/// whether a word or its place bars it, whether its source tags it a heading, whether its type is
+/// set apart from the body's, and its page.
 struct Candidate {
     lines: std::ops::Range<usize>,
     look: Look,
     own: f64,
     vetoed: bool,
     voted: bool,
+    set_apart: bool,
     page: usize,
 }
 
 /// The headings among the open lines of each reading context (`sequences`), weighed by their own
 /// evidence and their look's: a heading's lines take the heading's role, those after its first
-/// going on with it. `testimony` holds a transcript's pages of speakers' turns; `unnamed`, the lines
-/// bookmarks naming every heading leave unnamed.
+/// going on with it. A transcript's testimony has its own words' headings (its parts, witnesses
+/// and examinations), its anchors' and its contents' title, never the residual's: throughout a
+/// transcript that is testimony throughout (`Fences::testimony`), and on a transcript's pages of
+/// speakers' turns. `unnamed` holds the lines bookmarks naming every heading leave unnamed.
 pub(crate) fn weigh(
     pages: &[Page],
     slots: &Slots,
@@ -146,7 +211,6 @@ pub(crate) fn weigh(
     fences: &Fences,
     sequences: &Sequences,
     geometry: &Geometry,
-    testimony: &[bool],
     unnamed: &impl Fn(Slot) -> bool,
     decision: &mut Decision,
 ) {
@@ -160,6 +224,11 @@ pub(crate) fn weigh(
     let style = |slot: Slot| (evidence.face[slot.index()], evidence.half_points[slot.index()]);
     let apart = |upper: Slot, lower: Slot| apart(pages, slots, geometry, upper, lower);
     let voted = |slot: Slot| matches!(evidence.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle);
+    // Each page holding a speaker's turn: a transcript's testimony there.
+    let mut spoken = vec![false; pages.len()];
+    for slot in (0..slots.len()).filter(|&slot| evidence.words[slot] & WORD_SPEAKER != 0) {
+        spoken[slots.page(Slot(slot as u32))] = true;
+    }
     for sequence in &sequences.lines {
         let role = &decision.role;
         let eligible = |slot: Slot| {
@@ -183,15 +252,30 @@ pub(crate) fn weigh(
                 k += 1;
                 continue;
             }
+            // A marker alone on its line is one with the line it numbers, the next on its page (a
+            // heading's title, a paragraph's first line), whatever their types; with none, or with
+            // a number of its own, it heads nothing.
+            let alone = marker_alone(evidence, first, line(first).text.trim());
+            let mut end = k + 1;
+            if alone {
+                let numbers = sequence.get(end).is_some_and(|&next| {
+                    slots.page(next) == slots.page(first) && eligible(next) && !headings::rules::numbered(line(next).text.trim())
+                });
+                if !numbers {
+                    k += 1;
+                    continue;
+                }
+                end += 1;
+            }
             // A title wrapping onto the lines under it: same page and block, same type, short, no
             // number of its own, the line before ending no sentence.
-            let mut end = k + 1;
-            while end < sequence.len() && end - k < 3 {
+            let title = sequence[end - 1];
+            while end < sequence.len() && end - k < 3 + usize::from(alone) {
                 let (next, prior) = (sequence[end], sequence[end - 1]);
                 let before = line(prior).text.trim();
                 if apart(prior, next)
                     || !eligible(next)
-                    || style(next) != style(first)
+                    || style(next) != style(title)
                     || width(prior) >= 0.75
                     || width(next) >= 0.75
                     || headings::rules::numbered(line(next).text.trim())
@@ -213,7 +297,8 @@ pub(crate) fn weigh(
                 continue;
             }
             let text = sequence[k..end].iter().map(|&slot| line(slot).text.trim()).collect::<Vec<_>>().join(" ");
-            let (look, body_type) = look_of(pages, slots, evidence, fences, geometry, first, &text, &mut families);
+            // A numbered title is set as its title's line is, whatever its number's type.
+            let (look, typeset) = look_of(pages, slots, evidence, fences, geometry, title, &text, &mut families);
             let enumerated = headings::rules::enumerator(&text);
             let division_word = enumerated.as_ref().is_some_and(|(_, punctuation)| punctuation.chars().any(char::is_alphabetic));
             let next = sequence.get(end).copied();
@@ -233,37 +318,40 @@ pub(crate) fn weigh(
                 !prose(next) && !prose(after) && slots.page(next) == page && width(next) < 0.5 && width(after) < 0.5
             });
             let voted = sequence[k..end].iter().any(|&slot| voted(slot));
-            let transcript = fences.transcript(first);
             let numbered = headings::rules::numbered(&text);
-            let larger = measure(first).size > 0.0 && f64::from(evidence.half_points[first.index()]) / 2.0 >= measure(first).size * 1.1;
-            let vetoed = (transcript && testimony[slots.page(first)])
-                || (text.ends_with(['.', ',', ';']) && !headings::rules::bare_number(&text))
+            // A marker's text that goes on into the next line, or ends a sentence, is a paragraph's.
+            let runs_on = alone
+                && (sentence_ended(&text) || next.is_some_and(|next| fences.continues[next.index()].is_some()));
+            let vetoed = fences.testimony(first)
+                || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))
+                || runs_on
+                || numbered_paragraphs::editorial_line(&text)
+                || text.ends_with(['.', ',', ';'])
                 || headings::rules::label(&text)
-                || (transcript && headings::rules::turn_or_event(&text))
                 || date_line(&text)
                 || words > 20
                 || voted
                     && !numbered
                     && (end - k > 1
-                        || body_type && look.caps
-                        || !larger && below.is_some_and(|below| below > above.clamp(-3.0, 3.0) + 0.5));
+                        || typeset.body && look.caps
+                        || !typeset.larger && below.is_some_and(|below| below > above.clamp(-3.0, 3.0) + 0.5));
             let mut own = -1.5;
             own += if voted { 2.5 } else { 0.0 };
-            own += if !body_type || look.caps { 1.0 } else { 0.0 };
+            own += if typeset.set_apart { 1.0 } else { 0.0 };
             // A number in the body's own type numbers the body (its paragraphs, provisions, items).
-            own -= if body_type && !look.caps && !division_word { 1.5 } else { 0.0 };
-            own += if division_word { 1.5 } else if enumerated.is_some() && !body_type { 0.75 } else { 0.0 };
+            own -= if typeset.body && !look.caps && !division_word { 1.5 } else { 0.0 };
+            own += if division_word { 1.5 } else if enumerated.is_some() && !typeset.body { 0.75 } else { 0.0 };
             own += if opens_prose { 1.0 } else { 0.0 };
             own -= if fields_follow { 0.75 } else { 0.0 };
             own += if above >= 0.8 { 0.5 } else { 0.0 };
             own -= if text.ends_with(':') { 1.0 } else { 0.0 };
             own -= if words > 12 { 1.0 } else { 0.0 };
-            own -= if end - k > 1 && enumerated.is_none() { 0.5 } else { 0.0 };
-            candidates.push(Candidate { lines: k..end, look, own, vetoed, voted, page: slots.page(first) });
+            own -= if end - k > 1 + usize::from(alone) && enumerated.is_none() { 0.5 } else { 0.0 };
+            candidates.push(Candidate { lines: k..end, look, own, vetoed, voted, set_apart: typeset.set_apart, page: slots.page(first) });
             k = end;
         }
         // Each look's own signs: its recurrence over pages, its sources' share of it, and a look so
-        // common and so little tagged that it is the body's.
+        // common and so little set apart from the body's type that it is the body's.
         let mut looks: Vec<(Look, Vec<usize>)> = Vec::new();
         for (n, candidate) in candidates.iter().enumerate() {
             match looks.iter_mut().find(|(look, _)| *look == candidate.look) {
@@ -280,13 +368,14 @@ pub(crate) fn weigh(
             let size = members.len() as f64;
             let mean = members.iter().map(|&n| candidates[n].own).sum::<f64>() / size;
             let voted = members.iter().filter(|&&n| candidates[n].voted).count() as f64 / size;
+            let set_apart = members.iter().filter(|&&n| candidates[n].set_apart).count() as f64 / size;
             let mut pages_met: Vec<usize> = members.iter().map(|&n| candidates[n].page).collect();
             pages_met.sort_unstable();
             pages_met.dedup();
             let mut signs = 0.0;
             signs += if pages_met.len() >= 2 { 0.5 } else { 0.0 };
             signs += if voted >= 0.5 { 0.5 } else { 0.0 };
-            signs -= if members.len() > 40 && voted < 0.2 { 1.0 } else { 0.0 };
+            signs -= if members.len() > 40 && set_apart < 0.2 { 1.0 } else { 0.0 };
             for &n in members {
                 score[n] = 0.5 * candidates[n].own + 0.5 * mean + signs;
             }

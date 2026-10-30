@@ -6,38 +6,35 @@
 
 use super::*;
 
-/// A line set at its paragraph's leading under a full line that ends no sentence carries that
-/// sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no enumerator. A title above
-/// it stops short of its column's edge. The page's body lines are those `body` names (slots of the
-/// page's lines).
-pub(crate) fn continues_prose_among(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bool {
+/// A line set at its paragraph's leading under the line before it (`prior`), a full line that ends
+/// no sentence, carries that sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no
+/// enumerator. A title above it stops short of its column's edge. The line before is the one the
+/// reading order puts there, so a scan's overlapping boxes never stand another line in for it: one
+/// whose box reaches over a quarter of the line's height into it is none. The page's body lines,
+/// those `body` names, give the column's measure (`prior` and `slot` are slots of the page's lines).
+pub(crate) fn continues_prose_from(page: &Page, prior: usize, slot: usize, body: impl Fn(usize) -> bool) -> bool {
+    let (prior, line) = (&page.lines[prior], &page.lines[slot]);
     let height = line.bbox[3] - line.bbox[1];
-    let body_lines = || page.lines.iter().enumerate().filter(|(slot, _)| body(*slot)).map(|(_, line)| line);
-    body_lines()
-        .filter(|prior| {
-            !prior.exclude_from_body
-                && prior.bbox[3] <= line.bbox[1] + height * 0.25
-                && prior.bbox[0] < line.bbox[2]
-                && line.bbox[0] < prior.bbox[2]
-        })
-        .max_by(|left, right| left.bbox[3].total_cmp(&right.bbox[3]))
-        .is_some_and(|prior| {
-            let text = prior.text.trim_end();
-            let (left, right) = body_lines()
-                .filter(|other| {
-                    other.bbox[0] < prior.bbox[2]
-                        && prior.bbox[0] < other.bbox[2]
-                })
-                .fold((prior.bbox[0], prior.bbox[2]), |(left, right), other| {
-                    (left.min(other.bbox[0]), right.max(other.bbox[2]))
-                });
-            height > 0.0
-                && prior.bbox[2] >= right - (right - left) * 0.1
-                && line.bbox[1] - prior.bbox[3] < height * 0.5
-                && !sentence_ended(text)
-                && !text.ends_with([':', '\u{201d}', '"'])
-                && !enumerated(text)
-        })
+    if prior.exclude_from_body
+        || prior.bbox[3] > line.bbox[1] + height * 0.25
+        || prior.bbox[0] >= line.bbox[2]
+        || line.bbox[0] >= prior.bbox[2]
+    {
+        return false;
+    }
+    let text = prior.text.trim_end();
+    let (left, right) = page
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(other_slot, other)| body(*other_slot) && other.bbox[0] < prior.bbox[2] && prior.bbox[0] < other.bbox[2])
+        .fold((prior.bbox[0], prior.bbox[2]), |(left, right), (_, other)| (left.min(other.bbox[0]), right.max(other.bbox[2])));
+    height > 0.0
+        && prior.bbox[2] >= right - (right - left) * 0.1
+        && line.bbox[1] - prior.bbox[3] < height * 0.5
+        && !sentence_ended(text)
+        && !text.ends_with([':', '\u{201d}', '"'])
+        && !enumerated(text)
 }
 
 /// A long numbered line running the full column whose sentence the next line, at its leading,

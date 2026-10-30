@@ -27,7 +27,7 @@ pub(super) fn field(text: &str) -> Option<Field> {
     let key = text.split_once(':').map_or(text, |(key, _)| key);
     let key = key.trim().trim_end_matches('.').to_ascii_lowercase();
     Some(match key.as_str() {
-        "court file no" | "court file number" | "court file numbers" | "file no" => Field::File,
+        "court file no" | "court file number" | "court file numbers" | "file no" | "case no" | "case number" => Field::File,
         "court" => Field::Court,
         "judicial centre" | "judicial center" => Field::Place,
         "matters" | "re" => Field::Matter,

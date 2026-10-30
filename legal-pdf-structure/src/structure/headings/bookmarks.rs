@@ -156,16 +156,7 @@ pub(crate) fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
 pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
     let entries = validate(outline, pages);
-    let authorities = entries
-        .iter()
-        .find(|entry| {
-            entry.page == 1
-                && tokens(&entry.title).windows(3).any(|words| {
-                    words == ["book", "of", "authorities"]
-                        || words == ["bundle", "of", "authorities"]
-                })
-        })
-        .map(|entry| entry.level);
+    let authorities = authorities_level(&entries);
     let entries = entries
         .into_iter()
         .filter_map(|entry| {
@@ -285,10 +276,23 @@ pub(crate) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
 
 /// Whether a document's own bookmarks set out every level of it, so that a heading they do not
 /// name is none: one tree walking forward through the pages (not a bilingual act's two, the
-/// second starting over at its first page).
+/// second starting over at its first page). A book of authorities' bookmarks name its tabs and the
+/// passages cited in them, none of its authorities' headings.
 pub(crate) fn complete(outline: &[PdfOutlineEntry], pages: usize) -> bool {
     let entries = validate(outline, pages);
-    entries.len() * 10 >= outline.len() * 9 && classify(&entries, pages) == Tier::Full
+    entries.len() * 10 >= outline.len() * 9 && classify(&entries, pages) == Tier::Full && authorities_level(&entries).is_none()
+}
+
+/// The level of a book or bundle of authorities' bookmark on its first page, where its bookmarks
+/// open with one.
+fn authorities_level(entries: &[Entry]) -> Option<usize> {
+    entries
+        .iter()
+        .find(|entry| {
+            entry.page == 1
+                && tokens(&entry.title).windows(3).any(|words| words == ["book", "of", "authorities"] || words == ["bundle", "of", "authorities"])
+        })
+        .map(|entry| entry.level)
 }
 
 /// The document's bookmarks and its printed contents list as one outline. A listed entry the
