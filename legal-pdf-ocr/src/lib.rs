@@ -1,4 +1,6 @@
 #[cfg(feature = "ocr")]
+mod gutter;
+#[cfg(feature = "ocr")]
 mod indra;
 #[cfg(feature = "ocr")]
 mod line_detector;
