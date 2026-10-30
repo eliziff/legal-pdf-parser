@@ -112,13 +112,17 @@ impl IndraDetector {
                 "Indra detector returned unexpected dimensions {shape:?}"
             )));
         }
-        let mut boxes = decode(
-            values,
-            shape[3] as usize,
-            shape[2] as usize,
-            scale,
+        let mut boxes = crate::gutter::split_across_gutters(
+            image.as_raw(),
             width as usize,
-            height as usize,
+            decode(
+                values,
+                shape[3] as usize,
+                shape[2] as usize,
+                scale,
+                width as usize,
+                height as usize,
+            ),
         );
         xycut(&mut boxes);
         #[cfg(feature = "attribution")]
