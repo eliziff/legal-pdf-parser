@@ -1,7 +1,7 @@
-//! A page's layout: its geometry, columns, languages, tables, reading order, note-band lines,
-//! regions and markers printed apart, each in its own module; the line geometry they share is here.
+//! A page's layout: its geometry, columns, languages, tables, reading order, note-band lines and
+//! regions, each in its own module; the line geometry they share is here.
 
-use crate::structure::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
+use crate::structure::{is_note_symbol, PageView, Slot, MAX_SYMBOL_LABEL_LEN};
 use legal_pdf_core::{line_font_size, median, union_bbox, Diagnostic, Line, Page, Region};
 use regex::Regex;
 use std::{
@@ -21,8 +21,6 @@ mod note_lines;
 pub(crate) use note_lines::*;
 mod regions;
 pub(crate) use regions::*;
-mod markers;
-pub(crate) use markers::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrderRepair {
@@ -35,8 +33,26 @@ pub(super) enum OrderRepair {
 pub(super) struct ColumnModel {
     pub(super) kind: &'static str,
     pub(super) split_x: f64,
-    left_count: usize,
-    right_count: usize,
+    pub(super) left_count: usize,
+    pub(super) right_count: usize,
+}
+
+/// A column model as its kind's name, its split and its two columns' line counts.
+impl serde::Serialize for ColumnModel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&(self.kind, self.split_x, self.left_count, self.right_count), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ColumnModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let (kind, split_x, left_count, right_count): (String, f64, usize, usize) = serde::Deserialize::deserialize(deserializer)?;
+        let kind = ["single", "two_column", "margin_column", "multi_column"]
+            .into_iter()
+            .find(|known| *known == kind)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown column model kind {kind}")))?;
+        Ok(Self { kind, split_x, left_count, right_count })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

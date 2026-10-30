@@ -1,14 +1,12 @@
-//! Parents follow heading levels, open numbering families and reading order within each
-//! constituent document. Source membership, quotation containers and locators stay unchanged.
+//! The outline the graph's units hang in: parents follow heading levels, open numbering families and
+//! reading order within each constituent document. Source membership, quotation containers and
+//! locators stay unchanged.
 
-use legal_pdf_core::model::Page;
-use legal_structure_model::{
-    NodeKind, NumberingMarker, PrimaryRole, ScalarRange, ScalarText, StructureNode,
-};
-use std::collections::HashMap;
+use super::*;
+use legal_structure_model::{NumberingMarker, PrimaryRole};
 
 /// A unit's document, quotation, and note, table cell or parallel text membership.
-pub type Context = (String, Option<String>, Option<String>);
+pub(crate) type OutlineContext = (String, Option<String>, Option<String>);
 
 #[derive(Clone, Copy)]
 enum Region {
@@ -78,22 +76,15 @@ struct Outline {
     open_letter: Option<NumberingMarker>,
 }
 
-/// Set ranked units' parents from inferred heading levels and the shared numbering grammar.
-/// Only constituent documents scope the stacks; quotation and object membership stay intact.
-/// The unused source/navigation arguments remain part of this crate's public API.
-pub fn assemble_outline(
+/// Sets ranked units' parents from the headings' levels (`level`, by a heading's line id) and the
+/// shared numbering grammar, the units read in `text`, each in its context (`contexts`). Only
+/// constituent documents scope the stacks; quotation and object membership stay intact.
+pub(crate) fn assemble_outline(
     nodes: &mut [StructureNode],
-    contexts: &[Context],
+    contexts: &[OutlineContext],
     text: &str,
-    _pages: &[Page],
-    _line_range: &dyn Fn(&str) -> Option<ScalarRange>,
-    navigation: &HashMap<String, Option<String>>,
-    heading_levels: &HashMap<String, usize>,
+    level: &dyn Fn(&str) -> Option<usize>,
 ) {
-    crate::keep(|captured| {
-        captured.navigation.extend(navigation.iter().map(|(line, parent)| (line.clone(), parent.clone())));
-        captured.heading_levels.extend(heading_levels.iter().map(|(line, level)| (line.clone(), *level)));
-    });
     let containers = nodes
         .iter()
         .map(|node| (node.id.as_str(), node.kind))
@@ -127,11 +118,7 @@ pub fn assemble_outline(
         let heading = outline.headings.last().map(|&(_, node)| node);
         let parent = match region {
             Region::Heading => {
-                let level = nodes[index]
-                    .line_ids
-                    .iter()
-                    .find_map(|id| heading_levels.get(id).copied())
-                    .unwrap_or(1);
+                let level = nodes[index].line_ids.iter().find_map(|id| level(id)).unwrap_or(1);
                 while outline
                     .headings
                     .last()

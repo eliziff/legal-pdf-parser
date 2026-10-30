@@ -1,18 +1,15 @@
 //! Each node's exact membership and role, and the context its outline lives in.
 
 use super::*;
-use crate::structure::{quotations, PdfPrimitiveEvidence};
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the
 /// constituent document holding it, and its quotation, note, table cell or parallel text.
 pub(crate) fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
-    quotes: &quotations::Reading,
     index: &PdfTextIndex,
-    primitives: &PdfPrimitiveEvidence,
-) -> Vec<legal_pdf_witnesses::OutlineContext> {
+    decided: &Decided,
+) -> Vec<OutlineContext> {
     use legal_structure_model::PrimaryRole;
-    let translation = &primitives.contexts.translation_line_ids;
     // Establish exact membership before comparing containers. An envelope may cross
     // intervening columns, notes, quotations, or constituent documents.
     for node in nodes.iter_mut() {
@@ -40,10 +37,10 @@ pub(crate) fn outline_contexts(
             if let Some(marker) = node.marker_range {
                 let ids = index.line_ids(marker);
                 if let Some(first) = ids.first() {
-                    let context = primitives.contexts.reading_context(first);
+                    let context = decided.reading_context(first);
                     source.extend(
                         ids.iter()
-                            .filter(|id| primitives.contexts.reading_context(id) == context)
+                            .filter(|id| decided.reading_context(id) == context)
                             .filter_map(|id| index.line(id))
                             .map(|line| ScalarRange {
                                 start: marker.start.max(line.range.start),
@@ -122,27 +119,16 @@ pub(crate) fn outline_contexts(
             // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
             // belonging to its quotation or note: it names only its document.
             let unit = node.kind != NodeKind::Page;
-            let quotation = if node.kind == NodeKind::Quote {
-                quotes
-                    .introductions
-                    .get(&node.id)
-                    .and_then(|id| quotes.scopes.get(id))
-                    .cloned()
-            } else {
-                node.line_ids
-                    .first()
-                    .filter(|_| unit)
-                    .and_then(|id| quotes.scopes.get(id))
-                    .filter(|id| {
-                        node.line_ids
-                            .iter()
-                            .all(|line| quotes.scopes.get(line) == Some(*id))
-                    })
-                    .cloned()
-            };
+            // A quotation's own node stands in the text that quotes it.
+            let quotation = (node.kind != NodeKind::Quote)
+                .then(|| {
+                    let id = decided.quotation(node.line_ids.first().filter(|_| unit)?)?;
+                    node.line_ids.iter().all(|line| decided.quotation(line) == Some(id)).then(|| id.to_owned())
+                })
+                .flatten();
             let translated = unit
                 && !node.line_ids.is_empty()
-                && node.line_ids.iter().all(|id| translation.contains(id));
+                && node.line_ids.iter().all(|id| decided.translated(id));
             let container = smallest(&cells)
                 .filter(|_| unit)
                 .map(|id| format!("object:{id}"))

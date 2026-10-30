@@ -120,7 +120,7 @@ pub(crate) fn native_graph_parts(
     index: &PdfTextIndex,
     pages: &[Page],
     paragraphs: &[Paragraph],
-    primitives: &PdfPrimitiveEvidence,
+    decided: &Decided,
 ) -> Result<Vec<StructureNode>> {
     // A passage wholly in a contents list, or wholly a parallel translation, says so: a
     // reader of the text's own structure skips it. A transcript's line numbers are no part of
@@ -131,19 +131,13 @@ pub(crate) fn native_graph_parts(
         let all =
             |test: &dyn Fn(&String) -> bool| !line_ids.is_empty() && line_ids.iter().all(test);
         let numbered = |id: &String| labelled.contains(id.as_str());
-        let listed = |id: &String| {
-            primitives.claims.contents_line_ids.contains(id)
-                || index
-                    .line(id)
-                    .is_some_and(|line| primitives.claims.contents_pages.contains(&line.page_index))
-        };
         // Nearly all of it listed: a stray line the paragraph reader took in (a folio it did not
         // know for one) does not undo a list.
         let counted = line_ids.iter().filter(|id| !numbered(id)).count();
-        let in_list = line_ids.iter().filter(|id| listed(id)).count();
+        let in_list = line_ids.iter().filter(|id| decided.listed(id)).count();
         if counted > 0 && in_list * 5 >= counted * 4 {
             Some("contents")
-        } else if all(&|id| primitives.contexts.translation_line_ids.contains(id)) {
+        } else if all(&|id| decided.translated(id)) {
             Some("translation")
         } else {
             None
@@ -270,7 +264,7 @@ pub(crate) fn native_graph_parts(
     }
     // A table, its rows and their cells, addressed as a word processor's are. A blank
     // cell is an empty range where its text would stand.
-    for (slot, table) in primitives.claims.tables.iter().enumerate() {
+    for (slot, table) in decided.tables().iter().enumerate() {
         let table_id = format!("table:{}", slot + 1);
         let line_ids: Vec<String> = table.line_ids().into_iter().cloned().collect();
         let range = index
@@ -394,19 +388,8 @@ pub(crate) fn native_graph_parts(
     }
     let mut quoted = BTreeMap::<&str, Vec<String>>::new();
     for line in &index.lines {
-        let mut scope = primitives
-            .quotations
-            .scopes
-            .get(&line.line_id)
-            .map(String::as_str);
-        while let Some(id) = scope {
+        if let Some(id) = decided.quotation(&line.line_id) {
             quoted.entry(id).or_default().push(line.line_id.clone());
-            scope = primitives
-                .quotations
-                .introductions
-                .get(id)
-                .and_then(|intro| primitives.quotations.scopes.get(intro))
-                .map(String::as_str);
         }
     }
     for (id, line_ids) in quoted {

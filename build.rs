@@ -178,8 +178,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     document.extend(inspector_inputs(root, &[]));
     document.extend(crate_inputs(root, "structure"));
     document.extend(crate_inputs(root, "tables"));
-    document.extend(crate_inputs(root, "witnesses"));
-    document.push(root.join("legal-pdf-witnesses/data"));
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",
@@ -220,16 +218,12 @@ fn main() {
         (enabled("OCR"), "ocr"),
         (pdf, "structure"),
         (pdf, "tables"),
-        (pdf, "witnesses"),
         (pdf, "support"),
     ] {
         if !active {
             continue;
         }
         inputs.extend(crate_inputs(&root, name));
-    }
-    if pdf {
-        inputs.push(root.join("legal-pdf-witnesses/data"));
     }
     let mut features: Vec<_> = env::vars_os()
         .filter_map(|(name, _)| {
@@ -274,7 +268,6 @@ fn main() {
         let raster = if enabled("OCR") { raster_sources(&root) } else { Vec::new() };
         println!("cargo:rustc-env=LEGAL_PDF_RASTER_SHA256={}", fingerprint(&root, &raster, &[]));
         // Reader implementation inputs; derive_extracted also keys their shared engine service.
-        // Witness compositions remain outside this cache.
         let mut reader = vec![
             root.join("legal-pdf-core/src/model.rs"),
             root.join("legal-pdf-core/src/lib.rs"),

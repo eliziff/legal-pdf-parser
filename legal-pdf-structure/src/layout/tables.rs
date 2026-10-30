@@ -20,22 +20,26 @@ impl TableEvidence {
     }
 }
 
-pub(crate) fn has_table_caption(lines: &[Line]) -> bool {
+pub(crate) fn has_table_caption<'a>(lines: impl IntoIterator<Item = &'a Line>) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let regex =
         RE.get_or_init(|| Regex::new(r"(?i)^(?:table|tableau)\s+(?:\d+|[ivxlcdm]+)\b").unwrap());
-    lines.iter().any(|line| regex.is_match(line.text.trim()))
+    lines.into_iter().any(|line| regex.is_match(line.text.trim()))
 }
 
 /// The layout readings this crate lends the table detector.
 pub(crate) struct TableReadings;
 
 impl legal_pdf_tables::TableLayout for TableReadings {
-    /// A page's white space reads as a table only where its lines stand in a plain grid of rows,
-    /// columns and figures: justified prose and a note's label beside its text are gaps between
-    /// words, not columns.
-    fn white_space(&self, page: &Page) -> bool {
-        table_evidence(&page.lines).strong()
+    /// A page's white space reads as a table only where the lines its items offer (no furniture,
+    /// folio or line number) stand in a plain grid of rows, columns and figures: justified prose
+    /// and a note's label beside its text are gaps between words, not columns.
+    fn white_space(&self, page: &Page, items: &legal_pdf_tables::PageItems) -> bool {
+        let mut offered = vec![false; page.lines.len()];
+        for &(line, _) in &items.origin {
+            offered[line] = true;
+        }
+        table_evidence(&page.lines, |line| offered[line]).strong()
     }
 
     fn column_language(&self, lines: &[&Line], minimum: usize) -> Option<bool> {
@@ -43,7 +47,8 @@ impl legal_pdf_tables::TableLayout for TableReadings {
     }
 }
 
-pub(crate) fn table_evidence(lines: &[Line]) -> TableEvidence {
+/// The grid the lines `kept` holds (slots of `lines`) stand in.
+pub(crate) fn table_evidence(lines: &[Line], kept: impl Fn(usize) -> bool) -> TableEvidence {
     let height = median(lines
         .iter()
         .filter(|line| has_valid_bbox(line))
@@ -55,15 +60,11 @@ pub(crate) fn table_evidence(lines: &[Line]) -> TableEvidence {
     }
     let caption = lines
         .iter()
-        .filter(|line| has_table_caption(std::slice::from_ref(line)))
+        .filter(|line| has_table_caption([*line]))
         .min_by(|left, right| left.bbox[1].total_cmp(&right.bbox[1]));
     let caption_bottom = caption.map(|line| line.bbox[3]);
     let mut rows: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
-        has_valid_bbox(line)
-            && !line.exclude_from_body
-            && !matches!(line.region_type.as_str(), "header" | "footer")
-    }) {
+    for (index, line) in lines.iter().enumerate().filter(|(index, line)| has_valid_bbox(line) && kept(*index)) {
         rows.entry((line_center_y(line) / (height * 0.75)).round() as i64)
             .or_default()
             .push(index);

@@ -72,7 +72,7 @@ pub(super) fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize
 pub(super) fn attach_propositions(
     footnotes: &mut [Footnote],
     paragraphs: &[Paragraph],
-    primitives: &PdfPrimitiveEvidence,
+    decided: &Decided,
 ) {
     let by_pair: HashMap<String, usize> = footnotes
         .iter()
@@ -84,7 +84,7 @@ pub(super) fn attach_propositions(
         let context = paragraph
             .line_ids
             .first()
-            .map_or((0, false), |id| primitives.contexts.document_context(id));
+            .map_or((0, false), |id| decided.document_context(id));
         let previous_tail = tails.entry(context).or_default();
         let chars: Vec<char> = paragraph.text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
@@ -120,12 +120,12 @@ pub(super) fn unmatched_reference_diagnostics(
     pages: &[Page],
     footnotes: &[Footnote],
     anchors: &HashMap<String, Vec<Anchor>>,
-    primitives: &PdfPrimitiveEvidence,
+    decided: &Decided,
 ) -> Vec<Diagnostic> {
     let labels: HashSet<_> = footnotes
         .iter()
         .map(|note| {
-            let context = primitives.contexts.note_context(note);
+            let context = decided.note_context(note);
             (context, note.label.as_str())
         })
         .collect();
@@ -167,7 +167,7 @@ pub(super) fn unmatched_reference_diagnostics(
         if line.spans.iter().any(|span| {
             span.superscript
                 && labels.contains(&(
-                    primitives.contexts.document_context(&line.id),
+                    decided.document_context(&line.id),
                     normalize_label(span.text.trim()).as_str(),
                 ))
         }) {
@@ -186,7 +186,7 @@ pub(super) fn unmatched_reference_diagnostics(
 pub(super) fn attach_crossrefs(
     footnotes: &mut [Footnote],
     diagnostics: &mut Vec<Diagnostic>,
-    primitives: &PdfPrimitiveEvidence,
+    decided: &Decided,
 ) {
     static RE: OnceLock<Regex> = OnceLock::new();
     let pattern = RE.get_or_init(|| {
@@ -199,13 +199,13 @@ pub(super) fn attach_crossrefs(
     for footnote in footnotes.iter() {
         if let Ok(number) = footnote.label.parse::<u32>() {
             by_number
-                .entry((primitives.contexts.note_context(footnote), number))
+                .entry((decided.note_context(footnote), number))
                 .or_default()
                 .push((footnote.restart_sequence, footnote.pair_id.clone()));
         }
     }
     for footnote in footnotes {
-        let context = primitives.contexts.note_context(footnote);
+        let context = decided.note_context(footnote);
         let (mut prior_byte, mut prior_scalar) = (0, 0);
         for capture in pattern.captures_iter(&footnote.body) {
             let Some(found) = capture.get(0) else {
