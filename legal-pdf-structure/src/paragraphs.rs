@@ -11,8 +11,9 @@
 //! leading alone, as the Text-Fidelity Project's galley reads it (`paragraph_geometry.py`,
 //! `text_flow_continuity.py`, `text_flow.py`), with the line height and paragraph gap measured
 //! once for the document: a blank of twice the gap, or most of a line, opens a block; a sentence
-//! end and an indent open a paragraph; a line going on with a sentence or a hyphened word opens
-//! nothing.
+//! end before an indent, on a short line or before a blank wider than the gap opens a paragraph,
+//! as a short line before a wider blank does; a line going on with a sentence or a hyphened word
+//! opens nothing.
 
 use legal_pdf_core::{flag_share, line_font_size, upper_median as median, quantile, Line, Page, BOLD, ITALIC};
 use regex::Regex;
@@ -177,6 +178,8 @@ pub(crate) struct Measure {
     /// column, not its full-width title; a brief's text measure, not the short lines of its page
     /// of counsel.
     width: f64,
+    /// The median height of a scanned line.
+    line: f64,
     /// The median blank between two scanned lines stacked in one column, counted up to 1.25 line
     /// heights: a paragraph's own leading, not the space between paragraphs.
     gap: f64,
@@ -228,7 +231,7 @@ pub(crate) fn document_measure(pages: &[Page], counted: impl Fn(&Line) -> bool) 
             })
             .collect(),
     );
-    Measure { width, gap, pitch }
+    Measure { width, line: line_height, gap, pitch }
 }
 
 impl Pitch {
@@ -460,20 +463,35 @@ fn starts_paragraph(
     }
     if pitch.scan {
         // A scan's paragraph opens where a sentence ended and the next line is set in from the
-        // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure, or
-        // where a line well short of the measure ends a sentence and the next opens one (on the
-        // structure gold's scans, 86% of such pairs open a paragraph; recognition loses some
-        // lines' ends, so a short line ending no sentence opens one only across a blank).
+        // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure; where
+        // a sentence ended on a line well short of the measure, or before a blank 0.15 of a line
+        // wider than the document's leading; or where a line well short of the measure, ending no
+        // sentence (recognition loses some lines' ends), stands before a blank 0.4 of a line wider
+        // than the leading, or before a full line opening a sentence across a third of a line.
+        // The line after a short one may be short too: a one-line paragraph, an item, a salutation.
+        // On the structure gold's scans, requiring a full line after the short one and a sentence
+        // opening on it missed a quarter of the paragraph openings between body lines (recall 0.76
+        // on kept text layers, 0.67 on our recognition); these rules find 2,498 and 1,356 more of
+        // them, at 1,152 and 506 false openings.
         let mut lefts = block.iter().map(|line| line.bbox[0]).collect::<Vec<_>>();
         lefts.sort_by(f64::total_cmp);
         let flush = lefts[lefts.len() / 4];
         let ended = terminal || noted_terminal_re().is_match(a.text.trim());
         let opens = b.text.trim_start().chars().next().is_some_and(|c| c.is_uppercase() || c.is_ascii_digit());
-        let short = pitch.measure.width > 0.0 && width(a) < 0.75 * pitch.measure.width && width(b) >= 0.6 * pitch.measure.width;
+        let short = pitch.measure.width > 0.0 && width(a) < 0.75 * pitch.measure.width;
+        let line = if pitch.measure.line > 0.0 { pitch.measure.line } else { height(a).max(height(b)) };
+        let blank = b.bbox[1] - a.bbox[3];
+        let wider = blank - pitch.measure.gap;
         if ended && b.bbox[0] >= flush + (0.018 * pitch.measure.width).max(3.0) {
             return Some("sentence-indent");
         }
-        if short && opens && (ended || b.bbox[1] - a.bbox[3] > 0.3 * height(a).max(height(b))) {
+        if ended && (short || wider >= 0.15 * line) {
+            return Some("sentence-end");
+        }
+        let broken = a.text.trim_end().ends_with('-');
+        let wide_next = width(b) >= 0.6 * pitch.measure.width;
+        if short && !broken && (wider >= 0.4 * line || opens && wide_next && blank > 0.3 * height(a).max(height(b)))
+        {
             return Some("short-line");
         }
         return None;
