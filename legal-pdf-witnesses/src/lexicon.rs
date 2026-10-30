@@ -1,6 +1,7 @@
 //! The court-forms lexicon (tools/build_witness_lexicon.py): forms' titles, courts' names and the
 //! lines printed across many forms. `LEGALPDF_WITNESS_LEXICON` names another file.
 
+use aho_corasick::AhoCorasick;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -20,8 +21,9 @@ struct Words {
 pub struct Lexicon {
     pub text: String,
     titles: HashSet<String>,
-    /// Each court's name between spaces, as a line's words are read for it.
-    courts: Vec<String>,
+    /// Each court's name between spaces, as a line's words are read for it: one automaton finding
+    /// any of them in a line.
+    courts: AhoCorasick,
     boilerplate: HashSet<String>,
 }
 
@@ -48,7 +50,7 @@ impl Lexicon {
         let spaced = format!(" {key} ");
         Reading {
             form_title: !key.is_empty() && self.titles.contains(&key),
-            court: self.courts.iter().any(|court| spaced.contains(court.as_str())),
+            court: self.courts.is_match(&spaced),
             boilerplate: self.boilerplate.contains(&key),
         }
     }
@@ -64,7 +66,7 @@ pub fn lexicon() -> &'static Lexicon {
         let words: Words = serde_json::from_str(&text).unwrap_or_default();
         Lexicon {
             titles: words.form_titles.into_iter().collect(),
-            courts: words.courts.iter().map(|court| format!(" {court} ")).collect(),
+            courts: AhoCorasick::new(words.courts.iter().map(|court| format!(" {court} "))).expect("courts' names"),
             boilerplate: words.form_boilerplate.into_iter().collect(),
             text,
         }

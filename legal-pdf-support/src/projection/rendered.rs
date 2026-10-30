@@ -27,8 +27,53 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
     for (index, node) in structure.nodes.iter().enumerate() {
         node_at.entry(node.id.as_str()).or_insert(index);
     }
+    // What each candidate seam is checked against, indexed once: the fragments by where they start
+    // and by page, and the joins by the fragment they join from.
+    let mut fragment_starts: Vec<ScalarRange> = structure.source_fragments.iter().map(|fragment| fragment.range).collect();
+    fragment_starts.sort_by_key(|range| range.start);
+    let mut page_fragments = HashMap::<usize, Vec<ScalarRange>>::new();
+    for fragment in &structure.source_fragments {
+        page_fragments.entry(fragment.page_index).or_default().push(fragment.range);
+    }
+    let mut joins_from = HashMap::<usize, Vec<(usize, bool)>>::new();
+    for join in &structure.joins {
+        joins_from.entry(join.from).or_default().push((join.to, join.separator.is_empty()));
+    }
+    // The ranges of the nodes that own text (a role, or a leaf kind), each with its node (the first
+    // node of its id) by where it starts; beside each, the furthest end of those up to it, and the
+    // furthest of another node's: another node overlaps a part where one starting before the
+    // part's end ends after its start.
+    let mut owned: Vec<(usize, usize, usize)> = structure.nodes.iter()
+        .filter(|other| other.role.is_some() || matches!(other.kind,
+            NodeKind::Prose | NodeKind::Paragraph | NodeKind::Section | NodeKind::ListItem
+            | NodeKind::Heading | NodeKind::Footnote | NodeKind::Endnote))
+        .flat_map(|other| {
+            let owner = node_at[other.id.as_str()];
+            (if other.ranges.is_empty() { std::slice::from_ref(&other.range) } else { &other.ranges })
+                .iter().map(move |range| (range.start, range.end, owner))
+        })
+        .collect();
+    owned.sort_by_key(|&(start, _, _)| start);
+    let mut furthest: Vec<(usize, usize, Option<usize>)> = Vec::with_capacity(owned.len());
+    for &(_, end, owner) in &owned {
+        furthest.push(match furthest.last().copied() {
+            None => (end, owner, None),
+            Some((first, first_owner, other)) if owner == first_owner => (first.max(end), owner, other),
+            Some((first, _, _)) if end > first => (end, owner, Some(first)),
+            Some((first, first_owner, other)) => (first, first_owner, Some(other.map_or(end, |other| other.max(end)))),
+        });
+    }
+    let overlapped_by_another = |node: usize, part: ScalarRange| {
+        let before = owned.partition_point(|&(start, _, _)| start < part.end);
+        before > 0 && {
+            let (first, first_owner, other) = furthest[before - 1];
+            (if first_owner != node { Some(first) } else { other }).is_some_and(|end| part.start < end)
+        }
+    };
+    let mut joined_here = HashSet::new();
     for paragraph in paragraphs {
-        let Some(node) = node_at.get(paragraph.id.as_str()).map(|&index| &structure.nodes[index]) else { continue; };
+        let Some(&index) = node_at.get(paragraph.id.as_str()) else { continue; };
+        let node = &structure.nodes[index];
         let own = if matches!(node.kind, NodeKind::Heading)
             || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
             node.heading_range.as_ref().map(std::slice::from_ref)
@@ -74,26 +119,21 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
                 }
                 {
                     // No competing leaf ownership or intervening member may change these seed starts.
-                    if a.range.start >= b.range.start || structure.source_fragments.iter().any(|fragment|
-                        a.range.start < fragment.range.start && fragment.range.start < b.range.start
-                        && own.iter().any(|range| range.start < fragment.range.end && fragment.range.start < range.end))
-                        || structure.nodes.iter().any(|other| other.id != node.id
-                            && (other.role.is_some() || matches!(other.kind,
-                                NodeKind::Prose | NodeKind::Paragraph | NodeKind::Section | NodeKind::ListItem
-                                | NodeKind::Heading | NodeKind::Footnote | NodeKind::Endnote))
-                            && (if other.ranges.is_empty() { std::slice::from_ref(&other.range) } else { &other.ranges })
-                                .iter().any(|range| [a.range, b.range].iter().any(|part|
-                                    range.start < part.end && part.start < range.end))) {
+                    if a.range.start >= b.range.start || fragment_starts[
+                            fragment_starts.partition_point(|fragment| fragment.start <= a.range.start)
+                                ..fragment_starts.partition_point(|fragment| fragment.start < b.range.start)]
+                            .iter().any(|fragment| own.iter().any(|range| range.start < fragment.end && fragment.start < range.end))
+                        || [a.range, b.range].into_iter().any(|part| overlapped_by_another(index, part)) {
                         return None;
                     }
-                    if structure.joins.iter().any(|join| join.from == a.range.start
-                        && (join.to != b.range.start || !join.separator.is_empty())) { return None; }
+                    if joins_from.get(&a.range.start).is_some_and(|joins| joins.iter()
+                        .any(|&(to, bare)| to != b.range.start || !bare)) { return None; }
                 }
                 let continuation = if a.page_index != b.page_index {
-                    let first = |page| structure.source_fragments.iter().filter(|fragment| fragment.page_index == page)
+                    let first = |page| page_fragments.get(&page).into_iter().flatten()
                         .flat_map(|fragment| own.iter().filter_map(move |range| {
-                            let start = range.start.max(fragment.range.start);
-                            (start < range.end.min(fragment.range.end)).then_some(start)
+                            let start = range.start.max(fragment.start);
+                            (start < range.end.min(fragment.end)).then_some(start)
                         })).min();
                     Some(legal_structure_model::SourceContinuation {
                         kind: if node.kind == NodeKind::Heading || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
@@ -116,8 +156,7 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
                     ranges: vec![range], node_ids: vec![node.id.clone()],
                 });
             }
-            if !structure.joins.iter().any(|join| join.from == a.range.start)
-                && !joins.iter().any(|(join, _): &(legal_structure_model::SourceJoin, _)| join.from == a.range.start) {
+            if !joins_from.contains_key(&a.range.start) && joined_here.insert(a.range.start) {
                 joins.push((legal_structure_model::SourceJoin { from: a.range.start,
                     to: b.range.start, separator: String::new() }, continuation));
             }
@@ -341,6 +380,11 @@ pub(crate) fn attach_rendered_text(
             note_lines.insert(line.as_str());
         }
     }
+    // Each join's separator by the fragments it joins: for a pair named twice, the first join.
+    let mut separators = HashMap::new();
+    for join in &structure.joins {
+        separators.entry((join.from, join.to)).or_insert(join.separator.as_str());
+    }
     let mut position = 0;
     let mut previous_source_start = None;
     for page in pages {
@@ -367,9 +411,8 @@ pub(crate) fn attach_rendered_text(
                 if line.text.is_empty() || trimmed.is_empty() { continue; }
                 let owner = owners.get(line.id.as_str()).copied().unwrap_or(line.id.as_str());
                 if !text.is_empty() {
-                    let separator = structure.joins.iter().find(|join|
-                        Some(join.from) == previous_source_start && join.to == fragment.range.start)
-                        .map(|join| join.separator.as_str())
+                    let separator = previous_source_start
+                        .and_then(|from| separators.get(&(from, fragment.range.start)).copied())
                         .unwrap_or(if previous_owner == Some(owner) { " " } else { "\n\n" });
                     append(&mut text, &mut position, separator);
                 }

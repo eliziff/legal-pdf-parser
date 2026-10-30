@@ -1128,6 +1128,7 @@ dependencies = [
 name = "legal-pdf-witnesses"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "legal-pdf-core",
  "legal-structure-model",
  "regex",
