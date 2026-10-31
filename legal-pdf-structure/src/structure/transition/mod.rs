@@ -115,6 +115,10 @@ fn oracle(gold: &[i64; 8], state: &State, line: &LineView, candidates: &[Move]) 
             let fit = if stream.note.is_some_and(|last| value == last + 1) { 0 } else if stream.unanswered.iter().any(|&(r, _)| r == value) { 1 } else { 2 };
             return (fit, step);
         }
+        // A note counts on its number where it has one.
+        if m.opens && m.region == NOTE {
+            return (3, step);
+        }
         let fit = match (m.reading.and_then(|r| line.readings.get(usize::from(r))), marked) {
             (Some(reading), true) => match stream.stack.iter().rposition(|f| f.family == reading.family) {
                 Some(depth) if reading.value == stream.stack[depth].value + 1 => 0,
