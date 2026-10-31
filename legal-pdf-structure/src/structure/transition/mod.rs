@@ -3,17 +3,20 @@
 //! a line meets in one decision, scored on the line's evidence and the state together. Nothing is
 //! claimed first and given back later.
 //!
-//! Its scores come from tables fitted on the gold (`trees::Forest`): the local scores rank the line's
-//! region-and-opening classes on its evidence alone (`lines::LineTable`); the ranker scores each
-//! candidate move on its local score and its fit to the state. A line's candidates are the classes the
-//! local scores hold likely and those the state proposes (`State::proposed`). Tier 1 and tier 2 give the
-//! same moves other scores; the parser stays the same.
+//! Its scores come from tables fitted on the gold (`trees::Forest`), in two parts: the local scores, each
+//! region-and-opening class's log-probability on the line's evidence alone (`lines::LineTable`), read once
+//! per line; and the ranker's correction, how the move fits the state, fitted from the local score as its
+//! base. A move's score is the two summed. Every move competes but one the local scores hold all but
+//! impossible and the state does not propose (`State::proposed`): no learned cut decides what may be
+//! weighed. Tier 1 and tier 2 give the same moves other local scores; the parser stays the same.
 //!
 //! It runs beside the stage parser while it is fitted and measured; its environment:
 //! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`), or
-//!   LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of two (fold0.txt, fold1.txt) a document's half reads
-//!   in turn (out of fold), or both together where LEGALPDF_TRANSITION_FOLDS_AVERAGE is set;
-//! - LEGALPDF_TRANSITION_RANKER, a ranker forest (one score per candidate's `RANKED` features);
+//!   LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of k (fold0.txt ...), each fitted on every document but
+//!   those of its fold, which read it (out of fold), or all averaged where LEGALPDF_TRANSITION_FOLDS_AVERAGE
+//!   is set;
+//! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
+//!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold),
 //!   for the oracle;
@@ -36,10 +39,9 @@ mod emit;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// A line's candidates take the local scores' classes, best first, until they hold this much of its
-/// probability, at most `KEEP`.
-const MASS: f64 = 0.995;
-const KEEP: usize = 6;
+/// A class the local scores hold below this probability competes only where the state proposes it: a
+/// guard on the parse's cost, not a judgement.
+const FLOOR: f64 = 1e-4;
 /// The region-and-opening classes.
 const CLASSES: usize = 34;
 /// The origin the transition parser's nodes name.
@@ -50,10 +52,10 @@ pub(crate) const RANKED: usize = 2 + CANDIDATES + 40;
 
 enum LocalScores {
     One(Forest),
-    /// Out of fold: a document's half read by the forest fitted on the other half.
-    Folds(Forest, Forest),
-    /// Both halves' forests, their probabilities averaged.
-    Average(Forest, Forest),
+    /// Out of fold: a document read by the forest fitted on every fold but its own (`fold_of`).
+    Folds(Vec<Forest>),
+    /// Every fold's forest, their probabilities averaged.
+    Average(Vec<Forest>),
 }
 
 struct Settings {
@@ -74,9 +76,10 @@ fn settings() -> &'static Settings {
         let local = match (var("LEGALPDF_TRANSITION_LOCAL"), var("LEGALPDF_TRANSITION_LOCAL_FOLDS")) {
             (Some(path), _) => forest(path, ALL, CLASSES).map(LocalScores::One),
             (None, Some(folder)) => {
-                let pair = forest(folder.join("fold0.txt"), ALL, CLASSES).zip(forest(folder.join("fold1.txt"), ALL, CLASSES));
+                let folds: Vec<Forest> = (0..).map(|k| folder.join(format!("fold{k}.txt"))).take_while(|path| path.exists())
+                    .filter_map(|path| forest(path, ALL, CLASSES)).collect();
                 let average = std::env::var_os("LEGALPDF_TRANSITION_FOLDS_AVERAGE").is_some();
-                pair.map(|(a, b)| if average { LocalScores::Average(a, b) } else { LocalScores::Folds(a, b) })
+                (!folds.is_empty()).then(|| if average { LocalScores::Average(folds) } else { LocalScores::Folds(folds) })
             }
             (None, None) => None,
         };
@@ -193,18 +196,10 @@ fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, c
     f
 }
 
-/// The classes a line's candidates come from: the local scores' best until they hold `MASS` of its
-/// probability (at most `KEEP`), and those the state proposes.
+/// The classes a line's candidates come from: every class the local scores hold at `FLOOR` or above,
+/// and those the state proposes.
 fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
-    let mut classes = Vec::new();
-    let mut held = 0.0;
-    for &c in &local.ranked {
-        if held >= MASS || classes.len() == KEEP {
-            break;
-        }
-        classes.push(c);
-        held += local.probabilities[c];
-    }
+    let mut classes: Vec<usize> = local.ranked.iter().copied().filter(|&c| local.probabilities[c] >= FLOOR).collect();
     for c in state.proposed(line) {
         if !classes.contains(&c) {
             classes.push(c);
@@ -252,8 +247,16 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let probabilities = |row: &[f32]| -> Vec<f64> {
         match &s.local {
             Some(LocalScores::One(forest)) => forest.probabilities(row),
-            Some(LocalScores::Folds(fold0, fold1)) => if half(sha256) == 0 { fold1 } else { fold0 }.probabilities(row),
-            Some(LocalScores::Average(a, b)) => a.probabilities(row).iter().zip(b.probabilities(row)).map(|(x, y)| (x + y) / 2.0).collect(),
+            Some(LocalScores::Folds(folds)) => folds[fold_of(sha256, folds.len())].probabilities(row),
+            Some(LocalScores::Average(folds)) => {
+                let mut sum = vec![0.0; CLASSES];
+                for forest in folds {
+                    for (s, p) in sum.iter_mut().zip(forest.probabilities(row)) {
+                        *s += p / folds.len() as f64;
+                    }
+                }
+                sum
+            }
             None => vec![1.0 / CLASSES as f64; CLASSES],
         }
     };
@@ -276,7 +279,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                 let best_oracle = gold.and_then(|_| oracle(&gold_rows, k, &state, line, &candidates));
                 let choice = match &s.ranker {
                     Some(ranker) => {
-                        let scores: Vec<f64> = features.iter().map(|f| ranker.scores(f)[0]).collect();
+                        let scores: Vec<f64> = features.iter().map(|f| move_score(ranker, f)).collect();
                         (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
                     }
                     // No ranker: the oracle where the gold is read and reachable (the first round's
@@ -348,7 +351,7 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
         let mut extended: Vec<(usize, Move, f64)> = Vec::new();
         for (r, (state, score, _)) in readings.iter().enumerate() {
             let candidates = state.candidates(line, &classes_of(state, line, local));
-            let scores: Vec<f64> = candidates.iter().map(|m| ranker.scores(&ranked_features(state, line, table.row(k), local, m))[0]).collect();
+            let scores: Vec<f64> = candidates.iter().map(|m| move_score(ranker, &ranked_features(state, line, table.row(k), local, m))).collect();
             let top = scores.iter().copied().fold(f64::MIN, f64::max);
             let total: f64 = scores.iter().map(|x| (x - top).exp()).sum();
             for (m, x) in candidates.into_iter().zip(scores) {
@@ -403,8 +406,14 @@ fn labelled(table: &LineTable, fences: &Fences, views: &[LineView], moves: &[Mov
     labels
 }
 
-/// Which half of the documents a source falls in: the CRC-32 of its sha256 (zlib's), modulo two.
-fn half(sha256: &str) -> u32 {
+/// A candidate's score: its class's local log-probability, and the ranker's correction for its fit to the
+/// state (fitted from the local score as its base).
+fn move_score(ranker: &Forest, features: &[f32; RANKED]) -> f64 {
+    f64::from(features[0]) + ranker.scores(features)[0]
+}
+
+/// Which of `folds` folds a source falls in: the CRC-32 of its sha256 (zlib's), modulo `folds`.
+fn fold_of(sha256: &str, folds: usize) -> usize {
     let mut crc = 0xffff_ffffu32;
     for byte in sha256.bytes() {
         crc ^= u32::from(byte);
@@ -412,5 +421,5 @@ fn half(sha256: &str) -> u32 {
             crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
         }
     }
-    !crc % 2
+    (!crc as usize) % folds.max(1)
 }
