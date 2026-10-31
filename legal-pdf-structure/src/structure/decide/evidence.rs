@@ -634,7 +634,7 @@ pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
     let mut cursor = 0;
     for span in &line.spans {
         let text: Vec<char> = span.text.trim().chars().collect();
-        if text.is_empty() {
+        if text.is_empty() || text.len() > chars.len() {
             continue;
         }
         let Some(at) = (cursor..=chars.len().saturating_sub(text.len())).find(|&at| chars[at..at + text.len()] == text[..]) else { continue };
