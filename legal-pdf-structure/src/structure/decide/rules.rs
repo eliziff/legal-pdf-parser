@@ -524,11 +524,12 @@ impl Decision {
             if fences.contexts[ctx].quotation != 0 {
                 continue;
             }
-            // The context's openers in reading order: place, depth, slot.
+            // The context's openers in reading order: place, depth, slot. A consolidation's ladder
+            // skips its repealed sections and inserts others ("19.02"), so it need not count on by one.
             let mut openers: Vec<(u32, u16, Slot)> = runs
                 .runs
                 .iter()
-                .filter(|run| usize::from(run.ctx) == ctx && run.grammar == CandidateGrammar::Hierarchy && run.rooted && run.consecutive)
+                .filter(|run| usize::from(run.ctx) == ctx && run.grammar == CandidateGrammar::Hierarchy && run.rooted)
                 .flat_map(|run| &run.members)
                 .filter(|member| member.counted && member.carries_prose && member.kind.is_some() && self.rule[member.slot.index()] == Rule::Opener)
                 .map(|member| (sequences.at[member.slot.index()], if member.parent.is_none() { 0 } else { member.level.max(1) }, member.slot))
