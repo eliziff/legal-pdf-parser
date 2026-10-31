@@ -28,3 +28,5 @@ mod levels;
 pub(crate) use levels::*;
 mod write;
 pub(crate) use write::*;
+mod trace;
+pub(crate) use trace::*;

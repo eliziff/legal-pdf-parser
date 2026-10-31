@@ -67,7 +67,8 @@ impl<'a> Geometry<'a> {
 /// that may open its unit (`readings`) and the unit it opens, whether it goes on with the line above
 /// it in one heading, caption or unit, the level a rule gives it (0 for none) and its heading level
 /// once read (0 for none), the anchor naming it (an index among the anchors, plus one; 0 for none);
-/// and the disagreements of strong rules.
+/// the disagreements of strong rules; and, where the decision is traced, each residual candidate as
+/// the residual weighed it.
 #[derive(Debug, Default)]
 pub(crate) struct Decision {
     pub(crate) role: Vec<Role>,
@@ -80,6 +81,7 @@ pub(crate) struct Decision {
     pub(crate) anchor: Vec<u32>,
     pub(crate) anchors: Vec<OutlineAnchor>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) residual: Vec<ResidualRecord>,
     conflicts: Vec<(Rule, Rule, Slot)>,
 }
 

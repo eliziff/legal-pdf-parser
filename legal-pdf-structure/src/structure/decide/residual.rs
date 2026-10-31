@@ -185,6 +185,22 @@ pub(crate) fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: S
         || slots.line(pages, lower).bbox[1] - slots.line(pages, upper).bbox[3] > 0.8 * geometry.page(slots.page(lower)).0.height
 }
 
+/// The residual's weights. A candidate's own evidence as log-odds: `OWN_BASE`, and each of its
+/// indicators' weight where it holds, in order: its source tags it a heading; its type is set apart;
+/// it is set in the body's own type, in no capitals and with no division's word (a number in the
+/// body's type numbers the body); it opens with a division's word; it opens with another enumerator,
+/// not in the body's type; prose or a unit follows it; fields follow it; a blank of 0.8 of a line or
+/// more stands above it; it ends on a colon; it runs over twelve words; it wraps over more lines than
+/// its marker with no enumerator.
+pub(crate) const OWN_BASE: f64 = -1.5;
+pub(crate) const OWN: [f64; 11] = [2.5, 1.0, -1.5, 1.5, 0.75, 1.0, -0.75, 0.5, -1.0, -1.0, -0.5];
+/// A look's signs, each weighed where it holds, in order: its candidates stand on two pages or more;
+/// half or more are tagged headings by their source; it has over forty, under a fifth set apart.
+pub(crate) const LOOK: [f64; 3] = [0.5, 0.5, -1.0];
+/// A candidate's own evidence's share of its score where its look holds others, the look's mean
+/// taking the rest.
+pub(crate) const OWN_SHARE: f64 = 0.5;
+
 /// A candidate: its lines (places in its context's lines), its look, its own evidence as log-odds,
 /// whether a word or its place bars it, whether its source tags it a heading, whether its type is
 /// set apart from the body's, and its page.
@@ -229,7 +245,8 @@ pub(crate) fn weigh(
     for slot in (0..slots.len()).filter(|&slot| evidence.words[slot] & WORD_SPEAKER != 0) {
         spoken[slots.page(Slot(slot as u32))] = true;
     }
-    for sequence in &sequences.lines {
+    let traced = trace_folder().is_some();
+    for (context, sequence) in sequences.lines.iter().enumerate() {
         let role = &decision.role;
         let eligible = |slot: Slot| {
             let at = slot.index();
@@ -322,32 +339,64 @@ pub(crate) fn weigh(
             // A marker's text that goes on into the next line, or ends a sentence, is a paragraph's.
             let runs_on = alone
                 && (sentence_ended(&text) || next.is_some_and(|next| fences.continues[next.index()].is_some()));
-            let vetoed = fences.testimony(first)
-                || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))
-                || runs_on
-                || numbered_paragraphs::editorial_line(&text)
-                || text.ends_with(['.', ',', ';'])
-                || headings::rules::label(&text)
-                || date_line(&text)
-                || words > 20
-                || voted
-                    && !numbered
-                    && (end - k > 1
-                        || typeset.body && look.caps
-                        || !typeset.larger && below.is_some_and(|below| below > above.clamp(-3.0, 3.0) + 0.5));
-            let mut own = -1.5;
-            own += if voted { 2.5 } else { 0.0 };
-            own += if typeset.set_apart { 1.0 } else { 0.0 };
-            // A number in the body's own type numbers the body (its paragraphs, provisions, items).
-            own -= if typeset.body && !look.caps && !division_word { 1.5 } else { 0.0 };
-            own += if division_word { 1.5 } else if enumerated.is_some() && !typeset.body { 0.75 } else { 0.0 };
-            own += if opens_prose { 1.0 } else { 0.0 };
-            own -= if fields_follow { 0.75 } else { 0.0 };
-            own += if above >= 0.8 { 0.5 } else { 0.0 };
-            own -= if text.ends_with(':') { 1.0 } else { 0.0 };
-            own -= if words > 12 { 1.0 } else { 0.0 };
-            own -= if end - k > 1 + usize::from(alone) && enumerated.is_none() { 0.5 } else { 0.0 };
-            candidates.push(Candidate { lines: k..end, look, own, vetoed, voted, set_apart: typeset.set_apart, page: slots.page(first) });
+            let vetoes = [
+                (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))),
+                (VETO_RUNS_ON, runs_on),
+                (VETO_EDITORIAL, numbered_paragraphs::editorial_line(&text)),
+                (VETO_ENDS, text.ends_with(['.', ',', ';'])),
+                (VETO_LABEL, headings::rules::label(&text) || date_line(&text)),
+                (VETO_WORDS, words > 20),
+                (
+                    VETO_TAGGED,
+                    voted
+                        && !numbered
+                        && (end - k > 1
+                            || typeset.body && look.caps
+                            || !typeset.larger && below.is_some_and(|below| below > above.clamp(-3.0, 3.0) + 0.5)),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, holds)| *holds)
+            .fold(0, |bits, (bit, _)| bits | bit);
+            // The candidate's own evidence, each indicator weighed by `OWN`.
+            let terms = [
+                voted,
+                typeset.set_apart,
+                // A number in the body's own type numbers the body (its paragraphs, provisions, items).
+                typeset.body && !look.caps && !division_word,
+                division_word,
+                !division_word && enumerated.is_some() && !typeset.body,
+                opens_prose,
+                fields_follow,
+                above >= 0.8,
+                text.ends_with(':'),
+                words > 12,
+                end - k > 1 + usize::from(alone) && enumerated.is_none(),
+            ];
+            let own = terms.iter().zip(OWN).fold(OWN_BASE, |own, (&holds, weight)| own + if holds { weight } else { 0.0 });
+            if traced {
+                decision.residual.push(ResidualRecord {
+                    lines: sequence[k..end].iter().map(|slot| slot.0).collect(),
+                    context: context as u32,
+                    look: 0,
+                    terms,
+                    alone,
+                    above,
+                    below,
+                    words: words as u32,
+                    caps: look.caps,
+                    body: typeset.body,
+                    larger: typeset.larger,
+                    numbered,
+                    vetoes,
+                    signs: [false; LOOK.len()],
+                    members: 1,
+                    own,
+                    score: own,
+                    heading: false,
+                });
+            }
+            candidates.push(Candidate { lines: k..end, look, own, vetoed: vetoes != 0, voted, set_apart: typeset.set_apart, page: slots.page(first) });
             k = end;
         }
         // Each look's own signs: its recurrence over pages, its sources' share of it, and a look so
@@ -360,9 +409,12 @@ pub(crate) fn weigh(
             }
         }
         let mut score = vec![0.0; candidates.len()];
-        for (_, members) in &looks {
+        // Each candidate's look (an index among the context's looks) and its look's signs, traced.
+        let mut grouped = vec![(0u32, [false; LOOK.len()], 1u32); candidates.len()];
+        for (index, (_, members)) in looks.iter().enumerate() {
             if members.len() < 2 {
                 score[members[0]] = candidates[members[0]].own;
+                grouped[members[0]].0 = index as u32;
                 continue;
             }
             let size = members.len() as f64;
@@ -372,12 +424,19 @@ pub(crate) fn weigh(
             let mut pages_met: Vec<usize> = members.iter().map(|&n| candidates[n].page).collect();
             pages_met.sort_unstable();
             pages_met.dedup();
-            let mut signs = 0.0;
-            signs += if pages_met.len() >= 2 { 0.5 } else { 0.0 };
-            signs += if voted >= 0.5 { 0.5 } else { 0.0 };
-            signs -= if members.len() > 40 && set_apart < 0.2 { 1.0 } else { 0.0 };
+            let held = [pages_met.len() >= 2, voted >= 0.5, members.len() > 40 && set_apart < 0.2];
+            let signs = held.iter().zip(LOOK).fold(0.0, |signs, (&holds, weight)| signs + if holds { weight } else { 0.0 });
             for &n in members {
-                score[n] = 0.5 * candidates[n].own + 0.5 * mean + signs;
+                score[n] = OWN_SHARE * candidates[n].own + (1.0 - OWN_SHARE) * mean + signs;
+                grouped[n] = (index as u32, held, members.len() as u32);
+            }
+        }
+        if traced {
+            let first = decision.residual.len() - candidates.len();
+            for (n, record) in decision.residual[first..].iter_mut().enumerate() {
+                (record.look, record.signs, record.members) = grouped[n];
+                record.score = score[n];
+                record.heading = !candidates[n].vetoed && score[n] > 0.0;
             }
         }
         for (candidate, score) in candidates.iter().zip(score) {
