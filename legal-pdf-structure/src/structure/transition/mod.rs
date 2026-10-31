@@ -141,7 +141,16 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         let made = state.clone().apply(line, m);
         let mut wrong = 0;
         if m.opens && m.region == HEADING {
-            wrong += (made.level_step - here[4]).unsigned_abs() as u32 * 2;
+            if here[4] >= 0 {
+                wrong += (made.level_step - here[4]).unsigned_abs() as u32 * 2;
+            } else {
+                // A gold without levels (A2AJ's): the level the line's look last took in its document,
+                // else the open heading's.
+                let outline = state.outlines.get(&line.document);
+                let looked = outline.and_then(|o| o.look_levels.iter().find(|(look, _)| *look == line.look)).map(|&(_, l)| l);
+                let preferred = looked.unwrap_or_else(|| outline.map_or(1, |o| o.heading.max(1)));
+                wrong += u32::from((m.level - preferred).unsigned_abs());
+            }
         }
         if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 {
             wrong += u32::from(made.depth_step != here[7]);
@@ -323,7 +332,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
 pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, identity: &StructureIdentity) -> Result<StructureOutput> {
     let (table, moves) = run(pages, slots, evidence, fences, &identity.source_sha256);
     let views = views_of(pages, slots, evidence, fences, &table);
-    let structure_graph = emit::structure_graph(pages, slots, evidence, &table, &views, &moves, identity)?;
+    let structure_graph = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity)?;
     Ok(StructureOutput { paragraphs: Vec::new(), footnotes: Vec::new(), diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
 }
 

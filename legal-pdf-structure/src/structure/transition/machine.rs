@@ -17,11 +17,7 @@ pub(crate) const REGIONS: [&str; 17] = [
     "furniture", "page_label", "line_label", "title", "note_quote", "provision",
 ];
 pub(crate) const HEADING: u8 = 3;
-pub(crate) const QUOTE: u8 = 4;
 pub(crate) const NOTE: u8 = 5;
-pub(crate) const MARGINAL_NOTE: u8 = 10;
-pub(crate) const FURNITURE: u8 = 11;
-pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
