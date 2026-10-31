@@ -85,42 +85,9 @@ struct LineTrace<'a> {
     references: Vec<u32>,
 }
 
-/// The readings of a line's opening token, and of the number after a division word.
+/// The readings of a line's opening token, and of the number after any word (`marker_readings`).
 fn readings(text: &str) -> Vec<(String, u32, Vec<u32>)> {
-    let grammar = legal_pdf_core::layout_analysis();
-    let mut tokens = text.split_whitespace();
-    let Some(first) = tokens.next().filter(|token| token.chars().count() <= 12) else { return Vec::new() };
-    let read = |token: &str, word: Option<&str>| {
-        let alone = grammar.numbering_marker(token, None);
-        // A roman reading of one letter read again as the letter after the letter before it.
-        let letter = alone.as_ref().filter(|m| m.family.ends_with(":i") || m.family.ends_with(":I")).and_then(|m| {
-            let core = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
-            let c = core.chars().next().filter(|_| core.chars().count() == 1)?;
-            let before = u32::from(c.to_ascii_lowercase()) - u32::from('a');
-            let family = format!("{}{}", &m.family[..m.family.len() - 1], if c.is_ascii_uppercase() { 'A' } else { 'a' });
-            let previous = legal_structure_model::NumberingMarker { family, ordinal: before, prefix: Vec::new() };
-            grammar.numbering_marker(token, Some(&previous))
-        });
-        alone.into_iter().chain(letter).map(|m| {
-            (word.map_or(m.family.clone(), |word| format!("{}:{}", word.to_lowercase(), m.family)), m.ordinal, m.prefix)
-        }).collect::<Vec<_>>()
-    };
-    let mut found = read(first, None);
-    if first.chars().count() > 1 && first.chars().all(char::is_alphabetic) {
-        if let Some(number) = tokens.next() {
-            found.extend(read(number.trim_end_matches(['.', ':', '\u{2014}', '-']), Some(first)));
-        }
-    }
-    found.dedup();
-    found
-}
-
-/// The values of a line's reference marks (`reference_marks`, and its detached references).
-fn reference_values(line: &Line, size: f64) -> Vec<u32> {
-    let value = |text: &str| text.trim().parse().unwrap_or(0);
-    reference_marks(line, size).map(|(text, _)| value(text))
-        .chain(line.detached_references.iter().map(|reference| value(&reference.selected_text)))
-        .collect()
+    marker_readings(text, true).into_iter().map(|r| (r.family, r.value, r.prefix)).collect()
 }
 
 #[derive(serde::Serialize)]

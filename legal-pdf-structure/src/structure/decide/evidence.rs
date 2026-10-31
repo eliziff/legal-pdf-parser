@@ -612,6 +612,61 @@ pub(crate) fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&
     })
 }
 
+/// The values of a line's reference marks (`reference_marks`, and its detached references), 0 for
+/// a note symbol.
+pub(crate) fn reference_values(line: &Line, size: f64) -> Vec<u32> {
+    let value = |text: &str| text.trim().parse().unwrap_or(0);
+    reference_marks(line, size)
+        .map(|(text, _)| value(text))
+        .chain(line.detached_references.iter().map(|reference| value(&reference.selected_text)))
+        .collect()
+}
+
+/// A reading of a line's opening marker by the numbering grammar: its family, the value it counts and
+/// its dotted prefix; a number after a division word ("PART II") reads under the word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkerReading {
+    pub(crate) family: String,
+    pub(crate) value: u32,
+    pub(crate) prefix: Vec<u32>,
+}
+
+/// Every reading of a line's opening token by the numbering grammar: read alone and, where a single
+/// letter is also a roman numeral, as the letter after the letter before it ("(i)" as 1 and after
+/// "(h)"); and, where `division` says the line opens on a division word, the number after the word.
+pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
+    let grammar = layout_analysis();
+    let mut tokens = text.split_whitespace();
+    let Some(first) = tokens.next().filter(|token| token.chars().count() <= 12) else { return Vec::new() };
+    let read = |token: &str, word: Option<&str>| {
+        let alone = grammar.numbering_marker(token, None);
+        let letter = alone.as_ref().filter(|m| m.family.ends_with(":i") || m.family.ends_with(":I")).and_then(|m| {
+            let core = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
+            let c = core.chars().next().filter(|_| core.chars().count() == 1)?;
+            let family = format!("{}{}", &m.family[..m.family.len() - 1], if c.is_ascii_uppercase() { 'A' } else { 'a' });
+            let ordinal = u32::from(c.to_ascii_lowercase()) - u32::from('a');
+            grammar.numbering_marker(token, Some(&legal_structure_model::NumberingMarker { family, ordinal, prefix: Vec::new() }))
+        });
+        alone
+            .into_iter()
+            .chain(letter)
+            .map(|m| MarkerReading {
+                family: word.map_or(m.family.clone(), |word| format!("{}:{}", word.to_lowercase(), m.family)),
+                value: m.ordinal,
+                prefix: m.prefix,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut found = read(first, None);
+    if division && first.chars().count() > 1 && first.chars().all(char::is_alphabetic) {
+        if let Some(number) = tokens.next() {
+            found.extend(read(number.trim_end_matches(['.', ':', '\u{2014}', '-']), Some(first)));
+        }
+    }
+    found.dedup();
+    found
+}
+
 /// A line's reference tokens (`REFERENCE_*`), its type set at `size`.
 fn reference_tokens(line: &Line, size: f64) -> u8 {
     let mut found = 0;

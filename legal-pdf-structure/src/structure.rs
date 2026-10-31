@@ -49,6 +49,7 @@ mod diagnostics;
 pub use diagnostics::*;
 mod decide;
 pub(crate) use decide::*;
+mod transition;
 
 use crate::layout::*;
 use furniture::*;
@@ -281,6 +282,10 @@ pub fn derive_cached(
             measured
         }
     };
+    // The transition parser, read beside the stages while it is fitted and measured.
+    if transition::enabled() {
+        measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &identity.source_sha256));
+    }
     let mut notes = measure("derive.notes", || Notes::read(pages, &slots, &evidence, &fences, &runs));
     let mut decision = measure("derive.decide", || Decision::decide(pages, &slots, &evidence, &fences, &runs, &notes, outline));
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
