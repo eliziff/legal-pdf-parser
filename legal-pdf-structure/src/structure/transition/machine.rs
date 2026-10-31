@@ -54,6 +54,9 @@ pub(crate) struct Move {
     pub(crate) reading: Option<u8>,
     pub(crate) note: Option<u32>,
     pub(crate) level: i8,
+    /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
+    /// picked up past a block quotation or a page's notes).
+    pub(crate) resume: bool,
 }
 
 impl Move {
@@ -103,12 +106,14 @@ pub(crate) struct State {
     pub(crate) since: [u32; 17],
     /// The region of the unit open in each context's each stream (`stream_of`).
     pub(crate) open_regions: HashMap<(u16, usize), u8>,
+    /// The region of the unit each stream held before its open one's region took it.
+    pub(crate) interrupted: HashMap<(u16, usize), u8>,
 }
 
 impl Default for State {
     fn default() -> Self {
         // No region has opened a unit yet: as long ago as `features` counts.
-        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new() }
+        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new(), interrupted: HashMap::new() }
     }
 }
 
@@ -145,8 +150,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "note_counts", "note_next", "note_first", "note_answers", "unanswered", "note_plain",
     "line_number_next", "line_number_first",
     "heading_step", "heading_level", "look_levelled", "look_level_agrees", "stack_level_agrees",
+    "resumes", "interrupted_region",
 ];
-pub(crate) const CANDIDATES: usize = 28;
+pub(crate) const CANDIDATES: usize = 30;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -189,7 +195,7 @@ impl State {
 
     /// The region-and-opening classes the state itself proposes for a line, whatever the local scores
     /// say: going on with the unit open in each of the line's context's streams, or opening the next
-    /// unit of its region; a note opening on the next note number or on a number the body set; a
+    /// unit of its region; a heading where the line's look is one its document's headings took; a note opening on the next note number or on a number the body set; a
     /// transcript line number going on from the last; an opening of the region of an open frame its
     /// marker counts on from.
     pub(crate) fn proposed(&self, line: &LineView) -> Vec<usize> {
@@ -200,6 +206,10 @@ impl State {
         for region in open {
             out.push(usize::from(region) * 2);
             out.push(opening(region));
+        }
+        // A heading where the line is set as a heading of its document was set before.
+        if self.outline(line.document).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
+            out.push(opening(HEADING));
         }
         if let Some(open) = self.open(line.ctx) {
             let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
@@ -227,7 +237,7 @@ impl State {
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0 };
+            let plain = Move { region, opens, reading: None, note: None, level: 0, resume: false };
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 let mut values: Vec<u32> = line.label.into_iter().collect();
@@ -237,6 +247,10 @@ impl State {
                 bases.extend((0..line.readings.len().min(3)).map(|r| Move { reading: Some(r as u8), ..plain }));
             }
             bases.push(plain);
+            let key = (line.ctx, stream_of(region));
+            if !opens && self.interrupted.get(&key) == Some(&region) && self.open_regions.get(&key) != Some(&region) {
+                bases.push(Move { resume: true, ..plain });
+            }
             if opens && region == HEADING {
                 let deepest = (heading.max(1) + 2).min(LEVELS);
                 for base in bases {
@@ -316,6 +330,8 @@ impl State {
                 f32::from(level - under)
             });
         }
+        f[28] = flag(candidate.resume);
+        f[29] = self.interrupted.get(&(line.ctx, stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
         f
     }
 
@@ -365,7 +381,13 @@ impl State {
             self.since[usize::from(chosen.region)] = 0;
         }
         if chosen.region != 0 {
-            self.open_regions.insert((line.ctx, stream_of(chosen.region)), chosen.region);
+            let key = (line.ctx, stream_of(chosen.region));
+            if chosen.resume {
+                self.interrupted.remove(&key);
+            } else if let Some(&open) = self.open_regions.get(&key).filter(|&&open| open != chosen.region) {
+                self.interrupted.insert(key, open);
+            }
+            self.open_regions.insert(key, chosen.region);
         }
         self.previous = Some(*chosen);
         made

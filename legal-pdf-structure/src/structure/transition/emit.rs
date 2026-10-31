@@ -77,6 +77,8 @@ pub(crate) fn structure_graph(
     let mut frames: HashMap<u16, Vec<(String, usize)>> = HashMap::new();
     let mut headings: HashMap<u16, Vec<(i8, usize)>> = HashMap::new();
     let mut last_body: HashMap<u16, usize> = HashMap::new();
+    // The last unit of each region in each context's stream, which a line may resume.
+    let mut region_unit: HashMap<(u16, usize, u8), usize> = HashMap::new();
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let made = state.apply(line, chosen);
         if chosen.region == 0 {
@@ -84,8 +86,12 @@ pub(crate) fn structure_graph(
         }
         let key = (line.ctx, stream_of(chosen.region));
         let continues = !chosen.opens && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
+        let resumed = chosen.resume.then(|| region_unit.get(&(key.0, key.1, chosen.region)).copied()).flatten();
         let u = if continues {
             open[&key]
+        } else if let Some(u) = resumed {
+            open.insert(key, u);
+            u
         } else {
             let text = text_of(k);
             let reading = chosen.reading.and_then(|r| line.readings.get(usize::from(r)));
@@ -135,6 +141,7 @@ pub(crate) fn structure_graph(
                 last_body.insert(line.document, u);
             }
             open.insert(key, u);
+            region_unit.insert((key.0, key.1, chosen.region), u);
             u
         };
         units[u].lines.push(k);

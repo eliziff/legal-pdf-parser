@@ -19,7 +19,7 @@ pub(crate) const LINE_FEATURES: &[&str] = &[
     "ink", "ink_measured", "weight", "col_width", "col_centre",
     "label", "label_raised", "label_value", "label_size", "label_suppressed",
     "reference_superscript", "reference_detached", "reference_raised", "reference_glued",
-    "title_shaped", "beside", "line_number", "edge", "cell", "band", "translation",
+    "title_shaped", "beside", "line_number", "edge_repeated", "cell", "below_separator", "translation",
     "marker", "marker_word", "marker_value", "marker_prefix", "marker_two", "marker_only",
     "count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet",
     "wrap_()", "wrap_[]", "wrap_)", "wrap_.", "wrap_",
@@ -140,6 +140,27 @@ impl Looks {
 const COUNTS: [&str; 9] = ["1", "1.1", "1.1.1", "1.1.1.1", "a", "A", "i", "I", "bullet"];
 const WRAPS: [&str; 5] = ["()", "[]", ")", ".", ""];
 
+/// Whether each line (in `order`) stands at its page's top or bottom tenth with a text, figures aside,
+/// that lines there on three pages or more print: a running head or foot, measured, not fenced.
+fn repeated_at_edges(pages: &[Page], slots: &Slots, order: &[Slot]) -> Vec<bool> {
+    let key = |slot: Slot| -> Option<String> {
+        let page = &pages[slots.page(slot)];
+        let line = slots.line(pages, slot);
+        let height = page.height.max(1.0);
+        let edge = line.bbox[3] <= 0.1 * height || line.bbox[1] >= 0.9 * height;
+        let text: String = line.text.chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).collect();
+        (edge && text.chars().count() >= 3).then_some(text)
+    };
+    let mut pages_of: HashMap<String, HashSet<usize>> = HashMap::new();
+    let keys: Vec<Option<String>> = order.iter().map(|&slot| key(slot)).collect();
+    for (k, found) in keys.iter().enumerate() {
+        if let Some(text) = found {
+            pages_of.entry(text.clone()).or_default().insert(slots.page(order[k]));
+        }
+    }
+    keys.iter().map(|found| found.as_ref().is_some_and(|text| pages_of[text].len() >= 3)).collect()
+}
+
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
 pub(crate) struct LineTable {
@@ -169,6 +190,7 @@ impl LineTable {
         }).collect();
         let off_grid: Vec<usize> = pages.iter().map(|page| legal_pdf_core::off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
         let looks = Looks::tally(pages, slots, evidence);
+        let repeated = repeated_at_edges(pages, slots, &order);
         let page_count = pages.len().max(1) as f64;
         let mut readings = Vec::with_capacity(n);
         let mut references = Vec::with_capacity(n);
@@ -235,7 +257,8 @@ impl LineTable {
                 flag(evidence.references[at] & REFERENCE_SUPERSCRIPT != 0), flag(evidence.references[at] & REFERENCE_DETACHED != 0),
                 flag(evidence.references[at] & REFERENCE_RAISED != 0), flag(evidence.references[at] & REFERENCE_GLUED != 0),
                 flag(evidence.title_shaped[at]), flag(evidence.beside[at].is_some()), flag(evidence.line_number[at]),
-                flag(fences.edge[at].is_some()), flag(fences.cell[at] > 0), flag(fences.band[at]), flag(fences.translation[at]),
+                flag(repeated[k]), flag(fences.cell[at] > 0),
+                flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.translation[at]),
             ]);
             let found = marker_readings(&line.text, evidence.words[at] & WORD_DIVISION != 0);
             let mut marker = [0.0f64; 20];

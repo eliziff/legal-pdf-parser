@@ -149,6 +149,9 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         if m.opens && m.region != NOTE {
             wrong += u32::from(m.reading.is_some() != (here[5] == 1));
         }
+        if !m.opens {
+            wrong += 2 * u32::from(m.resume != (here[1] == 2));
+        }
         if m.opens && m.region == NOTE {
             wrong += match (m.note, made.paired) {
                 (Some(_), Some((line, ..))) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
@@ -207,7 +210,9 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
         let slot = table.order[k];
         let at = slot.index();
         LineView {
-            ctx: fences.ctx[at],
+            // A context is a document and whether it is a translation's: a quotation in it is read as
+            // the parser reads it, not as the fences part it.
+            ctx: fences.document[at].saturating_mul(2) + u16::from(fences.translation[at]),
             document: fences.document[at],
             readings: &table.readings[k],
             label: evidence.label[at].map(|l| l.value),
@@ -268,7 +273,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                     // No ranker: the oracle where the gold is read and reachable (the first round's
                     // rollout), else the local scores' best class, counting on nothing.
                     None => best_oracle.unwrap_or_else(|| {
-                        candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1).unwrap_or(0)
+                        candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume).unwrap_or(0)
                     }),
                 };
                 if s.dump.is_some() {
@@ -366,15 +371,25 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
 fn labelled(table: &LineTable, fences: &Fences, views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     let mut state = State::default();
     let mut labels: Vec<[i64; 8]> = Vec::with_capacity(moves.len());
+    // The first line of the last unit of each region opened in each context's stream.
+    let mut first_of: HashMap<(u16, usize, u8), usize> = HashMap::new();
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let at = table.order[k].index();
+        let stream = (line.ctx, stream_of(chosen.region));
+        let opened = chosen.opens || (!chosen.resume && state.open_regions.get(&stream) != Some(&chosen.region));
+        let resumed = chosen.resume.then(|| first_of.get(&(stream.0, stream.1, chosen.region)).copied()).flatten();
+        if opened {
+            first_of.insert((stream.0, stream.1, chosen.region), k);
+        }
         let starts_document = fences.document[at] != 0 && (k == 0 || fences.document[table.order[k - 1].index()] != fences.document[at]);
         let made = state.apply(line, chosen);
         if let Some((paired, ..)) = made.paired {
             labels[paired as usize][3] = 1;
         }
         let marked = chosen.opens && chosen.reading.is_some();
-        labels.push([i64::from(chosen.region), i64::from(chosen.opens), i64::from(starts_document), 0, made.level_step, i64::from(marked), -1, made.depth_step]);
+        let start = if chosen.opens { 1 } else if resumed.is_some() { 2 } else { 0 };
+        let pointer = resumed.map_or(-1, |first| first as i64);
+        labels.push([i64::from(chosen.region), start, i64::from(starts_document), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
     }
     labels
 }
