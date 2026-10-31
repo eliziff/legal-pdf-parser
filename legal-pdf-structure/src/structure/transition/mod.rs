@@ -20,7 +20,8 @@
 //! - LEGALPDF_TRANSITION_DUMP, a folder: each line's features (`<sha>.lines.f32`), each candidate's
 //!   (`<sha>.moves.f32`) and which the oracle makes (`<sha>.json`);
 //! - LEGALPDF_TRANSITION_LABELS, a folder: each document's labels as the parser reads it
-//!   (`<sha>.labels.json`), for the grader's `--labels`.
+//!   (`<sha>.labels.json`), for the grader's `--labels`;
+//! - LEGALPDF_TRANSITION_EMIT: the parse's output is the transition parser's structure (`emit`).
 
 use super::*;
 
@@ -30,6 +31,7 @@ mod machine;
 pub(crate) use machine::*;
 mod trees;
 use trees::Forest;
+mod emit;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -59,6 +61,7 @@ struct Settings {
     dump: Option<PathBuf>,
     labels: Option<PathBuf>,
     beam: usize,
+    emit: bool,
 }
 
 fn settings() -> &'static Settings {
@@ -82,6 +85,7 @@ fn settings() -> &'static Settings {
             dump: var("LEGALPDF_TRANSITION_DUMP"),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
             beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
+            emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
         }
     })
 }
@@ -89,7 +93,12 @@ fn settings() -> &'static Settings {
 /// Whether the transition parser runs on this parse.
 pub(crate) fn enabled() -> bool {
     let s = settings();
-    s.dump.is_some() || s.labels.is_some()
+    s.dump.is_some() || s.labels.is_some() || s.emit
+}
+
+/// Whether the transition parser's reading is the parse's output (LEGALPDF_TRANSITION_EMIT).
+pub(crate) fn emitting() -> bool {
+    settings().emit
 }
 
 /// The gold's labels by document and piece (`line@offset`), from rows of the grader's predictions
@@ -140,7 +149,7 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         }
         if m.opens && m.region == NOTE {
             wrong += match (m.note, made.paired) {
-                (Some(_), Some(line)) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
+                (Some(_), Some((line, ..))) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
                 (Some(_), _) => 1,
                 (None, _) => 3,
             };
@@ -190,15 +199,9 @@ fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
     classes
 }
 
-/// One document parsed: its lines' moves in reading order (greedily, or by a beam of whole readings
-/// where LEGALPDF_TRANSITION_BEAM says how wide), and (dumping) what the scorer is fitted on.
-pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str) {
-    let s = settings();
-    let table = LineTable::read(pages, slots, evidence, fences);
-    let n = table.order.len();
-    let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
-    let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
-    let views: Vec<LineView> = (0..n).map(|k| {
+/// Each line as the state reads it, in reading order.
+fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable) -> Vec<LineView<'a>> {
+    (0..table.order.len()).map(|k| {
         let slot = table.order[k];
         let at = slot.index();
         LineView {
@@ -211,7 +214,24 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
             references: &table.references[k],
             place: k as u32,
         }
-    }).collect();
+    }).collect()
+}
+
+/// One document parsed: its lines read (`LineTable`) and the moves they make in reading order
+/// (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide); and, as
+/// its environment asks, what the scorer is fitted on and the labels the grader reads.
+pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str) -> (LineTable, Vec<Move>) {
+    let table = LineTable::read(pages, slots, evidence, fences);
+    let moves = parse(pages, slots, evidence, fences, sha256, &table);
+    (table, moves)
+}
+
+fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable) -> Vec<Move> {
+    let s = settings();
+    let n = table.order.len();
+    let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
+    let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
+    let views = views_of(pages, slots, evidence, fences, table);
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
     let probabilities = |row: &[f32]| -> Vec<f64> {
         match &s.local {
@@ -228,7 +248,7 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
         Local { probabilities, ranked }
     }).collect();
     let moves = match (&s.ranker, s.beam) {
-        (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, &table, &views, &locals),
+        (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, &locals),
         _ => {
             let mut state = State::default();
             let mut moves = Vec::with_capacity(n);
@@ -282,12 +302,22 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
         }
     };
     if let Some(folder) = &s.labels {
-        let labels = labelled(&table, fences, &views, &moves);
+        let labels = labelled(table, fences, &views, &moves);
         let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});
         if let Err(error) = std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string())) {
             eprintln!("transition parser labels {sha256}: {error}");
         }
     }
+    moves
+}
+
+/// The document's structure as the transition parser reads it, its reading through `emit`: what
+/// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
+pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, identity: &StructureIdentity) -> Result<StructureOutput> {
+    let (table, moves) = run(pages, slots, evidence, fences, &identity.source_sha256);
+    let views = views_of(pages, slots, evidence, fences, &table);
+    let structure_graph = emit::structure_graph(pages, slots, evidence, &table, &views, &moves, identity)?;
+    Ok(StructureOutput { paragraphs: Vec::new(), footnotes: Vec::new(), diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
 }
 
 /// The best whole reading a beam of `width` keeps: every reading kept extended by each of the line's
@@ -338,7 +368,7 @@ fn labelled(table: &LineTable, fences: &Fences, views: &[LineView], moves: &[Mov
         let at = table.order[k].index();
         let starts_document = fences.document[at] != 0 && (k == 0 || fences.document[table.order[k - 1].index()] != fences.document[at]);
         let made = state.apply(line, chosen);
-        if let Some(paired) = made.paired {
+        if let Some((paired, ..)) = made.paired {
             labels[paired as usize][3] = 1;
         }
         let marked = chosen.opens && chosen.reading.is_some();

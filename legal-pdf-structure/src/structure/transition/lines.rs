@@ -145,7 +145,8 @@ const WRAPS: [&str; 5] = ["()", "[]", ")", ".", ""];
 pub(crate) struct LineTable {
     pub(crate) order: Vec<Slot>,
     pub(crate) readings: Vec<Vec<MarkerReading>>,
-    pub(crate) references: Vec<Vec<u32>>,
+    /// Each line's reference marks: value, first and past-last character (`reference_spans`).
+    pub(crate) references: Vec<Vec<(u32, u32, u32)>>,
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
     pub(crate) looks: Vec<u32>,
     pub(crate) features: Vec<f32>,
@@ -270,7 +271,7 @@ impl LineTable {
                 row[LINE_FEATURES.len() + WORD_BITS + bit] = ((evidence.look[at] >> bit) & 1) as f32;
             }
             readings.push(found);
-            references.push(reference_values(line, evidence.size[at]));
+            references.push(reference_spans(line, evidence.size[at]));
             look_ids.push(u32::from(evidence.face[at]) << 20 | u32::from(evidence.half_points[at].min(0xffff)) << 4 | u32::from(evidence.look[at] & LOOK_STYLE));
         }
         // The lines around each line, and the document's shape.

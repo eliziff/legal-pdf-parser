@@ -17,7 +17,11 @@ pub(crate) const REGIONS: [&str; 17] = [
     "furniture", "page_label", "line_label", "title", "note_quote", "provision",
 ];
 pub(crate) const HEADING: u8 = 3;
+pub(crate) const QUOTE: u8 = 4;
 pub(crate) const NOTE: u8 = 5;
+pub(crate) const MARGINAL_NOTE: u8 = 10;
+pub(crate) const FURNITURE: u8 = 11;
+pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
@@ -60,8 +64,9 @@ pub(crate) struct Frame {
 pub(crate) struct Open {
     pub(crate) stack: Vec<Frame>,
     pub(crate) note: Option<u32>,
-    /// The reference marks the body set that no note has answered, each with the line that set it.
-    pub(crate) unanswered: Vec<(u32, u32)>,
+    /// The reference marks the body set that no note has answered: each one's value, the line that set
+    /// it, and where it stands in that line (first and past-last character).
+    pub(crate) unanswered: Vec<(u32, u32, u32, u32)>,
     pub(crate) line_number: Option<u32>,
 }
 
@@ -103,7 +108,7 @@ pub(crate) struct LineView<'a> {
     pub(crate) label: Option<u32>,
     pub(crate) line_number: Option<u32>,
     pub(crate) look: u32,
-    pub(crate) references: &'a [u32],
+    pub(crate) references: &'a [(u32, u32, u32)],
     pub(crate) place: u32,
 }
 
@@ -112,7 +117,7 @@ pub(crate) struct LineView<'a> {
 /// unit's depth step from the body unit before it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Made {
-    pub(crate) paired: Option<u32>,
+    pub(crate) paired: Option<(u32, u32, u32)>,
     pub(crate) level_step: i64,
     pub(crate) depth_step: i64,
 }
@@ -176,7 +181,7 @@ impl State {
         let opening = |region: u8| usize::from(region) * 2 + 1;
         if let Some(open) = self.open(line.ctx) {
             let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
-            if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, _)| r == v)) {
+            if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, ..)| r == v)) {
                 out.push(opening(NOTE));
             }
             if line.line_number.is_some_and(|v| open.line_number.is_some_and(|last| v == last + 1)) {
@@ -264,7 +269,7 @@ impl State {
                     f[15] = 1.0;
                     f[16] = flag(stream.note.is_some_and(|last| value == last + 1));
                     f[17] = flag(value == 1);
-                    f[18] = flag(stream.unanswered.iter().any(|&(r, _)| r == value));
+                    f[18] = flag(stream.unanswered.iter().any(|&(r, ..)| r == value));
                 }
                 None => f[20] = 1.0,
             }
@@ -301,13 +306,14 @@ impl State {
         }
         if let (true, NOTE, Some(value)) = (chosen.opens, chosen.region, chosen.note) {
             stream.note = Some(value);
-            if let Some(at) = stream.unanswered.iter().rposition(|&(r, _)| r == value) {
-                made.paired = Some(stream.unanswered.remove(at).1);
+            if let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) {
+                let (_, place, start, end) = stream.unanswered.remove(at);
+                made.paired = Some((place, start, end));
             }
         }
         if REFERRING.contains(&chosen.region) && !line.references.is_empty() {
-            stream.unanswered.retain(|(r, _)| !line.references.contains(r));
-            stream.unanswered.extend(line.references.iter().map(|&r| (r, line.place)));
+            stream.unanswered.retain(|(r, ..)| !line.references.iter().any(|(v, ..)| v == r));
+            stream.unanswered.extend(line.references.iter().map(|&(v, start, end)| (v, line.place, start, end)));
             let excess = stream.unanswered.len().saturating_sub(30);
             stream.unanswered.drain(..excess);
         }

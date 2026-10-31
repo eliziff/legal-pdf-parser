@@ -622,6 +622,32 @@ pub(crate) fn reference_values(line: &Line, size: f64) -> Vec<u32> {
         .collect()
 }
 
+/// A line's reference marks (`reference_marks`) with where each stands in the line's text: its value
+/// (0 for a note symbol) and its first and past-last character. A mark is found by its span's text,
+/// spans read in order along the line; one whose text the line does not hold there is left out. A
+/// detached reference stands where it says.
+pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
+    let value = |text: &str| text.trim().parse().unwrap_or(0);
+    let chars: Vec<char> = line.text.chars().collect();
+    let marks: Vec<&str> = reference_marks(line, size).map(|(text, _)| text).collect();
+    let mut found = Vec::new();
+    let mut cursor = 0;
+    for span in &line.spans {
+        let text: Vec<char> = span.text.trim().chars().collect();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(at) = (cursor..=chars.len().saturating_sub(text.len())).find(|&at| chars[at..at + text.len()] == text[..]) else { continue };
+        cursor = at + text.len();
+        let trimmed = span.text.trim();
+        if marks.contains(&trimmed) && (span.superscript || reference_marks(line, size).any(|(t, _)| t == trimmed)) {
+            found.push((value(trimmed), at as u32, cursor as u32));
+        }
+    }
+    found.extend(line.detached_references.iter().map(|r| (value(&r.selected_text), r.start_offset as u32, r.end_offset as u32)));
+    found
+}
+
 /// A reading of a line's opening marker by the numbering grammar: its family, the value it counts and
 /// its dotted prefix; a number after a division word ("PART II") reads under the word.
 #[derive(Clone, Debug, PartialEq, Eq)]
