@@ -592,25 +592,34 @@ fn glued_reference(text: &str) -> bool {
         .is_match(text)
 }
 
+/// A line's spans of figures or note symbols set as references, its type set at `size`: each span's
+/// text and how it is set (`REFERENCE_SUPERSCRIPT`, or `REFERENCE_RAISED`: smaller or raised).
+pub(crate) fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&str, u8)> {
+    let height = line.bbox[3] - line.bbox[1];
+    line.spans.iter().filter_map(move |span| {
+        let text = span.text.trim();
+        if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit() || is_note_symbol(c)) {
+            None
+        } else if span.superscript {
+            Some((text, REFERENCE_SUPERSCRIPT))
+        } else if (size > 0.0 && span.size > 0.0 && span.size * 1.25 <= size)
+            || (height > 0.0 && span.bbox[3] <= line.bbox[3] - 0.25 * height)
+        {
+            Some((text, REFERENCE_RAISED))
+        } else {
+            None
+        }
+    })
+}
+
 /// A line's reference tokens (`REFERENCE_*`), its type set at `size`.
 fn reference_tokens(line: &Line, size: f64) -> u8 {
     let mut found = 0;
     if !line.detached_references.is_empty() {
         found |= REFERENCE_DETACHED;
     }
-    let height = line.bbox[3] - line.bbox[1];
-    for span in &line.spans {
-        let text = span.text.trim();
-        if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit() || is_note_symbol(c)) {
-            continue;
-        }
-        if span.superscript {
-            found |= REFERENCE_SUPERSCRIPT;
-        } else if (size > 0.0 && span.size > 0.0 && span.size * 1.25 <= size)
-            || (height > 0.0 && span.bbox[3] <= line.bbox[3] - 0.25 * height)
-        {
-            found |= REFERENCE_RAISED;
-        }
+    for (_, set) in reference_marks(line, size) {
+        found |= set;
     }
     if glued_reference(&line.text) {
         found |= REFERENCE_GLUED;
