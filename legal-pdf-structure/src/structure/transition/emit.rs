@@ -12,18 +12,6 @@
 use super::*;
 use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NoteReference, Origin, PrimaryRole, Scope, StructureNode};
 
-/// Regions whose units run on in one stream, as the gold's do (`labels::stream`): the body's, notes',
-/// marginal notes', furniture's, page and line labels'.
-fn stream(region: u8) -> usize {
-    match REGIONS[usize::from(region)] {
-        "note" | "note_quote" => 1,
-        "marginal_note" => 2,
-        "furniture" => 3,
-        "page_label" => 4,
-        "line_label" => 5,
-        _ => 0,
-    }
-}
 
 struct Unit {
     region: u8,
@@ -94,7 +82,7 @@ pub(crate) fn structure_graph(
         if chosen.region == 0 {
             continue;
         }
-        let key = (line.ctx, stream(chosen.region));
+        let key = (line.ctx, stream_of(chosen.region));
         let continues = !chosen.opens && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
         let u = if continues {
             open[&key]
@@ -162,7 +150,7 @@ pub(crate) fn structure_graph(
     let node_id = |u: usize| format!("transition-{:06}", u + 1);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };
-        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, "legal-pdf-transition.v1", Derivation::Heuristic, None);
+        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Heuristic, None);
         node.label = Some(format!("page{}", page.index + 1));
         node.page_indexes = vec![page.index];
         node.line_ids = page.lines.iter().map(|l| l.id.clone()).collect();
@@ -188,7 +176,7 @@ pub(crate) fn structure_graph(
             "line_label" => (NodeKind::Prose, Some(PrimaryRole::LineLabel)),
             _ => (NodeKind::Prose, None),
         };
-        let mut node = StructureNode::new(node_id(u), kind, range, "legal-pdf-transition.v1", Derivation::Heuristic, unit.parent.map(node_id));
+        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, Derivation::Heuristic, unit.parent.map(node_id));
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -209,7 +197,7 @@ pub(crate) fn structure_graph(
         }
         nodes.push(node);
         if region == "quote" && unit.lines.len() <= 60 {
-            let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, "legal-pdf-transition.v1", Derivation::Heuristic, Some(node_id(u)));
+            let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
             quote.ranges = ranges.clone();
             quote.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
             nodes.push(quote);
@@ -245,7 +233,7 @@ pub(crate) fn structure_graph(
         digest,
         Some(identity.source_sha256.clone()),
         Scope::complete(),
-        vec![Origin { id: "legal-pdf-transition.v1".to_owned() }],
+        vec![Origin { id: ORIGIN.to_owned() }],
         nodes,
         notes,
         Vec::new(),

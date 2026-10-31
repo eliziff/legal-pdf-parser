@@ -33,6 +33,18 @@ pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 const DEPTH: usize = 8;
 const LEVELS: i8 = 9;
 
+/// Regions whose units run on in one stream, as the gold's do (`labels::stream`): the body's, notes',
+/// marginal notes', furniture's, page and line labels'.
+pub(crate) fn stream_of(region: u8) -> usize {
+    match REGIONS[usize::from(region)] {
+        "note" | "note_quote" => 1,
+        "marginal_note" => 2,
+        "furniture" => 3,
+        "page_label" => 4,
+        "line_label" => 5,
+        _ => 0,
+    }
+}
 /// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
 /// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -89,12 +101,14 @@ pub(crate) struct State {
     pub(crate) outlines: HashMap<u16, Outline>,
     pub(crate) previous: Option<Move>,
     pub(crate) since: [u32; 17],
+    /// The region of the unit open in each context's each stream (`stream_of`).
+    pub(crate) open_regions: HashMap<(u16, usize), u8>,
 }
 
 impl Default for State {
     fn default() -> Self {
         // No region has opened a unit yet: as long ago as `features` counts.
-        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17] }
+        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new() }
     }
 }
 
@@ -174,11 +188,19 @@ impl State {
     }
 
     /// The region-and-opening classes the state itself proposes for a line, whatever the local scores
-    /// say: a note opening on the next note number or on a number the body set; a transcript line number
-    /// going on from the last; an opening of the region of an open frame its marker counts on from.
+    /// say: going on with the unit open in each of the line's context's streams, or opening the next
+    /// unit of its region; a note opening on the next note number or on a number the body set; a
+    /// transcript line number going on from the last; an opening of the region of an open frame its
+    /// marker counts on from.
     pub(crate) fn proposed(&self, line: &LineView) -> Vec<usize> {
         let mut out = Vec::new();
         let opening = |region: u8| usize::from(region) * 2 + 1;
+        let mut open: Vec<u8> = self.open_regions.iter().filter(|((ctx, _), _)| *ctx == line.ctx).map(|(_, &region)| region).collect();
+        open.sort_unstable();
+        for region in open {
+            out.push(usize::from(region) * 2);
+            out.push(opening(region));
+        }
         if let Some(open) = self.open(line.ctx) {
             let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
             if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, ..)| r == v)) {
@@ -341,6 +363,9 @@ impl State {
         }
         if chosen.opens {
             self.since[usize::from(chosen.region)] = 0;
+        }
+        if chosen.region != 0 {
+            self.open_regions.insert((line.ctx, stream_of(chosen.region)), chosen.region);
         }
         self.previous = Some(*chosen);
         made

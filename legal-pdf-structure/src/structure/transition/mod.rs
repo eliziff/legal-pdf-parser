@@ -42,6 +42,8 @@ const MASS: f64 = 0.995;
 const KEEP: usize = 6;
 /// The region-and-opening classes.
 const CLASSES: usize = 34;
+/// The origin the transition parser's nodes name.
+pub(crate) const ORIGIN: &str = "legal-pdf-transition.v1";
 /// A ranked candidate's features: its class's local log-probability and rank, its `CANDIDATE`
 /// features, and the line's place, type and marker (`lines::LINE_FEATURES`'s first twenty and its marker's).
 pub(crate) const RANKED: usize = 2 + CANDIDATES + 40;

@@ -303,10 +303,11 @@ pub fn validate_pdf_components(
                     .as_deref()
                     .is_some_and(|grammar| grammar.starts_with(constituents::GRAMMAR))
                 && (node.locator_kind.as_deref().is_none_or(str::is_empty)
-                    || node
-                        .proof
-                        .as_ref()
-                        .is_none_or(|proof| proof.rule != ResolutionRuleV2::HierarchySection)))
+                    || (node.origin_id != transition::ORIGIN
+                        && node
+                            .proof
+                            .as_ref()
+                            .is_none_or(|proof| proof.rule != ResolutionRuleV2::HierarchySection))))
         {
             return Err(Error::Message(format!(
                 "structure node {} is invalid",
