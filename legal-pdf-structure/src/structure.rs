@@ -287,6 +287,10 @@ pub fn derive_cached(
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);
     let decided = Decided::of(pages, &slots, &fences, &decision);
+    // Traced before the decision is written: writing puts each page's lines in reading order.
+    if let Some(folder) = trace_folder() {
+        write_trace(folder, &identity.source_sha256, pages, &slots, &evidence, &fences, &runs, &notes, &decision);
+    }
     let heading_sources = measure("derive.write", || write(pages, &slots, &evidence, &fences, &notes, &decision));
     // Regions are a view of the lines' roles, derived once they are written.
     build_regions(pages);
