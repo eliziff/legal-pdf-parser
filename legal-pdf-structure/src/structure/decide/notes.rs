@@ -202,6 +202,7 @@ impl Notes {
                 let typed = read_here || body > 0.0 && evidence.size[at] > 0.0 && evidence.size[at] < body * 0.90;
                 if fences.band[at]
                     && typed
+                    && flags[at] & BAND_PARAGRAPH == 0
                     && cut.is_none_or(|cut| slots.line(pages, slot).bbox[1] >= cut - separator_tolerance(&pages[slots.page(slot)]))
                     && fences.role[at] == Role::Open
                     && !notes.heading[at]
@@ -254,6 +255,31 @@ impl Notes {
                         notes.note[slot.index()] = None;
                     }
                 }
+            }
+            // A note's line has no body text under it across its span: one that has stands above
+            // the page's foot (a small-type headnote, a cover's lines), and is the body's (on the
+            // gold, 1,951 such lines were no notes, 170 were).
+            let mut lifted = Vec::new();
+            for band in &band_pages {
+                for &slot in band.view.lines.iter().filter(|slot| notes.note[slot.index()].is_some()) {
+                    let [x0, _, x1, y1] = slots.line(pages, slot).bbox;
+                    let under = band.view.lines.iter().any(|&other| {
+                        let (o, below) = (other.index(), slots.line(pages, other).bbox);
+                        notes.note[o].is_none()
+                            && fences.role[o] == Role::Open
+                            && !notes.heading[o]
+                            && !notes.running_head[o]
+                            && below[1] >= y1 - 0.5
+                            && below[0] < x1
+                            && x0 < below[2]
+                    });
+                    if under {
+                        lifted.push(slot);
+                    }
+                }
+            }
+            for slot in lifted {
+                notes.note[slot.index()] = None;
             }
             notes.segment(pages, slots, &order, &added, &read);
         }
@@ -314,14 +340,26 @@ impl Notes {
         let mut previous: Option<(usize, bool)> = None;
         for (page, places) in order {
             let start = slots.on(*page).start;
-            let lines: Vec<Slot> = places.iter().map(|&place| Slot(start + place as u32)).filter(|slot| self.note[slot.index()].is_some()).collect();
-            let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
+            let mut lines: Vec<Slot> = places.iter().map(|&place| Slot(start + place as u32)).filter(|slot| self.note[slot.index()].is_some()).collect();
+            let Some(&first) = lines.first() else {
                 continue;
             };
             let index = pages[*page].index;
             let first_text = &slots.line(pages, first).text;
             let unlabelled = label_prefix(first_text).is_none() && (!added[first.index()] || read[*page]);
             let continued = previous.is_some_and(|(prior, said)| prior + 1 == index && (said || unlabelled || continued_note(first_text)));
+            // A page's notes open at a note's label, unless they go on with the page before's: the
+            // lines before its first label are the body's (a cover's small type, a headnote over
+            // the text; on the gold, 2,444 such lines were no notes, 449 were).
+            if !continued {
+                let opens = lines.iter().position(|&slot| label_prefix(&slots.line(pages, slot).text).is_some()).unwrap_or(lines.len());
+                for slot in lines.drain(..opens) {
+                    self.note[slot.index()] = None;
+                }
+            }
+            let Some(&last) = lines.last() else {
+                continue;
+            };
             previous = Some((index, continued_note(&slots.line(pages, last).text)));
             self.segments.push(NoteSegment { lines, continued });
         }

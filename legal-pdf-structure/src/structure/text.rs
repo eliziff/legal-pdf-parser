@@ -83,6 +83,31 @@ pub(super) fn sentence_ended(text: &str) -> bool {
         .ends_with(['.', '?', '!', '\u{2026}'])
 }
 
+/// A line of six words or more, set in lower case, ending on a word no sentence ends on, so that
+/// its sentence goes on at the next body line whatever that opens with: an article, preposition,
+/// conjunction, pronoun or auxiliary, English or French ("of the", "à la", "and"), or a citation's
+/// abbreviation its number completes ("s.", "para.", "R. v.").
+pub(super) fn dangling_end(text: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "upon", "and", "or",
+        "nor", "but", "that", "which", "who", "whom", "whose", "is", "are", "was", "were", "be", "been", "being", "as",
+        "than", "its", "their", "his", "her", "this", "these", "those", "such", "if", "whether", "not", "under", "between",
+        "within", "without", "against", "during", "before", "after", "about", "over", "per", "via", "le", "la", "les", "un",
+        "une", "des", "du", "de", "à", "au", "aux", "et", "ou", "en", "par", "pour", "sur", "dans", "que", "qui", "dont",
+        "avec", "sans", "sous", "entre", "ce", "cette", "ces", "son", "sa", "ses", "leur", "leurs",
+    ];
+    const ABBREVIATIONS: &[&str] = &[
+        "s.", "ss.", "art.", "arts.", "para.", "paras.", "p.", "pp.", "no.", "nos.", "c.", "ch.", "v.", "vol.", "r.", "rr.",
+        "cl.", "sch.", "reg.", "regs.", "sec.", "secs.",
+    ];
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 6 || !text.chars().any(char::is_lowercase) {
+        return false;
+    }
+    let last = words[words.len() - 1].to_lowercase();
+    WORDS.contains(&last.as_str()) || ABBREVIATIONS.contains(&last.as_str())
+}
+
 pub(super) fn bracket_excess(text: &str) -> usize {
     let mut stack = Vec::new();
     for character in text.chars() {

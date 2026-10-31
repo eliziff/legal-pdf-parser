@@ -301,6 +301,24 @@ pub fn derive_cached(
     let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
     diagnostics.extend(pairing.diagnostics);
+    // A line written in the note band that no note holds (the pairer made no note of its label, or
+    // bounded the note's body short of it) is the body's, and joins its paragraph rather than
+    // standing alone: on the gold, 6,825 such lines were no notes, 2,146 were.
+    let given_back = {
+        let held: HashSet<&str> = footnotes.iter().flat_map(|note| &note.body_line_ids).map(String::as_str).collect();
+        let mut given_back = false;
+        for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+            if line.region_type == "footnote" && !held.contains(line.id.as_str()) {
+                line.region_type = "body".to_owned();
+                line.note_region_mode.clear();
+                given_back = true;
+            }
+        }
+        given_back
+    };
+    if given_back {
+        build_regions(pages);
+    }
     diagnostics.extend(measure("derive.unmatched_references", || {
         unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided)
     }));

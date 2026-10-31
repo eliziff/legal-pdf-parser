@@ -186,7 +186,7 @@ fn layout_end(lines: &IndexedLines, measures: &BodyMeasures, candidate: &Structu
 }
 
 /// The order runs read in at one place: a count of numbers, then a ladder, then a list.
-fn grammar_rank(grammar: CandidateGrammar) -> u8 {
+pub(crate) fn grammar_rank(grammar: CandidateGrammar) -> u8 {
     match grammar {
         CandidateGrammar::Numeric => 0,
         CandidateGrammar::Hierarchy => 1,

@@ -78,6 +78,11 @@ pub(crate) fn bold_char_share(line: &Line) -> f64 {
     flag_share(line, BOLD).unwrap_or(0.0)
 }
 
+/// A word hyphenated across the two lines, an unfinished sentence going on in lower case, or on a
+/// line ending on a word no sentence ends on (`dangling_end`, "... the criminal law of" / "England
+/// continued"), whatever the line goes on with, unless the line opens something of its own: an
+/// item's marker, a speaker's turn, a judge's name after "delivered by", or a smaller or bolder
+/// type. Or a bracket the line closes.
 pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     let previous_text = previous.text.trim();
     let current_text = current.text.trim();
@@ -94,7 +99,28 @@ pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     {
         return true;
     }
+    if dangling_end(previous_text) && !opens_after_dangling(previous, current) {
+        return true;
+    }
     bracket_excess(previous_text) > 0 && closes_before_opening(current_text)
+}
+
+/// Whether the line after one ending on a word no sentence ends on opens something of its own.
+fn opens_after_dangling(previous: &Line, current: &Line) -> bool {
+    static NAMED: OnceLock<Regex> = OnceLock::new();
+    static JUDGE: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED.get_or_init(|| Regex::new(r"(?i)(?:(?:delivered|given|rendered|written) by|rendue? par):?$").unwrap());
+    let judge = JUDGE.get_or_init(|| {
+        Regex::new(r"\b(?:J|JJ|C\.J|J\.A|JJ\.A|C\.J\.[A-Z]+|J\.C\.[A-Z])\.?(?:\s*[-\u{2014}\u{2013}:]\s*)?$|^(?:LE |LA |LES )?JUGES?\b").unwrap()
+    });
+    let text = current.text.trim();
+    let (size, before) = (line_font_size(current), line_font_size(previous));
+    crate::paragraphs::opens_item(text)
+        || crate::layout::opens_turn(current)
+        || named.is_match(previous.text.trim())
+        || text.split_whitespace().count() <= 8 && judge.is_match(text)
+        || size > 0.0 && before > 0.0 && size < before * 0.9
+        || bold_char_share(current) > bold_char_share(previous) + 0.5
 }
 
 /// A line that is only a date: "10 JUNE 2026", "DATED 11 JUNE 2026", "June 29, 2020", "1/4/2025".
