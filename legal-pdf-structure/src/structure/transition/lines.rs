@@ -146,6 +146,8 @@ pub(crate) struct LineTable {
     pub(crate) order: Vec<Slot>,
     pub(crate) readings: Vec<Vec<MarkerReading>>,
     pub(crate) references: Vec<Vec<u32>>,
+    /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
+    pub(crate) looks: Vec<u32>,
     pub(crate) features: Vec<f32>,
 }
 
@@ -169,6 +171,7 @@ impl LineTable {
         let page_count = pages.len().max(1) as f64;
         let mut readings = Vec::with_capacity(n);
         let mut references = Vec::with_capacity(n);
+        let mut look_ids = Vec::with_capacity(n);
         let mut own = vec![0f32; n * WIDTH];
         for (k, &slot) in order.iter().enumerate() {
             let at = slot.index();
@@ -268,6 +271,7 @@ impl LineTable {
             }
             readings.push(found);
             references.push(reference_values(line, evidence.size[at]));
+            look_ids.push(u32::from(evidence.face[at]) << 20 | u32::from(evidence.half_points[at].min(0xffff)) << 4 | u32::from(evidence.look[at] & LOOK_STYLE));
         }
         // The lines around each line, and the document's shape.
         let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER.start] > 0.0).count() as f32 / n.max(1) as f32;
@@ -296,6 +300,6 @@ impl LineTable {
             row[at + 5] = (1.0 + n as f32).ln();
             debug_assert_eq!(at + 6, ALL);
         }
-        Self { order, readings, references, features }
+        Self { order, readings, references, looks: look_ids, features }
     }
 }
