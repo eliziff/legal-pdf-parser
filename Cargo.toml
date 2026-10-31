@@ -23,7 +23,7 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 [features]
 default = []
 pdf = ["dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
-language = ["dep:legal-pdf-language"]
+language = ["dep:legal-pdf-core", "dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr", "legal-pdf-ocr/ocr"]
 indra = ["ocr"]
 fast-allocator = ["dep:mimalloc"]
