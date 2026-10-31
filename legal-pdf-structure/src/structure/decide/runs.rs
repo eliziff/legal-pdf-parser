@@ -509,19 +509,19 @@ impl Runs {
             let found = legal_pdf_support::profile::measure("candidates.detect", || {
                 legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true)
             });
-            // A provision ladder whose every top-level marker goes on with the sentence before it
-            // (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the question
-            // numbers under it are the count's, not its subsections.
+            // A provision ladder under one worded top-level marker that goes on with the sentence
+            // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
+            // question numbers under it are the count's, not its subsections. A list's items go on
+            // with their sentence too ("; and" / "b."), each its own top-level marker, and stand.
             let found: Vec<StructureCandidateRun> = found
                 .into_iter()
                 .filter(|run| {
-                    let roots: Vec<Slot> = run
-                        .markers
-                        .iter()
-                        .filter(|candidate| candidate.parent_candidate_id.is_none())
-                        .map(|candidate| view.place(candidate.marker_range.start).slot)
-                        .collect();
-                    run.grammar != CandidateGrammar::Hierarchy || roots.is_empty() || roots.iter().any(|root| fences.continues[root.index()].is_none())
+                    let mut roots = run.markers.iter().filter(|candidate| candidate.parent_candidate_id.is_none());
+                    let (Some(root), None) = (roots.next(), roots.next()) else { return true };
+                    let worded = root.label.chars().take_while(char::is_ascii_alphabetic).count() >= 3;
+                    run.grammar != CandidateGrammar::Hierarchy
+                        || !worded
+                        || fences.continues[view.place(root.marker_range.start).slot.index()].is_none()
                 })
                 .collect();
             if found.is_empty() {
