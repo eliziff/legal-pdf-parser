@@ -57,10 +57,27 @@ pub(crate) fn structure_graph(
     moves: &[Move],
     identity: &StructureIdentity,
 ) -> Result<DocumentStructure> {
-    // The text runs in the parser's reading order.
+    // The text runs in the parser's reading order, and each page's regions are its lines' regions as
+    // the parser reads them: furniture and page labels the page's header above its middle, its
+    // footer below.
     for (k, &slot) in table.order.iter().enumerate() {
-        slots.line_mut(pages, slot).reading_order = k as _;
+        let height = pages[slots.page(slot)].height.max(1.0);
+        let line = slots.line_mut(pages, slot);
+        line.reading_order = k as _;
+        let low = (line.bbox[1] + line.bbox[3]) / 2.0 > height / 2.0;
+        line.region_type = match REGIONS[usize::from(moves[k].region)] {
+            "line_label" => "line_label",
+            "furniture" | "page_label" if low => "footer",
+            "furniture" | "page_label" => "header",
+            "note" | "note_quote" => "footnote",
+            "heading" => "heading",
+            "title" => "title",
+            "marginal_note" => "marginal_note",
+            _ => "body",
+        }
+        .to_owned();
     }
+    build_regions(pages);
     let index = PdfTextIndex::from_pages(pages);
     let text_of = |k: usize| slots.line(pages, table.order[k]).text.clone();
     let id_of = |k: usize| slots.line(pages, table.order[k]).id.clone();
