@@ -85,18 +85,20 @@ pub(crate) struct Decision {
 
 /// The one reading of each line's opening marker that may open its unit, as (run, member) indexes,
 /// by slot: of the counted, unquoted markers on the line that resolve to a unit, the one standing
-/// first on it; where runs read that one marker, the first run's (a count of numbers before the
-/// provision ladder: the engine has already read an order's count inside a numbered paragraph as
-/// a list).
+/// first on it; where runs read that one marker, a count of numbers's before the provision
+/// ladder's and the ladder's before a list's, wherever each run starts (the engine has already
+/// read an order's count inside a numbered paragraph as a list; a factum's "PART I" ladder,
+/// starting above its first paragraph, takes no paragraph's number from the count).
 fn readings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
     let mut chosen: Vec<Option<(u32, u32)>> = vec![None; count];
+    let rank = |r: usize, k: usize| (runs.runs[r].members[k].marker[0].offset, crate::structure::graph::grammar_rank(runs.runs[r].grammar));
     for (r, run) in runs.runs.iter().enumerate() {
         for (k, member) in run.members.iter().enumerate() {
             if !member.counted || member.kind.is_none() || quoted(member) {
                 continue;
             }
             let at = member.slot.index();
-            let better = chosen[at].is_none_or(|(r0, k0)| member.marker[0].offset < runs.runs[r0 as usize].members[k0 as usize].marker[0].offset);
+            let better = chosen[at].is_none_or(|(r0, k0)| rank(r, k) < rank(r0 as usize, k0 as usize));
             if better {
                 chosen[at] = Some((r as u32, k as u32));
             }

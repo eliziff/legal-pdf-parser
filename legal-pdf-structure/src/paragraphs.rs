@@ -42,6 +42,11 @@ pub(crate) fn marker_only_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(&format!(r"^\s*([{BULLETS}o]|{ENUMERATOR})\s*$")).unwrap())
 }
 
+/// A line opening with a bullet or an enumerator, or nothing but one: an item's first line.
+pub(crate) fn opens_item(text: &str) -> bool {
+    bullet_re().is_match(text) || enumerator_re().is_match(text) || marker_only_re().is_match(text)
+}
+
 fn terminal_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?$").unwrap())
@@ -545,10 +550,7 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
         return false;
     }
     let text = b.text.trim_start();
-    if bullet_re().is_match(text)
-        || enumerator_re().is_match(text)
-        || marker_only_re().is_match(text)
-    {
+    if opens_item(text) {
         return false;
     }
     let lower = text.chars().next().is_some_and(char::is_lowercase);

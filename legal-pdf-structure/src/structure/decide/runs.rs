@@ -509,6 +509,21 @@ impl Runs {
             let found = legal_pdf_support::profile::measure("candidates.detect", || {
                 legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true)
             });
+            // A provision ladder whose every top-level marker goes on with the sentence before it
+            // (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the question
+            // numbers under it are the count's, not its subsections.
+            let found: Vec<StructureCandidateRun> = found
+                .into_iter()
+                .filter(|run| {
+                    let roots: Vec<Slot> = run
+                        .markers
+                        .iter()
+                        .filter(|candidate| candidate.parent_candidate_id.is_none())
+                        .map(|candidate| view.place(candidate.marker_range.start).slot)
+                        .collect();
+                    run.grammar != CandidateGrammar::Hierarchy || roots.is_empty() || roots.iter().any(|root| fences.continues[root.index()].is_none())
+                })
+                .collect();
             if found.is_empty() {
                 continue;
             }
