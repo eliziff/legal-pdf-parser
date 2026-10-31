@@ -5,13 +5,15 @@
 //!
 //! Its scores come from tables fitted on the gold (`trees::Forest`): the local scores rank the line's
 //! region-and-opening classes on its evidence alone (`lines::LineTable`); the ranker scores each
-//! candidate move on its local score and its fit to the state. Tier 1 and tier 2 give the same moves
-//! other scores; the parser stays the same.
+//! candidate move on its local score and its fit to the state. A line's candidates are the classes the
+//! local scores hold likely and those the state proposes (`State::proposed`). Tier 1 and tier 2 give the
+//! same moves other scores; the parser stays the same.
 //!
 //! It runs beside the stage parser while it is fitted and measured; its environment:
-//! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`), and
-//!   LEGALPDF_TRANSITION_LOCAL_FOLDS, two forests a document's half reads in turn (out of fold);
-//! - LEGALPDF_TRANSITION_RANKER, a ranker forest (binary over a candidate's `ranked` features);
+//! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`), or
+//!   LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of two (fold0.txt, fold1.txt) a document's half reads
+//!   in turn (out of fold), or both together where LEGALPDF_TRANSITION_FOLDS_AVERAGE is set;
+//! - LEGALPDF_TRANSITION_RANKER, a ranker forest (one score per candidate's `RANKED` features);
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold),
 //!   for the oracle;
@@ -32,15 +34,26 @@ use trees::Forest;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The region-and-opening classes the local scores keep for each line.
-const KEEP: usize = 4;
+/// A line's candidates take the local scores' classes, best first, until they hold this much of its
+/// probability, at most `KEEP`.
+const MASS: f64 = 0.995;
+const KEEP: usize = 6;
+/// The region-and-opening classes.
+const CLASSES: usize = 34;
 /// A ranked candidate's features: its class's local log-probability and rank, its `CANDIDATE`
 /// features, and the line's place, type and marker (`lines::LINE_FEATURES`'s first twenty and its marker's).
 pub(crate) const RANKED: usize = 2 + CANDIDATES + 40;
 
+enum LocalScores {
+    One(Forest),
+    /// Out of fold: a document's half read by the forest fitted on the other half.
+    Folds(Forest, Forest),
+    /// Both halves' forests, their probabilities averaged.
+    Average(Forest, Forest),
+}
+
 struct Settings {
-    local: Option<Forest>,
-    folds: Option<(Forest, Forest)>,
+    local: Option<LocalScores>,
     ranker: Option<Forest>,
     gold: Option<HashMap<String, HashMap<String, [i64; 8]>>>,
     dump: Option<PathBuf>,
@@ -52,12 +65,19 @@ fn settings() -> &'static Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     SETTINGS.get_or_init(|| {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
-        let forest = |path: PathBuf| Forest::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok();
-        let folds = var("LEGALPDF_TRANSITION_LOCAL_FOLDS").and_then(|folder| Some((forest(folder.join("fold0.txt"))?, forest(folder.join("fold1.txt"))?)));
+        let forest = |path: PathBuf, width: usize, classes: usize| Forest::read(&path, width, classes).map_err(|e| eprintln!("transition parser: {e}")).ok();
+        let local = match (var("LEGALPDF_TRANSITION_LOCAL"), var("LEGALPDF_TRANSITION_LOCAL_FOLDS")) {
+            (Some(path), _) => forest(path, ALL, CLASSES).map(LocalScores::One),
+            (None, Some(folder)) => {
+                let pair = forest(folder.join("fold0.txt"), ALL, CLASSES).zip(forest(folder.join("fold1.txt"), ALL, CLASSES));
+                let average = std::env::var_os("LEGALPDF_TRANSITION_FOLDS_AVERAGE").is_some();
+                pair.map(|(a, b)| if average { LocalScores::Average(a, b) } else { LocalScores::Folds(a, b) })
+            }
+            (None, None) => None,
+        };
         Settings {
-            local: var("LEGALPDF_TRANSITION_LOCAL").and_then(forest),
-            folds,
-            ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(forest),
+            local,
+            ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(|path| forest(path, RANKED, 1)),
             gold: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_gold(&path)),
             dump: var("LEGALPDF_TRANSITION_DUMP"),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
@@ -96,55 +116,46 @@ fn read_gold(path: &Path) -> HashMap<String, HashMap<String, [i64; 8]>> {
     found
 }
 
-/// The move the gold makes at a line, among `candidates`: its region and opening, counting on the
-/// reading that goes on with what is open (the next of an open family, else a new family's first,
-/// else any) where the gold marks the unit's marker, else on none; a note on the next number or an
-/// unanswered reference's; a heading at the gold's step from the heading before it (the nearest the
-/// candidates allow).
-fn oracle(gold: &[i64; 8], state: &State, line: &LineView, candidates: &[Move]) -> Option<usize> {
-    let (region, opens, marked) = (gold[0], gold[1] == 1, gold[5] == 1);
+/// The move the gold makes at a line, among `candidates`: of those of the gold's region and opening,
+/// the one whose result, the state replayed one move on, the gold agrees with most: a heading's level
+/// step, a body unit's depth step, whether the unit opens on its marker, a note answering a reference
+/// on a line the gold pairs. None where no candidate is of the gold's region and opening.
+fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidates: &[Move]) -> Option<usize> {
+    let here = &gold[k];
+    let (region, opens) = (here[0], here[1] == 1);
     if region < 0 {
         return None;
     }
-    let empty = Open::default();
-    let stream = state.streams.get(&line.ctx).unwrap_or(&empty);
-    let target = if gold[4] > 0 { (gold[4] - 10) as i8 } else { 0 };
-    let preference = |m: &Move| -> (u8, i8) {
-        let step = (m.step - target).abs();
-        if let Some(value) = m.note {
-            let fit = if stream.note.is_some_and(|last| value == last + 1) { 0 } else if stream.unanswered.iter().any(|&(r, _)| r == value) { 1 } else { 2 };
-            return (fit, step);
+    let disagreements = |m: &Move| -> u32 {
+        let made = state.clone().apply(line, m);
+        let mut wrong = 0;
+        if m.opens && m.region == HEADING {
+            wrong += (made.level_step - here[4]).unsigned_abs() as u32 * 2;
         }
-        // A note counts on its number where it has one.
+        if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 {
+            wrong += u32::from(made.depth_step != here[7]);
+        }
+        if m.opens && m.region != NOTE {
+            wrong += u32::from(m.reading.is_some() != (here[5] == 1));
+        }
         if m.opens && m.region == NOTE {
-            return (3, step);
+            wrong += match (m.note, made.paired) {
+                (Some(_), Some(line)) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
+                (Some(_), _) => 1,
+                (None, _) => 3,
+            };
         }
-        let fit = match (m.reading.and_then(|r| line.readings.get(usize::from(r))), marked) {
-            (Some(reading), true) => match stream.stack.iter().rposition(|f| f.family == reading.family) {
-                Some(depth) if reading.value == stream.stack[depth].value + 1 => 0,
-                None if reading.value == 1 => 1,
-                _ => 2,
-            },
-            (None, false) => 0,
-            (None, true) => 3,
-            (Some(_), false) => 4,
-        };
-        (fit, step)
+        wrong
     };
     (0..candidates.len())
         .filter(|&c| i64::from(candidates[c].region) == region && candidates[c].opens == opens)
-        .min_by_key(|&c| {
-            let (fit, step) = preference(&candidates[c]);
-            (step, fit, c)
-        })
+        .min_by_key(|&c| (disagreements(&candidates[c]), c))
 }
 
-/// A line's local scores: each region-and-opening class's probability, the classes best first, and
-/// the classes its candidates are drawn from.
+/// A line's local scores: each region-and-opening class's probability, and the classes best first.
 struct Local {
     probabilities: Vec<f64>,
     ranked: Vec<usize>,
-    classes: Vec<usize>,
 }
 
 /// A candidate move's ranked features: its class's local log-probability and rank, its fit to the
@@ -152,11 +163,31 @@ struct Local {
 fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, candidate: &Move) -> [f32; RANKED] {
     let mut f = [0f32; RANKED];
     f[0] = local.probabilities[candidate.class()].max(1e-6).ln() as f32;
-    f[1] = local.ranked.iter().position(|&c| c == candidate.class()).unwrap_or(34) as f32;
+    f[1] = local.ranked.iter().position(|&c| c == candidate.class()).unwrap_or(CLASSES) as f32;
     f[2..2 + CANDIDATES].copy_from_slice(&state.features(line, candidate));
     f[2 + CANDIDATES..22 + CANDIDATES].copy_from_slice(&row[..20]);
     f[22 + CANDIDATES..RANKED].copy_from_slice(&row[72..92]);
     f
+}
+
+/// The classes a line's candidates come from: the local scores' best until they hold `MASS` of its
+/// probability (at most `KEEP`), and those the state proposes.
+fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
+    let mut classes = Vec::new();
+    let mut held = 0.0;
+    for &c in &local.ranked {
+        if held >= MASS || classes.len() == KEEP {
+            break;
+        }
+        classes.push(c);
+        held += local.probabilities[c];
+    }
+    for c in state.proposed(line) {
+        if !classes.contains(&c) {
+            classes.push(c);
+        }
+    }
+    classes
 }
 
 /// One document parsed: its lines' moves in reading order (greedily, or by a beam of whole readings
@@ -166,17 +197,13 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
     let table = LineTable::read(pages, slots, evidence, fences);
     let n = table.order.len();
     let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
-    let forest = match &s.folds {
-        // Out of fold: a document's half is read by the forest fitted on the other half.
-        Some((fold0, fold1)) => Some(if half(sha256) == 0 { fold1 } else { fold0 }),
-        None => s.local.as_ref(),
-    };
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let views: Vec<LineView> = (0..n).map(|k| {
         let slot = table.order[k];
         let at = slot.index();
         LineView {
             ctx: fences.ctx[at],
+            document: fences.document[at],
             readings: &table.readings[k],
             label: evidence.label[at].map(|l| l.value),
             line_number: slots.line(pages, slot).text.trim().parse::<u32>().ok().filter(|_| evidence.line_number[at]),
@@ -186,16 +213,19 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
         }
     }).collect();
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
+    let probabilities = |row: &[f32]| -> Vec<f64> {
+        match &s.local {
+            Some(LocalScores::One(forest)) => forest.probabilities(row),
+            Some(LocalScores::Folds(fold0, fold1)) => if half(sha256) == 0 { fold1 } else { fold0 }.probabilities(row),
+            Some(LocalScores::Average(a, b)) => a.probabilities(row).iter().zip(b.probabilities(row)).map(|(x, y)| (x + y) / 2.0).collect(),
+            None => vec![1.0 / CLASSES as f64; CLASSES],
+        }
+    };
     let locals: Vec<Local> = (0..n).map(|k| {
-        let probabilities = forest.map(|f| f.probabilities(table.row(k))).unwrap_or_else(|| vec![1.0 / 34.0; 34]);
+        let probabilities = probabilities(table.row(k));
         let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
         ranked.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]).then(a.cmp(&b)));
-        let mut classes: Vec<usize> = ranked.iter().copied().take(KEEP).collect();
-        let gold_class = (gold_rows[k][0] >= 0).then(|| (gold_rows[k][0] * 2 + i64::from(gold_rows[k][1] == 1)) as usize);
-        if let Some(c) = gold_class.filter(|c| !classes.contains(c) && s.dump.is_some()) {
-            classes.push(c);
-        }
-        Local { probabilities, ranked, classes }
+        Local { probabilities, ranked }
     }).collect();
     let moves = match (&s.ranker, s.beam) {
         (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, &table, &views, &locals),
@@ -205,18 +235,18 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
             let (mut move_rows, mut move_lines, mut move_classes, mut move_oracle) = (Vec::<f32>::new(), Vec::<u32>::new(), Vec::<u16>::new(), Vec::<u8>::new());
             for k in 0..n {
                 let (line, local) = (&views[k], &locals[k]);
-                let candidates = state.candidates(line, &local.classes);
+                let candidates = state.candidates(line, &classes_of(&state, line, local));
                 let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
-                let best_oracle = gold.and_then(|_| oracle(&gold_rows[k], &state, line, &candidates));
+                let best_oracle = gold.and_then(|_| oracle(&gold_rows, k, &state, line, &candidates));
                 let choice = match &s.ranker {
                     Some(ranker) => {
                         let scores: Vec<f64> = features.iter().map(|f| ranker.scores(f)[0]).collect();
                         (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
                     }
-                    // No ranker: the oracle where the gold is read (the first round's rollout), else the
-                    // local scores' best class, counting on nothing.
+                    // No ranker: the oracle where the gold is read and reachable (the first round's
+                    // rollout), else the local scores' best class, counting on nothing.
                     None => best_oracle.unwrap_or_else(|| {
-                        candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.step == 0).unwrap_or(0)
+                        candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1).unwrap_or(0)
                     }),
                 };
                 if s.dump.is_some() {
@@ -271,7 +301,7 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
         let (line, local) = (&views[k], &locals[k]);
         let mut extended: Vec<(usize, Move, f64)> = Vec::new();
         for (r, (state, score, _)) in readings.iter().enumerate() {
-            let candidates = state.candidates(line, &local.classes);
+            let candidates = state.candidates(line, &classes_of(state, line, local));
             let scores: Vec<f64> = candidates.iter().map(|m| ranker.scores(&ranked_features(state, line, table.row(k), local, m))[0]).collect();
             let top = scores.iter().copied().fold(f64::MIN, f64::max);
             let total: f64 = scores.iter().map(|x| (x - top).exp()).sum();
@@ -299,35 +329,23 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
 }
 
 /// The moves as the grader's labels, the state replayed over them: region, opening, document start,
-/// paired reference (a body line a note answered), a heading's level step, a marker, no resumption, a
-/// body unit's depth step (its depth among the body units open on the stack, stepped from the one
-/// before).
+/// paired reference (a line a note answered), a heading's level step, a marker, no resumption, a body
+/// unit's depth step.
 fn labelled(table: &LineTable, fences: &Fences, views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     let mut state = State::default();
     let mut labels: Vec<[i64; 8]> = Vec::with_capacity(moves.len());
-    let mut body_depth: Option<usize> = None;
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let at = table.order[k].index();
         let starts_document = fences.document[at] != 0 && (k == 0 || fences.document[table.order[k - 1].index()] != fences.document[at]);
-        let mut label = [i64::from(chosen.region), i64::from(chosen.opens), i64::from(starts_document), 0, 0, i64::from(chosen.reading.is_some()), -1, 0];
-        if chosen.opens && chosen.region == HEADING {
-            label[4] = 10 + i64::from(chosen.step);
-        }
-        if let Some(paired) = state.apply(line, chosen) {
+        let made = state.apply(line, chosen);
+        if let Some(paired) = made.paired {
             labels[paired as usize][3] = 1;
         }
-        if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-            let depth = state.streams.get(&line.ctx).map_or(0, |open| open.stack.iter().filter(|f| RANKED_BODY.contains(&f.region)).count()).max(1);
-            label[7] = (10 + depth as i64 - body_depth.unwrap_or(1) as i64).clamp(2, 18);
-            body_depth = Some(depth);
-        }
-        labels.push(label);
+        let marked = chosen.opens && chosen.reading.is_some();
+        labels.push([i64::from(chosen.region), i64::from(chosen.opens), i64::from(starts_document), 0, made.level_step, i64::from(marked), -1, made.depth_step]);
     }
     labels
 }
-
-/// The body regions that take a depth (the tagger's ranked regions, headings aside).
-const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 
 /// Which half of the documents a source falls in: the CRC-32 of its sha256 (zlib's), modulo two.
 fn half(sha256: &str) -> u32 {

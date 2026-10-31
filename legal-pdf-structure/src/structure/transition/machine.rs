@@ -1,12 +1,13 @@
 //! The parser's moves and state. Each line in reading order makes one move: it opens a unit of a
 //! region or goes on with the one open in its stream, and a line that opens may count on its marker
-//! (one of its grammar readings) or on a note label; a heading opens at a level, a step from the
-//! heading open before it. What is open is kept per reading context: the stack of numbered units
-//! (family, value, region: PART II > 12 > (2) > (a)), the heading level and the level each look of
-//! heading last took, the last note opened and the reference marks the body set that no note has
-//! answered (with the line that set each), the last transcript line number. A move is scored on the
-//! line's evidence and on how it fits this state; applying it moves the state, and a note opening on a
-//! number the body set pairs with the line that set it.
+//! (one of its grammar readings) or on a note label; a heading opens at a level. What is open is kept
+//! per reading context (the stack of numbered units, family, value and region: PART II > 12 > (2) >
+//! (a); the last note opened and the reference marks the body set that no note has answered, with the
+//! line that set each; the last transcript line number) and per document in reading order (the open
+//! heading's level, the level each look of heading last took, the last body unit's depth). A move is
+//! scored on the line's evidence and on how it fits this state; applying it moves the state and says
+//! what the move made of the line: the reference it paired, its heading's level step, its body unit's
+//! depth step.
 
 use super::*;
 
@@ -20,24 +21,23 @@ pub(crate) const NOTE: u8 = 5;
 pub(crate) const LINE_LABEL: u8 = 13;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
-/// Regions of the body, whose reference marks notes answer.
-const BODY: [u8; 6] = [1, 2, 4, 8, 9, 16];
+/// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
+const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
+/// The body regions that take a depth (the tagger's ranked regions, headings aside).
+pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 /// A stack holds at most this many open units; headings run nine levels deep.
 const DEPTH: usize = 8;
 const LEVELS: i8 = 9;
-/// The steps a heading may take from the one open before it.
-const STEPS: [i8; 5] = [-2, -1, 0, 1, 2];
 
 /// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
-/// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's step from the
-/// heading open before it.
+/// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Move {
     pub(crate) region: u8,
     pub(crate) opens: bool,
     pub(crate) reading: Option<u8>,
     pub(crate) note: Option<u32>,
-    pub(crate) step: i8,
+    pub(crate) level: i8,
 }
 
 impl Move {
@@ -59,35 +59,62 @@ pub(crate) struct Frame {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Open {
     pub(crate) stack: Vec<Frame>,
-    /// The open heading's level (0 before the first).
-    pub(crate) heading: i8,
-    /// Each look a heading took and the level it last took.
-    pub(crate) look_levels: Vec<(u32, i8)>,
     pub(crate) note: Option<u32>,
     /// The reference marks the body set that no note has answered, each with the line that set it.
     pub(crate) unanswered: Vec<(u32, u32)>,
     pub(crate) line_number: Option<u32>,
 }
 
-/// The parse so far: what is open in each context, the move before, and how many lines ago each region
-/// last opened a unit.
+/// What a document's outline holds so far, in reading order.
 #[derive(Clone, Debug, Default)]
+pub(crate) struct Outline {
+    /// The open heading's level (0 before the first).
+    pub(crate) heading: i8,
+    /// Each look a heading took and the level it last took.
+    pub(crate) look_levels: Vec<(u32, i8)>,
+    /// The last body unit's depth (0 before the first).
+    pub(crate) body_depth: usize,
+}
+
+/// The parse so far: what is open in each context and each document's outline, the move before, and
+/// how many lines ago each region last opened a unit.
+#[derive(Clone, Debug)]
 pub(crate) struct State {
     pub(crate) streams: HashMap<u16, Open>,
+    pub(crate) outlines: HashMap<u16, Outline>,
     pub(crate) previous: Option<Move>,
     pub(crate) since: [u32; 17],
 }
 
-/// A line as the state reads it: its reading context, its marker's readings, its note label's value,
-/// its transcript line number, its look, the reference marks it sets, and its place in reading order.
+impl Default for State {
+    fn default() -> Self {
+        // No region has opened a unit yet: as long ago as `features` counts.
+        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17] }
+    }
+}
+
+/// A line as the state reads it: its reading context and document, its marker's readings, its note
+/// label's value, its transcript line number, its look, the reference marks it sets, and its place in
+/// reading order.
 pub(crate) struct LineView<'a> {
     pub(crate) ctx: u16,
+    pub(crate) document: u16,
     pub(crate) readings: &'a [MarkerReading],
     pub(crate) label: Option<u32>,
     pub(crate) line_number: Option<u32>,
     pub(crate) look: u32,
     pub(crate) references: &'a [u32],
     pub(crate) place: u32,
+}
+
+/// What a move made of its line: the earlier line whose reference mark its note answered, a heading's
+/// level step from the heading before it in its document (10 the same, as the gold steps), a body
+/// unit's depth step from the body unit before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Made {
+    pub(crate) paired: Option<u32>,
+    pub(crate) level_step: i64,
+    pub(crate) depth_step: i64,
 }
 
 /// The names of a candidate move's features, read off the move and the state: the move itself, the
@@ -137,16 +164,43 @@ impl State {
         self.streams.get(&ctx)
     }
 
-    /// Every move a line may make: each region opening or going on; an opening of a numbered region
-    /// counting on each of the line's readings or on none; a heading at each step from the open
-    /// heading that keeps its level within one and nine; a note opening on its label's value or a
-    /// reading's or on none. `classes` are the region-and-opening classes kept (the local scores' best).
+    fn outline(&self, document: u16) -> Option<&Outline> {
+        self.outlines.get(&document)
+    }
+
+    /// The region-and-opening classes the state itself proposes for a line, whatever the local scores
+    /// say: a note opening on the next note number or on a number the body set; a transcript line number
+    /// going on from the last; an opening of the region of an open frame its marker counts on from.
+    pub(crate) fn proposed(&self, line: &LineView) -> Vec<usize> {
+        let mut out = Vec::new();
+        let opening = |region: u8| usize::from(region) * 2 + 1;
+        if let Some(open) = self.open(line.ctx) {
+            let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
+            if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, _)| r == v)) {
+                out.push(opening(NOTE));
+            }
+            if line.line_number.is_some_and(|v| open.line_number.is_some_and(|last| v == last + 1)) {
+                out.push(opening(LINE_LABEL));
+            }
+            for reading in line.readings {
+                if let Some(frame) = open.stack.iter().rev().find(|f| f.family == reading.family && reading.value == f.value + 1) {
+                    out.push(opening(frame.region));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every move a line may make among `classes`: each region opening or going on; an opening of a
+    /// numbered region counting on each of the line's readings or on none; a heading at every level from
+    /// one to two below the open heading's; a note opening on its label's value or a reading's or on
+    /// none.
     pub(crate) fn candidates(&self, line: &LineView, classes: &[usize]) -> Vec<Move> {
-        let heading = self.open(line.ctx).map_or(0, |open| open.heading);
+        let heading = self.outline(line.document).map_or(0, |outline| outline.heading);
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, step: 0 };
+            let plain = Move { region, opens, reading: None, note: None, level: 0 };
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 let mut values: Vec<u32> = line.label.into_iter().collect();
@@ -157,14 +211,9 @@ impl State {
             }
             bases.push(plain);
             if opens && region == HEADING {
+                let deepest = (heading.max(1) + 2).min(LEVELS);
                 for base in bases {
-                    let first = heading == 0;
-                    for &step in STEPS.iter().filter(|&&s| !first || s >= 0) {
-                        let level = heading.max(1) + step;
-                        if (1..=LEVELS).contains(&level) {
-                            out.push(Move { step, ..base });
-                        }
-                    }
+                    out.extend((1..=deepest).map(|level| Move { level, ..base }));
                 }
             } else {
                 out.extend(bases);
@@ -177,6 +226,8 @@ impl State {
     pub(crate) fn features(&self, line: &LineView, candidate: &Move) -> [f32; CANDIDATES] {
         let empty = Open::default();
         let stream = self.open(line.ctx).unwrap_or(&empty);
+        let blank = Outline::default();
+        let outline = self.outline(line.document).unwrap_or(&blank);
         let flag = |b: bool| f32::from(u8::from(b));
         let mut f = [0f32; CANDIDATES];
         f[0] = f32::from(candidate.region);
@@ -226,10 +277,10 @@ impl State {
             }
         }
         if candidate.opens && candidate.region == HEADING {
-            let level = stream.heading.max(1) + candidate.step;
-            f[23] = f32::from(candidate.step);
+            let level = candidate.level;
+            f[23] = f32::from(level - outline.heading.max(1));
             f[24] = f32::from(level);
-            let looked = stream.look_levels.iter().find(|(look, _)| *look == line.look).map(|&(_, l)| l);
+            let looked = outline.look_levels.iter().find(|(look, _)| *look == line.look).map(|&(_, l)| l);
             f[25] = flag(looked.is_some());
             f[26] = looked.map_or(-9.0, |l| f32::from(level - l));
             // A numbered heading's level against the headings it would sit under on the stack.
@@ -241,28 +292,20 @@ impl State {
         f
     }
 
-    /// The state after `line` makes `chosen`; where it opens a note on a number the body set, the
-    /// place of the line that set it (now paired).
-    pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) -> Option<u32> {
+    /// The state after `line` makes `chosen`, and what the move made of the line.
+    pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) -> Made {
+        let mut made = Made::default();
         let stream = self.streams.entry(line.ctx).or_default();
-        let mut paired = None;
         if let Some(reading) = chosen.reading.and_then(|r| line.readings.get(usize::from(r))) {
             stream.stack = counted(&stream.stack, reading, chosen.region);
-        }
-        if chosen.opens && chosen.region == HEADING {
-            stream.heading = stream.heading.max(1) + chosen.step;
-            match stream.look_levels.iter_mut().find(|(look, _)| *look == line.look) {
-                Some(entry) => entry.1 = stream.heading,
-                None => stream.look_levels.push((line.look, stream.heading)),
-            }
         }
         if let (true, NOTE, Some(value)) = (chosen.opens, chosen.region, chosen.note) {
             stream.note = Some(value);
             if let Some(at) = stream.unanswered.iter().rposition(|&(r, _)| r == value) {
-                paired = Some(stream.unanswered.remove(at).1);
+                made.paired = Some(stream.unanswered.remove(at).1);
             }
         }
-        if BODY.contains(&chosen.region) && !line.references.is_empty() {
+        if REFERRING.contains(&chosen.region) && !line.references.is_empty() {
             stream.unanswered.retain(|(r, _)| !line.references.contains(r));
             stream.unanswered.extend(line.references.iter().map(|&r| (r, line.place)));
             let excess = stream.unanswered.len().saturating_sub(30);
@@ -273,6 +316,20 @@ impl State {
                 stream.line_number = Some(value);
             }
         }
+        let body_frames = stream.stack.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
+        let outline = self.outlines.entry(line.document).or_default();
+        if chosen.opens && chosen.region == HEADING {
+            made.level_step = 10 + i64::from(chosen.level - outline.heading.max(1));
+            outline.heading = chosen.level;
+            match outline.look_levels.iter_mut().find(|(look, _)| *look == line.look) {
+                Some(entry) => entry.1 = chosen.level,
+                None => outline.look_levels.push((line.look, chosen.level)),
+            }
+        } else if chosen.opens && RANKED_BODY.contains(&chosen.region) {
+            let depth = body_frames.max(1);
+            made.depth_step = (10 + depth as i64 - outline.body_depth.max(1) as i64).clamp(2, 18);
+            outline.body_depth = depth;
+        }
         for since in &mut self.since {
             *since = since.saturating_add(1);
         }
@@ -280,6 +337,6 @@ impl State {
             self.since[usize::from(chosen.region)] = 0;
         }
         self.previous = Some(*chosen);
-        paired
+        made
     }
 }

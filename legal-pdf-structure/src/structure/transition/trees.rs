@@ -36,9 +36,11 @@ pub(crate) struct Forest {
 }
 
 impl Forest {
-    pub(crate) fn read(path: &Path) -> Result<Self, String> {
+    /// The forest in `path`, which must read at most `width` features and score `expected` classes.
+    pub(crate) fn read(path: &Path, width: usize, expected: usize) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut classes = 1;
+        let mut features = 0usize;
         let mut trees = Vec::new();
         let mut fields: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         let mut in_tree = false;
@@ -62,6 +64,8 @@ impl Forest {
         for line in text.lines() {
             if let Some(n) = line.strip_prefix("num_class=") {
                 classes = n.trim().parse().map_err(|e| format!("num_class: {e}"))?;
+            } else if let Some(n) = line.strip_prefix("max_feature_idx=") {
+                features = n.trim().parse::<usize>().map_err(|e| format!("max_feature_idx: {e}"))? + 1;
             } else if line.starts_with("Tree=") {
                 if in_tree {
                     trees.push(finish(&fields)?);
@@ -81,6 +85,9 @@ impl Forest {
         }
         if trees.is_empty() {
             return Err(format!("{}: no trees", path.display()));
+        }
+        if features > width || classes != expected {
+            return Err(format!("{}: {features} features and {classes} classes, where the parser gives {width} and scores {expected}", path.display()));
         }
         Ok(Self { classes, trees })
     }
