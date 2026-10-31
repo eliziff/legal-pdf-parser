@@ -776,7 +776,8 @@ impl Evidence {
                             && !line_numbers[first + other]
                             && !line.text.trim().is_empty()
                             && crate::paragraphs::same_row(marker, line)
-                            && line.bbox[0] >= marker.bbox[2] - 1.0
+                            && (line.bbox[0] >= marker.bbox[2] - 1.0
+                                || (line.bbox[0] >= marker.bbox[0] - 2.0 && line.bbox[2] > marker.bbox[2]))
                     })
                     .min_by(|&a, &b| page.lines[a].bbox[0].total_cmp(&page.lines[b].bbox[0]))
                     .map(|other| slots.at(page_slot, other));

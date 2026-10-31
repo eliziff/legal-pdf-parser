@@ -71,6 +71,7 @@ fn outline_region(node: &StructureNode, container: Option<NodeKind>) -> Option<R
 #[derive(Default)]
 struct Outline {
     headings: Vec<(usize, usize)>,       // (level, node)
+    decimals: Vec<(Vec<u32>, usize)>,    // (decimal path, node)
     lists: Vec<(String, Option<usize>)>, // (family, parent)
     previous: Option<usize>,
     open_letter: Option<NumberingMarker>,
@@ -85,6 +86,34 @@ pub(crate) fn assemble_outline(
     text: &str,
     level: &dyn Fn(&str) -> Option<usize>,
 ) {
+    let by_id = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let prior_body_parents: Vec<Option<usize>> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let parent = *by_id.get(node.parent_id.as_deref()?)?;
+            (parent != index
+                && contexts[parent].0 == contexts[index].0
+                && matches!(
+                    nodes[parent].kind,
+                    NodeKind::Section | NodeKind::Paragraph | NodeKind::ListItem
+                )
+                && nodes[parent].kind != NodeKind::Heading
+                && nodes[parent].role != Some(PrimaryRole::Heading))
+            .then_some(parent)
+        })
+        .collect();
+    let has_subsections = nodes.iter().any(|node| {
+        node.kind == NodeKind::Section
+            && node
+                .label
+                .as_deref()
+                .is_some_and(|label| label.starts_with("sec") && label.contains('('))
+    });
     let containers = nodes
         .iter()
         .map(|node| (node.id.as_str(), node.kind))
@@ -101,12 +130,15 @@ pub(crate) fn assemble_outline(
             outline_region(node, container).map(|region| (index, region))
         })
         .collect::<Vec<_>>();
-    // A quotation container opens before units with the same source start.
+    // A quotation container or enclosing section container opens before units with the same source start.
     units.sort_by_key(|&(index, _)| {
+        let is_container = nodes[index].kind == NodeKind::Section
+            && nodes[index].role.is_none()
+            && nodes[index].ranges.is_empty();
         (
             nodes[index].range.start,
-            nodes[index].kind != NodeKind::Quote,
-            nodes[index].range.end,
+            nodes[index].kind != NodeKind::Quote && !is_container,
+            std::cmp::Reverse(nodes[index].range.end),
             nodes[index].id.clone(),
         )
     });
@@ -128,14 +160,62 @@ pub(crate) fn assemble_outline(
                 }
                 let parent = outline.headings.last().map(|&(_, node)| node);
                 outline.headings.push((level, index));
+                outline.decimals.clear();
                 outline.lists.clear();
                 outline.open_letter = None;
                 parent
             }
             Region::Text => {
-                outline.lists.clear();
-                outline.open_letter = None;
-                heading
+                let node = &nodes[index];
+                let marker = node
+                    .marker_range
+                    .and_then(|range| coordinates.slice(range.start..range.end))
+                    .or(node.label.as_deref())
+                    .and_then(|value| {
+                        legal_pdf_core::layout_analysis()
+                            .numbering_marker(value, outline.open_letter.as_ref())
+                    });
+                if let Some(prior) = prior_body_parents[index] {
+                    if let Some(ref m) = marker {
+                        if let Some(at) = outline.lists.iter().rposition(|(open, _)| open == &m.family) {
+                            outline.lists.truncate(at + 1);
+                            outline.lists[at].1 = Some(prior);
+                        } else {
+                            outline.lists.push((m.family.clone(), Some(prior)));
+                        }
+                        if m.family.rsplit(':').next() == Some("a") {
+                            outline.open_letter = marker;
+                        }
+                    }
+                    Some(prior)
+                } else {
+                    outline.lists.clear();
+                    outline.open_letter = None;
+                    let decimal_parent = marker
+                        .as_ref()
+                        .filter(|m| {
+                            !has_subsections
+                                && matches!(node.kind, NodeKind::Section | NodeKind::Paragraph)
+                                && (m.family.ends_with(":1") || m.family.contains("1.1"))
+                        })
+                        .and_then(|m| {
+                            let mut path = m.prefix.clone();
+                            if !(m.ordinal == 0 && !path.is_empty()) {
+                                path.push(m.ordinal);
+                            }
+                            while outline
+                                .decimals
+                                .last()
+                                .is_some_and(|(open, _)| !path.starts_with(open) || open.len() >= path.len())
+                            {
+                                outline.decimals.pop();
+                            }
+                            let parent = outline.decimals.last().map(|&(_, node)| node);
+                            outline.decimals.push((path, index));
+                            parent
+                        });
+                    decimal_parent.or(heading)
+                }
             }
             Region::UnderHeading => heading,
             Region::ListItem => {
@@ -153,7 +233,15 @@ pub(crate) fn assemble_outline(
                     .lists
                     .iter()
                     .rposition(|(open, _)| !family.is_empty() && open == family);
-                let parent = if let Some(at) = found {
+                let parent = if let Some(prior) = prior_body_parents[index] {
+                    if let Some(at) = found {
+                        outline.lists.truncate(at + 1);
+                        outline.lists[at].1 = Some(prior);
+                    } else if !family.is_empty() {
+                        outline.lists.push((family.to_owned(), Some(prior)));
+                    }
+                    Some(prior)
+                } else if let Some(at) = found {
                     let parent = outline.lists[at].1;
                     outline.lists.truncate(at + 1);
                     parent
@@ -182,6 +270,11 @@ pub(crate) fn assemble_outline(
         };
         parents[index] = parent;
         nodes[index].parent_id = parent.map(|parent| nodes[parent].id.clone());
-        outline.previous = Some(index);
+        let is_container = nodes[index].kind == NodeKind::Section
+            && nodes[index].role.is_none()
+            && nodes[index].ranges.is_empty();
+        if !is_container {
+            outline.previous = Some(index);
+        }
     }
 }

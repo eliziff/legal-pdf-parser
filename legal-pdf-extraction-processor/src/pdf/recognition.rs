@@ -125,11 +125,6 @@ pub(crate) fn reading_score(lines: &[Line], other: &HashSet<String>) -> f64 {
     recognition_noise(lines) + if words.is_empty() { 0.0 } else { foreign as f64 / words.len() as f64 }
 }
 
-/// Whether a page's text reads as recognized prose: at most one word in ten is noise.
-pub(crate) fn layer_reads_well(lines: &[Line]) -> bool {
-    recognition_noise(lines) <= 0.1
-}
-
 /// How much printable text a page holds; decoding garbage is pdf-inspector's verdict, folded in
 /// where the page is assembled.
 pub(crate) fn text_quality(lines: &[Line]) -> f64 {
@@ -297,8 +292,11 @@ pub fn recognize_pdf(
             let count = |lines: &[Line]| lines.iter().map(|line| line.text.split_whitespace().count()).sum::<usize>() as f64;
             let (layer_count, recognized_count) = (count(&page.lines), count(&lines));
             let missing = |own: f64, other: f64| if other > 0.0 { (1.0 - own / other).max(0.0) } else { 0.0 };
-            if layered && reading_score(&page.lines, &recognized_words) + missing(layer_count, recognized_count)
-                <= reading_score(&lines, &layer_words) + missing(recognized_count, layer_count) {
+            let (layer_score, recognized_score) = (reading_score(&page.lines, &recognized_words) + missing(layer_count, recognized_count),
+                reading_score(&lines, &layer_words) + missing(recognized_count, layer_count));
+            // A scan's layer is another recognizer's reading: it stands only where it reads better than ours.
+            let scan = metadata.scanned_pages.contains(&page_index);
+            if layered && (layer_score < recognized_score || !scan && layer_score == recognized_score) {
                 weak_pages.remove(&page_index);
                 continue;
             }

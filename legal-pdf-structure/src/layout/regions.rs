@@ -10,6 +10,16 @@ pub(crate) fn build_regions(pages: &mut [Page]) {
         let transcript = page.lines.iter().any(|line| line.region_type == "line_label");
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut labels: Vec<Vec<usize>> = Vec::new();
+        let turn_number = |a: &Line, b: &Line| {
+            let token = a.text.trim();
+            !token.is_empty()
+                && token.chars().count() <= 6
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | ')' | '(' | '[' | ']'))
+                && crate::paragraphs::same_row(a, b)
+                && opens_turn(b)
+        };
         for index in 0..page.lines.len() {
             let line = &page.lines[index];
             if transcript && line.region_type == "line_label" {
@@ -19,7 +29,16 @@ pub(crate) fn build_regions(pages: &mut [Page]) {
             if groups.last().is_some_and(|group| {
                 let prior = &page.lines[*group.last().expect("non-empty group")];
                 prior.region_type == line.region_type
-                    && if transcript && line.region_type == "body" { !opens_turn(line) } else { prior.block_index == line.block_index }
+                    && if transcript && line.region_type == "body" {
+                        turn_number(prior, line)
+                            || (!opens_turn(line)
+                                && !page
+                                    .lines
+                                    .get(index + 1)
+                                    .is_some_and(|next| turn_number(line, next)))
+                    } else {
+                        prior.block_index == line.block_index
+                    }
             }) {
                 groups.last_mut().expect("group exists").push(index);
             } else {

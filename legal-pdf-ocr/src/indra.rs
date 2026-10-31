@@ -47,8 +47,8 @@ pub use legal_pdf_core::OrtBackend as IndraBackend;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndraTier {
-    Quality,
     #[default]
+    Quality,
     Balanced,
     Fast,
     Turbo,
@@ -109,7 +109,7 @@ impl Default for IndraOptions {
             batch_size: 0,
             width_bucket: 0,
             input_height: 32,
-            tier: IndraTier::Balanced,
+            tier: IndraTier::Quality,
             backend: None,
             device: None,
             cpu_arena: true,

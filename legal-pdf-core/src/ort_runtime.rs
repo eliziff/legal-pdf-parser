@@ -11,7 +11,10 @@ struct Runtime {
 pub fn init(path: &Path, global_threads: Option<usize>) -> Result<Option<usize>> {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     if let Some(selected) = RUNTIME.get() {
-        return (selected.path == path)
+        // One library however its path is written (the tagger's is canonical, `\\?\C:\...`; recognition's is not).
+        let same = selected.path == path
+            || std::fs::canonicalize(&selected.path).ok().is_some_and(|own| std::fs::canonicalize(path).ok() == Some(own));
+        return same
             .then_some(selected.global_threads)
             .ok_or_else(|| {
                 Error::Message(format!(

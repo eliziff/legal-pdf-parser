@@ -331,7 +331,8 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
             || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em))
             || (pitch.short(a) && pitch.short(b));
         let overlap_allowed = if goes_on(b) || (pitch.short(a) && pitch.short(b)) { 2.0 * em } else { 1.0 };
-        return (!(b.bbox[0] >= a.bbox[2] - overlap_allowed && (marker || adjacent || field_label(a))))
+        let marker_beside = marker && b.bbox[0] >= a.bbox[0] - 2.0 && b.bbox[2] > a.bbox[2];
+        return (!(marker_beside || b.bbox[0] >= a.bbox[2] - overlap_allowed && (marker || adjacent || field_label(a))))
             .then_some("row-apart");
     }
     // Two short lines, the first ending no sentence, stack as one block (an address, a caption, a
