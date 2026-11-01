@@ -534,6 +534,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                         "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
                         "texts": table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect::<Vec<_>>(),
                         "looks": &table.looks,
+                        "pages": table.order.iter().map(|&slot| slots.page(slot)).collect::<Vec<_>>(),
+                        "references": &table.references,
                         "templates": &sheet.template,
                         "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
                         "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(),
