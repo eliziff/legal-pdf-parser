@@ -2,9 +2,11 @@
 //! (`encoder.onnx` beside `encoder.json`, LEGALPDF_TRANSITION_ENCODER), run over a whole document at
 //! once. It reads each line's features as the parser reads them (standardized by the fit's means and
 //! spreads, clipped at 8), its text as the tagger's runner does (each character min(code point, 0x2FFF)
-//! % 2048 + 1, each lowercase word's FNV-1a % 16383 + 1) and its look among the document's, and gives
-//! each line every region-and-opening class's probability. The parser and its ranker are the same over
-//! any tier's scores.
+//! % 2048 + 1, each lowercase word's FNV-1a % 16383 + 1), its look and its template among the document's
+//! (`stylesheet::template_ids`), and the document's openers (`stylesheet::opener`), whose states attend
+//! to one another across the whole document, each line reading the last opener at or before it; and
+//! gives each line every region-and-opening class's probability and, were it a heading's opening, each
+//! level's. The parser and its ranker are the same over any tier's scores.
 
 use super::*;
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -50,8 +52,9 @@ impl Encoder {
         Ok(Self { session: Mutex::new(session), meta })
     }
 
-    /// Each line's class probabilities, lines in reading order, `CLASSES` a line.
-    pub(crate) fn probabilities(&self, table: &LineTable, texts: &[&str]) -> std::result::Result<Vec<f64>, String> {
+    /// Each line's class probabilities (`CLASSES` a line) and heading-level probabilities
+    /// (`LEVEL_CLASSES` a line), lines in reading order.
+    pub(crate) fn probabilities(&self, table: &LineTable, texts: &[&str]) -> std::result::Result<(Vec<f32>, Vec<f32>), String> {
         let n = table.order.len();
         let m = &self.meta;
         let features: Vec<f32> = table.features.iter().enumerate()
@@ -73,17 +76,41 @@ impl Encoder {
         distinct.sort_unstable();
         distinct.dedup();
         let looks: Vec<i64> = table.looks.iter().map(|look| distinct.binary_search(look).unwrap_or(0) as i64).collect();
+        let templates: Vec<i64> = template_ids(table).into_iter().map(i64::from).collect();
+        // The openers' places (the first line where none is one), and each line's last opener at or
+        // before it, counted from 1 (0 for none).
+        let mut openers: Vec<i64> = (0..n).filter(|&k| opener(table, k)).map(|k| k as i64).collect();
+        if openers.is_empty() {
+            openers.push(0);
+        }
+        let mut last_opener = vec![0i64; n];
+        let mut seen = 0usize;
+        for (k, last) in last_opener.iter_mut().enumerate() {
+            while seen < openers.len() && openers[seen] as usize <= k {
+                seen += 1;
+            }
+            *last = seen as i64;
+        }
         let f = TensorRef::from_array_view(([n, ALL], &features[..])).map_err(|e| e.to_string())?;
         let c = TensorRef::from_array_view(([n, m.chars], &chars[..])).map_err(|e| e.to_string())?;
         let w = TensorRef::from_array_view(([n, m.words], &words[..])).map_err(|e| e.to_string())?;
         let l = TensorRef::from_array_view(([n], &looks[..])).map_err(|e| e.to_string())?;
+        let tm = TensorRef::from_array_view(([n], &templates[..])).map_err(|e| e.to_string())?;
+        let op = TensorRef::from_array_view(([openers.len()], &openers[..])).map_err(|e| e.to_string())?;
+        let lo = TensorRef::from_array_view(([n], &last_opener[..])).map_err(|e| e.to_string())?;
         let mut session = self.session.lock().map_err(|_| "encoder session poisoned")?;
-        let outputs = session.run(ort::inputs!["features" => f, "chars" => c, "words" => w, "looks" => l]).map_err(|e| format!("encoder run: {e}"))?;
+        let outputs = session
+            .run(ort::inputs!["features" => f, "chars" => c, "words" => w, "looks" => l, "templates" => tm, "openers" => op, "last_opener" => lo])
+            .map_err(|e| format!("encoder run: {e}"))?;
+        let softmax = |values: &[f32], width: usize| -> Vec<f32> {
+            values.chunks_exact(width).flat_map(|row| {
+                let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let total: f32 = row.iter().map(|x| (x - top).exp()).sum();
+                row.iter().map(move |x| (x - top).exp() / total)
+            }).collect()
+        };
         let (_, logits) = outputs["logits"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-        Ok(logits.chunks_exact(CLASSES).flat_map(|row| {
-            let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let total: f32 = row.iter().map(|x| (x - top).exp()).sum();
-            row.iter().map(move |x| f64::from((x - top).exp() / total))
-        }).collect())
+        let (_, levels) = outputs["levels"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        Ok((softmax(logits, CLASSES), softmax(levels, LEVEL_CLASSES)))
     }
 }

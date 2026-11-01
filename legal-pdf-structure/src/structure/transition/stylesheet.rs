@@ -51,6 +51,39 @@ fn feature(name: &str) -> usize {
     LINE_FEATURES.iter().position(|n| *n == name).expect("a line feature")
 }
 
+/// Each line's template, numbered from 0 in order of first appearance: its look, where it stands (at
+/// the margin, indented a little or more, centred, set right) and the numbering family its marker
+/// counts in.
+pub(crate) fn template_ids(table: &LineTable) -> Vec<u32> {
+    let (indent, centre, width, right) = (feature("indent"), feature("centre"), feature("width"), feature("right_gap"));
+    let counts: Vec<usize> = ["count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet"]
+        .iter().map(|name| feature(name)).collect();
+    let mut ids: HashMap<(u32, u8, u8), u32> = HashMap::new();
+    (0..table.order.len()).map(|k| {
+        let row = table.row(k);
+        let place = if row[centre].abs() < 0.04 && row[width] < 0.85 {
+            3
+        } else if row[indent] > 0.4 && row[right] < 0.05 {
+            4
+        } else if row[indent] < 0.02 {
+            0
+        } else if row[indent] < 0.08 {
+            1
+        } else {
+            2
+        };
+        let family = counts.iter().position(|&c| row[c] > 0.5).map_or(9, |c| c as u8);
+        let next = ids.len() as u32;
+        *ids.entry((table.looks[k], place, family)).or_insert(next)
+    }).collect()
+}
+
+/// Whether a line may open a unit as the encoder's attention reads the document: it opens on a marker,
+/// or it is short (sixty characters or fewer).
+pub(crate) fn opener(table: &LineTable, k: usize) -> bool {
+    !table.readings[k].is_empty() || table.row(k)[feature("length")] <= 0.8222
+}
+
 impl Stylesheet {
     pub(crate) fn read(
         pages: &[Page],
@@ -63,31 +96,9 @@ impl Stylesheet {
     ) -> Self {
         let n = table.order.len();
         let at = |name: &str| feature(name);
-        let (indent, centre, width, right) = (at("indent"), at("centre"), at("width"), at("right_gap"));
         let (size, bold, upper, edge) = (at("size"), at("bold"), at("upper"), at("edge_repeated"));
-        let counts: Vec<usize> = ["count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet"]
-            .iter().map(|name| at(name)).collect();
-        // Each line's template: its look, where it stands (at the margin, indented a little or more,
-        // centred, set right) and the numbering family its marker counts in.
-        let mut ids: HashMap<(u32, u8, u8), u32> = HashMap::new();
-        let template: Vec<u32> = (0..n).map(|k| {
-            let row = table.row(k);
-            let place = if row[centre].abs() < 0.04 && row[width] < 0.85 {
-                3
-            } else if row[indent] > 0.4 && row[right] < 0.05 {
-                4
-            } else if row[indent] < 0.02 {
-                0
-            } else if row[indent] < 0.08 {
-                1
-            } else {
-                2
-            };
-            let family = counts.iter().position(|&c| row[c] > 0.5).map_or(9, |c| c as u8);
-            let next = ids.len() as u32;
-            *ids.entry((table.looks[k], place, family)).or_insert(next)
-        }).collect();
-        let count = ids.len();
+        let template = template_ids(table);
+        let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
         let geometry = crate::structure::decide::Geometry::of(pages);
         let anchoring = crate::structure::decide::anchors(pages, slots, evidence, fences, &geometry, &fences.role, outline);

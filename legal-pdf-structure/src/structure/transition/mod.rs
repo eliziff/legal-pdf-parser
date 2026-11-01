@@ -60,7 +60,9 @@ const CLASSES: usize = 34;
 pub(crate) const ORIGIN: &str = "legal-pdf-transition.v1";
 /// A ranked candidate's features: its class's local log-probability and rank, its `CANDIDATE`
 /// features, and the line's place, type and marker (`lines::LINE_FEATURES`'s first twenty and its marker's).
-pub(crate) const RANKED: usize = 2 + CANDIDATES + 40;
+pub(crate) const RANKED: usize = 2 + CANDIDATES + 40 + 1;
+/// The heading levels a local model's level distribution covers (0 unused).
+pub(crate) const LEVEL_CLASSES: usize = 10;
 
 enum LocalScores {
     One(Forest),
@@ -218,6 +220,9 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
 pub(crate) struct Local {
     probabilities: Vec<f64>,
     ranked: Vec<usize>,
+    /// Where the local model says it (tier 1's and tier 2's encoders): each heading level's
+    /// probability were the line a heading's opening.
+    levels: Option<Vec<f32>>,
 }
 
 /// A candidate move's ranked features: its class's local log-probability and rank, its fit to the
@@ -228,7 +233,12 @@ fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, c
     f[1] = local.ranked.iter().position(|&c| c == candidate.class()).unwrap_or(CLASSES) as f32;
     f[2..2 + CANDIDATES].copy_from_slice(&state.features(line, candidate));
     f[2 + CANDIDATES..22 + CANDIDATES].copy_from_slice(&row[..20]);
-    f[22 + CANDIDATES..RANKED].copy_from_slice(&row[72..92]);
+    f[22 + CANDIDATES..62 + CANDIDATES].copy_from_slice(&row[72..92]);
+    // The heading's level by the local model's own reading of it.
+    f[62 + CANDIDATES] = match &local.levels {
+        Some(levels) if candidate.opens && candidate.region == HEADING => levels[usize::from(candidate.level.max(0) as u8).min(LEVEL_CLASSES - 1)].max(1e-6).ln(),
+        _ => -99.0,
+    };
     f
 }
 
@@ -317,22 +327,28 @@ fn locals_of(pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> 
     let s = settings();
     let n = table.order.len();
     // Another tier's probabilities, where they cover the document's lines.
-    let precomputed: Option<Vec<f32>> = match &s.local {
+    let read = |path: PathBuf, width: usize| -> Option<Vec<f32>> {
+        let values = std::fs::read(&path).ok().map(|bytes| bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<f32>>());
+        let fits = values.filter(|values| values.len() == n * width);
+        if fits.is_none() {
+            eprintln!("transition parser: no local scores for {} lines at {}", n, path.display());
+        }
+        fits
+    };
+    let (precomputed, levels): (Option<Vec<f32>>, Option<Vec<f32>>) = match &s.local {
         #[cfg(feature = "encoder")]
         Some(LocalScores::Encoder(model)) => {
             let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
-            model.probabilities(table, &texts).map_err(|e| eprintln!("transition parser {sha256}: {e}")).ok().map(|p| p.into_iter().map(|v| v as f32).collect())
-        }
-        Some(LocalScores::Precomputed(folder)) => {
-            let path = folder.join(format!("{sha256}.local.f32"));
-            let read = std::fs::read(&path).ok().map(|bytes| bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<f32>>());
-            let fits = read.filter(|values| values.len() == n * CLASSES);
-            if fits.is_none() {
-                eprintln!("transition parser: no local scores for {} lines at {}", n, path.display());
+            match model.probabilities(table, &texts) {
+                Ok((classes, levels)) => (Some(classes), Some(levels)),
+                Err(e) => {
+                    eprintln!("transition parser {sha256}: {e}");
+                    (None, None)
+                }
             }
-            fits
         }
-        _ => None,
+        Some(LocalScores::Precomputed(folder)) => (read(folder.join(format!("{sha256}.local.f32")), CLASSES), read(folder.join(format!("{sha256}.levels.f32")), LEVEL_CLASSES)),
+        _ => (None, None),
     };
     let probabilities = |k: usize, row: &[f32]| -> Vec<f64> {
         match &s.local {
@@ -348,7 +364,8 @@ fn locals_of(pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> 
         let probabilities = probabilities(k, table.row(k));
         let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
         ranked.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]).then(a.cmp(&b)));
-        Local { probabilities, ranked }
+        let levels = levels.as_ref().map(|levels| levels[k * LEVEL_CLASSES..(k + 1) * LEVEL_CLASSES].to_vec());
+        Local { probabilities, ranked, levels }
     }).collect()
 }
 
@@ -425,6 +442,9 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                         "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
                         "texts": table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect::<Vec<_>>(),
                         "looks": &table.looks,
+                        "templates": &sheet.template,
+                        "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(),
+                        "anchors": &sheet.anchor,
                         "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
                         "gold": gold_rows, "move_lines": move_lines, "move_classes": move_classes, "move_oracle": move_oracle,
                         "chosen": moves.iter().map(Move::class).collect::<Vec<_>>(),
