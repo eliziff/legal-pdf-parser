@@ -15,7 +15,8 @@
 //!   on all of train), or LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of k (fold0.txt ...), each fitted on
 //!   every document but those of its fold, which read it (out of fold, train's rollouts); or
 //!   LEGALPDF_TRANSITION_LOCAL_SCORES, a folder of each document's local probabilities from another
-//!   tier's model (`<sha>.local.f32`, a line's `CLASSES` in reading order; tier 1's encoder);
+//!   tier's model (`<sha>.local.f32`, a line's `CLASSES` in reading order), or LEGALPDF_TRANSITION_ENCODER,
+//!   a folder holding tier 1's or tier 2's document encoder (`encoder`), run in the engine;
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
@@ -39,6 +40,8 @@ use trees::Forest;
 mod emit;
 mod grammar;
 pub(crate) use grammar::{Grammar, Tables};
+#[cfg(feature = "encoder")]
+mod encoder;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -60,6 +63,8 @@ enum LocalScores {
     Folds(Vec<Forest>),
     /// Each document's probabilities as another tier's model read them, from this folder.
     Precomputed(PathBuf),
+    #[cfg(feature = "encoder")]
+    Encoder(encoder::Encoder),
 }
 
 struct Settings {
@@ -79,6 +84,9 @@ fn settings() -> &'static Settings {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
         let forest = |path: PathBuf, width: usize, classes: usize| Forest::read(&path, width, classes).map_err(|e| eprintln!("transition parser: {e}")).ok();
         let local = match (var("LEGALPDF_TRANSITION_LOCAL"), var("LEGALPDF_TRANSITION_LOCAL_FOLDS")) {
+            #[cfg(feature = "encoder")]
+            _ if var("LEGALPDF_TRANSITION_ENCODER").is_some() => var("LEGALPDF_TRANSITION_ENCODER")
+                .and_then(|dir| encoder::Encoder::load(&dir).map_err(|e| eprintln!("transition parser: {e}")).ok()).map(LocalScores::Encoder),
             _ if var("LEGALPDF_TRANSITION_LOCAL_SCORES").is_some() => var("LEGALPDF_TRANSITION_LOCAL_SCORES").map(LocalScores::Precomputed),
             (Some(path), _) => forest(path, ALL, CLASSES).map(LocalScores::One),
             (None, Some(folder)) => {
@@ -272,17 +280,23 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
 /// its environment asks, what the scorer is fitted on and the labels the grader reads.
 pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sha256: &str) -> (LineTable, Vec<Local>, Vec<Move>) {
     let table = LineTable::read(pages, slots, evidence, fences, &runs.before);
-    let locals = locals_of(&table, sha256);
+    let locals = locals_of(pages, slots, &table, sha256);
     let moves = parse(pages, slots, evidence, fences, sha256, &table, &locals);
     (table, locals, moves)
 }
 
 /// Each line's local scores, read once.
-fn locals_of(table: &LineTable, sha256: &str) -> Vec<Local> {
+#[cfg_attr(not(feature = "encoder"), allow(unused_variables))]
+fn locals_of(pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> Vec<Local> {
     let s = settings();
     let n = table.order.len();
     // Another tier's probabilities, where they cover the document's lines.
     let precomputed: Option<Vec<f32>> = match &s.local {
+        #[cfg(feature = "encoder")]
+        Some(LocalScores::Encoder(model)) => {
+            let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
+            model.probabilities(table, &texts).map_err(|e| eprintln!("transition parser {sha256}: {e}")).ok().map(|p| p.into_iter().map(|v| v as f32).collect())
+        }
         Some(LocalScores::Precomputed(folder)) => {
             let path = folder.join(format!("{sha256}.local.f32"));
             let read = std::fs::read(&path).ok().map(|bytes| bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<f32>>());
@@ -298,7 +312,7 @@ fn locals_of(table: &LineTable, sha256: &str) -> Vec<Local> {
         match &s.local {
             Some(LocalScores::One(forest)) => forest.probabilities(row),
             Some(LocalScores::Folds(folds)) => folds[fold_of(sha256, folds.len())].probabilities(row),
-            Some(LocalScores::Precomputed(_)) if precomputed.is_some() => {
+            _ if precomputed.is_some() => {
                 precomputed.as_ref().unwrap()[k * CLASSES..(k + 1) * CLASSES].iter().map(|&p| f64::from(p)).collect()
             }
             _ => vec![1.0 / CLASSES as f64; CLASSES],

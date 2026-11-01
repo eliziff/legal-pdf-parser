@@ -1066,6 +1066,7 @@ dependencies = [
  "legal-pdf-tables",
  "legal-pdf-tagger",
  "legal-structure-model",
+ "ort",
  "pdf-inspector",
  "regex",
  "serde",

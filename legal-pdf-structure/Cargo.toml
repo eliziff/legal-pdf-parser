@@ -15,6 +15,11 @@ regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
+
+[features]
+# Tier 1's and tier 2's document encoder run in the engine (transition/encoder.rs).
+encoder = ["dep:ort", "legal-pdf-core/ort-runtime"]
 
 # Unit tests run the structure engine, which programs supply at run time.
 [dev-dependencies]
