@@ -18,6 +18,7 @@
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
+//! - LEGALPDF_TRANSITION_GRAMMAR, the grammar tables counted over legal text (`grammar`);
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold),
 //!   for the oracle;
 //! - LEGALPDF_TRANSITION_DUMP, a folder: each line's features (`<sha>.lines.f32`), each candidate's
@@ -35,6 +36,8 @@ pub(crate) use machine::*;
 mod trees;
 use trees::Forest;
 mod emit;
+mod grammar;
+pub(crate) use grammar::Tables;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -66,6 +69,7 @@ struct Settings {
     labels: Option<PathBuf>,
     beam: usize,
     emit: bool,
+    grammar: Option<grammar::Grammar>,
 }
 
 fn settings() -> &'static Settings {
@@ -91,6 +95,7 @@ fn settings() -> &'static Settings {
             labels: var("LEGALPDF_TRANSITION_LABELS"),
             beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
+            grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
         }
     })
 }
@@ -210,6 +215,7 @@ fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
 
 /// Each line as the state reads it, in reading order.
 fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable) -> Vec<LineView<'a>> {
+    let tables = settings().grammar.as_ref().map(|g| g.for_document(evidence.instrument));
     (0..table.order.len()).map(|k| {
         let slot = table.order[k];
         let at = slot.index();
@@ -224,6 +230,8 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             look: table.looks[k],
             references: &table.references[k],
             place: k as u32,
+            tables,
+            heading_word: tables.and_then(|t| t.heading_word(&grammar::first_word(&slots.line(pages, slot).text, !table.readings[k].is_empty()))).unwrap_or(0.0),
         }
     }).collect()
 }
