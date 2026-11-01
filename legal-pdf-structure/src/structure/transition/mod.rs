@@ -27,7 +27,9 @@
 //!   documents (`train_whole`); LEGALPDF_TRANSITION_WHOLE_DUMP, a folder its problems and the heads'
 //!   training rows are written to (the gold given);
 //! - LEGALPDF_TRANSITION_DOC, a folder holding Detect-Order-Construct's stages as `docparse.py` exports
-//!   them (`doc`): the document read by them in place of the walk;
+//!   them (`doc`): the document read by them in place of the walk; LEGALPDF_TRANSITION_DOC_ORACLE, the gold
+//!   given: the document read by the same decoding from the heads' answers read off the gold (`doc::oracle`),
+//!   what the decoding and the moves can hold;
 //! - LEGALPDF_TRANSITION_JOINT, `weight,penalty`: the reading the joint stylesheet solve makes (`joint`),
 //!   the template prior's term weighted `weight` and a move against its template's role costing
 //!   `penalty`; LEGALPDF_TRANSITION_PRIOR, the template prior's forest (none: the roles weighed on the
@@ -63,7 +65,6 @@ mod joint;
 mod whole;
 #[cfg(feature = "encoder")]
 mod encoder;
-#[cfg(feature = "encoder")]
 mod doc;
 
 use std::path::{Path, PathBuf};
@@ -112,6 +113,7 @@ struct Settings {
     prior: Option<Forest>,
     #[cfg(feature = "encoder")]
     doc: Option<doc::Reader>,
+    doc_oracle: bool,
     emit: bool,
     grammar: Option<grammar::Grammar>,
     pub(crate) confusions: HashMap<char, Vec<(char, f32)>>,
@@ -154,6 +156,7 @@ fn settings() -> &'static Settings {
             whole_dump: var("LEGALPDF_TRANSITION_WHOLE_DUMP"),
             whole_weights: var("LEGALPDF_TRANSITION_WHOLE_WEIGHTS").and_then(|path| whole::read_weights(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()).unwrap_or(whole::PRIOR_WEIGHTS),
             prior: var("LEGALPDF_TRANSITION_PRIOR").and_then(|path| forest(path, joint::PRIOR, joint::ROLES)),
+            doc_oracle: std::env::var_os("LEGALPDF_TRANSITION_DOC_ORACLE").is_some(),
             #[cfg(feature = "encoder")]
             doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| doc::Reader::load(&dir).map_err(|e| eprintln!("transition parser: {e}")).ok()),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
@@ -503,6 +506,14 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
+    // Detect-Order-Construct's decoding from the gold's answers: what it can hold.
+    if s.doc_oracle && gold.is_some() {
+        let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
+        let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
+        let moves = doc::oracle(&gold_rows, &views, &line_pages);
+        write_labels(sha256, &ids, &views, &moves);
+        return moves;
+    }
     // Detect-Order-Construct's reading, where its stages are given.
     #[cfg(feature = "encoder")]
     if let Some(reader) = &s.doc {
