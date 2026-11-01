@@ -457,6 +457,9 @@ pub(crate) struct Evidence {
     /// An instrument: its operative words (`OPERATIVE`) six in a thousand of its words or more, over
     /// two hundred words; or its caller's profile says so.
     pub(crate) instrument: bool,
+    /// The operative words in a thousand of the document's words (0 under two hundred words), what
+    /// `instrument` thresholds; a thousand where the caller's profile says instrument.
+    pub(crate) operative: f32,
 }
 
 /// What normalizing leaves to be measured: which lines are a transcript's line numbers, by slot,
@@ -889,6 +892,7 @@ impl Evidence {
         evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
         evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
         evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
+        evidence.operative = if instrument { 1000.0 } else if words >= 200 { (operative * 1000) as f32 / words as f32 } else { 0.0 };
         evidence.faces = faces.names;
         evidence.families = families.names;
         evidence.line_number = line_numbers;

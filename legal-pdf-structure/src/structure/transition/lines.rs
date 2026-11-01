@@ -178,8 +178,11 @@ impl LineTable {
         &self.features[k * ALL..(k + 1) * ALL]
     }
 
-    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences) -> Self {
+    /// `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
+    /// markers' readings stand beside the repaired text's, the parser's to choose between.
+    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)]) -> Self {
         let order: Vec<Slot> = fences.order.clone();
+        let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
         let n = order.len();
         let measures: Vec<(PageMeasure, Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().map(|page| {
             let measure = PageMeasure::of(page);
@@ -260,7 +263,14 @@ impl LineTable {
                 flag(repeated[k]), flag(fences.cell[at] > 0),
                 flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.translation[at]),
             ]);
-            let found = marker_readings(&line.text, evidence.words[at] & WORD_DIVISION != 0);
+            let mut found = marker_readings(&line.text, evidence.words[at] & WORD_DIVISION != 0);
+            if let Some(text) = recognized.get(&slot) {
+                for reading in marker_readings(text, evidence.words[at] & WORD_DIVISION != 0) {
+                    if !found.contains(&reading) {
+                        found.push(reading);
+                    }
+                }
+            }
             let mut marker = [0.0f64; 20];
             if let Some(first) = found.first() {
                 let (word, plain) = match first.family.matches(':').count() {

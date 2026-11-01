@@ -126,10 +126,12 @@ pub(crate) struct LineView<'a> {
     pub(crate) look: u32,
     pub(crate) references: &'a [(u32, u32, u32)],
     pub(crate) place: u32,
-    /// The grammar tables for the line's document (`grammar::Grammar`), and how far its first word is a
-    /// heading's by them.
-    pub(crate) tables: Option<&'a Tables>,
-    pub(crate) heading_word: f32,
+    /// The grammar tables (`grammar::Grammar`), and how far the line's first word is a heading's by the
+    /// instruments' and the others'; and the document's operative words in a thousand of its words, which
+    /// of the two a move should go by.
+    pub(crate) grammar: Option<&'a Grammar>,
+    pub(crate) heading_words: [f32; 2],
+    pub(crate) operative: f32,
     /// The document's view of the line's look before any move: the mean probability its lines open a
     /// heading by the local scores, and how many lines of it they hold likelier a heading's opening than
     /// not (log).
@@ -159,8 +161,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "resumes", "interrupted_region",
     "grammar_relation", "grammar_child", "heading_word",
     "look_heading", "look_heading_lines",
+    "other_grammar_relation", "other_grammar_child", "other_heading_word", "operative",
 ];
-pub(crate) const CANDIDATES: usize = 35;
+pub(crate) const CANDIDATES: usize = 39;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -338,31 +341,35 @@ impl State {
                 f32::from(level - under)
             });
         }
-        // How likely the move's numbering is in real legal text (1 where the tables say nothing of it).
-        f[30] = 1.0;
-        f[31] = 1.0;
-        f[32] = 1.0;
-        if let Some(tables) = line.tables {
-            let top = stream.stack.last().map_or("", |frame| frame.family.as_str());
+        // How likely the move's numbering is in real legal text, by the instruments' tables and by the
+        // others' (1 where the tables say nothing of it), the document's operative words beside them.
+        let top = stream.stack.last().map_or("", |frame| frame.family.as_str());
+        let tables = line.grammar.map(|g| [&g.instruments, &g.others]);
+        for (i, at) in [30, 35].into_iter().enumerate() {
+            f[at] = 1.0;
+            f[at + 1] = 1.0;
+            f[at + 2] = 1.0;
+            let Some(tables) = tables.map(|t| t[i]) else { continue };
             if let Some(reading) = reading {
                 let relation = match stream.stack.iter().rposition(|frame| frame.family == reading.family) {
                     Some(depth) if depth + 1 == stream.stack.len() => if reading.value == stream.stack[depth].value + 1 { grammar::NEXT } else { grammar::SAME_OTHER },
                     Some(depth) => if reading.value == stream.stack[depth].value + 1 { grammar::POP_NEXT } else { grammar::POP_OTHER },
                     None => if reading.value == 1 { grammar::PUSH_1 } else { grammar::PUSH_OTHER },
                 };
-                f[30] = tables.relation(top, relation).unwrap_or(1.0);
+                f[at] = tables.relation(top, relation).unwrap_or(1.0);
                 if !stream.stack.iter().any(|frame| frame.family == reading.family) {
-                    f[31] = tables.child(top, &reading.family).unwrap_or(1.0);
+                    f[at + 1] = tables.child(top, &reading.family).unwrap_or(1.0);
                 }
             } else if candidate.opens && NUMBERED.contains(&candidate.region) && !line.readings.is_empty() {
-                f[30] = tables.relation(top, grammar::NONE).unwrap_or(1.0);
+                f[at] = tables.relation(top, grammar::NONE).unwrap_or(1.0);
             }
             if candidate.opens && candidate.region == HEADING {
-                f[32] = line.heading_word;
+                f[at + 2] = line.heading_words[i];
             }
         }
         f[33] = line.look_heading;
         f[34] = line.look_heading_lines;
+        f[38] = line.operative.min(100.0);
         f[28] = flag(candidate.resume);
         f[29] = self.interrupted.get(&(line.ctx, stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
         f

@@ -3,9 +3,10 @@
 //! family open on top of the stack, the log-probability of each relation the next marker takes to it
 //! (the next value, another value of the same family, a pop to an open family's next value or another,
 //! a push of a new family at 1 or another, no marker); for a family open, the log-probability of each
-//! family pushed under it; and how far each first word of a line is a heading's. An instrument reads
-//! the federal laws' tables, any other document every source's pooled; headings' words come from the
-//! pages and the laws, whose headings their markup marks.
+//! family pushed under it; and how far each first word of a line is a heading's. A move reads both
+//! the federal laws' tables and every source's pooled, with the document's operative words beside
+//! them to weigh which it goes by; headings' words come from the pages and the laws, whose headings
+//! their markup marks.
 
 use super::*;
 use std::path::Path;
@@ -90,9 +91,6 @@ impl Grammar {
         })
     }
 
-    pub(crate) fn for_document(&self, instrument: bool) -> &Tables {
-        if instrument { &self.instruments } else { &self.others }
-    }
 }
 
 /// A line's first word, lower-cased, its opening marker skipped where it has one.

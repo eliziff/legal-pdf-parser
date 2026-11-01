@@ -74,11 +74,12 @@ pub(crate) struct Member {
 }
 
 /// The document's numbering runs, and the lines whose markers the repair rewrote, with their text and
-/// words as rewritten.
+/// words as rewritten and their text before.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Runs {
     pub(crate) runs: Vec<Run>,
     pub(crate) edits: Vec<(Slot, String, Vec<Word>)>,
+    pub(crate) before: Vec<(Slot, String)>,
 }
 
 /// A line recognition read, the only reading that misreads a marker: our own recognition, or a
@@ -638,7 +639,7 @@ impl Runs {
             }
             fences.confirm_section_heads(pages, slots, evidence, |page, number| spine[page].contains(&number));
         }
-        Ok(Self { runs, edits })
+        Ok(Self { runs, edits, before: repaired })
     }
 
     /// Every member of every run.

@@ -37,7 +37,7 @@ mod trees;
 use trees::Forest;
 mod emit;
 mod grammar;
-pub(crate) use grammar::Tables;
+pub(crate) use grammar::{Grammar, Tables};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -215,7 +215,7 @@ fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
 
 /// Each line as the state reads it, in reading order.
 fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable, locals: &[Local]) -> Vec<LineView<'a>> {
-    let tables = settings().grammar.as_ref().map(|g| g.for_document(evidence.instrument));
+    let grammar = settings().grammar.as_ref();
     // Each look's lines as the local scores read them, before any move.
     let heading = usize::from(HEADING) * 2 + 1;
     let mut looks: HashMap<u32, (f64, usize, usize)> = HashMap::new();
@@ -240,8 +240,13 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             look: table.looks[k],
             references: &table.references[k],
             place: k as u32,
-            tables,
-            heading_word: tables.and_then(|t| t.heading_word(&grammar::first_word(&slots.line(pages, slot).text, !table.readings[k].is_empty()))).unwrap_or(0.0),
+            grammar,
+            heading_words: {
+                let word = grammar::first_word(&slots.line(pages, slot).text, !table.readings[k].is_empty());
+                let odds = |tables: &Tables| tables.heading_word(&word).unwrap_or(0.0);
+                grammar.map_or([0.0; 2], |g| [odds(&g.instruments), odds(&g.others)])
+            },
+            operative: evidence.operative,
             look_heading: (sum / lines.max(1) as f64) as f32,
             look_heading_lines: (1.0 + likely as f32).ln(),
         }
@@ -251,8 +256,8 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
 /// One document parsed: its lines read (`LineTable`) and the moves they make in reading order
 /// (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide); and, as
 /// its environment asks, what the scorer is fitted on and the labels the grader reads.
-pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str) -> (LineTable, Vec<Local>, Vec<Move>) {
-    let table = LineTable::read(pages, slots, evidence, fences);
+pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sha256: &str) -> (LineTable, Vec<Local>, Vec<Move>) {
+    let table = LineTable::read(pages, slots, evidence, fences, &runs.before);
     let locals = locals_of(&table, sha256);
     let moves = parse(pages, slots, evidence, fences, sha256, &table, &locals);
     (table, locals, moves)
@@ -358,8 +363,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
 
 /// The document's structure as the transition parser reads it, its reading through `emit`: what
 /// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
-pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, identity: &StructureIdentity) -> Result<StructureOutput> {
-    let (table, locals, moves) = run(pages, slots, evidence, fences, &identity.source_sha256);
+pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, identity: &StructureIdentity) -> Result<StructureOutput> {
+    let (table, locals, moves) = run(pages, slots, evidence, fences, runs, &identity.source_sha256);
     let views = views_of(pages, slots, evidence, fences, &table, &locals);
     let (structure_graph, paragraphs, footnotes) = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity)?;
     Ok(StructureOutput { paragraphs, footnotes, diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
