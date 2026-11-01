@@ -1,5 +1,5 @@
 //! The document read whole: one reading of every line chosen at once, nothing claimed by a first pass.
-//! Four parts read the document, each over all of it and solved exactly, and are made to agree on what
+//! Five parts read the document, each over all of it and solved exactly, and are made to agree on what
 //! they share by dual decomposition:
 //! - the lines' roles: every line's region and whether it opens a unit, by Viterbi over the whole
 //!   document, the state the region open in the body's stream and the one before it (a paragraph may
@@ -13,25 +13,31 @@
 //! - the notes: every reference mark is answered by at most one note label of its number, on its page
 //!   or the two after; a note may answer several marks;
 //! - the outline: which lines open headings and at what level, by dynamic programming over the lines
-//!   that may, on the open heading's level, a document's start opening none.
+//!   that may, on the open heading's level, a document's start opening none;
+//! - the body: which lines open body units and at what depth, by dynamic programming over the lines that
+//!   may, on the open depth, as the outline's levels are read.
 //!
 //! What they share: a line opens a unit of a region on its marker exactly where its number counts in
 //! that region's role; a line opens a note exactly where its label is a note's; a line opens a heading
-//! exactly where the outline holds one. The prices on those facts move until the parts agree (or the
-//! rounds run out: the roles' regions then stand, the numbers deciding the markers, the notes the notes'
-//! numbers, the outline the roles' headings' levels). Body depths follow the chains' nesting. The reading
-//! is the moves the emit turns into the consumer structure.
+//! exactly where the outline holds one; a line opens a body unit exactly where the body part gives it a
+//! depth. The prices on those facts move until the parts agree (or the rounds run out: the roles' regions
+//! then stand, the numbers deciding the markers, the notes the notes' numbers, the outline and the body the
+//! roles' headings' levels and body units' depths). The reading is the moves the emit turns into the
+//! consumer structure.
 //!
-//! Its scores come from five learned heads (`Heads`, LEGALPDF_TRANSITION_HEADS, forests `fit_whole.py`
+//! Its scores come from six learned heads (`Heads`, LEGALPDF_TRANSITION_HEADS, forests `fit_whole.py`
 //! fits on the gold): a number's role, a link between two numbers, a mark's pair with a note label, a
-//! heading's level given the open one's, a line's opening a constituent document; each over features the
+//! heading's level given the open one's, a body unit's depth given the open one's, a line's opening a
+//! constituent document; each over features the
 //! whole document's candidates give (how far a number's family runs before and after it, how many of it
 //! the document holds, what stands between two numbers or a mark and a label, a heading's template over
 //! the document), never over a reading. How much each part's scores weigh against the others' is learned
 //! on whole documents (`train`, LEGALPDF_TRANSITION_WHOLE_WEIGHTS): each training document's whole reading
 //! solved with a cost on every line read otherwise than the gold reads it, and the weights moved toward
 //! the gold reading's totals and away from the solved reading's (a structured perceptron, its steps
-//! scaled per weight by the steps before, averaged over every step).
+//! scaled per weight by the steps before, averaged over every step). Before training, each problem is
+//! solved pulled hard toward the gold's reading, and how much of the gold the solve can make is reported:
+//! the architecture's ceiling on the training documents.
 //!
 //! Where LEGALPDF_TRANSITION_WHOLE_DUMP names a folder and the gold is given, each document's problem
 //! (`<sha>.problem.json`: every candidate and its heads' scores, the gold reading's totals) and the heads'
@@ -58,11 +64,13 @@ pub(crate) const LINK_WIDTH: usize = 48;
 pub(crate) const PAIR_WIDTH: usize = 22;
 pub(crate) const OUTLINE_WIDTH: usize = 52;
 pub(crate) const START_WIDTH: usize = 32;
+pub(crate) const DEPTH_WIDTH: usize = 53;
 
 /// The weights of the parts' scores against each other, in this order: the local scores' log-probability,
 /// a paragraph resumed past another unit, a numbered opening on its marker, a counted number's role, a
-/// link, a pair, a note opened, a heading's level, a start's log-odds, a start, a heading opened.
-pub(crate) const WEIGHTS: usize = 11;
+/// link, a pair, a note opened, a heading's level, a start's log-odds, a start, a heading opened, a body
+/// unit's depth.
+pub(crate) const WEIGHTS: usize = 12;
 const W_LOCAL: usize = 0;
 const W_RESUME: usize = 1;
 const W_MARKED: usize = 2;
@@ -74,8 +82,9 @@ const W_LEVEL: usize = 7;
 const W_START: usize = 8;
 const W_START_BIAS: usize = 9;
 const W_HEADING: usize = 10;
+const W_DEPTH: usize = 11;
 /// The weights before any training.
-pub(crate) const PRIOR_WEIGHTS: [f64; WEIGHTS] = [1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, -2.0, 0.0];
+pub(crate) const PRIOR_WEIGHTS: [f64; WEIGHTS] = [1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, -2.0, 0.0, 1.0];
 
 /// The role a region's opening gives its number.
 fn role_of(region: u8) -> usize {
@@ -101,6 +110,7 @@ pub(crate) struct Heads {
     pair: Forest,
     outline: Forest,
     start: Forest,
+    depth: Forest,
 }
 
 impl Heads {
@@ -111,6 +121,7 @@ impl Heads {
             pair: Forest::read(&folder.join("pair.txt"), PAIR_WIDTH, 1)?,
             outline: Forest::read(&folder.join("outline.txt"), OUTLINE_WIDTH, LEVEL_CLASSES)?,
             start: Forest::read(&folder.join("start.txt"), START_WIDTH, 1)?,
+            depth: Forest::read(&folder.join("depth.txt"), DEPTH_WIDTH, LEVEL_CLASSES)?,
         })
     }
 }
@@ -147,9 +158,22 @@ pub(crate) struct Problem {
     marks: Vec<(u32, u16, u32, u32)>,
     pairs: Vec<(u32, u16, u32, f32)>,
     levels: Vec<Vec<[f32; LEVEL_CLASSES]>>,
+    depths: Vec<Vec<[f32; LEVEL_CLASSES]>>,
     starts: Vec<Option<f32>>,
     gold: Vec<i16>,
     gold_totals: Option<[f64; WEIGHTS]>,
+    gold_reading: Option<GoldReading>,
+}
+
+/// The gold reading in the solve's terms, for the reachability check: each line's counted role (0 none),
+/// heading level and body depth (0 none), start and note.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct GoldReading {
+    roles: Vec<u8>,
+    levels: Vec<u8>,
+    depths: Vec<u8>,
+    starts: Vec<bool>,
+    notes: Vec<bool>,
 }
 
 /// A whole reading: each line's choice (class, on its marker), each line's counted number (reading,
@@ -164,6 +188,7 @@ pub(crate) struct Solution {
     pairs: Vec<usize>,
     notes: Vec<bool>,
     levels: Vec<Option<i8>>,
+    depths: Vec<Option<u8>>,
     chain_of: Vec<Option<usize>>,
 }
 
@@ -188,7 +213,7 @@ fn step_state(region: u8, opens: bool, body: usize, before: usize, note: bool) -
 
 /// The lines' roles under the prices: the best reading by Viterbi, each line's choice; with `cost`, a
 /// unit more for every line read otherwise than the gold reads it (training's loss-augmented reading).
-fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], note_price: &[f64], heading_price: &[f64], cost: bool) -> Vec<(u16, bool)> {
+fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], note_price: &[f64], heading_price: &[f64], body_price: &[f64], cost: bool, toward: f64) -> Vec<(u16, bool)> {
     let n = problem.choices.len();
     let state_of = |body: usize, before: usize, note: bool| (body * SLOTS + before) * 2 + usize::from(note);
     let states = SLOTS * SLOTS * 2;
@@ -211,8 +236,16 @@ fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], not
             if opens && region == HEADING {
                 gain += w[W_HEADING] + heading_price[k];
             }
+            if opens && RANKED_BODY.contains(&region) {
+                gain += body_price[k];
+            }
             if cost && problem.gold.get(k).is_some_and(|&g| g >= 0 && g != class as i16) {
                 gain += 1.0;
+            }
+            // The reachability check's pull toward the gold's reading.
+            if toward > 0.0 && problem.gold.get(k).is_some_and(|&g| g == class as i16) {
+                let marked_gold = problem.gold_reading.as_ref().is_some_and(|g| g.roles[k] > 0);
+                gain += if marked == marked_gold { toward } else { toward / 2.0 };
             }
             gain
         }).collect();
@@ -253,8 +286,16 @@ fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], not
 /// members' worth (the number head's log-odds of the role against none, and the price on it) and links'
 /// worth sum the most, the chain counting only where that sum is positive; a number on no chain counts
 /// in its own best role where that is worth something; a line counts once.
-fn numbers_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[[f64; ROLES]]) -> (Vec<Option<(u8, u8)>>, Vec<usize>, Vec<bool>, Vec<Option<usize>>) {
+fn numbers_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[[f64; ROLES]], toward: f64) -> (Vec<Option<(u8, u8)>>, Vec<usize>, Vec<bool>, Vec<Option<usize>>) {
     let numbers = &problem.numbers;
+    let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0);
+    let price: Vec<[f64; ROLES]> = price.iter().enumerate().map(|(k, p)| {
+        let mut p = *p;
+        if let Some(role) = gold.map(|g| usize::from(g.roles[k])).filter(|&r| r > 0) {
+            p[role] += toward;
+        }
+        p
+    }).collect();
     let n_lines = problem.choices.len();
     let mut by: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for (i, &(_, _, family, value)) in numbers.iter().enumerate() {
@@ -270,7 +311,7 @@ fn numbers_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[[f64; ROLES]]) -
     let mut starts = vec![false; n_lines];
     for k in 1..n_lines {
         let Some(odds) = problem.starts[k] else { continue };
-        let evidence = w[W_START] * f64::from(odds) + w[W_START_BIAS];
+        let evidence = w[W_START] * f64::from(odds) + w[W_START_BIAS] + gold.map_or(0.0, |g| if g.starts[k] { toward } else { -toward });
         let cut: f64 = kept.iter().filter(|&&(p, s)| (numbers[p].0 as usize) < k && k <= numbers[s].0 as usize).map(|&(p, s)| worth(p, s)).sum();
         starts[k] = evidence - cut > 0.0;
     }
@@ -345,7 +386,8 @@ fn numbers_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[[f64; ROLES]]) -
 
 /// The notes under the prices: each reference mark to its best note label (its pair's worth, positive),
 /// a label opening a note where its worth (a note's weight, its price, its pairs') is positive.
-fn notes_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[f64]) -> (Vec<usize>, Vec<bool>) {
+fn notes_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[f64], toward: f64) -> (Vec<usize>, Vec<bool>) {
+    let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0);
     let n = problem.choices.len();
     let mut best: HashMap<(u32, u16), (usize, f64)> = HashMap::new();
     for (j, &(line, index, _, worth)) in problem.pairs.iter().enumerate() {
@@ -361,7 +403,7 @@ fn notes_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[f64]) -> (Vec<usiz
     let mut notes = vec![false; n];
     for &(line, _, _) in &problem.labels {
         let k = line as usize;
-        notes[k] = w[W_NOTE] + price[k] + gained[k] > 0.0;
+        notes[k] = w[W_NOTE] + price[k] + gained[k] + gold.map_or(0.0, |g| if g.notes[k] { toward } else { -toward }) > 0.0;
     }
     let mut pairs: Vec<usize> = best.values().map(|&(j, _)| j).filter(|&j| notes[problem.pairs[j].2 as usize]).collect();
     pairs.sort_unstable();
@@ -372,8 +414,24 @@ fn notes_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[f64]) -> (Vec<usiz
 /// at what level, by dynamic programming on the open heading's level (none after a document's start); a
 /// heading's worth its price and its level's log-odds given the open one's. Each line's level, where it
 /// opens a heading.
-fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &[f64]) -> Vec<Option<i8>> {
-    let n = problem.choices.len();
+fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &[f64], toward: f64) -> Vec<Option<i8>> {
+    let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0).map(|g| &g.levels[..]);
+    ladder(&problem.levels, w[W_LEVEL], starts, price, gold, toward).into_iter().map(|l| l.map(|l| l as i8)).collect()
+}
+
+/// The body units' depths under the prices, exactly, as the outline's levels are read: over the lines that
+/// may open a body unit, which do and at what depth, on the open depth (none after a document's start).
+fn depth_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &[f64], toward: f64) -> Vec<Option<u8>> {
+    let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0).map(|g| &g.depths[..]);
+    ladder(&problem.depths, w[W_DEPTH], starts, price, gold, toward).into_iter().map(|d| d.map(|d| d as u8)).collect()
+}
+
+/// A ladder read whole: over the lines `table` holds scores for (each step's log-odds given the open step,
+/// by open step), which take a step and which, by dynamic programming on the open step, a start opening
+/// none; a step's worth its line's price and its weighted log-odds (and, for the reachability check, a pull
+/// toward `gold`'s steps).
+fn ladder(table: &[Vec<[f32; LEVEL_CLASSES]>], weight: f64, starts: &[bool], price: &[f64], gold: Option<&[u8]>, toward: f64) -> Vec<Option<usize>> {
+    let n = price.len();
     let mut score = vec![f64::NEG_INFINITY; LEVEL_CLASSES];
     score[0] = 0.0;
     let mut back: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
@@ -385,7 +443,8 @@ fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &
             score[0] = best;
             back.push((k, (0..LEVEL_CLASSES).map(|_| (from, usize::MAX)).collect()));
         }
-        let Some(levels) = problem.levels.get(k).filter(|levels| !levels.is_empty()) else { continue };
+        let Some(levels) = table.get(k).filter(|levels| !levels.is_empty()) else { continue };
+        let pull = |level: usize| gold.map_or(0.0, |g| if usize::from(g[k]) == level { toward } else if g[k] > 0 { toward / 2.0 } else { -toward });
         let mut next = score.clone();
         let mut from: Vec<(usize, usize)> = (0..LEVEL_CLASSES).map(|s| (s, 0)).collect();
         for open in 0..LEVEL_CLASSES {
@@ -393,7 +452,7 @@ fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &
                 continue;
             }
             for level in 1..LEVEL_CLASSES {
-                let total = score[open] + price[k] + w[W_LEVEL] * f64::from(levels[open][level]);
+                let total = score[open] + price[k] + weight * f64::from(levels[open][level]) + pull(level);
                 if total > next[level] {
                     next[level] = total;
                     from[level] = (open, level);
@@ -408,7 +467,7 @@ fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &
     for (k, from) in back.iter().rev() {
         let (previous, level) = from[s];
         if level != usize::MAX && level > 0 {
-            out[*k] = Some(level as i8);
+            out[*k] = Some(level);
         }
         s = previous;
     }
@@ -459,16 +518,19 @@ fn assignment(left: &[usize], right: &[usize], worth: impl Fn(usize, usize) -> O
     out
 }
 
-/// The document's whole reading under weights `w`: the four parts made to agree by dual decomposition;
-/// with `cost`, the loss-augmented reading training compares the gold's with.
-pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool) -> Solution {
+/// The document's whole reading under weights `w`: the five parts made to agree by dual decomposition;
+/// with `cost`, the loss-augmented reading training compares the gold's with; with `toward`, every part
+/// pulled that much toward the gold's reading (the reachability check: what of the gold the solve can make).
+pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool, toward: f64) -> Solution {
     let n = problem.choices.len();
     let mut role_price = vec![[0f64; ROLES]; n];
     let mut note_price = vec![0.0; n];
     let mut heading_price = vec![0.0; n];
+    let mut body_price = vec![0.0; n];
     let negated = |prices: &[[f64; ROLES]]| prices.iter().map(|p| p.map(|x| -x)).collect::<Vec<_>>();
     let flip = |prices: &[f64]| prices.iter().map(|p| -p).collect::<Vec<_>>();
     let may_head: Vec<bool> = (0..n).map(|k| problem.levels.get(k).is_some_and(|l| !l.is_empty())).collect();
+    let may_body: Vec<bool> = (0..n).map(|k| problem.depths.get(k).is_some_and(|l| !l.is_empty())).collect();
     let is_label: Vec<bool> = {
         let mut out = vec![false; n];
         for &(line, _, _) in &problem.labels {
@@ -478,15 +540,17 @@ pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool) -> Soluti
     };
     let mut solution = Solution::default();
     for round in 0..ROUNDS {
-        let path = roles(problem, w, &role_price, &note_price, &heading_price, cost);
-        let (line_choice, links, starts, chain_of) = numbers_part(problem, w, &negated(&role_price));
-        let (pairs, notes) = notes_part(problem, w, &flip(&note_price));
-        let levels = outline_part(problem, w, &starts, &flip(&heading_price));
+        let path = roles(problem, w, &role_price, &note_price, &heading_price, &body_price, cost, toward);
+        let (line_choice, links, starts, chain_of) = numbers_part(problem, w, &negated(&role_price), toward);
+        let (pairs, notes) = notes_part(problem, w, &flip(&note_price), toward);
+        let levels = outline_part(problem, w, &starts, &flip(&heading_price), toward);
+        let depths = depth_part(problem, w, &starts, &flip(&body_price), toward);
         let step = 1.0 / (1.0 + round as f64);
         let mut agree = true;
         for k in 0..n {
             let (class, marked) = path[k];
-            let said = if marked { role_of((class / 2) as u8) } else { 0 };
+            let (region, opens) = ((class / 2) as u8, class % 2 == 1);
+            let said = if marked { role_of(region) } else { 0 };
             let counted = line_choice[k].map_or(0, |(_, role)| usize::from(role));
             if said != counted {
                 agree = false;
@@ -497,25 +561,33 @@ pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool) -> Soluti
                     role_price[k][said] -= step;
                 }
             }
-            let note = class == u16::from(NOTE) * 2 + 1;
-            if is_label[k] && note != notes[k] {
+            if is_label[k] && (opens && region == NOTE) != notes[k] {
                 agree = false;
                 note_price[k] += step * if notes[k] { 1.0 } else { -1.0 };
             }
-            let heading = class == u16::from(HEADING) * 2 + 1;
-            if may_head[k] && heading != levels[k].is_some() {
+            if may_head[k] && (opens && region == HEADING) != levels[k].is_some() {
                 agree = false;
                 heading_price[k] += step * if levels[k].is_some() { 1.0 } else { -1.0 };
             }
+            if may_body[k] && (opens && RANKED_BODY.contains(&region)) != depths[k].is_some() {
+                agree = false;
+                body_price[k] += step * if depths[k].is_some() { 1.0 } else { -1.0 };
+            }
         }
-        solution = Solution { path, line_choice, links, starts, pairs, notes, levels, chain_of };
+        solution = Solution { path, line_choice, links, starts, pairs, notes, levels, depths, chain_of };
         if agree {
             break;
         }
     }
-    // Where the parts still differ, the roles' regions stand: the outline levels the roles' headings.
-    let forced: Vec<f64> = (0..n).map(|k| if solution.path[k].0 == u16::from(HEADING) * 2 + 1 { 1e6 } else { -1e6 }).collect();
-    solution.levels = outline_part(problem, w, &solution.starts, &forced);
+    // Where the parts still differ, the roles' regions stand: the outline levels the roles' headings, the
+    // depths their body units.
+    let forced = |wanted: &dyn Fn(u8, bool) -> bool| -> Vec<f64> {
+        (0..n).map(|k| { let (c, _) = solution.path[k]; if wanted((c / 2) as u8, c % 2 == 1) { 1e6 } else { -1e6 } }).collect()
+    };
+    let heads = forced(&|region, opens| opens && region == HEADING);
+    let bodies = forced(&|region, opens| opens && RANKED_BODY.contains(&region));
+    solution.levels = outline_part(problem, w, &solution.starts, &heads, toward);
+    solution.depths = depth_part(problem, w, &solution.starts, &bodies, toward);
     solution
 }
 
@@ -563,6 +635,16 @@ pub(crate) fn totals(problem: &Problem, solution: &Solution) -> [f64; WEIGHTS] {
             t[W_START_BIAS] += 1.0;
         }
     }
+    let mut open = 0usize;
+    for k in 0..solution.depths.len() {
+        if solution.starts.get(k).copied().unwrap_or(false) {
+            open = 0;
+        }
+        if let (Some(depth), Some(depths)) = (solution.depths[k], problem.depths.get(k).filter(|d| !d.is_empty())) {
+            t[W_DEPTH] += f64::from(depths[open][usize::from(depth)]);
+            open = usize::from(depth);
+        }
+    }
     t
 }
 
@@ -582,10 +664,47 @@ pub(crate) fn train(folder: &Path, out: &Path, epochs: usize) -> Result<String, 
         }
     }
     problems.sort_by(|a, b| a.0.cmp(&b.0));
+    // The reachability check: each problem solved pulled hard toward the gold's reading; how much of the
+    // gold the solve can make at all (the architecture's ceiling on these documents).
+    let mut report = String::new();
+    {
+        let mut reach = [(0usize, 0usize); 5];
+        for (_, problem) in &problems {
+            let Some(gold) = &problem.gold_reading else { continue };
+            let solved = solve(problem, &PRIOR_WEIGHTS, false, 50.0);
+            for k in 0..problem.choices.len() {
+                if problem.gold[k] >= 0 {
+                    reach[0].1 += 1;
+                    reach[0].0 += usize::from(solved.path[k].0 as i16 == problem.gold[k]);
+                }
+                let role = solved.line_choice[k].map_or(0, |(_, r)| r);
+                if gold.roles[k] > 0 || role > 0 {
+                    reach[1].1 += 1;
+                    reach[1].0 += usize::from(role == gold.roles[k]);
+                }
+                let level = solved.levels[k].map_or(0, |l| l as u8);
+                if gold.levels[k] > 0 || level > 0 {
+                    reach[2].1 += 1;
+                    reach[2].0 += usize::from(level == gold.levels[k]);
+                }
+                let depth = solved.depths[k].unwrap_or(0);
+                if gold.depths[k] > 0 || depth > 0 {
+                    reach[3].1 += 1;
+                    reach[3].0 += usize::from(depth == gold.depths[k]);
+                }
+                if gold.starts[k] || solved.starts[k] {
+                    reach[4].1 += 1;
+                    reach[4].0 += usize::from(gold.starts[k] == solved.starts[k]);
+                }
+            }
+        }
+        let share = |(right, all): (usize, usize)| right as f64 / all.max(1) as f64;
+        report.push_str(&format!("reachable: lines' classes {:.4} of {}, numbers' roles {:.4} of {}, heading levels {:.4} of {}, body depths {:.4} of {}, starts {:.4} of {}\n",
+            share(reach[0]), reach[0].1, share(reach[1]), reach[1].1, share(reach[2]), reach[2].1, share(reach[3]), reach[3].1, share(reach[4]), reach[4].1));
+    }
     let mut w = PRIOR_WEIGHTS;
     let mut squares = [1e-6f64; WEIGHTS];
     let (mut sum, mut steps) = ([0f64; WEIGHTS], 0usize);
-    let mut report = String::new();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
     for epoch in 0..epochs {
         let (mut right, mut lines) = (0usize, 0usize);
@@ -597,7 +716,7 @@ pub(crate) fn train(folder: &Path, out: &Path, epochs: usize) -> Result<String, 
                     let (problems, w) = (&problems, &w);
                     scope.spawn(move || part.iter().map(|&i| {
                         let problem = &problems[i].1;
-                        let solved = solve(problem, w, true);
+                        let solved = solve(problem, w, true, 0.0);
                         let read = totals(problem, &solved);
                         let gold = problem.gold_totals.unwrap_or_default();
                         let mut delta = [0f64; WEIGHTS];
@@ -802,6 +921,51 @@ fn outline_features(k: usize, open: usize, table: &LineTable, views: &[LineView]
     f
 }
 
+/// A body opening's features given the open depth: the depth, its line's place and marker features, what
+/// the whole document's numbers say of its first number (`number_features`), how the local scores read it.
+fn depth_features(k: usize, open: usize, number: Option<&[f32; NUMBER_WIDTH]>, table: &LineTable, locals: &[Local]) -> [f32; DEPTH_WIDTH] {
+    let mut f = [0f32; DEPTH_WIDTH];
+    f[0] = open as f32;
+    let row = table.row(k);
+    f[1..21].copy_from_slice(&row[..20]);
+    f[21..41].copy_from_slice(&row[72..92]);
+    if let Some(x) = number {
+        f[41] = 1.0;
+        f[42] = x[1];
+        f[43] = x[2];
+        f[44] = x[10];
+        f[45] = x[14];
+        f[46] = x[15];
+        f[47] = x[16];
+        f[48] = x[18];
+    } else {
+        f[43] = 9.0;
+        f[48] = 9.0;
+    }
+    let p = &locals[k].probabilities;
+    for (at, class) in [3usize, 33, 5, 9].into_iter().enumerate() {
+        f[49 + at] = p[class] as f32;
+    }
+    f
+}
+
+/// The gold's body openings with their depths and the open depth before each.
+fn gold_depths(gold: &[[i64; 8]]) -> Vec<(usize, usize, usize)> {
+    let (mut out, mut current) = (Vec::new(), 0usize);
+    for (k, g) in gold.iter().enumerate() {
+        if g[2] == 1 {
+            current = 0;
+        }
+        let region = if g[0] == UNMARKED_BODY { 1 } else { g[0] };
+        if g[1] == 1 && region >= 0 && RANKED_BODY.contains(&(region as u8)) && g[7] > 0 {
+            let depth = (current.max(1) as i64 + g[7] - 10).clamp(1, LEVEL_CLASSES as i64 - 1) as usize;
+            out.push((k, current, depth));
+            current = depth;
+        }
+    }
+    out
+}
+
 /// The gold's headings with their levels and the open level before each, for the outline head's fit.
 fn gold_outline(gold: &[[i64; 8]]) -> Vec<(usize, usize, usize)> {
     let (mut out, mut current) = (Vec::new(), 0usize);
@@ -994,6 +1158,25 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             out
         }).collect()
     }).collect();
+    // Each line's depths given the open depth where it may open a body unit.
+    let first_number: HashMap<usize, usize> = numbers.iter().enumerate().rev().map(|(i, x)| (x.line, i)).collect();
+    let depths: Vec<Vec<[f32; LEVEL_CLASSES]>> = (0..n).map(|k| {
+        if !choices[k].iter().any(|&(c, _, _)| c % 2 == 1 && RANKED_BODY.contains(&((c / 2) as u8))) {
+            return Vec::new();
+        }
+        let number = first_number.get(&k).map(|&i| &own[i]);
+        (0..LEVEL_CLASSES).map(|open| {
+            let mut out = [0f32; LEVEL_CLASSES];
+            let scores = heads.map(|h| h.depth.probabilities(&depth_features(k, open, number, table, locals)));
+            for depth in 1..LEVEL_CLASSES {
+                out[depth] = match &scores {
+                    Some(p) => (p[depth].max(1e-9).ln() - even) as f32,
+                    None => -1.5 * depth.saturating_sub(open.max(1) + 1) as f32 - 0.5 * open.saturating_sub(depth) as f32,
+                };
+            }
+            out
+        }).collect()
+    }).collect();
     let mut problem = Problem {
         choices,
         numbers: numbers.iter().map(|x| (x.line as u32, x.reading as u8, families[x.family.as_str()], x.value)).collect(),
@@ -1003,20 +1186,27 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         marks: views.iter().enumerate().flat_map(|(k, v)| v.references.iter().enumerate().map(move |(m, r)| (k as u32, m as u16, r.0, v.page))).collect(),
         pairs: pairs.iter().zip(&pair_rows).map(|(&(k, m, l), row)| (k as u32, m as u16, l as u32, heads.map_or(PAIR, |h| h.pair.scores(row)[0] as f32))).collect(),
         levels,
+        depths,
         starts: start_rows.iter().map(|found| found.as_ref().map(|(row, restart)| match heads {
             Some(h) => h.start.scores(row)[0] as f32,
             None => if row[0] > 0.0 { 2.5 } else { 0.0 } + if row[2] + row[3] >= 0.5 { 0.5 } else { 0.0 } + if *restart { 2.0 } else { 0.0 },
         })).collect(),
         gold: (0..n).map(|k| gold_class(k).map_or(-1, |c| c as i16)).collect(),
         gold_totals: None,
+        gold_reading: None,
     };
     if let (Some((folder, sha256)), Some(gold)) = (dump, gold) {
         let (roles, link_gold, pair_gold) = gold_answers(&numbers, &links, &pairs, views, gold);
         let outline = gold_outline(gold);
+        let body = gold_depths(gold);
         // The gold reading in the solve's terms, and its totals.
         let mut gold_levels = vec![None; n];
         for &(k, _, level) in &outline {
             gold_levels[k] = Some(level as i8);
+        }
+        let mut gold_body = vec![None; n];
+        for &(k, _, depth) in &body {
+            gold_body[k] = Some(depth as u8);
         }
         let first_reading: HashMap<usize, usize> = numbers.iter().rev().map(|x| (x.line, x.reading)).collect();
         let path: Vec<(u16, bool)> = (0..n).map(|k| match gold_class(k) {
@@ -1034,10 +1224,18 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             pairs: pair_gold.iter().enumerate().filter(|(_, &g)| g == 1).map(|(j, _)| j).collect(),
             notes: (0..n).map(|k| path[k].0 == u16::from(NOTE) * 2 + 1).collect(),
             levels: gold_levels,
+            depths: gold_body,
             chain_of: Vec::new(),
             path,
         };
         problem.gold_totals = Some(totals(&problem, &solution));
+        problem.gold_reading = Some(GoldReading {
+            roles: solution.line_choice.iter().map(|c| c.map_or(0, |(_, r)| r)).collect(),
+            levels: solution.levels.iter().map(|l| l.map_or(0, |l| l as u8)).collect(),
+            depths: solution.depths.iter().map(|d| d.unwrap_or(0)).collect(),
+            starts: solution.starts.clone(),
+            notes: solution.notes.clone(),
+        });
         let rows = serde_json::json!({
             "sha256": sha256, "numbers": own.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "number_gold": roles,
             "links": link_rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "link_gold": link_gold,
@@ -1046,6 +1244,8 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             "outline_gold": outline.iter().map(|&(_, _, level)| level).collect::<Vec<_>>(),
             "starts": start_rows.iter().flatten().map(|(row, _)| row.to_vec()).collect::<Vec<_>>(),
             "start_gold": start_rows.iter().enumerate().filter(|(_, r)| r.is_some()).map(|(k, _)| i64::from(gold[k][2] == 1)).collect::<Vec<_>>(),
+            "depths": body.iter().map(|&(k, open, _)| depth_features(k, open, first_number.get(&k).map(|&i| &own[i]), table, locals).to_vec()).collect::<Vec<_>>(),
+            "depth_gold": body.iter().map(|&(_, _, depth)| depth).collect::<Vec<_>>(),
         });
         let write = || -> std::io::Result<()> {
             std::fs::create_dir_all(folder)?;
@@ -1056,36 +1256,15 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             eprintln!("whole reading dump {sha256}: {error}");
         }
     }
-    let solution = solve(&problem, weights, false);
+    let solution = solve(&problem, weights, false, 0.0);
     moves_of(&solution, &numbers, views, locals)
 }
 
 /// The reading's moves: the roles' regions; the markers the numbers count; the notes' numbers; the
-/// outline's levels; the starts; depths by the chains' nesting (a chain starting over at one under
-/// another's counted unit sits a level under it, the document's other chains at the top, a unit on no
-/// number at the depth of the counted unit before it, a quotation's one under it); resumptions as the
-/// state replays them.
+/// outline's levels and depths; the starts; resumptions as the state replays them.
 fn moves_of(solution: &Solution, numbers: &[Number], views: &[LineView], locals: &[Local]) -> Vec<Move> {
     let n = views.len();
-    let _ = locals;
-    let number_at: HashMap<(usize, usize), usize> = numbers.iter().enumerate().map(|(i, x)| ((x.line, x.reading), i)).collect();
-    let mut chain_depth: HashMap<usize, u8> = HashMap::new();
-    let mut last_counted: Option<(usize, u8)> = None;
-    let mut depth_of_line = vec![0u8; n];
-    for k in 0..n {
-        if solution.starts[k] {
-            last_counted = None;
-        }
-        let Some((reading, _)) = solution.line_choice[k] else { continue };
-        let Some(&i) = number_at.get(&(k, usize::from(reading))) else { continue };
-        let Some(head) = solution.chain_of.get(i).copied().flatten() else { continue };
-        let depth = *chain_depth.entry(head).or_insert_with(|| match last_counted {
-            Some((other, depth)) if other != head && numbers[i].value == 1 => (depth + 1).min(9),
-            _ => 1,
-        });
-        depth_of_line[k] = depth;
-        last_counted = Some((head, depth));
-    }
+    let _ = (locals, numbers);
     let mut state = State::default();
     let mut moves = Vec::with_capacity(n);
     let mut depth_before = 1u8;
@@ -1107,16 +1286,8 @@ fn moves_of(solution: &Solution, numbers: &[Number], views: &[LineView], locals:
             chosen.level = solution.levels[k].unwrap_or(1).max(1);
         }
         if opens && RANKED_BODY.contains(&region) {
-            chosen.depth = if depth_of_line[k] > 0 && chosen.reading.is_some() {
-                depth_of_line[k]
-            } else if region == QUOTE {
-                (depth_before + 1).min(9)
-            } else {
-                depth_before
-            };
-            if chosen.reading.is_some() || region != QUOTE {
-                depth_before = chosen.depth;
-            }
+            chosen.depth = solution.depths[k].unwrap_or(depth_before).max(1);
+            depth_before = chosen.depth;
         }
         let key = (state.ctx(line, false), stream_of(region));
         if !opens && region != 0 && state.open_regions.get(&key) != Some(&region) && state.interrupted.get(&key) == Some(&region) {
