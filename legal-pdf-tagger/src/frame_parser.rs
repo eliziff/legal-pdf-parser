@@ -151,8 +151,16 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
     }
     let anchors: HashMap<_, _> = parts.iter().rev().filter_map(|(owner, spans)| owner.map(|index|
         (candidates[index].0.id.as_str(), crate::frame::anchor(&spans[0])))).collect();
-    // A transcript (its lines numbered) reads by speakers' turns.
-    let transcript = structure.nodes.iter().any(|node| node.role == Some(PrimaryRole::LineLabel));
+    // A transcript reads by speakers' turns: a document whose lines open on speakers' labels often enough,
+    // numbered or not (a reasons' record of an examination, a hearing's minutes); a document with a few
+    // stray line labels and its form's own fields ("Email:") is none.
+    let transcript = {
+        let written: Vec<&str> = lines.iter().map(|(line, _, _)| line.text.as_str()).filter(|text| !text.trim().is_empty()).collect();
+        let spoken = written.iter().filter(|text| legal_structure_model::transcript::speaker_label(text).is_some()).count();
+        let numbered = structure.nodes.iter().any(|node| node.role == Some(PrimaryRole::LineLabel));
+        let share = spoken as f64 / written.len().max(1) as f64;
+        (numbered && share >= 0.02) || (spoken >= 20 && share >= 0.08)
+    };
     let mut groups = Vec::new();
     for (owner, spans) in parts {
         let node = owner.map(|index| candidates[index].0);
@@ -202,9 +210,11 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
             let first = &spans[0];
             if let Some((line, _, _)) = lines.iter().find(|(line, _, _)| line.id == first.line_id) {
                 let opening: String = line.text.chars().skip(first.start).take(first.end - first.start).collect();
-                if let Some((start, end)) = legal_structure_model::transcript::speaker_label(&opening) {
+                let labels = legal_structure_model::transcript::speaker_labels(&opening);
+                if !labels.is_empty() {
                     let at = |bytes: usize| first.start + opening[..bytes].chars().count();
-                    attributes.insert("speaker".into(), json!([SourceSpan { line_id: first.line_id.clone(), start: at(start), end: at(end) }]));
+                    let found: Vec<SourceSpan> = labels.into_iter().map(|(start, end)| SourceSpan { line_id: first.line_id.clone(), start: at(start), end: at(end) }).collect();
+                    attributes.insert("speaker".into(), json!(found));
                 }
             }
         }

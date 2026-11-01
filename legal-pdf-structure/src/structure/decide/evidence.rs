@@ -630,10 +630,11 @@ pub(crate) fn reference_values(line: &Line, size: f64) -> Vec<u32> {
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
 /// detached reference stands where it says.
 pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
+    static GLUED: OnceLock<Regex> = OnceLock::new();
     let value = |text: &str| text.trim().parse().unwrap_or(0);
     let chars: Vec<char> = line.text.chars().collect();
     let marks: Vec<&str> = reference_marks(line, size).map(|(text, _)| text).collect();
-    let mut found = Vec::new();
+    let mut found: Vec<(u32, u32, u32)> = Vec::new();
     let mut cursor = 0;
     for span in &line.spans {
         let text: Vec<char> = span.text.trim().chars().collect();
@@ -644,10 +645,37 @@ pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         cursor = at + text.len();
         let trimmed = span.text.trim();
         if marks.contains(&trimmed) && (span.superscript || reference_marks(line, size).any(|(t, _)| t == trimmed)) {
-            found.push((value(trimmed), at as u32, cursor as u32));
+            // A mark set over two spans ("2" then "3" of "23") is one mark.
+            match found.last_mut() {
+                Some(last) if last.2 == at as u32 && trimmed.chars().all(|c| c.is_ascii_digit()) && chars[last.1 as usize..last.2 as usize].iter().all(char::is_ascii_digit) => {
+                    last.2 = cursor as u32;
+                    last.0 = chars[last.1 as usize..last.2 as usize].iter().collect::<String>().parse().unwrap_or(0);
+                }
+                _ => found.push((value(trimmed), at as u32, cursor as u32)),
+            }
         }
     }
-    found.extend(line.detached_references.iter().map(|r| (value(&r.selected_text), r.start_offset as u32, r.end_offset as u32)));
+    // Figures run on after a word's punctuation ("count.12 This", "Act;3"), where no span sets them apart.
+    let glued = GLUED.get_or_init(|| Regex::new(r"\p{L}{2}[.,;:)\]\u{201d}\u{2019}](\d{1,3})(?:\s|$)").unwrap());
+    for found_at in glued.captures_iter(&line.text).filter_map(|c| c.get(1)) {
+        let start = line.text[..found_at.start()].chars().count() as u32;
+        let end = start + found_at.as_str().chars().count() as u32;
+        if !found.iter().any(|&(_, a, b)| a < end && start < b) {
+            found.push((value(found_at.as_str()), start, end));
+        }
+    }
+    // A detached reference stands where it says, its blank edges trimmed.
+    for r in &line.detached_references {
+        let (mut start, mut end) = (r.start_offset.min(chars.len()), r.end_offset.min(chars.len()));
+        while start < end && chars[start].is_whitespace() {
+            start += 1;
+        }
+        while end > start && chars[end - 1].is_whitespace() {
+            end -= 1;
+        }
+        found.push((value(&r.selected_text), start as u32, end as u32));
+    }
+    found.sort_by_key(|&(_, start, _)| start);
     found
 }
 
@@ -733,13 +761,29 @@ fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
 /// `sizes`.
 pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> {
     let line = &page.lines[slot];
-    let prefix = label_prefix(&line.text)?;
+    // A label glued to its note's first word ("27Ibid", "1\u{201c}significant") is one where its figures
+    // are set as a label's: raised, or smaller than the line's type.
+    let (prefix, glued) = match label_prefix(&line.text) {
+        Some(prefix) => (prefix, false),
+        None => {
+            let lead = line.text.len() - line.text.trim_start().len();
+            let figures = line.text[lead..].chars().take(3).take_while(char::is_ascii_digit).count();
+            let next = line.text[lead + figures..].chars().next()?;
+            if figures == 0 || !(next.is_uppercase() || "\u{201c}\u{2018}\"'".contains(next)) {
+                return None;
+            }
+            (label_prefix(&format!("{} {}", &line.text[..lead + figures], &line.text[lead + figures..]))?, true)
+        }
+    };
     let size = sizes[slot];
     let raised = label_is_raised(line, &prefix, size);
     let label_size = label_spans(line, &prefix)
         .filter_map(|span| (span.size > 0.0).then_some(span.size))
         .min_by(f64::total_cmp)
         .unwrap_or(size);
+    if glued && !raised && !(label_size > 0.0 && label_size <= size * 0.85) {
+        return None;
+    }
     let mut suppress = 0;
     if line.bbox[1] >= page.height * 0.94 {
         suppress |= SUPPRESS_FOOT;

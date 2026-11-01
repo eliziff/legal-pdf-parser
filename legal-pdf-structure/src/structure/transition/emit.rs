@@ -39,6 +39,32 @@ fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// A table line's cells where no reader found them: its spans in order, a new cell where the gap to the
+/// next is wider than two of the line's characters; each cell's first and past-last character.
+fn gap_cells(line: &Line) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.text.chars().collect();
+    let width = line.bbox[2] - line.bbox[0];
+    let glyph = if chars.is_empty() { 0.0 } else { width / chars.len() as f64 };
+    let mut cells: Vec<(usize, usize, f64)> = Vec::new();
+    let mut cursor = 0;
+    for span in &line.spans {
+        let text: Vec<char> = span.text.trim().chars().collect();
+        if text.is_empty() || text.len() > chars.len() {
+            continue;
+        }
+        let Some(at) = (cursor..=chars.len().saturating_sub(text.len())).find(|&at| chars[at..at + text.len()] == text[..]) else { continue };
+        cursor = at + text.len();
+        match cells.last_mut() {
+            Some(last) if span.bbox[0] - last.2 <= glyph * 2.0 => {
+                last.1 = cursor;
+                last.2 = span.bbox[2];
+            }
+            _ => cells.push((at, cursor, span.bbox[2])),
+        }
+    }
+    cells.into_iter().map(|(start, end, _)| (start, end)).collect()
+}
+
 /// The figures a line's text opens on, where they read `value`: their first and past-last character.
 fn leading_figures(text: &str, value: u32) -> Option<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
@@ -382,7 +408,17 @@ pub(crate) fn structure_graph(
                                 }
                             }
                         }
-                        None => cells.entry(if columns >= 2 { columns - 1 } else { 0 }).or_default().extend(line_range(k)),
+                        // No reader cells: the line's own columns, split where a wide gap parts its spans.
+                        None => {
+                            let parts = gap_cells(slots.line(pages, table.order[k]));
+                            if parts.len() >= 2 {
+                                for (column, (start, end)) in parts.into_iter().enumerate() {
+                                    cells.entry(column).or_default().extend(index.global_range(&id, start, end));
+                                }
+                            } else {
+                                cells.entry(if columns >= 2 { columns - 1 } else { 0 }).or_default().extend(line_range(k));
+                            }
+                        }
                     }
                 }
                 for (column, mut ranges) in cells {

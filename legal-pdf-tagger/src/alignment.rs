@@ -161,13 +161,24 @@ pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> 
             }
         }
     }
-    for line in &mut owners {
-        let mut last = None;
-        for slot in line.iter_mut() {
-            match slot {
-                Some(owner) => last = Some(*owner),
-                None => *slot = last,
+    for (r, line) in owners.iter_mut().enumerate() {
+        // A gap goes to the candidate line before it; but blank text between two candidate lines'
+        // characters (a margin's line number the parser set on a line of its own, then the gap to the
+        // line's text) is neither line's.
+        let text = &reference.lines[r].text;
+        let mut at = 0;
+        while at < line.len() {
+            if line[at].is_some() {
+                at += 1;
+                continue;
             }
+            let end = (at..line.len()).find(|&k| line[k].is_some()).unwrap_or(line.len());
+            let (before, after) = (at.checked_sub(1).and_then(|k| line[k]), line.get(end).copied().flatten());
+            let between = matches!((before, after), (Some(b), Some(a)) if b.0 != a.0) && text[at..end].iter().all(|c| c.is_whitespace());
+            if !between {
+                line[at..end].fill(before);
+            }
+            at = end;
         }
         if let Some(first) = line.iter().position(Option::is_some) {
             let owner = line[first];

@@ -403,15 +403,16 @@ pub fn parsed_regions(state: &State) -> Regions {
     Regions(found)
 }
 
-/// The gold's labels carried onto another frame's pieces through the scorer's alignment: a piece
-/// takes the label of the gold piece its first aligned character falls in, opening what that gold
-/// piece opens only where it holds the gold piece's first character; pointers move to the piece
-/// holding the start of the gold piece they name.
+/// The gold's labels carried onto another frame's pieces through the scorer's alignment, in that frame's
+/// own reading order. A piece takes the region of the gold unit its first aligned character falls in.
+/// The unit's first piece in this frame opens it, whatever character it starts on, so a misread first
+/// character ("IO" for "10") opens what the gold opens. A later piece continues the unit where it is the
+/// one open in its stream here, else resumes it. Levels and depths are the gold units' own, stepped in
+/// this frame's order.
 pub fn carry(reference: &State, gold_pieces: &[Piece], gold: &[Label], candidate: &State, pieces: &[Piece], alignment: &Alignment)
     -> Vec<Option<Label>> {
     let gold_at = Locator::new(gold_pieces);
     // Each candidate piece's aligned stretches of gold lines.
-    let mut aligned: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
     let mut stretches: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); pieces.len()];
     for (k, piece) in pieces.iter().enumerate() {
         for &(lo, hi, r, offset, limit) in &alignment.mappings[piece.line] {
@@ -422,26 +423,84 @@ pub fn carry(reference: &State, gold_pieces: &[Piece], gold: &[Label], candidate
             let exact = hi - lo == limit - offset;
             let (ga, gb) = if exact { (offset + a - lo, offset + b - lo) } else { (offset, limit) };
             stretches[k].push((r, ga, gb));
-            aligned.entry(r).or_default().push((ga, gb, k));
         }
     }
-    let moved = |name: &str| -> Option<String> {
-        let (r, at) = point(reference, name)?;
-        let k = aligned.get(&r)?.iter().find(|&&(a, b, _)| a <= at && at < b)?.2;
-        Some(anchor(candidate, &pieces[k]))
-    };
+    // The gold's units, read off its labels in its own order as `decode` reads them: each one's first
+    // piece and its level and depth (absolute, the steps undone).
+    let mut unit_of: Vec<Option<usize>> = vec![None; gold_pieces.len()];
+    let mut heads: Vec<usize> = Vec::new();
+    let mut levels: Vec<(usize, usize)> = Vec::new();
+    let mut unit_at: HashMap<String, usize> = HashMap::new();
+    let mut open: [Option<usize>; STREAMS] = [None; STREAMS];
+    let (mut heading, mut body): (Option<usize>, Option<usize>) = (None, None);
+    for (g, label) in gold.iter().enumerate() {
+        if label.region == 0 {
+            continue;
+        }
+        let s = stream(label.region);
+        let resumed = (label.start == 2).then(|| label.continues.as_deref().and_then(|a| unit_at.get(a).copied())).flatten();
+        let u = match (label.start, resumed, open[s]) {
+            (2, Some(u), _) => u,
+            (0 | 2, _, Some(u)) if gold[heads[u]].region == label.region => u,
+            _ => {
+                if label.document {
+                    (heading, body) = (None, None);
+                }
+                let level = (label.level > 0).then(|| stepped(heading, label.level)).unwrap_or(0);
+                let depth = (label.depth > 0).then(|| stepped(body, label.depth)).unwrap_or(0);
+                if level > 0 {
+                    heading = Some(level);
+                }
+                if depth > 0 {
+                    body = Some(depth);
+                }
+                heads.push(g);
+                levels.push((level, depth));
+                unit_at.insert(anchor(reference, &gold_pieces[g]), heads.len() - 1);
+                heads.len() - 1
+            }
+        };
+        unit_of[g] = Some(u);
+        open[s] = Some(u);
+    }
+    // This frame's pieces in its order: each unit opened by its first piece here, continued or resumed.
+    let mut first_here: HashMap<usize, usize> = HashMap::new();
+    let mut open_here: [Option<usize>; STREAMS] = [None; STREAMS];
+    let (mut heading, mut body): (Option<usize>, Option<usize>) = (None, None);
     (0..pieces.len()).map(|k| {
         let &(r, at, _) = stretches[k].first()?;
         let g = gold_at.at(r, at)?;
         let source = &gold[g];
         let mut label = Label { region: source.region, ..Label::default() };
-        if at == gold_pieces[g].start {
-            label.start = source.start;
-            label.continues = source.continues.as_deref().and_then(moved);
-            label.level = source.level;
-            label.depth = source.depth;
-            label.marker = source.marker;
-            label.document = source.document;
+        if let Some(u) = unit_of[g] {
+            let s = stream(source.region);
+            match first_here.get(&u) {
+                None => {
+                    let head = &gold[heads[u]];
+                    label.start = 1;
+                    label.marker = head.marker;
+                    label.document = head.document;
+                    if head.document {
+                        (heading, body) = (None, None);
+                    }
+                    let (level, depth) = levels[u];
+                    if level > 0 {
+                        label.level = step(heading, level);
+                        heading = Some(level);
+                    }
+                    if depth > 0 {
+                        label.depth = step(body, depth);
+                        body = Some(depth);
+                    }
+                    first_here.insert(u, k);
+                }
+                Some(&first) if open_here[s] != Some(u) => {
+                    label.start = 2;
+                    label.continues = Some(anchor(candidate, &pieces[first]));
+                }
+                Some(_) => {}
+            }
+            open_here[s] = Some(u);
         }
         // A paired reference anywhere in the gold this piece covers.
         label.reference = stretches[k].iter().any(|&(r, a, b)| {
@@ -654,6 +713,32 @@ pub fn assemble(regions: &[&str], texts: &[String], levels: &[usize], depths: &[
 /// unit's marker: its character range within the piece, when the engine's numbering grammar reads
 /// the token. A bare number ("12 persons") is no marker.
 fn leading_marker(text: &[char]) -> Option<(usize, usize)> {
+    strict_marker(text).or_else(|| loose_marker(text))
+}
+
+/// An enumerator the strict reading leaves out but the gold marks: a bare number ("3   At the time"), a
+/// section glued to its subsection ("3(1)", "56.1(2)"), a bullet, an upper-case roman of two letters or
+/// more ("II", "IV"): the opening token, up to the whitespace after it.
+fn loose_marker(text: &[char]) -> Option<(usize, usize)> {
+    let n = text.len();
+    let start = text.iter().position(|c| !c.is_whitespace())?;
+    let end = start + text[start..].iter().take_while(|c| !c.is_whitespace()).count();
+    if end < n && !text[end].is_whitespace() {
+        return None;
+    }
+    let raw: String = text[start..end].iter().collect();
+    let token = raw.trim_end_matches(['.', ':']);
+    let bare = !token.is_empty() && token.len() <= 4 && token.chars().all(|c| c.is_ascii_digit());
+    let glued = {
+        let section: String = token.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        !section.is_empty() && token[section.len()..].starts_with('(') && token.ends_with(')') && token.len() <= 14
+    };
+    let bullet = token.chars().count() == 1 && "\u{2022}\u{00b7}\u{25aa}\u{2013}\u{2014}-*\u{25cf}\u{25cb}\u{25a0}\u{25a1}\u{25ba}".contains(token);
+    let roman = token.len() >= 2 && token.len() <= 6 && token.chars().all(|c| "IVXLC".contains(c));
+    (bare || glued || bullet || roman).then_some((start, end))
+}
+
+fn strict_marker(text: &[char]) -> Option<(usize, usize)> {
     let n = text.len();
     let mut i = 0;
     while i < n && text[i].is_whitespace() {
@@ -789,12 +874,21 @@ pub fn decode(candidate: &State, pieces: &[Piece], labels: &[Label], source_sha2
             let chars = &line.text[piece.start.min(line.text.len())..piece.end.min(line.text.len())];
             leading_marker(chars).map(|(a, b)| vec![SourceSpan { line_id: line.id.clone(), start: piece.start + a, end: piece.start + b }])
         };
+        // A unit's marker where its labels say it opens on one: as the gold's grammar reads the piece's
+        // opening, else the frame's block marker where that stands at this very piece's opening (a
+        // block's marker is no marker of a unit opening inside the block).
+        let at_opening = |found: &Vec<SourceSpan>| {
+            let first = line.text[piece.start.min(line.text.len())..piece.end.min(line.text.len())].iter().position(|c| !c.is_whitespace()).map(|at| piece.start + at);
+            found.first().is_some_and(|s| s.line_id == line.id && Some(s.start) == first && s.end <= piece.end)
+        };
         let marker: Option<Vec<SourceSpan>> = if head[u] != k {
             None
         } else if region == "note" {
             note_labels.get(&k).cloned()
+        } else if label.marker {
+            read_marker().or_else(|| markers.get(&k).cloned().filter(at_opening))
         } else {
-            markers.get(&k).cloned().or_else(|| (label.marker && matches!(region, "text" | "provision" | "list_item")).then(read_marker).flatten())
+            None
         };
         let mut own_references: Vec<SourceSpan> = if label.reference {
             references.get(&k).into_iter().flatten().filter(|s| own(s)).cloned().collect()
