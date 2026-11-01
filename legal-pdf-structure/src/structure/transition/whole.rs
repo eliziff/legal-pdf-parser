@@ -13,10 +13,13 @@
 //!   heading's, another unit's number), the role worth the most over its members and links;
 //! - the notes: every reference mark is answered by at most one note label of its number, on its page
 //!   or the two after; a note may answer several marks;
-//! - the outline: which lines open headings and at what level, by dynamic programming over the lines
-//!   that may, on the open heading's level, a document's start opening none;
-//! - the body: which lines open body units and at what depth, by dynamic programming over the lines that
-//!   may, on the open depth, as the outline's levels are read.
+//! - the outline: which lines open headings, each a child of a heading open above it or of the top, its
+//!   level its parent's and one (or two, a level skipped), each placement worth its parent head's log-odds
+//!   and its agreement with its template's other headings (a skip-chain term over every pair of
+//!   same-template headings), by beam search over whole partial outlines, a document's start emptying it;
+//! - the body: which lines open body units, each a child of a body unit open above it or of the top, its
+//!   depth its parent's and one (or two), each worth its parent head's log-odds and its agreement with its
+//!   numbering family's other units, searched the same way.
 //!
 //! What they share: a line opens a unit of a region on its marker exactly where its number counts in
 //! that region's role; a line opens a note exactly where its label is a note's; a line opens a heading
@@ -28,8 +31,9 @@
 //!
 //! Its scores come from six learned heads (`Heads`, LEGALPDF_TRANSITION_HEADS, forests `fit_whole.py`
 //! fits on the gold): a number's role, a link between two numbers, a mark's pair with a note label, a
-//! heading's level given the open one's, a body unit's depth given the open one's, a line's opening a
-//! constituent document; each over features the
+//! heading's parent, a body unit's parent (each against every unit open above it in the gold, as HRDoc
+//! reads a document's hierarchy as parent relations), a line's opening a constituent document; each over
+//! features the
 //! whole document's candidates give (how far a number's family runs before and after it, how many of it
 //! the document holds, what stands between two numbers or a mark and a label, a heading's template over
 //! the document, the printed contents entry it answers and that entry's tier), never over a reading. How much each part's scores weigh against the others' is learned
@@ -63,15 +67,21 @@ pub(crate) const ROLES: usize = 7;
 pub(crate) const NUMBER_WIDTH: usize = 68;
 pub(crate) const LINK_WIDTH: usize = 48;
 pub(crate) const PAIR_WIDTH: usize = 22;
-pub(crate) const OUTLINE_WIDTH: usize = 55;
 pub(crate) const START_WIDTH: usize = 32;
-pub(crate) const DEPTH_WIDTH: usize = 53;
+pub(crate) const PARENT_WIDTH: usize = 79;
+/// The candidate parents a heading is scored against (the headings that may open before it), and a
+/// body unit (the body units that may open before it), besides the top.
+const HEADING_WINDOW: usize = 16;
+const BODY_WINDOW: usize = 8;
+/// The whole partial outlines and bodies the trees' search keeps.
+const BEAM: usize = 16;
 
 /// The weights of the parts' scores against each other, in this order: the local scores' log-probability,
 /// a paragraph resumed past another unit, a numbered opening on its marker, a counted number's role, a
-/// link, a pair, a note opened, a heading's level, a start's log-odds, a start, a heading opened, a body
-/// unit's depth.
-pub(crate) const WEIGHTS: usize = 12;
+/// link, a pair, a note opened, a heading's parent, a start's log-odds, a start, a heading opened, a body
+/// unit's parent, a heading's level agreeing with its template's, a body unit's depth agreeing with its
+/// numbering family's, a level or depth skipped below its parent's.
+pub(crate) const WEIGHTS: usize = 15;
 const W_LOCAL: usize = 0;
 const W_RESUME: usize = 1;
 const W_MARKED: usize = 2;
@@ -84,8 +94,11 @@ const W_START: usize = 8;
 const W_START_BIAS: usize = 9;
 const W_HEADING: usize = 10;
 const W_DEPTH: usize = 11;
+const W_TEMPLATE: usize = 12;
+const W_FAMILY: usize = 13;
+const W_GAP: usize = 14;
 /// The weights before any training.
-pub(crate) const PRIOR_WEIGHTS: [f64; WEIGHTS] = [1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, -2.0, 0.0, 1.0];
+pub(crate) const PRIOR_WEIGHTS: [f64; WEIGHTS] = [1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, -2.0, 0.0, 1.0, 0.5, 0.5, -2.0];
 
 /// The role a region's opening gives its number.
 fn role_of(region: u8) -> usize {
@@ -109,9 +122,9 @@ pub(crate) struct Heads {
     number: Forest,
     link: Forest,
     pair: Forest,
-    outline: Forest,
+    heading_parent: Forest,
     start: Forest,
-    depth: Forest,
+    body_parent: Forest,
 }
 
 impl Heads {
@@ -120,9 +133,9 @@ impl Heads {
             number: Forest::read(&folder.join("number.txt"), NUMBER_WIDTH, ROLES)?,
             link: Forest::read(&folder.join("link.txt"), LINK_WIDTH, 1)?,
             pair: Forest::read(&folder.join("pair.txt"), PAIR_WIDTH, 1)?,
-            outline: Forest::read(&folder.join("outline.txt"), OUTLINE_WIDTH, LEVEL_CLASSES)?,
+            heading_parent: Forest::read(&folder.join("hparent.txt"), PARENT_WIDTH, 1)?,
             start: Forest::read(&folder.join("start.txt"), START_WIDTH, 1)?,
-            depth: Forest::read(&folder.join("depth.txt"), DEPTH_WIDTH, LEVEL_CLASSES)?,
+            body_parent: Forest::read(&folder.join("bparent.txt"), PARENT_WIDTH, 1)?,
         })
     }
 }
@@ -158,8 +171,13 @@ pub(crate) struct Problem {
     labels: Vec<(u32, u32, u32)>,
     marks: Vec<(u32, u16, u32, u32)>,
     pairs: Vec<(u32, u16, u32, f32)>,
-    levels: Vec<Vec<[f32; LEVEL_CLASSES]>>,
-    depths: Vec<Vec<[f32; LEVEL_CLASSES]>>,
+    /// Each line that may open a heading: its candidate parents (lines, the top `u32::MAX`) and the parent
+    /// head's log-odds of each; likewise each line that may open a body unit.
+    heading_parents: Vec<Vec<(u32, f32)>>,
+    body_parents: Vec<Vec<(u32, f32)>>,
+    /// Each line's template and its first number's family (`u32::MAX` none), the trees' consistency keys.
+    templates: Vec<u32>,
+    families: Vec<u32>,
     starts: Vec<Option<f32>>,
     /// Each line's column: the text's, or a parallel translation's.
     #[serde(default)]
@@ -443,66 +461,154 @@ fn notes_part(problem: &Problem, w: &[f64; WEIGHTS], price: &[f64], toward: f64)
     (pairs, notes)
 }
 
-/// The outline under the prices, exactly: over the lines that may open a heading, in order, which do and
-/// at what level, by dynamic programming on the open heading's level (none after a document's start); a
-/// heading's worth its price and its level's log-odds given the open one's. Each line's level, where it
-/// opens a heading.
+/// The outline under the prices: which lines open headings, each a child of a heading open above it or of
+/// the top (`tree_part`), its level its parent's and one (or two, a level skipped).
 fn outline_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &[f64], toward: f64) -> Vec<Option<i8>> {
     let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0).map(|g| &g.levels[..]);
-    ladder(&problem.levels, w[W_LEVEL], starts, price, gold, toward).into_iter().map(|l| l.map(|l| l as i8)).collect()
+    tree_part(&problem.heading_parents, &problem.templates, [w[W_LEVEL], w[W_TEMPLATE], w[W_GAP]], starts, price, gold, toward)
+        .into_iter().map(|l| l.map(|l| l as i8)).collect()
 }
 
-/// The body units' depths under the prices, exactly, as the outline's levels are read: over the lines that
-/// may open a body unit, which do and at what depth, on the open depth (none after a document's start).
+/// The body under the prices: which lines open body units, each a child of a body unit open above it or of
+/// the top, its depth its parent's and one (or two).
 fn depth_part(problem: &Problem, w: &[f64; WEIGHTS], starts: &[bool], price: &[f64], toward: f64) -> Vec<Option<u8>> {
     let gold = problem.gold_reading.as_ref().filter(|_| toward > 0.0).map(|g| &g.depths[..]);
-    ladder(&problem.depths, w[W_DEPTH], starts, price, gold, toward).into_iter().map(|d| d.map(|d| d as u8)).collect()
+    tree_part(&problem.body_parents, &problem.families, [w[W_DEPTH], w[W_FAMILY], w[W_GAP]], starts, price, gold, toward)
+        .into_iter().map(|d| d.map(|d| d as u8)).collect()
 }
 
-/// A ladder read whole: over the lines `table` holds scores for (each step's log-odds given the open step,
-/// by open step), which take a step and which, by dynamic programming on the open step, a start opening
-/// none; a step's worth its line's price and its weighted log-odds (and, for the reachability check, a pull
-/// toward `gold`'s steps).
-fn ladder(table: &[Vec<[f32; LEVEL_CLASSES]>], weight: f64, starts: &[bool], price: &[f64], gold: Option<&[u8]>, toward: f64) -> Vec<Option<usize>> {
+/// A candidate parent's log-odds for line `k` (a parent outside the line's window is all but excluded).
+fn parent_score(candidates: &[(u32, f32)], parent: u32) -> f64 {
+    candidates.iter().find(|&&(p, _)| p == parent).map_or(-6.0, |&(_, s)| f64::from(s))
+}
+
+/// What a tree reading adds up to: each unit's parent's log-odds, each unit's agreement with its key's
+/// commonest step so far (+1 the same, -1 another; nothing for a key's first unit), each step skipped.
+#[derive(Clone)]
+struct Climb {
+    stack: Vec<(u32, u8)>,
+    counts: HashMap<u32, [u16; LEVEL_CLASSES]>,
+}
+
+impl Climb {
+    fn new() -> Self {
+        Self { stack: Vec::new(), counts: HashMap::new() }
+    }
+
+    /// The parent a unit at `level` takes (the nearest open unit above it), and the stack after it.
+    fn place(&mut self, line: u32, level: u8) -> u32 {
+        while self.stack.last().is_some_and(|&(_, l)| l >= level) {
+            self.stack.pop();
+        }
+        let parent = self.stack.last().map_or(u32::MAX, |&(p, _)| p);
+        self.stack.push((line, level));
+        parent
+    }
+
+    fn agreement(&self, key: u32, level: u8) -> f64 {
+        if key == u32::MAX {
+            return 0.0;
+        }
+        match self.counts.get(&key) {
+            Some(counts) if counts.iter().any(|&c| c > 0) => {
+                let common = (1..LEVEL_CLASSES).max_by_key(|&l| (counts[l], std::cmp::Reverse(l))).unwrap_or(1);
+                if usize::from(level) == common { 1.0 } else { -1.0 }
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn count(&mut self, key: u32, level: u8) {
+        if key != u32::MAX {
+            self.counts.entry(key).or_insert([0; LEVEL_CLASSES])[usize::from(level).min(LEVEL_CLASSES - 1)] += 1;
+        }
+    }
+}
+
+/// A tree read whole by beam search over whole partial readings: over the lines that may open a unit (those
+/// `candidates` holds parents for), in order, each skipped or placed under a unit open above it (or the top)
+/// one step under it or two; a reading's worth the sum over its units of the price, the weighted parent
+/// log-odds, the weighted agreement with the unit's key (its template, its numbering family) over every unit
+/// of that key before it in the reading (a skip-chain term: summed over the reading it weighs every pair of
+/// same-keyed units once), and the weighted steps skipped; a start emptying the tree. Each line's step.
+fn tree_part(candidates: &[Vec<(u32, f32)>], keys: &[u32], weights: [f64; 3], starts: &[bool], price: &[f64], gold: Option<&[u8]>, toward: f64) -> Vec<Option<usize>> {
     let n = price.len();
-    let mut score = vec![f64::NEG_INFINITY; LEVEL_CLASSES];
-    score[0] = 0.0;
-    let mut back: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let [w_parent, w_key, w_gap] = weights;
+    // Each reading: its climb, its worth, its last placement (an index in `placed`).
+    let mut placed: Vec<(u32, u32, u8)> = Vec::new();
+    let mut beam: Vec<(Climb, f64, u32)> = vec![(Climb::new(), 0.0, u32::MAX)];
     for k in 0..n {
         if starts[k] {
-            let best = score.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let from = (0..LEVEL_CLASSES).max_by(|&a, &b| score[a].total_cmp(&score[b])).unwrap_or(0);
-            score = vec![f64::NEG_INFINITY; LEVEL_CLASSES];
-            score[0] = best;
-            back.push((k, (0..LEVEL_CLASSES).map(|_| (from, usize::MAX)).collect()));
-        }
-        let Some(levels) = table.get(k).filter(|levels| !levels.is_empty()) else { continue };
-        let pull = |level: usize| gold.map_or(0.0, |g| if usize::from(g[k]) == level { toward } else if g[k] > 0 { toward / 2.0 } else { -toward });
-        let mut next = score.clone();
-        let mut from: Vec<(usize, usize)> = (0..LEVEL_CLASSES).map(|s| (s, 0)).collect();
-        for open in 0..LEVEL_CLASSES {
-            if score[open] == f64::NEG_INFINITY {
-                continue;
+            for (climb, _, _) in &mut beam {
+                *climb = Climb::new();
             }
-            for level in 1..LEVEL_CLASSES {
-                let total = score[open] + price[k] + weight * f64::from(levels[open][level]) + pull(level);
-                if total > next[level] {
-                    next[level] = total;
-                    from[level] = (open, level);
+        }
+        let Some(options) = candidates.get(k).filter(|c| !c.is_empty()) else { continue };
+        let pull = |level: Option<u8>| match (gold, level) {
+            (None, _) => 0.0,
+            (Some(g), Some(level)) if g[k] == level => toward,
+            (Some(g), Some(_)) if g[k] > 0 => 0.0,
+            (Some(_), Some(_)) => -toward,
+            (Some(g), None) => if g[k] > 0 { -toward } else { 0.0 },
+        };
+        let key = keys.get(k).copied().unwrap_or(u32::MAX);
+        let mut next: Vec<(Climb, f64, u32)> = Vec::new();
+        for (climb, worth, last) in &beam {
+            next.push((climb.clone(), worth + pull(None), *last));
+            // Under each open unit, or the top; a step under it, or two.
+            let parents: Vec<(u32, u8)> = std::iter::once((u32::MAX, 0u8)).chain(climb.stack.iter().copied()).collect();
+            for &(parent, parent_level) in &parents {
+                for gap in 0..2u8 {
+                    let level = parent_level + 1 + gap;
+                    if usize::from(level) >= LEVEL_CLASSES {
+                        continue;
+                    }
+                    let mut after = climb.clone();
+                    after.place(k as u32, level);
+                    let gain = price[k] + w_parent * parent_score(options, parent) + w_key * climb.agreement(key, level) + w_gap * f64::from(gap) + pull(Some(level));
+                    after.count(key, level);
+                    placed.push((*last, k as u32, level));
+                    next.push((after, worth + gain, placed.len() as u32 - 1));
                 }
             }
         }
-        back.push((k, from));
-        score = next;
+        next.sort_by(|a, b| b.1.total_cmp(&a.1));
+        next.truncate(BEAM);
+        beam = next;
     }
     let mut out = vec![None; n];
-    let mut s = (0..LEVEL_CLASSES).max_by(|&a, &b| score[a].total_cmp(&score[b])).unwrap_or(0);
-    for (k, from) in back.iter().rev() {
-        let (previous, level) = from[s];
-        if level != usize::MAX && level > 0 {
-            out[*k] = Some(level);
+    let mut at = beam.first().map_or(u32::MAX, |b| b.2);
+    while at != u32::MAX {
+        let (previous, line, level) = placed[at as usize];
+        out[line as usize] = Some(usize::from(level));
+        at = previous;
+    }
+    out
+}
+
+/// A tree reading's totals: each unit's parent's log-odds, its key's agreement, its steps skipped, replayed
+/// over its levels as the search reads them.
+fn tree_totals(candidates: &[Vec<(u32, f32)>], keys: &[u32], starts: &[bool], levels: &[Option<u8>]) -> [f64; 3] {
+    let mut out = [0f64; 3];
+    let mut climb = Climb::new();
+    for (k, level) in levels.iter().enumerate() {
+        if starts.get(k).copied().unwrap_or(false) {
+            climb = Climb::new();
         }
-        s = previous;
+        let Some(level) = *level else { continue };
+        let key = keys.get(k).copied().unwrap_or(u32::MAX);
+        out[1] += climb.agreement(key, level);
+        let parent_level = {
+            let mut probe = climb.clone();
+            while probe.stack.last().is_some_and(|&(_, l)| l >= level) {
+                probe.stack.pop();
+            }
+            probe.stack.last().map_or(0, |&(_, l)| l)
+        };
+        let parent = climb.place(k as u32, level);
+        out[0] += candidates.get(k).map_or(0.0, |c| parent_score(c, parent));
+        out[2] += f64::from(level.saturating_sub(parent_level + 1));
+        climb.count(key, level);
     }
     out
 }
@@ -562,8 +668,8 @@ pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool, toward: f
     let mut body_price = vec![0.0; n];
     let negated = |prices: &[[f64; ROLES]]| prices.iter().map(|p| p.map(|x| -x)).collect::<Vec<_>>();
     let flip = |prices: &[f64]| prices.iter().map(|p| -p).collect::<Vec<_>>();
-    let may_head: Vec<bool> = (0..n).map(|k| problem.levels.get(k).is_some_and(|l| !l.is_empty())).collect();
-    let may_body: Vec<bool> = (0..n).map(|k| problem.depths.get(k).is_some_and(|l| !l.is_empty())).collect();
+    let may_head: Vec<bool> = (0..n).map(|k| problem.heading_parents.get(k).is_some_and(|l| !l.is_empty())).collect();
+    let may_body: Vec<bool> = (0..n).map(|k| problem.body_parents.get(k).is_some_and(|l| !l.is_empty())).collect();
     let is_label: Vec<bool> = {
         let mut out = vec![false; n];
         for &(line, _, _) in &problem.labels {
@@ -653,30 +759,19 @@ pub(crate) fn totals(problem: &Problem, solution: &Solution) -> [f64; WEIGHTS] {
     t[W_LINK] = solution.links.iter().map(|&j| f64::from(problem.links[j].2)).sum();
     t[W_PAIR] = solution.pairs.iter().map(|&j| f64::from(problem.pairs[j].3)).sum();
     t[W_NOTE] = problem.labels.iter().filter(|&&(line, _, _)| solution.notes.get(line as usize).copied().unwrap_or(false)).count() as f64;
-    let mut open = 0usize;
-    for k in 0..solution.levels.len() {
-        if solution.starts.get(k).copied().unwrap_or(false) {
-            open = 0;
-        }
-        if let (Some(level), Some(levels)) = (solution.levels[k], problem.levels.get(k).filter(|l| !l.is_empty())) {
-            t[W_LEVEL] += f64::from(levels[open][level as usize]);
-            open = level as usize;
-        }
-    }
+    let levels: Vec<Option<u8>> = solution.levels.iter().map(|l| l.map(|l| l as u8)).collect();
+    let [parent, template, gap] = tree_totals(&problem.heading_parents, &problem.templates, &solution.starts, &levels);
+    t[W_LEVEL] = parent;
+    t[W_TEMPLATE] = template;
+    t[W_GAP] = gap;
+    let [parent, family, gap] = tree_totals(&problem.body_parents, &problem.families, &solution.starts, &solution.depths);
+    t[W_DEPTH] = parent;
+    t[W_FAMILY] = family;
+    t[W_GAP] += gap;
     for (k, &started) in solution.starts.iter().enumerate() {
         if started {
             t[W_START] += f64::from(problem.starts[k].unwrap_or(0.0));
             t[W_START_BIAS] += 1.0;
-        }
-    }
-    let mut open = 0usize;
-    for k in 0..solution.depths.len() {
-        if solution.starts.get(k).copied().unwrap_or(false) {
-            open = 0;
-        }
-        if let (Some(depth), Some(depths)) = (solution.depths[k], problem.depths.get(k).filter(|d| !d.is_empty())) {
-            t[W_DEPTH] += f64::from(depths[open][usize::from(depth)]);
-            open = usize::from(depth);
         }
     }
     t
@@ -940,23 +1035,86 @@ fn pair_features(k: usize, m: usize, l: usize, table: &LineTable, views: &[LineV
     f
 }
 
-/// A heading's features given the open heading's level: the level, its line's place and marker features,
-/// its template's measures over the whole document, and what the document's outline names it.
-fn outline_features(k: usize, open: usize, entry: Option<u8>, table: &LineTable, views: &[LineView]) -> [f32; OUTLINE_WIDTH] {
-    let mut f = [0f32; OUTLINE_WIDTH];
-    f[0] = open as f32;
+/// A unit's features against a candidate parent (None: the top): both lines' place and look, how they stand
+/// to each other (one template, one look, the type's size and weight, the indent, the centring, how far
+/// apart, how many units may open between), both lines' numbering (its family's class, a first value), the
+/// printed contents entries each answers and their tiers, the outline's bookmarks on each.
+#[allow(clippy::too_many_arguments)]
+fn parent_features(k: usize, parent: Option<usize>, between: usize, entries: &[Option<u8>], templates: &[u32], first: &HashMap<usize, usize>, numbers: &[Number], table: &LineTable, views: &[LineView]) -> [f32; PARENT_WIDTH] {
+    let mut f = [0f32; PARENT_WIDTH];
     let row = table.row(k);
-    f[1..21].copy_from_slice(&row[..20]);
-    f[21..41].copy_from_slice(&row[72..92]);
-    let t = &views[k].template;
-    f[41..50].copy_from_slice(&[t.lines, t.pages, t.heading, t.monotone, t.anchored, t.anchor_level, t.level, t.edge, t.beside]);
-    f[50] = f32::from(views[k].anchor);
-    f[51] = f32::from(u8::from(views[k].listed));
-    // The printed contents entry it answers: whether one, the entry's tier, the step that tier makes.
-    f[52] = f32::from(u8::from(entry.is_some()));
-    f[53] = entry.map_or(0.0, f32::from);
-    f[54] = entry.map_or(-9.0, |tier| f32::from(tier) - open.max(1) as f32);
+    f[..20].copy_from_slice(&row[..20]);
+    f[20..40].copy_from_slice(&row[72..92]);
+    let flag = |b: bool| f32::from(u8::from(b));
+    let class = |line: usize| first.get(&line).map_or(9.0, |&i| count_class(&numbers[i].family));
+    let first_value = |line: usize| first.get(&line).map_or(-1.0, |&i| numbers[i].value as f32);
+    match parent {
+        None => {
+            f[60] = 1.0;
+            f[66] = 9.0;
+        }
+        Some(p) => {
+            f[40..60].copy_from_slice(&table.row(p)[..20]);
+            f[61] = flag(templates.get(k) == templates.get(p));
+            f[62] = flag(views[k].look == views[p].look);
+            f[63] = feature(table, k, "size") - feature(table, p, "size");
+            f[64] = feature(table, k, "bold") - feature(table, p, "bold");
+            f[65] = feature(table, k, "indent") - feature(table, p, "indent");
+            f[66] = class(p);
+            f[67] = first_value(p);
+            f[68] = (1.0 + (k - p) as f32).ln();
+            f[69] = views[k].page as f32 - views[p].page as f32;
+            f[70] = feature(table, k, "upper") - feature(table, p, "upper");
+            f[71] = feature(table, k, "centre") - feature(table, p, "centre");
+            f[72] = entries[p].map_or(0.0, f32::from);
+            f[73] = f32::from(views[p].anchor);
+        }
+    }
+    f[74] = class(k);
+    f[75] = first_value(k);
+    f[76] = entries[k].map_or(0.0, f32::from);
+    f[77] = f32::from(views[k].anchor);
+    f[78] = (1.0 + between as f32).ln();
     f
+}
+
+/// Each line's candidate parents where it may open a unit of a tree (`may`): the top, and the `window` lines
+/// before it that may, with how many such lines stand between.
+fn parent_candidates(may: &[bool], window: usize) -> Vec<Vec<(Option<usize>, usize)>> {
+    let mut seen: Vec<usize> = Vec::new();
+    (0..may.len()).map(|k| {
+        if !may[k] {
+            return Vec::new();
+        }
+        let mut out = vec![(None, seen.len().min(window))];
+        out.extend(seen.iter().rev().take(window).enumerate().map(|(between, &p)| (Some(p), between)));
+        seen.push(k);
+        out
+    }).collect()
+}
+
+/// The gold's parents in a tree: each unit (line, step) of `steps` under the nearest unit open above it of a
+/// smaller step, each open unit a candidate; the rows of every candidate with whether it is the parent.
+fn gold_parents(steps: &[(usize, usize, usize)], starts: &[bool]) -> Vec<(usize, Option<usize>, bool)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut last_start = 0;
+    for &(k, _, level) in steps {
+        if (last_start..=k).any(|j| starts.get(j).copied().unwrap_or(false)) {
+            stack.clear();
+        }
+        last_start = k + 1;
+        while stack.last().is_some_and(|&(_, l)| l >= level) {
+            stack.pop();
+        }
+        let parent = stack.last().map(|&(p, _)| p);
+        out.push((k, None, parent.is_none()));
+        for &(p, _) in &stack {
+            out.push((k, Some(p), Some(p) == parent));
+        }
+        stack.push((k, level));
+    }
+    out
 }
 
 /// Each line's printed contents entry, where its text answers one: the document's rows read as a contents
@@ -985,34 +1143,6 @@ fn contents_entries(views: &[LineView]) -> Vec<Option<u8>> {
             || (entry.chars().count() >= 8 && entry.chars().count() >= half(key) && key.ends_with(*entry))))
             .map(|&(_, tier, _)| tier)
     }).collect()
-}
-
-/// A body opening's features given the open depth: the depth, its line's place and marker features, what
-/// the whole document's numbers say of its first number (`number_features`), how the local scores read it.
-fn depth_features(k: usize, open: usize, number: Option<&[f32; NUMBER_WIDTH]>, table: &LineTable, locals: &[Local]) -> [f32; DEPTH_WIDTH] {
-    let mut f = [0f32; DEPTH_WIDTH];
-    f[0] = open as f32;
-    let row = table.row(k);
-    f[1..21].copy_from_slice(&row[..20]);
-    f[21..41].copy_from_slice(&row[72..92]);
-    if let Some(x) = number {
-        f[41] = 1.0;
-        f[42] = x[1];
-        f[43] = x[2];
-        f[44] = x[10];
-        f[45] = x[14];
-        f[46] = x[15];
-        f[47] = x[16];
-        f[48] = x[18];
-    } else {
-        f[43] = 9.0;
-        f[48] = 9.0;
-    }
-    let p = &locals[k].probabilities;
-    for (at, class) in [3usize, 33, 5, 9].into_iter().enumerate() {
-        f[49 + at] = p[class] as f32;
-    }
-    f
 }
 
 /// The gold's body openings with their depths and the open depth before each.
@@ -1121,7 +1251,7 @@ fn start_features(k: usize, restart: bool, before: f32, table: &LineTable, views
 
 /// The document's reading: its lines' moves, chosen whole. With `dump` (a folder, the document's sha256)
 /// and the gold, its problem with the gold reading's totals, and the heads' training rows, written there.
-pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], heads: Option<&Heads>, weights: &[f64; WEIGHTS], gold: Option<&[[i64; 8]]>, dump: Option<(&Path, &str)>) -> Vec<Move> {
+pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], templates: &[u32], heads: Option<&Heads>, weights: &[f64; WEIGHTS], gold: Option<&[[i64; 8]]>, dump: Option<(&Path, &str)>) -> Vec<Move> {
     let n = views.len();
     // Every line-opening number, and what the whole document's numbers say of each.
     let numbers: Vec<Number> = (0..n).flat_map(|k| views[k].readings.iter().enumerate().take(3)
@@ -1203,48 +1333,28 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         }
         u
     }).collect();
-    let even = (1.0 / (LEVEL_CLASSES - 1) as f64).ln();
+    // The trees' candidates: every line that may open a heading against the top and the headings that may
+    // open before it, likewise every line that may open a body unit; the parent heads' log-odds of each.
     let entries = contents_entries(views);
-    let levels: Vec<Vec<[f32; LEVEL_CLASSES]>> = (0..n).map(|k| {
-        if !choices[k].iter().any(|&(c, _, _)| c == u16::from(HEADING) * 2 + 1) {
-            return Vec::new();
-        }
-        (0..LEVEL_CLASSES).map(|open| {
-            let mut out = [0f32; LEVEL_CLASSES];
-            let scores: Option<Vec<f64>> = match (heads, &locals[k].levels) {
-                (Some(h), _) => Some(h.outline.probabilities(&outline_features(k, open, entries[k], table, views))),
-                (None, Some(levels)) => Some(levels.iter().map(|&p| f64::from(p)).collect()),
-                (None, None) => None,
-            };
-            for level in 1..LEVEL_CLASSES {
-                out[level] = match (&scores, entries[k]) {
-                    (Some(p), _) => (p[level].max(1e-9).ln() - even) as f32,
-                    (None, Some(tier)) => if usize::from(tier) == level { 2.0 } else { -2.0 },
-                    (None, None) => -1.5 * level.saturating_sub(open.max(1) + 1) as f32,
-                };
-            }
-            out
-        }).collect()
-    }).collect();
-    // Each line's depths given the open depth where it may open a body unit.
     let first_number: HashMap<usize, usize> = numbers.iter().enumerate().rev().map(|(i, x)| (x.line, i)).collect();
-    let depths: Vec<Vec<[f32; LEVEL_CLASSES]>> = (0..n).map(|k| {
-        if !choices[k].iter().any(|&(c, _, _)| c % 2 == 1 && RANKED_BODY.contains(&((c / 2) as u8))) {
-            return Vec::new();
-        }
-        let number = first_number.get(&k).map(|&i| &own[i]);
-        (0..LEVEL_CLASSES).map(|open| {
-            let mut out = [0f32; LEVEL_CLASSES];
-            let scores = heads.map(|h| h.depth.probabilities(&depth_features(k, open, number, table, locals)));
-            for depth in 1..LEVEL_CLASSES {
-                out[depth] = match &scores {
-                    Some(p) => (p[depth].max(1e-9).ln() - even) as f32,
-                    None => -1.5 * depth.saturating_sub(open.max(1) + 1) as f32 - 0.5 * open.saturating_sub(depth) as f32,
-                };
-            }
-            out
-        }).collect()
+    let may_head: Vec<bool> = choices.iter().map(|o| o.iter().any(|&(c, _, _)| c == u16::from(HEADING) * 2 + 1)).collect();
+    let may_body: Vec<bool> = choices.iter().map(|o| o.iter().any(|&(c, _, _)| c % 2 == 1 && RANKED_BODY.contains(&((c / 2) as u8)))).collect();
+    let parent_rows = |k: usize, parent: Option<usize>, between: usize| parent_features(k, parent, between, &entries, templates, &first_number, &numbers, table, views);
+    let scored = |may: &[bool], window: usize, forest: Option<&Forest>| -> Vec<Vec<(u32, f32)>> {
+        parent_candidates(may, window).into_iter().enumerate().map(|(k, candidates)| candidates.into_iter().map(|(parent, between)| {
+            let score = forest.map_or(0.0, |f| f.scores(&parent_rows(k, parent, between))[0] as f32);
+            (parent.map_or(u32::MAX, |p| p as u32), score)
+        }).collect()).collect()
+    };
+    let heading_parents = scored(&may_head, HEADING_WINDOW, heads.map(|h| &h.heading_parent));
+    let body_parents = scored(&may_body, BODY_WINDOW, heads.map(|h| &h.body_parent));
+    // The consistency keys: each line's template, each line's first number's family.
+    let mut template_ids: HashMap<u32, u32> = HashMap::new();
+    let keyed_templates: Vec<u32> = (0..n).map(|k| {
+        let next = template_ids.len() as u32;
+        *template_ids.entry(templates.get(k).copied().unwrap_or(u32::MAX)).or_insert(next)
     }).collect();
+    let line_families: Vec<u32> = (0..n).map(|k| first_number.get(&k).map_or(u32::MAX, |&i| families[numbers[i].family.as_str()])).collect();
     let mut problem = Problem {
         choices,
         numbers: numbers.iter().map(|x| (x.line as u32, x.reading as u8, families[x.family.as_str()], x.value)).collect(),
@@ -1253,8 +1363,10 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         labels: (0..n).filter_map(|k| views[k].label.filter(|&v| v > 0).map(|v| (k as u32, v, views[k].page))).collect(),
         marks: views.iter().enumerate().flat_map(|(k, v)| v.references.iter().enumerate().map(move |(m, r)| (k as u32, m as u16, r.0, v.page))).collect(),
         pairs: pairs.iter().zip(&pair_rows).map(|(&(k, m, l), row)| (k as u32, m as u16, l as u32, heads.map_or(PAIR, |h| h.pair.scores(row)[0] as f32))).collect(),
-        levels,
-        depths,
+        heading_parents,
+        body_parents,
+        templates: keyed_templates,
+        families: line_families,
         columns: views.iter().map(|v| v.translation).collect(),
         starts: start_rows.iter().map(|found| found.as_ref().map(|(row, restart)| match heads {
             Some(h) => h.start.scores(row)[0] as f32,
@@ -1309,16 +1421,21 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             starts: solution.starts.clone(),
             notes: solution.notes.clone(),
         });
+        // The parent heads' rows: each gold unit against every unit open above it in the gold and the top.
+        let gold_starts: Vec<bool> = (0..n).map(|k| gold[k][2] == 1).collect();
+        let heading_rows = gold_parents(&outline, &gold_starts);
+        let body_rows = gold_parents(&body, &gold_starts);
+        let between_of = |may: &[bool], parent: Option<usize>, k: usize| parent.map_or(0, |p| (p + 1..k).filter(|&j| may[j]).count());
         let rows = serde_json::json!({
             "sha256": sha256, "numbers": own.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "number_gold": roles,
             "links": link_rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "link_gold": link_gold,
             "pairs": pair_rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "pair_gold": pair_gold,
-            "outline": outline.iter().map(|&(k, open, _)| outline_features(k, open, entries[k], table, views).to_vec()).collect::<Vec<_>>(),
-            "outline_gold": outline.iter().map(|&(_, _, level)| level).collect::<Vec<_>>(),
+            "hparents": heading_rows.iter().map(|&(k, p, _)| parent_rows(k, p, between_of(&may_head, p, k)).to_vec()).collect::<Vec<_>>(),
+            "hparent_gold": heading_rows.iter().map(|&(_, _, g)| i64::from(g)).collect::<Vec<_>>(),
             "starts": start_rows.iter().flatten().map(|(row, _)| row.to_vec()).collect::<Vec<_>>(),
             "start_gold": start_rows.iter().enumerate().filter(|(_, r)| r.is_some()).map(|(k, _)| i64::from(gold[k][2] == 1)).collect::<Vec<_>>(),
-            "depths": body.iter().map(|&(k, open, _)| depth_features(k, open, first_number.get(&k).map(|&i| &own[i]), table, locals).to_vec()).collect::<Vec<_>>(),
-            "depth_gold": body.iter().map(|&(_, _, depth)| depth).collect::<Vec<_>>(),
+            "bparents": body_rows.iter().map(|&(k, p, _)| parent_rows(k, p, between_of(&may_body, p, k)).to_vec()).collect::<Vec<_>>(),
+            "bparent_gold": body_rows.iter().map(|&(_, _, g)| i64::from(g)).collect::<Vec<_>>(),
         });
         let write = || -> std::io::Result<()> {
             std::fs::create_dir_all(folder)?;

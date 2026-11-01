@@ -500,7 +500,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
         // Out of fold where fold heads are given (a training document read by heads fitted without it).
         let heads = if s.heads_folds.is_empty() { s.heads.as_ref() } else { Some(&s.heads_folds[fold_of(sha256, s.heads_folds.len())]) };
-        let moves = whole::read(table, &views, locals, heads, &s.whole_weights, gold.map(|_| &gold_rows[..]), s.whole_dump.as_deref().map(|folder| (folder, sha256)));
+        let moves = whole::read(table, &views, locals, &sheet.template, heads, &s.whole_weights, gold.map(|_| &gold_rows[..]), s.whole_dump.as_deref().map(|folder| (folder, sha256)));
         if let Some(folder) = &s.labels {
             let labels = labelled(&views, &moves);
             let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});
