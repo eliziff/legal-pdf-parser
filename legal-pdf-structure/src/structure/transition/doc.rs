@@ -6,8 +6,12 @@
 //!   two flags (a unit opening on its printed marker, a line opening a constituent document); the page's
 //!   lines grouped into regions by union-find over the links both heads choose (or the successor's sure
 //!   ones, over a half), none into a line whose role opens a unit; each region's role its lines' plurality;
-//! - Order, over the document's regions: the region a unit goes on in (a paragraph past a page or a
-//!   quotation), and a note's region the region holding its reference mark;
+//! - Order, over the document's regions (rotary positions over the parser's order; each pair of regions within a
+//!   page of each other scored on their places too: their boxes, pages, distance in order, roles, and whether a
+//!   note's number is a mark the other sets): the region a unit goes on in (a paragraph past a page or a
+//!   quotation), a note's region the region holding its reference mark, and each region's successor in the
+//!   reading, the regions read by following it (the next unread region in the parser's order where it is unsure)
+//!   and each page's lines written in that order;
 //! - Construct, over the headings that open a unit and over the body's: each node's parent and left sibling
 //!   among the nodes before it, the tree built by the paper's Algorithm 1 (each node the right-most child of
 //!   the node on the tree's right-most path whose parent score times its child's sibling score is greatest),
@@ -370,6 +374,7 @@ mod model {
     use super::*;
     use ort::session::{builder::GraphOptimizationLevel, Session};
     use ort::value::TensorRef;
+    use std::collections::HashSet;
     use std::sync::Mutex;
 
     #[derive(serde::Deserialize)]
@@ -573,15 +578,74 @@ mod model {
                 }
             }
             let kinds: Vec<i64> = read.iter().map(|&r| i64::from(roles[r])).collect();
-            let (region_states, goes_on, note_of) = {
+            // The regions' places for the pair terms (`docparse.pairs_of`): each one's lines' union box and its first
+            // line's page; the regions within a page of each other; whether a note's number (the figures its first
+            // line opens on) is a mark the other region sets.
+            let mut region_boxes = vec![f32::MAX, f32::MAX, f32::MIN, f32::MIN].repeat(count);
+            let mut marks: Vec<HashSet<u32>> = vec![HashSet::new(); count];
+            for k in 0..n {
+                let i = of_line[k];
+                if i == usize::MAX {
+                    continue;
+                }
+                for c in 0..2 {
+                    region_boxes[i * 4 + c] = region_boxes[i * 4 + c].min(boxes[k * 4 + c]);
+                    region_boxes[i * 4 + c + 2] = region_boxes[i * 4 + c + 2].max(boxes[k * 4 + c + 2]);
+                }
+                marks[i].extend(views[k].references.iter().map(|&(v, ..)| v));
+            }
+            let region_pages: Vec<i64> = read.iter().map(|&r| pages[regions[r][0]] as i64).collect();
+            let number: Vec<Option<u32>> = read.iter().map(|&r| {
+                (roles[r] == NOTE || roles[r] == NOTE_QUOTE).then(|| texts[regions[r][0]].trim().chars().take(4).filter(char::is_ascii_digit).collect::<String>().parse().ok()).flatten()
+            }).collect();
+            let mut by_page: HashMap<i64, Vec<usize>> = HashMap::new();
+            for (i, &page) in region_pages.iter().enumerate() {
+                by_page.entry(page).or_default().push(i);
+            }
+            let (mut pair_i, mut pair_j, mut pair_match) = (Vec::new(), Vec::new(), Vec::new());
+            for (i, &page) in region_pages.iter().enumerate() {
+                for near in [page - 1, page, page + 1] {
+                    for &j in by_page.get(&near).into_iter().flatten() {
+                        pair_i.push(i as i64);
+                        pair_j.push(j as i64);
+                        pair_match.push(number[i].is_some_and(|v| marks[j].contains(&v)));
+                    }
+                }
+            }
+            let (region_states, goes_on, note_of, successor) = {
                 let ls = TensorRef::from_array_view(([line_region.len(), d], &line_states[..])).map_err(|e| e.to_string())?;
                 let lr = TensorRef::from_array_view(([line_region.len()], &line_region[..])).map_err(|e| e.to_string())?;
                 let rr = TensorRef::from_array_view(([count], &kinds[..])).map_err(|e| e.to_string())?;
+                let rb = TensorRef::from_array_view(([count, 4], &region_boxes[..])).map_err(|e| e.to_string())?;
+                let rp = TensorRef::from_array_view(([count], &region_pages[..])).map_err(|e| e.to_string())?;
+                let pi = TensorRef::from_array_view(([pair_i.len()], &pair_i[..])).map_err(|e| e.to_string())?;
+                let pj = TensorRef::from_array_view(([pair_j.len()], &pair_j[..])).map_err(|e| e.to_string())?;
+                let pm = TensorRef::from_array_view(([pair_match.len()], &pair_match[..])).map_err(|e| e.to_string())?;
                 let mut session = self.order.lock().map_err(|_| "order session poisoned")?;
-                let outputs = session.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr]).map_err(|e| format!("order: {e}"))?;
+                let outputs = session.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
+                    "region_pages" => rp, "pair_i" => pi, "pair_j" => pj, "pair_match" => pm]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
-                (take("regions")?, softmax_rows(&take("goes_on")?, count), take("note_of")?)
+                (take("regions")?, softmax_rows(&take("goes_on")?, count), take("note_of")?, softmax_rows(&take("successor")?, count))
             };
+            // The reading: from the parser's first region, each region's likeliest unread successor where the head
+            // holds it likelier than none (the region itself), else the next unread region in the parser's order.
+            let mut place = vec![usize::MAX; count];
+            let (mut at, mut next_unread) = (0usize, 0usize);
+            for position in 0..count {
+                place[at] = position;
+                while next_unread < count && place[next_unread] != usize::MAX {
+                    next_unread += 1;
+                }
+                if position + 1 == count {
+                    break;
+                }
+                let row = &successor[at * count..(at + 1) * count];
+                let best = (0..count).filter(|&j| place[j] == usize::MAX).max_by(|&a, &b| row[a].total_cmp(&row[b]));
+                at = match best {
+                    Some(j) if row[j] > row[at] => j,
+                    _ => next_unread,
+                };
+            }
             // Units: a region goes on in the later region its link holds likeliest, each region taken once, the
             // surest links first.
             let mut links: Vec<(usize, usize, f32)> = (0..count).filter_map(|i| {
@@ -634,7 +698,16 @@ mod model {
                 let target = argmax(&note_of[i * count..(i + 1) * count]);
                 (roles[read[i]] == NOTE && target != i).then_some(target)
             }).collect();
-            Ok(moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts))
+            let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
+            // Each line's rank: its region's place in the reading, then its place in the region.
+            let mut ranks = vec![-1i64; n];
+            for (i, &r) in read.iter().enumerate() {
+                for (at, &k) in regions[r].iter().enumerate() {
+                    ranks[k] = place[i] as i64 * 100_000 + at as i64;
+                }
+            }
+            read_in(&mut moves, &ranks, pages);
+            Ok(moves)
         }
     }
 }
