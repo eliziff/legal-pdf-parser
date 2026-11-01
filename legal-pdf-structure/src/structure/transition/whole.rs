@@ -128,7 +128,7 @@ pub(crate) struct Heads {
 }
 
 impl Heads {
-    pub(crate) fn read(folder: &Path) -> Result<Self, String> {
+    pub(crate) fn read(folder: &Path) -> std::result::Result<Self, String> {
         Ok(Self {
             number: Forest::read(&folder.join("number.txt"), NUMBER_WIDTH, ROLES)?,
             link: Forest::read(&folder.join("link.txt"), LINK_WIDTH, 1)?,
@@ -141,7 +141,7 @@ impl Heads {
 }
 
 /// The trained weights at `path` (a JSON array, `train`'s), else the prior ones.
-pub(crate) fn read_weights(path: &Path) -> Result<[f64; WEIGHTS], String> {
+pub(crate) fn read_weights(path: &Path) -> std::result::Result<[f64; WEIGHTS], String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let values: Vec<f64> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     values.try_into().map_err(|_| format!("{}: not {WEIGHTS} weights", path.display()))
@@ -782,7 +782,7 @@ pub(crate) fn totals(problem: &Problem, solution: &Solution) -> [f64; WEIGHTS] {
 /// moved toward the gold reading's totals and away from the read one's, each weight's step scaled by
 /// its steps before (AdaGrad), the local scores' weight kept positive; the average over every step is
 /// written to `out` (a JSON array) and each epoch's agreement with the gold reported.
-pub(crate) fn train(folder: &Path, out: &Path, epochs: usize) -> Result<String, String> {
+pub(crate) fn train(folder: &Path, out: &Path, epochs: usize) -> std::result::Result<String, String> {
     let mut problems: Vec<(String, Problem)> = Vec::new();
     for entry in std::fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -1370,7 +1370,7 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], temp
         columns: views.iter().map(|v| v.translation).collect(),
         starts: start_rows.iter().map(|found| found.as_ref().map(|(row, restart)| match heads {
             Some(h) => h.start.scores(row)[0] as f32,
-            None => if row[0] > 0.0 { 2.5 } else { 0.0 } + if row[2] + row[3] >= 0.5 { 0.5 } else { 0.0 } + if *restart { 2.0 } else { 0.0 },
+            None => (if row[0] > 0.0 { 2.5 } else { 0.0 }) + (if row[2] + row[3] >= 0.5 { 0.5 } else { 0.0 }) + (if *restart { 2.0 } else { 0.0 }),
         })).collect(),
         gold: (0..n).map(|k| gold_class(k).map_or(-1, |c| c as i16)).collect(),
         gold_totals: None,
