@@ -129,7 +129,7 @@ pub(crate) fn structure_graph(
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
             let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-                state.outlines.get(&state.document).map_or(1, |outline| outline.body_depth.max(1))
+                state.outlines.get(&state.outline_key(line, false)).map_or(1, |outline| outline.body_depth.max(1))
             } else {
                 0
             };

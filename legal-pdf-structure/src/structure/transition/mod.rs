@@ -56,6 +56,9 @@ use std::sync::OnceLock;
 const FLOOR: f64 = 1e-4;
 /// The region-and-opening classes.
 const CLASSES: usize = 34;
+/// The gold region of a line a gold reads only as body prose, a quotation or list item set in it unmarked
+/// (`gold_labels.py`, A2AJ's alignment).
+const UNMARKED_BODY: i64 = 101;
 /// The origin the transition parser's nodes name.
 pub(crate) const ORIGIN: &str = "legal-pdf-transition.v1";
 /// A ranked candidate's features: its class's local log-probability and rank, its `CANDIDATE`
@@ -185,7 +188,7 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
             } else {
                 // A gold without levels (A2AJ's): the level the line's look last took in its document,
                 // else the open heading's.
-                let outline = state.outlines.get(&(state.document + u16::from(m.starts)));
+                let outline = state.outlines.get(&state.outline_key(line, m.starts));
                 let looked = outline.and_then(|o| o.look_levels.iter().find(|(look, _)| *look == line.look)).map(|&(_, l)| l);
                 let preferred = looked.unwrap_or_else(|| outline.map_or(1, |o| o.heading.max(1)));
                 wrong += u32::from((m.level - preferred).unsigned_abs());
@@ -211,8 +214,11 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         }
         wrong
     };
+    // A gold that does not tell its text from a quotation or a list item set in it (A2AJ's, its body
+    // prose unmarked: `UNMARKED_BODY`) takes any of the three.
+    let regions: &[i64] = if region == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(&region) };
     (0..candidates.len())
-        .filter(|&c| i64::from(candidates[c].region) == region && candidates[c].opens == opens)
+        .filter(|&c| regions.contains(&i64::from(candidates[c].region)) && candidates[c].opens == opens)
         .min_by_key(|&c| (disagreements(&candidates[c]), c))
 }
 

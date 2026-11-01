@@ -4,7 +4,8 @@
 //! is measured over all its lines: how many and over how many pages, how far the local scores hold its
 //! lines headings, whether its markers count on, how many of its lines the document's own outline names
 //! (its bookmarks and its printed contents list, each entry found as a line of the page it names,
-//! `levels::anchors`) and at what level, how far it repeats at the pages' edges. Templates that may be
+//! `levels::anchors`) and at what level, how far it repeats at the pages' edges, how far it stands beside
+//! another line on its row (a marginal note's lane). Templates that may be
 //! headings are ordered among themselves (one above another where its occurrences restart the other's
 //! count and enclose its occurrences, by its look's weight where neither tells), the outline's levels
 //! fixing the templates it names; each line reads its template's level. After a first reading, each
@@ -26,6 +27,8 @@ pub(crate) struct TemplateView {
     pub(crate) anchor_level: f32,
     pub(crate) level: f32,
     pub(crate) edge: f32,
+    /// The share of its lines set beside another line on their row (a marginal note's lane).
+    pub(crate) beside: f32,
     /// After a first reading: the share of its lines made headings, and their commonest level.
     pub(crate) read_heading: f32,
     pub(crate) read_level: f32,
@@ -96,7 +99,7 @@ impl Stylesheet {
     ) -> Self {
         let n = table.order.len();
         let at = |name: &str| feature(name);
-        let (size, bold, upper, edge) = (at("size"), at("bold"), at("upper"), at("edge_repeated"));
+        let (size, bold, upper, edge, beside) = (at("size"), at("bold"), at("upper"), at("edge_repeated"), at("beside"));
         let template = template_ids(table);
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
@@ -127,6 +130,7 @@ impl Stylesheet {
             view.lines += 1.0;
             view.heading += locals[k].probabilities[heading_class] as f32;
             view.edge += row[edge];
+            view.beside += row[beside];
             page_sets[t].insert(slots.page(table.order[k]));
             if anchor[k] > 0 {
                 view.anchored += 1.0;
@@ -145,6 +149,7 @@ impl Stylesheet {
             let lines = views[t].lines.max(1.0);
             views[t].heading /= lines;
             views[t].edge /= lines;
+            views[t].beside /= lines;
             views[t].anchored /= lines;
             weight[t] /= lines;
             views[t].monotone = if counted[t].1 > 0 { counted[t].0 as f32 / counted[t].1 as f32 } else { -1.0 };

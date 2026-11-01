@@ -16,7 +16,9 @@ pub(crate) const REGIONS: [&str; 17] = [
     "none", "text", "list_item", "heading", "quote", "note", "table", "contents", "caption", "headnote", "marginal_note",
     "furniture", "page_label", "line_label", "title", "note_quote", "provision",
 ];
+pub(crate) const TEXT: u8 = 1;
 pub(crate) const HEADING: u8 = 3;
+pub(crate) const QUOTE: u8 = 4;
 pub(crate) const NOTE: u8 = 5;
 pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
@@ -83,6 +85,21 @@ pub(crate) struct Open {
     /// it, and where it stands in that line (first and past-last character).
     pub(crate) unanswered: Vec<(u32, u32, u32, u32)>,
     pub(crate) line_number: Option<u32>,
+    /// Whether the context reads a quotation (a quote opened and no paragraph of its own text since),
+    /// and the quoted text's own numbering, which the quotation counts on apart from the text's.
+    pub(crate) quoting: bool,
+    pub(crate) quoted: Vec<Frame>,
+}
+
+impl Open {
+    /// The numbering the context counts on: a quotation's own while it reads one.
+    pub(crate) fn frames(&self) -> &Vec<Frame> {
+        if self.quoting { &self.quoted } else { &self.stack }
+    }
+
+    fn frames_mut(&mut self) -> &mut Vec<Frame> {
+        if self.quoting { &mut self.quoted } else { &mut self.stack }
+    }
 }
 
 /// What a document's outline holds so far, in reading order.
@@ -183,8 +200,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "template_anchor_level", "template_level", "template_edge", "template_read_heading", "template_read_level",
     "level_by_template", "level_by_anchor", "level_by_reading", "anchored", "anchor_level", "listed",
     "regime_bracketed", "regime_sectioned", "regime_line_numbers", "regime_speakers",
+    "quoting", "template_beside",
 ];
-pub(crate) const CANDIDATES: usize = 64;
+pub(crate) const CANDIDATES: usize = 66;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -231,6 +249,13 @@ impl State {
         self.outlines.get(&document)
     }
 
+    /// The outline a line's headings go in: its document's, or the quotation's it reads in (the
+    /// quoted text's own headings); after `starts`, the next document's.
+    pub(crate) fn outline_key(&self, line: &LineView, starts: bool) -> u16 {
+        let quoting = !starts && self.open(self.ctx(line, false)).is_some_and(|open| open.quoting);
+        (self.document + u16::from(starts)) | if quoting { 0x8000 } else { 0 }
+    }
+
     /// The region-and-opening classes the state itself proposes for a line, whatever the local scores
     /// say: going on with the unit open in each of the line's context's streams, or opening the next
     /// unit of its region; a heading where the line's look is one its document's headings took; a note opening on the next note number or on a number the body set; a
@@ -247,7 +272,7 @@ impl State {
             out.push(opening(region));
         }
         // A heading where the line is set as a heading of its document was set before.
-        if self.outline(self.document).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
+        if self.outline(self.outline_key(line, false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
             out.push(opening(HEADING));
         }
         if let Some(open) = self.open(ctx) {
@@ -259,7 +284,7 @@ impl State {
                 out.push(opening(LINE_LABEL));
             }
             for reading in line.readings {
-                if let Some(frame) = open.stack.iter().rev().find(|f| f.family == reading.family && reading.value == f.value + 1) {
+                if let Some(frame) = open.frames().iter().rev().find(|f| f.family == reading.family && reading.value == f.value + 1) {
                     out.push(opening(frame.region));
                 }
             }
@@ -272,7 +297,7 @@ impl State {
     /// one to two below the open heading's; a note opening on its label's value or a reading's or on
     /// none; on a line that may open a constituent document, each of those opening it too.
     pub(crate) fn candidates(&self, line: &LineView, classes: &[usize]) -> Vec<Move> {
-        let heading = self.outline(self.document).map_or(0, |outline| outline.heading);
+        let heading = self.outline(self.outline_key(line, false)).map_or(0, |outline| outline.heading);
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
@@ -312,7 +337,8 @@ impl State {
         let empty = Open::default();
         let stream = self.open(self.ctx(line, candidate.starts)).unwrap_or(&empty);
         let blank = Outline::default();
-        let outline = self.outline(self.document + u16::from(candidate.starts)).unwrap_or(&blank);
+        let outline = self.outline(self.outline_key(line, candidate.starts)).unwrap_or(&blank);
+        let frames = stream.frames();
         let flag = |b: bool| f32::from(u8::from(b));
         let mut f = [0f32; CANDIDATES];
         f[0] = f32::from(candidate.region);
@@ -327,19 +353,19 @@ impl State {
         if let Some(reading) = reading {
             f[6] = 1.0;
             f[7] = count_class(&reading.family);
-            match stream.stack.iter().rposition(|frame| frame.family == reading.family) {
+            match frames.iter().rposition(|frame| frame.family == reading.family) {
                 Some(depth) => {
                     f[8] = 1.0;
-                    f[9] = (stream.stack.len() - 1 - depth) as f32;
-                    f[10] = step(reading.value, &stream.stack[depth]);
+                    f[9] = (frames.len() - 1 - depth) as f32;
+                    f[10] = step(reading.value, &frames[depth]);
                     f[13] = (depth + 1) as f32;
-                    f[14] = depth.checked_sub(1).map_or(-1.0, |d| f32::from(stream.stack[d].region));
+                    f[14] = depth.checked_sub(1).map_or(-1.0, |d| f32::from(frames[d].region));
                 }
                 None => {
                     f[11] = 1.0;
                     f[12] = flag(reading.value == 1);
-                    f[13] = (stream.stack.len() + 1).min(DEPTH) as f32;
-                    f[14] = stream.stack.last().map_or(-1.0, |frame| f32::from(frame.region));
+                    f[13] = (frames.len() + 1).min(DEPTH) as f32;
+                    f[14] = frames.last().map_or(-1.0, |frame| f32::from(frame.region));
                 }
             }
         }
@@ -370,13 +396,13 @@ impl State {
             f[26] = looked.map_or(-9.0, |l| f32::from(level - l));
             // A numbered heading's level against the headings it would sit under on the stack.
             f[27] = reading.map_or(-9.0, |reading| {
-                let under = counted(&stream.stack, reading, HEADING).iter().filter(|frame| frame.region == HEADING).count() as i8;
+                let under = counted(frames, reading, HEADING).iter().filter(|frame| frame.region == HEADING).count() as i8;
                 f32::from(level - under)
             });
         }
         // How likely the move's numbering is in real legal text, by the instruments' tables and by the
         // others' (1 where the tables say nothing of it), the document's operative words beside them.
-        let top = stream.stack.last().map_or("", |frame| frame.family.as_str());
+        let top = frames.last().map_or("", |frame| frame.family.as_str());
         let tables = line.grammar.map(|g| [&g.instruments, &g.others]);
         for (i, at) in [30, 35].into_iter().enumerate() {
             f[at] = 1.0;
@@ -384,13 +410,13 @@ impl State {
             f[at + 2] = 1.0;
             let Some(tables) = tables.map(|t| t[i]) else { continue };
             if let Some(reading) = reading {
-                let relation = match stream.stack.iter().rposition(|frame| frame.family == reading.family) {
-                    Some(depth) if depth + 1 == stream.stack.len() => if reading.value == stream.stack[depth].value + 1 { grammar::NEXT } else { grammar::SAME_OTHER },
-                    Some(depth) => if reading.value == stream.stack[depth].value + 1 { grammar::POP_NEXT } else { grammar::POP_OTHER },
+                let relation = match frames.iter().rposition(|frame| frame.family == reading.family) {
+                    Some(depth) if depth + 1 == frames.len() => if reading.value == frames[depth].value + 1 { grammar::NEXT } else { grammar::SAME_OTHER },
+                    Some(depth) => if reading.value == frames[depth].value + 1 { grammar::POP_NEXT } else { grammar::POP_OTHER },
                     None => if reading.value == 1 { grammar::PUSH_1 } else { grammar::PUSH_OTHER },
                 };
                 f[at] = tables.relation(top, relation).unwrap_or(1.0);
-                if !stream.stack.iter().any(|frame| frame.family == reading.family) {
+                if !frames.iter().any(|frame| frame.family == reading.family) {
                     f[at + 1] = tables.child(top, &reading.family).unwrap_or(1.0);
                 }
             } else if candidate.opens && NUMBERED.contains(&candidate.region) && !line.readings.is_empty() {
@@ -423,6 +449,8 @@ impl State {
         f[58] = f32::from(line.anchor);
         f[59] = flag(line.listed);
         f[60..64].copy_from_slice(&line.regime);
+        f[64] = flag(stream.quoting && !candidate.starts);
+        f[65] = t.beside;
         f
     }
 
@@ -435,9 +463,24 @@ impl State {
         }
         self.document_lines += 1;
         let ctx = self.ctx(line, false);
+        // A quote opens a quotation the context reads until a paragraph of the text's own opens; the line
+        // making the move reads in the context it leaves the state in.
+        {
+            let stream = self.streams.entry(ctx).or_default();
+            if chosen.opens && chosen.region == QUOTE {
+                if !stream.quoting {
+                    stream.quoted.clear();
+                }
+                stream.quoting = true;
+            } else if chosen.opens && chosen.region == TEXT {
+                stream.quoting = false;
+            }
+        }
+        let outline_key = self.outline_key(line, false);
         let stream = self.streams.entry(ctx).or_default();
         if let Some(reading) = chosen.reading.and_then(|r| line.readings.get(usize::from(r))) {
-            stream.stack = counted(&stream.stack, reading, chosen.region);
+            let frames = counted(stream.frames(), reading, chosen.region);
+            *stream.frames_mut() = frames;
         }
         if let (true, NOTE, Some(value)) = (chosen.opens, chosen.region, chosen.note) {
             stream.note = Some(value);
@@ -457,8 +500,8 @@ impl State {
                 stream.line_number = Some(value);
             }
         }
-        let body_frames = stream.stack.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
-        let outline = self.outlines.entry(self.document).or_default();
+        let body_frames = stream.frames().iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
+        let outline = self.outlines.entry(outline_key).or_default();
         if chosen.opens && chosen.region == HEADING {
             made.level_step = 10 + i64::from(chosen.level - outline.heading.max(1));
             outline.heading = chosen.level;
