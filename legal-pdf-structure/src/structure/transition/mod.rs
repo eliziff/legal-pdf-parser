@@ -510,7 +510,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     if s.doc_oracle && gold.is_some() {
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
         let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
-        let moves = doc::oracle(&gold_rows, &views, &line_pages);
+        let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
+        let moves = doc::oracle(&gold_rows, &views, &texts, &line_pages);
         write_labels(sha256, &ids, &views, &moves);
         return moves;
     }
@@ -650,8 +651,8 @@ fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     let mut first_of: HashMap<(u16, usize, u8), usize> = HashMap::new();
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let stream = (state.ctx(line, chosen.starts), stream_of(chosen.region));
-        let opened = chosen.opens || (!chosen.resume && state.open_regions.get(&stream) != Some(&chosen.region));
-        let resumed = chosen.resume.then(|| first_of.get(&(stream.0, stream.1, chosen.region)).copied()).flatten();
+        let opened = chosen.opens || (!chosen.resume && chosen.resumes.is_none() && state.open_regions.get(&stream) != Some(&chosen.region));
+        let resumed = chosen.resumes.map(|first| first as usize).or_else(|| chosen.resume.then(|| first_of.get(&(stream.0, stream.1, chosen.region)).copied()).flatten());
         if opened {
             first_of.insert((stream.0, stream.1, chosen.region), k);
         }

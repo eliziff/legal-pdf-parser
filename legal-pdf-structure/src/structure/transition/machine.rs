@@ -63,6 +63,10 @@ pub(crate) struct Move {
     /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
     /// picked up past a block quotation or a page's notes).
     pub(crate) resume: bool,
+    /// Goes on with the unit whose first line is this place, whichever unit its stream holds open (two units
+    /// read in turn: a form's labels and their values): over `resume`, which goes on with the last unit of its
+    /// region in its stream.
+    pub(crate) resumes: Option<u32>,
     /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
     /// its contexts, outline and numbering begin anew.
     pub(crate) starts: bool,
@@ -368,7 +372,7 @@ impl State {
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: false, answers: [None; 4] };
+            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, starts: false, answers: [None; 4] };
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 // A note counts on a number: its label's, or an arabic reading's (a lettered note answers no

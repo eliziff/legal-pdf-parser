@@ -1497,7 +1497,7 @@ fn moves_of(problem: &Problem, solution: &Solution, views: &[LineView]) -> Vec<M
         let line = &views[k];
         let (class, marked) = solution.path[k];
         let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-        let mut chosen = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: solution.starts[k] && opens, answers: [None; 4] };
+        let mut chosen = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, starts: solution.starts[k] && opens, answers: [None; 4] };
         if solution.starts[k] {
             depth_before = 1;
         }

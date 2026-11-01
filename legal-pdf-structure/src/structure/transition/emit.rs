@@ -125,6 +125,8 @@ pub(crate) fn structure_graph(
     let mut open: HashMap<(u16, usize), usize> = HashMap::new();
     // The last unit of each region in each context's stream, which a line may resume.
     let mut region_unit: HashMap<(u16, usize, u8), usize> = HashMap::new();
+    // Each unit by its first line, which a line names to go on with it.
+    let mut unit_at: HashMap<usize, usize> = HashMap::new();
     // The lines the parser opened a constituent document on; a start on a line of no region passes to
     // the next unit.
     let mut started: Vec<usize> = Vec::new();
@@ -141,8 +143,9 @@ pub(crate) fn structure_graph(
         let key = (state.ctx(line, false), stream_of(chosen.region));
         // A transcript's line number and a page's label are a line each.
         let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
-        let continues = !single && !chosen.opens && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
-        let resumed = (!single && chosen.resume).then(|| region_unit.get(&(key.0, key.1, chosen.region)).copied()).flatten();
+        let named = chosen.resumes.and_then(|first| unit_at.get(&(first as usize)).copied());
+        let continues = !single && !chosen.opens && named.is_none() && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
+        let resumed = named.or_else(|| (!single && chosen.resume).then(|| region_unit.get(&(key.0, key.1, chosen.region)).copied()).flatten());
         let u = if continues {
             open[&key]
         } else if let Some(u) = resumed {
@@ -175,6 +178,7 @@ pub(crate) fn structure_graph(
             let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) { usize::from(chosen.depth.max(1)) } else { 0 };
             units.push(Unit { region: chosen.region, lines: Vec::new(), marker, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
             let u = units.len() - 1;
+            unit_at.insert(k, u);
             open.insert(key, u);
             region_unit.insert((key.0, key.1, chosen.region), u);
             u

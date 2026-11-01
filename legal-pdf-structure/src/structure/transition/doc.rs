@@ -120,13 +120,21 @@ fn insert(parent: &[f32], sibling: &[f32], gaps: &[usize], n: usize, resets: &[b
     levels
 }
 
+/// A note's number: its label's where the label reader found one, else an arabic reading's, else the figures
+/// its text opens on ("27" of "27 Ibid", as the gold's notes are numbered).
+fn note_number(line: &LineView, text: &str) -> Option<u32> {
+    line.label
+        .or_else(|| line.readings.iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
+        .or_else(|| text.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+}
+
 /// The document's moves from the heads' answers: each region's lines its role's; a unit's first line opens it
-/// (at its level or depth, counting on its marker where the line is marked, a note on its number); a region
-/// going on in an earlier unit resumes it where another region of its stream came between; a note answers the
-/// mark of its number in the region its link names.
-fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize], units: &Units, views: &[LineView]) -> Vec<Move> {
+/// (at its level or depth, counting on its marker where the line is marked, a note on its number); a line of a
+/// unit another unit of its stream came before goes on with it by name (its first line); a note answers the
+/// marks of its number in the region its link names.
+fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize], units: &Units, views: &[LineView], texts: &[&str]) -> Vec<Move> {
     let n = lines.roles.len();
-    let mut moves = vec![Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, starts: false, answers: [None; 4] }; n];
+    let mut moves = vec![Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, starts: false, answers: [None; 4] }; n];
     for (k, mv) in moves.iter_mut().enumerate() {
         mv.starts = lines.starts[k];
     }
@@ -136,6 +144,15 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
             of_line[k] = i;
         }
     }
+    // Each region's unit, its first line: a region going on in an earlier one's unit is in that unit.
+    let mut unit = vec![usize::MAX; read.len()];
+    for i in 0..read.len() {
+        unit[i] = match units.before[i] {
+            Some(earlier) if earlier < i => unit[earlier],
+            _ => regions[read[i]][0],
+        };
+    }
+    // The unit each stream last read a line of.
     let mut last_in_stream: HashMap<usize, usize> = HashMap::new();
     for k in 0..n {
         let i = of_line[k];
@@ -146,32 +163,33 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
         let stream = stream_of(region);
         let mv = &mut moves[k];
         mv.region = region;
-        if regions[read[i]][0] == k {
-            match units.before[i] {
-                None => {
-                    mv.opens = true;
-                    if region == HEADING {
-                        mv.level = units.level[i].clamp(1, 9) as i8;
-                    } else if BODY.contains(&region) {
-                        mv.depth = units.level[i].clamp(1, 8) as u8;
-                    }
-                    if region == NOTE {
-                        let line = &views[k];
-                        mv.note = line.label.or_else(|| line.readings.iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value));
-                    } else if lines.marked[k] && !views[k].readings.is_empty() {
-                        mv.reading = Some(0);
-                    }
-                }
-                Some(earlier) => mv.resume = last_in_stream.get(&stream) != Some(&earlier),
+        if unit[i] == k {
+            mv.opens = true;
+            if region == HEADING {
+                mv.level = units.level[i].clamp(1, 9) as i8;
+            } else if BODY.contains(&region) {
+                mv.depth = units.level[i].clamp(1, 8) as u8;
             }
+            if region == NOTE {
+                mv.note = note_number(&views[k], texts[k]);
+            } else if lines.marked[k] && !views[k].readings.is_empty() {
+                mv.reading = Some(0);
+            }
+        } else if last_in_stream.get(&stream) != Some(&unit[i]) {
+            mv.resume = true;
+            mv.resumes = Some(unit[i] as u32);
         }
-        last_in_stream.insert(stream, i);
+        last_in_stream.insert(stream, unit[i]);
     }
     for (i, target) in units.note.iter().enumerate() {
         let first = regions[read[i]][0];
         let (Some(target), Some(value)) = (target, moves[first].opens.then_some(moves[first].note).flatten()) else { continue };
-        moves[first].answers[0] = regions[read[*target]].iter()
-            .find_map(|&k| views[k].references.iter().find(|&&(v, ..)| v == value).map(|&(_, s, _)| (views[k].place, s)));
+        let marks: Vec<(u32, u32)> = regions[read[*target]].iter()
+            .flat_map(|&k| views[k].references.iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, _)| (views[k].place, s)))
+            .take(4).collect();
+        for (slot, mark) in moves[first].answers.iter_mut().zip(marks) {
+            *slot = Some(mark);
+        }
     }
     moves
 }
@@ -196,7 +214,7 @@ fn gold_region(g: &[i64; 8]) -> i64 {
 /// part, its tree (each node under the nearest open node of a smaller level, the left sibling that parent's
 /// last child), its gap, and a note's region the region before it (two pages back at most) holding a mark of
 /// its number the gold pairs; read through the same `insert` and `moves_of` as the model's.
-pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], pages: &[usize]) -> Vec<Move> {
+pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
     let n = gold.len();
     // Each line's unit, as the gold's decoder reads its rows (`docparse.gold_units`).
     let mut unit = vec![usize::MAX; n];
@@ -308,12 +326,12 @@ pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], pages: &[usize]) -> 
         if roles[read[i]] != NOTE || before[i].is_some() {
             return None;
         }
-        let value = views[k].label.or_else(|| views[k].readings.iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))?;
+        let value = note_number(&views[k], texts[k])?;
         (0..k).rev().take_while(|&j| pages[k].saturating_sub(pages[j]) <= 2)
             .find(|&j| gold[j][3] == 1 && region_of[j] != usize::MAX && views[j].references.iter().any(|&(v, ..)| v == value))
             .map(|j| region_of[j])
     }).collect();
-    moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views)
+    moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts)
 }
 
 // ------------------------------------------------------------------------------------------------- the model
@@ -510,7 +528,7 @@ mod model {
             let read: Vec<usize> = (0..regions.len()).filter(|&r| roles[r] != 0).collect();
             let count = read.len();
             if count == 0 {
-                return Ok(moves_of(&lines, &regions, &roles, &read, &Units { before: Vec::new(), level: Vec::new(), note: Vec::new() }, views));
+                return Ok(moves_of(&lines, &regions, &roles, &read, &Units { before: Vec::new(), level: Vec::new(), note: Vec::new() }, views, texts));
             }
             // Order over the regions read.
             let mut of_line = vec![usize::MAX; n];
@@ -589,7 +607,7 @@ mod model {
                 let target = argmax(&note_of[i * count..(i + 1) * count]);
                 (roles[read[i]] == NOTE && target != i).then_some(target)
             }).collect();
-            Ok(moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views))
+            Ok(moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts))
         }
     }
 }
