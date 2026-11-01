@@ -267,9 +267,48 @@ pub(crate) fn native_graph_parts(
         };
         nodes.push(node);
     }
-    // A table, its rows and their cells, addressed as a word processor's are. A blank
-    // cell is an empty range where its text would stand.
-    for (slot, table) in decided.tables().iter().enumerate() {
+    nodes.extend(table_nodes(index, decided.tables().iter().enumerate(), ORIGIN)?);
+    let mut quoted = BTreeMap::<&str, Vec<String>>::new();
+    for line in &index.lines {
+        if let Some(id) = decided.quotation(&line.line_id) {
+            quoted.entry(id).or_default().push(line.line_id.clone());
+        }
+    }
+    for (id, line_ids) in quoted {
+        let range = index
+            .range_for_line_ids(&line_ids)
+            .ok_or_else(|| Error::Message(format!("quotation {id} has no indexed lines")))?;
+        let mut node = StructureNode::new(
+            id.to_owned(),
+            NodeKind::Quote,
+            range,
+            ORIGIN,
+            Derivation::Heuristic,
+            None,
+        );
+        node.ranges = source_membership(
+            line_ids
+                .iter()
+                .filter_map(|id| index.line(id).map(|line| line.range))
+                .collect(),
+        );
+        node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
+        node.line_ids = line_ids;
+        node.grammar = Some("display_quotation".to_owned());
+        nodes.push(node);
+    }
+    Ok(nodes)
+}
+
+/// Each table (with its place among the document's tables), its rows and their cells, addressed as
+/// a word processor's are; a blank cell is an empty range where its text would stand.
+pub(crate) fn table_nodes<'a>(
+    index: &PdfTextIndex,
+    tables: impl IntoIterator<Item = (usize, &'a legal_pdf_tables::PdfTable)>,
+    origin: &'static str,
+) -> Result<Vec<StructureNode>> {
+    let mut nodes = Vec::new();
+    for (slot, table) in tables {
         let table_id = format!("table:{}", slot + 1);
         let line_ids: Vec<String> = table.line_ids().into_iter().cloned().collect();
         let range = index
@@ -279,7 +318,7 @@ pub(crate) fn native_graph_parts(
             table_id.clone(),
             NodeKind::Table,
             range,
-            ORIGIN,
+            origin,
             Derivation::Heuristic,
             None,
         );
@@ -338,7 +377,7 @@ pub(crate) fn native_graph_parts(
                         format!("{row_id}/col:{}", cell.column + 1),
                         NodeKind::Cell,
                         range,
-                        ORIGIN,
+                        origin,
                         Derivation::Heuristic,
                         Some(row_id.clone()),
                     );
@@ -369,7 +408,7 @@ pub(crate) fn native_graph_parts(
                 row_id.clone(),
                 NodeKind::Row,
                 row_range,
-                ORIGIN,
+                origin,
                 Derivation::Heuristic,
                 Some(table_id.clone()),
             );
@@ -390,35 +429,6 @@ pub(crate) fn native_graph_parts(
         if let (Some(first), Some(last)) = (table_node.ranges.first(), table_node.ranges.last()) {
             table_node.range = ScalarRange { start: first.start, end: last.end };
         }
-    }
-    let mut quoted = BTreeMap::<&str, Vec<String>>::new();
-    for line in &index.lines {
-        if let Some(id) = decided.quotation(&line.line_id) {
-            quoted.entry(id).or_default().push(line.line_id.clone());
-        }
-    }
-    for (id, line_ids) in quoted {
-        let range = index
-            .range_for_line_ids(&line_ids)
-            .ok_or_else(|| Error::Message(format!("quotation {id} has no indexed lines")))?;
-        let mut node = StructureNode::new(
-            id.to_owned(),
-            NodeKind::Quote,
-            range,
-            ORIGIN,
-            Derivation::Heuristic,
-            None,
-        );
-        node.ranges = source_membership(
-            line_ids
-                .iter()
-                .filter_map(|id| index.line(id).map(|line| line.range))
-                .collect(),
-        );
-        node.page_indexes = index.page_indexes_for_line_ids(&line_ids);
-        node.line_ids = line_ids;
-        node.grammar = Some("display_quotation".to_owned());
-        nodes.push(node);
     }
     Ok(nodes)
 }

@@ -18,6 +18,7 @@ pub(crate) const REGIONS: [&str; 17] = [
 ];
 pub(crate) const HEADING: u8 = 3;
 pub(crate) const NOTE: u8 = 5;
+pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
