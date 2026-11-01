@@ -13,7 +13,9 @@
 //! It runs beside the stage parser while it is fitted and measured; its environment:
 //! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`; the product's, fitted
 //!   on all of train), or LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of k (fold0.txt ...), each fitted on
-//!   every document but those of its fold, which read it (out of fold, train's rollouts);
+//!   every document but those of its fold, which read it (out of fold, train's rollouts); or
+//!   LEGALPDF_TRANSITION_LOCAL_SCORES, a folder of each document's local probabilities from another
+//!   tier's model (`<sha>.local.f32`, a line's `CLASSES` in reading order; tier 1's encoder);
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
@@ -56,6 +58,8 @@ enum LocalScores {
     One(Forest),
     /// Out of fold: a document read by the forest fitted on every fold but its own (`fold_of`).
     Folds(Vec<Forest>),
+    /// Each document's probabilities as another tier's model read them, from this folder.
+    Precomputed(PathBuf),
 }
 
 struct Settings {
@@ -75,6 +79,7 @@ fn settings() -> &'static Settings {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
         let forest = |path: PathBuf, width: usize, classes: usize| Forest::read(&path, width, classes).map_err(|e| eprintln!("transition parser: {e}")).ok();
         let local = match (var("LEGALPDF_TRANSITION_LOCAL"), var("LEGALPDF_TRANSITION_LOCAL_FOLDS")) {
+            _ if var("LEGALPDF_TRANSITION_LOCAL_SCORES").is_some() => var("LEGALPDF_TRANSITION_LOCAL_SCORES").map(LocalScores::Precomputed),
             (Some(path), _) => forest(path, ALL, CLASSES).map(LocalScores::One),
             (None, Some(folder)) => {
                 let folds: Vec<Forest> = (0..).map(|k| folder.join(format!("fold{k}.txt"))).take_while(|path| path.exists())
@@ -275,15 +280,32 @@ pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
 /// Each line's local scores, read once.
 fn locals_of(table: &LineTable, sha256: &str) -> Vec<Local> {
     let s = settings();
-    let probabilities = |row: &[f32]| -> Vec<f64> {
+    let n = table.order.len();
+    // Another tier's probabilities, where they cover the document's lines.
+    let precomputed: Option<Vec<f32>> = match &s.local {
+        Some(LocalScores::Precomputed(folder)) => {
+            let path = folder.join(format!("{sha256}.local.f32"));
+            let read = std::fs::read(&path).ok().map(|bytes| bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<f32>>());
+            let fits = read.filter(|values| values.len() == n * CLASSES);
+            if fits.is_none() {
+                eprintln!("transition parser: no local scores for {} lines at {}", n, path.display());
+            }
+            fits
+        }
+        _ => None,
+    };
+    let probabilities = |k: usize, row: &[f32]| -> Vec<f64> {
         match &s.local {
             Some(LocalScores::One(forest)) => forest.probabilities(row),
             Some(LocalScores::Folds(folds)) => folds[fold_of(sha256, folds.len())].probabilities(row),
-            None => vec![1.0 / CLASSES as f64; CLASSES],
+            Some(LocalScores::Precomputed(_)) if precomputed.is_some() => {
+                precomputed.as_ref().unwrap()[k * CLASSES..(k + 1) * CLASSES].iter().map(|&p| f64::from(p)).collect()
+            }
+            _ => vec![1.0 / CLASSES as f64; CLASSES],
         }
     };
-    (0..table.order.len()).map(|k| {
-        let probabilities = probabilities(table.row(k));
+    (0..n).map(|k| {
+        let probabilities = probabilities(k, table.row(k));
         let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
         ranked.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]).then(a.cmp(&b)));
         Local { probabilities, ranked }
@@ -338,6 +360,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                     std::fs::write(folder.join(format!("{sha256}.moves.f32")), bytes(&move_rows))?;
                     let meta = serde_json::json!({
                         "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
+                        "texts": table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect::<Vec<_>>(),
+                        "looks": &table.looks,
                         "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
                         "gold": gold_rows, "move_lines": move_lines, "move_classes": move_classes, "move_oracle": move_oracle,
                         "chosen": moves.iter().map(Move::class).collect::<Vec<_>>(),
