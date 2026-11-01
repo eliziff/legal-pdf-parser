@@ -251,9 +251,9 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
         let start_kind = proposed.get(slots.line(pages, slot).id.as_str()).copied().unwrap_or(0);
         LineView {
             translation: fences.translation[at],
-            // The source's own document opens on its first line: a later line near its page's top, set as
-            // a title, or one the reader names may open another.
-            may_start: k > 0 && (page_place < 3 || start_kind != 0 || evidence.title_shaped[at]),
+            // The source's own document opens on its first line: a later line among its page's first five,
+            // or one the reader names, may open another.
+            may_start: k > 0 && (page_place < 5 || start_kind != 0),
             start_kind,
             page_place,
             readings: &table.readings[k],

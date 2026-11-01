@@ -124,9 +124,9 @@ impl Default for State {
 /// number, its look, the reference marks it sets, and its place in reading order.
 pub(crate) struct LineView<'a> {
     pub(crate) translation: bool,
-    /// Whether the line may open a constituent document (near its page's top, set as a title, or one the
-    /// constituents reader names), the kind the reader names it (`constituents::KINDS`, 0 for none), and
-    /// its place among its page's lines.
+    /// Whether the line may open a constituent document (near its page's top, or one the constituents
+    /// reader names), the kind the reader names it (`constituents::KINDS`, 0 for none), and its place
+    /// among its page's lines.
     pub(crate) may_start: bool,
     pub(crate) start_kind: u8,
     pub(crate) page_place: u32,
