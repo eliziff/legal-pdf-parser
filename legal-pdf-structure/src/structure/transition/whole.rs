@@ -31,7 +31,7 @@
 //! constituent document; each over features the
 //! whole document's candidates give (how far a number's family runs before and after it, how many of it
 //! the document holds, what stands between two numbers or a mark and a label, a heading's template over
-//! the document), never over a reading. How much each part's scores weigh against the others' is learned
+//! the document, the printed contents entry it answers and that entry's tier), never over a reading. How much each part's scores weigh against the others' is learned
 //! on whole documents (`train`, LEGALPDF_TRANSITION_WHOLE_WEIGHTS): each training document's whole reading
 //! solved with a cost on every line read otherwise than the gold reads it, and the weights moved toward
 //! the gold reading's totals and away from the solved reading's (a structured perceptron, its steps
@@ -62,7 +62,7 @@ pub(crate) const ROLES: usize = 7;
 pub(crate) const NUMBER_WIDTH: usize = 68;
 pub(crate) const LINK_WIDTH: usize = 48;
 pub(crate) const PAIR_WIDTH: usize = 22;
-pub(crate) const OUTLINE_WIDTH: usize = 52;
+pub(crate) const OUTLINE_WIDTH: usize = 55;
 pub(crate) const START_WIDTH: usize = 32;
 pub(crate) const DEPTH_WIDTH: usize = 53;
 
@@ -908,7 +908,7 @@ fn pair_features(k: usize, m: usize, l: usize, table: &LineTable, views: &[LineV
 
 /// A heading's features given the open heading's level: the level, its line's place and marker features,
 /// its template's measures over the whole document, and what the document's outline names it.
-fn outline_features(k: usize, open: usize, table: &LineTable, views: &[LineView]) -> [f32; OUTLINE_WIDTH] {
+fn outline_features(k: usize, open: usize, entry: Option<u8>, table: &LineTable, views: &[LineView]) -> [f32; OUTLINE_WIDTH] {
     let mut f = [0f32; OUTLINE_WIDTH];
     f[0] = open as f32;
     let row = table.row(k);
@@ -918,7 +918,39 @@ fn outline_features(k: usize, open: usize, table: &LineTable, views: &[LineView]
     f[41..50].copy_from_slice(&[t.lines, t.pages, t.heading, t.monotone, t.anchored, t.anchor_level, t.level, t.edge, t.beside]);
     f[50] = f32::from(views[k].anchor);
     f[51] = f32::from(u8::from(views[k].listed));
+    // The printed contents entry it answers: whether one, the entry's tier, the step that tier makes.
+    f[52] = f32::from(u8::from(entry.is_some()));
+    f[53] = entry.map_or(0.0, f32::from);
+    f[54] = entry.map_or(-9.0, |tier| f32::from(tier) - open.max(1) as f32);
     f
+}
+
+/// Each line's printed contents entry, where its text answers one: the document's rows read as a contents
+/// list's (a title and the locator it prints), each entry's tier its indent's rank among the entries'
+/// indents; a line answers the first entry on an earlier page whose title is its text, or which its text
+/// opens or closes holding half of it or more (a heading wrapped, a numbering label only one prints).
+fn contents_entries(views: &[LineView]) -> Vec<Option<u8>> {
+    let mut lefts: Vec<f32> = Vec::new();
+    for view in views.iter().filter(|v| v.contents_title.is_some()) {
+        if !lefts.iter().any(|&l| (l - view.left).abs() < 0.012) {
+            lefts.push(view.left);
+        }
+    }
+    lefts.sort_by(f32::total_cmp);
+    let tier = |left: f32| lefts.iter().position(|&l| (l - left).abs() < 0.012).map_or(1, |at| (at + 1).min(9)) as u8;
+    let entries: Vec<(&str, u8, u32)> = views.iter().filter_map(|v| v.contents_title.as_deref().map(|title| (title, tier(v.left), v.page))).collect();
+    let half = |of: &str| of.chars().count().div_ceil(2);
+    views.iter().map(|view| {
+        let key = view.title_key.as_str();
+        let length = key.chars().count();
+        if view.contents_title.is_some() || length < 3 {
+            return None;
+        }
+        entries.iter().find(|(entry, _, page)| *page < view.page && (*entry == key
+            || (length >= 8 && length >= half(entry) && (entry.starts_with(key) || entry.ends_with(key)))
+            || (entry.chars().count() >= 8 && entry.chars().count() >= half(key) && key.ends_with(*entry))))
+            .map(|&(_, tier, _)| tier)
+    }).collect()
 }
 
 /// A body opening's features given the open depth: the depth, its line's place and marker features, what
@@ -1138,6 +1170,7 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         u
     }).collect();
     let even = (1.0 / (LEVEL_CLASSES - 1) as f64).ln();
+    let entries = contents_entries(views);
     let levels: Vec<Vec<[f32; LEVEL_CLASSES]>> = (0..n).map(|k| {
         if !choices[k].iter().any(|&(c, _, _)| c == u16::from(HEADING) * 2 + 1) {
             return Vec::new();
@@ -1145,14 +1178,15 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         (0..LEVEL_CLASSES).map(|open| {
             let mut out = [0f32; LEVEL_CLASSES];
             let scores: Option<Vec<f64>> = match (heads, &locals[k].levels) {
-                (Some(h), _) => Some(h.outline.probabilities(&outline_features(k, open, table, views))),
+                (Some(h), _) => Some(h.outline.probabilities(&outline_features(k, open, entries[k], table, views))),
                 (None, Some(levels)) => Some(levels.iter().map(|&p| f64::from(p)).collect()),
                 (None, None) => None,
             };
             for level in 1..LEVEL_CLASSES {
-                out[level] = match &scores {
-                    Some(p) => (p[level].max(1e-9).ln() - even) as f32,
-                    None => -1.5 * level.saturating_sub(open.max(1) + 1) as f32,
+                out[level] = match (&scores, entries[k]) {
+                    (Some(p), _) => (p[level].max(1e-9).ln() - even) as f32,
+                    (None, Some(tier)) => if usize::from(tier) == level { 2.0 } else { -2.0 },
+                    (None, None) => -1.5 * level.saturating_sub(open.max(1) + 1) as f32,
                 };
             }
             out
@@ -1240,7 +1274,7 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             "sha256": sha256, "numbers": own.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "number_gold": roles,
             "links": link_rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "link_gold": link_gold,
             "pairs": pair_rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "pair_gold": pair_gold,
-            "outline": outline.iter().map(|&(k, open, _)| outline_features(k, open, table, views).to_vec()).collect::<Vec<_>>(),
+            "outline": outline.iter().map(|&(k, open, _)| outline_features(k, open, entries[k], table, views).to_vec()).collect::<Vec<_>>(),
             "outline_gold": outline.iter().map(|&(_, _, level)| level).collect::<Vec<_>>(),
             "starts": start_rows.iter().flatten().map(|(row, _)| row.to_vec()).collect::<Vec<_>>(),
             "start_gold": start_rows.iter().enumerate().filter(|(_, r)| r.is_some()).map(|(k, _)| i64::from(gold[k][2] == 1)).collect::<Vec<_>>(),
