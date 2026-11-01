@@ -10,7 +10,8 @@
 //! fixing the templates it names; each line reads its template's level. After a first reading, each
 //! template also carries how its lines were read (`Stylesheet::read_back`): the share made headings and
 //! the level they mostly took, so the second reading decides each line with the document's view of its
-//! template. The document's regime (paragraph-numbered, sectioned, transcribed) is measured with it.
+//! template. The regime (paragraph-numbered, sectioned, transcribed) is measured with it, over each
+//! constituent document the first reading opened.
 
 use super::*;
 
@@ -38,9 +39,12 @@ pub(crate) struct Stylesheet {
     pub(crate) anchor: Vec<u16>,
     /// Each line a contents list holds.
     pub(crate) listed: Vec<bool>,
-    /// The document's regime: the shares of its lines opening on a bracketed number, on a section's
-    /// number, on a transcript's line number, on a speaker's label.
-    pub(crate) regime: [f32; 4],
+    /// Each line's regime: the shares of its document's lines opening on a bracketed number, on a
+    /// section's number, on a transcript's line number, on a speaker's label; its document the whole
+    /// source before a first reading, the constituent that reading opened after it.
+    pub(crate) regime: Vec<[f32; 4]>,
+    /// Each line's own four openings.
+    opens: Vec<[bool; 4]>,
 }
 
 fn feature(name: &str) -> usize {
@@ -142,16 +146,45 @@ impl Stylesheet {
             view.lines = (1.0 + view.lines).ln();
             view.pages = (1.0 + view.pages).ln();
         }
-        // The regime: what the document's lines open on.
-        let lexicon = |bit: u32| (0..n).filter(|&k| evidence.words[table.order[k].index()] & bit != 0).count() as f32 / n.max(1) as f32;
-        let bracketed = (0..n).filter(|&k| table.readings[k].first().is_some_and(|r| r.family.contains("[]"))).count() as f32 / n.max(1) as f32;
-        let sectioned = (0..n).filter(|&k| table.readings[k].first().is_some_and(|r| r.family.ends_with(":1") && !r.family.contains("[]"))).count() as f32 / n.max(1) as f32;
-        let numbered = (0..n).filter(|&k| evidence.line_number[table.order[k].index()]).count() as f32 / n.max(1) as f32;
-        Self { template, templates: views, anchor, listed, regime: [bracketed, sectioned, numbered, lexicon(WORD_SPEAKER)] }
+        // The regime: what the lines open on.
+        let opens: Vec<[bool; 4]> = (0..n).map(|k| {
+            let at = table.order[k].index();
+            let first = table.readings[k].first();
+            [
+                first.is_some_and(|r| r.family.contains("[]")),
+                first.is_some_and(|r| r.family.ends_with(":1") && !r.family.contains("[]")),
+                evidence.line_number[at],
+                evidence.words[at] & WORD_SPEAKER != 0,
+            ]
+        }).collect();
+        let mut sheet = Self { template, templates: views, anchor, listed, regime: vec![[0.0; 4]; n], opens };
+        sheet.regimes(&[]);
+        sheet
     }
 
-    /// Each template as a first reading read its lines: the share made headings and their commonest level.
+    /// Each line's regime over its document, the documents opening at `starts` (places in reading order).
+    fn regimes(&mut self, starts: &[usize]) {
+        let n = self.opens.len();
+        let mut bounds: Vec<usize> = std::iter::once(0).chain(starts.iter().copied().filter(|&k| k > 0 && k < n)).collect();
+        bounds.push(n);
+        for pair in bounds.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            let lines = (to - from).max(1) as f32;
+            let mut shares = [0f32; 4];
+            for k in from..to {
+                for (share, open) in shares.iter_mut().zip(self.opens[k]) {
+                    *share += f32::from(u8::from(open)) / lines;
+                }
+            }
+            self.regime[from..to].fill(shares);
+        }
+    }
+
+    /// Each template as a first reading read its lines: the share made headings and their commonest level;
+    /// and each line's regime over the constituent document that reading put it in.
     pub(crate) fn read_back(&mut self, moves: &[Move]) {
+        let starts: Vec<usize> = moves.iter().enumerate().filter(|(_, m)| m.starts).map(|(k, _)| k).collect();
+        self.regimes(&starts);
         let count = self.templates.len();
         let mut headings = vec![0f32; count];
         let mut lines = vec![0f32; count];

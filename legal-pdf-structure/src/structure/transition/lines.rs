@@ -161,6 +161,36 @@ fn repeated_at_edges(pages: &[Page], slots: &Slots, order: &[Slot]) -> Vec<bool>
     keys.iter().map(|found| found.as_ref().is_some_and(|text| pages_of[text].len() >= 3)).collect()
 }
 
+/// A line recognition read: our own recognition, or a scan's invisible recognition layer.
+fn recognized_line(line: &Line) -> bool {
+    line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0)
+}
+
+/// The line's text with its opening token read as recognition likely misread it (`confusions`, each
+/// misread character's meant ones at a twentieth or more): each character read as its likeliest meaning
+/// alone, and all of them at once; at most six variants.
+fn misread_variants(text: &str, confusions: &HashMap<char, Vec<(char, f32)>>) -> Vec<String> {
+    let start = text.len() - text.trim_start().len();
+    let token_end = text[start..].find(char::is_whitespace).map_or(text.len(), |at| start + at);
+    let token: Vec<char> = text[start..token_end].chars().collect();
+    let meant: Vec<Option<char>> = token.iter().map(|c| confusions.get(c).and_then(|m| m.first()).filter(|(_, p)| *p >= 0.05).map(|(c, _)| *c)).collect();
+    let rebuild = |chars: &[char]| format!("{}{}{}", &text[..start], chars.iter().collect::<String>(), &text[token_end..]);
+    let mut variants = Vec::new();
+    for (k, m) in meant.iter().enumerate() {
+        if let Some(c) = m {
+            let mut chars = token.clone();
+            chars[k] = *c;
+            variants.push(rebuild(&chars));
+        }
+    }
+    if variants.len() > 1 {
+        let all: Vec<char> = token.iter().zip(&meant).map(|(c, m)| m.unwrap_or(*c)).collect();
+        variants.push(rebuild(&all));
+    }
+    variants.truncate(6);
+    variants
+}
+
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
 pub(crate) struct LineTable {
@@ -268,6 +298,16 @@ impl LineTable {
                 for reading in marker_readings(text, evidence.words[at] & WORD_DIVISION != 0) {
                     if !found.contains(&reading) {
                         found.push(reading);
+                    }
+                }
+            }
+            // A recognized line's marker as each likely misreading of its characters would have it.
+            if recognized_line(line) {
+                for variant in misread_variants(&line.text, &super::settings().confusions) {
+                    for reading in marker_readings(&variant, evidence.words[at] & WORD_DIVISION != 0) {
+                        if !found.contains(&reading) {
+                            found.push(reading);
+                        }
                     }
                 }
             }

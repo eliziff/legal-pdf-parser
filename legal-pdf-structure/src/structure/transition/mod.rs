@@ -21,6 +21,9 @@
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
 //! - LEGALPDF_TRANSITION_GRAMMAR, the grammar tables counted over legal text (`grammar`);
+//! - LEGALPDF_TRANSITION_CONFUSIONS, how recognition misreads the characters of a line's opening marker,
+//!   counted over the gold's corrected lines ({read: {meant: share}}): a recognized line's marker is
+//!   read too as each misreading would have it;
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold),
 //!   for the oracle;
 //! - LEGALPDF_TRANSITION_DUMP, a folder: each line's features (`<sha>.lines.f32`), each candidate's
@@ -78,6 +81,7 @@ struct Settings {
     beam: usize,
     emit: bool,
     grammar: Option<grammar::Grammar>,
+    pub(crate) confusions: HashMap<char, Vec<(char, f32)>>,
 }
 
 fn settings() -> &'static Settings {
@@ -107,6 +111,7 @@ fn settings() -> &'static Settings {
             beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
             grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
+            confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
         }
     })
 }
@@ -120,6 +125,19 @@ pub(crate) fn enabled() -> bool {
 /// Whether the transition parser's reading is the parse's output (LEGALPDF_TRANSITION_EMIT).
 pub(crate) fn emitting() -> bool {
     settings().emit
+}
+
+/// The confusion table at `path`: each misread character's meant ones, likeliest first.
+fn read_confusions(path: &Path) -> HashMap<char, Vec<(char, f32)>> {
+    let table: HashMap<String, HashMap<String, f32>> = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_else(|| {
+        eprintln!("transition parser: no confusion table at {}", path.display());
+        HashMap::new()
+    });
+    table.into_iter().filter_map(|(read, meant)| {
+        let mut meant: Vec<(char, f32)> = meant.into_iter().filter_map(|(c, p)| Some((c.chars().next()?, p))).collect();
+        meant.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Some((read.chars().next()?, meant))
+    }).collect()
 }
 
 /// The gold's labels by document and piece (`line@offset`), from rows of the grader's predictions
@@ -276,7 +294,7 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             template: *sheet.of(k),
             anchor: sheet.anchor[k],
             listed: sheet.listed[k],
-            regime: sheet.regime,
+            regime: sheet.regime[k],
         }
     }).collect()
 }
