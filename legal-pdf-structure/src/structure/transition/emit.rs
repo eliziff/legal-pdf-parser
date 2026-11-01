@@ -86,15 +86,20 @@ pub(crate) fn structure_graph(
     let mut open: HashMap<(u16, usize), usize> = HashMap::new();
     // The last unit of each region in each context's stream, which a line may resume.
     let mut region_unit: HashMap<(u16, usize, u8), usize> = HashMap::new();
-    let mut previous_document = None;
+    // The lines the parser opened a constituent document on; a start on a line of no region passes to
+    // the next unit.
+    let mut started: Vec<usize> = Vec::new();
+    let mut pending_start = false;
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let made = state.apply(line, chosen);
-        let starts_document = line.document != 0 && previous_document != Some(line.document);
-        previous_document = Some(line.document);
+        if chosen.starts {
+            started.push(k);
+            pending_start = true;
+        }
         if chosen.region == 0 {
             continue;
         }
-        let key = (line.ctx, stream_of(chosen.region));
+        let key = (state.ctx(line, false), stream_of(chosen.region));
         // A transcript's line number and a page's label are a line each.
         let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
         let continues = !single && !chosen.opens && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
@@ -124,11 +129,11 @@ pub(crate) fn structure_graph(
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
             let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-                state.outlines.get(&line.document).map_or(1, |outline| outline.body_depth.max(1))
+                state.outlines.get(&state.document).map_or(1, |outline| outline.body_depth.max(1))
             } else {
                 0
             };
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, label, level, depth, starts_document, references: Vec::new() });
+            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
             let u = units.len() - 1;
             open.insert(key, u);
             region_unit.insert((key.0, key.1, chosen.region), u);
@@ -290,8 +295,14 @@ pub(crate) fn structure_graph(
         ids.iter().filter(|id| table_region.contains(id.as_str())).count() * 2 > ids.len()
     });
     nodes.extend(crate::structure::graph::table_nodes(&index, kept, ORIGIN)?);
-    // The constituent documents the source holds (an exhibit, a schedule), as the stage parser gives them.
-    nodes.extend(constituents::constituents(&index, pages, &fences.starts));
+    // The constituent documents the parser opened, each of the kind the constituents reader names its
+    // opening line, else a document.
+    let starts: Vec<constituents::Start> = started.iter().map(|&k| {
+        let id = id_of(k);
+        let kind = fences.starts.iter().find(|start| start.line_id == id).map_or("document", |start| start.kind()).to_owned();
+        constituents::Start::new(id, &kind)
+    }).collect();
+    nodes.extend(constituents::constituents(&index, pages, &starts));
     // The paragraphs and footnotes the projection reads (authority units, lookups): every body unit's text,
     // each line's span in it and where its paired notes' reference marks stand; every note's.
     let page_of = |k: usize| slots.page(table.order[k]);

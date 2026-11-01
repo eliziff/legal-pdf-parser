@@ -27,6 +27,24 @@ pub(super) struct Start {
     kind: String,
 }
 
+/// The kinds of constituent the reader names, counted from 1; a bookmark's other kinds count after them.
+pub(super) const KINDS: [&str; 5] = ["exhibit", "email", "schedule", "annex", "form"];
+
+impl Start {
+    pub(super) fn new(line_id: String, kind: &str) -> Self {
+        Self { line_id, kind: kind.to_owned() }
+    }
+
+    pub(super) fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The kind's place in `KINDS` from 1, `KINDS.len() + 1` for another.
+    pub(super) fn kind_code(&self) -> u8 {
+        KINDS.iter().position(|kind| *kind == self.kind).map_or(KINDS.len() + 1, |at| at + 1) as u8
+    }
+}
+
 fn exhibit_cover() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

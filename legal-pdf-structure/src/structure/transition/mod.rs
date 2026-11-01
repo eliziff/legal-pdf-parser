@@ -154,12 +154,14 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
             } else {
                 // A gold without levels (A2AJ's): the level the line's look last took in its document,
                 // else the open heading's.
-                let outline = state.outlines.get(&line.document);
+                let outline = state.outlines.get(&(state.document + u16::from(m.starts)));
                 let looked = outline.and_then(|o| o.look_levels.iter().find(|(look, _)| *look == line.look)).map(|&(_, l)| l);
                 let preferred = looked.unwrap_or_else(|| outline.map_or(1, |o| o.heading.max(1)));
                 wrong += u32::from((m.level - preferred).unsigned_abs());
             }
         }
+        // A document the gold opens here, or none it does not.
+        wrong += 4 * u32::from(m.starts != (here[2] == 1));
         if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 {
             wrong += u32::from(made.depth_step != here[7]);
         }
@@ -225,15 +227,26 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
         entry.1 += 1;
         entry.2 += usize::from(local.probabilities[heading] > 0.5);
     }
+    // The openings the constituents reader names, and each line's place among its page's lines.
+    let proposed: HashMap<&str, u8> = fences.starts.iter().map(|start| (start.line_id.as_str(), start.kind_code())).collect();
+    let mut on_page: HashMap<usize, u32> = HashMap::new();
     (0..table.order.len()).map(|k| {
         let (sum, lines, likely) = looks[&table.looks[k]];
         let slot = table.order[k];
         let at = slot.index();
+        let page_place = {
+            let seen = on_page.entry(slots.page(slot)).or_default();
+            *seen += 1;
+            *seen - 1
+        };
+        let start_kind = proposed.get(slots.line(pages, slot).id.as_str()).copied().unwrap_or(0);
         LineView {
-            // A context is a document and whether it is a translation's: a quotation in it is read as
-            // the parser reads it, not as the fences part it.
-            ctx: fences.document[at].saturating_mul(2) + u16::from(fences.translation[at]),
-            document: fences.document[at],
+            translation: fences.translation[at],
+            // The source's own document opens on its first line: a later line near its page's top, set as
+            // a title, or one the reader names may open another.
+            may_start: k > 0 && (page_place < 3 || start_kind != 0 || evidence.title_shaped[at]),
+            start_kind,
+            page_place,
             readings: &table.readings[k],
             label: evidence.label[at].map(|l| l.value),
             line_number: slots.line(pages, slot).text.trim().parse::<u32>().ok().filter(|_| evidence.line_number[at]),
@@ -352,7 +365,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
         }
     };
     if let Some(folder) = &s.labels {
-        let labels = labelled(table, fences, &views, &moves);
+        let labels = labelled(&views, &moves);
         let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});
         if let Err(error) = std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string())) {
             eprintln!("transition parser labels {sha256}: {error}");
@@ -411,20 +424,19 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
 /// The moves as the grader's labels, the state replayed over them: region, opening, document start,
 /// paired reference (a line a note answered), a heading's level step, a marker, no resumption, a body
 /// unit's depth step.
-fn labelled(table: &LineTable, fences: &Fences, views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
+fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     let mut state = State::default();
     let mut labels: Vec<[i64; 8]> = Vec::with_capacity(moves.len());
     // The first line of the last unit of each region opened in each context's stream.
     let mut first_of: HashMap<(u16, usize, u8), usize> = HashMap::new();
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
-        let at = table.order[k].index();
-        let stream = (line.ctx, stream_of(chosen.region));
+        let stream = (state.ctx(line, chosen.starts), stream_of(chosen.region));
         let opened = chosen.opens || (!chosen.resume && state.open_regions.get(&stream) != Some(&chosen.region));
         let resumed = chosen.resume.then(|| first_of.get(&(stream.0, stream.1, chosen.region)).copied()).flatten();
         if opened {
             first_of.insert((stream.0, stream.1, chosen.region), k);
         }
-        let starts_document = fences.document[at] != 0 && (k == 0 || fences.document[table.order[k - 1].index()] != fences.document[at]);
+        let starts_document = chosen.starts;
         let made = state.apply(line, chosen);
         if let Some((paired, ..)) = made.paired {
             labels[paired as usize][3] = 1;

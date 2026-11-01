@@ -54,6 +54,9 @@ pub(crate) struct Move {
     /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
     /// picked up past a block quotation or a page's notes).
     pub(crate) resume: bool,
+    /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
+    /// its contexts, outline and numbering begin anew.
+    pub(crate) starts: bool,
 }
 
 impl Move {
@@ -93,10 +96,12 @@ pub(crate) struct Outline {
     pub(crate) body_depth: usize,
 }
 
-/// The parse so far: what is open in each context and each document's outline, the move before, and
-/// how many lines ago each region last opened a unit.
+/// The parse so far: what is open in each context and each document's outline, the move before, how
+/// many lines ago each region last opened a unit, and the constituent document read and its lines.
 #[derive(Clone, Debug)]
 pub(crate) struct State {
+    pub(crate) document: u16,
+    pub(crate) document_lines: u32,
     pub(crate) streams: HashMap<u16, Open>,
     pub(crate) outlines: HashMap<u16, Outline>,
     pub(crate) previous: Option<Move>,
@@ -110,16 +115,21 @@ pub(crate) struct State {
 impl Default for State {
     fn default() -> Self {
         // No region has opened a unit yet: as long ago as `features` counts.
-        Self { streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new(), interrupted: HashMap::new() }
+        Self { document: 0, document_lines: 0, streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new(), interrupted: HashMap::new() }
     }
 }
 
-/// A line as the state reads it: its reading context and document, its marker's readings, its note
-/// label's value, its transcript line number, its look, the reference marks it sets, and its place in
-/// reading order.
+/// A line as the state reads it: whether it reads in a parallel translation's column, what speaks to its
+/// opening a constituent document, its marker's readings, its note label's value, its transcript line
+/// number, its look, the reference marks it sets, and its place in reading order.
 pub(crate) struct LineView<'a> {
-    pub(crate) ctx: u16,
-    pub(crate) document: u16,
+    pub(crate) translation: bool,
+    /// Whether the line may open a constituent document (near its page's top, set as a title, or one the
+    /// constituents reader names), the kind the reader names it (`constituents::KINDS`, 0 for none), and
+    /// its place among its page's lines.
+    pub(crate) may_start: bool,
+    pub(crate) start_kind: u8,
+    pub(crate) page_place: u32,
     pub(crate) readings: &'a [MarkerReading],
     pub(crate) label: Option<u32>,
     pub(crate) line_number: Option<u32>,
@@ -162,8 +172,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "grammar_relation", "grammar_child", "heading_word",
     "look_heading", "look_heading_lines",
     "other_grammar_relation", "other_grammar_child", "other_heading_word", "operative",
+    "starts", "start_kind", "page_place", "document_lines", "documents",
 ];
-pub(crate) const CANDIDATES: usize = 39;
+pub(crate) const CANDIDATES: usize = 44;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -196,6 +207,12 @@ fn counted(stack: &[Frame], reading: &MarkerReading, region: u8) -> Vec<Frame> {
 }
 
 impl State {
+    /// The context a line reads in: its document and whether it is a translation's (a quotation in it is
+    /// read as the parser reads it, not as the fences part it); after `starts`, the next document's.
+    pub(crate) fn ctx(&self, line: &LineView, starts: bool) -> u16 {
+        (self.document + u16::from(starts)).saturating_mul(2) + u16::from(line.translation)
+    }
+
     fn open(&self, ctx: u16) -> Option<&Open> {
         self.streams.get(&ctx)
     }
@@ -212,17 +229,18 @@ impl State {
     pub(crate) fn proposed(&self, line: &LineView) -> Vec<usize> {
         let mut out = Vec::new();
         let opening = |region: u8| usize::from(region) * 2 + 1;
-        let mut open: Vec<u8> = self.open_regions.iter().filter(|((ctx, _), _)| *ctx == line.ctx).map(|(_, &region)| region).collect();
+        let ctx = self.ctx(line, false);
+        let mut open: Vec<u8> = self.open_regions.iter().filter(|((c, _), _)| *c == ctx).map(|(_, &region)| region).collect();
         open.sort_unstable();
         for region in open {
             out.push(usize::from(region) * 2);
             out.push(opening(region));
         }
         // A heading where the line is set as a heading of its document was set before.
-        if self.outline(line.document).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
+        if self.outline(self.document).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
             out.push(opening(HEADING));
         }
-        if let Some(open) = self.open(line.ctx) {
+        if let Some(open) = self.open(ctx) {
             let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
             if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, ..)| r == v)) {
                 out.push(opening(NOTE));
@@ -242,13 +260,13 @@ impl State {
     /// Every move a line may make among `classes`: each region opening or going on; an opening of a
     /// numbered region counting on each of the line's readings or on none; a heading at every level from
     /// one to two below the open heading's; a note opening on its label's value or a reading's or on
-    /// none.
+    /// none; on a line that may open a constituent document, each of those opening it too.
     pub(crate) fn candidates(&self, line: &LineView, classes: &[usize]) -> Vec<Move> {
-        let heading = self.outline(line.document).map_or(0, |outline| outline.heading);
+        let heading = self.outline(self.document).map_or(0, |outline| outline.heading);
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0, resume: false };
+            let plain = Move { region, opens, reading: None, note: None, level: 0, resume: false, starts: false };
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 let mut values: Vec<u32> = line.label.into_iter().collect();
@@ -258,7 +276,7 @@ impl State {
                 bases.extend((0..line.readings.len().min(3)).map(|r| Move { reading: Some(r as u8), ..plain }));
             }
             bases.push(plain);
-            let key = (line.ctx, stream_of(region));
+            let key = (self.ctx(line, false), stream_of(region));
             if !opens && self.interrupted.get(&key) == Some(&region) && self.open_regions.get(&key) != Some(&region) {
                 bases.push(Move { resume: true, ..plain });
             }
@@ -271,15 +289,20 @@ impl State {
                 out.extend(bases);
             }
         }
+        if line.may_start {
+            let starting: Vec<Move> = out.iter().filter(|m| !m.resume).map(|m| Move { starts: true, ..*m }).collect();
+            out.extend(starting);
+        }
         out
     }
 
     /// The candidate's features in `CANDIDATE` order.
     pub(crate) fn features(&self, line: &LineView, candidate: &Move) -> [f32; CANDIDATES] {
+        // A move opening a document reads against that document's state: nothing open yet.
         let empty = Open::default();
-        let stream = self.open(line.ctx).unwrap_or(&empty);
+        let stream = self.open(self.ctx(line, candidate.starts)).unwrap_or(&empty);
         let blank = Outline::default();
-        let outline = self.outline(line.document).unwrap_or(&blank);
+        let outline = self.outline(self.document + u16::from(candidate.starts)).unwrap_or(&blank);
         let flag = |b: bool| f32::from(u8::from(b));
         let mut f = [0f32; CANDIDATES];
         f[0] = f32::from(candidate.region);
@@ -371,14 +394,25 @@ impl State {
         f[34] = line.look_heading_lines;
         f[38] = line.operative.min(100.0);
         f[28] = flag(candidate.resume);
-        f[29] = self.interrupted.get(&(line.ctx, stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
+        f[29] = self.interrupted.get(&(self.ctx(line, candidate.starts), stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
+        f[39] = flag(candidate.starts);
+        f[40] = f32::from(line.start_kind);
+        f[41] = line.page_place.min(50) as f32;
+        f[42] = (1.0 + self.document_lines as f32).ln();
+        f[43] = f32::from(self.document.min(50));
         f
     }
 
     /// The state after `line` makes `chosen`, and what the move made of the line.
     pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) -> Made {
         let mut made = Made::default();
-        let stream = self.streams.entry(line.ctx).or_default();
+        if chosen.starts {
+            self.document += 1;
+            self.document_lines = 0;
+        }
+        self.document_lines += 1;
+        let ctx = self.ctx(line, false);
+        let stream = self.streams.entry(ctx).or_default();
         if let Some(reading) = chosen.reading.and_then(|r| line.readings.get(usize::from(r))) {
             stream.stack = counted(&stream.stack, reading, chosen.region);
         }
@@ -401,7 +435,7 @@ impl State {
             }
         }
         let body_frames = stream.stack.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
-        let outline = self.outlines.entry(line.document).or_default();
+        let outline = self.outlines.entry(self.document).or_default();
         if chosen.opens && chosen.region == HEADING {
             made.level_step = 10 + i64::from(chosen.level - outline.heading.max(1));
             outline.heading = chosen.level;
@@ -421,7 +455,7 @@ impl State {
             self.since[usize::from(chosen.region)] = 0;
         }
         if chosen.region != 0 {
-            let key = (line.ctx, stream_of(chosen.region));
+            let key = (ctx, stream_of(chosen.region));
             if chosen.resume {
                 self.interrupted.remove(&key);
             } else if let Some(&open) = self.open_regions.get(&key).filter(|&&open| open != chosen.region) {
