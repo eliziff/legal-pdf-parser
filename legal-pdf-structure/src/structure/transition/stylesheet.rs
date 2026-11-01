@@ -42,6 +42,9 @@ pub(crate) struct Stylesheet {
     pub(crate) anchor: Vec<u16>,
     /// Each line a contents list holds.
     pub(crate) listed: Vec<bool>,
+    /// Each line opening a row that reads as a contents list's (a title and the locator it prints, the
+    /// row the lines on one baseline): the title, normalized as titles are matched.
+    pub(crate) contents_titles: Vec<Option<String>>,
     /// Each line's regime: the shares of its document's lines opening on a bracketed number, on a
     /// section's number, on a transcript's line number, on a speaker's label; its document the whole
     /// source before a first reading, the constituent that reading opened after it.
@@ -81,6 +84,31 @@ pub(crate) fn template_ids(table: &LineTable) -> Vec<u32> {
     }).collect()
 }
 
+/// Each line opening a row read as a contents list's (`contents_lists::row_of` over the lines one baseline
+/// band holds on its page, in reading order): its title normalized as titles are matched
+/// (`bookmarks::normalize_title`), three characters or more.
+pub(crate) fn contents_rows(pages: &[Page], slots: &Slots, table: &LineTable) -> Vec<Option<String>> {
+    let n = table.order.len();
+    let mut titles = vec![None; n];
+    let mut k = 0;
+    while k < n {
+        let page = slots.page(table.order[k]);
+        let end = (k..n).find(|&e| slots.page(table.order[e]) != page).unwrap_or(n);
+        let places: Vec<usize> = (k..end).collect();
+        for band in crate::structure::contents_lists::row_bands(&places, |at| slots.line(pages, table.order[at]).bbox) {
+            let row = crate::structure::contents_lists::row_of(band.iter().map(|&at| slots.line(pages, table.order[at])).collect());
+            if row.locator.is_some() {
+                let title = crate::structure::headings::bookmarks::normalize_title(&row.title);
+                if title.chars().count() >= 3 {
+                    titles[band[0]] = Some(title);
+                }
+            }
+        }
+        k = end;
+    }
+    titles
+}
+
 /// Whether a line may open a unit as the encoder's attention reads the document: it opens on a marker,
 /// or it is short (sixty characters or fewer).
 pub(crate) fn opener(table: &LineTable, k: usize) -> bool {
@@ -104,7 +132,8 @@ impl Stylesheet {
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
         let geometry = crate::structure::decide::Geometry::of(pages);
-        let anchoring = crate::structure::decide::anchors(pages, slots, evidence, fences, &geometry, &fences.role, outline);
+        // The document's bookmarks alone: its printed contents the parser links itself (`State::answering`).
+        let anchoring = crate::structure::decide::anchors(pages, slots, evidence, fences, &geometry, &fences.role, outline, &[]);
         let place_of: HashMap<Slot, usize> = table.order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
         let mut anchor = vec![0u16; n];
         for found in &anchoring.anchors {
@@ -114,7 +143,12 @@ impl Stylesheet {
                 }
             }
         }
-        let listed: Vec<bool> = table.order.iter().map(|&slot| fences.role[slot.index()] == Role::Contents || fences.contents_pages[slots.page(slot)]).collect();
+        // A line on a row that reads as a contents list's: a title and the locator it prints.
+        let contents_titles = contents_rows(pages, slots, table);
+        let mut listed = vec![false; n];
+        for (k, title) in contents_titles.iter().enumerate() {
+            listed[k] = title.is_some();
+        }
         // Each template's measures.
         let heading_class = usize::from(HEADING) * 2 + 1;
         let mut views = vec![TemplateView::default(); count];
@@ -173,7 +207,7 @@ impl Stylesheet {
                 evidence.words[at] & WORD_SPEAKER != 0,
             ]
         }).collect();
-        let mut sheet = Self { template, templates: views, anchor, listed, regime: vec![[0.0; 4]; n], opens };
+        let mut sheet = Self { template, templates: views, anchor, listed, contents_titles, regime: vec![[0.0; 4]; n], opens };
         sheet.regimes(&[]);
         sheet
     }

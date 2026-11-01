@@ -19,6 +19,7 @@ pub(crate) const REGIONS: [&str; 17] = [
 pub(crate) const TEXT: u8 = 1;
 pub(crate) const HEADING: u8 = 3;
 pub(crate) const QUOTE: u8 = 4;
+pub(crate) const CONTENTS: u8 = 7;
 pub(crate) const NOTE: u8 = 5;
 pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
@@ -113,12 +114,27 @@ pub(crate) struct Outline {
     pub(crate) body_depth: usize,
 }
 
+/// A contents list's entry as the parser read it: its title (normalized, `bookmarks::normalize_title`), its
+/// level (its indent's tier among the document's entries), and whether a heading has answered it.
+#[derive(Clone, Debug)]
+pub(crate) struct Entry {
+    pub(crate) key: String,
+    pub(crate) level: u8,
+    pub(crate) answered: bool,
+    /// The page the entry is printed on: the heading it names stands on a later one.
+    pub(crate) page: u32,
+}
+
 /// The parse so far: what is open in each context and each document's outline, the move before, how
-/// many lines ago each region last opened a unit, and the constituent document read and its lines.
+/// many lines ago each region last opened a unit, the constituent document read and its lines, and each
+/// document's contents entries with the indents they stand at.
 #[derive(Clone, Debug)]
 pub(crate) struct State {
     pub(crate) document: u16,
     pub(crate) document_lines: u32,
+    pub(crate) entries: HashMap<u16, (Vec<Entry>, Vec<f32>)>,
+    /// The unanswered entry the line last asked about answers it (its place among the entries, its level).
+    answering: std::cell::RefCell<Option<(u32, Option<(usize, u8)>)>>,
     pub(crate) streams: HashMap<u16, Open>,
     pub(crate) outlines: HashMap<u16, Outline>,
     pub(crate) previous: Option<Move>,
@@ -132,7 +148,7 @@ pub(crate) struct State {
 impl Default for State {
     fn default() -> Self {
         // No region has opened a unit yet: as long ago as `features` counts.
-        Self { document: 0, document_lines: 0, streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new(), interrupted: HashMap::new() }
+        Self { document: 0, document_lines: 0, entries: HashMap::new(), answering: Default::default(), streams: HashMap::new(), outlines: HashMap::new(), previous: None, since: [500; 17], open_regions: HashMap::new(), interrupted: HashMap::new() }
     }
 }
 
@@ -170,6 +186,13 @@ pub(crate) struct LineView<'a> {
     pub(crate) anchor: u16,
     pub(crate) listed: bool,
     pub(crate) regime: [f32; 4],
+    /// The line's text normalized as a title is matched (`bookmarks::normalize_title`, empty for a long
+    /// line); read as a contents list's row, its title so normalized where it prints a locator, and where
+    /// it starts on its page (a share of the page's width).
+    pub(crate) title_key: String,
+    pub(crate) contents_title: Option<String>,
+    pub(crate) left: f32,
+    pub(crate) page: u32,
 }
 
 /// What a move made of its line: the earlier line whose reference mark its note answered, a heading's
@@ -201,8 +224,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "level_by_template", "level_by_anchor", "level_by_reading", "anchored", "anchor_level", "listed",
     "regime_bracketed", "regime_sectioned", "regime_line_numbers", "regime_speakers",
     "quoting", "template_beside",
+    "answers_entry", "entry_level", "level_by_entry", "contents_row", "entries", "entries_unanswered",
 ];
-pub(crate) const CANDIDATES: usize = 66;
+pub(crate) const CANDIDATES: usize = 72;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -331,6 +355,29 @@ impl State {
         out
     }
 
+    /// The unanswered contents entry of the line's document the line's text answers, its place and
+    /// level: the same title, or a title the line opens (a heading wrapped over lines) or closes (a
+    /// numbering label only the entry or the heading prints). Asked once a line.
+    fn answering(&self, line: &LineView) -> Option<(usize, u8)> {
+        if let Some((place, found)) = *self.answering.borrow() {
+            if place == line.place {
+                return found;
+            }
+        }
+        // A contents list's own row answers none: it is an entry, not the heading one names.
+        let found = (line.contents_title.is_none() && line.title_key.chars().count() >= 3).then(|| self.entries.get(&self.document)).flatten().and_then(|(entries, _)| {
+            let key = line.title_key.as_str();
+            // A part of a title matches where it holds half of the other or more.
+            let (length, half) = (key.chars().count(), |of: &str| of.chars().count().div_ceil(2));
+            entries.iter().position(|entry| !entry.answered && entry.page < line.page && (entry.key == key
+                || (length >= 8 && length >= half(&entry.key) && (entry.key.starts_with(key) || entry.key.ends_with(key)))
+                || (entry.key.chars().count() >= 8 && entry.key.chars().count() >= half(key) && key.ends_with(entry.key.as_str()))))
+                .map(|at| (at, entries[at].level))
+        });
+        *self.answering.borrow_mut() = Some((line.place, found));
+        found
+    }
+
     /// The candidate's features in `CANDIDATE` order.
     pub(crate) fn features(&self, line: &LineView, candidate: &Move) -> [f32; CANDIDATES] {
         // A move opening a document reads against that document's state: nothing open yet.
@@ -451,6 +498,19 @@ impl State {
         f[60..64].copy_from_slice(&line.regime);
         f[64] = flag(stream.quoting && !candidate.starts);
         f[65] = t.beside;
+        // The document's contents entries: whether the line answers one a heading has not, at what level,
+        // the heading's level against it; whether the line reads as a contents list's row.
+        let answered = self.answering(line);
+        f[66] = flag(answered.is_some());
+        f[67] = answered.map_or(0.0, |(_, level)| f32::from(level));
+        f[68] = match answered {
+            Some((_, level)) if candidate.opens && candidate.region == HEADING => f32::from(candidate.level) - f32::from(level),
+            _ => -9.0,
+        };
+        f[69] = flag(line.contents_title.is_some());
+        let (entries, unanswered) = self.entries.get(&self.document).map_or((0, 0), |(e, _)| (e.len(), e.iter().filter(|e| !e.answered).count()));
+        f[70] = (1.0 + entries as f32).ln();
+        f[71] = (1.0 + unanswered as f32).ln();
         f
     }
 
@@ -476,6 +536,29 @@ impl State {
                 stream.quoting = false;
             }
         }
+        // A contents list's row the parser reads in the list waits for the heading that answers it; a heading
+        // answers the first entry its title matches.
+        if chosen.region == CONTENTS {
+            if let Some(title) = &line.contents_title {
+                let (entries, lefts) = self.entries.entry(self.document).or_default();
+                let tier = match lefts.iter().position(|&left| (left - line.left).abs() < 0.012) {
+                    Some(at) => at,
+                    None => {
+                        lefts.push(line.left);
+                        lefts.sort_by(f32::total_cmp);
+                        lefts.iter().position(|&left| (left - line.left).abs() < 0.012).unwrap_or(0)
+                    }
+                };
+                entries.push(Entry { key: title.clone(), level: (tier + 1).min(9) as u8, answered: false, page: line.page });
+            }
+        } else if chosen.opens && chosen.region == HEADING {
+            if let Some((at, _)) = self.answering(line) {
+                if let Some((entries, _)) = self.entries.get_mut(&self.document) {
+                    entries[at].answered = true;
+                }
+            }
+        }
+        *self.answering.borrow_mut() = None;
         let outline_key = self.outline_key(line, false);
         let stream = self.streams.entry(ctx).or_default();
         if let Some(reading) = chosen.reading.and_then(|r| line.readings.get(usize::from(r))) {

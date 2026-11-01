@@ -311,6 +311,13 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             anchor: sheet.anchor[k],
             listed: sheet.listed[k],
             regime: sheet.regime[k],
+            title_key: {
+                let text = &slots.line(pages, slot).text;
+                if text.chars().count() <= 160 { crate::structure::headings::bookmarks::normalize_title(text) } else { String::new() }
+            },
+            contents_title: sheet.contents_titles[k].clone(),
+            page: slots.page(slot) as u32,
+            left: table.row(k)[LINE_FEATURES.iter().position(|n| *n == "x0").unwrap_or(0)],
         }
     }).collect()
 }

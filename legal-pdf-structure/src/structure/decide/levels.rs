@@ -65,7 +65,7 @@ pub(crate) struct Anchoring {
 /// under the other with no blank of most of a line between them (`apart`). Each found entry's level
 /// is its depth in its document's frame (every bookmark of a full set, a skeleton's chapters), else
 /// one under its nearest levelled ancestor.
-pub(crate) fn anchors(
+pub(in crate::structure) fn anchors(
     pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
@@ -73,8 +73,9 @@ pub(crate) fn anchors(
     geometry: &Geometry,
     role: &[Role],
     outline: &[PdfOutlineEntry],
+    entries: &[crate::structure::contents_lists::Entry],
 ) -> Anchoring {
-    let listed = headings::contents::contents_outline_among(pages, &fences.contents_entries, |page, at| {
+    let listed = headings::contents::contents_outline_among(pages, entries, |page, at| {
         !matches!(role[slots.at(page, at).index()], Role::LineLabel | Role::Furniture | Role::PageLabel | Role::Contents)
             && !fences.contents_pages[page]
     });
