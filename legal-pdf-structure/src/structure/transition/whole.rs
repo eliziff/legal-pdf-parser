@@ -2,8 +2,9 @@
 //! Five parts read the document, each over all of it and solved exactly, and are made to agree on what
 //! they share by dual decomposition:
 //! - the lines' roles: every line's region and whether it opens a unit, by Viterbi over the whole
-//!   document, the state the region open in the body's stream and the one before it (a paragraph may
-//!   go on past a quotation) and whether a note is open in the notes' stream;
+//!   document, the state in each column (the text's, a parallel translation's) the region open in the
+//!   body's stream and the one before it (a paragraph may go on past a quotation), and whether a note is
+//!   open in the notes' stream, over the states reachable;
 //! - the numbers: every line-opening marker reading is a candidate; a candidate continues another of
 //!   its family whose value is one less, earlier in the document, each with one successor at most and
 //!   one predecessor at most, each family's value pair (v, v + 1) its own exact assignment; the lines
@@ -160,6 +161,9 @@ pub(crate) struct Problem {
     levels: Vec<Vec<[f32; LEVEL_CLASSES]>>,
     depths: Vec<Vec<[f32; LEVEL_CLASSES]>>,
     starts: Vec<Option<f32>>,
+    /// Each line's column: the text's, or a parallel translation's.
+    #[serde(default)]
+    columns: Vec<bool>,
     gold: Vec<i16>,
     gold_totals: Option<[f64; WEIGHTS]>,
     gold_reading: Option<GoldReading>,
@@ -192,37 +196,56 @@ pub(crate) struct Solution {
     chain_of: Vec<Option<usize>>,
 }
 
-/// The body stream's state through a reading: the region open in it and the one before it, a note open.
-fn step_state(region: u8, opens: bool, body: usize, before: usize, note: bool) -> Option<(usize, usize, bool, bool)> {
-    let stream = stream_of(region);
-    if stream == 0 && region != 0 {
-        let r = usize::from(region);
-        if opens || r == body {
-            Some(if r == body { (r, before, note, false) } else { (r, body, note, false) })
-        } else if r == before {
-            Some((r, body, note, true))
-        } else {
-            None
+/// The body's state through a reading: in each column (the text's, a parallel translation's) the region
+/// open in the body's stream and the one before it; a note open in the notes' stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct Stream {
+    body: [u8; 2],
+    before: [u8; 2],
+    note: bool,
+}
+
+/// The state after a line of `column` makes its region and opening, and whether it resumed the unit its
+/// column's stream held before (None: a continuation of nothing open).
+fn step_state(region: u8, opens: bool, state: Stream, column: usize) -> Option<(Stream, bool)> {
+    let mut next = state;
+    match stream_of(region) {
+        0 if region != 0 => {
+            let (body, before) = (state.body[column], state.before[column]);
+            if opens || region == body {
+                if region != body {
+                    next.before[column] = body;
+                    next.body[column] = region;
+                }
+                Some((next, false))
+            } else if region == before {
+                next.before[column] = body;
+                next.body[column] = region;
+                Some((next, true))
+            } else {
+                None
+            }
         }
-    } else if stream == 1 {
-        (opens || note).then_some((body, before, true, false))
-    } else {
-        Some((body, before, note, false))
+        1 => {
+            if !opens && !state.note {
+                return None;
+            }
+            next.note = true;
+            Some((next, false))
+        }
+        _ => Some((next, false)),
     }
 }
 
-/// The lines' roles under the prices: the best reading by Viterbi, each line's choice; with `cost`, a
-/// unit more for every line read otherwise than the gold reads it (training's loss-augmented reading).
+/// The lines' roles under the prices: the best reading by Viterbi over the states reachable, each line's
+/// choice; with `cost`, a unit more for every line read otherwise than the gold reads it (training's
+/// loss-augmented reading); with `toward`, that much more for the gold's (the reachability check).
 fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], note_price: &[f64], heading_price: &[f64], body_price: &[f64], cost: bool, toward: f64) -> Vec<(u16, bool)> {
     let n = problem.choices.len();
-    let state_of = |body: usize, before: usize, note: bool| (body * SLOTS + before) * 2 + usize::from(note);
-    let states = SLOTS * SLOTS * 2;
-    let mut score = vec![f64::NEG_INFINITY; states];
-    score[state_of(0, 0, false)] = 0.0;
+    let mut layer: Vec<(Stream, f64)> = vec![(Stream::default(), 0.0)];
     let mut back: Vec<Vec<(u32, u16)>> = Vec::with_capacity(n);
     for (k, options) in problem.choices.iter().enumerate() {
-        let mut next = vec![f64::NEG_INFINITY; states];
-        let mut from = vec![(u32::MAX, 0u16); states];
+        let column = usize::from(problem.columns.get(k).copied().unwrap_or(false));
         let gains: Vec<f64> = options.iter().map(|&(class, marked, local)| {
             let region = (class / 2) as u8;
             let opens = class % 2 == 1;
@@ -242,40 +265,50 @@ fn roles(problem: &Problem, w: &[f64; WEIGHTS], role_price: &[[f64; ROLES]], not
             if cost && problem.gold.get(k).is_some_and(|&g| g >= 0 && g != class as i16) {
                 gain += 1.0;
             }
-            // The reachability check's pull toward the gold's reading.
             if toward > 0.0 && problem.gold.get(k).is_some_and(|&g| g == class as i16) {
                 let marked_gold = problem.gold_reading.as_ref().is_some_and(|g| g.roles[k] > 0);
                 gain += if marked == marked_gold { toward } else { toward / 2.0 };
             }
             gain
         }).collect();
-        for s in 0..states {
-            if score[s] == f64::NEG_INFINITY {
-                continue;
-            }
-            let (body, before, note) = (s / 2 / SLOTS, s / 2 % SLOTS, s % 2 == 1);
+        let mut index: HashMap<Stream, usize> = HashMap::new();
+        let mut next: Vec<(Stream, f64)> = Vec::new();
+        let mut from: Vec<(u32, u16)> = Vec::new();
+        for (j, &(state, score)) in layer.iter().enumerate() {
             for (c, &(class, _, _)) in options.iter().enumerate() {
-                let Some((b, f, o, resumed)) = step_state((class / 2) as u8, class % 2 == 1, body, before, note) else { continue };
-                let total = score[s] + gains[c] + if resumed { w[W_RESUME] } else { 0.0 };
-                let target = state_of(b, f, o);
-                if total > next[target] {
-                    next[target] = total;
-                    from[target] = (s as u32, c as u16);
+                let Some((target, resumed)) = step_state((class / 2) as u8, class % 2 == 1, state, column) else { continue };
+                let total = score + gains[c] + if resumed { w[W_RESUME] } else { 0.0 };
+                match index.get(&target) {
+                    Some(&at) if total <= next[at].1 => {}
+                    Some(&at) => {
+                        next[at].1 = total;
+                        from[at] = (j as u32, c as u16);
+                    }
+                    None => {
+                        index.insert(target, next.len());
+                        next.push((target, total));
+                        from.push((j as u32, c as u16));
+                    }
                 }
             }
         }
-        back.push(from);
-        score = next;
-    }
-    let mut s = (0..states).max_by(|&a, &b| score[a].total_cmp(&score[b])).unwrap_or(0);
-    let mut path = vec![(0u16, false); n];
-    for k in (0..n).rev() {
-        let (previous, c) = back[k][s];
-        let (class, marked, _) = problem.choices[k][if previous == u32::MAX { 0 } else { usize::from(c) }];
-        path[k] = (class, marked);
-        if previous != u32::MAX {
-            s = previous as usize;
+        if next.is_empty() {
+            // No choice goes on from any state: the line opens text.
+            next = layer.iter().map(|&(s, score)| (s, score)).collect();
+            from = (0..layer.len()).map(|j| (j as u32, u16::MAX)).collect();
         }
+        back.push(from);
+        layer = next;
+    }
+    let mut at = (0..layer.len()).max_by(|&a, &b| layer[a].1.total_cmp(&layer[b].1)).unwrap_or(0);
+    let mut path = vec![(u16::from(TEXT) * 2 + 1, false); n];
+    for k in (0..n).rev() {
+        let (previous, c) = back[k][at];
+        if c != u16::MAX {
+            let (class, marked, _) = problem.choices[k][usize::from(c)];
+            path[k] = (class, marked);
+        }
+        at = previous as usize;
     }
     path
 }
@@ -594,14 +627,15 @@ pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool, toward: f
 /// A reading's totals, one per weight: what each part's scores sum to over the reading.
 pub(crate) fn totals(problem: &Problem, solution: &Solution) -> [f64; WEIGHTS] {
     let mut t = [0f64; WEIGHTS];
-    let (mut body, mut before, mut note) = (0usize, 0usize, false);
+    let mut stream = Stream::default();
     for (k, &(class, marked)) in solution.path.iter().enumerate() {
         let local = problem.choices[k].iter().find(|&&(c, m, _)| c == class && m == marked).map_or(-20.0, |&(_, _, l)| f64::from(l));
         t[W_LOCAL] += local;
         t[W_MARKED] += f64::from(u8::from(marked));
         let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-        if let Some((b, f, o, resumed)) = step_state(region, opens, body, before, note) {
-            (body, before, note) = (b, f, o);
+        let column = usize::from(problem.columns.get(k).copied().unwrap_or(false));
+        if let Some((next, resumed)) = step_state(region, opens, stream, column) {
+            stream = next;
             t[W_RESUME] += f64::from(u8::from(resumed));
         }
         if opens && region == HEADING {
@@ -1221,6 +1255,7 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         pairs: pairs.iter().zip(&pair_rows).map(|(&(k, m, l), row)| (k as u32, m as u16, l as u32, heads.map_or(PAIR, |h| h.pair.scores(row)[0] as f32))).collect(),
         levels,
         depths,
+        columns: views.iter().map(|v| v.translation).collect(),
         starts: start_rows.iter().map(|found| found.as_ref().map(|(row, restart)| match heads {
             Some(h) => h.start.scores(row)[0] as f32,
             None => if row[0] > 0.0 { 2.5 } else { 0.0 } + if row[2] + row[3] >= 0.5 { 0.5 } else { 0.0 } + if *restart { 2.0 } else { 0.0 },
@@ -1295,14 +1330,21 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
         }
     }
     let solution = solve(&problem, weights, false, 0.0);
-    moves_of(&solution, &numbers, views, locals)
+    moves_of(&problem, &solution, views)
 }
 
 /// The reading's moves: the roles' regions; the markers the numbers count; the notes' numbers; the
 /// outline's levels and depths; the starts; resumptions as the state replays them.
-fn moves_of(solution: &Solution, numbers: &[Number], views: &[LineView], locals: &[Local]) -> Vec<Move> {
+fn moves_of(problem: &Problem, solution: &Solution, views: &[LineView]) -> Vec<Move> {
     let n = views.len();
-    let _ = (locals, numbers);
+    // Each note label's marks, as the notes part paired them: the mark's line's place and first character.
+    let mut answers: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
+    for &j in &solution.pairs {
+        let (line, index, label, _) = problem.pairs[j];
+        if let Some(&(_, start, _)) = views[line as usize].references.get(usize::from(index)) {
+            answers.entry(label as usize).or_default().push((line, start));
+        }
+    }
     let mut state = State::default();
     let mut moves = Vec::with_capacity(n);
     let mut depth_before = 1u8;
@@ -1310,7 +1352,7 @@ fn moves_of(solution: &Solution, numbers: &[Number], views: &[LineView], locals:
         let line = &views[k];
         let (class, marked) = solution.path[k];
         let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-        let mut chosen = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: solution.starts[k] && opens };
+        let mut chosen = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: solution.starts[k] && opens, answers: [None; 4] };
         if solution.starts[k] {
             depth_before = 1;
         }
@@ -1319,6 +1361,11 @@ fn moves_of(solution: &Solution, numbers: &[Number], views: &[LineView], locals:
         }
         if opens && region == NOTE {
             chosen.note = line.label.filter(|_| solution.notes[k]);
+            if chosen.note.is_some() {
+                for (slot, &mark) in chosen.answers.iter_mut().zip(answers.get(&k).into_iter().flatten()) {
+                    *slot = Some(mark);
+                }
+            }
         }
         if opens && region == HEADING {
             chosen.level = solution.levels[k].unwrap_or(1).max(1);

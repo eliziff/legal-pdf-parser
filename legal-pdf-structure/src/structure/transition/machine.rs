@@ -66,6 +66,9 @@ pub(crate) struct Move {
     /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
     /// its contexts, outline and numbering begin anew.
     pub(crate) starts: bool,
+    /// A note's opening: the reference marks it answers, each its line's place and its first character,
+    /// where the reading chose them (none: the marks of its number the text set last).
+    pub(crate) answers: [Option<(u32, u32)>; 4],
 }
 
 impl Move {
@@ -365,7 +368,7 @@ impl State {
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: false };
+            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: false, answers: [None; 4] };
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 // A note counts on a number: its label's, or an arabic reading's (a lettered note answers no
@@ -629,7 +632,21 @@ impl State {
         }
         if let (true, NOTE, Some(value)) = (chosen.opens, chosen.region, chosen.note) {
             stream.note = Some(value);
-            if let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) {
+            if chosen.answers.iter().any(Option::is_some) {
+                // The marks the reading chose, exactly.
+                let mut found = Vec::new();
+                for &(place, start) in chosen.answers.iter().flatten() {
+                    if let Some(at) = stream.unanswered.iter().position(|&(r, line, s, _)| r == value && line == place && s == start) {
+                        let (_, line, s, e) = stream.unanswered.remove(at);
+                        found.push((line, s, e));
+                    }
+                }
+                let mut found = found.into_iter();
+                made.paired = found.next();
+                for slot in &mut made.also {
+                    *slot = found.next();
+                }
+            } else if let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) {
                 let (_, place, start, end) = stream.unanswered.remove(at);
                 made.paired = Some((place, start, end));
                 // The text's other marks of the number the note answers too, nearest first.
