@@ -58,7 +58,7 @@ const MOST: usize = 10;
 /// The parts' scores without heads (log-odds).
 const LINK: f32 = 3.0;
 const PAIR: f32 = 3.0;
-const ROUNDS: usize = 40;
+const ROUNDS: usize = 20;
 /// The body regions a body continuation goes on in (the state's region slots), 0 for none.
 const SLOTS: usize = 17;
 
@@ -552,28 +552,39 @@ fn tree_part(candidates: &[Vec<(u32, f32)>], keys: &[u32], weights: [f64; 3], st
             (Some(g), None) => if g[k] > 0 { -toward } else { 0.0 },
         };
         let key = keys.get(k).copied().unwrap_or(u32::MAX);
-        let mut next: Vec<(Climb, f64, u32)> = Vec::new();
-        for (climb, worth, last) in &beam {
-            next.push((climb.clone(), worth + pull(None), *last));
-            // Under each open unit, or the top; a step under it, or two.
-            let parents: Vec<(u32, u8)> = std::iter::once((u32::MAX, 0u8)).chain(climb.stack.iter().copied()).collect();
-            for &(parent, parent_level) in &parents {
+        // Every extension scored first, without copying a reading: (reading, parent's place on its stack (none:
+        // skipped), level, worth); only the best `BEAM` are made.
+        let mut scored: Vec<(usize, Option<usize>, u8, f64)> = Vec::new();
+        for (r, (climb, worth, _)) in beam.iter().enumerate() {
+            scored.push((r, None, 0, worth + pull(None)));
+            for at in 0..=climb.stack.len() {
+                let (parent, parent_level) = if at == 0 { (u32::MAX, 0u8) } else { climb.stack[at - 1] };
+                let base = worth + price[k] + w_parent * parent_score(options, parent);
                 for gap in 0..2u8 {
                     let level = parent_level + 1 + gap;
                     if usize::from(level) >= LEVEL_CLASSES {
                         continue;
                     }
-                    let mut after = climb.clone();
-                    after.place(k as u32, level);
-                    let gain = price[k] + w_parent * parent_score(options, parent) + w_key * climb.agreement(key, level) + w_gap * f64::from(gap) + pull(Some(level));
-                    after.count(key, level);
-                    placed.push((*last, k as u32, level));
-                    next.push((after, worth + gain, placed.len() as u32 - 1));
+                    scored.push((r, Some(at), level, base + w_key * climb.agreement(key, level) + w_gap * f64::from(gap) + pull(Some(level))));
                 }
             }
         }
-        next.sort_by(|a, b| b.1.total_cmp(&a.1));
-        next.truncate(BEAM);
+        scored.sort_by(|a, b| b.3.total_cmp(&a.3));
+        scored.truncate(BEAM);
+        let mut next: Vec<(Climb, f64, u32)> = Vec::with_capacity(scored.len());
+        for (r, at, level, worth) in scored {
+            let (climb, _, last) = &beam[r];
+            match at {
+                None => next.push((climb.clone(), worth, *last)),
+                Some(_) => {
+                    let mut after = climb.clone();
+                    after.place(k as u32, level);
+                    after.count(key, level);
+                    placed.push((*last, k as u32, level));
+                    next.push((after, worth, placed.len() as u32 - 1));
+                }
+            }
+        }
         beam = next;
     }
     let mut out = vec![None; n];
@@ -678,12 +689,29 @@ pub(crate) fn solve(problem: &Problem, w: &[f64; WEIGHTS], cost: bool, toward: f
         out
     };
     let mut solution = Solution::default();
+    // The trees read again only where their prices or the starts moved since the last round.
+    let mut outline_seen: Option<(Vec<bool>, Vec<f64>, Vec<Option<i8>>)> = None;
+    let mut body_seen: Option<(Vec<bool>, Vec<f64>, Vec<Option<u8>>)> = None;
     for round in 0..ROUNDS {
         let path = roles(problem, w, &role_price, &note_price, &heading_price, &body_price, cost, toward);
         let (line_choice, links, starts, chain_of) = numbers_part(problem, w, &negated(&role_price), toward);
         let (pairs, notes) = notes_part(problem, w, &flip(&note_price), toward);
-        let levels = outline_part(problem, w, &starts, &flip(&heading_price), toward);
-        let depths = depth_part(problem, w, &starts, &flip(&body_price), toward);
+        let levels = match &outline_seen {
+            Some((s, p, found)) if *s == starts && *p == heading_price => found.clone(),
+            _ => {
+                let found = outline_part(problem, w, &starts, &flip(&heading_price), toward);
+                outline_seen = Some((starts.clone(), heading_price.clone(), found.clone()));
+                found
+            }
+        };
+        let depths = match &body_seen {
+            Some((s, p, found)) if *s == starts && *p == body_price => found.clone(),
+            _ => {
+                let found = depth_part(problem, w, &starts, &flip(&body_price), toward);
+                body_seen = Some((starts.clone(), body_price.clone(), found.clone()));
+                found
+            }
+        };
         let step = 1.0 / (1.0 + round as f64);
         let mut agree = true;
         for k in 0..n {
