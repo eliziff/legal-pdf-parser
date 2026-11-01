@@ -20,6 +20,10 @@
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
+//! - LEGALPDF_TRANSITION_JOINT, `weight,penalty`: the reading the joint stylesheet solve makes (`joint`),
+//!   the template prior's term weighted `weight` and a move against its template's role costing
+//!   `penalty`; LEGALPDF_TRANSITION_PRIOR, the template prior's forest (none: the roles weighed on the
+//!   reading alone);
 //! - LEGALPDF_TRANSITION_GRAMMAR, the grammar tables counted over legal text (`grammar`);
 //! - LEGALPDF_TRANSITION_CONFUSIONS, how recognition misreads the characters of a line's opening marker,
 //!   counted over the gold's corrected lines ({read: {meant: share}}): a recognized line's marker is
@@ -47,6 +51,7 @@ mod grammar;
 pub(crate) use grammar::{Grammar, Tables};
 mod stylesheet;
 pub(crate) use stylesheet::*;
+mod joint;
 #[cfg(feature = "encoder")]
 mod encoder;
 
@@ -87,6 +92,8 @@ struct Settings {
     dump_lines: f64,
     labels: Option<PathBuf>,
     beam: usize,
+    joint: Option<(f64, f64)>,
+    prior: Option<Forest>,
     emit: bool,
     grammar: Option<grammar::Grammar>,
     pub(crate) confusions: HashMap<char, Vec<(char, f32)>>,
@@ -118,6 +125,11 @@ fn settings() -> &'static Settings {
             dump_lines: std::env::var("LEGALPDF_TRANSITION_DUMP_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
             beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
+            joint: std::env::var("LEGALPDF_TRANSITION_JOINT").ok().and_then(|v| {
+                let (weight, penalty) = v.split_once(',')?;
+                Some((weight.trim().parse().ok()?, penalty.trim().parse().ok()?))
+            }),
+            prior: var("LEGALPDF_TRANSITION_PRIOR").and_then(|path| forest(path, joint::PRIOR, joint::ROLES)),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
             grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
@@ -452,6 +464,10 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     sheet.read_back(&first);
     let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
     let moves = match (&s.ranker, s.beam) {
+        (Some(ranker), _) if s.dump.is_none() && s.joint.is_some() => {
+            let (weight, penalty) = s.joint.unwrap_or_default();
+            joint::solve(ranker, s.prior.as_ref(), weight, penalty, table, &views, locals, sheet)
+        }
         (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, locals),
         _ => {
             let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
@@ -467,6 +483,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                         "texts": table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect::<Vec<_>>(),
                         "looks": &table.looks,
                         "templates": &sheet.template,
+                        "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
                         "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(),
                         "anchors": &sheet.anchor,
                         "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
