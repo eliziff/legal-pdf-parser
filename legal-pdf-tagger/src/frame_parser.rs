@@ -181,6 +181,12 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
             });
             if let Some(locator) = locator { attributes.insert("locator_kind".into(), json!(locator)); }
             if let Some(label) = &node.label { attributes.insert("label".into(), json!(label)); }
+            // A level or depth the parser states (its outline's own, gaps and all) beside the tree's.
+            for key in ["heading_level", "depth"] {
+                if let Some(value) = node.markup_attributes.get(key).and_then(|v| v.parse::<u64>().ok()) {
+                    attributes.insert(key.into(), json!(value));
+                }
+            }
             if let Some(marker) = node.marker_range.filter(|_| !matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)) {
                 let markers = line_spans(&text, &lines, &[marker])?.into_iter().filter_map(|mut found| {
                     let span = spans.iter().find(|span| span.line_id == found.line_id)?;

@@ -39,6 +39,15 @@ fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// The figures a line's text opens on, where they read `value`: their first and past-last character.
+fn leading_figures(text: &str, value: u32) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.iter().position(|c| !c.is_whitespace())?;
+    let length = chars[start..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let figures: String = chars[start..start + length].iter().collect();
+    (length > 0 && figures.parse::<u32>().ok() == Some(value)).then_some((start, start + length))
+}
+
 /// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
 /// paragraphs and footnotes the projection reads.
 pub(crate) fn structure_graph(
@@ -112,8 +121,13 @@ pub(crate) fn structure_graph(
         } else {
             let text = text_of(k);
             let reading = chosen.reading.and_then(|r| line.readings.get(usize::from(r)));
+            // A note's label is the number its move counts on: where the label reader found it, else the
+            // figures its opening token starts on ("27" of "27Ibid"); a note counting on none has none.
             let marker = if chosen.region == NOTE {
-                evidence.label[table.order[k].index()].and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1))))
+                chosen.note.and_then(|value| {
+                    let found = evidence.label[table.order[k].index()].filter(|label| label.value == value);
+                    found.and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1)))).or_else(|| leading_figures(&text, value))
+                })
             } else {
                 reading.and_then(|r| opening(&text, r.family.matches(':').count() > 1))
             };
@@ -128,11 +142,7 @@ pub(crate) fn structure_graph(
                 marker.map(printed)
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
-            let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-                state.outlines.get(&state.outline_key(line, false)).map_or(1, |outline| outline.body_depth.max(1))
-            } else {
-                0
-            };
+            let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) { usize::from(chosen.depth.max(1)) } else { 0 };
             units.push(Unit { region: chosen.region, lines: Vec::new(), marker, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
             let u = units.len() - 1;
             open.insert(key, u);
@@ -141,7 +151,7 @@ pub(crate) fn structure_graph(
         };
         units[u].lines.push(k);
         // The reference mark the note this line opens answered.
-        if let Some((place, start, end)) = made.paired {
+        for (place, start, end) in made.paired.into_iter().chain(made.also.into_iter().flatten()) {
             units[u].references.push((place as usize, start, end));
         }
     }
@@ -208,6 +218,7 @@ pub(crate) fn structure_graph(
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
     let node_id = |u: usize| format!("transition-{:06}", u + 1);
+    let page_of_line = |k: usize| slots.page(table.order[k]);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };
         let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Heuristic, None);
@@ -219,6 +230,10 @@ pub(crate) fn structure_graph(
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
+        // A table's units are its rows, built with the table below.
+        if unit.region == TABLE {
+            continue;
+        }
         let ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
         let Some(envelope) = ranges.iter().map(|r| r.start).min().zip(ranges.iter().map(|r| r.end).max()) else { continue };
         let range = ScalarRange { start: envelope.0, end: envelope.1 };
@@ -260,6 +275,14 @@ pub(crate) fn structure_graph(
         // Its region as the tagger states one (`region:<name>`), which readers take for the unit's kind; a
         // contents list's lines under the `contents` grammar.
         node.grammar = Some(if region == "contents" { "contents".to_owned() } else { format!("region:{region}") });
+        // Its level or depth as the parser reads it, the outline's own: a heading two levels under the
+        // one before stays two under, though no heading stands between them in the tree.
+        if unit.level > 0 {
+            node.markup_attributes.insert("heading_level".to_owned(), unit.level.to_string());
+        }
+        if unit.depth > 0 {
+            node.markup_attributes.insert("depth".to_owned(), unit.depth.to_string());
+        }
         nodes.push(node);
         if region == "quote" && unit.lines.len() <= 60 {
             let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
@@ -286,15 +309,124 @@ pub(crate) fn structure_graph(
             });
         }
     }
-    // The tables, rows and cells the table reader found, of those whose lines the parser read as a
-    // table's for the most part.
-    let table_region: HashSet<String> = units.iter().filter(|unit| REGIONS[usize::from(unit.region)] == "table")
-        .flat_map(|unit| unit.lines.iter().map(|&k| id_of(k))).collect();
-    let kept = fences.tables.iter().enumerate().filter(|(_, table)| {
-        let ids = table.line_ids();
-        ids.iter().filter(|id| table_region.contains(id.as_str())).count() * 2 > ids.len()
-    });
-    nodes.extend(crate::structure::graph::table_nodes(&index, kept, ORIGIN)?);
+    // The tables the parser read: a run of table units no other body unit breaks (notes and the page's
+    // furniture break none) is one table, one grid a page linked to the next page's; each unit a row, its
+    // cells the table reader's on its lines by their column (a line of one cell under a row of several
+    // goes on in the row's last column), a row the reader has no cells on one cell.
+    let mut reader_cells: HashMap<String, Vec<(usize, Option<(usize, usize)>)>> = HashMap::new();
+    for found in &fences.tables {
+        for row in &found.rows {
+            for cell in &row.cells {
+                for part in &cell.parts {
+                    reader_cells.entry(part.line_id.clone()).or_default().push((cell.column, part.chars));
+                }
+            }
+        }
+    }
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut running = false;
+    for (u, unit) in units.iter().enumerate() {
+        if unit.region == TABLE {
+            if !running {
+                runs.push(Vec::new());
+                running = true;
+            }
+            runs.last_mut().unwrap().push(u);
+        } else if !matches!(REGIONS[usize::from(unit.region)], "note" | "note_quote" | "furniture" | "page_label" | "line_label" | "marginal_note") {
+            running = false;
+        }
+    }
+    let mut continuations = Vec::new();
+    for (t, run) in runs.iter().enumerate() {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut by_page: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &u in run {
+            let page = page_of_line(units[u].lines[0]);
+            match by_page.iter_mut().find(|(p, _)| *p == page) {
+                Some((_, rows)) => rows.push(u),
+                None => by_page.push((page, vec![u])),
+            }
+        }
+        for (g, (_, rows)) in by_page.iter().enumerate() {
+            let table_id = format!("transition-table-{:04}-{:03}", t + 1, g + 1);
+            let mut table_ranges: Vec<ScalarRange> = Vec::new();
+            let mut grid_nodes: Vec<StructureNode> = Vec::new();
+            for (r, &u) in rows.iter().enumerate() {
+                let unit = &units[u];
+                let row_ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
+                let Some(hull) = row_ranges.iter().map(|x| x.start).min().zip(row_ranges.iter().map(|x| x.end).max()) else { continue };
+                let row_id = node_id(u);
+                let mut row = StructureNode::new(row_id.clone(), NodeKind::Row, ScalarRange { start: hull.0, end: hull.1 }, ORIGIN, Derivation::Heuristic, Some(table_id.clone()));
+                row.role = Some(PrimaryRole::Text);
+                row.grammar = Some("region:table".to_owned());
+                row.ranges = row_ranges.clone();
+                row.row = Some(r + 1);
+                row.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
+                row.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&id_of(k)).map(|l| l.page_index)).collect();
+                row.page_indexes.dedup();
+                // The row's cells by column.
+                let columns = reader_cells.get(&id_of(unit.lines[0])).map_or(0, |cells| cells.iter().map(|(c, _)| c + 1).max().unwrap_or(0));
+                let mut cells: std::collections::BTreeMap<usize, Vec<ScalarRange>> = std::collections::BTreeMap::new();
+                for &k in &unit.lines {
+                    let id = id_of(k);
+                    match reader_cells.get(&id) {
+                        Some(found) => {
+                            let wrapped = columns >= 2 && found.iter().map(|(c, _)| *c).collect::<HashSet<_>>().len() == 1;
+                            for &(column, chars) in found {
+                                let range = match chars {
+                                    Some((start, end)) => index.global_range(&id, start, end),
+                                    None => line_range(k),
+                                };
+                                if let Some(range) = range {
+                                    cells.entry(if wrapped { columns - 1 } else { column }).or_default().push(range);
+                                }
+                            }
+                        }
+                        None => cells.entry(if columns >= 2 { columns - 1 } else { 0 }).or_default().extend(line_range(k)),
+                    }
+                }
+                for (column, mut ranges) in cells {
+                    ranges.sort_by_key(|x| x.start);
+                    let Some(&first) = ranges.first() else { continue };
+                    let end = ranges.iter().map(|x| x.end).max().unwrap_or(first.end);
+                    let mut cell = StructureNode::new(format!("{row_id}-c{:03}", column + 1), NodeKind::Cell, ScalarRange { start: first.start, end }, ORIGIN, Derivation::Heuristic, Some(row_id.clone()));
+                    cell.ranges = ranges;
+                    cell.row = Some(r + 1);
+                    cell.column = Some(column + 1);
+                    cell.page_indexes = row.page_indexes.clone();
+                    grid_nodes.push(cell);
+                }
+                table_ranges.extend(row_ranges);
+                grid_nodes.push(row);
+            }
+            let (Some(start), Some(end)) = (table_ranges.iter().map(|x| x.start).min(), table_ranges.iter().map(|x| x.end).max()) else { continue };
+            let mut table_node = StructureNode::new(table_id, NodeKind::Table, ScalarRange { start, end }, ORIGIN, Derivation::Heuristic, parents[rows[0]].map(node_id));
+            table_node.ranges = table_ranges;
+            table_node.table_number = Some(t + 1);
+            table_node.line_ids = rows.iter().flat_map(|&u| units[u].lines.iter().map(|&k| id_of(k))).collect();
+            table_node.page_indexes = index.page_indexes_for_line_ids(&table_node.line_ids);
+            chain.push(start);
+            nodes.push(table_node);
+            nodes.extend(grid_nodes);
+        }
+        for pair in chain.windows(2) {
+            continuations.push(legal_structure_model::SourceContinuation { kind: legal_structure_model::ContinuationKind::Table, from: pair[0], to: pair[1], separator: None });
+        }
+    }
+    // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
+    for (k, chosen) in moves.iter().enumerate() {
+        if chosen.region != 0 || texts[k].trim().is_empty() {
+            continue;
+        }
+        let Some(range) = line_range(k) else { continue };
+        let mut node = StructureNode::new(format!("transition-none-{:06}", k + 1), NodeKind::Prose, range, ORIGIN, Derivation::Heuristic, None);
+        node.role = Some(PrimaryRole::Furniture);
+        node.grammar = Some("region:furniture".to_owned());
+        node.ranges = vec![range];
+        node.page_indexes = index.line(&id_of(k)).map(|l| vec![l.page_index]).unwrap_or_default();
+        node.line_ids = vec![id_of(k)];
+        nodes.push(node);
+    }
     // The constituent documents the parser opened, each of the kind the constituents reader names its
     // opening line, else a document.
     let starts: Vec<constituents::Start> = started.iter().map(|&k| {
@@ -389,6 +521,9 @@ pub(crate) fn structure_graph(
         notes,
         Vec::new(),
     );
+    if !continuations.is_empty() {
+        structure.continuations = Some(continuations);
+    }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     structure.profile = identity.profile;
     structure.source_fragments = index.source_fragments();

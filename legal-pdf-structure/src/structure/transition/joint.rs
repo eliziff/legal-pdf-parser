@@ -118,7 +118,7 @@ impl Solve<'_> {
                 kept.push(Checkpoint { at: k, state: state.clone(), score });
             }
             let (line, local) = (&self.views[k], &self.locals[k]);
-            let candidates = state.candidates(line, &classes_of(&state, line, local));
+            let candidates = state.candidates(line, &classes_of(&state, line, local, None));
             let scores: Vec<f64> = candidates.iter().map(|m| move_score(self.ranker, &ranked_features(&state, line, self.table.row(k), local, m))).collect();
             let top = scores.iter().copied().fold(f64::MIN, f64::max);
             let total = scores.iter().map(|x| (x - top).exp()).sum::<f64>().ln() + top;

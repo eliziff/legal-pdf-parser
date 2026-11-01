@@ -212,11 +212,12 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         }
         // A document the gold opens here, or none it does not.
         wrong += 4 * u32::from(m.starts != (here[2] == 1));
+        // A body unit's depth weighs above its marker: the gold's nesting is the print's.
         if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 {
-            wrong += u32::from(made.depth_step != here[7]);
+            wrong += (made.depth_step - here[7]).unsigned_abs() as u32 * 3;
         }
         if m.opens && m.region != NOTE {
-            wrong += u32::from(m.reading.is_some() != (here[5] == 1));
+            wrong += 2 * u32::from(m.reading.is_some() != (here[5] == 1));
         }
         if !m.opens {
             wrong += 2 * u32::from(m.resume != (here[1] == 2));
@@ -233,9 +234,11 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
     // A gold that does not tell its text from a quotation or a list item set in it (A2AJ's, its body
     // prose unmarked: `UNMARKED_BODY`) takes any of the three.
     let regions: &[i64] = if region == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(&region) };
+    // Ties go to the depth the numbering gives (a gold without depths: A2AJ's), then to the plain move.
+    let tie = |m: &Move| (m.depth > 0 && usize::from(m.depth) != state.stack_depth(line, m), m.reading.is_some());
     (0..candidates.len())
         .filter(|&c| regions.contains(&i64::from(candidates[c].region)) && candidates[c].opens == opens)
-        .min_by_key(|&c| (disagreements(&candidates[c]), c))
+        .min_by_key(|&c| (disagreements(&candidates[c]), tie(&candidates[c]), c))
 }
 
 /// A line's local scores: each region-and-opening class's probability, and the classes best first.
@@ -265,11 +268,16 @@ fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, c
 }
 
 /// The classes a line's candidates come from: every class the local scores hold at `FLOOR` or above,
-/// and those the state proposes.
-fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
+/// and those the state proposes; where the gold is given (`gold`, the line's row), its class too, so
+/// the oracle always has the gold's move and the ranker sees it among the candidates.
+fn classes_of(state: &State, line: &LineView, local: &Local, gold: Option<&[i64; 8]>) -> Vec<usize> {
     let mut classes: Vec<usize> = local.ranked.iter().copied().filter(|&c| local.probabilities[c] >= FLOOR).collect();
-    for c in state.proposed(line) {
-        if !classes.contains(&c) {
+    let golden = gold.filter(|g| g[0] >= 0).map(|g| {
+        let regions: &[i64] = if g[0] == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(&g[0]) };
+        regions.iter().map(|&r| r as usize * 2 + usize::from(g[1] == 1)).collect::<Vec<_>>()
+    });
+    for c in state.proposed(line).into_iter().chain(golden.into_iter().flatten()) {
+        if c < CLASSES && !classes.contains(&c) {
             classes.push(c);
         }
     }
@@ -303,9 +311,9 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
         let start_kind = proposed.get(slots.line(pages, slot).id.as_str()).copied().unwrap_or(0);
         LineView {
             translation: fences.translation[at],
-            // The source's own document opens on its first line: a later line among its page's first five,
-            // or one the reader names, may open another.
-            may_start: k > 0 && (page_place < 5 || start_kind != 0),
+            // The source's own document opens on its first line; any later line's opening may open another
+            // (a letter mid-page, the next message of an email chain).
+            may_start: k > 0,
             start_kind,
             page_place,
             readings: &table.readings[k],
@@ -425,7 +433,7 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
     let mut recorded = Recorded::default();
     for k in 0..views.len() {
         let (line, local) = (&views[k], &locals[k]);
-        let candidates = state.candidates(line, &classes_of(&state, line, local));
+        let candidates = state.candidates(line, &classes_of(&state, line, local, gold.map(|g| &g[k])));
         let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
         let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
         let choice = match &s.ranker {
@@ -434,7 +442,8 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
                 (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
             }
             None => best_oracle.unwrap_or_else(|| {
-                candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume).unwrap_or(0)
+                candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume && !m.starts
+                    && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0)
             }),
         };
         if record.is_some_and(|(sha256, share)| drawn(sha256, k, share)) {
@@ -529,7 +538,7 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
         let (line, local) = (&views[k], &locals[k]);
         let mut extended: Vec<(usize, Move, f64)> = Vec::new();
         for (r, (state, score, _)) in readings.iter().enumerate() {
-            let candidates = state.candidates(line, &classes_of(state, line, local));
+            let candidates = state.candidates(line, &classes_of(state, line, local, None));
             let scores: Vec<f64> = candidates.iter().map(|m| move_score(ranker, &ranked_features(state, line, table.row(k), local, m))).collect();
             let top = scores.iter().copied().fold(f64::MIN, f64::max);
             let total: f64 = scores.iter().map(|x| (x - top).exp()).sum();
@@ -573,7 +582,7 @@ fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
         }
         let starts_document = chosen.starts;
         let made = state.apply(line, chosen);
-        if let Some((paired, ..)) = made.paired {
+        for (paired, ..) in made.paired.into_iter().chain(made.also.into_iter().flatten()) {
             labels[paired as usize][3] = 1;
         }
         let marked = chosen.opens && chosen.reading.is_some();

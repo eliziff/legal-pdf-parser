@@ -21,8 +21,11 @@ pub(crate) const HEADING: u8 = 3;
 pub(crate) const QUOTE: u8 = 4;
 pub(crate) const CONTENTS: u8 = 7;
 pub(crate) const NOTE: u8 = 5;
+pub(crate) const TABLE: u8 = 6;
 pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
+pub(crate) const TITLE: u8 = 14;
+pub(crate) const NOTE_QUOTE: u8 = 15;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
@@ -54,6 +57,9 @@ pub(crate) struct Move {
     pub(crate) reading: Option<u8>,
     pub(crate) note: Option<u32>,
     pub(crate) level: i8,
+    /// A body unit's depth in its document's body (0 for none): the move's own, not its numbering's,
+    /// which is evidence for it.
+    pub(crate) depth: u8,
     /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
     /// picked up past a block quotation or a page's notes).
     pub(crate) resume: bool,
@@ -201,6 +207,8 @@ pub(crate) struct LineView<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Made {
     pub(crate) paired: Option<(u32, u32, u32)>,
+    /// The other marks of the note's number it answered too (a note several places in the text cite).
+    pub(crate) also: [Option<(u32, u32, u32)>; 3],
     pub(crate) level_step: i64,
     pub(crate) depth_step: i64,
 }
@@ -225,8 +233,11 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "regime_bracketed", "regime_sectioned", "regime_line_numbers", "regime_speakers",
     "quoting", "template_beside",
     "answers_entry", "entry_level", "level_by_entry", "contents_row", "entries", "entries_unanswered",
+    "depth", "depth_step", "depth_by_stack",
 ];
-pub(crate) const CANDIDATES: usize = 72;
+pub(crate) const CANDIDATES: usize = 75;
+/// A body unit's depth is tried this far below the last body unit's, and at the top.
+const DEPTH_SPAN: usize = 2;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -273,11 +284,24 @@ impl State {
         self.outlines.get(&document)
     }
 
-    /// The outline a line's headings go in: its document's, or the quotation's it reads in (the
-    /// quoted text's own headings); after `starts`, the next document's.
-    pub(crate) fn outline_key(&self, line: &LineView, starts: bool) -> u16 {
-        let quoting = !starts && self.open(self.ctx(line, false)).is_some_and(|open| open.quoting);
-        (self.document + u16::from(starts)) | if quoting { 0x8000 } else { 0 }
+    /// The outline a line's headings and body units go in: its document's, a quotation's headings and
+    /// units stepping in it as the gold steps them (the quotation's numbering is its own); after
+    /// `starts`, the next document's.
+    pub(crate) fn outline_key(&self, _line: &LineView, starts: bool) -> u16 {
+        self.document + u16::from(starts)
+    }
+
+    /// The depth a body opening's numbering puts it at: the body units open on its context's stack once
+    /// its reading counts (the stack as it stands for an unnumbered one), one at least.
+    pub(crate) fn stack_depth(&self, line: &LineView, candidate: &Move) -> usize {
+        let empty = Open::default();
+        let stream = self.open(self.ctx(line, candidate.starts)).unwrap_or(&empty);
+        let body = |frames: &[Frame]| frames.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
+        match candidate.reading.and_then(|r| line.readings.get(usize::from(r))) {
+            Some(reading) => body(&counted(stream.frames(), reading, candidate.region)),
+            None => body(stream.frames()),
+        }
+        .max(1)
     }
 
     /// The region-and-opening classes the state itself proposes for a line, whatever the local scores
@@ -294,6 +318,16 @@ impl State {
         for region in open {
             out.push(usize::from(region) * 2);
             out.push(opening(region));
+            // A note open in the stream may quote: its quotation's lines.
+            if region == NOTE {
+                out.push(usize::from(NOTE_QUOTE) * 2);
+                out.push(opening(NOTE_QUOTE));
+            }
+        }
+        // A document's first lines may be its title's.
+        if self.document_lines < 40 {
+            out.push(usize::from(TITLE) * 2);
+            out.push(opening(TITLE));
         }
         // A heading where the line is set as a heading of its document was set before.
         if self.outline(self.outline_key(line, false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
@@ -321,15 +355,23 @@ impl State {
     /// one to two below the open heading's; a note opening on its label's value or a reading's or on
     /// none; on a line that may open a constituent document, each of those opening it too.
     pub(crate) fn candidates(&self, line: &LineView, classes: &[usize]) -> Vec<Move> {
-        let heading = self.outline(self.outline_key(line, false)).map_or(0, |outline| outline.heading);
+        let outline = self.outline(self.outline_key(line, false));
+        let heading = outline.map_or(0, |outline| outline.heading);
+        // The depths a body opening is tried at: the top, and from two above the last body unit's to two
+        // below it; the numbering's depth among them (`stack_depth`).
+        let last = outline.map_or(0, |outline| outline.body_depth).max(1);
+        let mut depths: Vec<u8> = std::iter::once(1).chain(last.saturating_sub(DEPTH_SPAN).max(1)..=(last + DEPTH_SPAN).min(DEPTH + 1)).map(|d| d as u8).collect();
+        depths.dedup();
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0, resume: false, starts: false };
+            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, starts: false };
             let mut bases = Vec::new();
             if opens && region == NOTE {
+                // A note counts on a number: its label's, or an arabic reading's (a lettered note answers no
+                // figure in the text).
                 let mut values: Vec<u32> = line.label.into_iter().collect();
-                values.extend(line.readings.iter().map(|r| r.value).filter(|v| Some(*v) != line.label));
+                values.extend(line.readings.iter().filter(|r| count_class(&r.family) == 0.0).map(|r| r.value).filter(|v| Some(*v) != line.label));
                 bases.extend(values.into_iter().take(3).map(|v| Move { note: Some(v), ..plain }));
             } else if opens && NUMBERED.contains(&region) {
                 bases.extend((0..line.readings.len().min(3)).map(|r| Move { reading: Some(r as u8), ..plain }));
@@ -344,12 +386,22 @@ impl State {
                 for base in bases {
                     out.extend((1..=deepest).map(|level| Move { level, ..base }));
                 }
+            } else if opens && RANKED_BODY.contains(&region) {
+                for base in bases {
+                    let mut tried = depths.clone();
+                    let by_stack = self.stack_depth(line, &base).min(DEPTH + 1) as u8;
+                    if !tried.contains(&by_stack) {
+                        tried.push(by_stack);
+                    }
+                    out.extend(tried.into_iter().map(|depth| Move { depth, ..base }));
+                }
             } else {
                 out.extend(bases);
             }
         }
+        // A constituent document opens on a unit's opening, its first heading or body unit at the top.
         if line.may_start {
-            let starting: Vec<Move> = out.iter().filter(|m| !m.resume).map(|m| Move { starts: true, ..*m }).collect();
+            let starting: Vec<Move> = out.iter().filter(|m| m.opens && !m.resume && m.depth <= 1 && m.level <= 2).map(|m| Move { starts: true, ..*m }).collect();
             out.extend(starting);
         }
         out
@@ -511,6 +563,14 @@ impl State {
         let (entries, unanswered) = self.entries.get(&self.document).map_or((0, 0), |(e, _)| (e.len(), e.iter().filter(|e| !e.answered).count()));
         f[70] = (1.0 + entries as f32).ln();
         f[71] = (1.0 + unanswered as f32).ln();
+        // A body opening's depth, its step from the last body unit's, and against its numbering's.
+        if candidate.depth > 0 {
+            f[72] = f32::from(candidate.depth);
+            f[73] = f32::from(candidate.depth) - outline.body_depth.max(1) as f32;
+            f[74] = f32::from(candidate.depth) - self.stack_depth(line, candidate) as f32;
+        } else {
+            f[72..75].fill(-9.0);
+        }
         f
     }
 
@@ -570,6 +630,12 @@ impl State {
             if let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) {
                 let (_, place, start, end) = stream.unanswered.remove(at);
                 made.paired = Some((place, start, end));
+                // The text's other marks of the number the note answers too, nearest first.
+                for slot in &mut made.also {
+                    let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) else { break };
+                    let (_, place, start, end) = stream.unanswered.remove(at);
+                    *slot = Some((place, start, end));
+                }
             }
         }
         if REFERRING.contains(&chosen.region) && !line.references.is_empty() {
@@ -583,7 +649,6 @@ impl State {
                 stream.line_number = Some(value);
             }
         }
-        let body_frames = stream.frames().iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
         let outline = self.outlines.entry(outline_key).or_default();
         if chosen.opens && chosen.region == HEADING {
             made.level_step = 10 + i64::from(chosen.level - outline.heading.max(1));
@@ -593,7 +658,7 @@ impl State {
                 None => outline.look_levels.push((line.look, chosen.level)),
             }
         } else if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-            let depth = body_frames.max(1);
+            let depth = usize::from(chosen.depth.max(1));
             made.depth_step = (10 + depth as i64 - outline.body_depth.max(1) as i64).clamp(2, 18);
             outline.body_depth = depth;
         }

@@ -191,6 +191,39 @@ fn misread_variants(text: &str, confusions: &HashMap<char, Vec<(char, f32)>>) ->
     variants
 }
 
+/// A line's opening as the numbering grammar would read the markers the print runs together or
+/// dresses: a revision mark before the marker ("*18.02", "†L #15"), an ordinal ("1st."), a section
+/// glued to its subsection ("16(2)": the section, then the subsection), and a second marker after a
+/// first ("5 (1)", "2.01 (a)").
+fn marker_variants(text: &str) -> Vec<String> {
+    static GLUED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ORDINAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let glued = GLUED.get_or_init(|| regex::Regex::new(r"^(\d{1,4}(?:\.\d{1,3})*)(\([0-9A-Za-z]{1,4}\).*)$").unwrap());
+    let ordinal = ORDINAL.get_or_init(|| regex::Regex::new(r"^(\d{1,3})(?:st|nd|rd|th)\.?$").unwrap());
+    let trimmed = text.trim_start();
+    let mut out = Vec::new();
+    let unmarked = trimmed.trim_start_matches(['*', '†', '‡']).trim_start();
+    if unmarked.len() < trimmed.len() && !unmarked.is_empty() {
+        out.push(unmarked.to_owned());
+    }
+    let mut tokens = unmarked.split_whitespace();
+    let Some(first) = tokens.next() else { return out };
+    let rest: String = unmarked[first.len()..].to_owned();
+    if let Some(found) = ordinal.captures(first) {
+        out.push(format!("{}.{rest}", &found[1]));
+    }
+    if let Some(found) = glued.captures(first) {
+        out.push(format!("{}.{rest}", &found[1]));
+        out.push(format!("{}{rest}", &found[2]));
+    }
+    if let Some(second) = tokens.next().filter(|token| token.starts_with('(') && token.ends_with(')') && token.chars().count() <= 6) {
+        if !marker_readings(first, false).is_empty() {
+            out.push(unmarked[unmarked.find(second).unwrap_or(0)..].to_owned());
+        }
+    }
+    out
+}
+
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
 pub(crate) struct LineTable {
@@ -294,6 +327,14 @@ impl LineTable {
                 flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.translation[at]),
             ]);
             let mut found = marker_readings(&line.text, evidence.words[at] & WORD_DIVISION != 0);
+            // The markers the grammar reads only once the print's own run-ons are taken apart.
+            for variant in marker_variants(&line.text) {
+                for reading in marker_readings(&variant, false) {
+                    if !found.contains(&reading) {
+                        found.push(reading);
+                    }
+                }
+            }
             if let Some(text) = recognized.get(&slot) {
                 for reading in marker_readings(text, evidence.words[at] & WORD_DIVISION != 0) {
                     if !found.contains(&reading) {
