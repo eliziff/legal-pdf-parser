@@ -702,10 +702,9 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
         .map(|(n, l)| (l.id.clone(), n))
         .collect();
     let mut groups = prepared.groups;
-    // A tagger's node states its region; reading list items off the locator (parser_list_item) is
-    // for the parser's own nodes.
+    // A node that states its region (a tagger's, the transition parser's: its grammar `region:<name>`)
+    // is read so; reading list items off the locator (parser_list_item) is for the stage parser's nodes.
     let tagged: HashMap<&str, &str> = structure.nodes.iter()
-        .filter(|n| n.origin_id == crate::graph::ORIGIN)
         .filter_map(|n| crate::graph::region_of(n).map(|region| (n.id.as_str(), region)))
         .collect();
     for group in &mut groups {

@@ -257,9 +257,9 @@ pub(crate) fn structure_graph(
             }
             _ => {}
         }
-        if region == "contents" {
-            node.grammar = Some("contents".to_owned());
-        }
+        // Its region as the tagger states one (`region:<name>`), which readers take for the unit's kind; a
+        // contents list's lines under the `contents` grammar.
+        node.grammar = Some(if region == "contents" { "contents".to_owned() } else { format!("region:{region}") });
         nodes.push(node);
         if region == "quote" && unit.lines.len() <= 60 {
             let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
