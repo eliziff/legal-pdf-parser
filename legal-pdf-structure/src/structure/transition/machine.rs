@@ -240,7 +240,7 @@ pub(crate) const CANDIDATES: usize = 75;
 const DEPTH_SPAN: usize = 2;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
-fn count_class(family: &str) -> f32 {
+pub(crate) fn count_class(family: &str) -> f32 {
     let count = family.rsplit(':').next().unwrap_or("");
     ["1", "1.1", "1.1.1", "1.1.1.1", "a", "A", "i", "I", "bullet"].iter().position(|c| *c == count).map_or(9.0, |c| c as f32)
 }

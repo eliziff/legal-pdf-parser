@@ -21,7 +21,11 @@
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
 //! - LEGALPDF_TRANSITION_WHOLE: the document read whole (`whole`): every line's move chosen at once by
-//!   the roles, numbers and notes agreeing, in place of the walk;
+//!   its roles, numbers, notes and outline agreeing, in place of the walk; LEGALPDF_TRANSITION_HEADS, the
+//!   folder of its learned heads (LEGALPDF_TRANSITION_HEADS_FOLDS, a folder of k fitted out of fold,
+//!   fold0 ..., each document read by the one fitted without its fold); LEGALPDF_TRANSITION_WHOLE_WEIGHTS, its parts' weights trained on whole
+//!   documents (`train_whole`); LEGALPDF_TRANSITION_WHOLE_DUMP, a folder its problems and the heads'
+//!   training rows are written to (the gold given);
 //! - LEGALPDF_TRANSITION_JOINT, `weight,penalty`: the reading the joint stylesheet solve makes (`joint`),
 //!   the template prior's term weighted `weight` and a move against its template's role costing
 //!   `penalty`; LEGALPDF_TRANSITION_PRIOR, the template prior's forest (none: the roles weighed on the
@@ -97,6 +101,10 @@ struct Settings {
     beam: usize,
     joint: Option<(f64, f64)>,
     whole: bool,
+    heads: Option<whole::Heads>,
+    heads_folds: Vec<whole::Heads>,
+    whole_dump: Option<PathBuf>,
+    whole_weights: [f64; whole::WEIGHTS],
     prior: Option<Forest>,
     emit: bool,
     grammar: Option<grammar::Grammar>,
@@ -134,12 +142,23 @@ fn settings() -> &'static Settings {
                 Some((weight.trim().parse().ok()?, penalty.trim().parse().ok()?))
             }),
             whole: std::env::var_os("LEGALPDF_TRANSITION_WHOLE").is_some(),
+            heads: var("LEGALPDF_TRANSITION_HEADS").and_then(|dir| whole::Heads::read(&dir).map_err(|e| eprintln!("transition parser: {e}")).ok()),
+            heads_folds: var("LEGALPDF_TRANSITION_HEADS_FOLDS").map(|dir| (0..).map(|k| dir.join(format!("fold{k}"))).take_while(|d| d.exists())
+                .filter_map(|d| whole::Heads::read(&d).map_err(|e| eprintln!("transition parser: {e}")).ok()).collect()).unwrap_or_default(),
+            whole_dump: var("LEGALPDF_TRANSITION_WHOLE_DUMP"),
+            whole_weights: var("LEGALPDF_TRANSITION_WHOLE_WEIGHTS").and_then(|path| whole::read_weights(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()).unwrap_or(whole::PRIOR_WEIGHTS),
             prior: var("LEGALPDF_TRANSITION_PRIOR").and_then(|path| forest(path, joint::PRIOR, joint::ROLES)),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
             grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
         }
     })
+}
+
+/// The whole reading's weights trained on whole documents: the problems in `problems` (a dump's), read
+/// `epochs` times, the averaged weights written to `out` (`whole::train`).
+pub(crate) fn train_whole(problems: &Path, out: &Path, epochs: usize) -> std::result::Result<String, String> {
+    whole::train(problems, out, epochs)
 }
 
 /// Whether the transition parser runs on this parse.
@@ -477,9 +496,11 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
     // The document read whole: every line's move chosen at once from the evidence alone, no first reading.
-    if s.whole && s.dump.is_none() && gold.is_none() {
+    if s.whole {
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
-        let moves = whole::read(table, &views, locals);
+        // Out of fold where fold heads are given (a training document read by heads fitted without it).
+        let heads = if s.heads_folds.is_empty() { s.heads.as_ref() } else { Some(&s.heads_folds[fold_of(sha256, s.heads_folds.len())]) };
+        let moves = whole::read(table, &views, locals, heads, &s.whole_weights, gold.map(|_| &gold_rows[..]), s.whole_dump.as_deref().map(|folder| (folder, sha256)));
         if let Some(folder) = &s.labels {
             let labels = labelled(&views, &moves);
             let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});

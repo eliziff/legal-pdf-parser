@@ -59,6 +59,11 @@ pub(crate) use legal_structure_model::text::{
     is_note_symbol, label_prefix, line_start_label_prefix, normalize_label, LabelPrefix, MAX_SYMBOL_LABEL_LEN,
 };
 pub use graph::PdfTextIndex;
+
+/// The transition parser's whole reading trained on whole documents (`transition::train_whole`).
+pub fn train_whole_reading(problems: &std::path::Path, out: &std::path::Path, epochs: usize) -> std::result::Result<String, String> {
+    transition::train_whole(problems, out, epochs)
+}
 use graph::{map_note_pairs, native_graph_parts, PdfResolutionInput};
 use legal_pdf_core::model::{
     Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
