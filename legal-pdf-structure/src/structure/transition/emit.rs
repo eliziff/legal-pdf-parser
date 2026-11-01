@@ -38,7 +38,8 @@ fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// The document's structure graph from its lines (`table`, `views`) and the moves they made.
+/// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
+/// paragraphs and footnotes the projection reads.
 pub(crate) fn structure_graph(
     pages: &mut [Page],
     slots: &Slots,
@@ -48,7 +49,7 @@ pub(crate) fn structure_graph(
     views: &[LineView],
     moves: &[Move],
     identity: &StructureIdentity,
-) -> Result<DocumentStructure> {
+) -> Result<(DocumentStructure, Vec<Paragraph>, Vec<Footnote>)> {
     // The text runs in the parser's reading order, and each page's regions are its lines' regions as
     // the parser reads them: furniture and page labels the page's header above its middle, its
     // footer below.
@@ -137,7 +138,8 @@ pub(crate) fn structure_graph(
         let depths: Vec<usize> = units.iter().map(|unit| unit.depth).collect();
         let starts: Vec<bool> = units.iter().map(|unit| unit.starts_document).collect();
         legal_pdf_tagger::labels::assemble(&regions, &texts, &levels, &depths, &starts)
-    };    // Nodes, their ranges in scalar characters of the text.
+    };
+    // Nodes, their ranges in scalar characters of the text.
     let line_range = |k: usize| index.line(&id_of(k)).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
@@ -217,6 +219,69 @@ pub(crate) fn structure_graph(
     }
     // The constituent documents the source holds (an exhibit, a schedule), as the stage parser gives them.
     nodes.extend(constituents::constituents(&index, pages, &fences.starts));
+    // The paragraphs and footnotes the projection reads (authority units, lookups): every body unit's text,
+    // each line's span in it and where its paired notes' reference marks stand; every note's.
+    let page_of = |k: usize| slots.page(table.order[k]);
+    // A unit's lines joined as the stage's paragraphs join them (hyphenation by the document's words).
+    let vocabulary = crate::structure::joining::vocabulary(pages);
+    let joined = |unit: &Unit| {
+        let lines: Vec<&Line> = unit.lines.iter().map(|&k| slots.line(pages, table.order[k])).collect();
+        crate::structure::joining::join_lines(&lines, &vocabulary)
+    };
+    let note_of_reference: HashMap<usize, Vec<(usize, u32)>> = units.iter().enumerate().filter(|(_, unit)| unit.region == NOTE)
+        .flat_map(|(u, unit)| unit.references.iter().map(move |&(k, start, _)| (k, (u, start))))
+        .fold(HashMap::new(), |mut found, (k, at)| {
+            found.entry(k).or_insert_with(Vec::new).push(at);
+            found
+        });
+    let mut paragraphs = Vec::new();
+    let mut footnotes = Vec::new();
+    for (u, unit) in units.iter().enumerate() {
+        let region = REGIONS[usize::from(unit.region)];
+        if matches!(region, "furniture" | "page_label" | "line_label" | "marginal_note" | "none") {
+            continue;
+        }
+        let (text, spans) = joined(unit);
+        let pages_of: Vec<u32> = {
+            let mut found: Vec<u32> = unit.lines.iter().map(|&k| pages[page_of(k)].number).collect();
+            found.dedup();
+            found
+        };
+        if unit.region == NOTE {
+            let reference = unit.references.first().map(|&(k, _, _)| k);
+            footnotes.push(Footnote {
+                source_spans: spans,
+                pair_id: format!("{}-note", node_id(u)),
+                label: unit.label.clone().unwrap_or_default(),
+                occurrence: 1,
+                restart_sequence: 0,
+                reference_page: reference.map(|k| pages[page_of(k)].number),
+                body_pages: pages_of,
+                reference_line_id: reference.map(id_of),
+                body_line_ids: unit.lines.iter().map(|&k| id_of(k)).collect(),
+                body: text,
+                sentence_proposition: String::new(),
+                passage_since_prior_note: String::new(),
+                confidence: 1.0,
+                provenance: ORIGIN.to_owned(),
+                warnings: Vec::new(),
+                crossrefs: Vec::new(),
+            });
+            continue;
+        }
+        let anchors = unit.lines.iter().zip(&spans).flat_map(|(&k, span)| {
+            note_of_reference.get(&k).into_iter().flatten().map(move |&(note, start)| (note, span.start + (start as usize).saturating_sub(span.source_start)))
+        }).map(|(note, offset)| ParagraphAnchor { pair_id: format!("{}-note", node_id(note)), label: units[note].label.clone().unwrap_or_default(), offset }).collect();
+        paragraphs.push(Paragraph {
+            source_spans: spans,
+            id: node_id(u),
+            page_index: pages[page_of(unit.lines[0])].index,
+            region_type: if unit.region == HEADING { "heading".to_owned() } else { "body".to_owned() },
+            text,
+            line_ids: unit.lines.iter().map(|&k| id_of(k)).collect(),
+            anchors,
+        });
+    }
     let text = index.text().to_owned();
     let digest = {
         use sha2::Digest;
@@ -238,5 +303,5 @@ pub(crate) fn structure_graph(
     structure.profile = identity.profile;
     structure.source_fragments = index.source_fragments();
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
-    Ok(structure)
+    Ok((structure, paragraphs, footnotes))
 }

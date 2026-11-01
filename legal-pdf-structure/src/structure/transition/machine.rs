@@ -129,6 +129,11 @@ pub(crate) struct LineView<'a> {
     /// heading's by them.
     pub(crate) tables: Option<&'a Tables>,
     pub(crate) heading_word: f32,
+    /// The document's view of the line's look before any move: the mean probability its lines open a
+    /// heading by the local scores, and how many lines of it they hold likelier a heading's opening than
+    /// not (log).
+    pub(crate) look_heading: f32,
+    pub(crate) look_heading_lines: f32,
 }
 
 /// What a move made of its line: the earlier line whose reference mark its note answered, a heading's
@@ -152,8 +157,9 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "heading_step", "heading_level", "look_levelled", "look_level_agrees", "stack_level_agrees",
     "resumes", "interrupted_region",
     "grammar_relation", "grammar_child", "heading_word",
+    "look_heading", "look_heading_lines",
 ];
-pub(crate) const CANDIDATES: usize = 33;
+pub(crate) const CANDIDATES: usize = 35;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -354,6 +360,8 @@ impl State {
                 f[32] = line.heading_word;
             }
         }
+        f[33] = line.look_heading;
+        f[34] = line.look_heading_lines;
         f[28] = flag(candidate.resume);
         f[29] = self.interrupted.get(&(line.ctx, stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
         f

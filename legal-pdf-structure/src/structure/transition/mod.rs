@@ -184,7 +184,7 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
 }
 
 /// A line's local scores: each region-and-opening class's probability, and the classes best first.
-struct Local {
+pub(crate) struct Local {
     probabilities: Vec<f64>,
     ranked: Vec<usize>,
 }
@@ -214,9 +214,19 @@ fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
 }
 
 /// Each line as the state reads it, in reading order.
-fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable) -> Vec<LineView<'a>> {
+fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable, locals: &[Local]) -> Vec<LineView<'a>> {
     let tables = settings().grammar.as_ref().map(|g| g.for_document(evidence.instrument));
+    // Each look's lines as the local scores read them, before any move.
+    let heading = usize::from(HEADING) * 2 + 1;
+    let mut looks: HashMap<u32, (f64, usize, usize)> = HashMap::new();
+    for (k, local) in locals.iter().enumerate() {
+        let entry = looks.entry(table.looks[k]).or_default();
+        entry.0 += local.probabilities[heading];
+        entry.1 += 1;
+        entry.2 += usize::from(local.probabilities[heading] > 0.5);
+    }
     (0..table.order.len()).map(|k| {
+        let (sum, lines, likely) = looks[&table.looks[k]];
         let slot = table.order[k];
         let at = slot.index();
         LineView {
@@ -232,6 +242,8 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             place: k as u32,
             tables,
             heading_word: tables.and_then(|t| t.heading_word(&grammar::first_word(&slots.line(pages, slot).text, !table.readings[k].is_empty()))).unwrap_or(0.0),
+            look_heading: (sum / lines.max(1) as f64) as f32,
+            look_heading_lines: (1.0 + likely as f32).ln(),
         }
     }).collect()
 }
@@ -239,19 +251,16 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
 /// One document parsed: its lines read (`LineTable`) and the moves they make in reading order
 /// (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide); and, as
 /// its environment asks, what the scorer is fitted on and the labels the grader reads.
-pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str) -> (LineTable, Vec<Move>) {
+pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str) -> (LineTable, Vec<Local>, Vec<Move>) {
     let table = LineTable::read(pages, slots, evidence, fences);
-    let moves = parse(pages, slots, evidence, fences, sha256, &table);
-    (table, moves)
+    let locals = locals_of(&table, sha256);
+    let moves = parse(pages, slots, evidence, fences, sha256, &table, &locals);
+    (table, locals, moves)
 }
 
-fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable) -> Vec<Move> {
+/// Each line's local scores, read once.
+fn locals_of(table: &LineTable, sha256: &str) -> Vec<Local> {
     let s = settings();
-    let n = table.order.len();
-    let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
-    let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
-    let views = views_of(pages, slots, evidence, fences, table);
-    let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
     let probabilities = |row: &[f32]| -> Vec<f64> {
         match &s.local {
             Some(LocalScores::One(forest)) => forest.probabilities(row),
@@ -268,14 +277,23 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
             None => vec![1.0 / CLASSES as f64; CLASSES],
         }
     };
-    let locals: Vec<Local> = (0..n).map(|k| {
+    (0..table.order.len()).map(|k| {
         let probabilities = probabilities(table.row(k));
         let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
         ranked.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]).then(a.cmp(&b)));
         Local { probabilities, ranked }
-    }).collect();
+    }).collect()
+}
+
+fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local]) -> Vec<Move> {
+    let s = settings();
+    let n = table.order.len();
+    let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
+    let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
+    let views = views_of(pages, slots, evidence, fences, table, locals);
+    let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
     let moves = match (&s.ranker, s.beam) {
-        (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, &locals),
+        (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, locals),
         _ => {
             let mut state = State::default();
             let mut moves = Vec::with_capacity(n);
@@ -341,10 +359,10 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
 /// The document's structure as the transition parser reads it, its reading through `emit`: what
 /// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
 pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, identity: &StructureIdentity) -> Result<StructureOutput> {
-    let (table, moves) = run(pages, slots, evidence, fences, &identity.source_sha256);
-    let views = views_of(pages, slots, evidence, fences, &table);
-    let structure_graph = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity)?;
-    Ok(StructureOutput { paragraphs: Vec::new(), footnotes: Vec::new(), diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
+    let (table, locals, moves) = run(pages, slots, evidence, fences, &identity.source_sha256);
+    let views = views_of(pages, slots, evidence, fences, &table, &locals);
+    let (structure_graph, paragraphs, footnotes) = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity)?;
+    Ok(StructureOutput { paragraphs, footnotes, diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
 }
 
 /// The best whole reading a beam of `width` keeps: every reading kept extended by each of the line's

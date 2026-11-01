@@ -1064,11 +1064,13 @@ dependencies = [
  "legal-pdf-core",
  "legal-pdf-support",
  "legal-pdf-tables",
+ "legal-pdf-tagger",
  "legal-structure-model",
  "pdf-inspector",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1103,7 +1105,6 @@ version = "0.1.0"
 dependencies = [
  "diff-match-patch-rs 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "legal-pdf-core",
- "legal-structure",
  "legal-structure-model",
  "ort",
  "regex",
