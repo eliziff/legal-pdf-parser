@@ -239,9 +239,9 @@ fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, c
     f[1] = local.ranked.iter().position(|&c| c == candidate.class()).unwrap_or(CLASSES) as f32;
     f[2..2 + CANDIDATES].copy_from_slice(&state.features(line, candidate));
     f[2 + CANDIDATES..22 + CANDIDATES].copy_from_slice(&row[..20]);
-    f[22 + CANDIDATES..62 + CANDIDATES].copy_from_slice(&row[72..92]);
+    f[22 + CANDIDATES..42 + CANDIDATES].copy_from_slice(&row[72..92]);
     // The heading's level by the local model's own reading of it.
-    f[62 + CANDIDATES] = match &local.levels {
+    f[42 + CANDIDATES] = match &local.levels {
         Some(levels) if candidate.opens && candidate.region == HEADING => levels[usize::from(candidate.level.max(0) as u8).min(LEVEL_CLASSES - 1)].max(1e-6).ln(),
         _ => -99.0,
     };
