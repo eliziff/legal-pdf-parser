@@ -312,12 +312,18 @@ pub(crate) fn structure_graph(
         let lines: Vec<&Line> = unit.lines.iter().map(|&k| slots.line(pages, table.order[k])).collect();
         crate::structure::joining::join_lines(&lines, &vocabulary)
     };
-    let note_of_reference: HashMap<usize, Vec<(usize, u32)>> = units.iter().enumerate().filter(|(_, unit)| unit.region == NOTE)
-        .flat_map(|(u, unit)| unit.references.iter().map(move |&(k, start, _)| (k, (u, start))))
-        .fold(HashMap::new(), |mut found, (k, at)| {
-            found.entry(k).or_insert_with(Vec::new).push(at);
-            found
-        });
+    // Each paired reference mark, by its line: its note's pair and label, where it stands in the line.
+    let mut marks: HashMap<String, Vec<legal_pdf_core::Anchor>> = HashMap::new();
+    for (u, unit) in units.iter().enumerate().filter(|(_, unit)| unit.region == NOTE) {
+        for &(k, start, end) in &unit.references {
+            marks.entry(id_of(k)).or_default().push(legal_pdf_core::Anchor {
+                pair_id: format!("{}-note", node_id(u)),
+                label: unit.label.clone().unwrap_or_default(),
+                start: start as usize,
+                end: end as usize,
+            });
+        }
+    }
     let mut paragraphs = Vec::new();
     let mut footnotes = Vec::new();
     for (u, unit) in units.iter().enumerate() {
@@ -353,9 +359,9 @@ pub(crate) fn structure_graph(
             });
             continue;
         }
-        let anchors = unit.lines.iter().zip(&spans).flat_map(|(&k, span)| {
-            note_of_reference.get(&k).into_iter().flatten().map(move |&(note, start)| (note, span.start + (start as usize).saturating_sub(span.source_start)))
-        }).map(|(note, offset)| ParagraphAnchor { pair_id: format!("{}-note", node_id(note)), label: units[note].label.clone().unwrap_or_default(), offset }).collect();
+        // The paragraph's text as the stage writes it: each paired reference mark its note's marker.
+        let lines: Vec<&Line> = unit.lines.iter().map(|&k| slots.line(pages, table.order[k])).collect();
+        let Some((text, anchors, spans)) = crate::structure::joining::anchored_text(&lines, &vocabulary, &marks) else { continue };
         paragraphs.push(Paragraph {
             source_spans: spans,
             id: node_id(u),

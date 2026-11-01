@@ -113,13 +113,36 @@ pub(super) fn build_paragraphs_with_context(
     }
     let mut paragraphs = Vec::new();
     for (page, kind, lines) in regions {
-        let (text, source_spans) = join_lines(&lines, &vocabulary);
-        if text.is_empty() {
-            continue;
-        }
+        let Some((rendered, output_anchors, source_spans)) = anchored_text(&lines, &vocabulary, anchors) else { continue };
+        paragraphs.push(Paragraph {
+            source_spans,
+            id: format!("para-{:06}", paragraphs.len() + 1),
+            page_index: page.index,
+            region_type: kind.to_owned(),
+            text: rendered,
+            line_ids: lines.iter().map(|line| line.id.clone()).collect(),
+            anchors: output_anchors,
+        });
+    }
+    paragraphs
+}
+
+/// A paragraph's lines joined (`join_lines`), each paired reference mark `anchors` names (by line id)
+/// replaced by its note's marker, `⟦FN:pair⟧`, an anchor at its offset; with each source run kept.
+/// None where the lines hold no text.
+pub(super) fn anchored_text(
+    lines: &[&Line],
+    vocabulary: &Vocabulary,
+    anchors: &HashMap<String, Vec<Anchor>>,
+) -> Option<(String, Vec<ParagraphAnchor>, Vec<legal_pdf_core::model::SourceTextSpan>)> {
+    let (text, source_spans) = join_lines(lines, vocabulary);
+    if text.is_empty() {
+        return None;
+    }
+    {
         let mut events = Vec::new();
         let joined_coordinates = ScalarText::new(&text);
-        for line in &lines {
+        for line in lines {
             let coordinates = ScalarText::new(&line.text);
             for anchor in anchors.get(&line.id).into_iter().flatten() {
                 let start = coordinates.utf16(anchor.start);
@@ -165,15 +188,6 @@ pub(super) fn build_paragraphs_with_context(
             rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
             (rendered, output_anchors, retained_spans)
         };
-        paragraphs.push(Paragraph {
-            source_spans,
-            id: format!("para-{:06}", paragraphs.len() + 1),
-            page_index: page.index,
-            region_type: kind.to_owned(),
-            text: rendered,
-            line_ids: lines.iter().map(|line| line.id.clone()).collect(),
-            anchors: output_anchors,
-        });
+        Some((rendered, output_anchors, source_spans))
     }
-    paragraphs
 }
