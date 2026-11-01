@@ -1262,7 +1262,11 @@ pub(crate) fn read(table: &LineTable, views: &[LineView], locals: &[Local], head
             chain_of: Vec::new(),
             path,
         };
-        problem.gold_totals = Some(totals(&problem, &solution));
+        // A gold that leaves part of the reading unsaid (A2AJ's: its body unmarked, no levels or depths) gives no
+        // whole reading's totals to train the weights toward; its answers still fit the heads.
+        let partial = gold.iter().any(|g| g[0] == UNMARKED_BODY || (g[0] == i64::from(HEADING) && g[1] == 1 && g[4] < 0)
+            || (g[1] == 1 && g[0] >= 0 && RANKED_BODY.contains(&(g[0] as u8)) && g[7] < 0));
+        problem.gold_totals = (!partial).then(|| totals(&problem, &solution));
         problem.gold_reading = Some(GoldReading {
             roles: solution.line_choice.iter().map(|c| c.map_or(0, |(_, r)| r)).collect(),
             levels: solution.levels.iter().map(|l| l.map_or(0, |l| l as u8)).collect(),
