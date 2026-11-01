@@ -110,6 +110,12 @@ pub(crate) fn structure_graph(
         }
         .to_owned();
     }
+    // The reading's order of each page's lines, where the parse reads them in its own.
+    for (k, chosen) in moves.iter().enumerate() {
+        if let Some(rank) = chosen.rank {
+            slots.line_mut(pages, table.order[k]).reading_order = rank as usize;
+        }
+    }
     build_regions(pages);
     let index = PdfTextIndex::from_pages(pages);
     let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();

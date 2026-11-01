@@ -203,7 +203,7 @@ pub fn document(pages: &[Page], candidate: &State, pieces: &[Piece], tier0: &[La
     let row_of: HashMap<String, i64> = kept.iter().enumerate().map(|(row, &k)| (anchor(candidate, &pieces[k]), row as i64)).collect();
     let pointer = |name: &Option<String>| name.as_deref().and_then(|a| row_of.get(a)).copied().unwrap_or(-1);
     let row = |label: &Label| json!([label.region, label.start, u8::from(label.document), u8::from(label.reference),
-        label.level, u8::from(label.marker), pointer(&label.continues), label.depth]);
+        label.level, u8::from(label.marker), pointer(&label.continues), label.depth, label.rank.map_or(-1, |r| r as i64)]);
     let (markers, families) = markers(candidate, pieces, tier0);
     let off_grid: Vec<usize> = pages.iter().map(|page| off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
     let looks = Looks::tally(pages);

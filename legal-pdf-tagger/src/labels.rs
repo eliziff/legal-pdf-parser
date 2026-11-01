@@ -44,6 +44,9 @@ pub struct Label {
     pub marker: bool,
     pub document: bool,
     pub reference: bool,
+    /// Carried onto another frame's piece: the gold's reading rank of the gold text the piece's first character
+    /// aligns to (its line's place in the gold's reading order, then the character's place in the line).
+    pub rank: Option<usize>,
 }
 
 pub fn anchor(state: &State, piece: &Piece) -> String {
@@ -412,6 +415,7 @@ pub fn parsed_regions(state: &State) -> Regions {
 pub fn carry(reference: &State, gold_pieces: &[Piece], gold: &[Label], candidate: &State, pieces: &[Piece], alignment: &Alignment)
     -> Vec<Option<Label>> {
     let gold_at = Locator::new(gold_pieces);
+    let line_rank: HashMap<usize, usize> = reference.reading_order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
     // Each candidate piece's aligned stretches of gold lines.
     let mut stretches: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); pieces.len()];
     for (k, piece) in pieces.iter().enumerate() {
@@ -471,7 +475,7 @@ pub fn carry(reference: &State, gold_pieces: &[Piece], gold: &[Label], candidate
         let &(r, at, _) = stretches[k].first()?;
         let g = gold_at.at(r, at)?;
         let source = &gold[g];
-        let mut label = Label { region: source.region, ..Label::default() };
+        let mut label = Label { region: source.region, rank: line_rank.get(&r).map(|&i| i * 100_000 + at.min(99_999)), ..Label::default() };
         if let Some(u) = unit_of[g] {
             let s = stream(source.region);
             match first_here.get(&u) {

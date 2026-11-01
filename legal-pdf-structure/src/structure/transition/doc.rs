@@ -134,7 +134,7 @@ fn note_number(line: &LineView, text: &str) -> Option<u32> {
 /// marks of its number in the region its link names.
 fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize], units: &Units, views: &[LineView], texts: &[&str]) -> Vec<Move> {
     let n = lines.roles.len();
-    let mut moves = vec![Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, starts: false, answers: [None; 4] }; n];
+    let mut moves = vec![Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }; n];
     for (k, mv) in moves.iter_mut().enumerate() {
         mv.starts = lines.starts[k];
     }
@@ -214,7 +214,7 @@ fn gold_region(g: &[i64; 8]) -> i64 {
 /// part, its tree (each node under the nearest open node of a smaller level, the left sibling that parent's
 /// last child), its gap, and a note's region the region before it (two pages back at most) holding a mark of
 /// its number the gold pairs; read through the same `insert` and `moves_of` as the model's.
-pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
+pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
     let n = gold.len();
     // Each line's unit, as the gold's decoder reads its rows (`docparse.gold_units`).
     let mut unit = vec![usize::MAX; n];
@@ -331,7 +331,34 @@ pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], texts: &[&str], page
             .find(|&j| gold[j][3] == 1 && region_of[j] != usize::MAX && views[j].references.iter().any(|&(v, ..)| v == value))
             .map(|j| region_of[j])
     }).collect();
-    moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts)
+    let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
+    read_in(&mut moves, ranks, pages);
+    moves
+}
+
+/// The reading's order of the lines: each page's lines by their ranks (a line without one just after the line
+/// before it), as places in the document.
+fn read_in(moves: &mut [Move], ranks: &[i64], pages: &[usize]) {
+    let n = moves.len();
+    if ranks.iter().all(|&r| r < 0) {
+        return;
+    }
+    // A line without a rank takes the last rank before it on its page, read after that line.
+    let mut keyed: Vec<(usize, i64, usize)> = Vec::with_capacity(n);
+    let mut last = (usize::MAX, -1i64);
+    for k in 0..n {
+        if pages[k] != last.0 {
+            last = (pages[k], -1);
+        }
+        if ranks[k] >= 0 {
+            last.1 = ranks[k];
+        }
+        keyed.push((pages[k], last.1, k));
+    }
+    keyed.sort();
+    for (place, &(.., k)) in keyed.iter().enumerate() {
+        moves[k].rank = Some(place as u32);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------- the model

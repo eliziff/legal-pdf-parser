@@ -100,6 +100,8 @@ struct Settings {
     local: Option<LocalScores>,
     ranker: Option<Forest>,
     gold: Option<HashMap<String, HashMap<String, [i64; 8]>>>,
+    /// Each gold piece's reading rank in the gold (the labels' ninth column), where the gold gives one.
+    gold_ranks: HashMap<String, HashMap<String, i64>>,
     dump: Option<PathBuf>,
     dump_lines: f64,
     labels: Option<PathBuf>,
@@ -141,6 +143,7 @@ fn settings() -> &'static Settings {
             local,
             ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(|path| forest(path, RANKED, 1)),
             gold: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_gold(&path)),
+            gold_ranks: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_ranks(&path)).unwrap_or_default(),
             dump: var("LEGALPDF_TRANSITION_DUMP"),
             dump_lines: std::env::var("LEGALPDF_TRANSITION_DUMP_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
@@ -218,6 +221,16 @@ fn read_gold(path: &Path) -> HashMap<String, HashMap<String, [i64; 8]>> {
         found.insert(sha.to_owned(), per_piece);
     }
     found
+}
+
+/// Each gold piece's reading rank, the ninth column of the gold's labels (none where a row has no ninth).
+fn read_ranks(path: &Path) -> HashMap<String, HashMap<String, i64>> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).filter_map(|row| {
+        let (sha, ids, labels) = (row["sha256"].as_str()?.to_owned(), row["ids"].as_array()?.clone(), row["labels"].as_array()?.clone());
+        let ranks = ids.iter().zip(&labels).filter_map(|(id, label)| Some((id.as_str()?.to_owned(), label.get(8)?.as_i64().filter(|&r| r >= 0)?))).collect();
+        Some((sha, ranks))
+    }).collect()
 }
 
 /// The move the gold makes at a line, among `candidates`: of those of the gold's region and opening,
@@ -511,7 +524,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
         let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
         let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
-        let moves = doc::oracle(&gold_rows, &views, &texts, &line_pages);
+        let ranks: Vec<i64> = ids.iter().map(|id| s.gold_ranks.get(sha256).and_then(|r| r.get(&format!("{id}@0"))).copied().unwrap_or(-1)).collect();
+        let moves = doc::oracle(&gold_rows, &ranks, &views, &texts, &line_pages);
         write_labels(sha256, &ids, &views, &moves);
         return moves;
     }
