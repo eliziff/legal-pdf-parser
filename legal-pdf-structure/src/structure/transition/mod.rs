@@ -27,7 +27,9 @@
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold),
 //!   for the oracle;
 //! - LEGALPDF_TRANSITION_DUMP, a folder: each line's features (`<sha>.lines.f32`), each candidate's
-//!   (`<sha>.moves.f32`) and which the oracle makes (`<sha>.json`);
+//!   (`<sha>.moves.f32`) and which the oracle makes (`<sha>.json`), the candidates of the share of lines
+//!   LEGALPDF_TRANSITION_DUMP_LINES draws (all by default; none for a dump only the forests and encoders
+//!   read: the ranker's fit draws no more than a quarter of a round's lines);
 //! - LEGALPDF_TRANSITION_LABELS, a folder: each document's labels as the parser reads it
 //!   (`<sha>.labels.json`), for the grader's `--labels`;
 //! - LEGALPDF_TRANSITION_EMIT: the parse's output is the transition parser's structure (`emit`).
@@ -82,6 +84,7 @@ struct Settings {
     ranker: Option<Forest>,
     gold: Option<HashMap<String, HashMap<String, [i64; 8]>>>,
     dump: Option<PathBuf>,
+    dump_lines: f64,
     labels: Option<PathBuf>,
     beam: usize,
     emit: bool,
@@ -112,6 +115,7 @@ fn settings() -> &'static Settings {
             ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(|path| forest(path, RANKED, 1)),
             gold: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_gold(&path)),
             dump: var("LEGALPDF_TRANSITION_DUMP"),
+            dump_lines: std::env::var("LEGALPDF_TRANSITION_DUMP_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
             beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
@@ -392,10 +396,17 @@ struct Recorded {
     oracle: Vec<u8>,
 }
 
+/// Whether a document's line `k` is among the share `share` of its lines a fixed draw takes (CRC-32 of the
+/// sha256 and the line's place).
+fn drawn(sha256: &str, k: usize, share: f64) -> bool {
+    share >= 1.0 || (share > 0.0 && (fold_of(&format!("{sha256}:{k}"), 1 << 20) as f64) < share * f64::from(1u32 << 20))
+}
+
 /// One greedy reading of `views`: each line's move the ranker's best; without a ranker, the oracle's
 /// where `gold` is given and reachable (the first round's rollout), else the local scores' best class,
-/// counting on nothing. With `record`, every candidate as the scorer is fitted on it.
-fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: bool) -> (Vec<Move>, Recorded) {
+/// counting on nothing. With `record` (the document's sha256 and the share of its lines
+/// drawn), each drawn line's candidates as the scorer is fitted on them.
+fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded) {
     let s = settings();
     let mut state = State::default();
     let mut moves = Vec::with_capacity(views.len());
@@ -414,7 +425,7 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
                 candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume).unwrap_or(0)
             }),
         };
-        if record {
+        if record.is_some_and(|(sha256, share)| drawn(sha256, k, share)) {
             for (c, f) in features.iter().enumerate() {
                 recorded.rows.extend_from_slice(f);
                 recorded.lines.push(k as u32);
@@ -437,13 +448,13 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
-    let first = walk(table, &views_of(pages, slots, evidence, fences, table, locals, sheet), locals, None, false).0;
+    let first = walk(table, &views_of(pages, slots, evidence, fences, table, locals, sheet), locals, None, None).0;
     sheet.read_back(&first);
     let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
     let moves = match (&s.ranker, s.beam) {
         (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, locals),
         _ => {
-            let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some());
+            let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
             let (move_rows, move_lines, move_classes, move_oracle) = (recorded.rows, recorded.lines, recorded.classes, recorded.oracle);
             if let Some(folder) = &s.dump {
                 let write = || -> std::io::Result<()> {
