@@ -283,9 +283,9 @@ pub(crate) fn page_order(
         diagnostics.push(diagnostic);
     }
     order_note_lines(lines, &mut note, items, number);
-    // A running head and foot read top to bottom.
-    header.sort_by(|&left, &right| band_geometry_order(&lines[left], &lines[right]));
-    footer.sort_by(|&left, &right| band_geometry_order(&lines[left], &lines[right]));
+    // A running head and foot read row by row.
+    read_rows(lines, &mut header, |slot| band_geometry_top(&lines[slot]));
+    read_rows(lines, &mut footer, |slot| band_geometry_top(&lines[slot]));
     let mut ordered = header;
     ordered.extend(weave_note_columns(lines, body, note, items, page.width, number));
     ordered.extend(footer);

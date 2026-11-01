@@ -11,10 +11,32 @@ pub(crate) fn band_geometry_top(line: &Line) -> f64 {
         .unwrap_or(line.bbox[1])
 }
 
-pub(crate) fn band_geometry_order(left: &Line, right: &Line) -> std::cmp::Ordering {
-    band_geometry_top(left)
-        .total_cmp(&band_geometry_top(right))
-        .then(left.bbox[0].total_cmp(&right.bbox[0]))
+/// Lines (`members`, slots of `lines`) in rows, top to bottom, each row left to right: taken by
+/// `top`, a line joins the row whose middle its own sits within half the lines' median height of,
+/// so a skewed scan's row (each word a line, the tops rising across the page) reads left to right.
+pub(crate) fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -> f64) {
+    let height = |slot: usize| (lines[slot].bbox[3] - lines[slot].bbox[1]).max(0.0);
+    let half = median(members.iter().map(|&slot| height(slot)).collect()) / 2.0;
+    let mut keyed: Vec<(usize, f64)> = members.iter().map(|&slot| (slot, top(slot))).collect();
+    keyed.sort_by(|left, right| left.1.total_cmp(&right.1).then(lines[left.0].bbox[0].total_cmp(&lines[right.0].bbox[0])));
+    let mut rows: Vec<(f64, Vec<usize>)> = Vec::new();
+    for (slot, top) in keyed {
+        let middle = top + height(slot) / 2.0;
+        match rows.last_mut() {
+            Some((sum, row)) if (middle - *sum / row.len() as f64).abs() <= half => {
+                *sum += middle;
+                row.push(slot);
+            }
+            _ => rows.push((middle, vec![slot])),
+        }
+    }
+    *members = rows
+        .into_iter()
+        .flat_map(|(_, mut row)| {
+            row.sort_by(|&left, &right| lines[left].bbox[0].total_cmp(&lines[right].bbox[0]));
+            row
+        })
+        .collect();
 }
 
 pub(crate) fn standalone_note_label(line: &Line) -> bool {
@@ -54,33 +76,25 @@ pub(crate) fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<I
         .map(|(index, _)| index)
 }
 
-/// A page's note band (`note`, slots of `lines`) in reading order: column by column, top to
-/// bottom, a label set apart at its note's first line. `items` are the page's (on page `number`).
+/// A page's note band (`note`, slots of `lines`) in reading order: column by column, row by row
+/// (`read_rows`), a label set apart on its note's first line. `items` are the page's (on page `number`).
 pub(crate) fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &legal_pdf_tables::PageItems, number: u32) {
-    let mut tops: Vec<f64> = note.iter().map(|&slot| band_geometry_top(&lines[slot])).collect();
-    for (at, &label) in note.iter().enumerate() {
+    let mut tops: HashMap<usize, f64> = note.iter().map(|&slot| (slot, band_geometry_top(&lines[slot]))).collect();
+    for &label in note.iter() {
         if !standalone_note_label(&lines[label]) {
             continue;
         }
         if let Some(body) = aligned_note_body_among(lines, note.iter().copied(), label) {
-            tops[at] = tops[note.iter().position(|&slot| slot == body).unwrap_or(at)];
+            tops.insert(label, tops[&body]);
         }
     }
     let columns = note_column_model(lines, note, items, number);
-    let mut keyed: Vec<(usize, f64)> = note.iter().copied().zip(tops).collect();
-    keyed.sort_by(|&(left, left_top), &(right, right_top)| {
-        let (left, right) = (&lines[left], &lines[right]);
-        let left_column =
-            usize::from(columns.kind == "two_column" && line_center_x(left) >= columns.split_x);
-        let right_column =
-            usize::from(columns.kind == "two_column" && line_center_x(right) >= columns.split_x);
-        left_column.cmp(&right_column).then(
-            left_top
-                .total_cmp(&right_top)
-                .then(left.bbox[0].total_cmp(&right.bbox[0])),
-        )
-    });
-    *note = keyed.into_iter().map(|(slot, _)| slot).collect();
+    let right = |slot: &usize| columns.kind == "two_column" && line_center_x(&lines[*slot]) >= columns.split_x;
+    let (mut left_column, mut right_column): (Vec<usize>, Vec<usize>) = note.iter().copied().partition(|slot| !right(slot));
+    read_rows(lines, &mut left_column, |slot| tops[&slot]);
+    read_rows(lines, &mut right_column, |slot| tops[&slot]);
+    left_column.extend(right_column);
+    *note = left_column;
 }
 
 /// A page's body and note band (slots of `lines`) read together: on a page of two columns, each
