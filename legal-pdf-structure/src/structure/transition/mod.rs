@@ -11,10 +11,9 @@
 //! weighed. Tier 1 and tier 2 give the same moves other local scores; the parser stays the same.
 //!
 //! It runs beside the stage parser while it is fitted and measured; its environment:
-//! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`), or
-//!   LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of k (fold0.txt ...), each fitted on every document but
-//!   those of its fold, which read it (out of fold), or all averaged where LEGALPDF_TRANSITION_FOLDS_AVERAGE
-//!   is set;
+//! - LEGALPDF_TRANSITION_LOCAL, a local forest (multiclass over `Move::class`; the product's, fitted
+//!   on all of train), or LEGALPDF_TRANSITION_LOCAL_FOLDS, a folder of k (fold0.txt ...), each fitted on
+//!   every document but those of its fold, which read it (out of fold, train's rollouts);
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
@@ -57,8 +56,6 @@ enum LocalScores {
     One(Forest),
     /// Out of fold: a document read by the forest fitted on every fold but its own (`fold_of`).
     Folds(Vec<Forest>),
-    /// Every fold's forest, their probabilities averaged.
-    Average(Vec<Forest>),
 }
 
 struct Settings {
@@ -82,8 +79,7 @@ fn settings() -> &'static Settings {
             (None, Some(folder)) => {
                 let folds: Vec<Forest> = (0..).map(|k| folder.join(format!("fold{k}.txt"))).take_while(|path| path.exists())
                     .filter_map(|path| forest(path, ALL, CLASSES)).collect();
-                let average = std::env::var_os("LEGALPDF_TRANSITION_FOLDS_AVERAGE").is_some();
-                (!folds.is_empty()).then(|| if average { LocalScores::Average(folds) } else { LocalScores::Folds(folds) })
+                (!folds.is_empty()).then_some(LocalScores::Folds(folds))
             }
             (None, None) => None,
         };
@@ -283,15 +279,6 @@ fn locals_of(table: &LineTable, sha256: &str) -> Vec<Local> {
         match &s.local {
             Some(LocalScores::One(forest)) => forest.probabilities(row),
             Some(LocalScores::Folds(folds)) => folds[fold_of(sha256, folds.len())].probabilities(row),
-            Some(LocalScores::Average(folds)) => {
-                let mut sum = vec![0.0; CLASSES];
-                for forest in folds {
-                    for (s, p) in sum.iter_mut().zip(forest.probabilities(row)) {
-                        *s += p / folds.len() as f64;
-                    }
-                }
-                sum
-            }
             None => vec![1.0 / CLASSES as f64; CLASSES],
         }
     };
