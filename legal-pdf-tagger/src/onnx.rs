@@ -184,6 +184,7 @@ impl Tagger {
                 marker: start == 1 && c_marker.is_some_and(|h| c[h] == 1),
                 document: c_document.is_some_and(|h| c[h] == 1),
                 reference: c_reference.is_some_and(|h| c[h] == 1),
+                rank: None,
             };
             // Tier 0's contents lines stand under the model: its contents reader is precise (0.98 on
             // the structure gold's development split) and the model reads a contents list as text.
