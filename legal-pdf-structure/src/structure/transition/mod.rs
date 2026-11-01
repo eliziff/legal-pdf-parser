@@ -20,6 +20,8 @@
 //! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
 //!   from the candidate's `RANKED` features;
 //! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
+//! - LEGALPDF_TRANSITION_WHOLE: the document read whole (`whole`): every line's move chosen at once by
+//!   the roles, numbers and notes agreeing, in place of the walk;
 //! - LEGALPDF_TRANSITION_JOINT, `weight,penalty`: the reading the joint stylesheet solve makes (`joint`),
 //!   the template prior's term weighted `weight` and a move against its template's role costing
 //!   `penalty`; LEGALPDF_TRANSITION_PRIOR, the template prior's forest (none: the roles weighed on the
@@ -52,6 +54,7 @@ pub(crate) use grammar::{Grammar, Tables};
 mod stylesheet;
 pub(crate) use stylesheet::*;
 mod joint;
+mod whole;
 #[cfg(feature = "encoder")]
 mod encoder;
 
@@ -93,6 +96,7 @@ struct Settings {
     labels: Option<PathBuf>,
     beam: usize,
     joint: Option<(f64, f64)>,
+    whole: bool,
     prior: Option<Forest>,
     emit: bool,
     grammar: Option<grammar::Grammar>,
@@ -129,6 +133,7 @@ fn settings() -> &'static Settings {
                 let (weight, penalty) = v.split_once(',')?;
                 Some((weight.trim().parse().ok()?, penalty.trim().parse().ok()?))
             }),
+            whole: std::env::var_os("LEGALPDF_TRANSITION_WHOLE").is_some(),
             prior: var("LEGALPDF_TRANSITION_PRIOR").and_then(|path| forest(path, joint::PRIOR, joint::ROLES)),
             emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
             grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
@@ -471,6 +476,19 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
+    // The document read whole: every line's move chosen at once from the evidence alone, no first reading.
+    if s.whole && s.dump.is_none() && gold.is_none() {
+        let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
+        let moves = whole::read(table, &views, locals);
+        if let Some(folder) = &s.labels {
+            let labels = labelled(&views, &moves);
+            let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});
+            if let Err(error) = std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string())) {
+                eprintln!("transition parser labels {sha256}: {error}");
+            }
+        }
+        return moves;
+    }
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
     let first = walk(table, &views_of(pages, slots, evidence, fences, table, locals, sheet), locals, None, None).0;
