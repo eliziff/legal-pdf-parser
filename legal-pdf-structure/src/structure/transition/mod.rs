@@ -222,11 +222,15 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         if !m.opens {
             wrong += 2 * u32::from(m.resume != (here[1] == 2));
         }
+        // A note counts on its number where the gold's note prints one (its marker), and on none where it
+        // prints none.
         if m.opens && m.region == NOTE {
-            wrong += match (m.note, made.paired) {
-                (Some(_), Some((line, ..))) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
-                (Some(_), _) => 1,
-                (None, _) => 3,
+            wrong += match (m.note, made.paired, here[5] == 1) {
+                (None, _, false) => 0,
+                (Some(_), _, false) => 2,
+                (Some(_), Some((line, ..)), true) if gold.get(line as usize).is_some_and(|g| g[3] == 1) => 0,
+                (Some(_), _, true) => 1,
+                (None, _, true) => 3,
             };
         }
         wrong

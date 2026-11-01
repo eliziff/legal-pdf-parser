@@ -766,13 +766,21 @@ pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<Note
     let (prefix, glued) = match label_prefix(&line.text) {
         Some(prefix) => (prefix, false),
         None => {
+            // Recognition reads a note's asterisk as a middle dot ("\u{b7} 12 Stat. at Large"): one set as a
+            // label's is the asterisk.
             let lead = line.text.len() - line.text.trim_start().len();
+            if let Some(rest) = line.text[lead..].strip_prefix('\u{b7}').filter(|rest| rest.starts_with(' ')) {
+                // Read as a glued label is: kept only where it is set as a label's (below).
+                let prefix = label_prefix(&format!("{}*{rest}", &line.text[..lead]))?;
+                (prefix, true)
+            } else {
             let figures = line.text[lead..].chars().take(3).take_while(char::is_ascii_digit).count();
             let next = line.text[lead + figures..].chars().next()?;
             if figures == 0 || !(next.is_uppercase() || "\u{201c}\u{2018}\"'".contains(next)) {
                 return None;
             }
             (label_prefix(&format!("{} {}", &line.text[..lead + figures], &line.text[lead + figures..]))?, true)
+            }
         }
     };
     let size = sizes[slot];

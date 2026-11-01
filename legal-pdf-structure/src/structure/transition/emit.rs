@@ -40,12 +40,13 @@ fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
 }
 
 /// A table line's cells where no reader found them: its spans in order, a new cell where the gap to the
-/// next is wider than two of the line's characters; each cell's first and past-last character.
-fn gap_cells(line: &Line) -> Vec<(usize, usize)> {
+/// next is wider than two of the line's characters; each cell's first and past-last character and its
+/// left edge.
+fn gap_cells(line: &Line) -> Vec<(usize, usize, f64)> {
     let chars: Vec<char> = line.text.chars().collect();
     let width = line.bbox[2] - line.bbox[0];
     let glyph = if chars.is_empty() { 0.0 } else { width / chars.len() as f64 };
-    let mut cells: Vec<(usize, usize, f64)> = Vec::new();
+    let mut cells: Vec<(usize, usize, f64, f64)> = Vec::new();
     let mut cursor = 0;
     for span in &line.spans {
         let text: Vec<char> = span.text.trim().chars().collect();
@@ -59,11 +60,14 @@ fn gap_cells(line: &Line) -> Vec<(usize, usize)> {
                 last.1 = cursor;
                 last.2 = span.bbox[2];
             }
-            _ => cells.push((at, cursor, span.bbox[2])),
+            _ => cells.push((at, cursor, span.bbox[2], span.bbox[0])),
         }
     }
-    cells.into_iter().map(|(start, end, _)| (start, end)).collect()
+    cells.into_iter().map(|(start, end, _, left)| (start, end, left)).collect()
 }
+
+/// Two gap cells whose left edges stand this near (points) are in one column.
+const COLUMN_TOLERANCE: f64 = 12.0;
 
 /// The figures a line's text opens on, where they read `value`: their first and past-last character.
 fn leading_figures(text: &str, value: u32) -> Option<(usize, usize)> {
@@ -377,6 +381,14 @@ pub(crate) fn structure_graph(
             let table_id = format!("transition-table-{:04}-{:03}", t + 1, g + 1);
             let mut table_ranges: Vec<ScalarRange> = Vec::new();
             let mut grid_nodes: Vec<StructureNode> = Vec::new();
+            // The grid's columns where the reader found none: the left edges the rows' gap cells stand at,
+            // near ones one column.
+            let mut lefts: Vec<f64> = rows.iter().flat_map(|&u| units[u].lines.iter().copied())
+                .filter(|&k| !reader_cells.contains_key(&id_of(k)))
+                .flat_map(|k| gap_cells(slots.line(pages, table.order[k])).into_iter().map(|(_, _, left)| left))
+                .collect();
+            lefts.sort_by(f64::total_cmp);
+            lefts.dedup_by(|later, earlier| (*later - *earlier).abs() <= COLUMN_TOLERANCE);
             for (r, &u) in rows.iter().enumerate() {
                 let unit = &units[u];
                 let row_ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
@@ -408,11 +420,13 @@ pub(crate) fn structure_graph(
                                 }
                             }
                         }
-                        // No reader cells: the line's own columns, split where a wide gap parts its spans.
+                        // No reader cells: the line's own columns, split where a wide gap parts its spans,
+                        // each in the grid's column its left edge stands in.
                         None => {
                             let parts = gap_cells(slots.line(pages, table.order[k]));
                             if parts.len() >= 2 {
-                                for (column, (start, end)) in parts.into_iter().enumerate() {
+                                for (start, end, left) in parts {
+                                    let column = lefts.iter().position(|&x| (x - left).abs() <= COLUMN_TOLERANCE).unwrap_or(lefts.len().saturating_sub(1));
                                     cells.entry(column).or_default().extend(index.global_range(&id, start, end));
                                 }
                             } else {

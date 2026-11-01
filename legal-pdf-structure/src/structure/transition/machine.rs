@@ -382,7 +382,9 @@ impl State {
                 bases.push(Move { resume: true, ..plain });
             }
             if opens && region == HEADING {
-                let deepest = (heading.max(1) + 2).min(LEVELS);
+                // A heading may open as much as three levels under the open one (a schedule's own parts
+                // under a chapter's heading).
+                let deepest = (heading.max(1) + 3).min(LEVELS);
                 for base in bases {
                     out.extend((1..=deepest).map(|level| Move { level, ..base }));
                 }
