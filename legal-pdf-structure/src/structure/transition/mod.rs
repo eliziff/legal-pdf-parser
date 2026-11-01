@@ -40,6 +40,8 @@ use trees::Forest;
 mod emit;
 mod grammar;
 pub(crate) use grammar::{Grammar, Tables};
+mod stylesheet;
+pub(crate) use stylesheet::*;
 #[cfg(feature = "encoder")]
 mod encoder;
 
@@ -225,7 +227,7 @@ fn classes_of(state: &State, line: &LineView, local: &Local) -> Vec<usize> {
 }
 
 /// Each line as the state reads it, in reading order.
-fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable, locals: &[Local]) -> Vec<LineView<'a>> {
+fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable, locals: &[Local], sheet: &Stylesheet) -> Vec<LineView<'a>> {
     let grammar = settings().grammar.as_ref();
     // Each look's lines as the local scores read them, before any move.
     let heading = usize::from(HEADING) * 2 + 1;
@@ -271,18 +273,24 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             operative: evidence.operative,
             look_heading: (sum / lines.max(1) as f64) as f32,
             look_heading_lines: (1.0 + likely as f32).ln(),
+            template: *sheet.of(k),
+            anchor: sheet.anchor[k],
+            listed: sheet.listed[k],
+            regime: sheet.regime,
         }
     }).collect()
 }
 
-/// One document parsed: its lines read (`LineTable`) and the moves they make in reading order
-/// (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide); and, as
-/// its environment asks, what the scorer is fitted on and the labels the grader reads.
-pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sha256: &str) -> (LineTable, Vec<Local>, Vec<Move>) {
+/// One document parsed: its lines read (`LineTable`), its stylesheet (`Stylesheet`), and the moves
+/// they make in reading order (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM
+/// says how wide), read twice: a first greedy reading, whose reading of each template the second reads;
+/// and, as its environment asks, what the scorer is fitted on and the labels the grader reads.
+pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], sha256: &str) -> (LineTable, Vec<Local>, Stylesheet, Vec<Move>) {
     let table = LineTable::read(pages, slots, evidence, fences, &runs.before);
     let locals = locals_of(pages, slots, &table, sha256);
-    let moves = parse(pages, slots, evidence, fences, sha256, &table, &locals);
-    (table, locals, moves)
+    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
+    let moves = parse(pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
+    (table, locals, sheet, moves)
 }
 
 /// Each line's local scores, read once.
@@ -326,46 +334,69 @@ fn locals_of(pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> 
     }).collect()
 }
 
-fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local]) -> Vec<Move> {
+/// What a greedy walk recorded for the scorer's fit: each candidate's ranked features, its line, its
+/// class and whether the oracle makes it.
+#[derive(Default)]
+struct Recorded {
+    rows: Vec<f32>,
+    lines: Vec<u32>,
+    classes: Vec<u16>,
+    oracle: Vec<u8>,
+}
+
+/// One greedy reading of `views`: each line's move the ranker's best; without a ranker, the oracle's
+/// where `gold` is given and reachable (the first round's rollout), else the local scores' best class,
+/// counting on nothing. With `record`, every candidate as the scorer is fitted on it.
+fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: bool) -> (Vec<Move>, Recorded) {
+    let s = settings();
+    let mut state = State::default();
+    let mut moves = Vec::with_capacity(views.len());
+    let mut recorded = Recorded::default();
+    for k in 0..views.len() {
+        let (line, local) = (&views[k], &locals[k]);
+        let candidates = state.candidates(line, &classes_of(&state, line, local));
+        let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
+        let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
+        let choice = match &s.ranker {
+            Some(ranker) => {
+                let scores: Vec<f64> = features.iter().map(|f| move_score(ranker, f)).collect();
+                (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
+            }
+            None => best_oracle.unwrap_or_else(|| {
+                candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume).unwrap_or(0)
+            }),
+        };
+        if record {
+            for (c, f) in features.iter().enumerate() {
+                recorded.rows.extend_from_slice(f);
+                recorded.lines.push(k as u32);
+                recorded.classes.push(candidates[c].class() as u16);
+                recorded.oracle.push(u8::from(Some(c) == best_oracle));
+            }
+        }
+        state.apply(line, &candidates[choice]);
+        moves.push(candidates[choice]);
+    }
+    (moves, recorded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
     let s = settings();
     let n = table.order.len();
     let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
-    let views = views_of(pages, slots, evidence, fences, table, locals);
     let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
+    // The first reading, never the oracle's (the gold would read into the second's view of the
+    // templates); each template then carries how it read.
+    let first = walk(table, &views_of(pages, slots, evidence, fences, table, locals, sheet), locals, None, false).0;
+    sheet.read_back(&first);
+    let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
     let moves = match (&s.ranker, s.beam) {
         (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, locals),
         _ => {
-            let mut state = State::default();
-            let mut moves = Vec::with_capacity(n);
-            let (mut move_rows, mut move_lines, mut move_classes, mut move_oracle) = (Vec::<f32>::new(), Vec::<u32>::new(), Vec::<u16>::new(), Vec::<u8>::new());
-            for k in 0..n {
-                let (line, local) = (&views[k], &locals[k]);
-                let candidates = state.candidates(line, &classes_of(&state, line, local));
-                let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
-                let best_oracle = gold.and_then(|_| oracle(&gold_rows, k, &state, line, &candidates));
-                let choice = match &s.ranker {
-                    Some(ranker) => {
-                        let scores: Vec<f64> = features.iter().map(|f| move_score(ranker, f)).collect();
-                        (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
-                    }
-                    // No ranker: the oracle where the gold is read and reachable (the first round's
-                    // rollout), else the local scores' best class, counting on nothing.
-                    None => best_oracle.unwrap_or_else(|| {
-                        candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume).unwrap_or(0)
-                    }),
-                };
-                if s.dump.is_some() {
-                    for (c, f) in features.iter().enumerate() {
-                        move_rows.extend_from_slice(f);
-                        move_lines.push(k as u32);
-                        move_classes.push(candidates[c].class() as u16);
-                        move_oracle.push(u8::from(Some(c) == best_oracle));
-                    }
-                }
-                state.apply(line, &candidates[choice]);
-                moves.push(candidates[choice]);
-            }
+            let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some());
+            let (move_rows, move_lines, move_classes, move_oracle) = (recorded.rows, recorded.lines, recorded.classes, recorded.oracle);
             if let Some(folder) = &s.dump {
                 let write = || -> std::io::Result<()> {
                     std::fs::create_dir_all(folder)?;
@@ -401,9 +432,9 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
 
 /// The document's structure as the transition parser reads it, its reading through `emit`: what
 /// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
-pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, identity: &StructureIdentity) -> Result<StructureOutput> {
-    let (table, locals, moves) = run(pages, slots, evidence, fences, runs, &identity.source_sha256);
-    let views = views_of(pages, slots, evidence, fences, &table, &locals);
+pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], identity: &StructureIdentity) -> Result<StructureOutput> {
+    let (table, locals, sheet, moves) = run(pages, slots, evidence, fences, runs, outline, &identity.source_sha256);
+    let views = views_of(pages, slots, evidence, fences, &table, &locals, &sheet);
     let (structure_graph, paragraphs, footnotes) = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity)?;
     Ok(StructureOutput { paragraphs, footnotes, diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
 }

@@ -147,6 +147,12 @@ pub(crate) struct LineView<'a> {
     /// not (log).
     pub(crate) look_heading: f32,
     pub(crate) look_heading_lines: f32,
+    /// The document's stylesheet: the line's template, the level the document's outline names it at
+    /// (0 for none), whether a contents list holds it, and the document's regime (`Stylesheet`).
+    pub(crate) template: TemplateView,
+    pub(crate) anchor: u16,
+    pub(crate) listed: bool,
+    pub(crate) regime: [f32; 4],
 }
 
 /// What a move made of its line: the earlier line whose reference mark its note answered, a heading's
@@ -173,8 +179,12 @@ pub(crate) const CANDIDATE: &[&str] = &[
     "look_heading", "look_heading_lines",
     "other_grammar_relation", "other_grammar_child", "other_heading_word", "operative",
     "starts", "start_kind", "page_place", "document_lines", "documents",
+    "template_lines", "template_pages", "template_heading", "template_monotone", "template_anchored",
+    "template_anchor_level", "template_level", "template_edge", "template_read_heading", "template_read_level",
+    "level_by_template", "level_by_anchor", "level_by_reading", "anchored", "anchor_level", "listed",
+    "regime_bracketed", "regime_sectioned", "regime_line_numbers", "regime_speakers",
 ];
-pub(crate) const CANDIDATES: usize = 44;
+pub(crate) const CANDIDATES: usize = 64;
 
 /// The class of a family's count (`lines::COUNTS` order), 9 for none.
 fn count_class(family: &str) -> f32 {
@@ -400,6 +410,19 @@ impl State {
         f[41] = line.page_place.min(50) as f32;
         f[42] = (1.0 + self.document_lines as f32).ln();
         f[43] = f32::from(self.document.min(50));
+        // The stylesheet: the line's template, the outline's word on the line, the document's regime;
+        // and a heading's level against the level its template takes, the outline names, and its
+        // template's lines took on the first reading.
+        let t = &line.template;
+        f[44..54].copy_from_slice(&[t.lines, t.pages, t.heading, t.monotone, t.anchored, t.anchor_level, t.level, t.edge, t.read_heading, t.read_level]);
+        let against = |level: f32| if candidate.opens && candidate.region == HEADING && level > 0.0 { f32::from(candidate.level) - level } else { -9.0 };
+        f[54] = against(t.level);
+        f[55] = against(if line.anchor > 0 { f32::from(line.anchor) } else { t.anchor_level });
+        f[56] = against(t.read_level);
+        f[57] = flag(line.anchor > 0);
+        f[58] = f32::from(line.anchor);
+        f[59] = flag(line.listed);
+        f[60..64].copy_from_slice(&line.regime);
         f
     }
 

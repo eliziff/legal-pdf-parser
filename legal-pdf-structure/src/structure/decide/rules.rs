@@ -287,7 +287,7 @@ impl Decision {
         }
         decision.read_runs(pages, slots, evidence, fences, runs, &sequences);
         decision.marginal_notes(pages, slots, evidence, fences, runs, &sequences);
-        let anchoring = anchors(pages, slots, evidence, fences, &geometry, &decision, outline);
+        let anchoring = anchors(pages, slots, evidence, fences, &geometry, &decision.role, outline);
         for (index, anchor) in anchoring.anchors.iter().enumerate() {
             for (k, &slot) in anchor.lines.iter().enumerate() {
                 decision.claim(slot, Role::Heading, Rule::Anchor);

@@ -71,10 +71,9 @@ pub(crate) fn anchors(
     evidence: &Evidence,
     fences: &Fences,
     geometry: &Geometry,
-    decision: &Decision,
+    role: &[Role],
     outline: &[PdfOutlineEntry],
 ) -> Anchoring {
-    let role = &decision.role;
     let listed = headings::contents::contents_outline_among(pages, &fences.contents_entries, |page, at| {
         !matches!(role[slots.at(page, at).index()], Role::LineLabel | Role::Furniture | Role::PageLabel | Role::Contents)
             && !fences.contents_pages[page]
