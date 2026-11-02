@@ -660,7 +660,16 @@ mod model {
                 let outputs = sessions.order.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
                     "region_pages" => rp, "pair_i" => pi, "pair_j" => pj, "pair_match" => pm]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
-                (take("regions")?, take("goes_on")?, take("note_of")?, take("successor")?)
+                // A head's scores a pair: its scaled query of the pair's region against its key of the other, and the
+                // pair's term.
+                let head = |name: &str| -> std::result::Result<Vec<f32>, String> {
+                    let (q, k, r) = (take(&format!("{name}_q"))?, take(&format!("{name}_k"))?, take(&format!("{name}_r"))?);
+                    Ok((0..pair_i.len()).map(|p| {
+                        let (i, j) = (pair_i[p] as usize, pair_j[p] as usize);
+                        q[i * d..(i + 1) * d].iter().zip(&k[j * d..(j + 1) * d]).map(|(a, b)| a * b).sum::<f32>() + r[p]
+                    }).collect())
+                };
+                (take("regions")?, head("goes_on")?, head("note_of")?, head("successor")?)
             };
             // Each region's pairs (contiguous: built region by region), and each head's softmax over them.
             let mut rows: Vec<(usize, usize)> = vec![(0, 0); count];
