@@ -396,13 +396,34 @@ mod model {
         vectors: Vec<Vec<f32>>,
     }
 
+    /// One set of the stages' sessions: a parse holds one for its document, parses at once each their own (made
+    /// as they are wanted, kept for the next), none waiting on another's.
+    struct Sessions {
+        detect: Session,
+        order: Session,
+        headings: Session,
+        bodies: Session,
+    }
+
+    impl Sessions {
+        fn load(dir: &Path) -> std::result::Result<Self, String> {
+            Ok(Self {
+                detect: session(&dir.join("detect.onnx"))?,
+                order: session(&dir.join("order.onnx"))?,
+                headings: session(&dir.join("headings.onnx"))?,
+                bodies: session(&dir.join("bodies.onnx"))?,
+            })
+        }
+    }
+
     pub(crate) struct Reader {
-        detect: Mutex<Session>,
-        order: Mutex<Session>,
-        headings: Mutex<Session>,
-        bodies: Mutex<Session>,
+        dir: PathBuf,
+        sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
         gaps: [bool; 2],
+        /// Whether the reading's order is read off the successor head (LEGALPDF_TRANSITION_DOC_ORDER=off: the
+        /// parser's order kept).
+        reorder: bool,
         tokenizer: tokenizers::Tokenizer,
         embeddings: Vec<f32>,
         meta: Meta,
@@ -459,14 +480,13 @@ mod model {
             if embeddings.len() != meta.vocabulary * meta.text_dim {
                 return Err(format!("embeddings.f32 holds {} values; docparse.json says {} by {}", embeddings.len(), meta.vocabulary, meta.text_dim));
             }
-            let (headings, bodies) = (session(&dir.join("headings.onnx"))?, session(&dir.join("bodies.onnx"))?);
-            let gaps = [&headings, &bodies].map(|s| s.outputs.iter().any(|o| o.name == "gap"));
+            let first = Sessions::load(dir)?;
+            let gaps = [&first.headings, &first.bodies].map(|s| s.outputs.iter().any(|o| o.name == "gap"));
             let reader = Self {
-                detect: Mutex::new(session(&dir.join("detect.onnx"))?),
-                order: Mutex::new(session(&dir.join("order.onnx"))?),
-                headings: Mutex::new(headings),
-                bodies: Mutex::new(bodies),
+                dir: dir.to_path_buf(),
+                sessions: Mutex::new(vec![first]),
                 gaps,
+                reorder: std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").map_or(true, |v| v != "off"),
                 tokenizer,
                 embeddings,
                 meta,
@@ -508,8 +528,22 @@ mod model {
             Ok(out)
         }
 
-        /// The document's moves, a line each in reading order: `texts` and `pages` each line's.
+        /// The document's moves, a line each in reading order: `texts` and `pages` each line's; read with a set of
+        /// sessions of the reader's own, given back after.
         pub(crate) fn read(&self, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize]) -> std::result::Result<Vec<Move>, String> {
+            let held = self.sessions.lock().ok().and_then(|mut pool| pool.pop());
+            let mut sessions = match held {
+                Some(sessions) => sessions,
+                None => Sessions::load(&self.dir)?,
+            };
+            let moves = self.read_with(&mut sessions, table, views, texts, pages);
+            if let Ok(mut pool) = self.sessions.lock() {
+                pool.push(sessions);
+            }
+            moves
+        }
+
+        fn read_with(&self, sessions: &mut Sessions, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize]) -> std::result::Result<Vec<Move>, String> {
             let n = table.order.len();
             let (d, m) = (self.meta.d, &self.meta);
             if n == 0 {
@@ -531,8 +565,7 @@ mod model {
                 let f = TensorRef::from_array_view(([l, ALL], &features[start * ALL..end * ALL])).map_err(|e| e.to_string())?;
                 let t = TensorRef::from_array_view(([l, m.text_dim], &text[start * m.text_dim..end * m.text_dim])).map_err(|e| e.to_string())?;
                 let b = TensorRef::from_array_view(([l, 4], &boxes[start * 4..end * 4])).map_err(|e| e.to_string())?;
-                let mut session = self.detect.lock().map_err(|_| "detect session poisoned")?;
-                let outputs = session.run(ort::inputs!["features" => f, "text" => t, "boxes" => b]).map_err(|e| format!("detect: {e}"))?;
+                let outputs = sessions.detect.run(ort::inputs!["features" => f, "text" => t, "boxes" => b]).map_err(|e| format!("detect: {e}"))?;
                 let (_, s) = outputs["states"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 states[start * d..end * d].copy_from_slice(s);
                 let (_, role) = outputs["role"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
@@ -621,8 +654,7 @@ mod model {
                 let pi = TensorRef::from_array_view(([pair_i.len()], &pair_i[..])).map_err(|e| e.to_string())?;
                 let pj = TensorRef::from_array_view(([pair_j.len()], &pair_j[..])).map_err(|e| e.to_string())?;
                 let pm = TensorRef::from_array_view(([pair_match.len()], &pair_match[..])).map_err(|e| e.to_string())?;
-                let mut session = self.order.lock().map_err(|_| "order session poisoned")?;
-                let outputs = session.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
+                let outputs = sessions.order.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
                     "region_pages" => rp, "pair_i" => pi, "pair_j" => pj, "pair_match" => pm]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
                 (take("regions")?, softmax_rows(&take("goes_on")?, count), take("note_of")?, softmax_rows(&take("successor")?, count))
@@ -663,14 +695,13 @@ mod model {
                 }
             }
             // The trees over the regions that open a unit, headings and the body's apart.
-            let tree = |session: &Mutex<Session>, has_gap: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
+            let tree = |session: &mut Session, has_gap: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
                 let h = nodes.len();
                 if h == 0 {
                     return Ok(Vec::new());
                 }
                 let x: Vec<f32> = nodes.iter().flat_map(|&i| region_states[i * d..(i + 1) * d].iter().copied()).collect();
                 let s = TensorRef::from_array_view(([h, d], &x[..])).map_err(|e| e.to_string())?;
-                let mut session = session.lock().map_err(|_| "construct session poisoned")?;
                 let outputs = session.run(ort::inputs!["states" => s]).map_err(|e| format!("construct: {e}"))?;
                 let (_, parent) = outputs["parent"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 let (_, sibling) = outputs["sibling"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
@@ -687,10 +718,10 @@ mod model {
             let headings: Vec<usize> = (0..count).filter(|&i| opening(i) && roles[read[i]] == HEADING).collect();
             let bodies: Vec<usize> = (0..count).filter(|&i| opening(i) && BODY.contains(&roles[read[i]])).collect();
             let mut level = vec![0usize; count];
-            for (&i, l) in headings.iter().zip(tree(&self.headings, self.gaps[0], &headings)?) {
+            for (&i, l) in headings.iter().zip(tree(&mut sessions.headings, self.gaps[0], &headings)?) {
                 level[i] = l;
             }
-            for (&i, l) in bodies.iter().zip(tree(&self.bodies, self.gaps[1], &bodies)?) {
+            for (&i, l) in bodies.iter().zip(tree(&mut sessions.bodies, self.gaps[1], &bodies)?) {
                 level[i] = l;
             }
             // A note's region: the one its link names, where not itself.
@@ -706,7 +737,9 @@ mod model {
                     ranks[k] = place[i] as i64 * 100_000 + at as i64;
                 }
             }
-            read_in(&mut moves, &ranks, pages);
+            if self.reorder {
+                read_in(&mut moves, &ranks, pages);
+            }
             Ok(moves)
         }
     }
