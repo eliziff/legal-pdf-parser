@@ -556,7 +556,15 @@ mod model {
             let at = |name: &str| LINE_FEATURES.iter().position(|f| *f == name).unwrap_or(0);
             let corners = [at("x0"), at("y0"), at("x1"), at("y1")];
             let boxes: Vec<f32> = (0..n).flat_map(|k| corners.map(|c| table.features[k * ALL + c])).collect();
+            let clock = std::time::Instant::now();
+            let mut stages = [0f64; 5];
+            let mut lap = |stage: usize, since: &mut std::time::Instant| {
+                stages[stage] += since.elapsed().as_secs_f64();
+                *since = std::time::Instant::now();
+            };
+            let mut since = clock;
             let text = self.embed(texts)?;
+            lap(0, &mut since);
             // Detect, a page at a time.
             let mut states = vec![0f32; n * d];
             let mut lines = Lines { roles: vec![0; n], marked: vec![false; n], starts: vec![false; n], links: (0..n).collect() };
@@ -585,6 +593,7 @@ mod model {
                 }
                 start = end;
             }
+            lap(1, &mut since);
             // A link both heads choose, or the successor's sure one; none into a line whose role opens a unit.
             for k in 0..n {
                 let (next, back, sure) = chosen[k];
@@ -735,6 +744,7 @@ mod model {
                     after[i] = true;
                 }
             }
+            lap(2, &mut since);
             // The trees over the regions that open a unit, headings and the body's apart.
             let tree = |session: &mut Session, has_gap: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
                 let h = nodes.len();
@@ -770,6 +780,7 @@ mod model {
                 let target = best(&note_of, i, &|_| true).map_or(i, |(j, _)| j);
                 (roles[read[i]] == NOTE && target != i).then_some(target)
             }).collect();
+            lap(3, &mut since);
             let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
             // Each line's rank: its region's place in the reading, then its place in the region.
             let mut ranks = vec![-1i64; n];
@@ -780,6 +791,12 @@ mod model {
             }
             if self.reorder {
                 read_in(&mut moves, &ranks, pages);
+            }
+            lap(4, &mut since);
+            // LEGALPDF_TRANSITION_DOC_TIMES: each document's stages' times, for the reader's speed.
+            if std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some() {
+                eprintln!("doc times: {n} lines {count} regions {} pairs; embed {:.3}s detect {:.3}s order {:.3}s trees {:.3}s decode {:.3}s",
+                    pair_i.len(), stages[0], stages[1], stages[2], stages[3], stages[4]);
             }
             Ok(moves)
         }
