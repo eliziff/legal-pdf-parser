@@ -432,6 +432,9 @@ mod model {
     /// A successor link the predecessor head does not choose back is kept where the successor head holds it
     /// likelier than this.
     const SURE: f32 = 0.5;
+    /// The reading leaves the parser's order where the successor head holds another region at least this likely
+    /// (and the parser's next at most its complement).
+    const SURE_ORDER: f32 = 0.9;
 
     fn session(path: &Path) -> std::result::Result<Session, String> {
         Session::builder()
@@ -657,7 +660,31 @@ mod model {
                 let outputs = sessions.order.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
                     "region_pages" => rp, "pair_i" => pi, "pair_j" => pj, "pair_match" => pm]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
-                (take("regions")?, softmax_rows(&take("goes_on")?, count), take("note_of")?, softmax_rows(&take("successor")?, count))
+                (take("regions")?, take("goes_on")?, take("note_of")?, take("successor")?)
+            };
+            // Each region's pairs (contiguous: built region by region), and each head's softmax over them.
+            let mut rows: Vec<(usize, usize)> = vec![(0, 0); count];
+            for (p, &i) in pair_i.iter().enumerate() {
+                let i = i as usize;
+                if rows[i].1 == 0 {
+                    rows[i].0 = p;
+                }
+                rows[i].1 = p + 1;
+            }
+            let row_softmax = |logits: &[f32]| -> Vec<f32> {
+                let mut probs = vec![0f32; logits.len()];
+                for &(a, z) in &rows {
+                    if a < z {
+                        probs[a..z].copy_from_slice(&softmax_rows(&logits[a..z], z - a));
+                    }
+                }
+                probs
+            };
+            let (goes_on, successor) = (row_softmax(&goes_on), row_softmax(&successor));
+            // A region's likeliest other region by a head, with its probability (itself, where it has no pairs).
+            let best = |probs: &[f32], i: usize, open: &dyn Fn(usize) -> bool| -> Option<(usize, f32)> {
+                let (a, z) = rows[i];
+                (a..z).filter(|&p| open(pair_j[p] as usize)).max_by(|&x, &y| probs[x].total_cmp(&probs[y])).map(|p| (pair_j[p] as usize, probs[p]))
             };
             // The reading: from the parser's first region, each region's likeliest unread successor where the head
             // holds it likelier than none (the region itself), else the next unread region in the parser's order.
@@ -671,19 +698,24 @@ mod model {
                 if position + 1 == count {
                     break;
                 }
-                let row = &successor[at * count..(at + 1) * count];
-                let best = (0..count).filter(|&j| place[j] == usize::MAX).max_by(|&a, &b| row[a].total_cmp(&row[b]));
-                at = match best {
-                    Some(j) if row[j] > row[at] => j,
+                // The parser's next unread region, unless the head is sure of another (and holds the parser's next
+                // all but impossible); a line's number or a page's label is never read out of the parser's order.
+                let labels = |i: usize| matches!(roles[read[i]], LINE_LABEL | PAGE_LABEL);
+                let unread = |j: usize| place[j] == usize::MAX && !labels(j);
+                let parsers = {
+                    let (a, z) = rows[at];
+                    (a..z).find(|&p| pair_j[p] as usize == next_unread).map_or(0.0, |p| successor[p])
+                };
+                at = match best(&successor, at, &unread) {
+                    Some((j, p)) if !labels(at) && j != next_unread && p >= SURE_ORDER && parsers <= 1.0 - SURE_ORDER => j,
                     _ => next_unread,
                 };
             }
             // Units: a region goes on in the later region its link holds likeliest, each region taken once, the
             // surest links first.
             let mut links: Vec<(usize, usize, f32)> = (0..count).filter_map(|i| {
-                let row = &goes_on[i * count..(i + 1) * count];
-                let j = argmax(row);
-                (j > i).then_some((i, j, row[j]))
+                let (j, p) = best(&goes_on, i, &|_| true)?;
+                (j > i).then_some((i, j, p))
             }).collect();
             links.sort_by(|a, b| b.2.total_cmp(&a.2));
             let mut before = vec![None; count];
@@ -726,7 +758,7 @@ mod model {
             }
             // A note's region: the one its link names, where not itself.
             let note = (0..count).map(|i| {
-                let target = argmax(&note_of[i * count..(i + 1) * count]);
+                let target = best(&note_of, i, &|_| true).map_or(i, |(j, _)| j);
                 (roles[read[i]] == NOTE && target != i).then_some(target)
             }).collect();
             let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
