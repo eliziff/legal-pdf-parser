@@ -535,7 +535,7 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
         let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
         let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
-        match reader.read(table, &views, &texts, &line_pages) {
+        match reader.read(table, &views, &texts, &line_pages, &doc::Style::of(sheet, table)) {
             Ok(moves) => {
                 write_labels(sha256, &ids, &views, &moves);
                 return moves;

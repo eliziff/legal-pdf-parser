@@ -2,7 +2,10 @@
 //! fits on the gold and exports (LEGALPDF_TRANSITION_DOC, a folder of `detect.onnx`, `order.onnx`,
 //! `headings.onnx`, `bodies.onnx`, `docparse.json`, and the text model's `tokenizer.json` and
 //! `embeddings.f32`), and the paper's decoding of what they score into the parser's moves:
-//! - Detect, a page at a time: each line's role, its successor and predecessor among its page's lines, and
+//! - Detect, a page at a time, its lines' states then given their templates' across the document (the parser's
+//!   stylesheet, `stylesheet`: each template a node of its measured row and its lines' states) and each line its
+//!   outline anchor (the level the contents list or the bookmarks name it at): each line's role, its successor
+//!   and predecessor among its page's lines, and
 //!   two flags (a unit opening on its printed marker, a line opening a constituent document); the page's
 //!   lines grouped into regions by union-find over the links both heads choose (or the successor's sure
 //!   ones, over a half), none into a line whose role opens a unit; each region's role its lines' plurality;
@@ -207,6 +210,33 @@ fn resets(firsts: &[usize], starts: &[bool]) -> Vec<bool> {
     }).collect()
 }
 
+/// The parser's stylesheet as the DOC reader reads it: each line's template and outline anchor, and each template's
+/// measured row (`width` a row), the first reading's own measures left out (the reader reads before any).
+pub(crate) struct Style {
+    pub(crate) templates: Vec<u32>,
+    pub(crate) anchors: Vec<u16>,
+    pub(crate) rows: Vec<f32>,
+    pub(crate) width: usize,
+}
+
+impl Style {
+    pub(crate) fn of(sheet: &Stylesheet, table: &LineTable) -> Self {
+        let rows = joint::template_rows(sheet, table);
+        let width = rows.first().map_or(1, |r| r.len());
+        let mut flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        for row in flat.chunks_mut(width) {
+            // How the walker's first reading read the template (`read_heading`, `read_level`).
+            row[9] = 0.0;
+            row[10] = 0.0;
+        }
+        if flat.is_empty() {
+            flat = vec![0.0; width];
+        }
+        let flat = flat.into_iter().map(|v| if v.is_finite() { v.clamp(-8.0, 8.0) } else { 0.0 }).collect();
+        Self { templates: sheet.template.clone(), anchors: sheet.anchor.clone(), rows: flat, width }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------- the oracle
 /// The gold's region of a row (an unmarked body line: text).
 fn gold_region(g: &[i64; 8]) -> i64 {
@@ -385,6 +415,8 @@ mod model {
         classes: usize,
         mean: Vec<f32>,
         std: Vec<f32>,
+        /// A template row's width (the stylesheet's measures, `joint::template_rows`).
+        row_width: usize,
         vocabulary: usize,
         unknown: Option<u32>,
         normalize: bool,
@@ -400,6 +432,8 @@ mod model {
     /// as they are wanted, kept for the next), none waiting on another's.
     struct Sessions {
         detect: Session,
+        stylesheet: Session,
+        lines: Session,
         order: Session,
         headings: Session,
         bodies: Session,
@@ -409,6 +443,8 @@ mod model {
         fn load(dir: &Path) -> std::result::Result<Self, String> {
             Ok(Self {
                 detect: session(&dir.join("detect.onnx"))?,
+                stylesheet: session(&dir.join("stylesheet.onnx"))?,
+                lines: session(&dir.join("lines.onnx"))?,
                 order: session(&dir.join("order.onnx"))?,
                 headings: session(&dir.join("headings.onnx"))?,
                 bodies: session(&dir.join("bodies.onnx"))?,
@@ -533,20 +569,20 @@ mod model {
 
         /// The document's moves, a line each in reading order: `texts` and `pages` each line's; read with a set of
         /// sessions of the reader's own, given back after.
-        pub(crate) fn read(&self, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize]) -> std::result::Result<Vec<Move>, String> {
+        pub(crate) fn read(&self, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
             let held = self.sessions.lock().ok().and_then(|mut pool| pool.pop());
             let mut sessions = match held {
                 Some(sessions) => sessions,
                 None => Sessions::load(&self.dir)?,
             };
-            let moves = self.read_with(&mut sessions, table, views, texts, pages);
+            let moves = self.read_with(&mut sessions, table, views, texts, pages, style);
             if let Ok(mut pool) = self.sessions.lock() {
                 pool.push(sessions);
             }
             moves
         }
 
-        fn read_with(&self, sessions: &mut Sessions, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize]) -> std::result::Result<Vec<Move>, String> {
+        fn read_with(&self, sessions: &mut Sessions, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
             let n = table.order.len();
             let (d, m) = (self.meta.d, &self.meta);
             if n == 0 {
@@ -565,20 +601,48 @@ mod model {
             let mut since = clock;
             let text = self.embed(texts)?;
             lap(0, &mut since);
-            // Detect, a page at a time.
+            // Detect's encoder, a page at a time; the stylesheet over the document; Detect's heads, a page at a time.
+            let anchors: Vec<i64> = style.anchors.iter().map(|&a| i64::from(a.min(9))).collect();
+            let templates: Vec<i64> = style.templates.iter().map(|&t| i64::from(t)).collect();
+            let runs: Vec<(usize, usize)> = {
+                let mut runs = Vec::new();
+                let mut start = 0;
+                while start < n {
+                    let end = (start..n).find(|&k| pages[k] != pages[start]).unwrap_or(n);
+                    runs.push((start, end));
+                    start = end;
+                }
+                runs
+            };
             let mut states = vec![0f32; n * d];
-            let mut lines = Lines { roles: vec![0; n], marked: vec![false; n], starts: vec![false; n], links: (0..n).collect() };
-            let mut chosen = vec![(0usize, 0usize, 0f32); n];
-            let mut start = 0;
-            while start < n {
-                let end = (start..n).find(|&k| pages[k] != pages[start]).unwrap_or(n);
+            for &(start, end) in &runs {
                 let l = end - start;
                 let f = TensorRef::from_array_view(([l, ALL], &features[start * ALL..end * ALL])).map_err(|e| e.to_string())?;
                 let t = TensorRef::from_array_view(([l, m.text_dim], &text[start * m.text_dim..end * m.text_dim])).map_err(|e| e.to_string())?;
                 let b = TensorRef::from_array_view(([l, 4], &boxes[start * 4..end * 4])).map_err(|e| e.to_string())?;
-                let outputs = sessions.detect.run(ort::inputs!["features" => f, "text" => t, "boxes" => b]).map_err(|e| format!("detect: {e}"))?;
+                let a = TensorRef::from_array_view(([l], &anchors[start..end])).map_err(|e| e.to_string())?;
+                let outputs = sessions.detect.run(ort::inputs!["features" => f, "text" => t, "boxes" => b, "anchors" => a]).map_err(|e| format!("detect: {e}"))?;
                 let (_, s) = outputs["states"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 states[start * d..end * d].copy_from_slice(s);
+            }
+            if style.width != m.row_width {
+                return Err(format!("the stylesheet's rows are {} wide; docparse.json says {}", style.width, m.row_width));
+            }
+            let count = style.rows.len() / style.width.max(1);
+            let states = {
+                let s = TensorRef::from_array_view(([n, d], &states[..])).map_err(|e| e.to_string())?;
+                let t = TensorRef::from_array_view(([n], &templates[..])).map_err(|e| e.to_string())?;
+                let r = TensorRef::from_array_view(([count, style.width], &style.rows[..])).map_err(|e| e.to_string())?;
+                let outputs = sessions.stylesheet.run(ort::inputs!["states" => s, "templates" => t, "rows" => r]).map_err(|e| format!("stylesheet: {e}"))?;
+                outputs["styled"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?.1.to_vec()
+            };
+            let mut lines = Lines { roles: vec![0; n], marked: vec![false; n], starts: vec![false; n], links: (0..n).collect() };
+            let mut chosen = vec![(0usize, 0usize, 0f32); n];
+            for &(start, end) in &runs {
+                let l = end - start;
+                let s = TensorRef::from_array_view(([l, d], &states[start * d..end * d])).map_err(|e| e.to_string())?;
+                let b = TensorRef::from_array_view(([l, 4], &boxes[start * 4..end * 4])).map_err(|e| e.to_string())?;
+                let outputs = sessions.lines.run(ort::inputs!["states" => s, "boxes" => b]).map_err(|e| format!("lines: {e}"))?;
                 let (_, role) = outputs["role"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 let (_, flag) = outputs["flags"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 let (_, successor) = outputs["successor"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
@@ -591,7 +655,6 @@ mod model {
                     let next = argmax(&successor[i * l..(i + 1) * l]);
                     chosen[start + i] = (start + next, start + argmax(&predecessor[next * l..(next + 1) * l]), successor[i * l + next]);
                 }
-                start = end;
             }
             lap(1, &mut since);
             // A link both heads choose, or the successor's sure one; none into a line whose role opens a unit.
@@ -753,7 +816,11 @@ mod model {
                 }
                 let x: Vec<f32> = nodes.iter().flat_map(|&i| region_states[i * d..(i + 1) * d].iter().copied()).collect();
                 let s = TensorRef::from_array_view(([h, d], &x[..])).map_err(|e| e.to_string())?;
-                let outputs = session.run(ort::inputs!["states" => s]).map_err(|e| format!("construct: {e}"))?;
+                let node_templates: Vec<i64> = nodes.iter().map(|&i| templates[regions[read[i]][0]]).collect();
+                let node_anchors: Vec<i64> = nodes.iter().map(|&i| anchors[regions[read[i]][0]]).collect();
+                let t = TensorRef::from_array_view(([h], &node_templates[..])).map_err(|e| e.to_string())?;
+                let a = TensorRef::from_array_view(([h], &node_anchors[..])).map_err(|e| e.to_string())?;
+                let outputs = session.run(ort::inputs!["states" => s, "templates" => t, "anchors" => a]).map_err(|e| format!("construct: {e}"))?;
                 let (_, parent) = outputs["parent"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 let (_, sibling) = outputs["sibling"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 // Each node's gap where the graph gives one (`gap`, GAPS a node), else one level.
