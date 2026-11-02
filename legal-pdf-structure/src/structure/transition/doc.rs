@@ -457,8 +457,8 @@ mod model {
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
         gaps: [bool; 2],
-        /// Whether the reading's order is read off the successor head (LEGALPDF_TRANSITION_DOC_ORDER=off: the
-        /// parser's order kept).
+        /// Whether the reading's order is read off the successor head (LEGALPDF_TRANSITION_DOC_ORDER=on; by default
+        /// the parser's order is kept: ordered region by region, a transcript's line numbers would leave their lines).
         reorder: bool,
         tokenizer: tokenizers::Tokenizer,
         embeddings: Vec<f32>,
@@ -471,6 +471,8 @@ mod model {
     /// The reading leaves the parser's order where the successor head holds another region at least this likely
     /// (and the parser's next at most its complement).
     const SURE_ORDER: f32 = 0.9;
+    /// The Order graph's attention block (`docparse.BLOCK`): its regions come padded to whole blocks.
+    const BLOCK: usize = 64;
 
     fn session(path: &Path) -> std::result::Result<Session, String> {
         Session::builder()
@@ -525,7 +527,7 @@ mod model {
                 dir: dir.to_path_buf(),
                 sessions: Mutex::new(vec![first]),
                 gaps,
-                reorder: std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").map_or(true, |v| v != "off"),
+                reorder: std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"),
                 tokenizer,
                 embeddings,
                 meta,
@@ -720,16 +722,26 @@ mod model {
                     }
                 }
             }
+            // The regions padded to whole blocks of the graph's local attention (`docparse.BLOCK`), the padding marked.
+            let padded = count.div_ceil(BLOCK) * BLOCK;
+            let mut kinds_padded = kinds.clone();
+            kinds_padded.resize(padded, 0);
+            let region_valid: Vec<bool> = (0..padded).map(|i| i < count).collect();
+            let mut boxes_padded = region_boxes.clone();
+            boxes_padded.resize(padded * 4, 0.0);
+            let mut pages_padded = region_pages.clone();
+            pages_padded.resize(padded, -1);
             let (region_states, goes_on, note_of, successor) = {
                 let ls = TensorRef::from_array_view(([line_region.len(), d], &line_states[..])).map_err(|e| e.to_string())?;
                 let lr = TensorRef::from_array_view(([line_region.len()], &line_region[..])).map_err(|e| e.to_string())?;
-                let rr = TensorRef::from_array_view(([count], &kinds[..])).map_err(|e| e.to_string())?;
-                let rb = TensorRef::from_array_view(([count, 4], &region_boxes[..])).map_err(|e| e.to_string())?;
-                let rp = TensorRef::from_array_view(([count], &region_pages[..])).map_err(|e| e.to_string())?;
+                let rr = TensorRef::from_array_view(([padded], &kinds_padded[..])).map_err(|e| e.to_string())?;
+                let rv = TensorRef::from_array_view(([padded], &region_valid[..])).map_err(|e| e.to_string())?;
+                let rb = TensorRef::from_array_view(([padded, 4], &boxes_padded[..])).map_err(|e| e.to_string())?;
+                let rp = TensorRef::from_array_view(([padded], &pages_padded[..])).map_err(|e| e.to_string())?;
                 let pi = TensorRef::from_array_view(([pair_i.len()], &pair_i[..])).map_err(|e| e.to_string())?;
                 let pj = TensorRef::from_array_view(([pair_j.len()], &pair_j[..])).map_err(|e| e.to_string())?;
                 let pm = TensorRef::from_array_view(([pair_match.len()], &pair_match[..])).map_err(|e| e.to_string())?;
-                let outputs = sessions.order.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_boxes" => rb,
+                let outputs = sessions.order.run(ort::inputs!["line_states" => ls, "line_region" => lr, "region_roles" => rr, "region_valid" => rv, "region_boxes" => rb,
                     "region_pages" => rp, "pair_i" => pi, "pair_j" => pj, "pair_match" => pm]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
                 // A head's scores a pair: its scaled query of the pair's region against its key of the other, and the
