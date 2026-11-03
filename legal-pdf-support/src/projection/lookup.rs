@@ -3,19 +3,16 @@
 
 use super::*;
 
-pub(crate) struct PrintedParagraphMap {
-    pub(crate) paragraphs: Vec<PrintedParagraph>,
-    pub(crate) status: HashMap<usize, PdfLookupStatus>,
-}
-
 /// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number, its span of the
-/// query text in UTF-16 code units, the pages it is on and its native lines.
-/// `ranges` is exact membership; `start` and `end` only position its envelope.
+/// query text in UTF-16 code units, the pages it is on and its native lines, over every printing of
+/// it (a parallel report's columns). `ranges` is exact membership; `start` and `end` only position
+/// its envelope.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrintedParagraph {
+    /// Its printings' nodes, the first printing's first.
     #[serde(skip)]
-    pub(crate) id: String,
+    pub(crate) ids: Vec<String>,
     pub number: usize,
     pub start: usize,
     pub end: usize,
@@ -223,7 +220,7 @@ pub(crate) fn printed_unit(
         .first()
         .and_then(|number| document.pages.iter().find(|page| page.number == *number));
     PdfLookupUnit {
-        id: paragraph.id.clone(),
+        id: paragraph.ids[0].clone(),
         kind: "paragraph",
         locator: format!("paragraph {}", paragraph.number),
         text: range_text(text, &paragraph.ranges),

@@ -13,7 +13,7 @@ pub struct PdfDocument {
     pub(crate) recognized_pages: Option<Vec<PdfTextPage>>,
     pub(crate) passage_pages: Arc<Vec<PdfTextPage>>,
     #[serde(skip)]
-    pub(crate) printed: OnceLock<PrintedParagraphMap>,
+    pub(crate) printed: OnceLock<Vec<PrintedParagraph>>,
 }
 
 /// Display-space text geometry retained with the prepared document.
@@ -363,7 +363,7 @@ impl PdfDocument {
     /// The declared paragraph nodes of this PDF, in reading order.
     /// Empty where it numbers none: it is then placed by its pages.
     pub fn printed_paragraphs(&self) -> &[PrintedParagraph] {
-        &self.printed_paragraph_map().paragraphs
+        self.printed.get_or_init(|| self.read_printed_paragraphs())
     }
 
     /// Exact printed membership for geometry, without the text response-size limit.
@@ -375,7 +375,7 @@ impl PdfDocument {
         };
         match self.paragraph_range(from, to) {
             Ok(paragraphs) => {
-                let ids = paragraphs.iter().map(|paragraph| paragraph.id.as_str()).collect::<HashSet<_>>();
+                let ids = paragraphs.iter().flat_map(|paragraph| paragraph.ids.iter().map(String::as_str)).collect::<HashSet<_>>();
                 let mut ranges = self.structure.nodes.iter().filter(|node| ids.contains(node.id.as_str()))
                     .flat_map(|node| if node.ranges.is_empty() { std::slice::from_ref(&node.range) }
                         else { &node.ranges }).copied().collect();
@@ -391,76 +391,53 @@ impl PdfDocument {
         from: usize,
         to: usize,
     ) -> Result<&[PrintedParagraph], PdfLookupStatus> {
-        let mapping = self.printed_paragraph_map();
-        if mapping.status.is_empty() {
+        let paragraphs = self.printed_paragraphs();
+        if paragraphs.is_empty() {
             return Err(PdfLookupStatus::Unavailable);
         }
-        for number in from..=to {
-            let status = mapping
-                .status
-                .get(&number)
-                .copied()
-                .unwrap_or(PdfLookupStatus::NotFound);
-            if status != PdfLookupStatus::Found {
-                return Err(status);
-            }
+        let at = |number: usize| paragraphs.iter().position(|p| p.number == number).ok_or(PdfLookupStatus::NotFound);
+        let (start, end) = (at(from)?, at(to)?);
+        if (from..=to).any(|number| at(number).is_err()) || end < start {
+            return Err(PdfLookupStatus::NotFound);
         }
-        let paragraphs = &mapping.paragraphs;
-        let start = paragraphs
-            .iter()
-            .position(|p| p.number == from)
-            .ok_or(PdfLookupStatus::Unavailable)?;
-        let end = paragraphs
-            .iter()
-            .position(|p| p.number == to)
-            .filter(|end| *end >= start)
-            .ok_or(PdfLookupStatus::Unavailable)?;
         Ok(&paragraphs[start..=end])
     }
 
-    pub(crate) fn printed_paragraph_map(&self) -> &PrintedParagraphMap {
-        self.printed.get_or_init(|| self.read_printed_paragraphs())
-    }
-
-    pub(crate) fn read_printed_paragraphs(&self) -> PrintedParagraphMap {
-        let mut status = HashMap::new();
-        let mut paragraphs = Vec::new();
-        for node in self
-            .structure
-            .nodes
-            .iter()
-            .filter(|node| node.kind == NodeKind::Paragraph)
-        {
-            let Some(number) = node
-                .label
-                .as_deref()
-                .and_then(|label| parse_ordinal("paragraph", label))
-            else {
-                continue;
-            };
-            if status.insert(number, PdfLookupStatus::Found).is_some() {
-                status.insert(number, PdfLookupStatus::Ambiguous);
-                continue;
+    /// Each paragraph number the structure labels, once: the paragraph it numbers, with every printing of it. A
+    /// parallel report prints a paragraph once per language, so its printings are those the parser marks as the
+    /// translation and those on a page of the first (columns side by side); a later run of the same numbers on
+    /// other pages is the numbering starting again (another judge's reasons), and the number is the first's.
+    fn read_printed_paragraphs(&self) -> Vec<PrintedParagraph> {
+        let mut by_number = std::collections::BTreeMap::<usize, Vec<&legal_structure_model::StructureNode>>::new();
+        for node in self.structure.nodes.iter().filter(|node| node.kind == NodeKind::Paragraph) {
+            if let Some(number) = node.label.as_deref().and_then(|label| parse_ordinal("paragraph", label)) {
+                by_number.entry(number).or_default().push(node);
             }
-            let range = self.structure.query_range(node);
-            paragraphs.push(PrintedParagraph {
-                id: node.id.clone(),
-                number,
-                start: range.start,
-                end: range.end,
-                ranges: self.structure.query_ranges(node).into_owned(),
-                page_numbers: node
-                    .page_indexes
-                    .iter()
-                    .map(|page| (*page + 1) as u32)
-                    .collect(),
-                line_ids: node.line_ids.clone(),
-            });
         }
-        paragraphs
-            .retain(|paragraph| status.get(&paragraph.number) == Some(&PdfLookupStatus::Found));
+        let mut paragraphs: Vec<PrintedParagraph> = by_number.into_iter().map(|(number, mut printings)| {
+            printings.sort_by_key(|node| self.structure.query_range(node).start);
+            let first = printings[0];
+            let first_pages: HashSet<usize> = first.page_indexes.iter().copied().collect();
+            printings.retain(|node| std::ptr::eq(*node, first)
+                || node.grammar.as_deref() == Some("translation")
+                || node.page_indexes.iter().any(|page| first_pages.contains(page)));
+            let mut ranges: Vec<ScalarRange> = printings.iter().flat_map(|node| self.structure.query_ranges(node).into_owned()).collect();
+            ScalarRange::normalize_union(&mut ranges);
+            let mut page_numbers: Vec<u32> = printings.iter().flat_map(|node| node.page_indexes.iter().map(|page| (*page + 1) as u32)).collect();
+            page_numbers.sort_unstable();
+            page_numbers.dedup();
+            PrintedParagraph {
+                ids: printings.iter().map(|node| node.id.clone()).collect(),
+                number,
+                start: ranges.first().map_or(0, |range| range.start),
+                end: ranges.iter().map(|range| range.end).max().unwrap_or(0),
+                ranges,
+                page_numbers,
+                line_ids: printings.iter().flat_map(|node| node.line_ids.iter().cloned()).collect(),
+            }
+        }).collect();
         paragraphs.sort_by_key(|paragraph| (paragraph.start, paragraph.end));
-        PrintedParagraphMap { paragraphs, status }
+        paragraphs
     }
 
     /// Every page's text, in page order, as a page lookup returns it: empty where
