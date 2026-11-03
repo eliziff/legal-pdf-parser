@@ -6,12 +6,33 @@ use super::*;
 /// page's visible text, laid end to end, would not fill one line across it (a filing stamp, a record
 /// page number, "Page: 17", a heading over a pasted image), or two where the image covers the whole
 /// page (a repository's stamp over each page of a scan: its title, its address, its folio). A text
-/// layer behind the picture is invisible and does not count. A page of ordinary rendered text, or a
+/// layer behind the picture (invisible, or painted beneath it) does not count. A page of ordinary rendered text, or a
 /// tab divider's one line with no image under it, is never one.
+/// Each page's last picture covering nine tenths of it, as its index in `items`, which keep the order the page
+/// is painted in: text painted before it lies beneath it, unseen, as an invisible layer is (a scanner's reading of
+/// the scan, laid under it).
+pub(crate) fn covering_pictures(geometries: &PageGeometryMap, items: &[TextItem]) -> HashMap<u32, usize> {
+    let mut covering = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some((_, geometry)) = geometries.get(&item.page) else { continue };
+        let span = |start: f32, extent: f32, limit: f64| (f64::from(start + extent).min(limit) - f64::from(start).max(0.0)).max(0.0);
+        let area = geometry.raw_width * geometry.raw_height;
+        if matches!(item.item_type, ItemType::Image) && area > 0.0
+            && span(item.x, item.width, geometry.raw_width) * span(item.y, item.height, geometry.raw_height) >= 0.9 * area {
+            covering.insert(item.page, index);
+        }
+    }
+    covering
+}
+
 pub(crate) fn scanned_pages(geometries: &PageGeometryMap, items: &[TextItem]) -> Vec<usize> {
     let mut covered = HashMap::<u32, f64>::new();
     let mut written = HashMap::<u32, f64>::new();
-    for item in items {
+    let beneath = covering_pictures(geometries, items);
+    for (index, item) in items.iter().enumerate() {
+        if beneath.get(&item.page).is_some_and(|&picture| index < picture) && matches!(item.item_type, ItemType::Text) {
+            continue;
+        }
         match &item.item_type {
             // Image rects are in the visible box's own frame, before any page rotation.
             ItemType::Image => if let Some((_, geometry)) = geometries.get(&item.page) {

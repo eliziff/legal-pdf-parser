@@ -1103,7 +1103,6 @@ version = "0.1.0"
 dependencies = [
  "diff-match-patch-rs 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "legal-pdf-core",
- "legal-structure",
  "legal-structure-model",
  "ort",
  "regex",

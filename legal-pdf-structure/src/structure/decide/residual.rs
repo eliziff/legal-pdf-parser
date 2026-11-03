@@ -290,11 +290,16 @@ pub(crate) fn weigh(
             while end < sequence.len() && end - k < 3 + usize::from(alone) {
                 let (next, prior) = (sequence[end], sequence[end - 1]);
                 let before = line(prior).text.trim();
+                let division_alone = evidence.words[prior.index()] & WORD_DIVISION != 0
+                    && before.split_whitespace().count() <= 3
+                    && !before.ends_with([':', '-', '\u{2013}', '\u{2014}']);
                 if apart(prior, next)
                     || !eligible(next)
                     || style(next) != style(title)
                     || width(prior) >= 0.75
                     || width(next) >= 0.75
+                    || division_alone
+                    || evidence.words[next.index()] & WORD_DIVISION != 0
                     || headings::rules::numbered(line(next).text.trim())
                     || sentence_ended(before)
                     || before.ends_with([':', ';', ','])

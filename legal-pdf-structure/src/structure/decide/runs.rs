@@ -337,11 +337,13 @@ impl Lines<'_> {
     /// The line carrying a marker's text where the marker stands alone on its own: the line beside
     /// it on its row, or the line recognition read its text on, in its reading context.
     fn beside(&self, slot: Slot) -> Option<Slot> {
-        self.evidence.beside[slot.index()].or_else(|| {
-            let line = self.slots.line(self.pages, slot);
-            let body = line.ocr.as_ref()?.marker.as_ref()?.body_line_id.as_deref()?;
-            self.slots.of_id(body).filter(|body| self.fences.ctx[body.index()] == self.fences.ctx[slot.index()])
-        })
+        self.evidence.beside[slot.index()]
+            .filter(|body| self.fences.ctx[body.index()] == self.fences.ctx[slot.index()])
+            .or_else(|| {
+                let line = self.slots.line(self.pages, slot);
+                let body = line.ocr.as_ref()?.marker.as_ref()?.body_line_id.as_deref()?;
+                self.slots.of_id(body).filter(|body| self.fences.ctx[body.index()] == self.fences.ctx[slot.index()])
+            })
     }
 
     /// Whether a line fills its column's measure (85% of it or more).
@@ -372,7 +374,13 @@ impl Lines<'_> {
         let own = (content.slot == slot).then(|| text_from(self.pages, self.slots, content)).filter(|tail| !tail.trim().is_empty());
         let next = (index + 1 < self.view.lines.len())
             .then_some(index + 1)
-            .filter(|&next| !self.marked.contains(&self.view.lines[next].0));
+            .filter(|&next| {
+                !self.marked.contains(&self.view.lines[next].0)
+                    || run.markers.iter().any(|child| {
+                        child.parent_candidate_id.as_deref() == Some(candidate.id.as_str())
+                            && self.view.line_at(child.marker_range.start) == next
+                    })
+            });
         let text_index = if own.is_some() {
             Some(index)
         } else if let Some(beside) = beside {

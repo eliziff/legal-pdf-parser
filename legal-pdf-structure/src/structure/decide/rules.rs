@@ -441,10 +441,14 @@ impl Decision {
                             !evidence.title_shaped[lines[at as usize].index()]
                         });
                     let next = (from != u32::MAX).then(|| lines.get(from as usize + 1).copied()).flatten();
-                    let over_terms = next.is_some_and(|next| self.role[next.index()] != Role::Heading && subsection(slots.line(pages, next).text.trim()));
+                    let over_terms = next.is_some_and(|next| {
+                        self.role[next.index()] != Role::Heading
+                            && !evidence.title_shaped[next.index()]
+                            && subsection(slots.line(pages, next).text.trim())
+                    });
                     // The clause's text after its caption is the clause's, set apart from it where the
                     // page parts them ("2.2 / Landlord's Work" over "The Landlord shall perform").
-                    if (evidence.instrument || over_terms) && followed && self.claim(member.slot, Role::Body, Rule::Caption) {
+                    if (evidence.instrument && followed || over_terms) && self.claim(member.slot, Role::Body, Rule::Caption) {
                         self.unit[at] = Some((r as u32, kind));
                         self.join(member.text, Role::Body, Rule::Caption);
                     }
@@ -528,18 +532,25 @@ impl Decision {
             }
             // The context's openers in reading order: place, depth, slot. A consolidation's ladder
             // skips its repealed sections and inserts others ("19.02"), so it need not count on by one.
+            let mut integer_roots = 0usize;
             let mut openers: Vec<(u32, u16, Slot)> = runs
                 .runs
                 .iter()
                 .filter(|run| usize::from(run.ctx) == ctx && run.grammar == CandidateGrammar::Hierarchy && run.rooted)
                 .flat_map(|run| &run.members)
                 .filter(|member| member.counted && member.carries_prose && member.kind.is_some() && self.rule[member.slot.index()] == Rule::Opener)
-                .map(|member| (sequences.at[member.slot.index()], if member.parent.is_none() { 0 } else { member.level.max(1) }, member.slot))
+                .map(|member| {
+                    if member.parent.is_none() && !member.grammar_value.contains('.') {
+                        integer_roots += 1;
+                    }
+                    (sequences.at[member.slot.index()], if member.parent.is_none() { 0 } else { member.level.max(1) }, member.slot)
+                })
                 .collect();
             if openers.iter().filter(|(_, depth, _)| *depth == 0).count() < 3 {
                 continue;
             }
             openers.sort_unstable();
+            openers.dedup_by_key(|(at, _, _)| *at);
             let shaped = |slot: Slot| {
                 let line = text(slot);
                 let letters = line.chars().filter(|c| c.is_alphabetic()).count();
@@ -564,18 +575,20 @@ impl Decision {
                 let page = slots.page(opener);
                 let above = |step: u32| at.checked_sub(step).map(|place| lines[place as usize]).filter(|&slot| slots.page(slot) == page);
                 let mut caption: Vec<Slot> = Vec::new();
-                if let Some(first) = above(1).filter(|&slot| shaped(slot)) {
-                    caption.push(first);
-                    if let Some(upper) = above(2).filter(|&slot| shaped(slot) && fences.continues[first.index()].is_some()) {
-                        caption.insert(0, upper);
+                if integer_roots >= 2 {
+                    if let Some(first) = above(1).filter(|&slot| shaped(slot)) {
+                        caption.push(first);
+                        if let Some(upper) = above(2).filter(|&slot| shaped(slot) && fences.continues[first.index()].is_some()) {
+                            caption.insert(0, upper);
+                        }
+                    } else if let Some(lower) = above(1).filter(|&slot| wrapped(slot)) {
+                        if let Some(upper) = above(2).filter(|&slot| shaped(slot)) {
+                            caption = vec![upper, lower];
+                        }
                     }
-                } else if let Some(lower) = above(1).filter(|&slot| wrapped(slot)) {
-                    if let Some(upper) = above(2).filter(|&slot| shaped(slot)) {
-                        caption = vec![upper, lower];
+                    if caption.first().is_some_and(|first| fences.continues[first.index()].is_some()) {
+                        caption.clear();
                     }
-                }
-                if caption.first().is_some_and(|first| fences.continues[first.index()].is_some()) {
-                    caption.clear();
                 }
                 if caption.is_empty() {
                     caption = self.margin_caption(pages, slots, fences, opener, &shaped);
@@ -586,12 +599,20 @@ impl Decision {
             }
             // Whether each caption governs one opener of its depth before the next caption, and
             // its look.
+            let repealed = |slot: Slot| {
+                let line = text(slot);
+                line.contains("[Repealed") || line.contains("[Abrogé")
+            };
             let governs: Vec<bool> = (0..captions.len())
                 .map(|c| {
                     let (_, k) = captions[c];
                     let (at, depth, _) = openers[k];
                     let next = captions.get(c + 1).map_or(u32::MAX, |(lines, _)| sequences.at[lines[0].index()].min(openers[captions[c + 1].1].0));
-                    openers.iter().filter(|(place, other, _)| *place >= at && *place < next && *other <= depth).count() == 1
+                    openers
+                        .iter()
+                        .filter(|&&(place, other, slot)| place == at || (place > at && place < next && other <= depth && !repealed(slot)))
+                        .count()
+                        == 1
                 })
                 .collect();
             let look = |slot: Slot| {
@@ -623,8 +644,11 @@ impl Decision {
             };
             for ((caption, opener), &one) in captions.iter().zip(&governs) {
                 let key = look(caption[0]);
-                let share = groups.iter().find(|(seen, _, _)| *seen == key).map_or(0.0, |(_, members, ones)| *ones as f64 / *members as f64);
-                if !(beside(caption[0], openers[*opener].2) || one && share >= 0.6) {
+                let (members, share) = groups
+                    .iter()
+                    .find(|(seen, _, _)| *seen == key)
+                    .map_or((0, 0.0), |(_, members, ones)| (*members, *ones as f64 / *members as f64));
+                if !(beside(caption[0], openers[*opener].2) || (one || members >= 4) && share >= 0.6) {
                     continue;
                 }
                 for (k, &slot) in caption.iter().enumerate() {

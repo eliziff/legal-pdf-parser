@@ -90,15 +90,18 @@ pub fn assemble_pdf(
     assign_renderer_layout(&mut items);
     let scanned_pages = scanned_pages(geometries, &items);
     let pictures = pictures(geometries, &items);
-    items.retain(|item| matches!(&item.item_type, ItemType::Text));
-    // Pages whose text is all an invisible layer behind a scan: the layer is that scan's earlier
-    // recognition.
+    // Pages whose text is all a layer nobody sees, invisible or painted beneath a picture of the whole page: the
+    // layer is that scan's earlier recognition.
+    let covering = covering_pictures(geometries, &items);
     let mut shown_pages = HashSet::new();
     let mut layer_pages = HashSet::new();
-    for item in items.iter().filter(|item| !item.text.trim().is_empty()) {
-        if item.render_mode == Some(3) { layer_pages.insert(item.page); } else { shown_pages.insert(item.page); }
+    for (index, item) in items.iter().enumerate()
+        .filter(|(_, item)| matches!(&item.item_type, ItemType::Text) && !item.text.trim().is_empty()) {
+        let unseen = item.render_mode == Some(3) || covering.get(&item.page).is_some_and(|&picture| index < picture);
+        if unseen { layer_pages.insert(item.page); } else { shown_pages.insert(item.page); }
     }
     layer_pages.retain(|page| !shown_pages.contains(page));
+    items.retain(|item| matches!(&item.item_type, ItemType::Text));
     for line in group_source_order_lines(items) {
         by_page.entry(line.page).or_default().push(line);
     }
@@ -127,8 +130,10 @@ pub fn assemble_pdf(
             reasons.iter().any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT)
         });
         let quality = if garbled { 0.0 } else { text_quality(&lines) };
-        // A scan's invisible text layer that reads poorly is recognized again.
-        if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) && !layer_reads_well(&lines) {
+        // A scan's invisible text layer is another recognizer's reading of it, however well it reads
+        // ("2014 ~NSC 4326" in a layer that otherwise reads cleanly): it is recognized again, and the
+        // recognition decides which reading stands.
+        if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) {
             weak_pages.insert(page_index);
         }
         source_offset += lines.len();
@@ -174,14 +179,6 @@ pub fn assemble_pdf(
 
     for page in &detection.pages_needing_ocr {
         if let Ok(index) = usize::try_from(page.saturating_sub(1)) {
-            // A scan whose invisible text layer was read as its text needs no recognition when
-            // that text reads well: the layer is the scan already recognized. One that reads
-            // poorly, or a page needing recognition for any other reason, is recognized again.
-            let layer_only = layer_pages.contains(page) && detection.ocr_reasons_by_page.get(page).is_some_and(|reasons|
-                reasons.iter().all(|reason| reason == pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER));
-            if layer_only && pages.get(index).is_some_and(|page| !page.lines.is_empty() && layer_reads_well(&page.lines)) {
-                continue;
-            }
             weak_pages.insert(index);
         }
     }

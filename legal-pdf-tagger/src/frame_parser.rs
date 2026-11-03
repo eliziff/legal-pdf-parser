@@ -81,6 +81,16 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
         if tagged && node.kind == NodeKind::Section {
             continue;
         }
+        if node.kind == NodeKind::Section
+            && node.role.is_none()
+            && node.ranges.is_empty()
+            && structure.nodes.iter().any(|child| {
+                child.parent_id.as_deref() == Some(node.id.as_str())
+                    && child.range.start == node.range.start
+            })
+        {
+            continue;
+        }
         if node.kind != NodeKind::Row && in_row(if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }) {
             continue;
         }
@@ -181,24 +191,86 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
             });
             if let Some(locator) = locator { attributes.insert("locator_kind".into(), json!(locator)); }
             if let Some(label) = &node.label { attributes.insert("label".into(), json!(label)); }
-            if let Some(marker) = node.marker_range.filter(|_| !matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)) {
-                let markers = line_spans(&text, &lines, &[marker])?.into_iter().filter_map(|mut found| {
-                    let span = spans.iter().find(|span| span.line_id == found.line_id)?;
-                    found.start = found.start.max(span.start);
-                    found.end = found.end.min(span.end);
-                    (found.start < found.end).then_some(found)
-                }).collect::<Vec<_>>();
-                if !markers.is_empty() { attributes.insert("marker".into(), json!(markers)); }
+            let is_heading = role == PrimaryRole::Heading || node.kind == NodeKind::Heading;
+            if !is_heading
+                && matches!(
+                    node.kind,
+                    NodeKind::Section | NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose | NodeKind::Quote
+                )
+                && !matches!(
+                    role,
+                    PrimaryRole::Title
+                        | PrimaryRole::Furniture
+                        | PrimaryRole::PageLabel
+                        | PrimaryRole::LineLabel
+                        | PrimaryRole::MarginalNote
+                )
+            {
+                let (mut depth, mut at, mut seen_ancestors) =
+                    (1usize, node.parent_id.as_deref(), HashSet::new());
+                while let Some(id) = at.filter(|id| seen_ancestors.insert(*id)) {
+                    let Some(&ancestor) = nodes.get(id) else { break };
+                    let ancestor_heading =
+                        ancestor.kind == NodeKind::Heading || ancestor.role == Some(PrimaryRole::Heading);
+                    if !ancestor_heading
+                        && matches!(
+                            ancestor.kind,
+                            NodeKind::Section
+                                | NodeKind::Paragraph
+                                | NodeKind::ListItem
+                                | NodeKind::Prose
+                                | NodeKind::Quote
+                        )
+                    {
+                        depth += 1;
+                    }
+                    at = ancestor.parent_id.as_deref();
+                }
+                attributes.insert("depth".into(), json!(depth));
+            }
+            if !matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote) {
+                let mut marker_ranges = Vec::new();
+                if let Some(marker) = node.marker_range {
+                    marker_ranges.push(marker);
+                }
+                let (mut at, mut seen_ancestors) = (node.parent_id.as_deref(), HashSet::new());
+                while let Some(id) = at.filter(|id| seen_ancestors.insert(*id)) {
+                    let Some(&ancestor) = nodes.get(id) else { break };
+                    if let Some(marker) = ancestor.marker_range.filter(|m| {
+                        node.range.start <= m.start && m.end <= node.range.end
+                    }) {
+                        marker_ranges.push(marker);
+                    }
+                    at = ancestor.parent_id.as_deref();
+                }
+                marker_ranges.sort_by_key(|m| (m.start, m.end));
+                marker_ranges.dedup();
+                if !marker_ranges.is_empty() {
+                    let markers = line_spans(&text, &lines, &marker_ranges)?
+                        .into_iter()
+                        .filter_map(|mut found| {
+                            let span = spans.iter().find(|span| span.line_id == found.line_id)?;
+                            found.start = found.start.max(span.start);
+                            found.end = found.end.min(span.end);
+                            (found.start < found.end).then_some(found)
+                        })
+                        .collect::<Vec<_>>();
+                    if !markers.is_empty() {
+                        attributes.insert("marker".into(), json!(markers));
+                    }
+                }
             }
         }
         // A transcript's turn opens with its speaker's label ("Q.", "MR. SMITH:").
         if transcript && role == PrimaryRole::Text {
-            let first = &spans[0];
-            if let Some((line, _, _)) = lines.iter().find(|(line, _, _)| line.id == first.line_id) {
-                let opening: String = line.text.chars().skip(first.start).take(first.end - first.start).collect();
-                if let Some((start, end)) = legal_structure_model::transcript::speaker_label(&opening) {
-                    let at = |bytes: usize| first.start + opening[..bytes].chars().count();
-                    attributes.insert("speaker".into(), json!([SourceSpan { line_id: first.line_id.clone(), start: at(start), end: at(end) }]));
+            for first in spans.iter().take(2) {
+                if let Some((line, _, _)) = lines.iter().find(|(line, _, _)| line.id == first.line_id) {
+                    let opening: String = line.text.chars().skip(first.start).take(first.end - first.start).collect();
+                    if let Some((start, end)) = legal_structure_model::transcript::speaker_label(&opening) {
+                        let at = |bytes: usize| first.start + opening[..bytes].chars().count();
+                        attributes.insert("speaker".into(), json!([SourceSpan { line_id: first.line_id.clone(), start: at(start), end: at(end) }]));
+                        break;
+                    }
                 }
             }
         }
