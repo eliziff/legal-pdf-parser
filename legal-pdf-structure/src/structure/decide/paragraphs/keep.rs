@@ -66,6 +66,10 @@ impl Reading<'_> {
         if slots.line(pages, slot).recognized() && ((bbox[1] <= top || bbox[3] >= foot) && apart || speck) && line.chars().filter(|c| c.is_alphanumeric()).count() <= FOLIO_MARKS {
             return true;
         }
+        // A report's running head a recognizer reads differently on each page, so that no two match.
+        if slots.line(pages, slot).recognized() && bbox[1] <= top + 4.0 * height && report_head(line.trim()) {
+            return true;
+        }
         // A folio in words ("Page: 3"), and what the page's furniture prints elsewhere, are the page's.
         let folio = line.trim().strip_prefix("Page").or_else(|| line.trim().strip_prefix("PAGE")).is_some_and(|rest| {
             let rest = rest.trim_start_matches([':', ' ']);
@@ -125,4 +129,16 @@ impl Reading<'_> {
             }
         }
     }
+}
+
+/// A report's running head: "[1996] 1 R.C.S. BANQUE ROYALE c. NORD-AM.", "CHAN v. CANADA La Forest J. [1995] 3 S.C.R.", "SCHWARTZ c. CANADA Le juge
+/// La Forest". A citation in a sentence goes on to its page ("[1975] 2 R.C.S. 739"), and a sentence holds a comma.
+fn report_head(text: &str) -> bool {
+    if text.chars().count() > 90 || text.contains(',') {
+        return false;
+    }
+    let report = ["S.C.R.", "R.C.S."].iter().find_map(|name| text.find(name).map(|at| (at, at + name.len())));
+    let cited = report.is_some_and(|(at, end)| text[..at].contains('[') && !text[end..].trim_start().starts_with(|c: char| c.is_ascii_digit()));
+    let cause = text.contains(" c. ") || text.contains(" v. ");
+    cited || cause && (text.contains("Le juge ") || text.contains("Le Juge ") || text.ends_with(" J."))
 }
