@@ -136,7 +136,7 @@ impl Notes {
                     (BAND_EXCLUDED, matches!(fences.role[at], Role::LineLabel | Role::Contents)),
                     (BAND_FURNITURE, matches!(fences.role[at], Role::Furniture | Role::PageLabel)),
                     (BAND_CELL, fences.cell[at] != 0),
-                    (BAND_PARAGRAPH, unit[at] || !fences.held[at].is_empty() || fences.margin_number[at].is_some()),
+                    (BAND_PARAGRAPH, unit[at] || !fences.paragraphs.held[at].is_empty() || fences.margin_number[at].is_some()),
                     (BAND_NOTED, evidence.tag[at] == SourceTag::Note),
                     (BAND_HEADED, headed(at)),
                     (BAND_LAYOUT, layout_notes && layout_labelled(slots.line(pages, Slot(at as u32)))),

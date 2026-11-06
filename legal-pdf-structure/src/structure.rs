@@ -175,8 +175,8 @@ impl<'a> Decided<'a> {
     }
 
     /// The numbered paragraphs the line's text holds: each one's language, number and UTF-16 span of the line.
-    pub(super) fn held(&self, id: &str) -> &[(bool, u32, u32, u32)] {
-        self.slot(id).map_or(&[], |slot| self.fences.held[slot.index()].as_slice())
+    pub(super) fn held(&self, id: &str) -> &[Held] {
+        self.slot(id).map_or(&[], |slot| self.fences.paragraphs.held[slot.index()].as_slice())
     }
 
     /// A contents list's line, or a line of a page wholly a contents list's.

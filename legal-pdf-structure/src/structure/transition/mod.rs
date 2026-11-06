@@ -410,7 +410,7 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
             page: slots.page(slot) as u32,
             left: table.row(k)[LINE_FEATURES.iter().position(|n| *n == "x0").unwrap_or(0)],
             margin: table.margins.get(&k).and_then(|&margin| Some((margin as u32, table.readings[margin].first()?))),
-            count: fences.count[at],
+            count: fences.paragraphs.count[at],
         }
     }).collect()
 }

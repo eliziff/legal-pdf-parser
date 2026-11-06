@@ -13,8 +13,8 @@ impl Fences {
             return false;
         }
         let mut own = HashMap::<(u16, bool), HashSet<u32>>::new();
-        for at in 0..self.count.len() {
-            if let Some(number) = self.count[at] {
+        for at in 0..self.paragraphs.count.len() {
+            if let Some(number) = self.paragraphs.count[at] {
                 own.entry((self.document[at], self.translation[at])).or_default().insert(number);
             }
         }
@@ -34,7 +34,7 @@ impl Fences {
                 }
                 quotations.close(stream);
             }
-            let quoted = self.count[at].is_none()
+            let quoted = self.paragraphs.count[at].is_none()
                 && analysis.printed_paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
             if quoted {
                 self.quotation[at] = quotations.open(stream);

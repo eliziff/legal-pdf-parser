@@ -645,7 +645,7 @@ impl Runs {
             .collect();
         for &(r, m) in &members {
             let member = &mut runs[r].members[m];
-            let own = fences.count[member.slot.index()].is_some();
+            let own = fences.paragraphs.count[member.slot.index()].is_some();
             (member.kind, member.rule) = if own {
                 (paragraph, ResolutionRuleV2::RootedNumericProse)
             } else {

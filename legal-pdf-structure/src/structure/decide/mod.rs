@@ -15,6 +15,7 @@ use super::*;
 mod evidence;
 pub(crate) use evidence::*;
 mod paragraphs;
+pub(crate) use paragraphs::{Held, Paragraphs};
 mod fences;
 pub(crate) use fences::*;
 mod runs;

@@ -403,20 +403,20 @@ impl LineTable {
         // its language, whether it is a margin's number or a line one numbers, and whether it goes on with the line
         // before it.
         let mut t0 = vec![0u8; n * T0];
-        let mut last_held: [&[(bool, u32, u32, u32)]; 2] = [&[], &[]];
+        let mut last_held: [&[Held]; 2] = [&[], &[]];
         for (k, &slot) in order.iter().enumerate() {
             let at = slot.index();
             let row = &mut t0[k * T0..(k + 1) * T0];
             row[(fences.role[at] as usize).min(ROLES - 1)] = 1;
-            let held = &fences.held[at];
-            let goes_on = held.iter().any(|mine| last_held[usize::from(mine.0)].iter().any(|other| other.1 == mine.1));
-            let flags = [fences.band[at], fences.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
+            let held = &fences.paragraphs.held[at];
+            let goes_on = held.iter().any(|mine| last_held[usize::from(mine.translation)].iter().any(|other| other.number == mine.number));
+            let flags = [fences.band[at], fences.paragraphs.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
                 margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some()];
             for (cell, flag) in row[ROLES..].iter_mut().zip(flags) {
                 *cell = u8::from(flag);
             }
             for mine in held {
-                last_held[usize::from(mine.0)] = held;
+                last_held[usize::from(mine.translation)] = held;
             }
         }
         Self { order, readings, references, looks: look_ids, features, margin_rows, margins, t0 }

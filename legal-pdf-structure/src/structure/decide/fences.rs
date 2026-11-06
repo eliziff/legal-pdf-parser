@@ -235,11 +235,8 @@ pub(crate) struct Fences {
     pub(crate) margin_number: Vec<Option<Slot>>,
     /// The line opening the same paragraph in the other language, on a margin number's row.
     pub(crate) margin_twin: Vec<Option<Slot>>,
-    /// The paragraph number a line opens, and the spans of each line each numbered paragraph holds (its language,
-    /// number and UTF-16 span of the line's text): the document's paragraphs, read once before any other reading
-    /// claims a line (`read_paragraphs`).
-    pub(crate) count: Vec<Option<u32>>,
-    pub(crate) held: Vec<Vec<(bool, u32, u32, u32)>>,
+    /// The document's numbered paragraphs (`read_paragraphs`).
+    pub(crate) paragraphs: Paragraphs,
     /// Every line in reading order, page by page.
     pub(crate) order: Vec<Slot>,
     /// Each line's place in `order`.

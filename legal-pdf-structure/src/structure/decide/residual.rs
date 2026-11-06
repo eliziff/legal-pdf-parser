@@ -253,7 +253,7 @@ pub(crate) fn weigh(
         // Heard, a line a marker opens is weighed too, a heading its rival; a paragraph number is fixed.
         let unsettled = |at: usize| {
             role[at] == Role::Open
-                || hearing && matches!(rule[at], Rule::Opener | Rule::Caption) && fences.count[at].is_none() && fences.held[at].is_empty()
+                || hearing && matches!(rule[at], Rule::Opener | Rule::Caption) && fences.paragraphs.count[at].is_none() && fences.paragraphs.held[at].is_empty()
         };
         let eligible = |slot: Slot| {
             let at = slot.index();

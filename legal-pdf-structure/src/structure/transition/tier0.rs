@@ -116,7 +116,7 @@ fn line_views<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
                 left: 0.0,
                 page: slots.page(slot) as u32,
                 margin: table.margins.get(&k).and_then(|&margin| Some((margin as u32, table.readings[margin].first()?))),
-                count: fences.count[at],
+                count: fences.paragraphs.count[at],
             }
         })
         .collect()
@@ -210,7 +210,7 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
             let readings: Vec<Heard> = heard[starts[at] as usize..starts[at + 1] as usize].iter().copied()
                 .filter(|reading| !(reading.rule == Rule::Residual && reading.joined && !weighed[context]))
                 .collect();
-            let fixed = fences.count[at].is_some() || !fences.held[at].is_empty();
+            let fixed = fences.paragraphs.count[at].is_some() || !fences.paragraphs.held[at].is_empty();
             let competing = readings.iter().filter(|reading| reading.role != Role::Open).count() > 1;
             let member_kind = decision.reading[at].and_then(|(run, member)| runs.runs[run as usize].members[member as usize].kind);
             let mut winner: Option<(Heard, Move, f32)> = None;

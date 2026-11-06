@@ -2,6 +2,7 @@
 //! paragraph the spans of its lines it holds, in each language that prints it. Nothing is read here.
 
 use super::*;
+use crate::structure::Held;
 use legal_structure_model::{DocumentStructure, SourceFragment};
 
 /// Write the numbered paragraphs the reading decided. A document it read none in keeps what its pages read.
@@ -11,7 +12,7 @@ pub(crate) fn read_judgment_paragraphs(structure: &mut DocumentStructure, pages:
     let mut printed: [BTreeMap<usize, Vec<ScalarRange>>; 2] = Default::default();
     for fragment in &structure.source_fragments {
         let exact = lengths.get(fragment.id.as_str()) == Some(&(fragment.range.end - fragment.range.start));
-        for &(translation, number, start, end) in decided.held(&fragment.id) {
+        for &Held { translation, number, start, end } in decided.held(&fragment.id) {
             let range = if exact {
                 ScalarRange { start: fragment.range.start + start as usize, end: fragment.range.start + end as usize }
             } else {
@@ -22,8 +23,8 @@ pub(crate) fn read_judgment_paragraphs(structure: &mut DocumentStructure, pages:
     }
     // A table a paragraph holds whole is written as its own node: the paragraph's extent takes it.
     for node in structure.nodes.iter().filter(|node| node.kind == NodeKind::Table) {
-        if let Some(&(translation, number, ..)) = node.line_ids.first().and_then(|id| decided.held(id).first()) {
-            if node.line_ids.iter().all(|id| decided.held(id).iter().any(|held| held.1 == number)) {
+        if let Some(&Held { translation, number, .. }) = node.line_ids.first().and_then(|id| decided.held(id).first()) {
+            if node.line_ids.iter().all(|id| decided.held(id).iter().any(|held| held.number == number)) {
                 printed[usize::from(translation)].entry(number as usize).or_default().push(node.range);
             }
         }
