@@ -13,7 +13,7 @@
 use super::*;
 
 /// The regions no numbered paragraph holds.
-const SET_APART: [&str; 9] = ["furniture", "page_label", "line_label", "note", "note_quote", "title", "contents", "headnote", "marginal_note"];
+const SET_APART: [&str; 7] = ["furniture", "page_label", "line_label", "note", "note_quote", "title", "contents"];
 use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NotePairClaimV2, NoteReference, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
