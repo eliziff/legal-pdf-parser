@@ -269,7 +269,7 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
         }
     }
     // Each reading context's numbered unit open at its last region's end.
-    let mut numbered = HashMap::<u16, (usize, u8)>::new();
+    let mut numbered = HashMap::<u16, (usize, u8, bool)>::new();
     for (_, _, lines) in regions {
         let mut places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
         places.sort_unstable();
@@ -281,10 +281,12 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
         let contents = listed * 5 >= places.len() * 4;
         let context = fences.ctx[table.order[first].index()];
         let body = matches!(decision.role[table.order[first].index()], Role::Open | Role::Body);
-        // (Or one the paragraph stage holds in the same number, fixed: a region may part what the number holds.)
+        // (Or a sentence going on that the paragraph stage holds in the same number: "... v. J.M.," / "2016 NBCA 39, ...", a region's
+        // break no paragraph's. Its blocks are its own: a block opening under a finished sentence stays one.)
         let held = |at: usize, other: usize| fences.paragraphs.held[at].iter().any(|mine| fences.paragraphs.held[other].iter().any(|theirs| theirs.number == mine.number && theirs.translation == mine.translation));
-        let carried = numbered.get(&context).copied().filter(|&(open, _)| body && !contents
-            && (fences.continues[table.order[first].index()].is_some() || held(table.order[first].index(), table.order[open].index())));
+        let carried = numbered.get(&context).copied().filter(|&(open, _, closed)| body && !contents
+            && (fences.continues[table.order[first].index()].is_some() || !closed && held(table.order[first].index(), table.order[open].index())))
+            .map(|(open, region, _)| (open, region));
         let mut open = carried.unwrap_or((first, 0));
         for &k in &places {
             let at = table.order[k].index();
@@ -316,7 +318,7 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             }
         }
         if opened.contains_key(&open.0) {
-            numbered.insert(context, open);
+            numbered.insert(context, (open.0, open.1, lines.last().is_some_and(|line| sentence_ended(&line.text))));
         } else {
             numbered.remove(&context);
         }

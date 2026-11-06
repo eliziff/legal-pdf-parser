@@ -192,7 +192,7 @@ impl<'a> Reading<'a> {
         for page_slot in 0..pages.len() {
             let on: Vec<usize> = slots.on(page_slot).map(|slot| slot as usize).filter(|&at| fences.role[at] == Role::Open && !fences.band[at]).collect();
             for language in [false, true] {
-                let own: Vec<usize> = on.iter().copied().filter(|&at| fences.translation[at] == language).collect();
+                let mut own: Vec<usize> = on.iter().copied().filter(|&at| fences.translation[at] == language).collect();
                 if own.iter().any(|&at| !paragraphs.held[at].is_empty()) {
                     continue;
                 }
@@ -205,15 +205,19 @@ impl<'a> Reading<'a> {
                     }
                 }
                 // (A column may run a line longer than the other: a sentence left open goes on past the span, "... de la" / "Cour d'appel.".)
-                let mut open = None::<(bool, u32)>;
+                own.sort_by(|&a, &b| slots.line(pages, Slot(a as u32)).bbox[1].total_cmp(&slots.line(pages, Slot(b as u32)).bbox[1]));
+                let (mut open, mut foot) = (None::<(bool, u32)>, f64::MIN);
                 for at in own {
                     let line = slots.line(pages, Slot(at as u32));
                     let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
                     let beside = spans.iter().find(|(_, span)| span.0 <= middle && middle <= span.1).map(|(key, _)| *key);
-                    open = beside.or(open);
+                    // (The next line down, no gap over it.)
+                    let goes_on = open.filter(|_| line.bbox[1] - foot <= line.bbox[3] - line.bbox[1]);
+                    open = beside.or(goes_on);
                     if let Some((translation, number)) = open {
                         paragraphs.held[at].push(Held { translation, number, start: 0, end: line.text.encode_utf16().count() as u32 });
                     }
+                    foot = line.bbox[3];
                     if sentence_ended(&line.text) {
                         open = None;
                     }
