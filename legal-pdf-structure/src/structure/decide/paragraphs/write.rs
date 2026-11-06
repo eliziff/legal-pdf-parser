@@ -164,7 +164,7 @@ impl Reading<'_> {
             if let Some((marker, added)) = marker {
                 // A short ruling's bare numbers in the margin read as the paragraph's they are: too few for a count of their own.
                 let number = slots.line(pages, marker).text.trim();
-                let margin = (3..5).contains(&margins) && (self.fences.margin_number[marker.index()].is_some() || self.fences.margin_twin[marker.index()].is_some())
+                let margin = (3..=6).contains(&margins) && (self.fences.margin_number[marker.index()].is_some() || self.fences.margin_twin[marker.index()].is_some())
                     && number.bytes().all(|byte| byte.is_ascii_digit());
                 written.add(if margin { "[" } else { "" }, None);
                 written.add(number, (!added).then_some(marker));
