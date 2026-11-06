@@ -277,16 +277,16 @@ impl Fences {
     }
 
     /// The stream each line reads in.
-    fn streams(&self, layout: &dyn StructureAnalysis, pages: &[Page], slots: &Slots) -> Vec<Stream> {
+    fn streams(&self, printed: &[Option<usize>]) -> Vec<Stream> {
         // A judgment in one language may quote a statute in two, its columns side by side: the other language numbers
         // nothing, and its lines are the paragraph's quoting them. A parallel report prints its paragraphs in both.
         let numbered_apart = |at: usize| self.margin_twin[at].is_some() || self.translation[at] && (self.margin_number[at].is_some()
-            || layout.printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text).is_some());
-        let translated = (0..slots.len()).filter(|&at| self.translation[at] && self.role[at] == Role::Open).count();
-        let open = (0..slots.len()).filter(|&at| self.role[at] == Role::Open).count();
+            || printed[at].is_some());
+        let translated = (0..printed.len()).filter(|&at| self.translation[at] && self.role[at] == Role::Open).count();
+        let open = (0..printed.len()).filter(|&at| self.role[at] == Role::Open).count();
         // (A quoted section's own number numbers no count: what counts is how few the other language prints.)
-        let printed_number = |at: usize| self.margin_number[at].is_some() || layout.printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text).is_some();
-        let (apart, own) = ((0..slots.len()).filter(|&at| numbered_apart(at)).count(), (0..slots.len()).filter(|&at| !self.translation[at] && printed_number(at)).count());
+        let printed_number = |at: usize| self.margin_number[at].is_some() || printed[at].is_some();
+        let (apart, own) = ((0..printed.len()).filter(|&at| numbered_apart(at)).count(), (0..printed.len()).filter(|&at| !self.translation[at] && printed_number(at)).count());
         let one_text = translated * 4 < open && apart * 4 < own;
         self.translation.iter().map(|&translation| if translation && !one_text { Stream::Translation } else { Stream::Text }).collect()
     }
@@ -316,7 +316,9 @@ impl Fences {
         let mut holds: Vec<Vec<(bool, u32, u32, u32)>> = vec![Vec::new(); slots.len()];
         let label_size = self.label_size();
         let layout = analysis;
-        let stream_of = self.streams(layout, pages, slots);
+        // (Each line's printed number, read once.)
+        let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| layout.printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
+        let stream_of = self.streams(&printed);
         // The most letters and figures a recognizer's reading of a folio holds.
         const FOLIO_MARKS: usize = 4;
         // The most lines a heading over a numbered paragraph runs to.
@@ -365,7 +367,9 @@ impl Fences {
                 *lefts.entry((slots.page(slot) % 2, self.translation[slot.index()])).or_default().entry((line.bbox[0] / 3.0).round() as i64).or_default() += 1;
             }
         }
-        let column = |page: usize, language: bool| lefts.get(&(page % 2, language)).and_then(|lefts| lefts.iter().max_by_key(|(_, count)| **count)).map_or(f64::MAX, |(left, _)| *left as f64 * 3.0);
+        // (Read once for each page's parity and language.)
+        let columns: HashMap<(usize, bool), f64> = lefts.iter().filter_map(|(key, lefts)| lefts.iter().max_by_key(|(_, count)| **count).map(|(left, _)| (*key, *left as f64 * 3.0))).collect();
+        let column = |page: usize, language: bool| columns.get(&(page % 2, language)).copied().unwrap_or(f64::MAX);
         // Where a numbered line's words stand, from that edge: a quotation may hang its number in the judgment's own margin
         // (its words alone set in); a number alone on its line has them on its row.
         let indent = |slot: Slot| {
@@ -378,17 +382,18 @@ impl Fences {
             words - edge.get(&(slots.page(slot), self.translation[slot.index()])).copied().unwrap_or(0.0)
         };
         let numbered: Vec<Slot> = self.order.iter().copied()
-            .filter(|slot| body(slot.index()) && layout.printed_paragraph_number(&slots.line(pages, *slot).text).is_some())
+            .filter(|slot| body(slot.index()) && printed[slot.index()].is_some())
             .collect();
         let mut places = BTreeMap::<(bool, i64), usize>::new();
         for &slot in &numbered {
             *places.entry((self.translation[slot.index()], (indent(slot) / 3.0).round() as i64)).or_default() += 1;
         }
-        let place = |translation: bool| places.iter().filter(|((own, _), _)| *own == translation).max_by_key(|(_, count)| **count).map(|((_, at), _)| *at as f64 * 3.0);
+        let own_place = [false, true].map(|translation| places.iter().filter(|((own, _), _)| *own == translation).max_by_key(|(_, count)| **count).map(|((_, at), _)| *at as f64 * 3.0));
+        let place = |translation: bool| own_place[usize::from(translation)];
         // Words set further in than the judgment's are a quotation's. Words closer to their number say nothing: the judgment's
         // own paragraphs may print so among quotations that print as it does (`quoted_runs` reads those by their counts).
         let further = |slot: Slot| place(self.translation[slot.index()]).is_some_and(|own| indent(slot) - own > QUOTED_INDENT);
-        let number_of = |slot: Slot| (self.translation[slot.index()], layout.printed_paragraph_number(&slots.line(pages, slot).text));
+        let number_of = |slot: Slot| (self.translation[slot.index()], printed[slot.index()]);
         // A number no line at the judgment's own place prints is the judgment's, however it stands.
         let standing: HashSet<(bool, Option<usize>)> = numbered.iter().copied().filter(|&slot| !further(slot)).map(number_of).collect();
         let indented: HashSet<Slot> = numbered.iter().copied().filter(|&slot| further(slot) && standing.contains(&number_of(slot))).collect();
@@ -407,7 +412,7 @@ impl Fences {
         let (mut count_of, mut printed_numbers, mut counts) = (vec![[0u16; 2]; slots.len()], [0usize; 2], [0u16; 2]);
         let sequence: [Vec<(Slot, Option<usize>)>; 2] = Stream::BOTH.map(|stream| {
             numbered.iter().copied().filter(|slot| stream_of[slot.index()] == stream)
-                .map(|slot| (slot, layout.printed_paragraph_number(&slots.line(pages, slot).text))).collect()
+                .map(|slot| (slot, printed[slot.index()])).collect()
         });
         let place_in: HashMap<Slot, usize> = sequence.iter().flat_map(|numbers| numbers.iter().enumerate().map(|(place, (slot, _))| (*slot, place))).collect();
         // Notes listed after the reasons in the body's own type open no decision: the reasons' lines call their numbers in
@@ -647,7 +652,8 @@ impl Fences {
                     // the line above it stopped: only a real break lets the last paragraph end before the signatures.
                     let advance = here.bbox[1] - above.bbox[1];
                     let level = (here.bbox[0] - above.bbox[0]).abs() <= here.bbox[3] - here.bbox[1];
-                    let closing = analysis.signature_line(line) || analysis.end_matter(line) || analysis.author_line(line) || analysis.date_line(line) || analysis.disposition_line(line);
+                    // (Asked only where it can tell: after the last number, or under a sentence's end.)
+                    let closing = (to_number[place_in_kept] == usize::MAX || closes) && (analysis.signature_line(line) || analysis.end_matter(line) || analysis.author_line(line) || analysis.date_line(line) || analysis.disposition_line(line));
                     let last_goes_on = to_number[place_in_kept] == usize::MAX && level && !closing && last_advance > 0.0 && advance > 0.0 && advance <= last_advance * 1.15;
                     let same = same || last_goes_on;
                     if level && advance > 0.0 {

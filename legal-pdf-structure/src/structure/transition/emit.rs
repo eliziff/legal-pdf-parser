@@ -281,7 +281,7 @@ pub(crate) fn structure_graph(
         })
     };
     // Nodes, their ranges in scalar characters of the text.
-    let line_range = |k: usize| index.line(&id_of(k)).map(|l| l.range);
+    let line_range = |k: usize| index.line(&ids[k]).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
     // A written page's line set apart keeps the id its line's kind gives it, as the projection reads such lines.
@@ -295,8 +295,6 @@ pub(crate) fn structure_graph(
         }
     }).collect();
     let node_id = |u: usize| unit_ids[u].clone();
-    let claim_of: HashMap<&str, &NotePairClaimV2> = settled.iter().flat_map(|read| &read.claims)
-        .flat_map(|claim| claim.body.line_ids.iter().map(move |id| (id.as_str(), claim))).collect();
     let nothing_decided = Decision::default();
     let decided = Decided::of(pages, slots, fences, &nothing_decided);
     let page_of_line = |k: usize| slots.page(table.order[k]);
@@ -316,9 +314,8 @@ pub(crate) fn structure_graph(
         if unit.region == TABLE && !written {
             continue;
         }
-        // A note no pair materialized is no note of the graph's.
-        let claim = (unit.region == NOTE).then(|| claim_of.get(ids[unit.lines[0]].as_str()).copied()).flatten();
-        if written && unit.region == NOTE && claim.is_none() {
+        // The pairer's notes are written from its claims below.
+        if written && unit.region == NOTE {
             continue;
         }
         let ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
@@ -336,7 +333,6 @@ pub(crate) fn structure_graph(
             "text" if unit.marker.is_some() => (NodeKind::Paragraph, None),
             "provision" => (NodeKind::Section, None),
             "list_item" => (NodeKind::ListItem, None),
-            "note" | "note_quote" if claim.is_some_and(|claim| claim.kind == NoteKindV2::Endnote) => (NodeKind::Endnote, None),
             "note" | "note_quote" => (NodeKind::Footnote, None),
             "title" => (NodeKind::Prose, Some(PrimaryRole::Title)),
             "caption" => (NodeKind::Prose, Some(PrimaryRole::Caption)),
@@ -351,11 +347,10 @@ pub(crate) fn structure_graph(
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
-        node.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&id_of(k)).map(|l| l.page_index)).collect();
+        node.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&ids[k]).map(|l| l.page_index)).collect();
         node.page_indexes.dedup();
         let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
-        let noted = matches!(kind, NodeKind::Footnote | NodeKind::Endnote);
-        if !noted {
+        if kind != NodeKind::Footnote {
             node.marker_range = marker_range;
             // A numbered paragraph is addressed by its number ("par12" for "[12]" or "12."), as every reader labels it.
             node.label = if kind == NodeKind::Paragraph {
@@ -429,28 +424,11 @@ pub(crate) fn structure_graph(
             quote.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
             nodes.push(quote);
         }
-        if let Some(claim) = claim {
-            notes.push(Note {
-                id: claim.pair_id.clone(),
-                node_id: Some(node_id(u)),
-                kind: claim.kind,
-                label_range: claim.label.range,
-                body_range: claim.body.range,
-                label_ranges: vec![claim.label.range],
-                body_ranges: claim.body.ranges.clone(),
-                primary_reference: claim.references.first().map(|reference| reference.range),
-                references: claim.references.iter().map(|reference| NoteReference {
-                    range: reference.range,
-                    anchor: None,
-                    page_indexes: vec![reference.page_index],
-                    line_ids: vec![reference.line_id.clone()],
-                }).collect(),
-            });
-        } else if noted {
+        if kind == NodeKind::Footnote {
             let label_range = marker_range.unwrap_or(ScalarRange { start: range.start, end: range.start });
             let references: Vec<NoteReference> = unit.references.iter().filter_map(|&(k, start, end)| {
                 let range = index.global_range(&id_of(k), start as usize, end as usize)?;
-                Some(NoteReference { range, anchor: None, page_indexes: index.line(&id_of(k)).map(|l| vec![l.page_index]).unwrap_or_default(), line_ids: vec![id_of(k)] })
+                Some(NoteReference { range, anchor: None, page_indexes: index.line(&ids[k]).map(|l| vec![l.page_index]).unwrap_or_default(), line_ids: vec![id_of(k)] })
             }).collect();
             notes.push(Note {
                 id: format!("{}-note", node_id(u)),
@@ -478,6 +456,33 @@ pub(crate) fn structure_graph(
                 }
             }
         }
+    }
+    // The pairer's notes: each claim its node and its note, over the lines it claims, whatever the moves made of them.
+    for (n, claim) in settled.iter().flat_map(|read| &read.claims).enumerate() {
+        let id = format!("transition-note-{:06}", n + 1);
+        let kind = if claim.kind == NoteKindV2::Endnote { NodeKind::Endnote } else { NodeKind::Footnote };
+        let mut node = StructureNode::new(id.clone(), kind, claim.body.range, ORIGIN, Derivation::Heuristic, None);
+        node.ranges = claim.body.ranges.clone();
+        node.line_ids = claim.body.line_ids.clone();
+        node.page_indexes = claim.body.page_indexes.clone();
+        node.grammar = Some("region:note".to_owned());
+        nodes.push(node);
+        notes.push(Note {
+            id: claim.pair_id.clone(),
+            node_id: Some(id),
+            kind: claim.kind,
+            label_range: claim.label.range,
+            body_range: claim.body.range,
+            label_ranges: vec![claim.label.range],
+            body_ranges: claim.body.ranges.clone(),
+            primary_reference: claim.references.first().map(|reference| reference.range),
+            references: claim.references.iter().map(|reference| NoteReference {
+                range: reference.range,
+                anchor: None,
+                page_indexes: vec![reference.page_index],
+                line_ids: vec![reference.line_id.clone()],
+            }).collect(),
+        });
     }
     if written {
         nodes.extend(crate::structure::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
@@ -525,7 +530,7 @@ pub(crate) fn structure_graph(
                 row.ranges = row_ranges.clone();
                 row.row = Some(r + 1);
                 row.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
-                row.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&id_of(k)).map(|l| l.page_index)).collect();
+                row.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&ids[k]).map(|l| l.page_index)).collect();
                 row.page_indexes.dedup();
                 // The row's cells by column.
                 let columns = reader_cells.get(&id_of(unit.lines[0])).map_or(0, |cells| cells.iter().map(|(c, _)| c + 1).max().unwrap_or(0));
@@ -598,7 +603,7 @@ pub(crate) fn structure_graph(
         node.role = Some(PrimaryRole::Furniture);
         node.grammar = Some("region:furniture".to_owned());
         node.ranges = vec![range];
-        node.page_indexes = index.line(&id_of(k)).map(|l| vec![l.page_index]).unwrap_or_default();
+        node.page_indexes = index.line(&ids[k]).map(|l| vec![l.page_index]).unwrap_or_default();
         node.line_ids = vec![id_of(k)];
         nodes.push(node);
     }
@@ -639,13 +644,13 @@ pub(crate) fn structure_graph(
         if matches!(region, "furniture" | "page_label" | "line_label" | "none") || region == "marginal_note" && !written || unit.region == NOTE && written {
             continue;
         }
-        let (text, spans) = joined(unit);
-        let pages_of: Vec<u32> = {
-            let mut found: Vec<u32> = unit.lines.iter().map(|&k| pages[page_of(k)].number).collect();
-            found.dedup();
-            found
-        };
         if unit.region == NOTE {
+            let (text, spans) = joined(unit);
+            let pages_of: Vec<u32> = {
+                let mut found: Vec<u32> = unit.lines.iter().map(|&k| pages[page_of(k)].number).collect();
+                found.dedup();
+                found
+            };
             let reference = unit.references.first().map(|&(k, _, _)| k);
             footnotes.push(Footnote {
                 source_spans: spans,

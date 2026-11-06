@@ -249,10 +249,16 @@ pub(crate) fn weigh(
     }
     for (context, sequence) in sequences.lines.iter().enumerate() {
         let role = &decision.role;
+        let (rule, hearing) = (&decision.rule, decision.hearing);
+        // Heard, a line a marker opens is weighed too, a heading its rival; a paragraph number is fixed.
+        let unsettled = |at: usize| {
+            role[at] == Role::Open
+                || hearing && matches!(rule[at], Rule::Opener | Rule::Caption) && fences.count[at].is_none() && fences.held[at].is_empty()
+        };
         let eligible = |slot: Slot| {
             let at = slot.index();
             let text = line(slot).text.trim();
-            role[at] == Role::Open
+            unsettled(at)
                 && matches!(evidence.tag[at], SourceTag::None | SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
                 && fences.quotation[at] == 0
                 && (1..=160).contains(&text.chars().count())
@@ -443,6 +449,10 @@ pub(crate) fn weigh(
         for (candidate, score) in candidates.iter().zip(score) {
             let heading = !candidate.vetoed && score > 0.0;
             for (n, &slot) in sequence[candidate.lines.clone()].iter().enumerate() {
+                if decision.hearing {
+                    decision.hear_weighed(slot, heading, score as f32, heading && n > 0);
+                    continue;
+                }
                 decision.rule[slot.index()] = Rule::Residual;
                 if heading {
                     decision.role[slot.index()] = Role::Heading;

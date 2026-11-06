@@ -333,32 +333,7 @@ impl LineTable {
                 flag(repeated[k]), flag(fences.cell[at] > 0),
                 flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.translation[at]),
             ]);
-            let mut found = marker_readings(&line.text, evidence.words[at] & WORD_DIVISION != 0);
-            // The markers the grammar reads only once the print's own run-ons are taken apart.
-            for variant in marker_variants(&line.text) {
-                for reading in marker_readings(&variant, false) {
-                    if !found.contains(&reading) {
-                        found.push(reading);
-                    }
-                }
-            }
-            if let Some(text) = recognized.get(&slot) {
-                for reading in marker_readings(text, evidence.words[at] & WORD_DIVISION != 0) {
-                    if !found.contains(&reading) {
-                        found.push(reading);
-                    }
-                }
-            }
-            // A recognized line's marker as each likely misreading of its characters would have it.
-            if line.recognized() {
-                for variant in misread_variants(&line.text, confusions) {
-                    for reading in marker_readings(&variant, evidence.words[at] & WORD_DIVISION != 0) {
-                        if !found.contains(&reading) {
-                            found.push(reading);
-                        }
-                    }
-                }
-            }
+            let found = line_readings(line, evidence.words[at] & WORD_DIVISION != 0, recognized.get(&slot).copied(), confusions);
             let mut marker = [0.0f64; 20];
             if let Some(first) = found.first() {
                 let (word, plain) = match first.family.matches(':').count() {
@@ -393,7 +368,7 @@ impl LineTable {
             }
             readings.push(found);
             references.push(reference_spans(line, evidence.size[at]));
-            look_ids.push(u32::from(evidence.face[at]) << 20 | u32::from(evidence.half_points[at].min(0xffff)) << 4 | u32::from(evidence.look[at] & LOOK_STYLE));
+            look_ids.push(look_id(evidence, at));
         }
         // The lines around each line, and the document's shape.
         let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER.start] > 0.0).count() as f32 / n.max(1) as f32;
@@ -422,22 +397,7 @@ impl LineTable {
             row[at + 5] = (1.0 + n as f32).ln();
             debug_assert_eq!(at + 6, ALL);
         }
-        // The margin's paragraph numbers, each with the lines its number opens: a number the grammar reads, its row's
-        // and twin's lines read in the parse.
-        let place: HashMap<Slot, usize> = order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
-        let mut margin_rows = HashMap::new();
-        let mut margins = HashMap::new();
-        for (k, &slot) in order.iter().enumerate() {
-            let Some(row) = fences.margin_number[slot.index()].and_then(|row| place.get(&row).copied()) else { continue };
-            if readings[k].is_empty() {
-                continue;
-            }
-            let twin = fences.margin_twin[slot.index()].and_then(|twin| place.get(&twin).copied()).filter(|&twin| twin != row);
-            margin_rows.insert(k, (row, twin));
-            for opened in [k, row].into_iter().chain(twin) {
-                margins.insert(opened, k);
-            }
-        }
+        let (margin_rows, margins) = margin_lines(&order, &readings, fences);
         // What t0 decided of each line, for the DOC reader that works from it: its role, the note band, whether the
         // judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the line before in
         // its language, whether it is a margin's number or a line one numbers, and whether it goes on with the line
@@ -461,4 +421,72 @@ impl LineTable {
         }
         Self { order, readings, references, looks: look_ids, features, margin_rows, margins, t0 }
     }
+
+    /// The table with nothing measured: each line's readings, marks, look and margin number, all a reader with no fitted
+    /// scorer asks of it.
+    pub(crate) fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)]) -> Self {
+        let order: Vec<Slot> = fences.order.clone();
+        let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
+        let confusions = HashMap::new();
+        let readings: Vec<Vec<MarkerReading>> = order.iter().map(|&slot| {
+            let word = evidence.words[slot.index()] & WORD_DIVISION != 0;
+            line_readings(slots.line(pages, slot), word, recognized.get(&slot).copied(), &confusions)
+        }).collect();
+        let references = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), evidence.size[slot.index()])).collect();
+        let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
+        let (margin_rows, margins) = margin_lines(&order, &readings, fences);
+        Self { order, readings, references, looks, features: Vec::new(), margin_rows, margins, t0: Vec::new() }
+    }
+}
+
+/// A line's look as one number: its face, half-point size, bold, italic and capitals.
+fn look_id(evidence: &Evidence, at: usize) -> u32 {
+    u32::from(evidence.face[at]) << 20 | u32::from(evidence.half_points[at].min(0xffff)) << 4 | u32::from(evidence.look[at] & LOOK_STYLE)
+}
+
+/// A line's markers as the numbering grammar reads them (`word`: it opens on a division's word): its text's, those of the
+/// print's run-ons taken apart, those of its text as recognized before the repair (`recognized`), and those of each likely
+/// misreading of a recognized line's characters.
+fn line_readings(line: &Line, word: bool, recognized: Option<&str>, confusions: &HashMap<char, Vec<(char, f32)>>) -> Vec<MarkerReading> {
+    let mut found = marker_readings(&line.text, word);
+    let mut add = |readings: Vec<MarkerReading>| {
+        for reading in readings {
+            if !found.contains(&reading) {
+                found.push(reading);
+            }
+        }
+    };
+    for variant in marker_variants(&line.text) {
+        add(marker_readings(&variant, false));
+    }
+    if let Some(text) = recognized {
+        add(marker_readings(text, word));
+    }
+    if line.recognized() {
+        for variant in misread_variants(&line.text, confusions) {
+            add(marker_readings(&variant, word));
+        }
+    }
+    found
+}
+
+/// The margin's paragraph numbers, each with the lines its number opens: a number the grammar reads, its row's and twin's
+/// lines read in the parse. Each number's place with its row's and twin's; and each line a number numbers, and each
+/// number's own line, with the number's place.
+fn margin_lines(order: &[Slot], readings: &[Vec<MarkerReading>], fences: &Fences) -> (HashMap<usize, (usize, Option<usize>)>, HashMap<usize, usize>) {
+    let place: HashMap<Slot, usize> = order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
+    let mut margin_rows = HashMap::new();
+    let mut margins = HashMap::new();
+    for (k, &slot) in order.iter().enumerate() {
+        let Some(row) = fences.margin_number[slot.index()].and_then(|row| place.get(&row).copied()) else { continue };
+        if readings[k].is_empty() {
+            continue;
+        }
+        let twin = fences.margin_twin[slot.index()].and_then(|twin| place.get(&twin).copied()).filter(|&twin| twin != row);
+        margin_rows.insert(k, (row, twin));
+        for opened in [k, row].into_iter().chain(twin) {
+            margins.insert(opened, k);
+        }
+    }
+    (margin_rows, margins)
 }

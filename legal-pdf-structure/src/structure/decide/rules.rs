@@ -64,6 +64,17 @@ impl<'a> Geometry<'a> {
     }
 }
 
+/// A reading a rule gives a line, for the one decision on it (`transition::tier0`): the role, the rule, what the rule
+/// weighs it at where it weighs (the residual's score), and whether the line goes on with the one above it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Heard {
+    pub(crate) slot: Slot,
+    pub(crate) role: Role,
+    pub(crate) rule: Rule,
+    pub(crate) weight: f32,
+    pub(crate) joined: bool,
+}
+
 /// What each line is, by slot: its role, the rule that gave it, the reading of its opening marker
 /// that may open its unit (`readings`) and the unit it opens, whether it goes on with the line above
 /// it in one heading, caption or unit, the level a rule gives it (0 for none) and its heading level
@@ -84,9 +95,13 @@ pub(crate) struct Decision {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) residual: Vec<ResidualRecord>,
     conflicts: Vec<(Rule, Rule, Slot)>,
-    /// Each reading a strong rule gave a line another rule had decided: the machine's candidates beside the line's role.
-    pub(crate) refused: Vec<(Slot, Role, Rule)>,
     pub(crate) sequences: Sequences,
+    /// While the rules are heard (`hear`): no rule's claim keeps another from a line, every line no fence took (`free`)
+    /// is open to each rule, and what each says stands in `heard`. `role` and `rule` hold the first reading of each line
+    /// meanwhile, what a rule asks of the lines around it.
+    pub(crate) hearing: bool,
+    free: Vec<bool>,
+    pub(crate) heard: Vec<Heard>,
 }
 
 /// The one reading of each line's opening marker that may open its unit, as (run, member) indexes,
@@ -154,6 +169,9 @@ impl Decision {
     /// Gives an open line a role by a strong rule; a line another rule decided keeps its own, and
     /// where the roles differ the two rules are noted.
     fn claim(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
+        if self.hearing {
+            return self.hear_rule(slot, role, rule);
+        }
         let at = slot.index();
         if self.role[at] == Role::Open {
             self.role[at] = role;
@@ -162,13 +180,15 @@ impl Decision {
         }
         if self.role[at] != role {
             self.conflicts.push((self.rule[at], rule, slot));
-            self.refused.push((slot, role, rule));
         }
         false
     }
 
     /// Gives an open line a role; a decided line keeps its own.
     fn fill(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
+        if self.hearing {
+            return self.hear_rule(slot, role, rule);
+        }
         let at = slot.index();
         let open = self.role[at] == Role::Open;
         if open {
@@ -179,7 +199,62 @@ impl Decision {
     }
 
     fn open(&self, slot: Slot) -> bool {
+        if self.hearing {
+            return self.free[slot.index()];
+        }
         self.role[slot.index()] == Role::Open
+    }
+
+    /// A rule's reading of a line no fence took, for the one decision on it; the line's first reading stands for the
+    /// rules that ask what is around them.
+    fn hear_rule(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
+        let at = slot.index();
+        if !self.free[at] {
+            return false;
+        }
+        self.heard.push(Heard { slot, role, rule, weight: 0.0, joined: false });
+        if self.role[at] == Role::Open {
+            self.role[at] = role;
+            self.rule[at] = rule;
+        }
+        true
+    }
+
+    /// The reading just heard goes on with the line above it, or does not.
+    fn heard_joined(&mut self, joined: bool) {
+        if self.hearing {
+            if let Some(last) = self.heard.last_mut() {
+                last.joined = joined;
+            }
+        }
+    }
+
+    /// The residual's reading of a line, at its score.
+    pub(crate) fn hear_weighed(&mut self, slot: Slot, heading: bool, weight: f32, joined: bool) {
+        let role = if heading { Role::Heading } else { Role::Open };
+        self.heard.push(Heard { slot, role, rule: Rule::Residual, weight, joined });
+    }
+
+    /// The one decision on a line: `winner` its reading, the unit, level and anchor only its rule gave standing, the
+    /// strong readings it beat (`others`) noted as disagreements. No winner leaves it open.
+    pub(crate) fn settle_line(&mut self, slot: Slot, winner: Option<Heard>, others: &[Heard]) {
+        let at = slot.index();
+        let rule = winner.map_or(Rule::None, |heard| heard.rule);
+        self.role[at] = winner.map_or(Role::Open, |heard| heard.role);
+        self.rule[at] = rule;
+        self.joined[at] = winner.is_some_and(|heard| heard.joined);
+        if !matches!(rule, Rule::Opener | Rule::Caption) {
+            self.unit[at] = None;
+        }
+        if !matches!(rule, Rule::Anchor | Rule::TranscriptPart) {
+            self.given[at] = 0;
+        }
+        if rule != Rule::Anchor {
+            self.anchor[at] = 0;
+        }
+        for other in others.iter().filter(|other| other.role != Role::Open && other.role != self.role[at]) {
+            self.conflicts.push((rule, other.rule, slot));
+        }
     }
 
     /// Every line of the document's pages decided, measured (`evidence`), fenced and ordered
@@ -195,6 +270,44 @@ impl Decision {
         outline: &[PdfOutlineEntry],
         traced: bool,
     ) -> Self {
+        let geometry = Geometry::of(pages);
+        let mut decision = Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, &geometry, traced, false);
+        decision.finish(pages, slots, evidence, fences, runs, &geometry);
+        decision
+    }
+
+    /// The rules heard, none deciding: every reading each gives a line no fence took, in `heard`, for the one decision on
+    /// each line; `finish` follows it.
+    pub(crate) fn hear(
+        analysis: &dyn StructureAnalysis,
+        pages: &[Page],
+        slots: &Slots,
+        evidence: &Evidence,
+        fences: &Fences,
+        runs: &Runs,
+        notes: &Notes,
+        outline: &[PdfOutlineEntry],
+        geometry: &Geometry,
+        traced: bool,
+    ) -> Self {
+        Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, geometry, traced, true)
+    }
+
+    /// The rules up to and through the residual.
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        analysis: &dyn StructureAnalysis,
+        pages: &[Page],
+        slots: &Slots,
+        evidence: &Evidence,
+        fences: &Fences,
+        runs: &Runs,
+        notes: &Notes,
+        outline: &[PdfOutlineEntry],
+        geometry: &Geometry,
+        traced: bool,
+        hearing: bool,
+    ) -> Self {
         let count = slots.len();
         let mut decision = Self {
             role: fences.role.clone(),
@@ -205,9 +318,10 @@ impl Decision {
             given: vec![0; count],
             level: vec![0; count],
             anchor: vec![0; count],
+            hearing,
+            free: if hearing { fences.role.iter().map(|role| *role == Role::Open).collect() } else { Vec::new() },
             ..Self::default()
         };
-        let geometry = Geometry::of(pages);
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
         let mut sequences = Sequences { lines: vec![Vec::new(); fences.contexts.len()], at: vec![u32::MAX; count] };
         // Each document a transcript of whose witnesses are named.
@@ -241,7 +355,6 @@ impl Decision {
             } else if notes.note[at].is_some() {
                 if beside_numbers {
                     decision.conflicts.push((Rule::TranscriptLine, Rule::NoteBand, slot));
-                    decision.refused.push((slot, Role::Note, Rule::NoteBand));
                 } else {
                     decision.claim(slot, Role::Note, Rule::NoteBand);
                 }
@@ -295,13 +408,22 @@ impl Decision {
         }
         decision.read_runs(pages, slots, evidence, fences, runs, &sequences);
         decision.marginal_notes(analysis, pages, slots, evidence, fences, runs, &sequences);
-        let anchoring = anchors(pages, slots, evidence, fences, &geometry, &decision.role, outline, &fences.contents_entries);
+        // Heard, the outline names a line a marker opens as well as any other.
+        let named: Vec<Role> = if hearing {
+            (0..count).map(|at| if matches!(decision.rule[at], Rule::Opener | Rule::Caption) { Role::Open } else { decision.role[at] }).collect()
+        } else {
+            Vec::new()
+        };
+        let anchoring = anchors(pages, slots, evidence, fences, geometry, if hearing { &named } else { &decision.role }, outline, &fences.contents_entries);
         for (index, anchor) in anchoring.anchors.iter().enumerate() {
             for (k, &slot) in anchor.lines.iter().enumerate() {
-                decision.claim(slot, Role::Heading, Rule::Anchor);
+                let spoke = decision.claim(slot, Role::Heading, Rule::Anchor);
                 decision.anchor[slot.index()] = index as u32 + 1;
                 decision.given[slot.index()] = anchor.level.min(u16::from(u8::MAX)) as u8;
                 decision.joined[slot.index()] |= k > 0;
+                if spoke {
+                    decision.heard_joined(k > 0);
+                }
             }
         }
         decision.anchors = anchoring.anchors;
@@ -317,32 +439,39 @@ impl Decision {
                         && place <= fences.place[slot.index()]
                 })
         };
-        weigh(analysis, pages, slots, evidence, fences, &sequences, &geometry, &unnamed, &mut decision, traced);
-        decision.title(pages, slots, evidence, fences, &sequences, &geometry);
+        weigh(analysis, pages, slots, evidence, fences, &sequences, geometry, &unnamed, &mut decision, traced);
+        decision.sequences = sequences;
+        decision
+    }
+
+    /// What follows the rules: the title among the headings, the counted markers no rule settled, the rest body, the
+    /// headings' levels and the disagreements.
+    pub(crate) fn finish(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry) {
+        let sequences = std::mem::take(&mut self.sequences);
+        self.title(pages, slots, evidence, fences, &sequences, geometry);
         // A counted marker no rule settled opens the unit its reading reads, the line carrying its
         // text going on with it; every other line is body, or a quotation's.
-        for at in 0..count {
-            let Some((r, k)) = decision.reading[at] else { continue };
+        for at in 0..self.role.len() {
+            let Some((r, k)) = self.reading[at] else { continue };
             let member = &runs.runs[r as usize].members[k as usize];
             let Some(kind) = member.kind else { continue };
             let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
-            if decision.unit[at].is_none() && decision.fill(member.slot, role, Rule::Opener) {
-                decision.unit[at] = Some((r, kind));
-                decision.join(member.text, role, Rule::Opener);
+            if self.unit[at].is_none() && self.fill(member.slot, role, Rule::Opener) {
+                self.unit[at] = Some((r, kind));
+                self.join(member.text, role, Rule::Opener);
             }
         }
-        for at in 0..count {
-            if decision.role[at] == Role::Open {
-                decision.role[at] = if fences.quotation[at] != 0 { Role::Quote } else { Role::Body };
-                if decision.rule[at] == Rule::None {
-                    decision.rule[at] = Rule::Body;
+        for at in 0..self.role.len() {
+            if self.role[at] == Role::Open {
+                self.role[at] = if fences.quotation[at] != 0 { Role::Quote } else { Role::Body };
+                if self.rule[at] == Rule::None {
+                    self.rule[at] = Rule::Body;
                 }
             }
         }
-        heading_levels(pages, slots, evidence, fences, &sequences, &geometry, &mut decision);
-        decision.report(pages, slots);
-        decision.sequences = sequences;
-        decision
+        heading_levels(pages, slots, evidence, fences, &sequences, geometry, self);
+        self.report(pages, slots);
+        self.sequences = sequences;
     }
 
     /// The rules each run settles: a quotation's numbers open nothing; three or more titles alone,
@@ -426,7 +555,7 @@ impl Decision {
                     continue;
                 }
                 let Some(kind) = member.kind else { continue };
-                if self.rule[at] == Rule::HistoryHeading || self.rule[at] == Rule::TitleOnly {
+                if !self.hearing && (self.rule[at] == Rule::HistoryHeading || self.rule[at] == Rule::TitleOnly) {
                     continue;
                 }
                 if member.carries_prose {
@@ -470,6 +599,9 @@ impl Decision {
         if let Some(text) = text {
             let filled = self.fill(text, role, rule);
             self.joined[text.index()] |= filled;
+            if filled {
+                self.heard_joined(true);
+            }
         }
     }
 
@@ -639,6 +771,7 @@ impl Decision {
                 for (k, &slot) in caption.iter().enumerate() {
                     if self.claim(slot, Role::MarginalNote, Rule::MarginalNote) {
                         self.joined[slot.index()] = k > 0;
+                        self.heard_joined(k > 0);
                         decided.push(slot);
                     }
                 }

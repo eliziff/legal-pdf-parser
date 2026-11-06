@@ -1,15 +1,16 @@
-//! Tier 0 as the machine's reader: the document's lines read by the rules (`decide`), every reading a rule gave a line
-//! a candidate in one decision on that line, the scorer compiled in (no fitted file, no environment), and the moves
-//! the decided lines make written by `emit`. It is chosen by `Reader::Machine`, in the request; `Reader::Stages` stays
-//! the default until this reader matches it by mode.
+//! Tier 0 as the machine's reader: every rule heard on every line, one decision on each line, the scorer compiled in (no
+//! fitted file, no environment), and the moves the decided lines make written by `emit`. It is chosen by `Reader::Machine`,
+//! in the request; `Reader::Stages` stays the default until this reader matches it by mode.
 //!
 //! What it reads, in order:
-//! - the notes and the rules (`Notes::read`, `Decision::decide`): each line's standing reading, and the readings of
-//!   strong rules that came second on it (`Decision::refused`);
-//! - one decision on each line two rules read differently (`settle`), in reading order against what is open
-//!   (`machine::State`): whether a marker counts on, whether a note's number is the next or answers a mark the body set,
-//!   what the rule itself is worth. Paragraph numbers stand outside it: a line the judgment reader counts or holds
-//!   (`Fences::count`, `Fences::held`) keeps its reading, and `read_judgment_paragraphs` writes them as t0 does;
+//! - the notes (`Notes::read`), and the rules heard (`Decision::hear`): no rule's reading keeps another's from a line, and
+//!   the residual weighs a line a marker opens as it weighs an open one;
+//! - one decision on each line (`settle`), in reading order against what is open (`machine::State`): each reading worth
+//!   what its rule is worth (`worth`, in the order the stages took their turns, the residual at its score), and where
+//!   readings compete, how each fits the numbering and the notes open (`fit`). Paragraph numbers stand outside it: a line
+//!   the judgment reader counts or holds (`Fences::count`, `Fences::held`) goes by its rules' worth alone, the residual
+//!   does not weigh it, and `read_judgment_paragraphs` writes the numbers as t0 does;
+//! - what follows the decision (`Decision::finish`): the title, the levels;
 //! - the decided lines written (`write_lines`), their regions built, their notes paired (`note_pairing`), the pairer's
 //!   pairs fixed input to the moves, as paragraph numbers are;
 //! - the moves (`moves_of`): each of the document's reading regions a unit, each note a unit, each line set apart a
@@ -19,10 +20,6 @@ use super::emit::Settled;
 use super::*;
 use legal_structure_model::UnitRole;
 
-/// What a reading is worth over the others on its line, before the state speaks: the reading standing keeps a tie.
-const STANDING: f32 = 0.5;
-/// A line the document's outline names, or a notes heading: the reading's own word.
-const OWN_WORD: f32 = 0.75;
 /// A marker going on from the number open in its family.
 const COUNTS_ON: f32 = 1.0;
 /// A marker opening a count at one.
@@ -35,6 +32,30 @@ const ANSWERS: f32 = 1.5;
 const NEXT_NOTE: f32 = 1.0;
 /// A note's number neither.
 const STRAY_NOTE: f32 = -0.5;
+
+/// What a rule's reading is worth before the state speaks: the order the stages take their turns, near enough that a
+/// count or a note's number can tip two neighbours. A line a bookmark names stands just under a marker, and a heading the
+/// residual weighs at its score over the worth of body.
+fn worth(heard: &Heard, chosen: &Move) -> f32 {
+    match heard.rule {
+        _ if heard.role == Role::Open => 0.0,
+        Rule::EndnoteHead => 12.0,
+        Rule::NotesHeading => 11.0,
+        Rule::NoteBand if chosen.note.is_some() => 7.75,
+        Rule::NoteBand => 8.75,
+        Rule::HistoryHeading => 7.7,
+        Rule::TranscriptPart => 7.65,
+        Rule::QuotedNumber => 7.6,
+        Rule::TitleOnly => 7.5,
+        Rule::Opener | Rule::Caption => 7.0,
+        Rule::DivisionHeading | Rule::Ladder => 6.9,
+        Rule::MarginalNote => 6.8,
+        Rule::Anchor => 6.75,
+        Rule::HistoryLine | Rule::TranscriptLine | Rule::FrontMatter => 4.0,
+        Rule::Residual => 3.0 + heard.weight,
+        _ => 0.0,
+    }
+}
 
 /// A move making nothing but its region and whether it opens.
 fn plain(region: u8, opens: bool) -> Move {
@@ -66,7 +87,6 @@ fn region_of(role: Role, kind: Option<UnitRole>) -> u8 {
 /// Each line as the state reads it, in reading order. No fitted reader runs here, so nothing asks for its stylesheet or
 /// its words' tables.
 fn line_views<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable) -> Vec<LineView<'a>> {
-    let left = LINE_FEATURES.iter().position(|name| *name == "x0").unwrap_or(0);
     (0..table.order.len())
         .map(|k| {
             let slot = table.order[k];
@@ -93,7 +113,7 @@ fn line_views<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
                 regime: [0.0; 4],
                 title_key: String::new(),
                 contents_title: None,
-                left: table.row(k)[left],
+                left: 0.0,
                 page: slots.page(slot) as u32,
                 margin: table.margins.get(&k).and_then(|&margin| Some((margin as u32, table.readings[margin].first()?))),
                 count: fences.count[at],
@@ -164,52 +184,56 @@ fn fit(state: &State, view: &LineView, chosen: &Move) -> f32 {
     score
 }
 
-/// One decision on each line two strong rules read differently, in reading order: the reading standing and those refused
-/// weighed on the same terms, the state moved by the winner. A line whose paragraph number the judgment reader counts or
-/// holds stays as it stands. Headings' levels are read again where a line changed.
-fn settle(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &mut Decision) {
-    if decision.refused.is_empty() || legal_structure_model::ablated("machine_fit") {
-        return;
-    }
-    let mut refused: HashMap<usize, Vec<(Role, Rule)>> = HashMap::new();
-    for &(slot, role, rule) in &decision.refused {
-        refused.entry(slot.index()).or_default().push((role, rule));
-    }
+/// One decision on each line no fence took, in reading order: its readings each worth its rule's word (`worth`), and where
+/// more than one speaks and no paragraph number is at stake, how it fits what is open (`fit`); the state moved by the
+/// winner. A heading the residual weighed over several lines goes on only from its own first line: where that line went
+/// another way, the rest stand as they would alone. A line no rule read stays open, for `Decision::finish`.
+fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &mut Decision) {
+    let weighing = !legal_structure_model::ablated("machine_fit");
+    let mut heard = std::mem::take(&mut decision.heard);
+    heard.sort_by_key(|reading| reading.slot);
     let mut state = State::default();
-    let mut changed = false;
+    let mut starts = vec![0u32; decision.role.len() + 1];
+    for reading in &heard {
+        starts[reading.slot.index() + 1] += 1;
+    }
+    for at in 1..starts.len() {
+        starts[at] += starts[at - 1];
+    }
+    // Each reading context: whether its last line is a heading the residual weighed.
+    let mut weighed = vec![false; fences.contexts.len()];
     for (k, view) in views.iter().enumerate() {
-        let at = table.order[k].index();
-        let kind = decision.unit[at].map(|unit| unit.1);
-        let standing = candidate(view, runs, decision.role[at], kind, decision.reading[at], decision.level[at], decision.joined[at]);
-        let mut chosen = standing;
-        if fences.count[at].is_none() && fences.held[at].is_empty() {
-            if let Some(others) = refused.get(&at) {
-                let opens = |rule: Rule| matches!(rule, Rule::Opener | Rule::Caption);
-                let member_kind = decision.reading[at].and_then(|(run, member)| runs.runs[run as usize].members[member as usize].kind);
-                let mut best = STANDING + fit(&state, view, &standing);
-                for &(role, rule) in others {
-                    let kind = member_kind.filter(|_| opens(rule));
-                    let other = candidate(view, runs, role, kind, decision.reading[at], decision.given[at], false);
-                    let own = if matches!(rule, Rule::Anchor | Rule::NotesHeading) { OWN_WORD } else { 0.0 };
-                    let score = own + fit(&state, view, &other);
-                    if score > best {
-                        best = score;
-                        chosen = other;
-                        decision.role[at] = role;
-                        decision.rule[at] = rule;
-                        decision.unit[at] = kind.zip(decision.reading[at]).map(|(kind, (run, _))| (run, kind));
-                        changed = true;
-                    }
+        let slot = table.order[k];
+        let at = slot.index();
+        let chosen = if fences.role[at] == Role::Open {
+            let context = usize::from(fences.ctx[at]);
+            let readings: Vec<Heard> = heard[starts[at] as usize..starts[at + 1] as usize].iter().copied()
+                .filter(|reading| !(reading.rule == Rule::Residual && reading.joined && !weighed[context]))
+                .collect();
+            let fixed = fences.count[at].is_some() || !fences.held[at].is_empty();
+            let competing = readings.iter().filter(|reading| reading.role != Role::Open).count() > 1;
+            let member_kind = decision.reading[at].and_then(|(run, member)| runs.runs[run as usize].members[member as usize].kind);
+            let mut winner: Option<(Heard, Move, f32)> = None;
+            for reading in &readings {
+                let kind = member_kind.filter(|_| matches!(reading.rule, Rule::Opener | Rule::Caption));
+                let chosen = candidate(view, runs, reading.role, kind, decision.reading[at], decision.given[at], reading.joined);
+                let mut score = worth(reading, &chosen);
+                if weighing && competing && !fixed {
+                    score += fit(&state, view, &chosen);
+                }
+                if winner.as_ref().is_none_or(|(_, _, best)| score > *best) {
+                    winner = Some((*reading, chosen, score));
                 }
             }
-        }
+            decision.settle_line(slot, winner.as_ref().map(|(reading, ..)| *reading), &readings);
+            weighed[context] = winner.as_ref().is_some_and(|(reading, ..)| reading.rule == Rule::Residual && reading.role == Role::Heading);
+            winner.map_or_else(|| plain(TEXT, false), |(_, chosen, _)| chosen)
+        } else {
+            candidate(view, runs, decision.role[at], None, None, 0, false)
+        };
         state.apply(view, &chosen);
     }
-    if changed {
-        let sequences = std::mem::take(&mut decision.sequences);
-        heading_levels(pages, slots, evidence, fences, &sequences, &Geometry::of(pages), decision);
-        decision.sequences = sequences;
-    }
+    decision.hearing = false;
 }
 
 /// The moves of the written document. Each reading region (`reading_regions`) is a unit: its first line opens it, on its
@@ -221,8 +245,20 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     let mut opened = HashMap::new();
+    // The pairer's lines are its notes', a line it took from the body among them.
+    for note in notes {
+        let places: Vec<usize> = note.body_line_ids.iter().filter_map(|id| place(id)).collect();
+        let Some(&first) = places.iter().min() else { continue };
+        for &k in &places {
+            moves[k] = Some(if k == first {
+                Move { note: Some(note.label.parse().unwrap_or(0)), ..plain(NOTE, true) }
+            } else {
+                Move { resumes: Some(first as u32), ..plain(NOTE, false) }
+            });
+        }
+    }
     for (_, _, lines) in regions {
-        let places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).collect();
+        let places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
         let Some(&first) = places.iter().min() else { continue };
         let at = table.order[first].index();
         // A line of the note band the pairer gave back is the body's.
@@ -242,17 +278,6 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
         opening.opens = true;
         for &k in &places {
             moves[k] = Some(if k == first { opening } else { Move { resumes: Some(first as u32), ..plain(opening.region, false) } });
-        }
-    }
-    for note in notes {
-        let places: Vec<usize> = note.body_line_ids.iter().filter_map(|id| place(id)).collect();
-        let Some(&first) = places.iter().min() else { continue };
-        for &k in &places {
-            moves[k] = Some(if k == first {
-                Move { note: Some(note.label.parse().unwrap_or(0)), ..plain(NOTE, true) }
-            } else {
-                Move { resumes: Some(first as u32), ..plain(NOTE, false) }
-            });
         }
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
@@ -294,13 +319,15 @@ pub(crate) fn output(
     trace: Option<&Path>,
 ) -> Result<StructureOutput> {
     let mut notes = Notes::read(analysis, pages, slots, evidence, &fences, runs);
-    let mut decision = Decision::decide(analysis, pages, slots, evidence, &fences, runs, &notes, outline, trace.is_some());
+    let geometry = Geometry::of(pages);
+    let mut decision = Decision::hear(analysis, pages, slots, evidence, &fences, runs, &notes, outline, &geometry, trace.is_some());
+    let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before);
+    let views = line_views(pages, slots, evidence, &fences, &table);
+    settle(&fences, runs, &table, &views, &mut decision);
+    decision.finish(pages, slots, evidence, &fences, runs, &geometry);
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);
-    let table = LineTable::read(pages, slots, evidence, &fences, &runs.before, &HashMap::new());
-    let views = line_views(pages, slots, evidence, &fences, &table);
-    settle(pages, slots, evidence, &fences, runs, &table, &views, &mut decision);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
