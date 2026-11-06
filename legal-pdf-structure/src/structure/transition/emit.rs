@@ -416,12 +416,12 @@ pub(crate) fn structure_graph(
             format!("region:{region}")
         });
         // Its level or depth as the parser reads it, the outline's own: a heading two levels under the
-        // one before stays two under, though no heading stands between them in the tree. (Written, a heading's level is the
-        // tree's, as tier 0's outline nests it.)
+        // one before stays two under, though no heading stands between them in the tree. (Written, both are the tree's, as
+        // tier 0's outline nests them.)
         if unit.level > 0 && !written {
             node.markup_attributes.insert("heading_level".to_owned(), unit.level.to_string());
         }
-        if unit.depth > 0 {
+        if unit.depth > 0 && !written {
             node.markup_attributes.insert("depth".to_owned(), unit.depth.to_string());
         }
         nodes.push(node);
