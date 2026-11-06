@@ -86,7 +86,7 @@ pub(crate) struct Runs {
 /// language with its lines in reading order (`repair_label_dropouts`): each rewritten line's slot
 /// and its text before. The repair reads a fenced running head or folio as the page's head or
 /// foot, a line label as one, and a line under the note separator as a note's.
-fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Slot, String)> {
+fn repair_markers(analysis: &dyn StructureAnalysis, pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Slot, String)> {
     if !pages.iter().flat_map(|page| &page.lines).any(Line::recognized) {
         return Vec::new();
     }
@@ -139,7 +139,7 @@ fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Sl
             ));
             view.last_mut().expect("a page for the line").lines.push(line);
         }
-        layout_analysis().repair_label_dropouts(&mut view);
+        analysis.repair_label_dropouts(&mut view);
         for (mut line, (slot, region, mode, order, text)) in view.into_iter().flat_map(|page| page.lines).zip(held) {
             line.region_type = region;
             line.note_region_mode = mode;
@@ -316,6 +316,7 @@ fn part_at_paragraphs(runs: Vec<StructureCandidateRun>, view: &View, evidence: &
 /// What each line of a reading context shows of a marker on it: the context's view, the pages'
 /// measures, and the lines a marker of the view opens (`marked`, by slot).
 struct Lines<'a> {
+    analysis: &'a dyn StructureAnalysis,
     pages: &'a [Page],
     slots: &'a Slots,
     evidence: &'a Evidence,
@@ -430,7 +431,7 @@ impl Lines<'_> {
         let opening = run.grammar == CandidateGrammar::Hierarchy && candidate.parent_candidate_id.is_none();
         let prose = run.grammar == CandidateGrammar::Enumerator
             && candidate.label.ends_with('.')
-            && (continued || candidate.label == "v." && layout_analysis().has_citation_signal(&line.text));
+            && (continued || candidate.label == "v." && self.analysis.has_citation_signal(&line.text));
         if cited || prose || opening && continued {
             observe(CandidateObservationV2::CrossReference);
         }
@@ -492,11 +493,11 @@ impl Runs {
     /// The runs of every reading context of the document's pages, measured (`evidence`) and fenced
     /// and ordered (`fences`), each marker resolved to the unit it opens; and, once the statute's
     /// spine is read, its running heads naming its sections fenced (`confirm_section_heads`).
-    pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Self> {
-        let repaired = legal_pdf_support::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
+    pub(crate) fn read(analysis: &dyn StructureAnalysis, pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Self> {
+        let repaired = legal_pdf_support::profile::measure("runs.repair", || repair_markers(analysis, pages, slots, fences));
         let pages: &[Page] = pages;
-        evidence.reread(pages, slots, &repaired);
-        fences.read_numbers(pages, slots, evidence, !repaired.is_empty());
+        evidence.reread(analysis, pages, slots, &repaired);
+        fences.read_numbers(analysis, pages, slots, evidence, !repaired.is_empty());
         // A paragraph number in the margin stands beside the line of its row it numbers, as one printed line
         // (`Fences::read_margin_numbers`): the numbering reads it opening that line, not ending the one before.
         for (at, row) in fences.margin_number.iter().enumerate() {
@@ -524,7 +525,7 @@ impl Runs {
         for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
             let view = View::of(pages, slots, evidence, lines);
             let found = legal_pdf_support::profile::measure("candidates.detect", || {
-                legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true)
+                analysis.detect_structure_candidate_runs(&view.text, true)
             });
             // A provision ladder under one worded top-level marker that goes on with the sentence
             // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
@@ -547,7 +548,7 @@ impl Runs {
             let found = part_at_paragraphs(found, &view, evidence, fences);
             let marked: HashSet<Slot> =
                 found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
-            let shown = Lines { pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
+            let shown = Lines { analysis, pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
             let readings: Vec<Vec<Reading>> = found
                 .iter()
                 .map(|run| {
@@ -581,7 +582,7 @@ impl Runs {
                 })
                 .collect();
             let roles = legal_pdf_support::profile::measure("runs.resolve", || {
-                legal_structure_model::structure_analysis().resolve_candidates(&found, &candidate_evidence)
+                analysis.resolve_candidates(&found, &candidate_evidence)
             })
             .map_err(|error| Error::Message(error.to_string()))?;
             let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> =
@@ -669,7 +670,7 @@ impl Runs {
             {
                 spine[slots.page(member.slot)].push(member.value);
             }
-            fences.confirm_section_heads(pages, slots, evidence, |page, number| spine[page].contains(&number));
+            fences.confirm_section_heads(analysis, pages, slots, evidence, |page, number| spine[page].contains(&number));
         }
         Ok(Self { runs, edits, before: repaired })
     }

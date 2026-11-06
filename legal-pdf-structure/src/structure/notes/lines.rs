@@ -32,10 +32,10 @@ pub(crate) fn structural_reset_heading(text: &str) -> bool {
     .is_match(text.trim())
 }
 
-pub(crate) fn citation_shaped_candidate(page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
+pub(crate) fn citation_shaped_candidate(analysis: &dyn StructureAnalysis, page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
     let line = &page.lines[candidate.0];
     let tail = scalar_suffix(&line.text, candidate.1.end);
-    layout_analysis().is_citation_shaped_tail(tail)
+    analysis.is_citation_shaped_tail(tail)
 }
 
 pub(crate) fn longest_label_run(values: &[u32]) -> usize {

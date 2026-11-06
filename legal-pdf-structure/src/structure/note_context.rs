@@ -184,6 +184,7 @@ pub(super) fn unmatched_reference_diagnostics(
 }
 
 pub(super) fn attach_crossrefs(
+    analysis: &dyn StructureAnalysis,
     footnotes: &mut [Footnote],
     diagnostics: &mut Vec<Diagnostic>,
     decided: &Decided,
@@ -244,7 +245,7 @@ pub(super) fn attach_crossrefs(
                 source_pair_id: footnote.pair_id.clone(),
                 kind,
                 number,
-                shortform: layout_analysis().crossref_short_form(&footnote.body, found.start()),
+                shortform: analysis.crossref_short_form(&footnote.body, found.start()),
                 start,
                 end,
                 resolved: !target_pair_id.is_empty(),

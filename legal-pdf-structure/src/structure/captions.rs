@@ -3,7 +3,8 @@
 //! naming the case by its citation. The decision reads them as front matter, never headings.
 
 use super::party_label;
-use legal_pdf_core::{layout_analysis, CitationSpan, Line};
+use legal_pdf_core::{CitationSpan, Line};
+use legal_structure_model::StructureAnalysis;
 
 /// A caption's labelled field.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,21 +67,21 @@ pub(super) fn closing(text: &str) -> bool {
         || text.starts_with("reasons for decision")
 }
 
-fn numbered_start(marker: &str) -> bool {
-    layout_analysis()
+fn numbered_start(analysis: &dyn StructureAnalysis, marker: &str) -> bool {
+    analysis
         .numbering_marker(marker, None)
         .is_some_and(|marker| marker.ordinal == 1)
 }
 
-pub(super) fn reasons(line: &Line) -> bool {
+pub(super) fn reasons(analysis: &dyn StructureAnalysis, line: &Line) -> bool {
     let value = line.text.trim();
-    if value.starts_with('[') && value.ends_with(']') && numbered_start(value) {
+    if value.starts_with('[') && value.ends_with(']') && numbered_start(analysis, value) {
         return true;
     }
     let Some((marker, text)) = value.split_once(char::is_whitespace) else {
         return false;
     };
-    text.trim().chars().count() >= 24 && numbered_start(marker)
+    text.trim().chars().count() >= 24 && numbered_start(analysis, marker)
 }
 
 /// A dedicated citation line can name the case; a reference inside another field cannot.

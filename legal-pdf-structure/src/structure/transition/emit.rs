@@ -11,8 +11,20 @@
 //! gold's own hierarchy rule (the engine's `assemble_parents`).
 
 use super::*;
-use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NoteReference, Origin, PrimaryRole, Scope, StructureNode};
+use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NotePairClaimV2, NoteReference, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
 
+/// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
+/// its notes the pairer's: their claims, their reference marks by line, the projection's notes, the claims left aside;
+/// and the run member each unit opens on, by the unit's first line (`runs`).
+pub(crate) struct Settled<'a> {
+    pub(crate) index: &'a PdfTextIndex,
+    pub(crate) claims: Vec<NotePairClaimV2>,
+    pub(crate) anchors: &'a HashMap<String, Vec<legal_pdf_core::Anchor>>,
+    pub(crate) footnotes: Vec<Footnote>,
+    pub(crate) diagnostics: Vec<StructureDiagnostic>,
+    pub(crate) runs: &'a Runs,
+    pub(crate) opened: HashMap<usize, (u32, u32)>,
+}
 
 struct Unit {
     region: u8,
@@ -81,7 +93,7 @@ pub(super) fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
 }
 
 /// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
-/// paragraphs and footnotes the projection reads.
+/// paragraphs and footnotes the projection reads. With `settled`, what tier 0 wrote and paired before its moves stands.
 pub(crate) fn structure_graph(
     pages: &mut [Page],
     slots: &Slots,
@@ -91,35 +103,46 @@ pub(crate) fn structure_graph(
     views: &[LineView],
     moves: &[Move],
     identity: &StructureIdentity,
+    mut settled: Option<Settled>,
 ) -> Result<(DocumentStructure, Vec<Paragraph>, Vec<Footnote>)> {
-    // The text runs in the parser's reading order, and each page's regions are its lines' regions as
-    // the parser reads them: furniture and page labels the page's header above its middle, its
-    // footer below.
-    for (k, &slot) in table.order.iter().enumerate() {
-        let height = pages[slots.page(slot)].height.max(1.0);
-        let line = slots.line_mut(pages, slot);
-        line.reading_order = k as _;
-        let low = (line.bbox[1] + line.bbox[3]) / 2.0 > height / 2.0;
-        line.region_type = match REGIONS[usize::from(moves[k].region)] {
-            "line_label" => "line_label",
-            "furniture" | "page_label" if low => "footer",
-            "furniture" | "page_label" => "header",
-            "note" | "note_quote" => "footnote",
-            "heading" => "heading",
-            "title" => "title",
-            "marginal_note" => "marginal_note",
-            _ => "body",
+    let written = settled.is_some();
+    if !written {
+        // The text runs in the parser's reading order, and each page's regions are its lines' regions as
+        // the parser reads them: furniture and page labels the page's header above its middle, its
+        // footer below.
+        for (k, &slot) in table.order.iter().enumerate() {
+            let height = pages[slots.page(slot)].height.max(1.0);
+            let line = slots.line_mut(pages, slot);
+            line.reading_order = k as _;
+            let low = (line.bbox[1] + line.bbox[3]) / 2.0 > height / 2.0;
+            line.region_type = match REGIONS[usize::from(moves[k].region)] {
+                "line_label" => "line_label",
+                "furniture" | "page_label" if low => "footer",
+                "furniture" | "page_label" => "header",
+                "note" | "note_quote" => "footnote",
+                "heading" => "heading",
+                "title" => "title",
+                "marginal_note" => "marginal_note",
+                _ => "body",
+            }
+            .to_owned();
         }
-        .to_owned();
-    }
-    // The reading's order of each page's lines, where the parse reads them in its own.
-    for (k, chosen) in moves.iter().enumerate() {
-        if let Some(rank) = chosen.rank {
-            slots.line_mut(pages, table.order[k]).reading_order = rank as usize;
+        // The reading's order of each page's lines, where the parse reads them in its own.
+        for (k, chosen) in moves.iter().enumerate() {
+            if let Some(rank) = chosen.rank {
+                slots.line_mut(pages, table.order[k]).reading_order = rank as usize;
+            }
         }
+        build_regions(pages);
     }
-    build_regions(pages);
-    let index = PdfTextIndex::from_pages(pages);
+    let built;
+    let index = match &settled {
+        Some(read) => read.index,
+        None => {
+            built = PdfTextIndex::from_pages(pages);
+            &built
+        }
+    };
     let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let text_of = |k: usize| texts[k].clone();
@@ -130,34 +153,27 @@ pub(crate) fn structure_graph(
     // whether it opens a constituent document.
     let mut state = State::default();
     let mut units: Vec<Unit> = Vec::new();
-    let mut open: HashMap<(u16, usize), usize> = HashMap::new();
-    // The last unit of each region in each context's stream, which a line may resume.
-    let mut region_unit: HashMap<(u16, usize, u8), usize> = HashMap::new();
-    // Each unit by its first line, which a line names to go on with it.
+    let mut streams = Streams::default();
+    // Each unit by its first line.
     let mut unit_at: HashMap<usize, usize> = HashMap::new();
-    // The lines the parser opened a constituent document on; a start on a line of no region passes to
-    // the next unit.
+    // The lines the parser opened a constituent document on; a start on a line of no region passes to the next unit.
     let mut started: Vec<usize> = Vec::new();
-    let mut pending_start = false;
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let made = state.apply(line, chosen);
         if chosen.starts {
             started.push(k);
-            pending_start = true;
         }
         if chosen.region == 0 {
             continue;
         }
         let key = (state.ctx(line, false), stream_of(chosen.region));
-        // A transcript's line number and a page's label are a line each.
         let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
-        let named = chosen.resumes.and_then(|first| unit_at.get(&(first as usize)).copied());
-        let continues = !single && !chosen.opens && named.is_none() && open.get(&key).is_some_and(|&u| units[u].region == chosen.region);
-        let resumed = named.or_else(|| (!single && chosen.resume).then(|| region_unit.get(&(key.0, key.1, chosen.region)).copied()).flatten());
-        let u = if continues {
-            open[&key]
-        } else if let Some(u) = resumed {
-            open.insert(key, u);
+        let stands = streams.stands(key, chosen);
+        let held = match stands {
+            Stands::GoesOn(first) | Stands::Resumes(first) => unit_at.get(&first).copied(),
+            Stands::Opens => None,
+        };
+        let u = if let Some(u) = held {
             u
         } else {
             // A unit counting on the margin's number prints its marker on the margin's line.
@@ -192,14 +208,13 @@ pub(crate) fn structure_graph(
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
             let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) { usize::from(chosen.depth.max(1)) } else { 0 };
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
-            let u = units.len() - 1;
-            unit_at.insert(k, u);
-            open.insert(key, u);
-            region_unit.insert((key.0, key.1, chosen.region), u);
-            u
+            let starts_document = started.last().is_some_and(|&line| units.last().is_none_or(|unit: &Unit| unit.lines[0] < line));
+            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, depth, starts_document, references: Vec::new() });
+            unit_at.insert(k, units.len() - 1);
+            units.len() - 1
         };
         units[u].lines.push(k);
+        streams.step(key, chosen.region, if held.is_some() { stands } else { Stands::Opens }, k);
         // The reference mark the note this line opens answered.
         for (place, start, end) in made.paired.into_iter().chain(made.also.into_iter().flatten()) {
             units[u].references.push((place as usize, start, end));
@@ -214,41 +229,43 @@ pub(crate) fn structure_graph(
         let starts: Vec<bool> = units.iter().map(|unit| unit.starts_document).collect();
         legal_structure_model::structure_analysis().assemble_parents(&regions, &texts, &levels, &depths, &starts)
     };
-    // What the lines tell a reader of the pages: a line number is no part of the body; a note's lines
-    // on the pages after its first continue it.
-    for unit in &units {
-        let first_page = unit.lines.first().map(|&k| slots.page(table.order[k]));
-        for &k in &unit.lines {
-            let slot = table.order[k];
-            let later = Some(slots.page(slot)) != first_page;
-            let line = slots.line_mut(pages, slot);
-            line.exclude_from_body = unit.region == LINE_LABEL;
-            line.note_region_mode = match (unit.region, later) {
-                (NOTE, true) => "footnote_continuation",
-                (NOTE, false) => "footnote",
-                _ => "",
+    if !written {
+        // What the lines tell a reader of the pages: a line number is no part of the body; a note's lines
+        // on the pages after its first continue it.
+        for unit in &units {
+            let first_page = unit.lines.first().map(|&k| slots.page(table.order[k]));
+            for &k in &unit.lines {
+                let slot = table.order[k];
+                let later = Some(slots.page(slot)) != first_page;
+                let line = slots.line_mut(pages, slot);
+                line.exclude_from_body = unit.region == LINE_LABEL;
+                line.note_region_mode = match (unit.region, later) {
+                    (NOTE, true) => "footnote_continuation",
+                    (NOTE, false) => "footnote",
+                    _ => "",
+                }
+                .to_owned();
             }
-            .to_owned();
         }
-    }
-    // Each page's printed label: of the lines the parser read as the page's label, the one the
-    // folios' offset names, else the first whose text reads as a label (`furniture::printed_label`).
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        let labelled: Vec<(String, usize)> = units
-            .iter()
-            .filter(|unit| unit.region == PAGE_LABEL)
-            .flat_map(|unit| unit.lines.iter().copied())
-            .filter(|&k| slots.page(table.order[k]) == page_slot)
-            .filter_map(|k| {
-                let line = (table.order[k].0 - slots.on(page_slot).start) as usize;
-                Some((crate::structure::furniture::printed_label(&page.lines[line].text)?, line))
-            })
-            .collect();
-        let folio = fences.folios[page_slot].as_ref().map(|(slot, _)| (slot.0 - slots.on(page_slot).start) as usize);
-        let chosen = labelled.iter().find(|(_, line)| Some(*line) == folio).or(labelled.first());
-        page.printed_label = chosen.map(|(label, _)| label.clone());
-        page.printed_label_source = chosen.map(|&(_, line)| page.lines[line].region_type.clone());
-        page.printed_label_line_id = chosen.map(|&(_, line)| page.lines[line].id.clone());
+        // Each page's printed label: of the lines the parser read as the page's label, the one the
+        // folios' offset names, else the first whose text reads as a label (`furniture::printed_label`).
+        for (page_slot, page) in pages.iter_mut().enumerate() {
+            let labelled: Vec<(String, usize)> = units
+                .iter()
+                .filter(|unit| unit.region == PAGE_LABEL)
+                .flat_map(|unit| unit.lines.iter().copied())
+                .filter(|&k| slots.page(table.order[k]) == page_slot)
+                .filter_map(|k| {
+                    let line = (table.order[k].0 - slots.on(page_slot).start) as usize;
+                    Some((crate::structure::furniture::printed_label(&page.lines[line].text)?, line))
+                })
+                .collect();
+            let folio = fences.folios[page_slot].as_ref().map(|(slot, _)| (slot.0 - slots.on(page_slot).start) as usize);
+            let chosen = labelled.iter().find(|(_, line)| Some(*line) == folio).or(labelled.first());
+            page.printed_label = chosen.map(|(label, _)| label.clone());
+            page.printed_label_source = chosen.map(|&(_, line)| page.lines[line].region_type.clone());
+            page.printed_label_line_id = chosen.map(|&(_, line)| page.lines[line].id.clone());
+        }
     }
     // A provision's path from the outermost provision it stands in: "12(1)(a)".
     let section_path = |u: usize| {
@@ -267,7 +284,21 @@ pub(crate) fn structure_graph(
     let line_range = |k: usize| index.line(&id_of(k)).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
-    let node_id = |u: usize| format!("transition-{:06}", u + 1);
+    // A written page's line set apart keeps the id its line's kind gives it, as the projection reads such lines.
+    let folios: HashSet<&str> = pages.iter().filter_map(|page| page.printed_label_line_id.as_deref()).collect();
+    let unit_ids: Vec<String> = units.iter().enumerate().map(|(u, unit)| {
+        let id = ids[unit.lines[0]].as_str();
+        match REGIONS[usize::from(unit.region)] {
+            "line_label" if written => format!("{id}:line"),
+            "furniture" | "page_label" if written => format!("{id}:{}", if folios.contains(id) { "page" } else { "furniture" }),
+            _ => format!("transition-{:06}", u + 1),
+        }
+    }).collect();
+    let node_id = |u: usize| unit_ids[u].clone();
+    let claim_of: HashMap<&str, &NotePairClaimV2> = settled.iter().flat_map(|read| &read.claims)
+        .flat_map(|claim| claim.body.line_ids.iter().map(move |id| (id.as_str(), claim))).collect();
+    let nothing_decided = Decision::default();
+    let decided = Decided::of(pages, slots, fences, &nothing_decided);
     let page_of_line = |k: usize| slots.page(table.order[k]);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };
@@ -280,19 +311,32 @@ pub(crate) fn structure_graph(
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
-        // A table's units are its rows, built with the table below.
-        if unit.region == TABLE {
+        // A table's units are its rows, built with the table below; where the fences' tables are written, its text stays
+        // the body's beside them.
+        if unit.region == TABLE && !written {
+            continue;
+        }
+        // A note no pair materialized is no note of the graph's.
+        let claim = (unit.region == NOTE).then(|| claim_of.get(ids[unit.lines[0]].as_str()).copied()).flatten();
+        if written && unit.region == NOTE && claim.is_none() {
             continue;
         }
         let ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
         let Some(envelope) = ranges.iter().map(|r| r.start).min().zip(ranges.iter().map(|r| r.end).max()) else { continue };
         let range = ScalarRange { start: envelope.0, end: envelope.1 };
         let region = REGIONS[usize::from(unit.region)];
+        // The member a settled unit opens on; a heading numbering a provision is that provision, a heading still.
+        let member = settled.as_ref().and_then(|read| {
+            let &(run, at) = read.opened.get(&unit.lines[0])?;
+            Some(&read.runs.runs[run as usize].members[at as usize])
+        });
         let (kind, role) = match region {
+            "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
             "heading" => (NodeKind::Heading, None),
             "text" if unit.marker.is_some() => (NodeKind::Paragraph, None),
             "provision" => (NodeKind::Section, None),
             "list_item" => (NodeKind::ListItem, None),
+            "note" | "note_quote" if claim.is_some_and(|claim| claim.kind == NoteKindV2::Endnote) => (NodeKind::Endnote, None),
             "note" | "note_quote" => (NodeKind::Footnote, None),
             "title" => (NodeKind::Prose, Some(PrimaryRole::Title)),
             "caption" => (NodeKind::Prose, Some(PrimaryRole::Caption)),
@@ -310,7 +354,8 @@ pub(crate) fn structure_graph(
         node.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&id_of(k)).map(|l| l.page_index)).collect();
         node.page_indexes.dedup();
         let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
-        if kind != NodeKind::Footnote {
+        let noted = matches!(kind, NodeKind::Footnote | NodeKind::Endnote);
+        if !noted {
             node.marker_range = marker_range;
             // A numbered paragraph is addressed by its number ("par12" for "[12]" or "12."), as every reader labels it.
             node.label = if kind == NodeKind::Paragraph {
@@ -321,12 +366,42 @@ pub(crate) fn structure_graph(
             };
         }
         match kind {
-            NodeKind::Heading => node.heading_range = Some(range),
+            NodeKind::Heading => {
+                node.heading_range = Some(range);
+                if written {
+                    let lines: Vec<&str> = unit.lines.iter().map(|&k| texts[k].as_str()).collect();
+                    node.label = Some(lines.join(" "));
+                    node.marker_range = ranges.first().and_then(|first| crate::structure::graph::heading_marker(first.start, lines[0], lines.len()));
+                }
+            }
             NodeKind::Section => {
                 node.locator_kind = Some("section".to_owned());
                 node.aliases = section_path(u).map(|path| vec![path]);
             }
             _ => {}
+        }
+        // A settled unit is addressed as the run it opens on reads it: a paragraph by its count, a provision by its
+        // grammar's value (a clause, a part, an article), its printing an alias; its marker and text where they stand.
+        if let Some(member) = member {
+            let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
+            if let Some((start, end)) = scalar(member.marker[0]).zip(scalar(member.marker[1])) {
+                node.marker_range = Some(ScalarRange { start, end: end.max(start) });
+            }
+            node.content_start = scalar(member.content);
+            match kind {
+                NodeKind::Paragraph => node.label = Some(format!("par{}", member.grammar_value)),
+                NodeKind::ListItem => node.label = Some(member.label.clone()),
+                NodeKind::Section => {
+                    node.label = Some(member.grammar_value.clone());
+                    node.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
+                    let printed = (member.label != member.grammar_value).then(|| member.label.clone());
+                    node.aliases = Some(printed.into_iter().chain(node.aliases.take().into_iter().flatten()).collect()).filter(|aliases: &Vec<String>| !aliases.is_empty());
+                    if role == Some(PrimaryRole::Heading) {
+                        node.heading_range = Some(range);
+                    }
+                }
+                _ => {}
+            }
         }
         // Its region as the tagger states one (`region:<name>`), which readers take for the unit's kind; a
         // contents list's lines under the `contents` grammar.
@@ -334,7 +409,7 @@ pub(crate) fn structure_graph(
         // (`paragraph_printings`), as the stage's nodes say.
         node.grammar = Some(if region == "contents" {
             "contents".to_owned()
-        } else if kind == NodeKind::Paragraph && unit.lines.iter().all(|&k| views[k].translation) {
+        } else if (kind == NodeKind::Paragraph || written && kind == NodeKind::Prose) && unit.lines.iter().all(|&k| views[k].translation) {
             "translation".to_owned()
         } else {
             format!("region:{region}")
@@ -348,13 +423,30 @@ pub(crate) fn structure_graph(
             node.markup_attributes.insert("depth".to_owned(), unit.depth.to_string());
         }
         nodes.push(node);
-        if region == "quote" && unit.lines.len() <= 60 {
+        if region == "quote" && unit.lines.len() <= 60 && !written {
             let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
             quote.ranges = ranges.clone();
             quote.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
             nodes.push(quote);
         }
-        if kind == NodeKind::Footnote {
+        if let Some(claim) = claim {
+            notes.push(Note {
+                id: claim.pair_id.clone(),
+                node_id: Some(node_id(u)),
+                kind: claim.kind,
+                label_range: claim.label.range,
+                body_range: claim.body.range,
+                label_ranges: vec![claim.label.range],
+                body_ranges: claim.body.ranges.clone(),
+                primary_reference: claim.references.first().map(|reference| reference.range),
+                references: claim.references.iter().map(|reference| NoteReference {
+                    range: reference.range,
+                    anchor: None,
+                    page_indexes: vec![reference.page_index],
+                    line_ids: vec![reference.line_id.clone()],
+                }).collect(),
+            });
+        } else if noted {
             let label_range = marker_range.unwrap_or(ScalarRange { start: range.start, end: range.start });
             let references: Vec<NoteReference> = unit.references.iter().filter_map(|&(k, start, end)| {
                 let range = index.global_range(&id_of(k), start as usize, end as usize)?;
@@ -387,17 +479,16 @@ pub(crate) fn structure_graph(
             }
         }
     }
+    if written {
+        nodes.extend(crate::structure::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
+        nodes.extend(crate::structure::graph::quotation_nodes(index, &decided, ORIGIN)?);
+    }
     let mut runs: Vec<Vec<usize>> = Vec::new();
-    let mut running = false;
-    for (u, unit) in units.iter().enumerate() {
-        if unit.region == TABLE {
-            if !running {
-                runs.push(Vec::new());
-                running = true;
-            }
-            runs.last_mut().unwrap().push(u);
-        } else if !matches!(REGIONS[usize::from(unit.region)], "note" | "note_quote" | "furniture" | "page_label" | "line_label" | "marginal_note") {
-            running = false;
+    let breaks = |unit: &Unit| !matches!(REGIONS[usize::from(unit.region)], "table" | "note" | "note_quote" | "furniture" | "page_label" | "line_label" | "marginal_note");
+    for u in (0..units.len()).filter(|&u| !written && units[u].region == TABLE) {
+        match runs.last_mut().filter(|run: &&mut Vec<usize>| !units[run[run.len() - 1]..u].iter().any(breaks)) {
+            Some(run) => run.push(u),
+            None => runs.push(vec![u]),
         }
     }
     let mut continuations = Vec::new();
@@ -518,7 +609,7 @@ pub(crate) fn structure_graph(
         let kind = fences.starts.iter().find(|start| start.line_id == id).map_or("document", |start| start.kind()).to_owned();
         constituents::Start::new(id, &kind)
     }).collect();
-    nodes.extend(constituents::constituents(&index, pages, &starts));
+    nodes.extend(constituents::constituents(index, pages, &starts));
     // The paragraphs and footnotes the projection reads (authority units, lookups): every body unit's text,
     // each line's span in it and where its paired notes' reference marks stand; every note's.
     let page_of = |k: usize| slots.page(table.order[k]);
@@ -529,10 +620,10 @@ pub(crate) fn structure_graph(
         crate::structure::joining::join_lines(&lines, &vocabulary)
     };
     // Each paired reference mark, by its line: its note's pair and label, where it stands in the line.
-    let mut marks: HashMap<String, Vec<legal_pdf_core::Anchor>> = HashMap::new();
+    let mut paired: HashMap<String, Vec<legal_pdf_core::Anchor>> = HashMap::new();
     for (u, unit) in units.iter().enumerate().filter(|(_, unit)| unit.region == NOTE) {
         for &(k, start, end) in &unit.references {
-            marks.entry(id_of(k)).or_default().push(legal_pdf_core::Anchor {
+            paired.entry(id_of(k)).or_default().push(legal_pdf_core::Anchor {
                 pair_id: format!("{}-note", node_id(u)),
                 label: unit.label.clone().unwrap_or_default(),
                 start: start as usize,
@@ -540,11 +631,12 @@ pub(crate) fn structure_graph(
             });
         }
     }
+    let marks = settled.as_ref().map_or(&paired, |read| read.anchors);
     let mut paragraphs = Vec::new();
     let mut footnotes = Vec::new();
     for (u, unit) in units.iter().enumerate() {
         let region = REGIONS[usize::from(unit.region)];
-        if matches!(region, "furniture" | "page_label" | "line_label" | "marginal_note" | "none") {
+        if matches!(region, "furniture" | "page_label" | "line_label" | "none") || region == "marginal_note" && !written || unit.region == NOTE && written {
             continue;
         }
         let (text, spans) = joined(unit);
@@ -577,12 +669,12 @@ pub(crate) fn structure_graph(
         }
         // The paragraph's text as the stage writes it: each paired reference mark its note's marker.
         let lines: Vec<&Line> = unit.lines.iter().map(|&k| slots.line(pages, table.order[k])).collect();
-        let Some((text, anchors, spans)) = crate::structure::joining::anchored_text(&lines, &vocabulary, &marks) else { continue };
+        let Some((text, anchors, spans)) = crate::structure::joining::anchored_text(&lines, &vocabulary, marks) else { continue };
         paragraphs.push(Paragraph {
             source_spans: spans,
             id: node_id(u),
             page_index: pages[page_of(unit.lines[0])].index,
-            region_type: if unit.region == HEADING { "heading".to_owned() } else { "body".to_owned() },
+            region_type: if unit.region == HEADING || written && matches!(region, "title" | "marginal_note") { region.to_owned() } else { "body".to_owned() },
             text,
             line_ids: unit.lines.iter().map(|&k| id_of(k)).collect(),
             anchors,
@@ -603,7 +695,7 @@ pub(crate) fn structure_graph(
         vec![Origin { id: ORIGIN.to_owned() }],
         nodes,
         notes,
-        Vec::new(),
+        settled.as_mut().map_or_else(Vec::new, |read| std::mem::take(&mut read.diagnostics)),
     );
     if !continuations.is_empty() {
         structure.continuations = Some(continuations);
@@ -611,10 +703,16 @@ pub(crate) fn structure_graph(
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
     // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The
-    // reading is the fences', all `Decided` reads for it.
+    // reading is the fences', all `Decided` reads for it. On a line a model reads as a provision the number is the
+    // provision's: a contract's clauses count as paragraphs do, and no paragraph stands over them. Tier 0's rules read
+    // the same numbers, and nothing here overrules them.
     structure.source_fragments = index.source_fragments();
-    crate::structure::graph::read_judgment_paragraphs(&mut structure, pages, &Decided::of(pages, slots, fences, &Decision::default()));
+    crate::structure::graph::read_judgment_paragraphs(&mut structure, pages, &decided);
+    if !written {
+        let provisions: HashSet<&str> = units.iter().filter(|unit| REGIONS[usize::from(unit.region)] == "provision").flat_map(|unit| unit.lines.iter().map(|&k| ids[k].as_str())).collect();
+        structure.nodes.retain(|node| !node.id.starts_with("judgment-paragraph-") || !node.line_ids.first().is_some_and(|id| provisions.contains(id.as_str())));
+    }
     structure.profile = identity.profile;
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
-    Ok((structure, paragraphs, footnotes))
+    Ok((structure, paragraphs, settled.map_or(footnotes, |read| read.footnotes)))
 }

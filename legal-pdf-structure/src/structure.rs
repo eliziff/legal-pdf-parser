@@ -25,6 +25,9 @@
 //!    cross-references (`note_context`), and the structure graph resolved on the decision's roles
 //!    (`graph`) with its outline assembled (`graph::assemble_outline`).
 //!
+//! Stages 4 to 7 are `Reader::Stages`, the default. `Reader::Machine` reads the same notes and rules, weighs the readings
+//! two rules disagree on in one decision per line, and writes its moves (`transition::tier0`, `transition::emit`).
+//!
 //! Measure a change on the structure gold with `experiments/legal-structure-gold/grade/prove.ps1`
 //! (with `STRUCTURE_GOLD_ORACLE_LAYOUT=1` as an arm, as a perfect layout model reads), the PDF
 //! footnote benchmark with `experiments/footnote-gold/score.py`, and provider text with the A2AJ
@@ -35,6 +38,7 @@ mod constituents;
 mod contents_lists;
 mod furniture;
 mod graph;
+mod heading_ladder;
 mod headings;
 mod notes;
 use notes::*;
@@ -75,8 +79,9 @@ use legal_pdf_core::model::{
 };
 use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
+use heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
 use legal_structure_model::{
-    enumerator_interpretations, parse_heading_runs, utf16_len, DocumentStructure, EnumeratorInterpretation, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText,
+    utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText, StructureAnalysis,
 };
 use regex::Regex;
 use serde_json::json;
@@ -199,6 +204,18 @@ impl<'a> Decided<'a> {
     }
 }
 
+/// What builds a document's structure once its fences and runs are read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reader {
+    /// The stages after the fences: notes, the rules, `write`, the graph's resolution. The default.
+    #[default]
+    Stages,
+    /// The transition parser's one move per line with tier 0's rules as its candidates, the scorer compiled in
+    /// (`transition::tier0`), `emit` its output. Compiled with the `transition` feature.
+    Machine,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureIdentity {
     pub profile: Option<legal_structure_model::DetectionProfile>,
@@ -206,6 +223,7 @@ pub struct StructureIdentity {
     pub source_sha256: String,
     /// The page labels the PDF declares (`/PageLabels`), by page index; empty where it has none.
     pub page_labels: Vec<Option<String>>,
+    pub reader: Reader,
 }
 
 pub struct StructureOutput {
@@ -242,24 +260,44 @@ struct Measured {
     runs: Runs,
 }
 
+/// A line written in the note band that no note holds (the pairer made no note of its label, or
+/// bounded the note's body short of it) is the body's, and joins its paragraph rather than
+/// standing alone: on the gold, 6,825 such lines were no notes, 2,146 were. Whether any was.
+fn give_back(pages: &mut [Page], footnotes: &[Footnote]) -> bool {
+    let held: HashSet<&str> = footnotes.iter().flat_map(|note| &note.body_line_ids).map(String::as_str).collect();
+    let mut given_back = false;
+    for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
+        if line.region_type == "footnote" && !held.contains(line.id.as_str()) {
+            line.region_type = "body".to_owned();
+            line.note_region_mode.clear();
+            given_back = true;
+        }
+    }
+    given_back
+}
+
 pub fn derive(
+    analysis: &dyn StructureAnalysis,
     pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    derive_cached(pages, separators, outline, identity, None)
+    derive_cached(analysis, pages, separators, outline, identity, None, None)
 }
 
 /// `derive`, reading what the measuring, fencing and numbering read from `cache` where it is there
 /// (a file named for the input pages and the code that reads them) and writing it there where not.
-/// The notes, the decision and everything after it are read on every run.
+/// The notes, the decision and everything after it are read on every run. With `trace`, the decision is also written
+/// to that folder (`decide::trace`); the parse is the same.
 pub fn derive_cached(
+    analysis: &dyn StructureAnalysis,
     pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
     cache: Option<&std::path::Path>,
+    trace: Option<&std::path::Path>,
 ) -> Result<StructureOutput> {
     use legal_pdf_support::profile::measure;
     if separators.len() != pages.len() {
@@ -285,10 +323,10 @@ pub fn derive_cached(
         }
         None => {
             let mut evidence = measure("derive.measure", || {
-                Evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
+                Evidence::measure(analysis, pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
             });
-            let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline));
-            let runs = measure("derive.runs", || Runs::read(pages, &slots, &mut evidence, &mut fences))?;
+            let mut fences = measure("derive.fences", || Fences::read(analysis, pages, &slots, &evidence, outline));
+            let runs = measure("derive.runs", || Runs::read(analysis, pages, &slots, &mut evidence, &mut fences))?;
             let measured = Measured { evidence, fences, runs };
             if let Some(path) = cache {
                 let _ = legal_pdf_core::write_gzip_json(path, &measured);
@@ -296,6 +334,13 @@ pub fn derive_cached(
             measured
         }
     };
+    // The machine, where the request names it.
+    if identity.reader == Reader::Machine {
+        #[cfg(feature = "transition")]
+        return measure("derive.machine", || transition::tier0::output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace));
+        #[cfg(not(feature = "transition"))]
+        return Err(Error::Message("this engine was built without the machine reader".to_owned()));
+    }
     // The transition parser: its reading the output where LEGALPDF_TRANSITION_EMIT says so, else read
     // beside the stages while it is fitted and measured.
     #[cfg(feature = "transition")]
@@ -307,14 +352,14 @@ pub fn derive_cached(
             measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
         }
     }
-    let mut notes = measure("derive.notes", || Notes::read(pages, &slots, &evidence, &fences, &runs));
-    let mut decision = measure("derive.decide", || Decision::decide(pages, &slots, &evidence, &fences, &runs, &notes, outline));
+    let mut notes = measure("derive.notes", || Notes::read(analysis, pages, &slots, &evidence, &fences, &runs));
+    let mut decision = measure("derive.decide", || Decision::decide(analysis, pages, &slots, &evidence, &fences, &runs, &notes, outline, trace.is_some()));
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);
     let decided = Decided::of(pages, &slots, &fences, &decision);
     // Traced before the decision is written: writing puts each page's lines in reading order.
-    if let Some(folder) = trace_folder() {
+    if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, &slots, &evidence, &fences, &runs, &notes, &decision);
     }
     let heading_sources = measure("derive.write", || write(pages, &slots, &evidence, &fences, &notes, &decision));
@@ -325,28 +370,13 @@ pub fn derive_cached(
         PdfResolutionInput::from_decision(pages, &slots, &evidence, &runs, &decided)
     });
     let pairing = measure("derive.pair_footnotes", || {
-        note_pairing::pair_notes(pages, &decided, &resolution.citation_spans, &resolution.index)
+        note_pairing::pair_notes(analysis, pages, &decided, &resolution.citation_spans, &resolution.index)
     });
     let (note_pairs, graph_diagnostics) = map_note_pairs(&resolution.index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
     let mut footnotes = pairing.footnotes;
     diagnostics.extend(pairing.diagnostics);
-    // A line written in the note band that no note holds (the pairer made no note of its label, or
-    // bounded the note's body short of it) is the body's, and joins its paragraph rather than
-    // standing alone: on the gold, 6,825 such lines were no notes, 2,146 were.
-    let given_back = {
-        let held: HashSet<&str> = footnotes.iter().flat_map(|note| &note.body_line_ids).map(String::as_str).collect();
-        let mut given_back = false;
-        for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
-            if line.region_type == "footnote" && !held.contains(line.id.as_str()) {
-                line.region_type = "body".to_owned();
-                line.note_region_mode.clear();
-                given_back = true;
-            }
-        }
-        given_back
-    };
-    if given_back {
+    if give_back(pages, &footnotes) {
         build_regions(pages);
     }
     diagnostics.extend(measure("derive.unmatched_references", || {
@@ -354,13 +384,13 @@ pub fn derive_cached(
     }));
     let paragraphs = measure("derive.paragraphs", || build_paragraphs_with_context(pages, &anchors, &decided));
     measure("derive.propositions", || attach_propositions(&mut footnotes, &paragraphs, &decided));
-    measure("derive.crossrefs", || attach_crossrefs(&mut footnotes, &mut diagnostics, &decided));
+    measure("derive.crossrefs", || attach_crossrefs(analysis, &mut footnotes, &mut diagnostics, &decided));
     let mut nodes = native_graph_parts(&resolution.index, pages, &paragraphs, &decided)?;
     nodes.extend(constituents::constituents(&resolution.index, pages, &fences.starts));
     let source_fragments = resolution.index.source_fragments();
     let document_id = identity.document_id.clone();
     let mut structure_graph = measure("derive.structure_graph", || {
-        legal_structure_model::structure_analysis().resolve_structure_graph_with_assembler(
+        analysis.resolve_structure_graph_with_assembler(
             identity.document_id,
             "local-pdf".to_owned(),
             resolution.index.text(),
@@ -373,7 +403,7 @@ pub fn derive_cached(
             graph_diagnostics,
             &mut |nodes| {
                 let contexts = graph::outline_contexts(nodes, &document_id, &resolution.index, &decided);
-                graph::assemble_outline(nodes, &contexts, resolution.index.text(), &|id| decided.heading_level(id));
+                graph::assemble_outline(analysis, nodes, &contexts, resolution.index.text(), &|id| decided.heading_level(id));
             },
         )
     })

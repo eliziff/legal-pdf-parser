@@ -23,46 +23,38 @@ pub(crate) fn continues_prose_from(page: &Page, prior: usize, slot: usize, body:
         return false;
     }
     let text = prior.text.trim_end();
-    let (left, right) = page
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(other_slot, other)| body(*other_slot) && other.bbox[0] < prior.bbox[2] && prior.bbox[0] < other.bbox[2])
-        .fold((prior.bbox[0], prior.bbox[2]), |(left, right), (_, other)| (left.min(other.bbox[0]), right.max(other.bbox[2])));
     height > 0.0
-        && prior.bbox[2] >= right - (right - left) * 0.1
         && line.bbox[1] - prior.bbox[3] < height * 0.5
         && !sentence_ended(text)
         && !text.ends_with([':', '\u{201d}', '"'])
         && !enumerated(text)
+        && runs_the_column(page, prior, body)
+}
+
+/// Whether a line runs its column: the page's body lines beside it, those `body` names, give the column's measure.
+fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bool {
+    let (left, right) = page
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(other_slot, other)| body(*other_slot) && other.bbox[0] < line.bbox[2] && line.bbox[0] < other.bbox[2])
+        .fold((line.bbox[0], line.bbox[2]), |(left, right), (_, other)| (left.min(other.bbox[0]), right.max(other.bbox[2])));
+    line.bbox[2] >= right - (right - left) * 0.1
 }
 
 /// A long numbered line running the full column whose sentence the next line, at its leading,
 /// finishes ("1. IAEA, Safety Standards Series, Geological Disposal Facilities for" /
 /// "Radioactive Waste, Vienna, 2011.") opens a paragraph or an entry, not a heading: the line at
 /// `slot` onto the line `next` (slots of the page's lines), the page's body lines those `body` names.
-pub(crate) fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
+pub(crate) fn carries_a_sentence_onto(analysis: &dyn StructureAnalysis, page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
     let line = &page.lines[slot];
     let height = line.bbox[3] - line.bbox[1];
-    let (left, right) = page
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(other_slot, other)| {
-            body(*other_slot)
-                && other.bbox[0] < line.bbox[2]
-                && line.bbox[0] < other.bbox[2]
-        })
-        .fold((line.bbox[0], line.bbox[2]), |(left, right), (_, other)| {
-            (left.min(other.bbox[0]), right.max(other.bbox[2]))
-        });
     let followed_by_body = body(next);
     let next = &page.lines[next];
     let text = line.text.trim_end();
     let following = next.text.trim_end();
     height > 0.0
         && text.split_whitespace().count() >= 8
-        && line.bbox[2] >= right - (right - left) * 0.1
         && !sentence_ended(text)
         && !text.ends_with(':')
         && followed_by_body
@@ -70,7 +62,8 @@ pub(crate) fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, bod
         && next.bbox[1] - line.bbox[3] < height * 0.5
         && sentence_ended(following)
         && !following.ends_with('?')
-        && !layout_analysis().has_citation_signal(&format!("{text} {following}"))
+        && runs_the_column(page, line, body)
+        && !analysis.has_citation_signal(&format!("{text} {following}"))
 }
 
 /// The share of a line's characters its face sets bold.

@@ -221,6 +221,7 @@ struct Candidate {
 /// transcript that is testimony throughout (`Fences::testimony`), and on a transcript's pages of
 /// speakers' turns. `unnamed` holds the lines bookmarks naming every heading leave unnamed.
 pub(crate) fn weigh(
+    analysis: &dyn StructureAnalysis,
     pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
@@ -229,6 +230,7 @@ pub(crate) fn weigh(
     geometry: &Geometry,
     unnamed: &impl Fn(Slot) -> bool,
     decision: &mut Decision,
+    traced: bool,
 ) {
     let mut families = Families::default();
     let line = |slot: Slot| slots.line(pages, slot);
@@ -245,7 +247,6 @@ pub(crate) fn weigh(
     for slot in (0..slots.len()).filter(|&slot| evidence.words[slot] & WORD_SPEAKER != 0) {
         spoken[slots.page(Slot(slot as u32))] = true;
     }
-    let traced = trace_folder().is_some();
     for (context, sequence) in sequences.lines.iter().enumerate() {
         let role = &decision.role;
         let eligible = |slot: Slot| {
@@ -340,9 +341,9 @@ pub(crate) fn weigh(
             let runs_on = alone
                 && (sentence_ended(&text) || next.is_some_and(|next| fences.continues[next.index()].is_some()));
             let vetoes = [
-                (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))),
+                (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(analysis, &text))),
                 (VETO_RUNS_ON, runs_on),
-                (VETO_EDITORIAL, legal_pdf_core::layout_analysis().editorial_line(&text)),
+                (VETO_EDITORIAL, analysis.editorial_line(&text)),
                 (VETO_ENDS, text.ends_with(['.', ',', ';'])),
                 (VETO_LABEL, headings::rules::label(&text) || date_line(&text)),
                 (VETO_WORDS, words > 20),

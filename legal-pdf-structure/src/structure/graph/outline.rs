@@ -3,7 +3,7 @@
 //! locators stay unchanged.
 
 use super::*;
-use legal_structure_model::{NumberingMarker, PrimaryRole};
+use legal_structure_model::{NumberingMarker, PrimaryRole, StructureAnalysis};
 
 /// A unit's document, quotation, and note, table cell or parallel text membership.
 pub(crate) type OutlineContext = (String, Option<String>, Option<String>);
@@ -83,6 +83,7 @@ struct Outline {
 /// documents and a parallel translation scope the stacks (a column's list or heading never opens under the
 /// other language's paragraph); quotation and object membership stay intact.
 pub(crate) fn assemble_outline(
+    analysis: &dyn StructureAnalysis,
     nodes: &mut [StructureNode],
     contexts: &[OutlineContext],
     text: &str,
@@ -156,8 +157,7 @@ pub(crate) fn assemble_outline(
                     .and_then(|range| coordinates.slice(range.start..range.end))
                     .or(node.label.as_deref());
                 let marker = marker.and_then(|value| {
-                    legal_pdf_core::layout_analysis()
-                        .numbering_marker(value, outline.open_letter.as_ref())
+                    analysis.numbering_marker(value, outline.open_letter.as_ref())
                 });
                 let family = marker.as_ref().map_or("", |marker| marker.family.as_str());
                 let found = outline

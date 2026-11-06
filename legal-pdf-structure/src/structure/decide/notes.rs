@@ -70,10 +70,34 @@ fn body_size(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences
         .unwrap_or(0.0)
 }
 
+/// Where a walk over a document's pages stands among its endnotes.
+#[derive(Clone, Copy)]
+enum EndnoteRun {
+    Outside,
+    /// In a run of endnotes; the label the next page's should open with, where the run printed one.
+    Within { expected: Option<u32> },
+}
+
+impl EndnoteRun {
+    /// Whether notes numbered `numbers` go on with the run: no label, or the one it expects.
+    fn goes_on_at(self, numbers: &[u32]) -> bool {
+        matches!(self, Self::Within { expected } if numbers.is_empty() || expected.is_some_and(|expected| numbers[0] == expected))
+    }
+
+    /// The run, entered or kept, past a page of endnotes numbered `numbers`.
+    fn through(self, numbers: &[u32]) -> Self {
+        let kept = match self {
+            Self::Within { expected } => expected,
+            Self::Outside => None,
+        };
+        Self::Within { expected: numbers.last().map_or(kept, |number| number.checked_add(1)) }
+    }
+}
+
 impl Notes {
     /// The notes of the document's pages, measured (`evidence`), fenced and ordered (`fences`), its
     /// numbering runs read (`runs`).
-    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
+    pub(crate) fn read(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
         let count = slots.len();
         let separators = &fences.separators;
         let starts: Vec<usize> = (0..pages.len()).map(|page| slots.on(page).start as usize).collect();
@@ -151,7 +175,7 @@ impl Notes {
                     }
                 })
                 .collect();
-            let reading = legal_pdf_support::profile::measure("notes.band", || read_band(&band_pages, &lines));
+            let reading = legal_pdf_support::profile::measure("notes.band", || read_band(analysis, &band_pages, &lines));
             for &(slot, kind) in &reading.notes {
                 notes.note[slot.index()] = Some(kind);
             }
@@ -235,7 +259,7 @@ impl Notes {
                 .fold(0, |bits, (bit, _)| bits | bit);
             }
             let promoted = legal_pdf_support::profile::measure("notes.lanes", || {
-                note_promotions(LaneLines { pages, order: &order, starts: &starts, flags: &lane_flags }, &separators)
+                note_promotions(analysis, LaneLines { pages, order: &order, starts: &starts, flags: &lane_flags }, &separators)
             });
             for (page, place) in promoted {
                 notes.note[starts[page] + place].get_or_insert(NoteKind::Footnote);
@@ -290,20 +314,17 @@ impl Notes {
     /// language: all its notes are endnotes on a page under a notes heading, holding an endnote,
     /// or going on with the endnotes of the page before (no label, or the label they expect).
     fn settle_kinds(&mut self, pages: &[Page], slots: &Slots, band_pages: &[BandPage]) {
-        let mut active = false;
-        let mut expected: Option<u32> = None;
+        let mut run = EndnoteRun::Outside;
         let mut previous_page: Option<usize> = None;
         for band in band_pages {
             let index = band.view.page.index;
             if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(index)) {
-                active = false;
-                expected = None;
+                run = EndnoteRun::Outside;
             }
             previous_page = Some(index);
             let noted: Vec<Slot> = band.view.lines.iter().copied().filter(|slot| self.note[slot.index()].is_some()).collect();
             if noted.is_empty() {
-                active = false;
-                expected = None;
+                run = EndnoteRun::Outside;
                 continue;
             }
             let heading = band.view.lines.iter().any(|&slot| endnote_heading(&slots.line(pages, slot).text));
@@ -313,18 +334,13 @@ impl Notes {
                 .filter_map(|&slot| line_start_label_prefix(&slots.line(pages, slot).text))
                 .filter_map(|prefix| normalize_label(&prefix.label).parse().ok())
                 .collect();
-            let continues = active && (numbers.is_empty() || expected.is_some_and(|expected| numbers[0] == expected));
-            if heading || explicit || continues {
+            if heading || explicit || run.goes_on_at(&numbers) {
                 for slot in &noted {
                     self.note[slot.index()] = Some(NoteKind::Endnote);
                 }
-                active = true;
-                if let Some(number) = numbers.last() {
-                    expected = number.checked_add(1);
-                }
+                run = run.through(&numbers);
             } else {
-                active = false;
-                expected = None;
+                run = EndnoteRun::Outside;
             }
         }
     }

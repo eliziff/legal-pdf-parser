@@ -753,16 +753,6 @@ pub fn decode(candidate: &State, pieces: &[Piece], labels: &[Label], source_sha2
     for (u, parent) in legal_structure_model::structure_analysis().assemble_parents(&regions, &texts, &levels, &depths, &starts).into_iter().enumerate() {
         units[u].parent = parent;
     }
-    if std::env::var("LEGALPDF_ASSEMBLE_TRACE").is_ok_and(|prefix| source_sha256.starts_with(&prefix)) {
-        eprintln!("assemble-units {} pieces {} labelled {}", units.len(), pieces.len(), labels.iter().filter(|l| l.region != 0).count());
-        for u in 0..units.len() {
-            let piece = &pieces[head[u]];
-            eprintln!("assemble {u} {} {} {} {:?} {:?} start={} doc={} head={}@{} marker_label={} block_marker={} typed_markers={}",
-                regions[u], levels[u], legal_structure_model::structure_analysis().numbering_family(&texts[u]), units[u].parent, texts[u].chars().take(30).collect::<String>(),
-                labels[head[u]].start, units[u].starts_document, candidate.lines[piece.line].id, piece.start, labels[head[u]].marker,
-                markers.contains_key(&head[u]), typed[units[u].lines[0]].markers.len());
-        }
-    }
     // Note pairs: each frame note's references, to the unit holding the note's first piece.
     let mut notes: Vec<NotePair> = Vec::new();
     let unit_of_typed: HashMap<usize, usize> = units.iter().enumerate().flat_map(|(u, unit)| unit.lines.iter().map(move |&t| (t, u))).collect();

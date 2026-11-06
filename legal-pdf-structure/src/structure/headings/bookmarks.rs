@@ -18,6 +18,7 @@
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use legal_pdf_core::model::PdfOutlineEntry;
+use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -154,7 +155,7 @@ pub(crate) fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> 
 }
 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
-pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+pub(crate) fn package_targets(analysis: &dyn StructureAnalysis, outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
     let entries = validate(outline, pages);
     let authorities = authorities_level(&entries);
     let entries = entries
@@ -168,7 +169,7 @@ pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<
             {
                 unit.clone()
             } else if authorities == Some(entry.level)
-                && legal_pdf_core::layout_analysis()
+                && analysis
                     .numbering_marker(entry.title.split_whitespace().next()?, None)
                     .is_some()
             {

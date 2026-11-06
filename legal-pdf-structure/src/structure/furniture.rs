@@ -244,7 +244,9 @@ pub(super) fn aligned_furniture(hits: &[FurnitureHit], minimum: usize) -> HashSe
     let mut seen_pages = vec![0_u32; hits.iter().map(|hit| hit.page_slot).max().unwrap_or(0) + 1];
     let mut x_counts = BTreeMap::new();
     let mut generation = 0;
-    for y_start in hits {
+    // (Hits at one height read one cluster: the first of them reads it for all.)
+    let mut heights = HashSet::new();
+    for y_start in hits.iter().filter(|hit| heights.insert(hit.y_ratio.to_bits())) {
         y_cluster.clear();
         y_cluster.extend(hits.iter().copied().filter(|hit| {
             hit.y_ratio >= y_start.y_ratio
@@ -429,7 +431,7 @@ pub(super) fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Ed
 /// heading alone on its line ("PART 50") whose text no other line prints, and on a row of no other
 /// furniture, is no running head. Lines `line_label` holds are a transcript's line numbers, never
 /// furniture. Each line read as furniture, with its edge and the rule that read it.
-pub(super) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
+pub(super) fn read(analysis: &dyn StructureAnalysis, views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
     // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
     if legal_structure_model::ablated("furniture") {
         return Vec::new();
@@ -579,7 +581,7 @@ pub(super) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                     let body = &page.lines[body_index];
                     (body.bbox[1] > page.height * 0.86
                         && line_sizes[body_index] < body_size * 0.90
-                        && layout_analysis().has_citation_signal(&body.text))
+                        && analysis.has_citation_signal(&body.text))
                     .then_some([label_index, body_index])
                 })
                 .flatten()

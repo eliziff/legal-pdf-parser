@@ -2025,11 +2025,12 @@ pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
 /// Parse the accepted DOCX text and authoritative table coordinates once, then
 /// feed the canonical Rust detector directly.
 pub fn analyze_docx_bytes(
+    analysis: &dyn legal_structure_model::StructureAnalysis,
     bytes: &[u8],
     document_id: String,
 ) -> Result<legal_structure_model::DocumentStructure> {
     let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
-    legal_structure_model::structure_analysis()
+    analysis
         .analyze_docx(document_id, paragraphs, &table_cells)
         .map_err(|error| Error::Message(error.to_string()))
 }
@@ -2078,11 +2079,12 @@ fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
 /// Build the model-visible drafting document in one Rust operation. OOXML and
 /// Pandoc adaptation stay here; the resulting text uses the canonical detector.
 pub fn analyze_docx_drafting_bytes(
+    analysis: &dyn legal_structure_model::StructureAnalysis,
     bytes: &[u8],
     document_id: String,
 ) -> Result<legal_structure_model::DocumentStructure> {
     let markdown = drafting_docx_text(bytes)?;
-    legal_structure_model::structure_analysis()
+    analysis
         .analyze_instrument(markdown, document_id, &[], true)
         .map_err(|error| Error::Message(error.to_string()))
 }

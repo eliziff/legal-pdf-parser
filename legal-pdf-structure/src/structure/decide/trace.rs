@@ -1,16 +1,9 @@
-//! A document's decision traced, for fitting its weights on the gold: with LEGALPDF_DECISION_TRACE
-//! naming a folder, each document's `<source sha256>.trace.json.gz` there holds each line's id and
+//! A document's decision traced, for fitting its weights on the gold: given a folder, each document's `<source sha256>.trace.json.gz` there holds each line's id and
 //! page, what each stage read of it (the evidence, fences and runs, the notes, the decision), and
 //! each weighed choice with the evidence it weighed (`ResidualRecord`). The parse is the same with a
 //! trace or without one.
 
 use super::*;
-
-/// The folder traces are written to, once read from the environment.
-pub(crate) fn trace_folder() -> Option<&'static std::path::Path> {
-    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    FOLDER.get_or_init(|| std::env::var_os("LEGALPDF_DECISION_TRACE").map(std::path::PathBuf::from)).as_deref()
-}
 
 /// One residual candidate as the residual weighed it: its lines (slots), its reading context and look
 /// (an index among the context's looks), the indicators its own log-odds sum (`OWN`, in order), the

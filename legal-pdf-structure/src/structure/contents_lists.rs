@@ -13,7 +13,8 @@
 
 use super::headings::bookmarks::normalize_title;
 use super::{PageView, Slot};
-use legal_pdf_core::{layout_analysis, Line};
+use legal_pdf_core::Line;
+use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -72,10 +73,10 @@ fn value(token: &str) -> u32 {
 }
 
 /// Mostly a citation, its leader and locator aside: an authority's entry.
-fn citation(text: &str) -> bool {
+fn citation(analysis: &dyn StructureAnalysis, text: &str) -> bool {
     static TAIL: OnceLock<Regex> = OnceLock::new();
     let title = pattern(&TAIL, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]–-]*$").replace(text.trim(), "");
-    let citations = layout_analysis().citations(&title);
+    let citations = analysis.citations(&title);
     let cited: usize = citations.iter().map(|found| found.range.len()).sum();
     !citations.is_empty() && cited * 3 >= title.trim().len()
 }
@@ -321,6 +322,7 @@ pub(super) struct Lists {
 /// page's furniture (running heads and feet, folios), which are headings already and which a table
 /// holds, and each view's page number (the label the PDF declares for it, else its folio's).
 pub(super) struct ListInput<'a> {
+    pub(super) analysis: &'a dyn StructureAnalysis,
     pub(super) line_label: &'a dyn Fn(Slot) -> bool,
     pub(super) furniture: &'a dyn Fn(Slot) -> bool,
     pub(super) heading: &'a dyn Fn(Slot) -> bool,
@@ -345,22 +347,17 @@ pub(super) fn read(views: &[PageView], input: &ListInput) -> Lists {
     let mut lists = Lists::default();
     let index = index_pages(views);
     let recurrences = recurrences(views, input);
-    let trace = std::env::var_os("LEGALPDF_CONTENTS_TRACE").is_some();
-    let mut continuing = false;
-    let mut previous_index = None;
+    // The page whose contents list may go on over the next.
+    let mut open_list: Option<usize> = None;
     for (slot, view) in views.iter().enumerate() {
         let page = view.page;
-        if previous_index.is_some_and(|prior: usize| prior + 1 != page.index) {
-            continuing = false;
-        }
-        previous_index = Some(page.index);
+        let continuing = open_list.take().is_some_and(|prior| prior + 1 == page.index);
         // A word index is contents throughout, its letters aside.
         if index.contains(&page.index) || reference_page(view, input) {
             lists.contents.extend(view.iter()
                 .filter(|(line_slot, line)| !input.set_aside(*line_slot) && !index_letter(&line.text))
                 .map(|(line_slot, _)| line_slot));
             lists.pages.insert(page.index);
-            continuing = false;
             continue;
         }
         let rows = rows(view, input);
@@ -404,14 +401,8 @@ pub(super) fn read(views: &[PageView], input: &ListInput) -> Lists {
         let unlocated = !accepted && (run.is_some() || (headed || continuing) && titled_rows.len() >= 5 && echoed(&titled_rows, slot, &recurrences));
         // Entries mostly citations, their locators in one column whatever their order: a table of
         // authorities (its locators are the paragraphs citing each authority, not its place).
-        let cites = |r: usize| citation(&rows[r].text) || r > 0 && citation(&format!("{} {}", rows[r - 1].text, rows[r].text));
+        let cites = |r: usize| citation(input.analysis, &rows[r].text) || r > 0 && citation(input.analysis, &format!("{} {}", rows[r - 1].text, rows[r].text));
         let authorities = !accepted && entries.len() >= 5 && entries.iter().filter(|&&r| cites(r)).count() * 5 >= entries.len() * 3;
-        if trace && (entries.len() >= 2 || headed || run.is_some()) {
-            eprintln!(
-                "contents\tpage {}\trows {}\tentries {}\tlisted {}\tagree {agreeing}/{checked}\theaded {headed}\tcontinuing {continuing}\taccepted {accepted}\tunlocated {unlocated}\tauthorities {authorities}\tfirst {:?}",
-                page.index + 1, rows.len(), entries.len(), listed.len(), listed.first().map(|&r| rows[r].text.chars().take(50).collect::<String>()),
-            );
-        }
         if accepted || unlocated {
             if let Some(title) = named {
                 lists.titles.extend(row_slots(view, &rows[title..=title]));
@@ -471,7 +462,7 @@ pub(super) fn read(views: &[PageView], input: &ListInput) -> Lists {
         } else if authorities {
             lists.authorities.extend(row_slots(view, &rows[entries[0]..=entries[entries.len() - 1]]));
         }
-        continuing = accepted || unlocated;
+        open_list = (accepted || unlocated).then_some(page.index);
     }
     lists
 }

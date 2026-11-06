@@ -11,7 +11,7 @@
 
 use super::{arabic_page_number, graph::PdfTextIndex, headings, party_label, PageView, Slot};
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
-use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
+use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureAnalysis, StructureNode};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -248,12 +248,12 @@ pub(super) fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Ve
 
 /// Package bookmarks supply opening pages before the readers calibrate each document; a line
 /// `set_aside` holds (a transcript's line number, furniture, a note) opens none.
-pub(super) fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+pub(super) fn bookmarked_starts(analysis: &dyn StructureAnalysis, views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
     let by_index = views
         .iter()
         .map(|view| (view.page.index, view))
         .collect::<HashMap<_, _>>();
-    headings::bookmarks::package_targets(outline, views.len())
+    headings::bookmarks::package_targets(analysis, outline, views.len())
         .into_iter()
         .filter_map(|(page, kind)| {
             let (_, line) = by_index

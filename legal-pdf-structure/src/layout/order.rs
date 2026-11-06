@@ -260,6 +260,7 @@ pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
 pub(crate) fn page_order(
     page: &Page,
     stream: impl Fn(usize) -> Stream,
+    line_label: impl Fn(usize) -> bool,
     items: &legal_pdf_tables::PageItems,
     columns: ColumnModel,
     table_page: bool,
@@ -295,7 +296,8 @@ pub(crate) fn page_order(
     } else {
         // A law report's margin numbers are no column's lines: the columns' order is read without them, and they
         // stand after it (`Fences::read_margin_numbers` reads each before its row).
-        let lane = margin_lane(lines, &body, page.width);
+        // (A transcript's line numbers are its rows': they stay where they stand.)
+        let lane: Vec<usize> = margin_lane(lines, &body, page.width).into_iter().filter(|&slot| !line_label(slot)).collect();
         body.retain(|slot| !lane.contains(slot));
         let decision = arbitrate_body_order(page, &mut body, items, columns);
         body.extend(lane);
@@ -338,7 +340,7 @@ pub(crate) fn page_order(
 /// (an examination's "BY MR. JONES:", "EXHIBIT NO. 3", "--- Upon resuming").
 pub(crate) fn opens_turn(line: &Line) -> bool {
     let text = line.text.trim_start();
-    legal_structure_model::transcript::speaker_label(text).is_some()
+    legal_pdf_core::layout_analysis().speaker_label(text).is_some()
         || text.starts_with("--")
         || (text.chars().any(char::is_alphabetic) && !text.chars().any(char::is_lowercase))
 }

@@ -163,19 +163,8 @@ pub struct Unit {
 /// numbered body unit is by the document's type (a provision in a contract or legislation, a quote
 /// in a judgment, submission or article) is written into the gold by its postcorrections
 /// (experiments/legal-structure-gold/postcorrect.py), so training and grading read the same gold.
-///
-/// STRUCTURE_GOLD_PROVISION_HEADINGS=N scores a consumer's reading instead: provisions at depth N
-/// or shallower are headings (a PDF export's outline of a contract).
 pub fn regions(gold: &Gold) -> Vec<&str> {
-    static AS_HEADINGS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let as_headings = *AS_HEADINGS.get_or_init(|| std::env::var("STRUCTURE_GOLD_PROVISION_HEADINGS").ok().and_then(|v| v.parse().ok()));
-    gold.units.iter().map(|unit| {
-        let region = gold.typed[unit.lines[0]].region.as_str();
-        match as_headings {
-            Some(deepest) if region == "provision" && unit.depth.is_some_and(|depth| depth <= deepest) => "heading",
-            _ => region,
-        }
-    }).collect()
+    gold.units.iter().map(|unit| gold.typed[unit.lines[0]].region.as_str()).collect()
 }
 
 #[derive(Deserialize)]
@@ -357,19 +346,13 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
     let mut annotations = Vec::new();
     let mut continuations = FrameLinks::new();
     let mut notes: HashMap<usize, usize> = HashMap::new();
-    let trace = std::env::var("LEGALPDF_ASSEMBLE_TRACE").is_ok_and(|p| gold.source_sha256.starts_with(&p));
     for (u, unit) in units.iter().enumerate() {
         let first = &typed[unit.lines[0]];
         // Every printed marker the unit opens with, on whichever of its lines ("6", then "(1) Every lot").
         let marker: Vec<SourceSpan> = unit.lines.iter().flat_map(|&n| typed[n].markers.iter().flatten()).cloned().collect();
-        if trace {
-            eprintln!("projected u{u} {} parts={} heads={:?} marker={}", region[u], parts[u].len(),
-                parts[u].iter().map(|p| anchor(&p[0])).collect::<Vec<_>>(), marker.first().map_or(String::new(), anchor));
-        }
         for (k, spans) in parts[u].iter().enumerate() {
             let mut attrs = Map::new();
             attrs.insert("region".into(), json!(region[u]));
-            // A provision read as a heading (STRUCTURE_GOLD_PROVISION_HEADINGS) heads at its depth.
             if let Some(level) = unit.level.or(unit.depth).filter(|_| region[u] == "heading") {
                 attrs.insert("heading_level".into(), json!(level));
             }

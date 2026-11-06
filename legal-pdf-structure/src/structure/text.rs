@@ -2,6 +2,7 @@
 //! after, capitals, a sentence's end, title case, brackets, a contents list's own title.
 
 use super::*;
+pub(super) use legal_pdf_core::model::sentence_ended;
 
 /// A heading's enumerator, alone on its line ("IV.", "(a)" aside, "b)", "12."), or a decimal
 /// section number ("1.1", "2.3.1") with or without a period after it.
@@ -73,14 +74,6 @@ pub(super) fn all_caps(text: &str) -> bool {
     letters.next().is_some_and(|first| {
         first.is_uppercase() && letters.all(|character| character.is_uppercase())
     })
-}
-
-/// A sentence's end: a full stop, question or exclamation mark or an ellipsis, before any closing
-/// quotes and brackets.
-pub(super) fn sentence_ended(text: &str) -> bool {
-    text.trim_end()
-        .trim_end_matches(|c: char| "\"'\u{2019}\u{201d}\u{bb})]}".contains(c))
-        .ends_with(['.', '?', '!', '\u{2026}'])
 }
 
 /// A line of six words or more, set in lower case, ending on a word no sentence ends on, so that

@@ -201,7 +201,7 @@ pub(crate) fn grammar_rank(grammar: CandidateGrammar) -> u8 {
 /// a line the document's outline names, a heading of a rooted, consecutive count of provisions),
 /// never as a ladder's rung, an enactment's history or a transcript's part; a contents line, a
 /// quotation, a note, a table's cell and the page's edge never do.
-fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
+pub(crate) fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
     match role {
         Role::Open | Role::Body | Role::ListItem => true,
         Role::Heading | Role::Title | Role::MarginalNote => match rule {
@@ -403,26 +403,29 @@ impl PdfResolutionInput {
                     parts
                 })
                 .collect();
-            // Each line's citations, as scalar spans of its text.
-            let citation_spans = lines
-                .lines
-                .iter()
-                .map(|(_, line)| {
-                    let scalars = |byte: u32| line.text.char_indices().take_while(|(at, _)| *at < byte as usize).count();
-                    let mut spans: Vec<PdfSourceSpan> = slots
-                        .of_id(&line.id)
-                        .map(|slot| evidence.citations_of(slot))
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|cited| PdfSourceSpan { start: scalars(cited.core.0), end: scalars(cited.core.1) })
-                        .filter(|span| span.start < span.end)
-                        .collect();
-                    spans.sort_by_key(|span| (span.start, span.end));
-                    (line.id.clone(), spans)
-                })
-                .collect::<BTreeMap<_, _>>();
-            (runs, candidate_evidence, roles, citation_spans)
+            (runs, candidate_evidence, roles, citation_spans(pages, slots, evidence))
         };
         Self { index, runs, evidence: candidate_evidence, roles, citation_spans }
     }
+}
+
+/// Each line's citations, as scalar spans of its text, by line id.
+pub(super) fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<PdfSourceSpan>> {
+    pages
+        .iter()
+        .flat_map(|page| &page.lines)
+        .map(|line| {
+            let scalars = |byte: u32| line.text.char_indices().take_while(|(at, _)| *at < byte as usize).count();
+            let mut spans: Vec<PdfSourceSpan> = slots
+                .of_id(&line.id)
+                .map(|slot| evidence.citations_of(slot))
+                .unwrap_or_default()
+                .iter()
+                .map(|cited| PdfSourceSpan { start: scalars(cited.core.0), end: scalars(cited.core.1) })
+                .filter(|span| span.start < span.end)
+                .collect();
+            spans.sort_by_key(|span| (span.start, span.end));
+            (line.id.clone(), spans)
+        })
+        .collect()
 }

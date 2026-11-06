@@ -356,25 +356,25 @@ impl PdfDocument {
         fingerprint
     }
 
-    pub fn lookup(&self, request: &PdfLookupRequest) -> PdfStructureLookup {
-        structure_lookup(self, request)
+    pub fn lookup(&self, analysis: &dyn StructureAnalysis, request: &PdfLookupRequest) -> PdfStructureLookup {
+        structure_lookup(analysis, self, request)
     }
 
     /// The declared paragraph nodes of this PDF, in reading order.
     /// Empty where it numbers none: it is then placed by its pages.
-    pub fn printed_paragraphs(&self) -> &[PrintedParagraph] {
-        self.printed.get_or_init(|| self.read_printed_paragraphs())
+    pub fn printed_paragraphs(&self, analysis: &dyn StructureAnalysis) -> &[PrintedParagraph] {
+        self.printed.get_or_init(|| self.read_printed_paragraphs(analysis))
     }
 
     /// Exact printed membership for geometry, without the text response-size limit: each paragraph's extent, its
     /// own lines and everything set within it (its list's items, its block quotations), every printing of it.
-    pub fn paragraph_source_ranges(&self, locator: &str) -> (PdfLookupStatus, Vec<ScalarRange>) {
+    pub fn paragraph_source_ranges(&self, analysis: &dyn StructureAnalysis, locator: &str) -> (PdfLookupStatus, Vec<ScalarRange>) {
         let range = numeric_range("paragraph", locator)
-            .or_else(|| parse_ordinal("paragraph", locator).map(|n| (n, n)));
+            .or_else(|| analysis.parse_ordinal("paragraph", locator).map(|n| (n, n)));
         let Some((from, to)) = range.filter(|(a, b)| a <= b && b - a < 100) else {
             return (PdfLookupStatus::Invalid, Vec::new());
         };
-        match self.paragraph_range(from, to) {
+        match self.paragraph_range(analysis, from, to) {
             Ok(paragraphs) => {
                 // Each printing's extent: its words, its quotations and lists, as the structure reads them.
                 let ids = paragraphs.iter().flat_map(|paragraph| paragraph.ids.iter().map(String::as_str)).collect::<HashSet<_>>();
@@ -390,10 +390,11 @@ impl PdfDocument {
 
     pub(crate) fn paragraph_range(
         &self,
+        analysis: &dyn StructureAnalysis,
         from: usize,
         to: usize,
     ) -> Result<&[PrintedParagraph], PdfLookupStatus> {
-        let paragraphs = self.printed_paragraphs();
+        let paragraphs = self.printed_paragraphs(analysis);
         if paragraphs.is_empty() {
             return Err(PdfLookupStatus::Unavailable);
         }
@@ -407,8 +408,8 @@ impl PdfDocument {
 
     /// Each paragraph number the structure labels, once, with every printing of it, as the structure engine reads
     /// them (`paragraph_printings`): the paragraph a pinpoint to that number addresses.
-    fn read_printed_paragraphs(&self) -> Vec<PrintedParagraph> {
-        let printed = legal_structure_model::structure_analysis().paragraph_printings(&self.structure);
+    fn read_printed_paragraphs(&self, analysis: &dyn StructureAnalysis) -> Vec<PrintedParagraph> {
+        let printed = analysis.paragraph_printings(&self.structure);
         let mut paragraphs: Vec<PrintedParagraph> = printed.into_iter().map(|(number, printings)| {
             let printings: Vec<&legal_structure_model::StructureNode> = printings.iter().map(|&index| &self.structure.nodes[index]).collect();
             let mut ranges: Vec<ScalarRange> = printings.iter().flat_map(|node| self.structure.query_ranges(node).into_owned()).collect();

@@ -5,7 +5,7 @@ use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 use legal_pdf_structure::{
-    status, validate_document, validate_pdf_components, StructureIdentity, StructureOutput,
+    status, validate_document, validate_pdf_components, Reader, StructureIdentity, StructureOutput,
 };
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(feature = "ppdoc")]
@@ -316,6 +316,8 @@ pub(crate) struct ParseOptions {
     /// LEGALPDF_TAGGER_MODEL names one, for the structure gold's grader).
     #[cfg(feature = "tagger")]
     pub tagger: Option<crate::tagger::TaggerOptions>,
+    /// What builds the structure (`Reader`): the request's, the stages by default.
+    pub reader: Reader,
 }
 
 impl Default for ParseOptions {
@@ -337,6 +339,7 @@ impl Default for ParseOptions {
             ppdoc: None,
             #[cfg(feature = "tagger")]
             tagger: None,
+            reader: Reader::Stages,
         }
     }
 }
@@ -404,8 +407,9 @@ fn cache_key(
     ocr_pages: Option<&[usize]>,
     semantic_profile: Option<DetectionProfile>,
     tagger_identity: Option<&str>,
+    reader: Reader,
 ) -> Result<String> {
-    let value = json!({
+    let mut value = json!({
         "source_sha256": source_hash,
         "schema_version": SCHEMA_VERSION,
         "parser_version": PARSER_VERSION,
@@ -423,6 +427,10 @@ fn cache_key(
         "ocr_pages": ocr_pages,
         "profile": semantic_profile,
     });
+    // The default reader's keys stay as they were.
+    if reader != Reader::Stages {
+        value["reader"] = json!(reader);
+    }
     serialization_sha256(&value)
 }
 
@@ -432,6 +440,7 @@ fn derive_extracted(
     source_hash: &str,
     cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
+    reader: Reader,
 ) -> Result<StructureOutput> {
     // Reader state depends on source pages, navigation hints and the engine's layout services.
     let reader_cache = cache_root.and_then(|root| {
@@ -452,6 +461,7 @@ fn derive_extracted(
         )
     });
     let mut derived = legal_pdf_structure::derive_cached(
+        legal_structure_model::structure_analysis(),
         &mut extracted.pages,
         &extracted.separators,
         &extracted.outline,
@@ -460,8 +470,10 @@ fn derive_extracted(
             source_sha256: source_hash.to_owned(),
             profile: semantic_profile,
             page_labels: extracted.metadata.embedded_page_labels.clone(),
+            reader,
         },
         reader_cache.as_deref(),
+        std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
@@ -521,12 +533,13 @@ fn derive_document(
     semantic_profile: Option<DetectionProfile>,
     #[cfg_attr(not(feature = "tagger"), allow(unused_variables))] tagger: TaggerChoice<'_>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
+    reader: Reader,
 ) -> Result<PdfDocument> {
     let document_id = format!("doc-{}", &source_hash[..20]);
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     #[allow(unused_mut)]
     let mut derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile)
+        derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile, reader)
     })?;
     // The structure tagger, where a model is configured, re-labels the graph's paragraph-level
     // nodes: regions, starts, markers and heading levels from the model, parents by the
@@ -662,7 +675,18 @@ pub fn gold_structure_document(
     source_hash: &str,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    derive_document(extracted, source_hash, "structure-gold", None, None, None, pages)
+    gold_read_document(extracted, source_hash, Reader::Stages, pages)
+}
+
+/// `gold_structure_document`, read by `reader`.
+#[doc(hidden)]
+pub fn gold_read_document(
+    extracted: ExtractedPdf,
+    source_hash: &str,
+    reader: Reader,
+    pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
+) -> Result<PdfDocument> {
+    derive_document(extracted, source_hash, "structure-gold", None, None, None, pages, reader)
 }
 
 fn build_document(
@@ -677,7 +701,7 @@ fn build_document(
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
-    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
+    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None, Reader::Stages)?;
     // A parse completes its structure in its projection; this document stops before it.
     derived.structure_graph.refresh_revision()?;
     let mut metadata = Map::new();
@@ -913,6 +937,7 @@ pub(crate) fn parse_pdf(
         options.ocr_pages.as_deref(),
         options.profile,
         tagger_identity.as_deref(),
+        options.reader,
     )?;
     if let Some(root) = &cache_root {
         if let Some(cached) = cached_document(root, &key, &source_hash) {
@@ -935,7 +960,7 @@ pub(crate) fn parse_pdf(
     let tagger = options.tagger.as_ref();
     #[cfg(not(feature = "tagger"))]
     let tagger = None;
-    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, tagger, None)?;
+    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, tagger, None, options.reader)?;
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
         let cache_path = parse_cache_root(root)

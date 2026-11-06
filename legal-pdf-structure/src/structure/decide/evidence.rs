@@ -377,7 +377,7 @@ pub(crate) const WORD_HEARING_PART: u32 = 1 << 13;
 pub(crate) const WORD_TURN: u32 = 1 << 14;
 /// An index's entry, ending on its page (`rules::index_entry`).
 pub(crate) const WORD_INDEX_ENTRY: u32 = 1 << 15;
-/// A speaker's label opening the line (`transcript::speaker_label`).
+/// A speaker's label opening the line (`LayoutAnalysis::speaker_label`).
 pub(crate) const WORD_SPEAKER: u32 = 1 << 16;
 /// A notes heading (`endnote_heading`).
 pub(crate) const WORD_NOTES_HEADING: u32 = 1 << 17;
@@ -387,7 +387,7 @@ pub(crate) const WORD_RESET_HEADING: u32 = 1 << 18;
 pub(crate) const WORD_CONTENTS_TITLE: u32 = 1 << 19;
 /// A word index's letter (`contents_lists::index_letter`).
 pub(crate) const WORD_INDEX_LETTER: u32 = 1 << 20;
-/// A statute's history note (`statute::history_note`).
+/// A statute's history note (`StructureAnalysis::history_note`).
 pub(crate) const WORD_HISTORY: u32 = 1 << 21;
 /// A division's word and its numeral, letter or roman numeral opening the line ("PART IV",
 /// "ARTICLE 5", "SCHEDULE A", "CHAPITRE 2": `division_word`). A section's number is no division's.
@@ -555,7 +555,7 @@ fn court_name(text: &str) -> bool {
 }
 
 /// The lexicon a line's words match (`WORD_*`), the citation title aside.
-fn lexicon(line: &Line) -> u32 {
+fn lexicon(analysis: &dyn StructureAnalysis, line: &Line) -> u32 {
     let text = line.text.trim();
     [
         (WORD_LABEL, headings::rules::label(text)),
@@ -564,21 +564,21 @@ fn lexicon(line: &Line) -> u32 {
         (WORD_DATE, date_line(text)),
         (WORD_FIELD, captions::field(&line.text).is_some()),
         (WORD_CLOSING, captions::closing(&line.text)),
-        (WORD_REASONS, captions::reasons(line)),
-        (WORD_SIGNATURE, legal_structure_model::structure_analysis().signature_line(text)),
-        (WORD_AUTHOR, legal_structure_model::structure_analysis().author_line(text)),
+        (WORD_REASONS, captions::reasons(analysis, line)),
+        (WORD_SIGNATURE, analysis.signature_line(text)),
+        (WORD_AUTHOR, analysis.author_line(text)),
         (WORD_WITNESS, headings::rules::witness(text)),
         (WORD_EXAMINATION, headings::rules::examination(text)),
         (WORD_TRANSCRIPT_PART, headings::rules::transcript_part(text)),
         (WORD_HEARING_PART, headings::rules::hearing_part(text)),
-        (WORD_TURN, headings::rules::turn_or_event(text)),
+        (WORD_TURN, headings::rules::turn_or_event(analysis, text)),
         (WORD_INDEX_ENTRY, headings::rules::index_entry(text)),
-        (WORD_SPEAKER, legal_structure_model::transcript::speaker_label(text).is_some()),
+        (WORD_SPEAKER, analysis.speaker_label(text).is_some()),
         (WORD_NOTES_HEADING, endnote_heading(text)),
         (WORD_RESET_HEADING, structural_reset_heading(text)),
         (WORD_CONTENTS_TITLE, contents_lists::contents_title(text)),
         (WORD_INDEX_LETTER, contents_lists::index_letter(text)),
-        (WORD_HISTORY, legal_structure_model::statute::history_note(text)),
+        (WORD_HISTORY, analysis.history_note(text)),
         (WORD_DIVISION, division_word(text)),
         (WORD_COURT, court_name(text)),
     ]
@@ -762,14 +762,14 @@ fn reference_tokens(line: &Line, size: f64) -> u8 {
 }
 
 /// The line's opening marker (`Marker`), its family named in `families`.
-fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
+fn opening_marker(analysis: &dyn StructureAnalysis, line: &Line, families: &mut Names) -> Option<Marker> {
     let text = closed_up(&line.text);
     let text = text.trim_start();
     let token = text.split_whitespace().next()?;
     if token.chars().count() > 12 {
         return None;
     }
-    let reading = layout_analysis().numbering_marker(token, None)?;
+    let reading = analysis.numbering_marker(token, None)?;
     let end = line.text.len() - text.len() + token.len();
     Some(Marker {
         family: families.id(&reading.family),
@@ -855,6 +855,7 @@ impl Evidence {
     /// page labels it declares (by page index), and `instrument` whether its caller knows it for an
     /// instrument.
     pub(crate) fn measure(
+        analysis: &dyn StructureAnalysis,
         pages: &[Page],
         slots: &Slots,
         normalized: Normalized,
@@ -907,7 +908,7 @@ impl Evidence {
                 );
                 evidence.weight.push(line.weight as f32);
                 evidence.tag.push(SourceTag::of(line));
-                evidence.marker.push(opening_marker(line, &mut families));
+                evidence.marker.push(opening_marker(analysis, line, &mut families));
                 evidence.label.push(note_label(page, &sizes, at));
                 evidence.references.push(reference_tokens(line, sizes[at]));
                 evidence.title_shaped.push(
@@ -916,7 +917,7 @@ impl Evidence {
                         && !sentence_ended(text)
                         && !text.ends_with([',', ';', ':']),
                 );
-                evidence.words.push(lexicon(line));
+                evidence.words.push(lexicon(analysis, line));
                 if !line_numbers[first + at] {
                     let (read, found) = operative_words(&line.text);
                     words += read;
@@ -963,7 +964,7 @@ impl Evidence {
                 }
             }
         }
-        evidence.read_citations(pages, slots, &line_numbers);
+        evidence.read_citations(analysis, pages, slots, &line_numbers);
         evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
         evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
         evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
@@ -980,7 +981,7 @@ impl Evidence {
     /// reference, which a citation holding it protects), or shaped as a title, and every line of the
     /// first two pages, each with the line either side of it; then which of the first two pages'
     /// lines name the case by its citation.
-    fn read_citations(&mut self, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
+    fn read_citations(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
         let count = slots.len();
         let mut wanted: Vec<bool> = (0..count)
             .map(|slot| {
@@ -1022,7 +1023,6 @@ impl Evidence {
         }
         let mut found: Vec<Cited> = Vec::new();
         if !window.is_empty() {
-            let analysis = layout_analysis();
             let placed = &placed;
             let line_text = |at: usize| &slots.line(pages, placed[at].0).text;
             // Each windowed line a byte range overlaps, where the line starts in the window, and the
@@ -1100,7 +1100,7 @@ impl Evidence {
     /// Reads again what a line's text says of it, for the lines whose opening marker the runs'
     /// repair rewrote (`repaired`: each slot with its text before): its marker, note label, shape and
     /// lexicon, and its citations moved with the words after the marker.
-    pub(crate) fn reread(&mut self, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
+    pub(crate) fn reread(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
         if repaired.is_empty() {
             return;
         }
@@ -1115,11 +1115,11 @@ impl Evidence {
             let page = &pages[page_slot];
             let line = slots.line(pages, *slot);
             let text = line.text.trim();
-            self.marker[at] = opening_marker(line, &mut families);
+            self.marker[at] = opening_marker(analysis, line, &mut families);
             self.label[at] = note_label(page, &self.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
             self.title_shaped[at] =
                 !text.is_empty() && text.split_whitespace().count() <= 12 && !sentence_ended(text) && !text.ends_with([',', ';', ':']);
-            self.words[at] = lexicon(line) | self.words[at] & WORD_CITATION_TITLE;
+            self.words[at] = lexicon(analysis, line) | self.words[at] & WORD_CITATION_TITLE;
             // The words after the rewritten marker keep their citations, moved by what the marker
             // gained or lost.
             let after = before.len() - before.bytes().rev().zip(line.text.bytes().rev()).take_while(|(a, b)| a == b).count();

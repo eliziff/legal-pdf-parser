@@ -156,7 +156,7 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
     // stray line labels and its form's own fields ("Email:") is none.
     let transcript = {
         let written: Vec<&str> = lines.iter().map(|(line, _, _)| line.text.as_str()).filter(|text| !text.trim().is_empty()).collect();
-        let spoken = written.iter().filter(|text| legal_structure_model::transcript::speaker_label(text).is_some()).count();
+        let spoken = written.iter().filter(|text| legal_pdf_core::layout_analysis().speaker_label(text).is_some()).count();
         let numbered = structure.nodes.iter().any(|node| node.role == Some(PrimaryRole::LineLabel));
         let share = spoken as f64 / written.len().max(1) as f64;
         (numbered && share >= 0.02) || (spoken >= 20 && share >= 0.08)
@@ -210,7 +210,7 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
             let first = &spans[0];
             if let Some((line, _, _)) = lines.iter().find(|(line, _, _)| line.id == first.line_id) {
                 let opening: String = line.text.chars().skip(first.start).take(first.end - first.start).collect();
-                let labels = legal_structure_model::transcript::speaker_labels(&opening);
+                let labels = legal_pdf_core::layout_analysis().speaker_labels(&opening);
                 if !labels.is_empty() {
                     let at = |bytes: usize| first.start + opening[..bytes].chars().count();
                     let found: Vec<SourceSpan> = labels.into_iter().map(|(start, end)| SourceSpan { line_id: first.line_id.clone(), start: at(start), end: at(end) }).collect();
@@ -239,13 +239,6 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
             attributes,
             document: None,
         });
-    }
-    if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() {
-        let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
-        for group in &groups { *kinds.entry(group.kind.as_str()).or_default() += 1; }
-        let quotes = structure.nodes.iter().filter(|n| n.kind == NodeKind::Quote).count();
-        let quote_candidates = candidates.iter().filter(|(n, ..)| n.kind == NodeKind::Quote).count();
-        eprintln!("composition	blocks {kinds:?}	quote nodes {quotes}	quote candidates {quote_candidates}");
     }
     let source_anchor = |offset: usize| -> Result<String, String> {
         let (line, _, scalar_start) = lines.iter().find(|(_, range, _)| range.start <= offset && offset < range.end)

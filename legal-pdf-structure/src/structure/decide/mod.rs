@@ -14,6 +14,7 @@ use super::*;
 
 mod evidence;
 pub(crate) use evidence::*;
+mod paragraphs;
 mod fences;
 pub(crate) use fences::*;
 mod runs;

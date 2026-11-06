@@ -72,6 +72,20 @@ pub(crate) fn write(
     notes: &Notes,
     decision: &Decision,
 ) -> HashMap<String, String> {
+    let trail = write_lines(pages, slots, evidence, fences, notes, decision);
+    in_reading_order(pages, slots, fences);
+    trail
+}
+
+/// `write`, each page's lines left in their places.
+pub(crate) fn write_lines(
+    pages: &mut [Page],
+    slots: &Slots,
+    evidence: &Evidence,
+    fences: &Fences,
+    notes: &Notes,
+    decision: &Decision,
+) -> HashMap<String, String> {
     let count = slots.len();
     // A page's note lines that go on with the last note of the page before: its first, and those
     // after it up to the next label.
@@ -123,7 +137,7 @@ pub(crate) fn write(
     }
     // A heading's trail names the rule that made it one; a title's, a marginal note's and a line
     // its source tagged a heading name the rule that took it from the headings.
-    let trail = (0..count)
+    (0..count)
         .filter_map(|at| {
             let (role, rule) = (decision.role[at], decision.rule[at]);
             let tagged = matches!(evidence.tag[at], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle);
@@ -135,7 +149,11 @@ pub(crate) fn write(
             };
             Some((slots.line(pages, Slot(at as u32)).id.clone(), format!("{mark}{}", rule.name())))
         })
-        .collect();
+        .collect()
+}
+
+/// Each page's lines, standing in their slots' order, put in reading order.
+pub(crate) fn in_reading_order(pages: &mut [Page], slots: &Slots, fences: &Fences) {
     for (page_slot, page) in pages.iter_mut().enumerate() {
         let range = slots.on(page_slot);
         let mut lines: Vec<Option<Line>> = std::mem::take(&mut page.lines).into_iter().map(Some).collect();
@@ -144,7 +162,6 @@ pub(crate) fn write(
             .filter_map(|slot| lines[(slot.0 - range.start) as usize].take())
             .collect();
     }
-    trail
 }
 
 /// Whether two lines of a page stand on one row.

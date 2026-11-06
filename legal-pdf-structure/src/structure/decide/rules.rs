@@ -11,7 +11,8 @@
 
 use super::*;
 use legal_pdf_core::{Columns, PageMeasure};
-use legal_structure_model::{CandidateGrammar, CandidateObservationV2, HeadingLadderStatus, UnitRole};
+use crate::structure::heading_ladder::HeadingLadderStatus;
+use legal_structure_model::{CandidateGrammar, CandidateObservationV2, UnitRole};
 use std::cell::OnceCell;
 
 /// A unit a line opens: its run (an index into the document's runs) and its kind.
@@ -83,6 +84,9 @@ pub(crate) struct Decision {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) residual: Vec<ResidualRecord>,
     conflicts: Vec<(Rule, Rule, Slot)>,
+    /// Each reading a strong rule gave a line another rule had decided: the machine's candidates beside the line's role.
+    pub(crate) refused: Vec<(Slot, Role, Rule)>,
+    pub(crate) sequences: Sequences,
 }
 
 /// The one reading of each line's opening marker that may open its unit, as (run, member) indexes,
@@ -158,6 +162,7 @@ impl Decision {
         }
         if self.role[at] != role {
             self.conflicts.push((self.rule[at], rule, slot));
+            self.refused.push((slot, role, rule));
         }
         false
     }
@@ -180,6 +185,7 @@ impl Decision {
     /// Every line of the document's pages decided, measured (`evidence`), fenced and ordered
     /// (`fences`), its runs read (`runs`) and its notes (`notes`), its bookmarks `outline`.
     pub(crate) fn decide(
+        analysis: &dyn StructureAnalysis,
         pages: &[Page],
         slots: &Slots,
         evidence: &Evidence,
@@ -187,6 +193,7 @@ impl Decision {
         runs: &Runs,
         notes: &Notes,
         outline: &[PdfOutlineEntry],
+        traced: bool,
     ) -> Self {
         let count = slots.len();
         let mut decision = Self {
@@ -234,6 +241,7 @@ impl Decision {
             } else if notes.note[at].is_some() {
                 if beside_numbers {
                     decision.conflicts.push((Rule::TranscriptLine, Rule::NoteBand, slot));
+                    decision.refused.push((slot, Role::Note, Rule::NoteBand));
                 } else {
                     decision.claim(slot, Role::Note, Rule::NoteBand);
                 }
@@ -244,7 +252,7 @@ impl Decision {
             // An enactment's history after a dash heads its provision.
             let dashed = line.strip_prefix(['\u{2014}', '\u{2013}', '-']).map(str::trim_start);
             if dashed.is_some_and(|rest| {
-                legal_structure_model::statute::history_note(rest) || cited_share(evidence, slot, slots.line(pages, slot).text.len()) >= 0.8
+                analysis.history_note(rest) || cited_share(evidence, slot, slots.line(pages, slot).text.len()) >= 0.8
             }) {
                 decision.claim(slot, Role::Heading, Rule::HistoryHeading);
                 continue;
@@ -276,7 +284,7 @@ impl Decision {
                 if decision.reading[at].is_none() {
                     deferred.push((slot, Rule::TranscriptLine));
                 }
-            } else if front_matter(pages, slots, evidence, fences, slot) {
+            } else if front_matter(analysis, pages, slots, evidence, fences, slot) {
                 deferred.push((slot, Rule::FrontMatter));
             }
         }
@@ -286,7 +294,7 @@ impl Decision {
             }
         }
         decision.read_runs(pages, slots, evidence, fences, runs, &sequences);
-        decision.marginal_notes(pages, slots, evidence, fences, runs, &sequences);
+        decision.marginal_notes(analysis, pages, slots, evidence, fences, runs, &sequences);
         let anchoring = anchors(pages, slots, evidence, fences, &geometry, &decision.role, outline, &fences.contents_entries);
         for (index, anchor) in anchoring.anchors.iter().enumerate() {
             for (k, &slot) in anchor.lines.iter().enumerate() {
@@ -309,7 +317,7 @@ impl Decision {
                         && place <= fences.place[slot.index()]
                 })
         };
-        weigh(pages, slots, evidence, fences, &sequences, &geometry, &unnamed, &mut decision);
+        weigh(analysis, pages, slots, evidence, fences, &sequences, &geometry, &unnamed, &mut decision, traced);
         decision.title(pages, slots, evidence, fences, &sequences, &geometry);
         // A counted marker no rule settled opens the unit its reading reads, the line carrying its
         // text going on with it; every other line is body, or a quotation's.
@@ -333,6 +341,7 @@ impl Decision {
         }
         heading_levels(pages, slots, evidence, fences, &sequences, &geometry, &mut decision);
         decision.report(pages, slots);
+        decision.sequences = sequences;
         decision
     }
 
@@ -519,7 +528,7 @@ impl Decision {
     /// opener of its depth before the next caption and set as most such captions of its look
     /// (bold, size, centring) are, is the opener's marginal note; any other is left to the lines
     /// still open. A caption's twin on its row in the other language's column reads as it does.
-    fn marginal_notes(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sequences: &Sequences) {
+    fn marginal_notes(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, sequences: &Sequences) {
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
         let mut decided: Vec<Slot> = Vec::new();
         for (ctx, lines) in sequences.lines.iter().enumerate() {
@@ -545,7 +554,7 @@ impl Decision {
                 let letters = line.chars().filter(|c| c.is_alphabetic()).count();
                 let upper = line.chars().filter(|c| c.is_uppercase()).count();
                 self.open(slot)
-                    && legal_structure_model::statute::marginal_note_shaped(line)
+                    && analysis.marginal_note_shaped(line)
                     && upper * 5 < letters * 4
                     && evidence.words[slot.index()] & WORD_DIVISION == 0
                     && !fences.numbered_row[slot.index()]
@@ -646,7 +655,7 @@ impl Decision {
                 if fences.translation[twin.index()] != fences.translation[slot.index()]
                     && evidence.row(slots, twin) == row
                     && self.open(twin)
-                    && legal_structure_model::statute::marginal_note_shaped(text(twin))
+                    && analysis.marginal_note_shaped(text(twin))
                 {
                     self.claim(twin, Role::MarginalNote, Rule::MarginalNote);
                 }
@@ -771,7 +780,7 @@ fn quoted(member: &Member) -> bool {
 /// "Fitzpatrick J.:"), a field's label with its blank, its value or another line on its row, a
 /// lead-in's colon after a joining word, a court's name heading its document's first two pages or
 /// standing over its parties (a party's role, a field or a label within the twelve lines after it).
-fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, slot: Slot) -> bool {
+fn front_matter(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, slot: Slot) -> bool {
     let words = evidence.words[slot.index()];
     let line = slots.line(pages, slot);
     let text = line.text.trim();
@@ -786,7 +795,7 @@ fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
                 .any(|next| evidence.words[next.index()] & (WORD_PARTY | WORD_FIELD | WORD_LABEL) != 0)
     };
     if words & (WORD_LABEL | WORD_PARTY | WORD_JURAT | WORD_DATE | WORD_SIGNATURE | WORD_AUTHOR) != 0
-        || text.strip_suffix(':').is_some_and(|name| legal_structure_model::structure_analysis().signature_line(name))
+        || text.strip_suffix(':').is_some_and(|name| analysis.signature_line(name))
         || joining_colon(text)
         || words & WORD_COURT != 0 && court()
     {

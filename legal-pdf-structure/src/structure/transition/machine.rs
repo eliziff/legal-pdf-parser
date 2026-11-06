@@ -17,15 +17,19 @@ pub(crate) const REGIONS: [&str; 17] = [
     "furniture", "page_label", "line_label", "title", "note_quote", "provision",
 ];
 pub(crate) const TEXT: u8 = 1;
+pub(crate) const LIST_ITEM: u8 = 2;
 pub(crate) const HEADING: u8 = 3;
 pub(crate) const QUOTE: u8 = 4;
 pub(crate) const CONTENTS: u8 = 7;
 pub(crate) const NOTE: u8 = 5;
 pub(crate) const TABLE: u8 = 6;
+pub(crate) const MARGINAL_NOTE: u8 = 10;
+pub(crate) const FURNITURE: u8 = 11;
 pub(crate) const PAGE_LABEL: u8 = 12;
 pub(crate) const LINE_LABEL: u8 = 13;
 pub(crate) const TITLE: u8 = 14;
 pub(crate) const NOTE_QUOTE: u8 = 15;
+pub(crate) const PROVISION: u8 = 16;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
@@ -217,6 +221,54 @@ pub(crate) struct LineView<'a> {
     /// The paragraph number the decide stage's judgment reader reads the line opening (`Fences::count`): t0's
     /// reading of the document's numbered paragraphs, which DOC's decoding works from.
     pub(crate) count: Option<u32>,
+}
+
+/// How a move stands to the units of its stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stands {
+    /// Opens a unit at its line.
+    Opens,
+    /// Goes on with the unit open in its stream, whose first line this is.
+    GoesOn(usize),
+    /// Takes up another unit, whose first line this is.
+    Resumes(usize),
+}
+
+/// A document's units as the moves make them, each by its first line: the one open in each context's stream, the last
+/// of each region in each stream, which a line may resume, and each one's region.
+#[derive(Default)]
+pub(crate) struct Streams {
+    open: HashMap<(u16, usize), usize>,
+    last_of_region: HashMap<(u16, usize, u8), usize>,
+    regions: HashMap<usize, u8>,
+}
+
+impl Streams {
+    /// How `chosen` stands in the stream `key`. A transcript's line number and a page's label are a line each.
+    pub(crate) fn stands(&self, key: (u16, usize), chosen: &Move) -> Stands {
+        let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
+        match (chosen.resumes, self.open.get(&key)) {
+            (Some(first), _) => Stands::Resumes(first as usize),
+            (_, Some(&first)) if !single && !chosen.opens && self.regions.get(&first) == Some(&chosen.region) => Stands::GoesOn(first),
+            _ if !single && chosen.resume => self.last_of_region.get(&(key.0, key.1, chosen.region)).map_or(Stands::Opens, |&first| Stands::Resumes(first)),
+            _ => Stands::Opens,
+        }
+    }
+
+    /// The stream after the move at `line`.
+    pub(crate) fn step(&mut self, key: (u16, usize), region: u8, stands: Stands, line: usize) {
+        match stands {
+            Stands::Opens => {
+                self.open.insert(key, line);
+                self.last_of_region.insert((key.0, key.1, region), line);
+                self.regions.insert(line, region);
+            }
+            Stands::Resumes(first) => {
+                self.open.insert(key, first);
+            }
+            Stands::GoesOn(_) => {}
+        }
+    }
 }
 
 /// A move's `reading` that counts on the number the margin prints beside the line's row (`LineView::margin`),

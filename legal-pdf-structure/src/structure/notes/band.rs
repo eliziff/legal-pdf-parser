@@ -453,7 +453,7 @@ struct Continuation {
 /// The candidate that continues the carried sequence: the one numbered next, that reads as no
 /// citation's number, and that the longest counting run follows. The labels before it, and other
 /// citation-shaped ones numbered next, are suppressed (returned with it, by place).
-fn continue_endnotes(sheet: &Sheet, candidates: &[Candidate], facts: &PageFacts, run: &EndnoteRun) -> (Continuation, Vec<usize>) {
+fn continue_endnotes(analysis: &dyn StructureAnalysis, sheet: &Sheet, candidates: &[Candidate], facts: &PageFacts, run: &EndnoteRun) -> (Continuation, Vec<usize>) {
     let page = sheet.page;
     let mut suppressed = Vec::new();
     let expected_indexes: Vec<usize> = candidates
@@ -461,7 +461,7 @@ fn continue_endnotes(sheet: &Sheet, candidates: &[Candidate], facts: &PageFacts,
         .enumerate()
         .filter_map(|(index, (_, prefix, _))| (prefix.label.parse::<u32>().ok() == run.expected).then_some(index))
         .collect();
-    let noncitation: Vec<usize> = expected_indexes.iter().copied().filter(|index| !citation_shaped_candidate(page, &candidates[*index])).collect();
+    let noncitation: Vec<usize> = expected_indexes.iter().copied().filter(|index| !citation_shaped_candidate(analysis, page, &candidates[*index])).collect();
     let pool = if noncitation.is_empty() { &expected_indexes } else { &noncitation };
     let expected_index = pool.iter().copied().max_by_key(|index| {
         let mut sequence = 1;
@@ -482,7 +482,7 @@ fn continue_endnotes(sheet: &Sheet, candidates: &[Candidate], facts: &PageFacts,
         if let Some(selected) = expected_index {
             suppressed.extend(candidates[..selected].iter().map(|candidate| candidate.0));
             for index in &expected_indexes {
-                if *index != selected && citation_shaped_candidate(page, &candidates[*index]) {
+                if *index != selected && citation_shaped_candidate(analysis, page, &candidates[*index]) {
                     suppressed.push(candidates[*index].0);
                 }
             }
@@ -791,7 +791,7 @@ fn verify_endnotes(sheets: &[Sheet], notes: &mut [Vec<(usize, NoteKind)>]) {
 }
 
 /// Every page's note band, in order, then the endnote runs the body never refers to given back.
-pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
+pub(crate) fn read_band(analysis: &dyn StructureAnalysis, pages: &[BandPage], lines: &BandLines) -> BandReading {
     let mut found = BandReading::default();
     let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
     let mut notes: Vec<Vec<(usize, NoteKind)>> = Vec::with_capacity(sheets.len());
@@ -808,7 +808,7 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
         let (candidates, suppress) = label_candidates(sheet, &reading, &paragraph);
         found.suppressed.extend(suppress.into_iter().map(|place| sheet.view.slot(place)));
         let facts = page_facts(band, sheet, &reading, &candidates);
-        let (continuation, suppress) = continue_endnotes(sheet, &candidates, &facts, &run);
+        let (continuation, suppress) = continue_endnotes(analysis, sheet, &candidates, &facts, &run);
         found.suppressed.extend(suppress.into_iter().map(|place| sheet.view.slot(place)));
         let margin = margin_notes(sheet, &reading, &candidates);
         let endnote_page = facts.endnote_heading_y.is_some()

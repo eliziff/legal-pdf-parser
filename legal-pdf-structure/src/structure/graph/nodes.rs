@@ -244,19 +244,9 @@ pub(crate) fn native_graph_parts(
         node.label = heading.then(|| node.ranges.iter().map(|part|
             text.slice(part.start..part.end).expect("indexed heading part must be in bounds")
         ).collect::<Vec<_>>().join(" "));
-        // A heading's printed number: before its title on its first line, or that whole line where
-        // the number stands alone over its title ("II." over "Background Facts").
         if let Some(first) = node.ranges.first().filter(|_| heading) {
             let line = text.slice(first.start..first.end).expect("indexed heading part must be in bounds");
-            let marker = heading_marker_re()
-                .captures(line)
-                .or_else(|| (node.ranges.len() > 1).then(|| heading_marker_alone_re().captures(line)).flatten());
-            if let Some(found) = marker.and_then(|c| c.get(1)) {
-                node.marker_range = Some(ScalarRange {
-                    start: first.start + line[..found.start()].chars().count(),
-                    end: first.start + line[..found.end()].chars().count(),
-                });
-            }
+            node.marker_range = heading_marker(first.start, line, node.ranges.len());
         }
         node.page_indexes = index.page_indexes_for_line_ids(&paragraph.line_ids);
         node.line_ids.clone_from(&paragraph.line_ids);
@@ -268,6 +258,27 @@ pub(crate) fn native_graph_parts(
         nodes.push(node);
     }
     nodes.extend(table_nodes(index, decided.tables().iter().enumerate(), ORIGIN)?);
+    nodes.extend(quotation_nodes(index, decided, ORIGIN)?);
+    Ok(nodes)
+}
+
+/// A heading's printed number, its first line `line` starting at `start` in the text and the heading holding `lines`
+/// lines: before its title on that line, or that whole line where the number stands alone over its title ("II." over
+/// "Background Facts").
+pub(crate) fn heading_marker(start: usize, line: &str, lines: usize) -> Option<ScalarRange> {
+    let found = heading_marker_re()
+        .captures(line)
+        .or_else(|| (lines > 1).then(|| heading_marker_alone_re().captures(line)).flatten())?
+        .get(1)?;
+    Some(ScalarRange {
+        start: start + line[..found.start()].chars().count(),
+        end: start + line[..found.end()].chars().count(),
+    })
+}
+
+/// Each quotation the fences read, a node over its lines.
+pub(crate) fn quotation_nodes(index: &PdfTextIndex, decided: &Decided, origin: &'static str) -> Result<Vec<StructureNode>> {
+    let mut nodes = Vec::new();
     let mut quoted = BTreeMap::<&str, Vec<String>>::new();
     for line in &index.lines {
         if let Some(id) = decided.quotation(&line.line_id) {
@@ -282,7 +293,7 @@ pub(crate) fn native_graph_parts(
             id.to_owned(),
             NodeKind::Quote,
             range,
-            ORIGIN,
+            origin,
             Derivation::Heuristic,
             None,
         );

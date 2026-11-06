@@ -208,7 +208,12 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
         let stream = stream_of(region);
         let mv = &mut moves[k];
         mv.region = region;
-        if unit[i] == k {
+        let stands = match (unit[i] == k, last_in_stream.insert(stream, unit[i])) {
+            (true, _) => Stands::Opens,
+            (false, Some(last)) if last == unit[i] => Stands::GoesOn(last),
+            _ => Stands::Resumes(unit[i]),
+        };
+        if matches!(stands, Stands::Opens) {
             mv.opens = true;
             if region == HEADING {
                 mv.level = units.level[i].clamp(1, 9) as i8;
@@ -229,11 +234,10 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
                     _ => OPENING,
                 });
             }
-        } else if last_in_stream.get(&stream) != Some(&unit[i]) {
+        } else if let Stands::Resumes(first) = stands {
             mv.resume = true;
-            mv.resumes = Some(unit[i] as u32);
+            mv.resumes = Some(first as u32);
         }
-        last_in_stream.insert(stream, unit[i]);
     }
     for (i, target) in units.note.iter().enumerate() {
         let first = regions[read[i]][0];
@@ -522,9 +526,11 @@ mod model {
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
         gaps: [bool; 2],
-        /// Whether the reading's order is read off the successor head (LEGALPDF_TRANSITION_DOC_ORDER=on; by default
-        /// the parser's order is kept: ordered region by region, a transcript's line numbers would leave their lines).
+        /// Whether the reading's order is read off the successor head (by default the parser's order is kept:
+        /// ordered region by region, a transcript's line numbers would leave their lines).
         reorder: bool,
+        /// Whether each document's stages' times are written, for the reader's speed.
+        times: bool,
         tokenizer: tokenizers::Tokenizer,
         embeddings: Vec<f32>,
         meta: Meta,
@@ -571,7 +577,7 @@ mod model {
     impl Reader {
         /// The stages under `dir`, their ONNX Runtime the one LEGALPDF_ONNX_RUNTIME or LEGALPDF_ONNXRUNTIME
         /// names; the text model's reading checked against Python's on `parity.json`'s texts.
-        pub(crate) fn load(dir: &Path) -> std::result::Result<Self, String> {
+        pub(crate) fn load(dir: &Path, reorder: bool, times: bool) -> std::result::Result<Self, String> {
             let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"));
             let meta: Meta = serde_json::from_str(&read("docparse.json")?).map_err(|e| format!("docparse.json: {e}"))?;
             if meta.width != ALL || meta.classes != CLASSES || meta.mean.len() != ALL || meta.std.len() != ALL {
@@ -592,7 +598,8 @@ mod model {
                 dir: dir.to_path_buf(),
                 sessions: Mutex::new(vec![first]),
                 gaps,
-                reorder: std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"),
+                reorder,
+                times,
                 tokenizer,
                 embeddings,
                 meta,
@@ -961,8 +968,7 @@ mod model {
                 read_in(&mut moves, &ranks, pages);
             }
             lap(4, &mut since);
-            // LEGALPDF_TRANSITION_DOC_TIMES: each document's stages' times, for the reader's speed.
-            if std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some() {
+            if self.times {
                 eprintln!("doc times: {n} lines {count} regions {} pairs; embed {:.3}s detect {:.3}s order {:.3}s trees {:.3}s decode {:.3}s",
                     pair_i.len(), stages[0], stages[1], stages[2], stages[3], stages[4]);
             }

@@ -1,13 +1,12 @@
 //! The parsed PDF as applications read it: the projected document (`document`), lookups by locator
 //! (`lookup`), and its rendered text (`rendered`).
 
-pub use legal_structure_model::parse_ordinal;
 use legal_pdf_core::model::{
     Footnote, Line, Page, Paragraph, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
 };
-use legal_structure_model::{Derivation, DocumentStructure, NodeKind, StructureNode};
+use legal_structure_model::{Derivation, DocumentStructure, NodeKind, StructureAnalysis, StructureNode};
 use legal_structure_model::{
-    document_fingerprint, normalize_compact_numbered_section_locator, serialization_sha256, utf16_len,
+    document_fingerprint, serialization_sha256, utf16_len,
     DigestWriter, DocumentFingerprint, ScalarText,
 };
 use regex::Regex;

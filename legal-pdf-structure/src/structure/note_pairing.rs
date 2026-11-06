@@ -1,6 +1,6 @@
 //! Pair within logical documents, then retain one PDF-wide identity for each materialized note.
 
-use super::{Decided, DocumentContext, PdfTextIndex};
+use super::{Decided, DocumentContext, PdfTextIndex, StructureAnalysis};
 use legal_pdf_core::model::{Line, Page, PairingOutput, PdfSourceSpan};
 use std::collections::{BTreeMap, HashMap};
 
@@ -26,12 +26,12 @@ fn without_lines(page: &Page) -> Page {
 /// modes), each constituent document and language on its own lines; the pages' lines are left as
 /// they stand.
 pub(super) fn pair_notes(
+    analysis: &dyn StructureAnalysis,
     pages: &mut [Page],
     decided: &Decided,
     citations: &BTreeMap<String, Vec<PdfSourceSpan>>,
     index: &PdfTextIndex,
 ) -> PairingOutput {
-    let analysis = legal_pdf_core::layout_analysis();
     let contexts: Vec<Vec<DocumentContext>> = pages
         .iter()
         .map(|page| page.lines.iter().map(|line| decided.document_context(&line.id)).collect())

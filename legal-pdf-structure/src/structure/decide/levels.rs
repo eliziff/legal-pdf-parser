@@ -346,7 +346,6 @@ pub(crate) fn heading_levels(
     geometry: &Geometry,
     decision: &mut Decision,
 ) {
-    let trace = std::env::var_os("LEGALPDF_LEVEL_TRACE").is_some();
     let mut families = Families::default();
     let text = |slot: Slot| slots.line(pages, slot).text.trim();
     for lines in &sequences.lines {
@@ -451,15 +450,6 @@ pub(crate) fn heading_levels(
                     _ => read,
                 }
             };
-            if trace {
-                eprintln!(
-                    "level\t{}\t{:?}\tread {read}\tplaced {}\tbase {base}\t-> {level}\t{}",
-                    slots.line(pages, unit[0]).id,
-                    rung,
-                    placed(unit),
-                    texts[k].chars().take(60).collect::<String>()
-                );
-            }
             for &slot in unit {
                 decision.level[slot.index()] = level.min(usize::from(u8::MAX)) as u8;
             }

@@ -438,7 +438,7 @@ pub(crate) fn normalize_footnote(raw: &str) -> String {
         .to_lowercase()
 }
 
-pub(crate) fn normalized_section(raw: &str) -> Option<String> {
+pub(crate) fn normalized_section(analysis: &dyn StructureAnalysis, raw: &str) -> Option<String> {
     static PREFIX: OnceLock<Regex> = OnceLock::new();
     let value = nfkc_text(raw);
     let compact: String = PREFIX
@@ -447,12 +447,12 @@ pub(crate) fn normalized_section(raw: &str) -> Option<String> {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    let normalized = normalize_compact_numbered_section_locator(&compact);
+    let normalized = analysis.numbered_section_locator(&compact);
     (!normalized.is_empty()).then_some(normalized)
 }
 
-pub(crate) fn section_alias(raw: &str) -> String {
-    normalized_section(raw).unwrap_or_else(|| {
+pub(crate) fn section_alias(analysis: &dyn StructureAnalysis, raw: &str) -> String {
+    normalized_section(analysis, raw).unwrap_or_else(|| {
         let value = nfkc_text(raw);
         value
             .split_whitespace()
@@ -462,13 +462,13 @@ pub(crate) fn section_alias(raw: &str) -> String {
     })
 }
 
-pub(crate) fn section_matches(section: &StructureNode, requested_kind: &str, requested: &str) -> bool {
+pub(crate) fn section_matches(analysis: &dyn StructureAnalysis, section: &StructureNode, requested_kind: &str, requested: &str) -> bool {
     if requested_kind != "section" && section.locator_kind.as_deref() != Some(requested_kind) {
         return false;
     }
     if requested_kind == "section"
         && !section.id.is_empty()
-        && section_alias(&format!("section:{}", section.id)) == requested
+        && section_alias(analysis, &format!("section:{}", section.id)) == requested
     {
         return true;
     }
@@ -477,7 +477,7 @@ pub(crate) fn section_matches(section: &StructureNode, requested_kind: &str, req
         .iter()
         .map(String::as_str)
         .chain(section.aliases.iter().flatten().map(String::as_str))
-        .any(|value| section_alias(value) == requested)
+        .any(|value| section_alias(analysis, value) == requested)
 }
 
 pub(crate) fn exact_footnotes(document: &PdfDocument, locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
@@ -578,7 +578,7 @@ where
     lookup
 }
 
-pub(crate) fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest) -> PdfStructureLookup {
+pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfDocument, input: &PdfLookupRequest) -> PdfStructureLookup {
     if !input.valid() {
         return result(
             input,
@@ -607,9 +607,9 @@ pub(crate) fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest)
         let inline = numeric_range(kind, &input.locator);
         let start_number = inline
             .map(|item| item.0)
-            .or_else(|| parse_ordinal(kind, &input.locator));
+            .or_else(|| analysis.parse_ordinal(kind, &input.locator));
         let end_number = end_locator
-            .map(|end| parse_ordinal(kind, end))
+            .map(|end| analysis.parse_ordinal(kind, end))
             .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
         let (Some(start_number), Some(end_number)) = (start_number, end_number) else {
             return result(
@@ -690,9 +690,9 @@ pub(crate) fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest)
         let inline = numeric_range(kind, &input.locator);
         let start_number = inline
             .map(|item| item.0)
-            .or_else(|| parse_ordinal(kind, &input.locator));
+            .or_else(|| analysis.parse_ordinal(kind, &input.locator));
         let end_number = end_locator
-            .map(|end| parse_ordinal(kind, end))
+            .map(|end| analysis.parse_ordinal(kind, end))
             .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
         let (Some(start_number), Some(end_number)) = (start_number, end_number) else {
             return result(
@@ -733,11 +733,11 @@ pub(crate) fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest)
                 Some("Paragraph range exceeds the lookup limit".to_owned()),
             );
         }
-        let selected = match document.paragraph_range(start_number, end_number) {
+        let selected = match document.paragraph_range(analysis, start_number, end_number) {
             Ok(selected) => selected,
             Err(status) => return result(input, status, None),
         };
-        let printed = document.printed_paragraphs();
+        let printed = document.printed_paragraphs(analysis);
         let start = printed
             .iter()
             .position(|p| std::ptr::eq(p, &selected[0]))
@@ -803,11 +803,11 @@ pub(crate) fn structure_lookup(document: &PdfDocument, input: &PdfLookupRequest)
             )),
         );
     }
-    let requested = section_alias(&input.locator);
+    let requested = section_alias(analysis, &input.locator);
     let candidates: Vec<_> = sections
         .iter()
         .enumerate()
-        .filter(|(_, section)| section_matches(section, &input.locator_kind, &requested))
+        .filter(|(_, section)| section_matches(analysis, section, &input.locator_kind, &requested))
         .map(|(index, _)| index)
         .collect();
     if candidates.len() > 1 {

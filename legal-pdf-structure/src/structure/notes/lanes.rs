@@ -17,6 +17,7 @@ use legal_pdf_core::{
     line_font_size,
     model::{Line, Page},
 };
+use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -136,8 +137,8 @@ fn leading_note_number(text: &str) -> Option<i64> {
         .and_then(|found| found[1].parse().ok())
 }
 
-fn strict_citation(text: &str) -> bool {
-    !legal_pdf_core::layout_analysis().protected_citation_spans(text).is_empty()
+fn strict_citation(analysis: &dyn StructureAnalysis, text: &str) -> bool {
+    !analysis.protected_citation_spans(text).is_empty()
 }
 
 fn citation_shaped(text: &str) -> bool {
@@ -348,10 +349,10 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 
 /// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
-pub(crate) fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
+pub(crate) fn note_promotions(analysis: &dyn StructureAnalysis, lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
     let lines = DocumentLines::new(lines);
     let mut claims = BTreeSet::<LineRef>::new();
-    let rerouted = post_footnote_reroute(&lines);
+    let rerouted = post_footnote_reroute(analysis, &lines);
     let closed = band_closure(&lines, &rerouted);
     claims.extend(rerouted.iter().chain(&closed));
     let reserved = claims.iter().copied().collect::<HashSet<_>>();
@@ -366,7 +367,7 @@ pub(crate) fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) 
 /// marker, a printed label continuing the page's note numbers, or the unfinished sentence of the
 /// note before them where a later note or a citation's shape anchors it. Declining a line breaks
 /// the chain, so the body below a page's notes inherits nothing.
-fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
+fn post_footnote_reroute(analysis: &dyn StructureAnalysis, lines: &DocumentLines<'_>) -> Vec<LineRef> {
     let mut claims = Vec::new();
     for (page, slots) in lines.order {
         let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
@@ -377,16 +378,10 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             .iter()
             .rposition(|line| lines.is_note(*line))
             .unwrap_or(first_note);
-        let mut last_text = String::new();
-        let mut last_anchor = false;
-        let mut last_number = None::<i64>;
+        let mut trail = Trail::Broken;
         for (position, &line) in refs.iter().enumerate() {
             if lines.is_note(line) {
-                last_text = lines.text(line).to_owned();
-                last_anchor = true;
-                if let Some(number) = leading_note_number(&folded(&last_text)) {
-                    last_number = Some(number);
-                }
+                trail = trail.past_note(lines.text(line));
                 continue;
             }
             let text = lines.text(line);
@@ -394,11 +389,12 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
                 continue;
             }
             if !lines.mutable(line) {
-                last_text.clear();
-                last_anchor = false;
-                last_number = None;
+                trail = Trail::Broken;
                 continue;
             }
+            let Trail::Note { text: last_text, anchored, number: last_number } = &trail else {
+                continue;
+            };
             if last_text.is_empty() {
                 continue;
             }
@@ -411,8 +407,8 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             }
             let marker = marker_match(&fold);
             let sandwiched = position < last_note;
-            let continuation = !last_text.is_empty() && last_anchor && !super::sentence_ended(&last_text);
-            let citation = strict_citation(text);
+            let continuation = *anchored && !super::sentence_ended(last_text);
+            let citation = strict_citation(analysis, text);
             let number = (bare || marker)
                 .then(|| leading_note_number(&fold))
                 .flatten();
@@ -420,28 +416,44 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
                 number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
             let bare_claim = bare && continues;
             if bare && !bare_claim {
-                last_text.clear();
-                last_anchor = false;
-                last_number = None;
+                trail = Trail::Broken;
                 continue;
             }
-            let anchored_continuation = continuation && (sandwiched || citation || last_anchor);
-            let anchored_citation = citation && sandwiched && !last_text.is_empty();
-            if !(marker || anchored_continuation || anchored_citation || bare_claim) {
-                last_text.clear();
-                last_anchor = false;
-                last_number = None;
+            let anchored_citation = citation && sandwiched;
+            if !(marker || continuation || anchored_citation || bare_claim) {
+                trail = Trail::Broken;
                 continue;
             }
             claims.push(line);
-            last_text = text.to_owned();
-            last_anchor = marker || bare_claim;
-            if number.is_some() && (marker || bare_claim) {
-                last_number = number;
-            }
+            let numbered = marker || bare_claim;
+            trail = Trail::Note {
+                text: text.to_owned(),
+                anchored: numbered,
+                number: number.filter(|_| numbered).or(*last_number),
+            };
         }
     }
     claims
+}
+
+/// What a walk down a page carries from the notes above the line it is at.
+enum Trail {
+    /// A line no note goes on over broke the trail.
+    Broken,
+    /// The last line a note holds: its text, whether a note label or a note line anchors it (a
+    /// continuation claimed without its own label does not), and the last note number read.
+    Note { text: String, anchored: bool, number: Option<i64> },
+}
+
+impl Trail {
+    /// The trail past a line of a note, whose own number, where it prints one, replaces the last.
+    fn past_note(self, text: &str) -> Self {
+        let last = match self {
+            Self::Note { number, .. } => number,
+            Self::Broken => None,
+        };
+        Self::Note { text: text.to_owned(), anchored: true, number: leading_note_number(&folded(text)).or(last) }
+    }
 }
 
 /// The bottom note band closed over a page-final run of text when the band's last note breaks

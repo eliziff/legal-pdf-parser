@@ -59,9 +59,9 @@ pub(crate) fn hearing_part(text: &str) -> bool {
 /// A transcript's line that is a turn or a procedural event, never a heading: an examiner resuming
 /// ("BY MR. PHILLIPS:"), a speaker's turn ("Q.", "THE WITNESS:"), a recess, an exhibit marked, a
 /// discussion off the record.
-pub(crate) fn turn_or_event(text: &str) -> bool {
+pub(crate) fn turn_or_event(analysis: &dyn legal_structure_model::StructureAnalysis, text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    legal_structure_model::transcript::speaker_label(text).is_some()
+    analysis.speaker_label(text).is_some()
         || pattern(&RE, r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
 }
 

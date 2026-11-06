@@ -218,6 +218,7 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
         let mut pages = Vec::with_capacity(entry.pages);
         for page in 1..=entry.pages {
             pages.push(query_pdf_document(
+                legal_pdf_core::CHECKOUT_ENGINE,
                 &document,
                 &PdfLookupRequest::new("page", page.to_string()),
             ));

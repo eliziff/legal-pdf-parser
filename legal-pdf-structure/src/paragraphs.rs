@@ -585,16 +585,6 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     full && (!terminal_re().is_match(a.text.trim()) || lower)
 }
 
-/// With LEGALPDF_PARAGRAPH_TRACE set, each break names its rule on stderr: the page, the line
-/// that opens the new block or paragraph, its first characters.
-fn trace(line: &Line, kind: &str, reason: &str) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("LEGALPDF_PARAGRAPH_TRACE").is_some()) {
-        let text: String = line.text.trim().chars().take(48).collect();
-        eprintln!("ptrace\t{}\t{}\t{kind}\t{reason}\t{text}", line.page_index, line.id);
-    }
-}
-
 /// Each of a page's `lines` (in reading order) `counted` holds numbered by its printed paragraph,
 /// from 0 in order; none for the others, which part the runs of counted lines.
 pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
@@ -613,23 +603,10 @@ pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure)
             end += 1;
         }
         let run = &lines[start..end];
-        // LEGALPDF_LAYOUT_UNITS=on: where a page layout model has given every line a region, the
-        // regions are the paragraphs: a block starts where the region changes and nowhere else.
-        let layout_units = layout_units_mode() && run.iter().all(|line| !line.region_id.is_empty());
         let mut block_start = 0;
         for k in 1..=run.len() {
-            if k < run.len() {
-                if layout_units {
-                    if run[k - 1].region_id == run[k].region_id {
-                        continue;
-                    }
-                    trace(&run[k], "block", "layout-region");
-                } else {
-                    match starts_block(run[k - 1], run[k], &pitch) {
-                        None => continue,
-                        Some(reason) => trace(run[k], "block", reason),
-                    }
-                }
+            if k < run.len() && starts_block(run[k - 1], run[k], &pitch).is_none() {
+                continue;
             }
             let block: Vec<&Line> = run[block_start..k].to_vec();
             assigned[start + block_start] = Some(next);
@@ -637,11 +614,8 @@ pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure)
             for j in 1..block.len() {
                 let after = block.get(j + 1).copied();
                 let margin = indented.then(|| margin_at(&block, j));
-                if !layout_units {
-                    if let Some(reason) = starts_paragraph(block[j - 1], block[j], &block, after, margin, &pitch) {
-                        trace(block[j], "paragraph", reason);
-                        next += 1;
-                    }
+                if starts_paragraph(block[j - 1], block[j], &block, after, margin, &pitch).is_some() {
+                    next += 1;
                 }
                 assigned[start + block_start + j] = Some(next);
             }
@@ -651,10 +625,4 @@ pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure)
         start = end;
     }
     assigned
-}
-
-/// Whether a page layout model's regions, when present on every line, define the paragraphs.
-pub(crate) fn layout_units_mode() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEGALPDF_LAYOUT_UNITS").is_ok_and(|v| v == "on"))
 }

@@ -13,7 +13,7 @@ pub use document::LegalDocument;
 #[cfg(feature = "ppdoc")]
 pub use ppdoc::{PPDocDetection, PPDocLayout, PPDocOptions, PreparedPPDoc};
 pub use projection::{
-    numeric_range, parse_ordinal, PdfDocument, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
+    numeric_range, PdfDocument, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PdfTextLine,
     PdfTextPage, PdfTextWord, PrintedParagraph,
 };
