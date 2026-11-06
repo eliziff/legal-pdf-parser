@@ -311,8 +311,9 @@ pub(crate) fn structure_graph(
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
-        // A table's units are its rows, built with the table below, or the fences' tables where those are written.
-        if unit.region == TABLE {
+        // A table's units are its rows, built with the table below; where the fences' tables are written, its text stays
+        // the body's beside them.
+        if unit.region == TABLE && !written {
             continue;
         }
         // The pairer's notes are written from its claims below.
@@ -322,7 +323,7 @@ pub(crate) fn structure_graph(
         let ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
         let Some(envelope) = ranges.iter().map(|r| r.start).min().zip(ranges.iter().map(|r| r.end).max()) else { continue };
         let range = ScalarRange { start: envelope.0, end: envelope.1 };
-        let region = REGIONS[usize::from(unit.region)];
+        let region = if unit.region == TABLE { "text" } else { REGIONS[usize::from(unit.region)] };
         // The member a settled unit opens on; a heading numbering a provision is that provision, a heading still.
         let member = settled.as_ref().and_then(|read| {
             let &(run, at) = read.opened.get(&unit.lines[0])?;
