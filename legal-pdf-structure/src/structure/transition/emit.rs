@@ -24,6 +24,8 @@ pub(crate) struct Settled<'a> {
     pub(crate) diagnostics: Vec<StructureDiagnostic>,
     pub(crate) runs: &'a Runs,
     pub(crate) opened: HashMap<usize, (u32, u32)>,
+    /// The further markers a unit's first line opens on, a unit each under it.
+    pub(crate) within: HashMap<usize, Vec<(u32, u32)>>,
 }
 
 struct Unit {
@@ -327,7 +329,7 @@ pub(crate) fn structure_graph(
             Some(&read.runs.runs[run as usize].members[at as usize])
         });
         let (kind, role) = match region {
-            "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
+            "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
             "heading" => (NodeKind::Heading, None),
             "text" if unit.marker.is_some() => (NodeKind::Paragraph, None),
             "provision" => (NodeKind::Section, Some(PrimaryRole::Text)),
@@ -423,6 +425,33 @@ pub(crate) fn structure_graph(
             node.markup_attributes.insert("depth".to_owned(), unit.depth.to_string());
         }
         nodes.push(node);
+        // A further marker on the unit's first line opens a unit under it, to the unit's end: "2(1) The Court has ...", the
+        // section and its subsection.
+        let within = settled.as_ref().and_then(|read| read.within.get(&unit.lines[0]).map(|members| (read.runs, members)));
+        for (&(run, at), runs) in within.into_iter().flat_map(|(runs, members)| members.iter().map(move |pair| (pair, runs))) {
+            let member = &runs.runs[run as usize].members[at as usize];
+            let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
+            let (Some((start, end)), Some(role)) = (scalar(member.marker[0]).zip(scalar(member.marker[1])), member.kind) else { continue };
+            let kind = match role {
+                legal_structure_model::UnitRole::Section => NodeKind::Section,
+                legal_structure_model::UnitRole::Item => NodeKind::ListItem,
+                legal_structure_model::UnitRole::Paragraph => NodeKind::Paragraph,
+            };
+            let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, ORIGIN, Derivation::Native, Some(node_id(u)));
+            own.role = Some(PrimaryRole::Text);
+            own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
+            own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
+            own.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&ids[k]).map(|l| l.page_index)).collect();
+            own.page_indexes.dedup();
+            own.marker_range = Some(ScalarRange { start, end: end.max(start) });
+            own.content_start = scalar(member.content);
+            own.label = Some(member.grammar_value.clone());
+            own.grammar = Some(format!("region:{}", match role { legal_structure_model::UnitRole::Section => "provision", legal_structure_model::UnitRole::Item => "list_item", legal_structure_model::UnitRole::Paragraph => "text" }));
+            if kind == NodeKind::Section {
+                own.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
+            }
+            nodes.push(own);
+        }
         if region == "quote" && unit.lines.len() <= 60 && !written {
             let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
             quote.ranges = ranges.clone();

@@ -243,17 +243,19 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
 /// other line stands alone. A body unit's depth is its numbering's (`State::stack_depth`). With the moves, the run member
 /// each unit opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
-fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[Footnote]) -> (Vec<Move>, HashMap<usize, (u32, u32)>) {
+fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[Footnote]) -> (Vec<Move>, HashMap<usize, (u32, u32)>, HashMap<usize, Vec<(u32, u32)>>) {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     let mut opened = HashMap::new();
     // A marker any run gives a unit opens it, where the decision read the line by no run of its own.
-    let mut marked = HashMap::<Slot, (u32, u32)>::new();
+    let mut marked = HashMap::<Slot, Vec<(u32, u32)>>::new();
     for (r, run) in runs.runs.iter().enumerate() {
         for (at, member) in run.members.iter().enumerate().filter(|(_, member)| member.kind.is_some()) {
-            marked.entry(member.slot).or_insert((r as u32, at as u32));
+            marked.entry(member.slot).or_default().push((r as u32, at as u32));
         }
     }
+    // The further markers a line opens on, a unit each: "2(1) The Court has ...".
+    let mut within = HashMap::<usize, Vec<(u32, u32)>>::new();
     // The pairer's lines are its notes', a line it took from the body among them.
     for note in notes {
         let places: Vec<usize> = note.body_line_ids.iter().filter_map(|id| place(id)).collect();
@@ -285,7 +287,7 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             let at = table.order[k].index();
             // A line of the note band the pairer gave back is the body's.
             let role = if decision.role[at] == Role::Note { Role::Body } else { decision.role[at] };
-            let reading = decision.reading[at].or_else(|| marked.get(&table.order[k]).copied());
+            let reading = decision.reading[at].or_else(|| marked.get(&table.order[k]).and_then(|members| members.first().copied()));
             let member = reading.filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
             let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
             if k == first && carried.is_none() || kind.is_some() && !contents {
@@ -294,6 +296,14 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
                     opening = plain(CONTENTS, true);
                 } else if let Some(member) = member.filter(|_| kind.is_some()) {
                     opened.insert(k, member);
+                    let mark = |(run, at): (u32, u32)| runs.runs[run as usize].members[at as usize].marker[0];
+                    let mut further: Vec<(u32, u32)> = marked.get(&table.order[k]).into_iter().flatten().copied()
+                        .filter(|&other| other != member && mark(other).offset > mark(member).offset && graph::opens_units(role, decision.rule[at], &runs.runs[other.0 as usize])).collect();
+                    further.sort_by_key(|&other| mark(other).offset);
+                    further.dedup_by_key(|other| mark(*other).offset);
+                    if !further.is_empty() {
+                        within.insert(k, further);
+                    }
                 }
                 opening.opens = true;
                 moves[k] = Some(opening);
@@ -323,7 +333,7 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             chosen
         })
         .collect();
-    (moves, opened)
+    (moves, opened, within)
 }
 
 /// Each page's lines back in their slots, which `emit` addresses them by.
@@ -375,9 +385,9 @@ pub(crate) fn output(
     if give_back(pages, &footnotes) {
         build_regions(pages);
     }
-    let (moves, opened) = moves_of(slots, &fences, runs, &table, &views, &decision, &reading_regions(pages, &decided), &footnotes);
+    let (moves, opened, within) = moves_of(slots, &fences, runs, &table, &views, &decision, &reading_regions(pages, &decided), &footnotes);
     in_slot_order(pages, slots);
-    let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened };
+    let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
     let (structure_graph, paragraphs, mut footnotes) = emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, Some(settled))?;
     diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
     attach_propositions(&mut footnotes, &paragraphs, &decided);
