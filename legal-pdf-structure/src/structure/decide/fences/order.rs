@@ -74,9 +74,9 @@ impl Fences {
             }
             // The page's text lines; its body's edges and height are read on those of some length, so a short line
             // ("The PSR stated at page 8:") opens its row's paragraph but moves no edge. (A column of numbers beside a column of
-            // words reads as a table's grid: those words are text all the same.)
+            // words reads as a table's grid: those words are text all the same. A lone letter is a report's margin letter, no row.)
             let words: Vec<Slot> = slots.on(page_slot).map(Slot)
-                .filter(|&slot| (open(slot) || self.role[slot.index()] == Role::Table) && slots.line(pages, slot).text.chars().any(char::is_alphabetic)).collect();
+                .filter(|&slot| (open(slot) || self.role[slot.index()] == Role::Table) && slots.line(pages, slot).text.chars().filter(|c| c.is_alphabetic()).count() >= 2).collect();
             let body: Vec<Slot> = words.iter().copied().filter(|&slot| {
                 let line = slots.line(pages, slot);
                 line.bbox[2] - line.bbox[0] > page.width * 0.20
