@@ -646,13 +646,18 @@ pub(super) fn read(analysis: &dyn StructureAnalysis, views: &[PageView], rows: &
                 let line = &page.lines[index];
                 found[index].is_none() && line.text.chars().filter(|c| c.is_alphabetic()).count() >= 20
             };
+            // (Figures too long for a folio stand so in a table's row, its words in cells: "(7)  15050040" / "James Bingham en
+            // 1862" / "11749133" / "9 févr. 2001" / "& Timber Corporation".)
+            let cells = |index: usize| page.lines[index].text.trim().len() > 4
+                && (0..page.lines.len()).filter(|&other| other != index && row_of.of[other] == row_of.of[index] && found[other].is_none())
+                    .map(|other| page.lines[other].text.chars().filter(|c| c.is_alphabetic()).count()).sum::<usize>() >= 20;
             let margin: Vec<usize> = (0..page.lines.len())
                 .filter(|&index| found[index].is_some() && {
                     let text = page.lines[index].text.trim();
-                    !text.is_empty() && text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit())
+                    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
                 })
                 .filter(|&index| row_of.of[index] != u32::MAX
-                    && (0..page.lines.len()).any(|other| other != index && row_of.of[other] == row_of.of[index] && prose(other)))
+                    && (page.lines[index].text.trim().len() <= 4 && (0..page.lines.len()).any(|other| other != index && row_of.of[other] == row_of.of[index] && prose(other)) || cells(index)))
                 .collect();
             for index in margin {
                 found[index] = None;

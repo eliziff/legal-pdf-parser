@@ -93,6 +93,9 @@ impl Reading<'_> {
             if in_quotation || set_out.is_some() {
                 let bbox = set_out.filter(|_| !in_quotation).map_or(bbox, |next| slots.line(pages, *next).bbox);
                 let mut row = bbox;
+                // (The quotation's own leading, from its last two lines on the page.)
+                let tops: Vec<f64> = spans.keys().rev().filter(|&&slot| slots.page(slot) == page).take(2).map(|&slot| slots.line(pages, slot).bbox[1]).collect();
+                let leading = if let [last, before] = tops[..] { last - before } else { 0.0 };
                 for at in from + 1..kept.len() {
                     let under = slots.line(pages, kept[at]);
                     let enumerator = under.text.split_whitespace().next().is_some_and(|token| token.chars().count() <= 5 && token.ends_with(['.', ')']));
@@ -100,8 +103,9 @@ impl Reading<'_> {
                     // (In the quotation's small type, an item of its own further in is its: "[ ... ]" / "d) Les défenderesses ...".)
                     let quoted = small && self.smaller(kept[at].index());
                     let marked = self.marker_of.contains_key(&(kept[at], self.stream_of[kept[at].index()]));
-                    // (A line closing the reasons stands at a first line's indent: "Appeal allowed with costs.", "Solicitors for the appellants: ...".)
-                    let closing = self.analysis.disposition_line(&under.text) || self.analysis.end_matter(&under.text) || self.analysis.author_line(&under.text);
+                    // (A line closing the reasons stands at a first line's indent: "Appeal allowed with costs.", "Solicitors for the appellants: ...".
+                    // It stands apart: at the quotation's own leading it is the quotation's, a quoted order's "Counsel for the Applicant".)
+                    let closing = under.bbox[1] - row[1] > leading * 1.15 && (self.analysis.disposition_line(&under.text) || self.analysis.end_matter(&under.text) || self.analysis.author_line(&under.text));
                     if opens.contains(&kept[at]) || closing || marked && !quoted || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row && !(quoted && under.bbox[0] > bbox[0]) || enumerator && !quoted {
                         break;
                     }

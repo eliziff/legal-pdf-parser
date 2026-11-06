@@ -64,7 +64,25 @@ impl<'a> PageMeasures<'a> {
             let (ends, bbox) = (&mut page_ends[slots.page(slot)], slots.line(pages, slot).bbox);
             *ends = (ends.0.min(bbox[1]), ends.1.max(bbox[3]));
         }
-        let running: HashSet<&str> = fences.order.iter().filter(|slot| fences.role[slot.index()] == Role::Furniture).map(|&slot| slots.line(pages, slot).text.trim()).collect();
+        let mut running: HashSet<&str> = fences.order.iter().filter(|slot| fences.role[slot.index()] == Role::Furniture).map(|&slot| slots.line(pages, slot).text.trim()).collect();
+        // A short decision may print its running head on too few pages for the page reader: the same words on the top row of two
+        // pages or more, smaller than the body, a gap under them ("Rocktree Solar Project Time Extension and Approvals Transfer").
+        let top_row = |slot: Slot| {
+            let bbox = slots.line(pages, slot).bbox;
+            bbox[1] < page_ends[slots.page(slot)].0 + bbox[3] - bbox[1]
+        };
+        let mut under = vec![f64::MAX; pages.len()];
+        for &slot in fences.order.iter().filter(|&&slot| !top_row(slot)) {
+            under[slots.page(slot)] = under[slots.page(slot)].min(slots.line(pages, slot).bbox[1]);
+        }
+        let mut heads = HashMap::<&str, HashSet<usize>>::new();
+        for &slot in fences.order.iter().filter(|&&slot| top_row(slot) && fences.below_body(evidence, slot.index(), 0.95)) {
+            let (line, page) = (slots.line(pages, slot), slots.page(slot));
+            if under[page] - line.bbox[3] > line.bbox[3] - line.bbox[1] {
+                heads.entry(line.text.trim()).or_default().insert(page);
+            }
+        }
+        running.extend(heads.into_iter().filter(|(_, pages)| pages.len() >= 2).map(|(head, _)| head));
         Self { body_end, band_top, cells_end, edge, columns, right_edges, page_ends, running }
     }
 

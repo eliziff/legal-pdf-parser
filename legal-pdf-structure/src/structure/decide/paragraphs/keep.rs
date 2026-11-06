@@ -60,7 +60,10 @@ impl Reading<'_> {
         let neighbour = |step: isize| fences.order.get(reading_place.wrapping_add_signed(step)).filter(|other| slots.page(**other) == slots.page(slot)).map(|other| slots.line(pages, *other).bbox);
         let height = bbox[3] - bbox[1];
         let apart = if bbox[3] >= foot { neighbour(-1).is_none_or(|above| bbox[1] - above[3] > height) } else { neighbour(1).is_none_or(|below| below[1] - bbox[3] > height) };
-        if slots.line(pages, slot).recognized() && (bbox[1] <= top || bbox[3] >= foot) && apart && line.chars().filter(|c| c.is_alphanumeric()).count() <= FOLIO_MARKS {
+        // (Or a speck inside a line's own box: "eC" among a line's words.)
+        let inside = |other: [f64; 4]| other[0] <= bbox[0] && bbox[2] <= other[2] && other[1] <= bbox[1] && bbox[3] <= other[3];
+        let speck = neighbour(-1).is_some_and(inside) || neighbour(1).is_some_and(inside);
+        if slots.line(pages, slot).recognized() && ((bbox[1] <= top || bbox[3] >= foot) && apart || speck) && line.chars().filter(|c| c.is_alphanumeric()).count() <= FOLIO_MARKS {
             return true;
         }
         // A folio in words ("Page: 3"), and what the page's furniture prints elsewhere, are the page's.
@@ -79,13 +82,15 @@ impl Reading<'_> {
     /// (Words far smaller than the body and in no note are a page's aside, "OUR VISION...": but a size no one
     /// measured, an editor's "[Emphasis added]", and on a scan a line among the page's lines, whose layer boxes
     /// lines by their letters, are the text's.)
-    /// (A letterhead, far larger than the body, is no one's: "Federal Court" / "of Appeal" at twice its type.)
+    /// (A letterhead, far larger than the body, is no one's: "Federal Court" / "of Appeal" at twice its type. One letter so large
+    /// is a first paragraph's drop capital, at the text's left; further in it is a mark on the page, a rule in the margin read "I".)
     fn text_words(&self, slot: Slot, kept: &[Slot]) -> bool {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let (at, line, bbox) = (slot.index(), &slots.line(pages, slot).text, slots.line(pages, slot).bbox);
         let text = evidence.size[at] * 2.0 >= fences.label_size() || evidence.size[at] == 0.0 || self.analysis.editorial_line(line)
     || slots.line(pages, slot).recognized() && (!self.edge_line(slot) || kept.last().is_some_and(|last| !sentence_ended(&slots.line(pages, *last).text)));
-        let wordmark = fences.body.is_some_and(|(_, size)| evidence.size[at] * 2.0 >= f64::from(size) * 1.6) && line.trim().chars().count() > 1 && line.split_whitespace().count() <= 6;
+        let further_in = bbox[0] - self.measures.column(slots.page(slot), fences.translation[at]) > QUOTED_INDENT;
+        let wordmark = fences.body.is_some_and(|(_, size)| evidence.size[at] * 2.0 >= f64::from(size) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;
         // (A layer may print one line twice, the second a suffix of the first in its box.)
         let repeated = kept.last().is_some_and(|last| {
             let above = slots.line(pages, *last);
