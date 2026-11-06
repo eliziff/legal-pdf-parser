@@ -705,6 +705,12 @@ pub(crate) fn structure_graph(
     if !continuations.is_empty() {
         structure.continuations = Some(continuations);
     }
+    // Written, the outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
+    if written {
+        let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
+        let contexts = crate::structure::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, &decided);
+        crate::structure::graph::assemble_outline(legal_structure_model::structure_analysis(), &mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
+    }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
     // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The

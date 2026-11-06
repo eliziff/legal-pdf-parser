@@ -8,7 +8,7 @@
 //! - one decision on each line (`settle`), in reading order against what is open (`machine::State`): each reading worth
 //!   what its rule is worth (`worth`, in the order the stages took their turns, the residual at its score), and where
 //!   readings compete, how each fits the numbering and the notes open (`fit`). Paragraph numbers stand outside it: a line
-//!   the judgment reader counts or holds (`Fences::count`, `Fences::held`) goes by its rules' worth alone, the residual
+//!   the judgment reader counts or holds (`Fences::paragraphs`) goes by its rules' worth alone, the residual
 //!   does not weigh it, and `read_judgment_paragraphs` writes the numbers as t0 does;
 //! - what follows the decision (`Decision::finish`): the title, the levels;
 //! - the decided lines written (`write_lines`), their regions built, their notes paired (`note_pairing`), the pairer's
@@ -18,7 +18,7 @@
 
 use super::emit::Settled;
 use super::*;
-use legal_structure_model::UnitRole;
+use legal_structure_model::{CandidateGrammar, UnitRole};
 
 /// A marker going on from the number open in its family.
 const COUNTS_ON: f32 = 1.0;
@@ -62,8 +62,9 @@ fn plain(region: u8, opens: bool) -> Move {
     Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }
 }
 
-/// The region a role is, where the line opens the unit `kind`.
-fn region_of(role: Role, kind: Option<UnitRole>) -> u8 {
+/// The region a role is, where the line opens the unit `kind`. A section is a provision where its numbering is an
+/// enactment's (`hierarchy`): a transcript's or a report's "12." opens a section of text.
+fn region_of(role: Role, kind: Option<UnitRole>, hierarchy: bool) -> u8 {
     match role {
         Role::LineLabel => LINE_LABEL,
         Role::PageLabel => PAGE_LABEL,
@@ -77,7 +78,7 @@ fn region_of(role: Role, kind: Option<UnitRole>) -> u8 {
         Role::ListItem => LIST_ITEM,
         Role::Quote => QUOTE,
         Role::Open | Role::Body => match kind {
-            Some(UnitRole::Section) => PROVISION,
+            Some(UnitRole::Section) if hierarchy => PROVISION,
             Some(UnitRole::Item) => LIST_ITEM,
             _ => TEXT,
         },
@@ -141,7 +142,8 @@ fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Opti
 /// A reading of the line as the move it would make: a unit's opening on its marker, a labelled note's opening on its
 /// number, a heading's opening at `level`, else the line going on.
 fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, reading: Option<(u32, u32)>, level: u8, joined: bool) -> Move {
-    let mut chosen = plain(region_of(role, kind), kind.is_some());
+    let hierarchy = reading.is_some_and(|(run, _)| runs.runs[run as usize].grammar == CandidateGrammar::Hierarchy);
+    let mut chosen = plain(region_of(role, kind, hierarchy), kind.is_some());
     if kind.is_some() {
         chosen.reading = reading_of(view, runs, reading);
     }
@@ -282,11 +284,19 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
     let mut state = State::default();
+    // A table is one unit: its lines go on from the one before, the page's edge between them.
+    let mut in_table = false;
     let moves = moves
         .into_iter()
         .enumerate()
         .map(|(k, chosen)| {
-            let mut chosen = chosen.unwrap_or_else(|| plain(region_of(decision.role[table.order[k].index()], None), true));
+            let mut chosen = chosen.unwrap_or_else(|| {
+                let region = region_of(decision.role[table.order[k].index()], None, false);
+                plain(region, region != TABLE || !in_table)
+            });
+            if !matches!(chosen.region, FURNITURE | PAGE_LABEL | LINE_LABEL) {
+                in_table = chosen.region == TABLE;
+            }
             chosen.starts = starts.contains(&k);
             if chosen.opens && RANKED_BODY.contains(&chosen.region) {
                 chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;

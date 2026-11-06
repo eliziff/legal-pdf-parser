@@ -30,9 +30,7 @@ fast-allocator = ["dep:mimalloc"]
 profiling = ["pdf", "legal-pdf-support/profiling"]
 allocation-profiling = ["profiling", "legal-pdf-support/allocation-profiling"]
 ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
-# Tier 1's readers beside tier 0 (the walker; DOC comes with the tagger's encoder).
-tier1 = ["pdf", "legal-pdf-structure/transition"]
-tagger = ["tier1", "dep:legal-pdf-tagger", "legal-pdf-core/ort-runtime", "legal-pdf-structure/encoder"]
+tagger = ["pdf", "dep:legal-pdf-tagger", "legal-pdf-core/ort-runtime", "legal-pdf-structure/encoder"]
 full = ["language", "indra", "ppdoc", "tagger"]
 # The command-line tools, which run this checkout's structure engine.
 cli = ["pdf", "legal-pdf-core/structure-analysis"]

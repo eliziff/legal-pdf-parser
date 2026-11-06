@@ -52,8 +52,7 @@ mod diagnostics;
 pub use diagnostics::*;
 mod decide;
 pub(crate) use decide::*;
-/// Tier 1: the transition parser's readers (the walker; DOC with `encoder`), bundled where a consumer asks for them.
-#[cfg(feature = "transition")]
+/// The machine: tier 0 read as one decision on each line, and the transition parser's fitted readers (DOC with `encoder`).
 mod transition;
 /// The origin of the transition parser's nodes.
 const TRANSITION_ORIGIN: &str = "legal-pdf-transition.v1";
@@ -68,7 +67,6 @@ pub(crate) use legal_structure_model::text::{
 pub use graph::PdfTextIndex;
 
 /// The transition parser's whole reading trained on whole documents (`transition::train_whole`).
-#[cfg(feature = "transition")]
 pub fn train_whole_reading(problems: &std::path::Path, out: &std::path::Path, epochs: usize) -> std::result::Result<String, String> {
     transition::train_whole(problems, out, epochs)
 }
@@ -336,21 +334,15 @@ pub fn derive_cached(
     };
     // The machine, where the request names it.
     if identity.reader == Reader::Machine {
-        #[cfg(feature = "transition")]
         return measure("derive.machine", || transition::tier0::output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace));
-        #[cfg(not(feature = "transition"))]
-        return Err(Error::Message("this engine was built without the machine reader".to_owned()));
     }
     // The transition parser: its reading the output where LEGALPDF_TRANSITION_EMIT says so, else read
     // beside the stages while it is fitted and measured.
-    #[cfg(feature = "transition")]
-    {
-        if transition::emitting() {
-            return measure("derive.transition", || transition::output(pages, &slots, &evidence, &fences, &runs, outline, &identity));
-        }
-        if transition::enabled() {
-            measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
-        }
+    if transition::emitting() {
+        return measure("derive.transition", || transition::output(pages, &slots, &evidence, &fences, &runs, outline, &identity));
+    }
+    if transition::enabled() {
+        measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
     }
     let mut notes = measure("derive.notes", || Notes::read(analysis, pages, &slots, &evidence, &fences, &runs));
     let mut decision = measure("derive.decide", || Decision::decide(analysis, pages, &slots, &evidence, &fences, &runs, &notes, outline, trace.is_some()));
