@@ -1,6 +1,6 @@
 //! Tier 0 as the machine's reader: every rule heard on every line, one decision on each line, the scorer compiled in (no
 //! fitted file, no environment), and the moves the decided lines make written by `emit`. It is chosen by `Reader::Machine`,
-//! in the request; `Reader::Stages` stays the default until this reader matches it by mode.
+//! the default; `Reader::Stages` stays to measure against.
 //!
 //! What it reads, in order:
 //! - the notes (`Notes::read`), and the rules heard (`Decision::hear`): no rule's reading keeps another's from a line, and

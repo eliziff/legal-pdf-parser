@@ -339,7 +339,7 @@ impl Default for ParseOptions {
             ppdoc: None,
             #[cfg(feature = "tagger")]
             tagger: None,
-            reader: Reader::Stages,
+            reader: Reader::default(),
         }
     }
 }
@@ -427,7 +427,7 @@ fn cache_key(
         "ocr_pages": ocr_pages,
         "profile": semantic_profile,
     });
-    // The default reader's keys stay as they were.
+    // Tier 0's keys stay as they were: a cached reading names the reader that read it.
     if reader != Reader::Stages {
         value["reader"] = json!(reader);
     }
@@ -675,7 +675,7 @@ pub fn gold_structure_document(
     source_hash: &str,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    gold_read_document(extracted, source_hash, Reader::Stages, pages)
+    gold_read_document(extracted, source_hash, Reader::default(), pages)
 }
 
 /// `gold_structure_document`, read by `reader`.
@@ -701,7 +701,7 @@ fn build_document(
     let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
     let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
-    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None, Reader::Stages)?;
+    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None, Reader::default())?;
     // A parse completes its structure in its projection; this document stops before it.
     derived.structure_graph.refresh_revision()?;
     let mut metadata = Map::new();

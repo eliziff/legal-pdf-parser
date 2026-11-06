@@ -56,7 +56,7 @@ pub struct PdfRequest {
     #[cfg(not(feature = "tagger"))]
     #[serde(default, deserialize_with = "present")]
     tagger: Option<serde::de::IgnoredAny>,
-    /// What builds the structure: "stages", the default, or "machine".
+    /// What builds the structure: "machine", the default, or "stages".
     #[serde(default)]
     reader: legal_pdf_structure::Reader,
 }

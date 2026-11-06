@@ -25,7 +25,7 @@
 //!    cross-references (`note_context`), and the structure graph resolved on the decision's roles
 //!    (`graph`) with its outline assembled (`graph::assemble_outline`).
 //!
-//! Stages 4 to 7 are `Reader::Stages`, the default. `Reader::Machine` reads the same notes and rules, weighs the readings
+//! Stages 4 to 7 are `Reader::Stages`, kept to measure against. `Reader::Machine`, the default, reads the same notes and rules, weighs the readings
 //! two rules disagree on in one decision per line, and writes its moves (`transition::tier0`, `transition::emit`).
 //!
 //! Measure a change on the structure gold with `experiments/legal-structure-gold/grade/prove.ps1`
@@ -206,11 +206,11 @@ impl<'a> Decided<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Reader {
-    /// The stages after the fences: notes, the rules, `write`, the graph's resolution. The default.
-    #[default]
+    /// The stages after the fences: notes, the rules, `write`, the graph's resolution. Tier 0, kept to measure against.
     Stages,
     /// The transition parser's one move per line with tier 0's rules as its candidates, the scorer compiled in
-    /// (`transition::tier0`), `emit` its output. Compiled with the `transition` feature.
+    /// (`transition::tier0`), `emit` its output. The default.
+    #[default]
     Machine,
 }
 
