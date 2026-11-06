@@ -96,7 +96,8 @@ impl<'a> Reading<'a> {
         if let Some(path) = std::env::var_os("LEGALPDF_JUDGMENT_STREAM") {
             let lines = fences.order.iter().map(|&slot| {
                 let at = slot.index();
-                format!("{:?}\t{}\t{}\t{:.1}\t{:?}\t{}\n", fences.role[at], fences.band[at], fences.translation[at], evidence.size[at], fences.body, slots.line(pages, slot).text)
+                format!("{:?}\t{}\t{}\t{:.1}\t{:?}\t{}\t{:?}\t{:?}\t{}\n", fences.role[at], fences.band[at], fences.translation[at], evidence.size[at], fences.body, slot.index(),
+                    fences.margin_number[at].map(Slot::index), fences.margin_twin[at].map(Slot::index), slots.line(pages, slot).text)
             }).collect::<String>();
             let _ = std::fs::write(std::path::PathBuf::from(path).with_extension("lines.txt"), lines);
         }

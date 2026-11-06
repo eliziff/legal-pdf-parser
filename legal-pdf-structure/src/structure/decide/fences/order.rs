@@ -51,7 +51,8 @@ impl Fences {
     /// The paragraph numbers a report prints in its margin, beside the row where each paragraph's text opens (in
     /// both columns of a parallel report): a number alone on its line, standing clear of the page's body text by
     /// up to eight lines' height, level with a line of it, and counting on with the document's other such
-    /// numbers, three or more in a row. Each is read just before the first line of its row in the main text (a
+    /// numbers, three or more in a row, a scan's count going on over a number it lost or a stray figure it read
+    /// ("104", "1", "105"). Each is read just before the first line of its row in the main text (a
     /// parallel translation's after), so it opens that line's paragraph; a page's reading order otherwise sets the
     /// margin after both columns, where its numbers would open whatever follows (the next page's running head).
     pub(super) fn read_margin_numbers(&mut self, pages: &[Page], slots: &Slots) {
@@ -157,11 +158,24 @@ impl Fences {
             }
         }
         found.sort_by_key(|&(_, _, row, _)| self.place[row.index()]);
-        let counts = |at: usize, step: usize| at + step < found.len() && found[at + step].0 == found[at].0 + step as u32;
-        let mut kept = vec![false; found.len()];
+        // Each number's longest count ending on it, each going on from one of the few before it by a step of at most three.
+        let mut length = vec![1usize; found.len()];
+        let mut before = vec![None; found.len()];
         for at in 0..found.len() {
-            if counts(at, 1) && counts(at, 2) {
-                kept[at..at + 3].iter_mut().for_each(|kept| *kept = true);
+            for back in at.saturating_sub(4)..at {
+                let step = found[at].0.checked_sub(found[back].0).filter(|step| (1..=3).contains(step));
+                if step.is_some() && length[back] + 1 > length[at] {
+                    length[at] = length[back] + 1;
+                    before[at] = Some(back);
+                }
+            }
+        }
+        let mut kept = vec![false; found.len()];
+        for at in (0..found.len()).filter(|&at| length[at] >= 3) {
+            let mut link = Some(at);
+            while let Some(at) = link {
+                kept[at] = true;
+                link = before[at];
             }
         }
         // A number belongs to the text it numbers: its language and document are its row line's (a number beside a
