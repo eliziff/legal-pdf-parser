@@ -39,7 +39,6 @@ mod headings;
 mod notes;
 use notes::*;
 mod note_pairing;
-mod numbered_paragraphs;
 mod text;
 mod joining;
 use joining::*;
@@ -49,7 +48,11 @@ mod diagnostics;
 pub use diagnostics::*;
 mod decide;
 pub(crate) use decide::*;
+/// Tier 1: the transition parser's readers (the walker; DOC with `encoder`), bundled where a consumer asks for them.
+#[cfg(feature = "transition")]
 mod transition;
+/// The origin of the transition parser's nodes.
+const TRANSITION_ORIGIN: &str = "legal-pdf-transition.v1";
 
 use crate::layout::*;
 use furniture::*;
@@ -61,6 +64,7 @@ pub(crate) use legal_structure_model::text::{
 pub use graph::PdfTextIndex;
 
 /// The transition parser's whole reading trained on whole documents (`transition::train_whole`).
+#[cfg(feature = "transition")]
 pub fn train_whole_reading(problems: &std::path::Path, out: &std::path::Path, epochs: usize) -> std::result::Result<String, String> {
     transition::train_whole(problems, out, epochs)
 }
@@ -163,6 +167,11 @@ impl<'a> Decided<'a> {
     /// The line is in the French column of a parallel English and French text.
     pub(super) fn translated(&self, id: &str) -> bool {
         self.slot(id).is_some_and(|slot| self.fences.translation[slot.index()])
+    }
+
+    /// The numbered paragraphs the line's text holds: each one's language, number and UTF-16 span of the line.
+    pub(super) fn held(&self, id: &str) -> &[(bool, u32, u32, u32)] {
+        self.slot(id).map_or(&[], |slot| self.fences.held[slot.index()].as_slice())
     }
 
     /// A contents list's line, or a line of a page wholly a contents list's.
@@ -289,11 +298,14 @@ pub fn derive_cached(
     };
     // The transition parser: its reading the output where LEGALPDF_TRANSITION_EMIT says so, else read
     // beside the stages while it is fitted and measured.
-    if transition::emitting() {
-        return measure("derive.transition", || transition::output(pages, &slots, &evidence, &fences, &runs, outline, &identity));
-    }
-    if transition::enabled() {
-        measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
+    #[cfg(feature = "transition")]
+    {
+        if transition::emitting() {
+            return measure("derive.transition", || transition::output(pages, &slots, &evidence, &fences, &runs, outline, &identity));
+        }
+        if transition::enabled() {
+            measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
+        }
     }
     let mut notes = measure("derive.notes", || Notes::read(pages, &slots, &evidence, &fences, &runs));
     let mut decision = measure("derive.decide", || Decision::decide(pages, &slots, &evidence, &fences, &runs, &notes, outline));
@@ -368,6 +380,8 @@ pub fn derive_cached(
     .map_err(|error| Error::Message(error.to_string()))?;
     structure_graph.profile = identity.profile;
     structure_graph.source_fragments = source_fragments;
+    // A judgment's numbered paragraphs, read as any text of a decision is read.
+    measure("derive.judgment_paragraphs", || graph::read_judgment_paragraphs(&mut structure_graph, pages, &decided));
     Ok(StructureOutput {
         paragraphs,
         footnotes,

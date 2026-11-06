@@ -4,7 +4,7 @@
 //! `embeddings.f32`), and the paper's decoding of what they score into the parser's moves:
 //! - Detect, a page at a time, its lines' states then given their templates' across the document (the parser's
 //!   stylesheet, `stylesheet`: each template a node of its measured row and its lines' states) and each line its
-//!   outline anchor (the level the contents list or the bookmarks name it at): each line's role, its successor
+//!   outline anchor (the level the bookmarks name it at): each line's role, its successor
 //!   and predecessor among its page's lines, and
 //!   two flags (a unit opening on its printed marker, a line opening a constituent document); the page's
 //!   lines grouped into regions by union-find over the links both heads choose (or the successor's sure
@@ -30,9 +30,9 @@
 
 use super::*;
 
-/// The regions whose units take a depth in the body's tree (`docparse.BODY`): text, list items, quotations,
-/// provisions.
-const BODY: [u8; 4] = [1, 2, 4, 16];
+/// The regions whose units take a depth in the body's tree (`docparse.BODY`): all that the gold's depth steps chain
+/// over (`RANKED_BODY`).
+const BODY: [u8; 7] = RANKED_BODY;
 /// A heading's or body unit's gap under its parent is one of 1..=GAPS levels.
 pub(crate) const GAPS: usize = 4;
 
@@ -98,6 +98,42 @@ fn regions_of(lines: &Lines) -> (Vec<Vec<usize>>, Vec<u8>) {
     (regions, roles)
 }
 
+/// The paragraphs t0 decided in the regions' links: a line the judgment reader reads opening a numbered paragraph
+/// (`LineView::count`) takes no link from any other line. The margin's paragraph numbers (`LineTable::margin_rows`):
+/// a number and the row's line it numbers are one region, the number its first line (it is read just before it);
+/// the row's line and its twin's in the other column take no link from any other line, each opening its column's
+/// paragraph, nor does the number.
+fn margin_links(links: &mut [usize], margin_rows: &HashMap<usize, (usize, Option<usize>)>, views: &[LineView]) {
+    let mut opened: std::collections::HashSet<usize> = margin_rows.iter().flat_map(|(&margin, &(row, twin))| [margin, row].into_iter().chain(twin)).collect();
+    opened.extend((0..views.len()).filter(|&k| views[k].count.is_some()));
+    for (k, next) in links.iter_mut().enumerate() {
+        if opened.contains(next) && !margin_rows.contains_key(&k) {
+            *next = k;
+        }
+    }
+    for (&margin, &(row, _)) in margin_rows {
+        links[margin] = row;
+    }
+}
+
+/// A body region whose first line Detect reads going on (its role's opening bit unset) and that Order puts in no
+/// earlier unit goes on in the last region before it of its role in its column's language (a paragraph past the
+/// page's foot, or read past the other column's lines): the region read last of that role and language, on its page
+/// or the page before (as Order pairs regions), its unit the one open in that stream. A region the margin numbers
+/// opens.
+fn goes_on_in_column(before: &mut [Option<usize>], regions: &[Vec<usize>], roles: &[u8], read: &[usize], line_roles: &[usize], views: &[LineView]) {
+    let mut last: HashMap<(u8, bool), usize> = HashMap::new();
+    for i in 0..read.len() {
+        let first = regions[read[i]][0];
+        let key = (roles[read[i]], views[first].translation);
+        if before[i].is_none() && BODY.contains(&key.0) && line_roles[first] % 2 == 0 && views[first].margin.is_none() && views[first].count.is_none() {
+            let page = views[first].page;
+            before[i] = last.get(&key).copied().filter(|&earlier| views[regions[read[earlier]][0]].page + 1 >= page);
+        }
+        last.insert(key, i);
+    }
+}
+
 /// The paper's Algorithm 1 over `n` nodes: each node in turn the right-most child of the node on the tree's
 /// right-most path (the root first) whose parent probability times the node's sibling probability for that
 /// node's last child (itself where it has none) is greatest; `resets[i]` empties the tree before node `i`.
@@ -128,18 +164,20 @@ fn insert(parent: &[f32], sibling: &[f32], gaps: &[usize], n: usize, resets: &[b
 }
 
 /// A note's number: its label's where the label reader found one, else an arabic reading's, else the figures
-/// its text opens on ("27" of "27 Ibid", as the gold's notes are numbered).
-fn note_number(line: &LineView, text: &str) -> Option<u32> {
+/// its text opens on ("27" of "27 Ibid", as the gold's notes are numbered), else 0 for a note symbol, as a reference
+/// mark's value is (`reference_spans`).
+pub(super) fn note_number(line: &LineView, text: &str) -> Option<u32> {
     line.label
         .or_else(|| line.readings.iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
-        .or_else(|| text.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+        .or_else(|| super::emit::leading_figures(text).map(|(figures, _)| figures))
+        .or_else(|| text.trim_start().starts_with(['*', '\u{2020}', '\u{2021}', '\u{a7}']).then_some(0))
 }
 
 /// The document's moves from the heads' answers: each region's lines its role's; a unit's first line opens it
 /// (at its level or depth, counting on its marker where the line is marked, a note on its number); a line of a
 /// unit another unit of its stream came before goes on with it by name (its first line); a note answers the
 /// marks of its number in the region its link names.
-fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize], units: &Units, views: &[LineView], texts: &[&str]) -> Vec<Move> {
+fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize], units: &Units, views: &[LineView], texts: &[&str], only: Option<&[bool]>) -> Vec<Move> {
     let n = lines.roles.len();
     let mut moves = vec![Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }; n];
     for (k, mv) in moves.iter_mut().enumerate() {
@@ -175,12 +213,21 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
             if region == HEADING {
                 mv.level = units.level[i].clamp(1, 9) as i8;
             } else if BODY.contains(&region) {
-                mv.depth = units.level[i].clamp(1, 8) as u8;
+                mv.depth = units.level[i].clamp(1, 9) as u8;
             }
             if region == NOTE {
                 mv.note = note_number(&views[k], texts[k]);
-            } else if lines.marked[k] && !views[k].readings.is_empty() {
-                mv.reading = Some(0);
+            } else if lines.marked[k] {
+                // A unit opening on its marker counts on the margin's number where the margin numbers it, in either
+                // column; else on the number t0 reads it opening on; else on the line's first reading; a marker no
+                // reading makes out (a recognizer's "(2]") is its opening token, counting on nothing.
+                let counted = views[k].count.and_then(|n| views[k].readings.iter().position(|r| r.value == n));
+                mv.reading = Some(match (views[k].margin, counted, views[k].readings.is_empty()) {
+                    (Some(_), ..) => MARGIN,
+                    (_, Some(r), _) => r as u8,
+                    (_, _, false) => 0,
+                    _ => OPENING,
+                });
             }
         } else if last_in_stream.get(&stream) != Some(&unit[i]) {
             mv.resume = true;
@@ -190,9 +237,15 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
     }
     for (i, target) in units.note.iter().enumerate() {
         let first = regions[read[i]][0];
-        let (Some(target), Some(value)) = (target, moves[first].opens.then_some(moves[first].note).flatten()) else { continue };
-        let marks: Vec<(u32, u32)> = regions[read[*target]].iter()
-            .flat_map(|&k| views[k].references.iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, _)| (views[k].place, s)))
+        let Some(value) = moves[first].opens.then_some(moves[first].note).flatten() else { continue };
+        // A note the heads pair with no mark answers none, not the last of its number the text set.
+        let Some(target) = target else {
+            moves[first].answers[0] = Some((u32::MAX, 0, 0));
+            continue;
+        };
+        // Of the region's marks of its number, those on the lines `only` names, where it names any (the gold's).
+        let marks: Vec<(u32, u32, u32)> = regions[read[*target]].iter().filter(|&&k| only.is_none_or(|lines| lines[k]))
+            .flat_map(|&k| views[k].references.iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, e)| (views[k].place, s, e)))
             .take(4).collect();
         for (slot, mark) in moves[first].answers.iter_mut().zip(marks) {
             *slot = Some(mark);
@@ -253,6 +306,9 @@ pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts
     // Each line's unit, as the gold's decoder reads its rows (`docparse.gold_units`).
     let mut unit = vec![usize::MAX; n];
     let mut open: HashMap<usize, usize> = HashMap::new();
+    // A line the gold reads first in a unit the parser reads later (the two orders differ) names a line after it: that
+    // line goes on in this one's unit.
+    let named_later: HashMap<usize, usize> = gold.iter().enumerate().filter(|(k, g)| g[1] == 2 && usize::try_from(g[6]).is_ok_and(|p| p > *k)).map(|(k, g)| (g[6] as usize, k)).collect();
     for (k, g) in gold.iter().enumerate() {
         let region = gold_region(g);
         if region <= 0 {
@@ -260,9 +316,10 @@ pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts
         }
         let stream = stream_of(region as u8);
         let pointer = usize::try_from(g[6]).ok().filter(|&p| p < k && unit[p] != usize::MAX);
-        unit[k] = match (g[1], pointer, open.get(&stream)) {
-            (2, Some(p), _) => unit[p],
-            (0, _, Some(&u)) if gold_region(&gold[u]) == region => u,
+        unit[k] = match (g[1], pointer, open.get(&stream), named_later.get(&k)) {
+            (_, _, _, Some(&earlier)) if unit[earlier] != usize::MAX => unit[earlier],
+            (2, Some(p), ..) => unit[p],
+            (0, _, Some(&u), _) if gold_region(&gold[u]) == region => u,
             _ => k,
         };
         open.insert(stream, unit[k]);
@@ -348,24 +405,32 @@ pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts
             level[i] = l;
         }
     }
-    // A note's region: the gold's paired mark of its number before it, two pages back at most.
+    // A note's region: the gold's paired mark of its number nearest before it, else after it, wherever it stands.
     let mut region_of = vec![usize::MAX; n];
     for (i, &r) in read.iter().enumerate() {
         for &k in &regions[r] {
             region_of[k] = i;
         }
     }
+    // Each mark is one note's; a parallel report's two notes of a number take the marks of their own languages.
+    let mut taken: HashSet<(usize, u32)> = HashSet::new();
     let note = (0..count).map(|i| {
         let k = first(i);
         if roles[read[i]] != NOTE || before[i].is_some() {
             return None;
         }
         let value = note_number(&views[k], texts[k])?;
-        (0..k).rev().take_while(|&j| pages[k].saturating_sub(pages[j]) <= 2)
-            .find(|&j| gold[j][3] == 1 && region_of[j] != usize::MAX && views[j].references.iter().any(|&(v, ..)| v == value))
-            .map(|j| region_of[j])
+        let paired = |j: &usize| gold[*j][3] == 1 && !taken.contains(&(*j, value)) && region_of[*j] != usize::MAX && views[*j].references.iter().any(|&(v, ..)| v == value);
+        let same = |j: &usize| views[*j].translation == views[k].translation;
+        let found = (0..k).rev().filter(paired).find(same).or_else(|| (k + 1..n).filter(paired).find(same))
+            .or_else(|| (0..k).rev().find(paired)).or_else(|| (k + 1..n).find(paired));
+        if let Some(j) = found {
+            taken.insert((j, value));
+        }
+        found.map(|j| region_of[j])
     }).collect();
-    let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
+    let gold_marks: Vec<bool> = gold.iter().map(|g| g[3] == 1).collect();
+    let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts, Some(&gold_marks));
     read_in(&mut moves, ranks, pages);
     moves
 }
@@ -606,6 +671,7 @@ mod model {
             // Detect's encoder, a page at a time; the stylesheet over the document; Detect's heads, a page at a time.
             let anchors: Vec<i64> = style.anchors.iter().map(|&a| i64::from(a.min(9))).collect();
             let templates: Vec<i64> = style.templates.iter().map(|&t| i64::from(t)).collect();
+            let t0: Vec<f32> = table.t0.iter().map(|&v| f32::from(v)).collect();
             let runs: Vec<(usize, usize)> = {
                 let mut runs = Vec::new();
                 let mut start = 0;
@@ -623,7 +689,8 @@ mod model {
                 let t = TensorRef::from_array_view(([l, m.text_dim], &text[start * m.text_dim..end * m.text_dim])).map_err(|e| e.to_string())?;
                 let b = TensorRef::from_array_view(([l, 4], &boxes[start * 4..end * 4])).map_err(|e| e.to_string())?;
                 let a = TensorRef::from_array_view(([l], &anchors[start..end])).map_err(|e| e.to_string())?;
-                let outputs = sessions.detect.run(ort::inputs!["features" => f, "text" => t, "boxes" => b, "anchors" => a]).map_err(|e| format!("detect: {e}"))?;
+                let z = TensorRef::from_array_view(([l, T0], &t0[start * T0..end * T0])).map_err(|e| e.to_string())?;
+                let outputs = sessions.detect.run(ort::inputs!["features" => f, "text" => t, "boxes" => b, "anchors" => a, "t0" => z]).map_err(|e| format!("detect: {e}"))?;
                 let (_, s) = outputs["states"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 states[start * d..end * d].copy_from_slice(s);
             }
@@ -666,11 +733,16 @@ mod model {
                     lines.links[k] = next;
                 }
             }
+            margin_links(&mut lines.links, &table.margin_rows, views);
+            // A line t0 reads opening a numbered paragraph on a number it prints opens on that marker.
+            for (k, marked) in lines.marked.iter_mut().enumerate() {
+                *marked |= views[k].count.is_some_and(|number| views[k].readings.iter().any(|r| r.value == number));
+            }
             let (regions, roles) = regions_of(&lines);
             let read: Vec<usize> = (0..regions.len()).filter(|&r| roles[r] != 0).collect();
             let count = read.len();
             if count == 0 {
-                return Ok(moves_of(&lines, &regions, &roles, &read, &Units { before: Vec::new(), level: Vec::new(), note: Vec::new() }, views, texts));
+                return Ok(moves_of(&lines, &regions, &roles, &read, &Units { before: Vec::new(), level: Vec::new(), note: Vec::new() }, views, texts, None));
             }
             // Order over the regions read.
             let mut of_line = vec![usize::MAX; n];
@@ -689,8 +761,8 @@ mod model {
             }
             let kinds: Vec<i64> = read.iter().map(|&r| i64::from(roles[r])).collect();
             // The regions' places for the pair terms (`docparse.pairs_of`): each one's lines' union box and its first
-            // line's page; the regions within a page of each other; whether a note's number (the figures its first
-            // line opens on) is a mark the other region sets.
+            // line's page; the regions within a page of each other; whether a note's number is a mark the other
+            // region sets.
             let mut region_boxes = vec![f32::MAX, f32::MAX, f32::MIN, f32::MIN].repeat(count);
             let mut marks: Vec<HashSet<u32>> = vec![HashSet::new(); count];
             for k in 0..n {
@@ -706,11 +778,17 @@ mod model {
             }
             let region_pages: Vec<i64> = read.iter().map(|&r| pages[regions[r][0]] as i64).collect();
             let number: Vec<Option<u32>> = read.iter().map(|&r| {
-                (roles[r] == NOTE || roles[r] == NOTE_QUOTE).then(|| texts[regions[r][0]].trim().chars().take(4).filter(char::is_ascii_digit).collect::<String>().parse().ok()).flatten()
+                (roles[r] == NOTE || roles[r] == NOTE_QUOTE).then(|| note_number(&views[regions[r][0]], texts[regions[r][0]])).flatten()
             }).collect();
             let mut by_page: HashMap<i64, Vec<usize>> = HashMap::new();
             for (i, &page) in region_pages.iter().enumerate() {
                 by_page.entry(page).or_default().push(i);
+            }
+            let mut setting: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (j, set) in marks.iter().enumerate() {
+                for &value in set {
+                    setting.entry(value).or_default().push(j);
+                }
             }
             let (mut pair_i, mut pair_j, mut pair_match) = (Vec::new(), Vec::new(), Vec::new());
             for (i, &page) in region_pages.iter().enumerate() {
@@ -719,6 +797,14 @@ mod model {
                         pair_i.push(i as i64);
                         pair_j.push(j as i64);
                         pair_match.push(number[i].is_some_and(|v| marks[j].contains(&v)));
+                    }
+                }
+                // A note's candidates are every region setting its number, however far (endnotes).
+                for &j in number[i].and_then(|v| setting.get(&v)).into_iter().flatten() {
+                    if (region_pages[j] - page).abs() > 1 {
+                        pair_i.push(i as i64);
+                        pair_j.push(j as i64);
+                        pair_match.push(true);
                     }
                 }
             }
@@ -814,11 +900,14 @@ mod model {
             let mut before = vec![None; count];
             let mut after = vec![false; count];
             for (i, j, _) in links {
-                if before[j].is_none() && !after[i] {
+                // A paragraph the margin numbers, or t0 reads opening, opens: it goes on in no earlier one.
+                let opens = { let first = &views[regions[read[j]][0]]; first.margin.is_some() || first.count.is_some() };
+                if before[j].is_none() && !after[i] && !opens {
                     before[j] = Some(i);
                     after[i] = true;
                 }
             }
+            goes_on_in_column(&mut before, &regions, &roles, &read, &lines.roles, views);
             lap(2, &mut since);
             // The trees over the regions that open a unit, headings and the body's apart.
             let tree = |session: &mut Session, has_gap: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
@@ -860,7 +949,7 @@ mod model {
                 (roles[read[i]] == NOTE && target != i).then_some(target)
             }).collect();
             lap(3, &mut since);
-            let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts);
+            let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts, None);
             // Each line's rank: its region's place in the reading, then its place in the region.
             let mut ranks = vec![-1i64; n];
             for (i, &r) in read.iter().enumerate() {

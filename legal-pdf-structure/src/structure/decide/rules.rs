@@ -786,7 +786,7 @@ fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
                 .any(|next| evidence.words[next.index()] & (WORD_PARTY | WORD_FIELD | WORD_LABEL) != 0)
     };
     if words & (WORD_LABEL | WORD_PARTY | WORD_JURAT | WORD_DATE | WORD_SIGNATURE | WORD_AUTHOR) != 0
-        || text.strip_suffix(':').is_some_and(legal_structure_model::judgment::signature_line)
+        || text.strip_suffix(':').is_some_and(|name| legal_structure_model::structure_analysis().signature_line(name))
         || joining_colon(text)
         || words & WORD_COURT != 0 && court()
     {

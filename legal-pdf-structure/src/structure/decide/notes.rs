@@ -75,7 +75,7 @@ impl Notes {
     /// numbering runs read (`runs`).
     pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
         let count = slots.len();
-        let separators: Vec<Option<f64>> = evidence.pages.iter().map(|page| page.separator).collect();
+        let separators = &fences.separators;
         let starts: Vec<usize> = (0..pages.len()).map(|page| slots.on(page).start as usize).collect();
         // Each document and language: its lines in page order, and each page's in reading order.
         let group = |slot: Slot| (fences.document[slot.index()], fences.translation[slot.index()]);
@@ -112,7 +112,7 @@ impl Notes {
                     (BAND_EXCLUDED, matches!(fences.role[at], Role::LineLabel | Role::Contents)),
                     (BAND_FURNITURE, matches!(fences.role[at], Role::Furniture | Role::PageLabel)),
                     (BAND_CELL, fences.cell[at] != 0),
-                    (BAND_PARAGRAPH, unit[at]),
+                    (BAND_PARAGRAPH, unit[at] || !fences.held[at].is_empty() || fences.margin_number[at].is_some()),
                     (BAND_NOTED, evidence.tag[at] == SourceTag::Note),
                     (BAND_HEADED, headed(at)),
                     (BAND_LAYOUT, layout_notes && layout_labelled(slots.line(pages, Slot(at as u32)))),

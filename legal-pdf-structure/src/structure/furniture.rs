@@ -636,6 +636,25 @@ pub(super) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                     None
                 };
             }
+            // A bare number with a line of the page's prose on its row is the margin's, not the page's: a law report
+            // prints its paragraph numbers beside the row each opens on, and at the page's first or last row they read
+            // as a repeated edge number ("#"). A folio or a page number stands beside furniture or alone.
+            let row_of = rows[page_slot];
+            let prose = |index: usize| {
+                let line = &page.lines[index];
+                found[index].is_none() && line.text.chars().filter(|c| c.is_alphabetic()).count() >= 20
+            };
+            let margin: Vec<usize> = (0..page.lines.len())
+                .filter(|&index| found[index].is_some() && {
+                    let text = page.lines[index].text.trim();
+                    !text.is_empty() && text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .filter(|&index| row_of.of[index] != u32::MAX
+                    && (0..page.lines.len()).any(|other| other != index && row_of.of[other] == row_of.of[index] && prose(other)))
+                .collect();
+            for index in margin {
+                found[index] = None;
+            }
             for (index, edge) in print_margins(view, &line_label) {
                 found[index] = Some((edge, Rule::PrintMargin));
             }
@@ -811,7 +830,8 @@ pub(super) fn document_id_line(value: &str) -> bool {
     let text = value.trim();
     let digits = text.chars().filter(char::is_ascii_digit).count();
     let visible = text.chars().filter(|c| !c.is_whitespace()).count();
-    digits >= 6
+    // (Eight figures: "1974.14" is a year and a note's call.)
+    digits >= 8
         && digits * 5 >= visible * 2
         && text.chars().count() <= 40
         && RE

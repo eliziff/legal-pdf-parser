@@ -51,12 +51,25 @@ pub(crate) fn translation_lines(
     set_aside: impl Fn(Slot) -> bool,
 ) -> Vec<Slot> {
     let body = |&(slot, line): &(Slot, &Line)| has_valid_bbox(line) && !set_aside(slot);
-    let splits = models
+    // A page's lines may show its two columns where its model does not (a margin lane read as a third): most of its lines
+    // of words stand clear to one side of the body's middle.
+    let by_lines = |view: &PageView| {
+        let prose = view.iter().filter(body).map(|(_, line)| line).filter(|line| line.text.chars().count() >= 20).collect::<Vec<_>>();
+        let left = prose.iter().map(|line| line.bbox[0]).min_by(f64::total_cmp)?;
+        let right = prose.iter().map(|line| line.bbox[2]).max_by(f64::total_cmp)?;
+        let middle = (left + right) / 2.0;
+        let sides = (prose.iter().filter(|line| line.bbox[2] <= middle).count(), prose.iter().filter(|line| line.bbox[0] >= middle).count());
+        (sides.0 >= 8 && sides.1 >= 8 && (sides.0 + sides.1) * 10 >= prose.len() * 8).then_some(middle)
+    };
+    let splits = views
         .iter()
-        .map(|model| (model.kind == "two_column").then_some(model.split_x))
+        .zip(models)
+        .map(|(view, model)| (model.kind == "two_column").then_some(model.split_x).or_else(|| by_lines(view)))
         .collect::<Vec<_>>();
     let side = |line: &Line, split: f64| {
-        (line.bbox[2] <= split || line.bbox[0] >= split).then(|| line_center_x(line) >= split)
+        // (A split a list's hang pulled into a column leaves that column's lines just over it.)
+        let over = (split - line.bbox[0]).min(line.bbox[2] - split);
+        (over <= (line.bbox[2] - line.bbox[0]) * 0.1).then(|| line_center_x(line) >= split)
     };
     // Pages whose two columns are confidently one language each, and which side is French.
     let parallel = views
@@ -114,8 +127,10 @@ pub(crate) fn translation_lines(
                 .windows(2)
                 .filter(|pair| {
                     let (above, below) = (pair[0].1, pair[1].1);
-                    let height = above.bbox[3] - above.bbox[1];
-                    above.bbox[3] <= top && below.bbox[1] - above.bbox[3] >= height * 2.0
+                    // (A line a PDF gives no height, its box a baseline alone, stands as high as its type.)
+                    let height = Some(above.bbox[3] - above.bbox[1]).filter(|height| *height >= 1.0).unwrap_or_else(|| line_font_size(above));
+                    let bottom = above.bbox[1] + height;
+                    bottom <= top && below.bbox[1] - bottom >= height * 2.0
                 })
                 .map(|pair| pair[0].1.bbox[3])
                 .max_by(f64::total_cmp);
@@ -123,8 +138,10 @@ pub(crate) fn translation_lines(
                 french.retain(|(_, line)| line.bbox[3] > cut);
             }
         }
-        if confirmed.contains(&view.page.index)
-            || column_language(language_votes(french.iter().map(|(_, line)| *line)), 3) == Some(true)
+        // A two-column page of a parallel text keeps its sides unless its words say otherwise: a list of authors in English
+        // titles leaves the French column's language unread.
+        let votes = column_language(language_votes(french.iter().map(|(_, line)| *line)), 3);
+        if confirmed.contains(&view.page.index) || votes == Some(true) || page_split.is_some() && votes.is_none()
         {
             translation.extend(french.into_iter().map(|(slot, _)| slot));
         }

@@ -342,7 +342,7 @@ pub(crate) fn weigh(
             let vetoes = [
                 (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))),
                 (VETO_RUNS_ON, runs_on),
-                (VETO_EDITORIAL, numbered_paragraphs::editorial_line(&text)),
+                (VETO_EDITORIAL, legal_pdf_core::layout_analysis().editorial_line(&text)),
                 (VETO_ENDS, text.ends_with(['.', ',', ';'])),
                 (VETO_LABEL, headings::rules::label(&text) || date_line(&text)),
                 (VETO_WORDS, words > 20),

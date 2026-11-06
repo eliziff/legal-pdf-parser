@@ -85,8 +85,9 @@ pub(super) fn sentence_ended(text: &str) -> bool {
 
 /// A line of six words or more, set in lower case, ending on a word no sentence ends on, so that
 /// its sentence goes on at the next body line whatever that opens with: an article, preposition,
-/// conjunction, pronoun or auxiliary, English or French ("of the", "à la", "and"), or a citation's
-/// abbreviation its number completes ("s.", "para.", "R. v.").
+/// conjunction, pronoun or auxiliary, English or French ("of the", "à la", "and"), a citation's
+/// abbreviation its number completes ("s.", "para.", "R. v."), or a title its name completes ("Mr.",
+/// "Mme").
 pub(super) fn dangling_end(text: &str) -> bool {
     const WORDS: &[&str] = &[
         "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "upon", "and", "or",
@@ -98,7 +99,8 @@ pub(super) fn dangling_end(text: &str) -> bool {
     ];
     const ABBREVIATIONS: &[&str] = &[
         "s.", "ss.", "art.", "arts.", "para.", "paras.", "p.", "pp.", "no.", "nos.", "c.", "ch.", "v.", "vol.", "r.", "rr.",
-        "cl.", "sch.", "reg.", "regs.", "sec.", "secs.",
+        "cl.", "sch.", "reg.", "regs.", "sec.", "secs.", "mr.", "mrs.", "ms.", "messrs.", "dr.", "hon.", "prof.", "st.",
+        "m.", "mme", "mme.", "mmes",
     ];
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.len() < 6 || !text.chars().any(char::is_lowercase) {

@@ -74,11 +74,14 @@ struct Outline {
     lists: Vec<(String, Option<usize>)>, // (family, parent)
     previous: Option<usize>,
     open_letter: Option<NumberingMarker>,
+    /// The last unit of the text's own words since its heading: the one a quotation after it is set within.
+    quoting: Option<usize>,
 }
 
 /// Sets ranked units' parents from the headings' levels (`level`, by a heading's line id) and the
-/// shared numbering grammar, the units read in `text`, each in its context (`contexts`). Only
-/// constituent documents scope the stacks; quotation and object membership stay intact.
+/// shared numbering grammar, the units read in `text`, each in its context (`contexts`). Constituent
+/// documents and a parallel translation scope the stacks (a column's list or heading never opens under the
+/// other language's paragraph); quotation and object membership stay intact.
 pub(crate) fn assemble_outline(
     nodes: &mut [StructureNode],
     contexts: &[OutlineContext],
@@ -112,10 +115,18 @@ pub(crate) fn assemble_outline(
     });
     let mut parents = vec![None; nodes.len()];
     let coordinates = ScalarText::new(text);
-    let mut documents = HashMap::<&str, Outline>::new();
+    let mut documents = HashMap::<(&str, bool), Outline>::new();
     for (index, region) in units {
-        let outline = documents.entry(&contexts[index].0).or_default();
+        let translated = contexts[index].2.as_deref() == Some("translation");
+        let outline = documents.entry((&contexts[index].0, translated)).or_default();
         let heading = outline.headings.last().map(|&(_, node)| node);
+        // A passage the text quotes (its paragraphs, their numbers the quoted text's) stands within the unit quoting it.
+        if contexts[index].1.is_some() && matches!(region, Region::Text | Region::ListItem) {
+            let parent = outline.quoting.or(heading);
+            parents[index] = parent;
+            nodes[index].parent_id = parent.map(|parent| nodes[parent].id.clone());
+            continue;
+        }
         let parent = match region {
             Region::Heading => {
                 let level = nodes[index].line_ids.iter().find_map(|id| level(id)).unwrap_or(1);
@@ -183,5 +194,10 @@ pub(crate) fn assemble_outline(
         parents[index] = parent;
         nodes[index].parent_id = parent.map(|parent| nodes[parent].id.clone());
         outline.previous = Some(index);
+        outline.quoting = match region {
+            Region::Heading => None,
+            Region::Text | Region::ListItem => Some(index),
+            Region::UnderHeading | Region::Quote => outline.quoting,
+        };
     }
 }

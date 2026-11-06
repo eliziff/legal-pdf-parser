@@ -180,7 +180,7 @@ impl Tagger {
                 start,
                 continues: None,
                 level: if region == heading && start == 1 { c_level.map_or(0, |h| c[h]) } else { 0 },
-                depth: if region != heading && start == 1 && labels::ranked(REGIONS[region]) { c_depth.map_or(0, |h| c[h]) } else { 0 },
+                depth: if region != heading && start == 1 && legal_structure_model::structure_analysis().hierarchy_ranks(REGIONS[region]) { c_depth.map_or(0, |h| c[h]) } else { 0 },
                 marker: start == 1 && c_marker.is_some_and(|h| c[h] == 1),
                 document: c_document.is_some_and(|h| c[h] == 1),
                 reference: c_reference.is_some_and(|h| c[h] == 1),

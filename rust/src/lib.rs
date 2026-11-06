@@ -33,6 +33,7 @@ pub use legal_pdf_ocr::render_gray_pages;
 pub use legal_pdf_extraction_processor::ExtractedPdf;
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
+#[cfg(feature = "tier1")]
 pub use legal_pdf_structure::train_whole_reading;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::model::*;

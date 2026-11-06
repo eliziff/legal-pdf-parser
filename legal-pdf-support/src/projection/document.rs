@@ -366,7 +366,8 @@ impl PdfDocument {
         self.printed.get_or_init(|| self.read_printed_paragraphs())
     }
 
-    /// Exact printed membership for geometry, without the text response-size limit.
+    /// Exact printed membership for geometry, without the text response-size limit: each paragraph's extent, its
+    /// own lines and everything set within it (its list's items, its block quotations), every printing of it.
     pub fn paragraph_source_ranges(&self, locator: &str) -> (PdfLookupStatus, Vec<ScalarRange>) {
         let range = numeric_range("paragraph", locator)
             .or_else(|| parse_ordinal("paragraph", locator).map(|n| (n, n)));
@@ -375,10 +376,11 @@ impl PdfDocument {
         };
         match self.paragraph_range(from, to) {
             Ok(paragraphs) => {
+                // Each printing's extent: its words, its quotations and lists, as the structure reads them.
                 let ids = paragraphs.iter().flat_map(|paragraph| paragraph.ids.iter().map(String::as_str)).collect::<HashSet<_>>();
-                let mut ranges = self.structure.nodes.iter().filter(|node| ids.contains(node.id.as_str()))
-                    .flat_map(|node| if node.ranges.is_empty() { std::slice::from_ref(&node.range) }
-                        else { &node.ranges }).copied().collect();
+                let mut ranges: Vec<ScalarRange> = self.structure.nodes.iter().filter(|node| ids.contains(node.id.as_str()))
+                    .flat_map(|node| if node.extent.is_empty() { node.ranges.clone() } else { node.extent.clone() })
+                    .collect();
                 ScalarRange::normalize_union(&mut ranges);
                 (PdfLookupStatus::Found, ranges)
             }
@@ -403,24 +405,12 @@ impl PdfDocument {
         Ok(&paragraphs[start..=end])
     }
 
-    /// Each paragraph number the structure labels, once: the paragraph it numbers, with every printing of it. A
-    /// parallel report prints a paragraph once per language, so its printings are those the parser marks as the
-    /// translation and those on a page of the first (columns side by side); a later run of the same numbers on
-    /// other pages is the numbering starting again (another judge's reasons), and the number is the first's.
+    /// Each paragraph number the structure labels, once, with every printing of it, as the structure engine reads
+    /// them (`paragraph_printings`): the paragraph a pinpoint to that number addresses.
     fn read_printed_paragraphs(&self) -> Vec<PrintedParagraph> {
-        let mut by_number = std::collections::BTreeMap::<usize, Vec<&legal_structure_model::StructureNode>>::new();
-        for node in self.structure.nodes.iter().filter(|node| node.kind == NodeKind::Paragraph) {
-            if let Some(number) = node.label.as_deref().and_then(|label| parse_ordinal("paragraph", label)) {
-                by_number.entry(number).or_default().push(node);
-            }
-        }
-        let mut paragraphs: Vec<PrintedParagraph> = by_number.into_iter().map(|(number, mut printings)| {
-            printings.sort_by_key(|node| self.structure.query_range(node).start);
-            let first = printings[0];
-            let first_pages: HashSet<usize> = first.page_indexes.iter().copied().collect();
-            printings.retain(|node| std::ptr::eq(*node, first)
-                || node.grammar.as_deref() == Some("translation")
-                || node.page_indexes.iter().any(|page| first_pages.contains(page)));
+        let printed = legal_structure_model::structure_analysis().paragraph_printings(&self.structure);
+        let mut paragraphs: Vec<PrintedParagraph> = printed.into_iter().map(|(number, printings)| {
+            let printings: Vec<&legal_structure_model::StructureNode> = printings.iter().map(|&index| &self.structure.nodes[index]).collect();
             let mut ranges: Vec<ScalarRange> = printings.iter().flat_map(|node| self.structure.query_ranges(node).into_owned()).collect();
             ScalarRange::normalize_union(&mut ranges);
             let mut page_numbers: Vec<u32> = printings.iter().flat_map(|node| node.page_indexes.iter().map(|page| (*page + 1) as u32)).collect();

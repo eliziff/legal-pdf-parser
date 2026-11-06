@@ -81,7 +81,8 @@ pub(super) fn line_width(line: &Line) -> f64 {
 pub(super) fn has_valid_bbox(line: &Line) -> bool {
     line.bbox.iter().all(|value| value.is_finite())
         && line.bbox[2] > line.bbox[0]
-        && line.bbox[3] > line.bbox[1]
+        // (A PDF's font may give its lines no height: 2001 SCC 79's every line stands on one y.)
+        && line.bbox[3] >= line.bbox[1]
 }
 
 pub(super) fn line_center_x(line: &Line) -> f64 {

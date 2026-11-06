@@ -8,7 +8,7 @@
 //! value the run does not bound on both sides is written only when the re-reading shows it.
 //! Printed text is exact and never touched.
 
-use legal_pdf_core::model::{Line, Page, Word, INVISIBLE};
+use legal_pdf_core::model::{Line, Page, Word};
 use legal_pdf_core::{OcrLine, PdfOcrProvider};
 use std::collections::BTreeMap;
 
@@ -142,12 +142,6 @@ fn read_marker_with(text: &str, misread_open: bool) -> Option<Reading> {
     }
     let _ = start;
     Some(Reading { family, values, exact, taken: k })
-}
-
-/// Whether recognition read the line (our own, or a scan's invisible layer): the only readings
-/// that lose glyphs.
-fn recognized(line: &Line) -> bool {
-    line.source == "ocr" || line.spans.iter().any(|span| span.flags & INVISIBLE != 0)
 }
 
 struct Place {
@@ -302,8 +296,8 @@ fn reread_value(lines: &[OcrLine], family: Family) -> Option<(Vec<u32>, bool, Oc
 }
 
 /// The marker written into the line: the garbled token (if any) replaced, else the marker prepended;
-/// words shift, and the marker's word takes the re-read box or an estimate left of the text.
-fn splice(line: &mut Line, family: Family, value: u32, taken: usize, reread: Option<&OcrLine>) {
+/// words shift, and the marker's word takes the box it was read in (`shown`) or an estimate left of the text.
+fn splice(line: &mut Line, family: Family, value: u32, taken: usize, shown: Option<[f64; 4]>) {
     let marker = family.write(value);
     let rest: String = line.text.chars().skip(taken).collect();
     let new_text = if rest.is_empty() { marker.clone() } else { format!("{marker} {rest}") };
@@ -316,7 +310,7 @@ fn splice(line: &mut Line, family: Family, value: u32, taken: usize, reread: Opt
         .map(|w| w.bbox[0])
         .fold(f64::INFINITY, f64::min);
     let text_start = if text_start.is_finite() { text_start } else { line.bbox[0] };
-    let marker_box = reread.map(|l| l.bbox).unwrap_or([
+    let marker_box = shown.unwrap_or([
         (text_start - 0.6 * h * marker.chars().count() as f64 - 0.3 * h).max(0.0),
         line.bbox[1],
         text_start - 0.3 * h,
@@ -351,10 +345,70 @@ fn splice(line: &mut Line, family: Family, value: u32, taken: usize, reread: Opt
     if let Some(ocr) = &mut line.ocr {
         ocr.recovered = true;
     }
-    if line.source != "ocr" {
+    if line.source != "ocr" && taken == 0 {
+        // A marker set before a printed line moves its spans along.
+        for span in &mut line.spans {
+            span.start += delta;
+            span.end += delta;
+        }
+    } else if line.source != "ocr" {
         // A kept layer's line now carries our reading of its margin: its spans no longer match its text.
         line.spans.clear();
     }
+}
+
+/// Paragraph numbers printed as pictures: a judgment that draws each "[1]" to "[N]" as a small image at the
+/// body's left edge, level with its paragraph's first line, its text layer holding none of them. Each such
+/// line takes its number by the count, in reading order, as a marker word in the picture's box. A picture
+/// is at most a line and a half high and three lines' height wide, at most three heights left of the line's first word. The
+/// pictures stand at one left edge, three of them at least; a document that prints as many bracketed numbers
+/// of its own, or whose pictures stand at more than one place, has none. Pages read from their image
+/// (`skip`) are not read here.
+pub(crate) fn picture_numbers(
+    pages: &mut [Page],
+    pictures: &std::collections::HashMap<u32, Vec<[f64; 4]>>,
+    skip: &std::collections::BTreeSet<usize>,
+) -> usize {
+    let mut found: Vec<(usize, usize, [f64; 4])> = Vec::new();
+    for (at, page) in pages.iter().enumerate() {
+        if skip.contains(&page.index) {
+            continue;
+        }
+        for rect in pictures.get(&page.number).into_iter().flatten() {
+            let (width, high) = (rect[2] - rect[0], rect[3] - rect[1]);
+            let beside = page.lines.iter().enumerate()
+                .filter(|(_, line)| {
+                    let h = height(line);
+                    let overlap = rect[3].min(line.bbox[3]) - rect[1].max(line.bbox[1]);
+                    !line.recognized() && overlap >= 0.5 * h.min(high) && width <= 3.0 * h && high <= 1.6 * h
+                        && rect[2] <= line.bbox[0] + 0.5 && line.bbox[0] - rect[2] <= 3.0 * h
+                })
+                .min_by(|(_, a), (_, b)| a.bbox[0].total_cmp(&b.bbox[0]));
+            if let Some((line, _)) = beside {
+                found.push((at, line, *rect));
+            }
+        }
+    }
+    if found.len() < 3 {
+        return 0;
+    }
+    let edge = legal_pdf_core::upper_median(found.iter().map(|(_, _, rect)| rect[0]).collect());
+    let at_edge = |x: f64| (x - edge).abs() <= 3.0;
+    // A judgment printing its paragraph numbers in its text, at whatever edge, as many as its pictures or more (not
+    // the few a quotation prints), draws none: its pictures are other marks (a heading's list number, "(2) The
+    // Place of the Search").
+    let printed = pages.iter().flat_map(|page| &page.lines)
+        .filter(|line| read_marker(&line.text).is_some_and(|reading| reading.exact && reading.family == Family::Bracket))
+        .count();
+    if printed >= 3 && printed >= found.len() || !found.iter().all(|(_, _, rect)| at_edge(rect[0])) {
+        return 0;
+    }
+    found.sort_by(|a, b| (a.0, a.2[1]).partial_cmp(&(b.0, b.2[1])).unwrap_or(std::cmp::Ordering::Equal));
+    found.dedup_by_key(|(page, line, _)| (*page, *line));
+    for (value, (page, line, rect)) in found.iter().enumerate() {
+        splice(&mut pages[*page].lines[*line], Family::Bracket, value as u32 + 1, 0, Some(*rect));
+    }
+    found.len()
 }
 
 /// Recover the lost paragraph numbers of the scanned pages; returns how many lines took a number.
@@ -390,7 +444,7 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
             let mut candidates: Vec<Candidate> = (places[a].rank + 1..places[b].rank).filter_map(|k| {
                 let place = &places[k];
                 let line = &pages[place.page].lines[place.line];
-                if !recognized(line) || !at_column(place) {
+                if !line.recognized() || !at_column(place) {
                     return None;
                 }
                 match &place.reading {
@@ -448,7 +502,7 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
                 }
                 let place = &places[k];
                 let line = &pages[place.page].lines[place.line];
-                if !recognized(line) || !at_column(place) || !place.opens {
+                if !line.recognized() || !at_column(place) || !place.opens {
                     continue;
                 }
                 if place.reading.as_ref().is_some_and(|r| r.exact) {
@@ -469,7 +523,7 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
             }
         }
         for (page, line, value, taken, reread) in writes {
-            splice(&mut pages[page].lines[line], family, value, taken, reread.as_ref());
+            splice(&mut pages[page].lines[line], family, value, taken, reread.as_ref().map(|shown| shown.bbox));
             repaired += 1;
         }
     }

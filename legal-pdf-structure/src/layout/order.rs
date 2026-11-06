@@ -24,6 +24,30 @@ pub(crate) fn geometry_order(lines: &[Line], members: &mut [usize]) {
     });
 }
 
+/// Two columns' lines read column by column down the page, band by band: a line spanning both columns (over 55% of
+/// the page's width) stands as a band of its own between the columns it parts.
+pub(crate) fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> Vec<usize> {
+    let mut sorted = members.to_vec();
+    geometry_order(lines, &mut sorted);
+    let mut ordered = Vec::with_capacity(sorted.len());
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for slot in sorted {
+        let line = &lines[slot];
+        if !has_valid_bbox(line) || line_width(line) / page_width > 0.55 {
+            ordered.append(&mut left);
+            ordered.append(&mut right);
+            ordered.push(slot);
+        } else if line_center_x(line) < model.split_x {
+            left.push(slot);
+        } else {
+            right.push(slot);
+        }
+    }
+    ordered.append(&mut left);
+    ordered.append(&mut right);
+    ordered
+}
+
 pub(crate) fn hyphen_join_score(lines: &[Line], members: &[usize]) -> (usize, usize) {
     let mut candidates = 0;
     let mut satisfied = 0;
@@ -103,6 +127,13 @@ pub(crate) fn arbitrate_body_order(
             kept[slot] = true;
         }
         let challenger = inspected_order(body, kept_items(items, |slot| kept[slot]), lines.len());
+        // Where pdf-inspector's order still crosses the columns (columns set line for line on one baseline, which it
+        // reads as one line), the columns' geometry read one after the other.
+        let challenger = if column_switches(lines, &challenger, model, page_width) > 2 {
+            column_geometry_order(lines, body, model, page_width)
+        } else {
+            challenger
+        };
         let challenger_switches = column_switches(lines, &challenger, model, page_width);
         let challenger_hyphens = hyphen_join_score(lines, &challenger);
         let (left_count, right_count) = body
@@ -114,13 +145,18 @@ pub(crate) fn arbitrate_body_order(
             });
         let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }
             .max(((left_count + right_count) as f64 * 0.10) as usize);
-        if source_switches >= minimum_switches
-            && source_run <= 6
-            && challenger_switches <= 2
-            && source_switches.saturating_sub(challenger_switches) >= 2
-            && challenger_hyphens.1 >= source_hyphens.1
-            && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
-                <= source_hyphens.0.saturating_sub(source_hyphens.1)
+        // A source changing column at nearly every line (half its column runs a line or two long) reads the page's
+        // rows across both columns: its hyphen joins pair one column's word with the other's line, and prove
+        // nothing; the challenger reading the columns one after the other stands.
+        let rows = source_run <= 2 && source_switches >= minimum_switches && challenger_switches * 4 <= source_switches;
+        if rows
+            || source_switches >= minimum_switches
+                && source_run <= 6
+                && challenger_switches <= 2
+                && source_switches.saturating_sub(challenger_switches) >= 2
+                && challenger_hyphens.1 >= source_hyphens.1
+                && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
+                    <= source_hyphens.0.saturating_sub(source_hyphens.1)
         {
             *body = challenger;
             return OrderDecision {
@@ -257,7 +293,13 @@ pub(crate) fn page_order(
     } else if table_page {
         OrderDecision::keep("table_grid")
     } else {
-        arbitrate_body_order(page, &mut body, items, columns)
+        // A law report's margin numbers are no column's lines: the columns' order is read without them, and they
+        // stand after it (`Fences::read_margin_numbers` reads each before its row).
+        let lane = margin_lane(lines, &body, page.width);
+        body.retain(|slot| !lane.contains(slot));
+        let decision = arbitrate_body_order(page, &mut body, items, columns);
+        body.extend(lane);
+        decision
     };
     if decision.repair != OrderRepair::None {
         let mut diagnostic = Diagnostic::info(

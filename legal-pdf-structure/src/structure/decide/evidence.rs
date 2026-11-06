@@ -565,8 +565,8 @@ fn lexicon(line: &Line) -> u32 {
         (WORD_FIELD, captions::field(&line.text).is_some()),
         (WORD_CLOSING, captions::closing(&line.text)),
         (WORD_REASONS, captions::reasons(line)),
-        (WORD_SIGNATURE, legal_structure_model::judgment::signature_line(text)),
-        (WORD_AUTHOR, legal_structure_model::judgment::author_line(text)),
+        (WORD_SIGNATURE, legal_structure_model::structure_analysis().signature_line(text)),
+        (WORD_AUTHOR, legal_structure_model::structure_analysis().author_line(text)),
         (WORD_WITNESS, headings::rules::witness(text)),
         (WORD_EXAMINATION, headings::rules::examination(text)),
         (WORD_TRANSCRIPT_PART, headings::rules::transcript_part(text)),
@@ -664,6 +664,19 @@ pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
             found.push((value(found_at.as_str()), start, end));
         }
     }
+    // Recognition sets a raised mark on the line's own run of text: figures run straight on from a word or its
+    // abbreviation ("Ontario1", "Reid J.2") are a mark for the notes to answer, or no one's.
+    static RECOGNIZED: OnceLock<Regex> = OnceLock::new();
+    if line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0) {
+        let run_on = RECOGNIZED.get_or_init(|| Regex::new(r"[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}](\d{1,3})(?:[\s.,;:)]|$)").unwrap());
+        for found_at in run_on.captures_iter(&line.text).filter_map(|c| c.get(1)) {
+            let start = line.text[..found_at.start()].chars().count() as u32;
+            let end = start + found_at.as_str().chars().count() as u32;
+            if !found.iter().any(|&(_, a, b)| a < end && start < b) {
+                found.push((value(found_at.as_str()), start, end));
+            }
+        }
+    }
     // A detached reference stands where it says, its blank edges trimmed.
     for r in &line.detached_references {
         let (mut start, mut end) = (r.start_offset.min(chars.len()), r.end_offset.min(chars.len()));
@@ -688,11 +701,20 @@ pub(crate) struct MarkerReading {
     pub(crate) prefix: Vec<u32>,
 }
 
+/// A line's text with the space a recognizer leaves inside its opening bracket closed up ("[ 13] Having ...").
+fn closed_up(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.trim_start().strip_prefix("[ ") {
+        Some(rest) => format!("[{}", rest.trim_start()).into(),
+        None => text.into(),
+    }
+}
+
 /// Every reading of a line's opening token by the numbering grammar: read alone and, where a single
 /// letter is also a roman numeral, as the letter after the letter before it ("(i)" as 1 and after
 /// "(h)"); and, where `division` says the line opens on a division word, the number after the word.
 pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
     let grammar = layout_analysis();
+    let text = closed_up(text);
     let mut tokens = text.split_whitespace();
     let Some(first) = tokens.next().filter(|token| token.chars().count() <= 12) else { return Vec::new() };
     let read = |token: &str, word: Option<&str>| {
@@ -741,7 +763,8 @@ fn reference_tokens(line: &Line, size: f64) -> u8 {
 
 /// The line's opening marker (`Marker`), its family named in `families`.
 fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
-    let text = line.text.trim_start();
+    let text = closed_up(&line.text);
+    let text = text.trim_start();
     let token = text.split_whitespace().next()?;
     if token.chars().count() > 12 {
         return None;
@@ -921,7 +944,7 @@ impl Evidence {
                             && !line_numbers[first + other]
                             && !line.text.trim().is_empty()
                             && crate::paragraphs::same_row(marker, line)
-                            && line.bbox[0] >= marker.bbox[2] - 1.0
+                            && line.bbox[0] >= marker.bbox[2] - if line.recognized() { line.bbox[3] - line.bbox[1] } else { 1.0 }
                     })
                     .min_by(|&a, &b| page.lines[a].bbox[0].total_cmp(&page.lines[b].bbox[0]))
                     .map(|other| slots.at(page_slot, other));

@@ -8,7 +8,7 @@
 //! `Prose` of its role (furniture, a page label, a transcript's line number each a line labelled by its
 //! text, a title, a marginal note, a caption, a headnote), and the tables the parser read as tables
 //! with their rows and cells. Each page carries its printed label as its alias. Parents follow the
-//! gold's own hierarchy rule (`labels::assemble`).
+//! gold's own hierarchy rule (the engine's `assemble_parents`).
 
 use super::*;
 use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NoteReference, Origin, PrimaryRole, Scope, StructureNode};
@@ -18,6 +18,8 @@ struct Unit {
     region: u8,
     lines: Vec<usize>,
     marker: Option<(usize, usize)>,
+    /// The line `marker` stands on: the unit's first, or the margin's line numbering it.
+    marker_line: usize,
     label: Option<String>,
     /// A heading's level, a body unit's depth (0 for neither).
     level: usize,
@@ -69,13 +71,13 @@ fn gap_cells(line: &Line) -> Vec<(usize, usize, f64)> {
 /// Two gap cells whose left edges stand this near (points) are in one column.
 const COLUMN_TOLERANCE: f64 = 12.0;
 
-/// The figures a line's text opens on, where they read `value`: their first and past-last character.
-fn leading_figures(text: &str, value: u32) -> Option<(usize, usize)> {
+/// The figures a line's text opens on: what they read, and their first and past-last character.
+pub(super) fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
     let chars: Vec<char> = text.chars().collect();
     let start = chars.iter().position(|c| !c.is_whitespace())?;
     let length = chars[start..].iter().take_while(|c| c.is_ascii_digit()).count();
     let figures: String = chars[start..start + length].iter().collect();
-    (length > 0 && figures.parse::<u32>().ok() == Some(value)).then_some((start, start + length))
+    Some((figures.parse().ok()?, (start, start + length)))
 }
 
 /// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
@@ -123,7 +125,7 @@ pub(crate) fn structure_graph(
     let text_of = |k: usize| texts[k].clone();
     let id_of = |k: usize| ids[k].clone();
     // Units, each line joining the unit open in its stream, resuming the one it held before, or opening
-    // one. Their parents follow the gold's own rule (`labels::assemble`): from each unit's region, its
+    // one. Their parents follow the gold's own rule (the engine's `assemble_parents`): from each unit's region, its
     // opening text, a heading's level, a body unit's depth among the body units open on the stack, and
     // whether it opens a constituent document.
     let mut state = State::default();
@@ -158,15 +160,23 @@ pub(crate) fn structure_graph(
             open.insert(key, u);
             u
         } else {
-            let text = text_of(k);
-            let reading = chosen.reading.and_then(|r| line.readings.get(usize::from(r)));
+            // A unit counting on the margin's number prints its marker on the margin's line.
+            let marker_line = match (chosen.reading, line.margin) {
+                (Some(MARGIN), Some((margin, _))) => margin as usize,
+                _ => k,
+            };
+            let text = text_of(marker_line);
+            let reading = line.reading(chosen.reading);
             // A note's label is the number its move counts on: where the label reader found it, else the
             // figures its opening token starts on ("27" of "27Ibid"); a note counting on none has none.
             let marker = if chosen.region == NOTE {
                 chosen.note.and_then(|value| {
                     let found = evidence.label[table.order[k].index()].filter(|label| label.value == value);
-                    found.and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1)))).or_else(|| leading_figures(&text, value))
+                    found.and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1))))
+                        .or_else(|| leading_figures(&text).filter(|&(figures, _)| figures == value).map(|(_, range)| range))
                 })
+            } else if chosen.reading == Some(OPENING) {
+                opening(&text, false)
             } else {
                 reading.and_then(|r| opening(&text, r.family.matches(':').count() > 1))
             };
@@ -182,7 +192,7 @@ pub(crate) fn structure_graph(
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
             let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) { usize::from(chosen.depth.max(1)) } else { 0 };
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
+            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, depth, starts_document: std::mem::take(&mut pending_start), references: Vec::new() });
             let u = units.len() - 1;
             unit_at.insert(k, u);
             open.insert(key, u);
@@ -202,7 +212,7 @@ pub(crate) fn structure_graph(
         let levels: Vec<usize> = units.iter().map(|unit| unit.level).collect();
         let depths: Vec<usize> = units.iter().map(|unit| unit.depth).collect();
         let starts: Vec<bool> = units.iter().map(|unit| unit.starts_document).collect();
-        legal_pdf_tagger::labels::assemble(&regions, &texts, &levels, &depths, &starts)
+        legal_structure_model::structure_analysis().assemble_parents(&regions, &texts, &levels, &depths, &starts)
     };
     // What the lines tell a reader of the pages: a line number is no part of the body; a note's lines
     // on the pages after its first continue it.
@@ -299,10 +309,16 @@ pub(crate) fn structure_graph(
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
         node.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&id_of(k)).map(|l| l.page_index)).collect();
         node.page_indexes.dedup();
-        let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.lines[0]), start, end));
+        let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
         if kind != NodeKind::Footnote {
             node.marker_range = marker_range;
-            node.label = unit.label.clone();
+            // A numbered paragraph is addressed by its number ("par12" for "[12]" or "12."), as every reader labels it.
+            node.label = if kind == NodeKind::Paragraph {
+                unit.label.as_deref().map(|label| label.trim_matches(|c: char| !c.is_ascii_digit()))
+                    .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).map(|digits| format!("par{digits}"))
+            } else {
+                unit.label.clone()
+            };
         }
         match kind {
             NodeKind::Heading => node.heading_range = Some(range),
@@ -314,7 +330,15 @@ pub(crate) fn structure_graph(
         }
         // Its region as the tagger states one (`region:<name>`), which readers take for the unit's kind; a
         // contents list's lines under the `contents` grammar.
-        node.grammar = Some(if region == "contents" { "contents".to_owned() } else { format!("region:{region}") });
+        // A numbered paragraph wholly in the translation prints that paragraph in the other language
+        // (`paragraph_printings`), as the stage's nodes say.
+        node.grammar = Some(if region == "contents" {
+            "contents".to_owned()
+        } else if kind == NodeKind::Paragraph && unit.lines.iter().all(|&k| views[k].translation) {
+            "translation".to_owned()
+        } else {
+            format!("region:{region}")
+        });
         // Its level or depth as the parser reads it, the outline's own: a heading two levels under the
         // one before stays two under, though no heading stands between them in the tree.
         if unit.level > 0 {
@@ -585,8 +609,12 @@ pub(crate) fn structure_graph(
         structure.continuations = Some(continuations);
     }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
-    structure.profile = identity.profile;
+    // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
+    // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The
+    // reading is the fences', all `Decided` reads for it.
     structure.source_fragments = index.source_fragments();
+    crate::structure::graph::read_judgment_paragraphs(&mut structure, pages, &Decided::of(pages, slots, fences, &Decision::default()));
+    structure.profile = identity.profile;
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
     Ok((structure, paragraphs, footnotes))
 }

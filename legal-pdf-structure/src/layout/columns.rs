@@ -18,20 +18,28 @@ pub(crate) fn kept_items(items: &legal_pdf_tables::PageItems, keep: impl Fn(usiz
 /// of `lines`), read on their text items on page `number` (`detect_columns`, a projection of the
 /// words across the page whose empty valleys are the gutters): two side by side, set apart at the
 /// gutter between them, a pair whose narrower is under half the wider's width being a body and its
-/// margin column (pdf-inspector's sidebar); more than two, a multi-column page.
+/// margin column (pdf-inspector's sidebar); more than two, a multi-column page. A lane whose lines are all bare
+/// numbers is no column: a report's paragraph numbers printed in its margin.
 pub(crate) fn columns_of(
     lines: &[Line],
     members: impl Iterator<Item = usize>,
     items: &[pdf_inspector::TextItem],
     number: u32,
 ) -> ColumnModel {
-    let regions = pdf_inspector::extractor::detect_columns(items, number, false);
+    let members: Vec<&Line> = members.map(|slot| &lines[slot]).filter(|line| has_valid_bbox(line) && !line.exclude_from_body).collect();
+    let regions: Vec<_> = pdf_inspector::extractor::detect_columns(items, number, false)
+        .into_iter()
+        .filter(|region| {
+            let inside = |line: &&&Line| (f64::from(region.x_min)..=f64::from(region.x_max)).contains(&line_center_x(line));
+            !members.iter().filter(inside).all(|line| bare_number(line))
+        })
+        .collect();
     let [left, right, ..] = regions.as_slice() else {
         return ColumnModel { kind: "single", split_x: 0.0, left_count: 0, right_count: 0 };
     };
     let split_x = f64::from(left.x_max + right.x_min) / 2.0;
     let (mut left_count, mut right_count) = (0, 0);
-    for line in members.map(|slot| &lines[slot]).filter(|line| has_valid_bbox(line) && !line.exclude_from_body) {
+    for line in members {
         if line_center_x(line) < split_x {
             left_count += 1;
         } else {
@@ -47,6 +55,27 @@ pub(crate) fn columns_of(
         "margin_column"
     };
     ColumnModel { kind, split_x, left_count, right_count }
+}
+
+/// A number standing alone on its line ("24", "[24]"): a report's paragraph number when it stands in the margin.
+pub(crate) fn bare_number(line: &Line) -> bool {
+    let text = line.text.trim();
+    let text = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')).unwrap_or(text);
+    !text.is_empty() && text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The body lines (`body`, slots of `lines`) that are bare numbers clear of the body's prose on either side: a law
+/// report's margin numbers, a lane of their own that is no column of the page's text.
+pub(crate) fn margin_lane(lines: &[Line], body: &[usize], page_width: f64) -> Vec<usize> {
+    let prose: Vec<&Line> = body.iter().map(|&slot| &lines[slot])
+        .filter(|line| has_valid_bbox(line) && line_width(line) > page_width * 0.20 && line.text.chars().any(char::is_alphabetic))
+        .collect();
+    let (Some(left), Some(right)) = (prose.iter().map(|line| line.bbox[0]).min_by(f64::total_cmp),
+        prose.iter().map(|line| line.bbox[2]).max_by(f64::total_cmp)) else { return Vec::new() };
+    body.iter().copied()
+        .filter(|&slot| has_valid_bbox(&lines[slot]) && bare_number(&lines[slot])
+            && (lines[slot].bbox[2] < left || lines[slot].bbox[0] > right))
+        .collect()
 }
 
 /// The lines `members` names (slots of the page's `count` lines), in the order pdf-inspector reads

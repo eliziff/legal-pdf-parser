@@ -192,6 +192,7 @@ pub fn assemble_pdf(
         u32::try_from(index + 1).is_ok_and(|number| !layer_pages.contains(&number))
             && pages.get(index).is_some_and(|page| !page.lines.is_empty())
     }));
+    crate::paragraph_recovery::picture_numbers(&mut pages, &pictures, &weak_pages);
     let image_regions = image_regions(&pages, pictures, &weak_pages);
     let mut extracted = ExtractedPdf {
         pages,

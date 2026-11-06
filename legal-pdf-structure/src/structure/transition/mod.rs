@@ -79,7 +79,7 @@ const CLASSES: usize = 34;
 /// (`gold_labels.py`, A2AJ's alignment).
 const UNMARKED_BODY: i64 = 101;
 /// The origin the transition parser's nodes name.
-pub(crate) const ORIGIN: &str = "legal-pdf-transition.v1";
+pub(crate) const ORIGIN: &str = super::TRANSITION_ORIGIN;
 /// A ranked candidate's features: its class's local log-probability and rank, its `CANDIDATE`
 /// features, and the line's place, type and marker (`lines::LINE_FEATURES`'s first twenty and its marker's).
 pub(crate) const RANKED: usize = 2 + CANDIDATES + 40 + 1;
@@ -102,6 +102,8 @@ struct Settings {
     gold: Option<HashMap<String, HashMap<String, [i64; 8]>>>,
     /// Each gold piece's reading rank in the gold (the labels' ninth column), where the gold gives one.
     gold_ranks: HashMap<String, HashMap<String, i64>>,
+    /// Each document's pieces in the order of its rows: what a row's pointer counts.
+    gold_pieces: HashMap<String, Vec<String>>,
     dump: Option<PathBuf>,
     dump_lines: f64,
     labels: Option<PathBuf>,
@@ -144,6 +146,7 @@ fn settings() -> &'static Settings {
             ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(|path| forest(path, RANKED, 1)),
             gold: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_gold(&path)),
             gold_ranks: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_ranks(&path)).unwrap_or_default(),
+            gold_pieces: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_pieces(&path)).unwrap_or_default(),
             dump: var("LEGALPDF_TRANSITION_DUMP"),
             dump_lines: std::env::var("LEGALPDF_TRANSITION_DUMP_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
@@ -230,6 +233,15 @@ fn read_ranks(path: &Path) -> HashMap<String, HashMap<String, i64>> {
         let (sha, ids, labels) = (row["sha256"].as_str()?.to_owned(), row["ids"].as_array()?.clone(), row["labels"].as_array()?.clone());
         let ranks = ids.iter().zip(&labels).filter_map(|(id, label)| Some((id.as_str()?.to_owned(), label.get(8)?.as_i64().filter(|&r| r >= 0)?))).collect();
         Some((sha, ranks))
+    }).collect()
+}
+
+/// Each document's pieces in the order of its gold rows.
+fn read_pieces(path: &Path) -> HashMap<String, Vec<String>> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).filter_map(|row| {
+        let ids = row["ids"].as_array()?.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect();
+        Some((row["sha256"].as_str()?.to_owned(), ids))
     }).collect()
 }
 
@@ -394,6 +406,8 @@ fn views_of<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
             contents_title: sheet.contents_titles[k].clone(),
             page: slots.page(slot) as u32,
             left: table.row(k)[LINE_FEATURES.iter().position(|n| *n == "x0").unwrap_or(0)],
+            margin: table.margins.get(&k).and_then(|&margin| Some((margin as u32, table.readings[margin].first()?))),
+            count: fences.count[at],
         }
     }).collect()
 }
@@ -518,7 +532,16 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
     let n = table.order.len();
     let gold = s.gold.as_ref().and_then(|g| g.get(sha256));
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
-    let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8])).collect();
+    // A row's pointer names a row of the gold's pieces (a line may hold several): here, the place of that piece's line.
+    let place: HashMap<&str, i64> = ids.iter().enumerate().map(|(k, id)| (id.as_str(), k as i64)).collect();
+    let pieces = s.gold_pieces.get(sha256);
+    let gold_rows: Vec<[i64; 8]> = ids.iter().map(|id| {
+        let mut row = gold.and_then(|g| g.get(&format!("{id}@0"))).copied().unwrap_or([-1; 8]);
+        if row[6] >= 0 {
+            row[6] = pieces.and_then(|pieces| pieces.get(row[6] as usize)).and_then(|piece| place.get(piece.split('@').next().unwrap_or(piece))).copied().unwrap_or(-1);
+        }
+        row
+    }).collect();
     // Detect-Order-Construct's decoding from the gold's answers: what it can hold.
     if s.doc_oracle && gold.is_some() {
         let views = views_of(pages, slots, evidence, fences, table, locals, sheet);
@@ -583,6 +606,8 @@ fn parse(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sh
                         "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
                         "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(),
                         "anchors": &sheet.anchor,
+                        "t0": &table.t0,
+                        "note_numbers": (0..n).map(|k| doc::note_number(&views[k], &slots.line(pages, table.order[k]).text).map_or(-1, i64::from)).collect::<Vec<_>>(),
                         "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
                         "gold": gold_rows, "move_lines": move_lines, "move_classes": move_classes, "move_oracle": move_oracle,
                         "chosen": moves.iter().map(Move::class).collect::<Vec<_>>(),
@@ -662,6 +687,7 @@ fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], lo
 fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     let mut state = State::default();
     let mut labels: Vec<[i64; 8]> = Vec::with_capacity(moves.len());
+    let mut paired_lines: Vec<usize> = Vec::new();
     // The first line of the last unit of each region opened in each context's stream.
     let mut first_of: HashMap<(u16, usize, u8), usize> = HashMap::new();
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
@@ -673,13 +699,15 @@ fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
         }
         let starts_document = chosen.starts;
         let made = state.apply(line, chosen);
-        for (paired, ..) in made.paired.into_iter().chain(made.also.into_iter().flatten()) {
-            labels[paired as usize][3] = 1;
-        }
+        // A mark may stand after its note: its line is labelled once every line is.
+        paired_lines.extend(made.paired.into_iter().chain(made.also.into_iter().flatten()).map(|(line, ..)| line as usize));
         let marked = chosen.opens && chosen.reading.is_some();
         let start = if chosen.opens { 1 } else if resumed.is_some() { 2 } else { 0 };
         let pointer = resumed.map_or(-1, |first| first as i64);
         labels.push([i64::from(chosen.region), start, i64::from(starts_document), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
+    }
+    for line in paired_lines {
+        labels[line][3] = 1;
     }
     labels
 }

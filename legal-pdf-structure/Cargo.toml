@@ -8,7 +8,6 @@ license = "MIT"
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-pdf-support = { path = "../legal-pdf-support" }
 legal-pdf-tables = { path = "../legal-pdf-tables" }
-legal-pdf-tagger = { path = "../legal-pdf-tagger" }
 legal-structure-model = { workspace = true }
 pdf-inspector = { workspace = true }
 regex = "1.11"
@@ -20,9 +19,11 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 
 [features]
+# Tier 1: the transition parser's readers (transition/), the walker on its own.
+transition = []
 # Tier 1's and tier 2's document encoder, and Detect-Order-Construct's stages, run in the engine
 # (transition/encoder.rs, transition/doc.rs).
-encoder = ["dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]
+encoder =["transition", "dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]
 
 # Unit tests run the structure engine, which programs supply at run time.
 [dev-dependencies]

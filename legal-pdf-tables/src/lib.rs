@@ -232,12 +232,20 @@ pub fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems {
             .enumerate()
             .filter(|(_, word)| !word.text.trim().is_empty())
             .collect();
+        // A recognizer pads the box it reads a line in (a scan's two columns' boxes all but meet across their
+        // gutter): a recognized line's words are offered within its ink, a quarter of its height in from each end.
+        let pad = if line.ocr.is_some() { 0.25 * (line.bbox[3] - line.bbox[1]).max(0.0) } else { 0.0 };
+        let inked = |bbox: [f64; 4]| {
+            let (left, right) = (bbox[0].max(line.bbox[0] + pad), bbox[2].min(line.bbox[2] - pad));
+            let middle = (bbox[0] + bbox[2]) / 2.0;
+            if right > left { [left, bbox[1], right, bbox[3]] } else { [middle - 0.5, bbox[1], middle + 0.5, bbox[3]] }
+        };
         if words.is_empty() {
-            items.push(item(line, line.text.trim(), line.bbox, span(0), false, false));
+            items.push(item(line, line.text.trim(), inked(line.bbox), span(0), false, false));
             origin.push((slot, WHOLE));
         }
         for (at, word) in words {
-            items.push(item(line, &word.text, word.bbox, span(word.start), word.underlined, word.struck));
+            items.push(item(line, &word.text, inked(word.bbox), span(word.start), word.underlined, word.struck));
             origin.push((slot, at));
         }
     }
@@ -527,7 +535,11 @@ fn page_tables(
         sizes.sort_by(f32::total_cmp);
         let body = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0);
         for table in detect_tables(&free, body, false) {
-            found.push(on_page(table, &rest[..]));
+            // Lines of running words set out by a wide indent are text, however they align ("[4]    This appeal concerns ...").
+            let running = table.item_indices.iter().filter(|&&k| free[k].text.split_whitespace().count() >= 8).count();
+            if table.kind != TableKind::Data || running < 2 {
+                found.push(on_page(table, &rest[..]));
+            }
         }
     }
     let contents = found
@@ -545,9 +557,22 @@ fn page_tables(
         .filter(|table| !table.line_ids().into_iter().any(|id| translated(id)))
         .filter(|table| !bilingual_columns(page, table, layout))
         .filter(|table| !two_column_list(table))
+        .filter(|table| !runs_past_its_grid(page, table))
         .collect();
     tables.sort_by(|left, right| left.top.total_cmp(&right.top));
     (tables, contents)
+}
+
+/// A grid a page's rules make over running text: its lines run past the grid's edges (underlined words, a boxed quotation, a
+/// heading's rule).
+fn runs_past_its_grid(page: &Page, table: &PdfTable) -> bool {
+    let (Some(&left), Some(&right)) = (table.xs.first(), table.xs.last()) else { return false };
+    let ids: HashSet<&String> = table.line_ids().into_iter().collect();
+    let past = |line: &&Line| {
+        let words = line.words.iter().filter(|word| !word.text.trim().is_empty());
+        words.clone().count() >= 8 && words.into_iter().any(|word| word.bbox[2] <= left || word.bbox[0] >= right)
+    };
+    page.lines.iter().filter(|line| ids.contains(&line.id)).filter(past).count() >= 3
 }
 
 fn row_text(table: &PdfTable, row: usize) -> Vec<String> {
@@ -590,7 +615,7 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
     let old = std::mem::replace(&mut table.xs, xs.to_vec());
     for cell in table.rows.iter_mut().flat_map(|row| &mut row.cells) {
         let left = nearest(old[cell.column]);
-        let right = nearest(old[cell.column + cell.column_span]);
+        let right = nearest(old[(cell.column + cell.column_span).min(old.len() - 1)]);
         cell.column = left;
         cell.column_span = right.saturating_sub(left).max(1);
     }

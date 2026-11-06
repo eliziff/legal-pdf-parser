@@ -242,8 +242,12 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
                 previous = Some(slot);
                 continue;
             }
+            // The line a margin's paragraph number numbers goes on in the number's block.
             let start = previous.is_none_or(|prior| {
                 let before = prior.index();
+                if fences.margin_number[before] == Some(slot) {
+                    return false;
+                }
                 let free = !decision.joined[at] && fences.continues[at].is_none();
                 class(role[before]) != kind
                     || fences.ctx[before] != fences.ctx[at]

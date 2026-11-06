@@ -36,6 +36,10 @@ const MARKER: std::ops::Range<usize> = 72..92;
 /// (`AROUND` and `MARKER` of each), whether the next and previous are on its page, and the document's
 /// shape.
 pub(crate) const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
+/// The roles `Role` names (`docparse.T0`).
+const ROLES: usize = 14;
+/// What t0 decided of a line: its role, one of `ROLES`, and seven flags (`docparse.T0`).
+pub(crate) const T0: usize = ROLES + 7;
 
 /// The shape of a line's text: its length, its share of capitals, figures, punctuation and spaces,
 /// how it opens and how it ends.
@@ -161,11 +165,6 @@ fn repeated_at_edges(pages: &[Page], slots: &Slots, order: &[Slot]) -> Vec<bool>
     keys.iter().map(|found| found.as_ref().is_some_and(|text| pages_of[text].len() >= 3)).collect()
 }
 
-/// A line recognition read: our own recognition, or a scan's invisible recognition layer.
-fn recognized_line(line: &Line) -> bool {
-    line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0)
-}
-
 /// The line's text with its opening token read as recognition likely misread it (`confusions`, each
 /// misread character's meant ones at a twentieth or more): each character read as its likeliest meaning
 /// alone, and all of them at once; at most six variants.
@@ -234,6 +233,14 @@ pub(crate) struct LineTable {
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
     pub(crate) looks: Vec<u32>,
     pub(crate) features: Vec<f32>,
+    /// Each paragraph number the margin prints (`Fences::read_margin_numbers`), by its line's place: the place of
+    /// the row's line it numbers, and of its twin's in the other language's column, where it has one.
+    pub(crate) margin_rows: HashMap<usize, (usize, Option<usize>)>,
+    /// Each line a margin number numbers (a row's or a twin's), and each margin number's own line, by its place: the
+    /// margin line's place.
+    pub(crate) margins: HashMap<usize, usize>,
+    /// What t0 decided of each line (`T0` a line), the DOC reader's input.
+    pub(crate) t0: Vec<u8>,
 }
 
 impl LineTable {
@@ -343,7 +350,7 @@ impl LineTable {
                 }
             }
             // A recognized line's marker as each likely misreading of its characters would have it.
-            if recognized_line(line) {
+            if line.recognized() {
                 for variant in misread_variants(&line.text, &super::settings().confusions) {
                     for reading in marker_readings(&variant, evidence.words[at] & WORD_DIVISION != 0) {
                         if !found.contains(&reading) {
@@ -415,6 +422,43 @@ impl LineTable {
             row[at + 5] = (1.0 + n as f32).ln();
             debug_assert_eq!(at + 6, ALL);
         }
-        Self { order, readings, references, looks: look_ids, features }
+        // The margin's paragraph numbers, each with the lines its number opens: a number the grammar reads, its row's
+        // and twin's lines read in the parse.
+        let place: HashMap<Slot, usize> = order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
+        let mut margin_rows = HashMap::new();
+        let mut margins = HashMap::new();
+        for (k, &slot) in order.iter().enumerate() {
+            let Some(row) = fences.margin_number[slot.index()].and_then(|row| place.get(&row).copied()) else { continue };
+            if readings[k].is_empty() {
+                continue;
+            }
+            let twin = fences.margin_twin[slot.index()].and_then(|twin| place.get(&twin).copied()).filter(|&twin| twin != row);
+            margin_rows.insert(k, (row, twin));
+            for opened in [k, row].into_iter().chain(twin) {
+                margins.insert(opened, k);
+            }
+        }
+        // What t0 decided of each line, for the DOC reader that works from it: its role, the note band, whether the
+        // judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the line before in
+        // its language, whether it is a margin's number or a line one numbers, and whether it goes on with the line
+        // before it.
+        let mut t0 = vec![0u8; n * T0];
+        let mut last_held: HashMap<bool, &Vec<(bool, u32, u32, u32)>> = HashMap::new();
+        for (k, &slot) in order.iter().enumerate() {
+            let at = slot.index();
+            let row = &mut t0[k * T0..(k + 1) * T0];
+            row[(fences.role[at] as usize).min(ROLES - 1)] = 1;
+            let held = &fences.held[at];
+            let goes_on = held.iter().any(|mine| last_held.get(&mine.0).is_some_and(|before| before.iter().any(|other| other.1 == mine.1)));
+            let flags = [fences.band[at], fences.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
+                margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some()];
+            for (cell, flag) in row[ROLES..].iter_mut().zip(flags) {
+                *cell = u8::from(flag);
+            }
+            for mine in held {
+                last_held.insert(mine.0, held);
+            }
+        }
+        Self { order, readings, references, looks: look_ids, features, margin_rows, margins, t0 }
     }
 }

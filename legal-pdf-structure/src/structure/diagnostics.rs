@@ -303,7 +303,7 @@ pub fn validate_pdf_components(
                     .as_deref()
                     .is_some_and(|grammar| grammar.starts_with(constituents::GRAMMAR))
                 && (node.locator_kind.as_deref().is_none_or(str::is_empty)
-                    || (node.origin_id != transition::ORIGIN
+                    || (node.origin_id != TRANSITION_ORIGIN
                         && node
                             .proof
                             .as_ref()

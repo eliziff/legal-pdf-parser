@@ -92,6 +92,11 @@ pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     if hyphen_fragment_tail(previous_text) && hyphen_continuation(current_text) {
         return true;
     }
+    // An enumeration within the sentence the line above leaves open ("two components:" / "(1) the risk …; and
+    // (2) the gravity …"): the line prints its opening marker's successor too, as no list's item does.
+    if !sentence_ended(previous_text) && inline_enumeration(current_text) {
+        return true;
+    }
     if starts_note_or_list(current_text) {
         return false;
     }
@@ -99,10 +104,42 @@ pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     {
         return true;
     }
+    // A lead-in's last words wrapped onto a line of their own ("… codified in s. 19 of the Criminal" / "Code:"): a
+    // few words closing on a colon go on with the sentence the line above leaves open.
+    if !sentence_ended(previous_text) && current_text.ends_with(':') && current_text.split_whitespace().count() <= 4 {
+        return true;
+    }
     if dangling_end(previous_text) && !opens_after_dangling(previous, current) {
         return true;
     }
     bracket_excess(previous_text) > 0 && closes_before_opening(current_text)
+}
+
+/// A line opening on a bracketed marker ("(1)", "(a)", "(i)") that prints the marker after it later in the
+/// same line ("(2)", "(b)", "(ii)"): an enumeration run into a sentence, not a list's item.
+fn inline_enumeration(text: &str) -> bool {
+    const ROMANS: [&str; 12] = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"];
+    let Some((token, rest)) = text.strip_prefix('(').and_then(|rest| rest.split_once(')')) else { return false };
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let next = if let Ok(number) = token.parse::<u32>() {
+        (number + 1).to_string()
+    } else if let Some(at) = ROMANS.iter().position(|roman| roman.eq_ignore_ascii_case(token)) {
+        match ROMANS.get(at + 1) {
+            Some(next) if token.chars().all(char::is_lowercase) => (*next).to_owned(),
+            Some(next) => next.to_uppercase(),
+            None => return false,
+        }
+    } else if let [letter] = token.as_bytes() {
+        if !letter.is_ascii_alphabetic() || matches!(letter, b'z' | b'Z') {
+            return false;
+        }
+        char::from(letter + 1).to_string()
+    } else {
+        return false;
+    };
+    rest.contains(&format!("({next}) ")) || rest.trim_end().ends_with(&format!("({next})"))
 }
 
 /// Whether the line after one ending on a word no sentence ends on opens something of its own.

@@ -619,18 +619,13 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
 }
 
-/// What the structure gold's inputs are keyed by: the extraction code and the models the
+/// What the structure gold's inputs are keyed by: the extraction schema and the models the
 /// environment names. Work after extraction never re-extracts the gold; recognition is cached on
 /// its own, and a change to it that should reach the inputs bumps the version here.
 #[doc(hidden)]
 pub fn gold_inputs_identity() -> String {
     let models = ["LEGALPDF_INDRA_MODEL_PACK", "LEGALPDF_ONNXRUNTIME", "LEGALPDF_PPDOC_MODEL_PACK"].map(|name| std::env::var(name).ok());
-    let identity = serialization_sha256(&(
-        "legalpdf.gold-inputs.v2",
-        env!("LEGAL_PDF_EXTRACTION_SHA256"),
-        models,
-    ))
-    .unwrap_or_default();
+    let identity = serialization_sha256(&("legalpdf.gold-inputs.v2", EXTRACTION_CACHE_SCHEMA, models)).unwrap_or_default();
     identity[..16.min(identity.len())].to_owned()
 }
 /// The structure gold's synthetic scan: `pdf`, an image-only copy of a typeset document, extracted
@@ -799,8 +794,9 @@ fn maybe_prune_document_cache(root: &Path, ocr_root: &Path) {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
     // ponytail: amortized maintenance; rescan sooner if cache overshoot becomes material.
     if WRITES.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
-        // The parse cache and the OCR cache are bounded apart: a parse never evicts recognition.
-        prune_cache(&["documents", "extractions"].map(|directory| parse_cache_root(root).join(directory)));
+        // Each is bounded apart: a parse never evicts an extraction or recognition.
+        prune_cache(&[parse_cache_root(root).join("documents")]);
+        prune_cache(&[parse_cache_root(root).join("extractions")]);
         prune_cache(&[ocr_root.join("recognition")]);
     }
 }
@@ -1020,11 +1016,9 @@ fn recognized_extraction(
         Some(provider) => Some(provider as &mut dyn legal_pdf_core::PdfOcrProvider),
         None => selected_ocr,
     };
-    let extraction_key = serialization_sha256(&(
-        EXTRACTION_CACHE_SCHEMA,
-        source_hash,
-        env!("LEGAL_PDF_EXTRACTION_SHA256"),
-    ))?;
+    // A PDF's extraction is keyed by the PDF and the schema, never by a fingerprint of source files: work after
+    // extraction never re-extracts, and a change to extraction itself bumps EXTRACTION_CACHE_SCHEMA.
+    let extraction_key = serialization_sha256(&(EXTRACTION_CACHE_SCHEMA, source_hash))?;
     let extraction_path = cache_root.map(|root| {
         parse_cache_root(root)
             .join("extractions")
@@ -1041,7 +1035,6 @@ fn recognized_extraction(
         .filter(|cached| {
             cached.schema_version == EXTRACTION_CACHE_SCHEMA
                 && cached.source_sha256 == source_hash
-                && cached.cache_key == extraction_key
                 && !cached.extraction.pages.is_empty()
                 && cached.extraction.pages.len() == cached.extraction.separators.len()
         });

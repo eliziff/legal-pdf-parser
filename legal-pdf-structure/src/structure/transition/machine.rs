@@ -73,9 +73,10 @@ pub(crate) struct Move {
     /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
     /// its contexts, outline and numbering begin anew.
     pub(crate) starts: bool,
-    /// A note's opening: the reference marks it answers, each its line's place and its first character,
-    /// where the reading chose them (none: the marks of its number the text set last).
-    pub(crate) answers: [Option<(u32, u32)>; 4],
+    /// A note's opening: the reference marks it answers, each its line's place and its first and past-last
+    /// character, where the reading chose them, wherever they stand (none: the marks of its number the text set
+    /// last; a place of `u32::MAX` alone: no mark).
+    pub(crate) answers: [Option<(u32, u32, u32)>; 4],
 }
 
 impl Move {
@@ -209,6 +210,31 @@ pub(crate) struct LineView<'a> {
     pub(crate) contents_title: Option<String>,
     pub(crate) left: f32,
     pub(crate) page: u32,
+    /// The paragraph number the margin prints beside the line's row, numbering the paragraph the line opens in
+    /// its column (`Fences::read_margin_numbers`: in both columns of a parallel report): the margin line's place
+    /// and its number's reading. A move counts on it as `MARGIN`.
+    pub(crate) margin: Option<(u32, &'a MarkerReading)>,
+    /// The paragraph number the decide stage's judgment reader reads the line opening (`Fences::count`): t0's
+    /// reading of the document's numbered paragraphs, which DOC's decoding works from.
+    pub(crate) count: Option<u32>,
+}
+
+/// A move's `reading` that counts on the number the margin prints beside the line's row (`LineView::margin`),
+/// not on one of the line's own.
+pub(crate) const MARGIN: u8 = u8::MAX;
+/// A move's `reading` that opens on the line's marker where no reading makes it out: its opening token, counting on
+/// nothing.
+pub(crate) const OPENING: u8 = u8::MAX - 1;
+
+impl<'a> LineView<'a> {
+    /// The reading a move's `reading` names: one of the line's own, the margin's number (`MARGIN`), or none (`OPENING`).
+    pub(crate) fn reading(&self, reading: Option<u8>) -> Option<&'a MarkerReading> {
+        match reading? {
+            OPENING => None,
+            MARGIN => self.margin.map(|(_, reading)| reading),
+            r => self.readings.get(usize::from(r)),
+        }
+    }
 }
 
 /// What a move made of its line: the earlier line whose reference mark its note answered, a heading's
@@ -307,7 +333,7 @@ impl State {
         let empty = Open::default();
         let stream = self.open(self.ctx(line, candidate.starts)).unwrap_or(&empty);
         let body = |frames: &[Frame]| frames.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
-        match candidate.reading.and_then(|r| line.readings.get(usize::from(r))) {
+        match line.reading(candidate.reading) {
             Some(reading) => body(&counted(stream.frames(), reading, candidate.region)),
             None => body(stream.frames()),
         }
@@ -460,7 +486,7 @@ impl State {
         f[5] = (self.since[usize::from(candidate.region)] as f32).min(500.0);
         f[7] = 9.0;
         f[14] = -1.0;
-        let reading = candidate.reading.and_then(|r| line.readings.get(usize::from(r)));
+        let reading = line.reading(candidate.reading);
         if let Some(reading) = reading {
             f[6] = 1.0;
             f[7] = count_class(&reading.family);
@@ -633,7 +659,7 @@ impl State {
         *self.answering.borrow_mut() = None;
         let outline_key = self.outline_key(line, false);
         let stream = self.streams.entry(ctx).or_default();
-        if let Some(reading) = chosen.reading.and_then(|r| line.readings.get(usize::from(r))) {
+        if let Some(reading) = line.reading(chosen.reading) {
             let frames = counted(stream.frames(), reading, chosen.region);
             *stream.frames_mut() = frames;
         }
@@ -642,11 +668,11 @@ impl State {
             if chosen.answers.iter().any(Option::is_some) {
                 // The marks the reading chose, exactly.
                 let mut found = Vec::new();
-                for &(place, start) in chosen.answers.iter().flatten() {
+                for &(place, start, end) in chosen.answers.iter().flatten().filter(|mark| mark.0 != u32::MAX) {
                     if let Some(at) = stream.unanswered.iter().position(|&(r, line, s, _)| r == value && line == place && s == start) {
-                        let (_, line, s, e) = stream.unanswered.remove(at);
-                        found.push((line, s, e));
+                        stream.unanswered.remove(at);
                     }
+                    found.push((place, start, end));
                 }
                 let mut found = found.into_iter();
                 made.paired = found.next();

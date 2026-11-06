@@ -1507,8 +1507,9 @@ fn moves_of(problem: &Problem, solution: &Solution, views: &[LineView]) -> Vec<M
         if opens && region == NOTE {
             chosen.note = line.label.filter(|_| solution.notes[k]);
             if chosen.note.is_some() {
-                for (slot, &mark) in chosen.answers.iter_mut().zip(answers.get(&k).into_iter().flatten()) {
-                    *slot = Some(mark);
+                for (slot, &(place, start)) in chosen.answers.iter_mut().zip(answers.get(&k).into_iter().flatten()) {
+                    let end = views[place as usize].references.iter().find(|mark| mark.1 == start).map_or(start, |mark| mark.2);
+                    *slot = Some((place, start, end));
                 }
             }
         }

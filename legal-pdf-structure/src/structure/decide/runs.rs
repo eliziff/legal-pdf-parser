@@ -82,18 +82,12 @@ pub(crate) struct Runs {
     pub(crate) before: Vec<(Slot, String)>,
 }
 
-/// A line recognition read, the only reading that misreads a marker: our own recognition, or a
-/// scan's invisible recognition layer.
-fn recognized(line: &Line) -> bool {
-    line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0)
-}
-
 /// The markers recognition misread, restored from the runs they stand in, in each document and
 /// language with its lines in reading order (`repair_label_dropouts`): each rewritten line's slot
 /// and its text before. The repair reads a fenced running head or folio as the page's head or
 /// foot, a line label as one, and a line under the note separator as a note's.
 fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Slot, String)> {
-    if !pages.iter().flat_map(|page| &page.lines).any(recognized) {
+    if !pages.iter().flat_map(|page| &page.lines).any(Line::recognized) {
         return Vec::new();
     }
     let mut lines: Vec<Option<Line>> = pages.iter_mut().flat_map(|page| std::mem::take(&mut page.lines)).map(Some).collect();
@@ -164,8 +158,9 @@ fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Sl
 }
 
 /// A reading context's lines as one text, line under line, a marker standing alone on its line
-/// run on with the line beside it that carries its text: each line's slot and where it begins and
-/// ends in the text, in scalars.
+/// run on with the line beside it that carries its text, and a citation wrapped from one line to the
+/// next run on as one ("[1997]" over "1 S.C.R. 748": the volume opening the line is no marker): each
+/// line's slot and where it begins and ends in the text, in scalars.
 struct View {
     text: String,
     lines: Vec<(Slot, usize, usize)>,
@@ -176,9 +171,15 @@ impl View {
         let mut text = String::new();
         let mut placed = Vec::with_capacity(lines.len());
         let mut cursor = 0;
+        let wrapped = |before: Slot, slot: Slot| {
+            let end = slots.line(pages, before).text.trim_end().len() as u32;
+            evidence.citations_of(before).iter().any(|cited| !cited.protected && cited.range.1 >= end)
+                && evidence.citations_of(slot).iter().any(|cited| !cited.protected && cited.range.0 == 0)
+        };
         for (at, &slot) in lines.iter().enumerate() {
             if at > 0 {
-                text.push(if evidence.beside[lines[at - 1].index()] == Some(slot) { ' ' } else { '\n' });
+                let before = lines[at - 1];
+                text.push(if evidence.beside[before.index()] == Some(slot) || wrapped(before, slot) { ' ' } else { '\n' });
                 cursor += 1;
             }
             let line = &slots.line(pages, slot).text;
@@ -419,10 +420,12 @@ impl Lines<'_> {
             observe(CandidateObservationV2::ListItemLayout);
         }
         // The marker is a citation's number, a sentence's word wrapped onto its line, or a bare
-        // period marker inside prose ("v." of a case name).
+        // period marker inside prose ("v." of a case name). A number the margin prints is a paragraph's by its place on
+        // the page, whatever the citation reading of the page's raw line order ran into it ("[2002] 4 R.C.S." over "67").
         let marker_end = self.view.place(candidate.marker_range.end);
         let (from, to) = bytes_of(&line.text, start.offset, if marker_end.slot == slot { marker_end.offset } else { u32::MAX });
-        let cited = evidence.citations_of(slot).iter().any(|cited| cited.core.0 < to && from < cited.core.1);
+        let cited = fences.margin_number[at].is_none()
+            && evidence.citations_of(slot).iter().any(|cited| cited.core.0 < to && from < cited.core.1);
         let continued = fences.continues[at].is_some();
         let opening = run.grammar == CandidateGrammar::Hierarchy && candidate.parent_candidate_id.is_none();
         let prose = run.grammar == CandidateGrammar::Enumerator
@@ -430,6 +433,11 @@ impl Lines<'_> {
             && (continued || candidate.label == "v." && layout_analysis().has_citation_signal(&line.text));
         if cited || prose || opening && continued {
             observe(CandidateObservationV2::CrossReference);
+        }
+        // A number the margin prints beside the row its text opens on, counting on with the document's others, is
+        // a report's paragraph number, never a section's (`Fences::read_margin_numbers`).
+        if fences.margin_number[at].is_some() {
+            observe(CandidateObservationV2::ComposedParagraph);
         }
         if fences.cell[at] != 0 || matches!(evidence.tag[at], SourceTag::Table | SourceTag::Visual) {
             observe(CandidateObservationV2::TableOrForm);
@@ -488,6 +496,14 @@ impl Runs {
         let repaired = legal_pdf_support::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
         let pages: &[Page] = pages;
         evidence.reread(pages, slots, &repaired);
+        fences.read_numbers(pages, slots, evidence, !repaired.is_empty());
+        // A paragraph number in the margin stands beside the line of its row it numbers, as one printed line
+        // (`Fences::read_margin_numbers`): the numbering reads it opening that line, not ending the one before.
+        for (at, row) in fences.margin_number.iter().enumerate() {
+            if let Some(row) = row {
+                evidence.beside[at] = Some(*row);
+            }
+        }
         let edits = repaired
             .iter()
             .map(|(slot, _)| {
@@ -618,6 +634,22 @@ impl Runs {
                     members,
                 });
             }
+        }
+        // The document's paragraphs are the count the reading took (`Fences::read_paragraphs`): a quoted decision's
+        // numbers, a list's, the other language's issue list are none of it.
+        let paragraph = Some(legal_structure_model::UnitRole::Paragraph);
+        let counted = |member: &Member| member.kind == paragraph;
+        let members: Vec<(usize, usize)> = runs.iter().enumerate()
+            .flat_map(|(r, run)| run.members.iter().enumerate().filter(|(_, member)| counted(member)).map(move |(m, _)| (r, m)))
+            .collect();
+        for &(r, m) in &members {
+            let member = &mut runs[r].members[m];
+            let own = fences.count[member.slot.index()].is_some();
+            (member.kind, member.rule) = if own {
+                (paragraph, ResolutionRuleV2::RootedNumericProse)
+            } else {
+                (Some(legal_structure_model::UnitRole::Item), ResolutionRuleV2::OffCount)
+            };
         }
         // A statute's running head naming its page's sections is the page's furniture where the
         // spine (its rooted, consecutive provisions, counted and opening prose) opens a section it
