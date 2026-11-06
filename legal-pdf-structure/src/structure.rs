@@ -284,10 +284,10 @@ pub fn derive_cached(
     // The transition parser: its reading the output where LEGALPDF_TRANSITION_EMIT says so, else read
     // beside the stages while it is fitted and measured.
     if transition::emitting() {
-        return measure("derive.transition", || transition::output(pages, &slots, &evidence, &fences, &runs, outline, &identity));
+        return measure("derive.transition", || transition::output(analysis, pages, &slots, &evidence, &fences, &runs, outline, &identity));
     }
     if transition::enabled() {
-        measure("derive.transition", || transition::run(pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
+        measure("derive.transition", || transition::run(analysis, pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
     }
     measure("derive.machine", || transition::tier0::output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
 }

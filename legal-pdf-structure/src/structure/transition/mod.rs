@@ -419,9 +419,11 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
 /// they make in reading order (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM
 /// says how wide), read twice: a first greedy reading, whose reading of each template the second reads;
 /// and, as its environment asks, what the scorer is fitted on and the labels the grader reads.
-pub(crate) fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], sha256: &str) -> (LineTable, Vec<Local>, Stylesheet, Vec<Move>) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], sha256: &str) -> (LineTable, Vec<Local>, Stylesheet, Vec<Move>) {
     let s = settings();
-    let table = LineTable::read(pages, slots, evidence, fences, &runs.before, &s.confusions);
+    let (notes, decision) = tier0::decided(analysis, pages, slots, evidence, fences, runs, outline);
+    let table = LineTable::read(pages, slots, evidence, fences, &notes, &decision, &runs.before, &s.confusions);
     let locals = locals_of(s, pages, slots, &table, sha256);
     let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
     let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
@@ -639,8 +641,8 @@ fn write_labels(s: &Settings, sha256: &str, ids: &[String], views: &[LineView], 
 
 /// The document's structure as the transition parser reads it, its reading through `emit`: what
 /// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
-pub(crate) fn output(pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], identity: &StructureIdentity) -> Result<StructureOutput> {
-    let (table, locals, sheet, moves) = run(pages, slots, evidence, fences, runs, outline, &identity.source_sha256);
+pub(crate) fn output(analysis: &dyn StructureAnalysis, pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], identity: &StructureIdentity) -> Result<StructureOutput> {
+    let (table, locals, sheet, moves) = run(analysis, pages, slots, evidence, fences, runs, outline, &identity.source_sha256);
     let views = views_of(settings(), pages, slots, evidence, fences, &table, &locals, &sheet);
     let (structure_graph, paragraphs, footnotes) = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity, None)?;
     Ok(StructureOutput { paragraphs, footnotes, diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })

@@ -343,6 +343,35 @@ fn in_slot_order(pages: &mut [Page], slots: &Slots) {
     }
 }
 
+/// The notes and the one decision on each line.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    analysis: &dyn StructureAnalysis,
+    pages: &[Page],
+    slots: &Slots,
+    evidence: &Evidence,
+    fences: &Fences,
+    runs: &Runs,
+    outline: &[PdfOutlineEntry],
+    table: &LineTable,
+    views: &[LineView],
+    traced: bool,
+) -> (Notes, Decision) {
+    let notes = Notes::read(analysis, pages, slots, evidence, fences, runs);
+    let geometry = Geometry::of(pages);
+    let mut decision = Decision::hear(analysis, pages, slots, evidence, fences, runs, &notes, outline, &geometry, traced);
+    settle(fences, runs, table, views, &mut decision);
+    decision.finish(pages, slots, evidence, fences, runs, &geometry);
+    (notes, decision)
+}
+
+/// What the machine decides of the document, for the DOC reader that works from it.
+pub(crate) fn decided(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry]) -> (Notes, Decision) {
+    let table = LineTable::plain(pages, slots, evidence, fences, &runs.before);
+    let views = line_views(pages, slots, evidence, fences, &table);
+    decide(analysis, pages, slots, evidence, fences, runs, outline, &table, &views, false)
+}
+
 /// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output(
@@ -356,13 +385,9 @@ pub(crate) fn output(
     identity: &StructureIdentity,
     trace: Option<&Path>,
 ) -> Result<StructureOutput> {
-    let mut notes = Notes::read(analysis, pages, slots, evidence, &fences, runs);
-    let geometry = Geometry::of(pages);
-    let mut decision = Decision::hear(analysis, pages, slots, evidence, &fences, runs, &notes, outline, &geometry, trace.is_some());
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before);
     let views = line_views(pages, slots, evidence, &fences, &table);
-    settle(&fences, runs, &table, &views, &mut decision);
-    decision.finish(pages, slots, evidence, &fences, runs, &geometry);
+    let (mut notes, mut decision) = decide(analysis, pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);

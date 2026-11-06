@@ -38,8 +38,8 @@ const MARKER: std::ops::Range<usize> = 72..92;
 pub(crate) const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
 /// The roles `Role` names (`docparse.T0`).
 const ROLES: usize = 14;
-/// What t0 decided of a line: its role, one of `ROLES`, and seven flags (`docparse.T0`).
-pub(crate) const T0: usize = ROLES + 7;
+/// What t0 decided of a line: its role, one of `ROLES`, twelve flags and its heading's level (`docparse.T0`).
+pub(crate) const T0: usize = ROLES + 13;
 
 /// The shape of a line's text: its length, its share of capitals, figures, punctuation and spaces,
 /// how it opens and how it ends.
@@ -250,7 +250,8 @@ impl LineTable {
 
     /// `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
     /// markers' readings stand beside the repaired text's, the parser's to choose between.
-    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
         let order: Vec<Slot> = fences.order.clone();
         let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
         let n = order.len();
@@ -398,23 +399,27 @@ impl LineTable {
             debug_assert_eq!(at + 6, ALL);
         }
         let (margin_rows, margins) = margin_lines(&order, &readings, fences);
-        // What t0 decided of each line, for the DOC reader that works from it: its role, the note band, whether the
-        // judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the line before in
-        // its language, whether it is a margin's number or a line one numbers, and whether it goes on with the line
-        // before it.
+        // What t0 decided of each line, for the DOC reader that works from it: the role the machine settled on, the note
+        // band, whether the judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the
+        // line before in its language, whether it is a margin's number or a line one numbers, whether it goes on with the
+        // line before it, whether the notes read it a note, whether a quotation holds it, whether a constituent document
+        // starts on it, whether it opens a unit or joins the line above, and its heading's level.
+        let starts: HashSet<&str> = fences.starts.iter().map(|start| start.line_id.as_str()).collect();
         let mut t0 = vec![0u8; n * T0];
         let mut last_held: [&[Held]; 2] = [&[], &[]];
         for (k, &slot) in order.iter().enumerate() {
             let at = slot.index();
             let row = &mut t0[k * T0..(k + 1) * T0];
-            row[(fences.role[at] as usize).min(ROLES - 1)] = 1;
+            row[(decision.role[at] as usize).min(ROLES - 1)] = 1;
             let held = &fences.paragraphs.held[at];
             let goes_on = held.iter().any(|mine| last_held[usize::from(mine.translation)].iter().any(|other| other.number == mine.number));
             let flags = [fences.band[at], fences.paragraphs.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
-                margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some()];
+                margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some(), notes.note[at].is_some(),
+                fences.quotation[at] != 0, starts.contains(slots.line(pages, slot).id.as_str()), decision.unit[at].is_some(), decision.joined[at]];
             for (cell, flag) in row[ROLES..].iter_mut().zip(flags) {
                 *cell = u8::from(flag);
             }
+            row[T0 - 1] = decision.level[at];
             for mine in held {
                 last_held[usize::from(mine.translation)] = held;
             }
