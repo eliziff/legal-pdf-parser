@@ -329,7 +329,7 @@ pub(crate) fn structure_graph(
             Some(&read.runs.runs[run as usize].members[at as usize])
         });
         let (kind, role) = match region {
-            "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
+            "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
             "heading" => (NodeKind::Heading, None),
             "text" if unit.marker.is_some() => (NodeKind::Paragraph, None),
             "provision" => (NodeKind::Section, Some(PrimaryRole::Text)),
