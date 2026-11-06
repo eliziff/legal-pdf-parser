@@ -89,7 +89,8 @@ impl Reading<'_> {
         // (A layer may print one line twice, the second a suffix of the first in its box.)
         let repeated = kept.last().is_some_and(|last| {
             let above = slots.line(pages, *last);
-            slots.page(*last) == slots.page(slot) && (above.bbox[1] - bbox[1]).abs() <= 2.0 && line.trim().chars().count() >= 12 && above.text.trim_end().ends_with(line.trim())
+            let middle = (bbox[1] + bbox[3]) / 2.0;
+            slots.page(*last) == slots.page(slot) && above.bbox[1] <= middle && middle <= above.bbox[3] && line.trim().chars().count() >= 12 && above.text.trim_end().ends_with(line.trim())
         });
         text && !wordmark && !repeated
     }

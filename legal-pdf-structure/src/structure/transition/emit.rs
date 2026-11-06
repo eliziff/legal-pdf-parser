@@ -300,7 +300,7 @@ pub(crate) fn structure_graph(
     let page_of_line = |k: usize| slots.page(table.order[k]);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };
-        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Heuristic, None);
+        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, if written { Derivation::Native } else { Derivation::Heuristic }, None);
         node.label = Some(format!("page{}", page.number));
         node.aliases = page.printed_label.clone().map(|label| vec![label]);
         node.anchor.clone_from(&page.printed_label_line_id);
@@ -330,7 +330,7 @@ pub(crate) fn structure_graph(
             "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
             "heading" => (NodeKind::Heading, None),
             "text" if unit.marker.is_some() => (NodeKind::Paragraph, None),
-            "provision" => (NodeKind::Section, None),
+            "provision" => (NodeKind::Section, Some(PrimaryRole::Text)),
             "list_item" => (NodeKind::ListItem, None),
             "note" | "note_quote" => (NodeKind::Footnote, None),
             "title" => (NodeKind::Prose, Some(PrimaryRole::Title)),
@@ -342,7 +342,9 @@ pub(crate) fn structure_graph(
             "line_label" => (NodeKind::Prose, Some(PrimaryRole::LineLabel)),
             _ => (NodeKind::Prose, None),
         };
-        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, Derivation::Heuristic, parents[u].map(node_id));
+        // (Written, a unit is the document's own, as tier 0's are; a heading is read from its look.)
+        let derivation = if written && kind != NodeKind::Heading { Derivation::Native } else { Derivation::Heuristic };
+        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, derivation, parents[u].map(node_id));
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -383,7 +385,10 @@ pub(crate) fn structure_graph(
             }
             node.content_start = scalar(member.content);
             match kind {
-                NodeKind::Paragraph => node.label = Some(format!("par{}", member.grammar_value)),
+                NodeKind::Paragraph => {
+                    node.label = Some(format!("par{}", member.grammar_value));
+                    node.aliases = Some(vec![member.label.clone()]);
+                }
                 NodeKind::ListItem => node.label = Some(member.label.clone()),
                 NodeKind::Section => {
                     node.label = Some(member.grammar_value.clone());
@@ -409,8 +414,9 @@ pub(crate) fn structure_graph(
             format!("region:{region}")
         });
         // Its level or depth as the parser reads it, the outline's own: a heading two levels under the
-        // one before stays two under, though no heading stands between them in the tree.
-        if unit.level > 0 {
+        // one before stays two under, though no heading stands between them in the tree. (Written, a heading's level is the
+        // tree's, as tier 0's outline nests it.)
+        if unit.level > 0 && !written {
             node.markup_attributes.insert("heading_level".to_owned(), unit.level.to_string());
         }
         if unit.depth > 0 {

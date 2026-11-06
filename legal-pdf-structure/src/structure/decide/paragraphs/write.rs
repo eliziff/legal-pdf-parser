@@ -107,7 +107,14 @@ impl Reading<'_> {
         // (A note's call may stand after the stop: "... at arm's length.11" / "Figure 4.".)
         let uncalled = above.text.trim_end().trim_end_matches(|c: char| c.is_ascii_digit());
         let closes = sentence_ended(&above.text) || above.text.trim_end().ends_with([')', ']']) || uncalled.ends_with(['.', '?', '!']) && sentence_ended(uncalled);
-        let apart = closes && !plain && flow.to_number[place] <= CLOSING_LINES;
+        // (A place's initials end no sentence: "... the possibility that B.C." / "Rugby was insured?".)
+        let last_word = above.text.split_whitespace().last().unwrap_or_default();
+        let initials = last_word.trim_end_matches('.').contains('.') && last_word.chars().all(|c| c.is_uppercase() || c == '.');
+        // (Nor does a line go apart for ending a sentence where the next line's first word could not have stood on it, in the
+        // paragraph the page prints: a last sentence with no stop of its own, "La liberté d'expression est nettement violée par cette interdiction".)
+        let room = self.measures.right_edge(slots.page(before), fences.translation[before.index()]) - above.bbox[2];
+        let full = slots.page(before) == slots.page(slot) && !here.recognized() && here.words.first().is_some_and(|word| word.bbox[2] - word.bbox[0] >= room) && in_body(&&slot) && in_body(&&before);
+        let apart = closes && !plain && !initials && !(same && full) && flow.to_number[place] <= CLOSING_LINES;
         // After the last number a line at the same place and leading goes on with the paragraph, however short
         // the line above it stopped: only a real break lets the last paragraph end before the signatures.
         let advance = here.bbox[1] - above.bbox[1];
@@ -126,7 +133,6 @@ impl Reading<'_> {
         let signer = line.split_whitespace().count() <= 4 && line.split_whitespace().all(|word| word.starts_with(char::is_uppercase)) && !line.trim_end().ends_with('.') && kept.get(place + 1).is_some_and(|next| analysis.signature_line(&slots.line(pages, *next).text));
         // (A line further out than the line above, whose first word would have fit on it, goes on from no sentence: a quotation's or a list's
         // last line stopped short of the column, "... V6T 1Z1" / "The Security Guard Unit", "7. R. v. Slemko, [2017] B.C.J. No. 2667" / "Legal Parameters and Principles.".)
-        let room = self.measures.right_edge(slots.page(before), fences.translation[before.index()]) - above.bbox[2];
         let stopped_short = slots.page(before) == slots.page(slot) && above.bbox[0] - here.bbox[0] > here.bbox[3] - here.bbox[1] && here.words.first().is_some_and(|word| word.bbox[2] - word.bbox[0] < room) && !here.recognized();
         let apart = apart || (closing || signer) && (flow.to_number[place] == usize::MAX || closes) || analysis.author_line(line) || stopped_short;
         let fused = place > 0 && self.drop_capital(kept, place - 1);

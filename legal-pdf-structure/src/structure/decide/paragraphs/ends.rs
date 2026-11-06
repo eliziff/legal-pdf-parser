@@ -99,7 +99,10 @@ impl Reading<'_> {
                     let same_row = (under.bbox[1] - row[1]).abs() <= 2.0;
                     // (In the quotation's small type, an item of its own further in is its: "[ ... ]" / "d) Les défenderesses ...".)
                     let quoted = small && self.smaller(kept[at].index());
-                    if opens.contains(&kept[at]) || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row && !(quoted && under.bbox[0] > bbox[0]) || enumerator && !quoted {
+                    let marked = self.marker_of.contains_key(&(kept[at], self.stream_of[kept[at].index()]));
+                    // (A line closing the reasons stands at a first line's indent: "Appeal allowed with costs.", "Solicitors for the appellants: ...".)
+                    let closing = self.analysis.disposition_line(&under.text) || self.analysis.end_matter(&under.text) || self.analysis.author_line(&under.text);
+                    if opens.contains(&kept[at]) || closing || marked && !quoted || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row && !(quoted && under.bbox[0] > bbox[0]) || enumerator && !quoted {
                         break;
                     }
                     row = under.bbox;

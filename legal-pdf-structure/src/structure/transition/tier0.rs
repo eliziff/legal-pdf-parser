@@ -238,7 +238,8 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 
 /// The moves of the written document. Each reading region (`reading_regions`) is a unit: its first line opens it, on its
 /// marker where the decision gave the line a unit, a heading at its level, and so does each marker the decision lets open
-/// a unit further down it (a page's leading may not part them); its other lines go on in the unit they follow by name. A contents
+/// a unit further down it (a page's leading may not part them); its other lines go on in the unit they follow by name, and
+/// a region going on from the last (`Fences::continues`) goes on in the numbered unit that region ended in, over a page. A contents
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
 /// other line stands alone. A body unit's depth is its numbering's (`State::stack_depth`). With the moves, the run member
 /// each unit opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
@@ -265,6 +266,8 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             });
         }
     }
+    // Each reading context's numbered unit open at its last region's end.
+    let mut numbered = HashMap::<u16, (usize, u8)>::new();
     for (_, _, lines) in regions {
         let mut places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
         places.sort_unstable();
@@ -274,7 +277,10 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             decision.role[slot.index()] == Role::Contents || fences.contents_pages[slots.page(slot)]
         }).count();
         let contents = listed * 5 >= places.len() * 4;
-        let mut open = (first, 0);
+        let context = fences.ctx[table.order[first].index()];
+        let body = matches!(decision.role[table.order[first].index()], Role::Open | Role::Body);
+        let carried = numbered.get(&context).copied().filter(|_| body && !contents && fences.continues[table.order[first].index()].is_some());
+        let mut open = carried.unwrap_or((first, 0));
         for &k in &places {
             let at = table.order[k].index();
             // A line of the note band the pairer gave back is the body's.
@@ -282,7 +288,7 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             let reading = decision.reading[at].or_else(|| marked.get(&table.order[k]).copied());
             let member = reading.filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
             let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
-            if k == first || kind.is_some() && !contents {
+            if k == first && carried.is_none() || kind.is_some() && !contents {
                 let mut opening = candidate(&views[k], runs, role, kind, reading, decision.level[at], false);
                 if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && contents {
                     opening = plain(CONTENTS, true);
@@ -295,6 +301,11 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             } else {
                 moves[k] = Some(Move { resumes: Some(open.0 as u32), ..plain(open.1, false) });
             }
+        }
+        if opened.contains_key(&open.0) {
+            numbered.insert(context, open);
+        } else {
+            numbered.remove(&context);
         }
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
