@@ -204,11 +204,18 @@ impl<'a> Reading<'a> {
                         *span = (span.0.min(bbox[1]), span.1.max(bbox[3]));
                     }
                 }
+                // (A column may run a line longer than the other: a sentence left open goes on past the span, "... de la" / "Cour d'appel.".)
+                let mut open = None::<(bool, u32)>;
                 for at in own {
                     let line = slots.line(pages, Slot(at as u32));
                     let middle = (line.bbox[1] + line.bbox[3]) / 2.0;
-                    if let Some((&(translation, number), _)) = spans.iter().find(|(_, span)| span.0 <= middle && middle <= span.1) {
+                    let beside = spans.iter().find(|(_, span)| span.0 <= middle && middle <= span.1).map(|(key, _)| *key);
+                    open = beside.or(open);
+                    if let Some((translation, number)) = open {
                         paragraphs.held[at].push(Held { translation, number, start: 0, end: line.text.encode_utf16().count() as u32 });
+                    }
+                    if sentence_ended(&line.text) {
+                        open = None;
                     }
                 }
             }

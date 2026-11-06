@@ -685,7 +685,8 @@ impl Decision {
                 let line = text(slot);
                 let letters = line.chars().filter(|c| c.is_alphabetic()).count();
                 let upper = line.chars().filter(|c| c.is_uppercase()).count();
-                self.open(slot)
+                // (No reading on it yet, heard or not: a note's count is asked of the document's lines no rule took.)
+                self.role[slot.index()] == Role::Open
                     && analysis.marginal_note_shaped(line)
                     && upper * 5 < letters * 4
                     && evidence.words[slot.index()] & WORD_DIVISION == 0
@@ -693,7 +694,7 @@ impl Decision {
             };
             // A note's line wrapped under its first: open, short, going on in lower case.
             let wrapped = |slot: Slot| {
-                self.open(slot)
+                self.role[slot.index()] == Role::Open
                     && fences.continues[slot.index()] == Some(Continuation::Flow)
                     && text(slot).starts_with(char::is_lowercase)
                     && (1..=16).contains(&text(slot).split_whitespace().count())

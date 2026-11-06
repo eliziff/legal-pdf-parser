@@ -281,7 +281,10 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
         let contents = listed * 5 >= places.len() * 4;
         let context = fences.ctx[table.order[first].index()];
         let body = matches!(decision.role[table.order[first].index()], Role::Open | Role::Body);
-        let carried = numbered.get(&context).copied().filter(|_| body && !contents && fences.continues[table.order[first].index()].is_some());
+        // (Or one the paragraph stage holds in the same number, fixed: a region may part what the number holds.)
+        let held = |at: usize, other: usize| fences.paragraphs.held[at].iter().any(|mine| fences.paragraphs.held[other].iter().any(|theirs| theirs.number == mine.number && theirs.translation == mine.translation));
+        let carried = numbered.get(&context).copied().filter(|&(open, _)| body && !contents
+            && (fences.continues[table.order[first].index()].is_some() || held(table.order[first].index(), table.order[open].index())));
         let mut open = carried.unwrap_or((first, 0));
         for &k in &places {
             let at = table.order[k].index();
