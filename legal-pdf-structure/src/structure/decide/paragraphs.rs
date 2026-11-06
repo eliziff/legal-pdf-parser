@@ -291,8 +291,12 @@ impl Fences {
                 if self.set_apart(row.index()) || k != 1 && self.translation[row.index()] != self.translation[at] {
                     continue;
                 }
-                // The twin row's language takes the margin's number as text the stream adds, not as its line.
-                marker_of.entry((row, stream_of[row.index()])).or_insert((marker, k == 1));
+                // The twin row's language takes the margin's number as text the stream adds, not as its line. (A number of the
+                // margin's count takes its row from a stray figure beside it, a recognizer's "1" for a mark at the row's head.)
+                let held = marker_of.entry((row, stream_of[row.index()])).or_insert((marker, k == 1));
+                if k < 2 && self.margin_number[held.0.index()].is_none() {
+                    *held = (marker, k == 1);
+                }
             }
         }
         marker_of
