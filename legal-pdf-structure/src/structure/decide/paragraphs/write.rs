@@ -150,6 +150,7 @@ impl Reading<'_> {
         let flow = self.flow(kept, stream);
         let mut written = Written::default();
         let (mut previous, mut last_advance) = (None::<Slot>, 0.0f64);
+        let margins = self.fences.margin_number.iter().filter(|row| row.is_some()).count();
         for (place_in_kept, &slot) in kept.iter().enumerate() {
             let line = &slots.line(pages, slot).text;
             let marker = self.marker_of.get(&(slot, stream)).copied();
@@ -161,9 +162,9 @@ impl Reading<'_> {
             }
             previous = Some(slot);
             if let Some((marker, added)) = marker {
-                // A bare number in the margin's count reads as the paragraph's it is, however few the ruling's paragraphs.
+                // A short ruling's bare numbers in the margin read as the paragraph's they are: too few for a count of their own.
                 let number = slots.line(pages, marker).text.trim();
-                let margin = (self.fences.margin_number[marker.index()].is_some() || self.fences.margin_twin[marker.index()].is_some())
+                let margin = margins < 5 && (self.fences.margin_number[marker.index()].is_some() || self.fences.margin_twin[marker.index()].is_some())
                     && number.bytes().all(|byte| byte.is_ascii_digit());
                 written.add(if margin { "[" } else { "" }, None);
                 written.add(number, (!added).then_some(marker));
