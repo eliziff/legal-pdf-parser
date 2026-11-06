@@ -15,7 +15,7 @@ impl Reading<'_> {
             let at = slot.index();
                 // The notes a fence took keep the count, and may go on onto the next page: a note left among the words goes on from them.
                 if fences.role[at] == Role::Note && self.stream_of[at] == stream {
-                    notes.fenced(evidence.label[at].map(|label| label.value), &slots.line(pages, slot).text, evidence.size[at], slots.page(slot));
+                    notes.fenced(evidence.label[at].map(|label| (label.value, label.raised)), &slots.line(pages, slot).text, evidence.size[at], slots.page(slot));
                 }
                 if self.counts.count_of[at][stream.index()] != document || self.stream_of[at] != stream || fences.set_apart(at) || self.attached.contains(&slot) {
                     continue;

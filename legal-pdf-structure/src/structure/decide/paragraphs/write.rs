@@ -11,8 +11,6 @@ const CLOSING_LINES: usize = 4;
 pub(super) struct Written {
     pub(super) text: Vec<u16>,
     pub(super) place: Vec<Option<(Slot, u32)>>,
-    /// How many lines each line stands before the next that opens on a number (none after the last).
-    pub(super) to_number: Vec<usize>,
     /// Each number alone on its line and the line of words it opens.
     pub(super) led: Vec<(Slot, Slot)>,
 }
@@ -92,8 +90,12 @@ impl Reading<'_> {
         let wrapped = place >= 2 && slots.line(pages, kept[place - 2]).text.trim_end().ends_with(['-', '\u{2013}']);
         let alone = figures && !wrapped && evidence.marker[before.index()].is_some_and(|reading| reading.only) && evidence.marker[at].is_none()
             && above.bbox[0] <= here.bbox[0] + (here.bbox[3] - here.bbox[1]);
+        // (A figure under a line going on, a lower-case word after it, is the sentence's: "... provisions of Appendix" / "2 of the Referendum Act".)
+        let mut words = line.split_whitespace();
+        let figure = words.next().is_some_and(|first| first.chars().all(|c| c.is_ascii_digit())) && words.next().is_some_and(|word| word.starts_with(char::is_lowercase));
+        let wrapped_figure = figure && !sentence_ended(&above.text) && !above.text.trim_end().ends_with(':');
         // A line goes on with the printed paragraph it stands in, unless it opens on a marker of its own.
-        let same = evidence.marker[at].is_none() && (flow.flows.contains(&slot) || flow.printed.get(&slot).is_some_and(|paragraph| flow.printed.get(&before) == Some(paragraph)));
+        let same = (evidence.marker[at].is_none() || wrapped_figure) && (flow.flows.contains(&slot) || flow.printed.get(&slot).is_some_and(|paragraph| flow.printed.get(&before) == Some(paragraph)));
         // The last few lines before a number, under a line ending a sentence, stand on their own, whatever the
         // page's geometry says: whether they head what follows is the reader's to say (`trailing_headings`).
         // A line in the body's own type ending as a sentence or a lead-in does is the paragraph's words, and so are the
@@ -102,7 +104,9 @@ impl Reading<'_> {
         let in_body = |slot: &&Slot| fences.body == Some((evidence.face[slot.index()], evidence.half_points[slot.index()]));
         let stops = |slot: &Slot| slots.line(pages, *slot).text.trim_end().trim_end_matches([')', '"', '\u{201d}', '\u{bb}']).ends_with(['.', '?', '!', ':']);
         let plain = kept[place..].iter().take(CLOSING_LINES.min(flow.to_number[place])).take_while(in_body).any(stops);
-        let closes = sentence_ended(&above.text) || above.text.trim_end().ends_with([')', ']']);
+        // (A note's call may stand after the stop: "... at arm's length.11" / "Figure 4.".)
+        let uncalled = above.text.trim_end().trim_end_matches(|c: char| c.is_ascii_digit());
+        let closes = sentence_ended(&above.text) || above.text.trim_end().ends_with([')', ']']) || uncalled.ends_with(['.', '?', '!']) && sentence_ended(uncalled);
         let apart = closes && !plain && flow.to_number[place] <= CLOSING_LINES;
         // After the last number a line at the same place and leading goes on with the paragraph, however short
         // the line above it stopped: only a real break lets the last paragraph end before the signatures.
@@ -120,7 +124,11 @@ impl Reading<'_> {
         // (An author's line stands on its own wherever it does: a column's last word may have gone over the gutter.)
         // (A signer's name over the title under it too: "... signée en son nom par Claude Roy" / "Vice-president".)
         let signer = line.split_whitespace().count() <= 4 && line.split_whitespace().all(|word| word.starts_with(char::is_uppercase)) && !line.trim_end().ends_with('.') && kept.get(place + 1).is_some_and(|next| analysis.signature_line(&slots.line(pages, *next).text));
-        let apart = apart || (closing || signer) && (flow.to_number[place] == usize::MAX || closes) || analysis.author_line(line);
+        // (A line further out than the line above, whose first word would have fit on it, goes on from no sentence: a quotation's or a list's
+        // last line stopped short of the column, "... V6T 1Z1" / "The Security Guard Unit", "7. R. v. Slemko, [2017] B.C.J. No. 2667" / "Legal Parameters and Principles.".)
+        let room = self.measures.right_edge(slots.page(before), fences.translation[before.index()]) - above.bbox[2];
+        let stopped_short = slots.page(before) == slots.page(slot) && above.bbox[0] - here.bbox[0] > here.bbox[3] - here.bbox[1] && here.words.first().is_some_and(|word| word.bbox[2] - word.bbox[0] < room) && !here.recognized();
+        let apart = apart || (closing || signer) && (flow.to_number[place] == usize::MAX || closes) || analysis.author_line(line) || stopped_short;
         let fused = place > 0 && self.drop_capital(kept, place - 1);
         let joined = marker.is_none() && (alone || fused || !apart && (same || fences.continues[at].is_some())) || self.numbers.indented.contains(&slot);
         if alone && marker.is_none() {
@@ -157,7 +165,6 @@ impl Reading<'_> {
                 written.add(line, Some(slot));
             }
         }
-        written.to_number = flow.to_number;
         written
     }
 }

@@ -72,24 +72,34 @@ impl Reading<'_> {
     }
 
     // A quotation's last lines, in its indent, are the paragraph's: the text alone cannot see an indent ("Kelty", a letter's "Per:").
-    fn quotation_tail(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], to_number: &[usize], kept_at: &HashMap<Slot, usize>) {
+    fn quotation_tail(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], opens: &HashSet<Slot>, kept_at: &HashMap<Slot, usize>) {
         let (pages, slots) = (self.pages, self.slots);
         if let Some(&last) = spans.keys().next_back() {
             let (bbox, page) = (slots.line(pages, last).bbox, slots.page(last));
-            // (Inside a quotation: the line above stands at its indent too, as a first line's does not.)
+            // (Inside a quotation: the line above stands at its indent too, as a first line's does not, or it is set smaller than the text.)
+            let small = self.smaller(last.index());
             let held: Vec<f64> = spans.keys().map(|&slot| slots.line(pages, slot).bbox[0]).collect();
             // (On this page: a report's margin alternates, and a paragraph over a page is no quotation for it. The page's own running
-            // text stands no further in: a paragraph may open on the next page's quotation.)
+            // text stands no further in: a paragraph may open on the next page's quotation. A number hanging in the margin says
+            // nothing of the text's edge.)
             let language = self.fences.translation[last.index()];
-            let left = spans.keys().filter(|&&slot| slots.page(slot) == page).map(|&slot| slots.line(pages, slot).bbox[0]).fold(self.measures.column(page, language), f64::min);
-            if bbox[0] - left > QUOTED_INDENT && held.len() >= 2 && (held[held.len() - 2] - bbox[0]).abs() <= 3.0 {
-                let from = kept_at.get(&last).copied().unwrap_or(kept.len());
+            let left = spans.keys().filter(|&&slot| slots.page(slot) == page && self.evidence.marker[slot.index()].is_none()).map(|&slot| slots.line(pages, slot).bbox[0]).fold(self.measures.column(page, language), f64::min);
+            let from = kept_at.get(&last).copied().unwrap_or(kept.len());
+            let in_quotation = bbox[0] - left > QUOTED_INDENT && held.len() >= 2 && ((held[held.len() - 2] - bbox[0]).abs() <= 3.0 || small);
+            // (Or a sentence left open sets one out: "Counsel for Wiseau Films advised that," / "As for the location of the assets ...".)
+            let set_out = slots.line(pages, last).text.trim_end().ends_with([',', ':']).then(|| kept.get(from + 1)).flatten().filter(|next| {
+                slots.page(**next) == page && !opens.contains(*next) && slots.line(pages, **next).bbox[0] - left > QUOTED_INDENT
+            });
+            if in_quotation || set_out.is_some() {
+                let bbox = set_out.filter(|_| !in_quotation).map_or(bbox, |next| slots.line(pages, *next).bbox);
                 let mut row = bbox;
                 for at in from + 1..kept.len() {
                     let under = slots.line(pages, kept[at]);
                     let enumerator = under.text.split_whitespace().next().is_some_and(|token| token.chars().count() <= 5 && token.ends_with(['.', ')']));
                     let same_row = (under.bbox[1] - row[1]).abs() <= 2.0;
-                    if to_number[at] == 0 || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row || enumerator {
+                    // (In the quotation's small type, an item of its own further in is its: "[ ... ]" / "d) Les défenderesses ...".)
+                    let quoted = small && self.smaller(kept[at].index());
+                    if opens.contains(&kept[at]) || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row && !(quoted && under.bbox[0] > bbox[0]) || enumerator && !quoted {
                         break;
                     }
                     row = under.bbox;
@@ -100,7 +110,7 @@ impl Reading<'_> {
     }
 
     /// The paragraph's held lines, its tail cut or taken back.
-    pub(super) fn settle(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], to_number: &[usize], kept_at: &HashMap<Slot, usize>) {
+    pub(super) fn settle(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], opens: &HashSet<Slot>, kept_at: &HashMap<Slot, usize>) {
         let held_lines: Vec<Slot> = spans.keys().copied().collect();
         let heading = self.heading_above(&held_lines);
         if let Some(heading) = heading {
@@ -115,7 +125,7 @@ impl Reading<'_> {
             }
         }
         if heading.is_none() && tail.is_none() {
-            self.quotation_tail(spans, kept, to_number, kept_at);
+            self.quotation_tail(spans, kept, opens, kept_at);
         }
     }
 }

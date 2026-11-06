@@ -124,7 +124,12 @@ impl<'a> Reading<'a> {
     fn hold(&self, text: &str, written: &Written, kept: &[Slot], stream: Stream, paragraphs: &mut Paragraphs) {
         let (pages, slots, place) = (self.pages, self.slots, &written.place);
         let kept_at: HashMap<Slot, usize> = kept.iter().enumerate().map(|(at, slot)| (*slot, at)).collect();
-        for (number, ranges) in self.analysis.judgment_paragraphs(text) {
+        let read = self.analysis.judgment_paragraphs(text);
+        // (The lines the numbers open on: a marker opening any other line is a quotation's or a list's.)
+        let opens: HashSet<Slot> = read.iter().filter_map(|(_, ranges)| ranges.first()).filter_map(|range| {
+            place.get(range.start..range.end.min(place.len())).unwrap_or_default().iter().flatten().next().map(|(slot, _)| *slot)
+        }).collect();
+        for (number, ranges) in read {
             let number = number as u32;
             let mut spans = BTreeMap::<Slot, (u32, u32)>::new();
             let mut first = None;
@@ -145,7 +150,7 @@ impl<'a> Reading<'a> {
                     spans.entry(slot).or_insert((0, words.encode_utf16().count() as u32));
                 }
             }
-            self.settle(&mut spans, kept, &written.to_number, &kept_at);
+            self.settle(&mut spans, kept, &opens, &kept_at);
             if let Some(first) = first {
                 paragraphs.count[first.index()].get_or_insert(number);
             }

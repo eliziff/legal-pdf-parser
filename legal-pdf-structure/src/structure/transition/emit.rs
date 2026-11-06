@@ -309,9 +309,8 @@ pub(crate) fn structure_graph(
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
-        // A table's units are its rows, built with the table below; where the fences' tables are written, its text stays
-        // the body's beside them.
-        if unit.region == TABLE && !written {
+        // A table's units are its rows, built with the table below, or the fences' tables where those are written.
+        if unit.region == TABLE {
             continue;
         }
         // The pairer's notes are written from its claims below.

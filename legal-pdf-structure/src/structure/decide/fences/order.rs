@@ -130,7 +130,8 @@ impl Fences {
                     let x = slots.line(pages, other).bbox[0];
                     // (A justified line's row may be split into its words: they are no edge of one another.)
                     let edge = body.iter().filter(|&&line| !level(line)).map(|&line| slots.line(pages, line).bbox[0]).filter(|edge| *edge <= x && x - edge < height * 3.0).fold(x, f64::min);
-                    x - edge > height * 0.4
+                    let behind = words.iter().any(|&word| level(word) && self.translation[word.index()] == self.translation[other.index()] && slots.line(pages, word).bbox[2] <= x);
+                    x - edge > height * 0.4 && !behind
                 };
                 // No paragraph opens on a lower-case word ("and dispassionate person in the community."): a stray
                 // number beside a line running on is no paragraph's.

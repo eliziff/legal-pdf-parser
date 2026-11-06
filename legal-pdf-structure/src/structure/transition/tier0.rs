@@ -18,7 +18,7 @@
 
 use super::emit::Settled;
 use super::*;
-use legal_structure_model::{CandidateGrammar, UnitRole};
+use legal_structure_model::UnitRole;
 
 /// A marker going on from the number open in its family.
 const COUNTS_ON: f32 = 1.0;
@@ -62,9 +62,8 @@ fn plain(region: u8, opens: bool) -> Move {
     Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }
 }
 
-/// The region a role is, where the line opens the unit `kind`. A section is a provision where its numbering is an
-/// enactment's (`hierarchy`): a transcript's or a report's "12." opens a section of text.
-fn region_of(role: Role, kind: Option<UnitRole>, hierarchy: bool) -> u8 {
+/// The region a role is, where the line opens the unit `kind`.
+fn region_of(role: Role, kind: Option<UnitRole>) -> u8 {
     match role {
         Role::LineLabel => LINE_LABEL,
         Role::PageLabel => PAGE_LABEL,
@@ -78,7 +77,7 @@ fn region_of(role: Role, kind: Option<UnitRole>, hierarchy: bool) -> u8 {
         Role::ListItem => LIST_ITEM,
         Role::Quote => QUOTE,
         Role::Open | Role::Body => match kind {
-            Some(UnitRole::Section) if hierarchy => PROVISION,
+            Some(UnitRole::Section) => PROVISION,
             Some(UnitRole::Item) => LIST_ITEM,
             _ => TEXT,
         },
@@ -142,8 +141,7 @@ fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Opti
 /// A reading of the line as the move it would make: a unit's opening on its marker, a labelled note's opening on its
 /// number, a heading's opening at `level`, else the line going on.
 fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, reading: Option<(u32, u32)>, level: u8, joined: bool) -> Move {
-    let hierarchy = reading.is_some_and(|(run, _)| runs.runs[run as usize].grammar == CandidateGrammar::Hierarchy);
-    let mut chosen = plain(region_of(role, kind, hierarchy), kind.is_some());
+    let mut chosen = plain(region_of(role, kind), kind.is_some());
     if kind.is_some() {
         chosen.reading = reading_of(view, runs, reading);
     }
@@ -239,7 +237,8 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 }
 
 /// The moves of the written document. Each reading region (`reading_regions`) is a unit: its first line opens it, on its
-/// marker where the decision gave the line a unit, a heading at its level; its other lines go on in it by name. A contents
+/// marker where the decision gave the line a unit, a heading at its level, and so does each marker the decision lets open
+/// a unit further down it (a page's leading may not part them); its other lines go on in the unit they follow by name. A contents
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
 /// other line stands alone. A body unit's depth is its numbering's (`State::stack_depth`). With the moves, the run member
 /// each unit opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
@@ -260,43 +259,43 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
         }
     }
     for (_, _, lines) in regions {
-        let places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
-        let Some(&first) = places.iter().min() else { continue };
-        let at = table.order[first].index();
-        // A line of the note band the pairer gave back is the body's.
-        let role = if decision.role[at] == Role::Note { Role::Body } else { decision.role[at] };
-        let member = decision.reading[at].filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
-        let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
-        let mut opening = candidate(&views[first], runs, role, kind, decision.reading[at], decision.level[at], false);
+        let mut places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
+        places.sort_unstable();
+        let Some(&first) = places.first() else { continue };
         let listed = places.iter().filter(|&&k| {
             let slot = table.order[k];
             decision.role[slot.index()] == Role::Contents || fences.contents_pages[slots.page(slot)]
         }).count();
-        if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && listed * 5 >= places.len() * 4 {
-            opening = plain(CONTENTS, true);
-        } else if let Some(member) = member.filter(|_| kind.is_some()) {
-            opened.insert(first, member);
-        }
-        opening.opens = true;
+        let contents = listed * 5 >= places.len() * 4;
+        let mut open = (first, 0);
         for &k in &places {
-            moves[k] = Some(if k == first { opening } else { Move { resumes: Some(first as u32), ..plain(opening.region, false) } });
+            let at = table.order[k].index();
+            // A line of the note band the pairer gave back is the body's.
+            let role = if decision.role[at] == Role::Note { Role::Body } else { decision.role[at] };
+            let member = decision.reading[at].filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
+            let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
+            if k == first || kind.is_some() && !contents {
+                let mut opening = candidate(&views[k], runs, role, kind, decision.reading[at], decision.level[at], false);
+                if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && contents {
+                    opening = plain(CONTENTS, true);
+                } else if let Some(member) = member.filter(|_| kind.is_some()) {
+                    opened.insert(k, member);
+                }
+                opening.opens = true;
+                moves[k] = Some(opening);
+                open = (k, opening.region);
+            } else {
+                moves[k] = Some(Move { resumes: Some(open.0 as u32), ..plain(open.1, false) });
+            }
         }
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
     let mut state = State::default();
-    // A table is one unit: its lines go on from the one before, the page's edge between them.
-    let mut in_table = false;
     let moves = moves
         .into_iter()
         .enumerate()
         .map(|(k, chosen)| {
-            let mut chosen = chosen.unwrap_or_else(|| {
-                let region = region_of(decision.role[table.order[k].index()], None, false);
-                plain(region, region != TABLE || !in_table)
-            });
-            if !matches!(chosen.region, FURNITURE | PAGE_LABEL | LINE_LABEL) {
-                in_table = chosen.region == TABLE;
-            }
+            let mut chosen = chosen.unwrap_or_else(|| plain(region_of(decision.role[table.order[k].index()], None), true));
             chosen.starts = starts.contains(&k);
             if chosen.opens && RANKED_BODY.contains(&chosen.region) {
                 chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;
