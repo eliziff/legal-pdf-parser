@@ -13,7 +13,7 @@
 use super::*;
 
 /// The regions no numbered paragraph holds.
-const SET_APART: [&str; 8] = ["furniture", "page_label", "line_label", "note", "note_quote", "heading", "title", "contents"];
+const SET_APART: [&str; 7] = ["furniture", "page_label", "line_label", "note", "note_quote", "title", "contents"];
 use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NotePairClaimV2, NoteReference, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
@@ -762,9 +762,9 @@ pub(crate) fn structure_graph(
     // provision's: a contract's clauses count as paragraphs do, and no paragraph stands over them. Tier 0's rules read
     // the same numbers, and nothing here overrules them.
     structure.source_fragments = index.source_fragments();
-    // What a model reads as no paragraph's leaves them, the line a number opens never.
+    // What a model reads as no paragraph's leaves them on a scan, the line a number opens never: printed text the rules read exactly.
     let apart: HashSet<&str> = units.iter().filter(|unit| !written && SET_APART.contains(&REGIONS[usize::from(unit.region)])).flat_map(|unit| unit.lines.iter().copied())
-        .filter(|&k| { let at = table.order[k].index(); fences.paragraphs.count[at].is_none() && fences.margin_number[at].is_none() })
+        .filter(|&k| { let at = table.order[k].index(); slots.line(pages, table.order[k]).recognized() && fences.paragraphs.count[at].is_none() && fences.margin_number[at].is_none() })
         .map(|k| ids[k].as_str()).collect();
     crate::structure::graph::read_judgment_paragraphs(&mut structure, pages, &decided, &apart);
     if !written {

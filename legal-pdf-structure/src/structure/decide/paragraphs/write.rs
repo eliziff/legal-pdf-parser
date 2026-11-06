@@ -161,8 +161,11 @@ impl Reading<'_> {
             }
             previous = Some(slot);
             if let Some((marker, added)) = marker {
-                written.add(slots.line(pages, marker).text.trim_end(), (!added).then_some(marker));
-                written.add(" ", None);
+                // A number in the margin's count reads as the paragraph's it is, however few the ruling's paragraphs.
+                let margin = self.fences.margin_number[marker.index()].is_some() || self.fences.margin_twin[marker.index()].is_some();
+                written.add(if margin { "[" } else { "" }, None);
+                written.add(slots.line(pages, marker).text.trim(), (!added).then_some(marker));
+                written.add(if margin { "] " } else { " " }, None);
             }
             if self.drop_capital(kept, place_in_kept) {
                 let (figure, capital) = line.trim().split_at(1);
