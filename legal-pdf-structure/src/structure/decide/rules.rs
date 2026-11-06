@@ -257,25 +257,6 @@ impl Decision {
         }
     }
 
-    /// Every line of the document's pages decided, measured (`evidence`), fenced and ordered
-    /// (`fences`), its runs read (`runs`) and its notes (`notes`), its bookmarks `outline`.
-    pub(crate) fn decide(
-        analysis: &dyn StructureAnalysis,
-        pages: &[Page],
-        slots: &Slots,
-        evidence: &Evidence,
-        fences: &Fences,
-        runs: &Runs,
-        notes: &Notes,
-        outline: &[PdfOutlineEntry],
-        traced: bool,
-    ) -> Self {
-        let geometry = Geometry::of(pages);
-        let mut decision = Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, &geometry, traced, false);
-        decision.finish(pages, slots, evidence, fences, runs, &geometry);
-        decision
-    }
-
     /// The rules heard, none deciding: every reading each gives a line no fence took, in `heard`, for the one decision on
     /// each line; `finish` follows it.
     pub(crate) fn hear(

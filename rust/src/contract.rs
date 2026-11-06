@@ -56,9 +56,6 @@ pub struct PdfRequest {
     #[cfg(not(feature = "tagger"))]
     #[serde(default, deserialize_with = "present")]
     tagger: Option<serde::de::IgnoredAny>,
-    /// What builds the structure: "machine", the default, or "stages".
-    #[serde(default)]
-    reader: legal_pdf_structure::Reader,
 }
 
 #[cfg(feature = "tagger")]
@@ -159,7 +156,6 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
             &request.expected_source_sha256,
             "expected_source_sha256",
         )?,
-        reader: request.reader,
         ..ParseOptions::default()
     };
 

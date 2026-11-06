@@ -297,8 +297,7 @@ pub(crate) fn structure_graph(
         }
     }).collect();
     let node_id = |u: usize| unit_ids[u].clone();
-    let nothing_decided = Decision::default();
-    let decided = Decided::of(pages, slots, fences, &nothing_decided);
+    let decided = Decided::of(pages, slots, fences);
     let page_of_line = |k: usize| slots.page(table.order[k]);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };

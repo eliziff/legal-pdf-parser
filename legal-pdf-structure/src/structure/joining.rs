@@ -65,28 +65,6 @@ pub(super) fn join_lines(lines: &[&Line], vocabulary: &Vocabulary) -> (String, V
     (text, source_spans)
 }
 
-pub(super) fn build_paragraphs_with_context(
-    pages: &[Page],
-    anchors: &HashMap<String, Vec<Anchor>>,
-    decided: &Decided,
-) -> Vec<Paragraph> {
-    let vocabulary = vocabulary(pages);
-    let mut paragraphs = Vec::new();
-    for (page, kind, lines) in reading_regions(pages, decided) {
-        let Some((rendered, output_anchors, source_spans)) = anchored_text(&lines, &vocabulary, anchors) else { continue };
-        paragraphs.push(Paragraph {
-            source_spans,
-            id: format!("para-{:06}", paragraphs.len() + 1),
-            page_index: page.index,
-            region_type: kind.to_owned(),
-            text: rendered,
-            line_ids: lines.iter().map(|line| line.id.clone()).collect(),
-            anchors: output_anchors,
-        });
-    }
-    paragraphs
-}
-
 /// The pages' written regions as the document reads them: each region's lines in one reading context, a body's going
 /// on over a page in the region it continues. Each with its first page and its kind.
 pub(super) fn reading_regions<'a>(pages: &'a [Page], decided: &Decided) -> Vec<(&'a Page, &'a str, Vec<&'a Line>)> {

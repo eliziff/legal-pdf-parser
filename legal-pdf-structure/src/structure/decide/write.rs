@@ -60,23 +60,6 @@ fn region(role: Role, edge: Option<Edge>) -> &'static str {
     }
 }
 
-/// Writes the document's decision (`decision`) to its pages, measured (`evidence`), fenced and
-/// ordered (`fences`), its notes read (`notes`), and puts each page's lines in reading order.
-/// Returns each heading line's trail ("+anchor"), and that of each line a rule took from the
-/// headings ("-marginal_note"), by line id.
-pub(crate) fn write(
-    pages: &mut [Page],
-    slots: &Slots,
-    evidence: &Evidence,
-    fences: &Fences,
-    notes: &Notes,
-    decision: &Decision,
-) -> HashMap<String, String> {
-    let trail = write_lines(pages, slots, evidence, fences, notes, decision);
-    in_reading_order(pages, slots, fences);
-    trail
-}
-
 /// `write`, each page's lines left in their places.
 pub(crate) fn write_lines(
     pages: &mut [Page],

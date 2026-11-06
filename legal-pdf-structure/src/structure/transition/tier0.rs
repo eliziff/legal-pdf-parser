@@ -369,7 +369,7 @@ pub(crate) fn output(
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
-    let decided = Decided::of(pages, slots, &fences, &decision);
+    let decided = Decided::of(pages, slots, &fences);
     let heading_sources = write_lines(pages, slots, evidence, &fences, &notes, &decision);
     // The pairer reads each page's lines in reading order.
     in_reading_order(pages, slots, &fences);
