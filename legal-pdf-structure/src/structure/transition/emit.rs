@@ -425,8 +425,9 @@ pub(crate) fn structure_graph(
             node.markup_attributes.insert("depth".to_owned(), unit.depth.to_string());
         }
         nodes.push(node);
-        // A further marker on the unit's first line opens a unit under it, to the unit's end: "2(1) The Court has ...", the
-        // section and its subsection.
+        // A further marker on the unit's first line opens a unit under it, to the unit's end, the unit before it left with what
+        // stands before that marker: "2(1) The Court has ...", the section "2" and its subsection.
+        let mut holder = nodes.len() - 1;
         let within = settled.as_ref().and_then(|read| read.within.get(&unit.lines[0]).map(|members| (read.runs, members)));
         for (&(run, at), runs) in within.into_iter().flat_map(|(runs, members)| members.iter().map(move |pair| (pair, runs))) {
             let member = &runs.runs[run as usize].members[at as usize];
@@ -437,7 +438,12 @@ pub(crate) fn structure_graph(
                 legal_structure_model::UnitRole::Item => NodeKind::ListItem,
                 legal_structure_model::UnitRole::Paragraph => NodeKind::Paragraph,
             };
-            let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, ORIGIN, Derivation::Native, Some(node_id(u)));
+            let above = &mut nodes[holder];
+            above.range.end = start;
+            above.ranges = above.ranges.iter().filter(|part| part.start < start).map(|part| ScalarRange { start: part.start, end: part.end.min(start) }).collect();
+            above.line_ids.truncate(1);
+            above.page_indexes.truncate(1);
+            let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, ORIGIN, Derivation::Native, Some(above.id.clone()));
             own.role = Some(PrimaryRole::Text);
             own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
             own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -445,12 +451,13 @@ pub(crate) fn structure_graph(
             own.page_indexes.dedup();
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
             own.content_start = scalar(member.content);
-            own.label = Some(member.grammar_value.clone());
+            own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
             own.grammar = Some(format!("region:{}", match role { legal_structure_model::UnitRole::Section => "provision", legal_structure_model::UnitRole::Item => "list_item", legal_structure_model::UnitRole::Paragraph => "text" }));
             if kind == NodeKind::Section {
                 own.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
             }
             nodes.push(own);
+            holder = nodes.len() - 1;
         }
         if region == "quote" && unit.lines.len() <= 60 && !written {
             let mut quote = StructureNode::new(format!("{}-quote", node_id(u)), NodeKind::Quote, range, ORIGIN, Derivation::Heuristic, Some(node_id(u)));
