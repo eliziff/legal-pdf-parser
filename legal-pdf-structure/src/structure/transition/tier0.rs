@@ -246,6 +246,13 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     let mut opened = HashMap::new();
+    // A marker any run gives a unit opens it, where the decision read the line by no run of its own.
+    let mut marked = HashMap::<Slot, (u32, u32)>::new();
+    for (r, run) in runs.runs.iter().enumerate() {
+        for (at, member) in run.members.iter().enumerate().filter(|(_, member)| member.kind.is_some()) {
+            marked.entry(member.slot).or_insert((r as u32, at as u32));
+        }
+    }
     // The pairer's lines are its notes', a line it took from the body among them.
     for note in notes {
         let places: Vec<usize> = note.body_line_ids.iter().filter_map(|id| place(id)).collect();
@@ -272,10 +279,11 @@ fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, view
             let at = table.order[k].index();
             // A line of the note band the pairer gave back is the body's.
             let role = if decision.role[at] == Role::Note { Role::Body } else { decision.role[at] };
-            let member = decision.reading[at].filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
+            let reading = decision.reading[at].or_else(|| marked.get(&table.order[k]).copied());
+            let member = reading.filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
             let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
             if k == first || kind.is_some() && !contents {
-                let mut opening = candidate(&views[k], runs, role, kind, decision.reading[at], decision.level[at], false);
+                let mut opening = candidate(&views[k], runs, role, kind, reading, decision.level[at], false);
                 if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && contents {
                     opening = plain(CONTENTS, true);
                 } else if let Some(member) = member.filter(|_| kind.is_some()) {

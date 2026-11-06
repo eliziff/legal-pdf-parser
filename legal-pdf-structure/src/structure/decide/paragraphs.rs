@@ -126,9 +126,12 @@ impl<'a> Reading<'a> {
         let kept_at: HashMap<Slot, usize> = kept.iter().enumerate().map(|(at, slot)| (*slot, at)).collect();
         let read = self.analysis.judgment_paragraphs(text);
         // (The lines the numbers open on: a marker opening any other line is a quotation's or a list's.)
-        let opens: HashSet<Slot> = read.iter().filter_map(|(_, ranges)| ranges.first()).filter_map(|range| {
+        let mut opens: HashSet<Slot> = read.iter().filter_map(|(_, ranges)| ranges.first()).filter_map(|range| {
             place.get(range.start..range.end.min(place.len())).unwrap_or_default().iter().flatten().next().map(|(slot, _)| *slot)
         }).collect();
+        // (A number alone on its line opens the row of words it stands by.)
+        let rows: Vec<Slot> = kept.iter().copied().filter(|&row| self.marker_of.get(&(row, stream)).is_some_and(|(marker, _)| opens.contains(marker))).collect();
+        opens.extend(rows);
         for (number, ranges) in read {
             let number = number as u32;
             let mut spans = BTreeMap::<Slot, (u32, u32)>::new();
