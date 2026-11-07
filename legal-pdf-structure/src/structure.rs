@@ -281,11 +281,8 @@ pub fn derive_cached(
             measured
         }
     };
-    // The transition parser: its reading the output where LEGALPDF_TRANSITION_EMIT says so, else read
-    // beside the stages while it is fitted and measured.
-    if transition::emitting() {
-        return measure("derive.transition", || transition::output(analysis, pages, &slots, &evidence, &fences, &runs, outline, &identity));
-    }
+    // The transition parser's walk, read beside the output while it is fitted and measured (its dumps and labels).
+    // The output is tier 0's alone; a tier scores its moves (`tier0::output`, the DOC tier where it is given).
     if transition::enabled() {
         measure("derive.transition", || transition::run(analysis, pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
     }

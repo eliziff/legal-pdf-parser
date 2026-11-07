@@ -52,7 +52,7 @@
 //!   read: the ranker's fit draws no more than a quarter of a round's lines);
 //! - LEGALPDF_TRANSITION_LABELS, a folder: each document's labels as the parser reads it
 //!   (`<sha>.labels.json`), for the grader's `--labels`;
-//! - LEGALPDF_TRANSITION_EMIT: the parse's output is the transition parser's structure (`emit`).
+//! - The parse's output is tier 0's (`tier0::output`) whatever the tier: LEGALPDF_TRANSITION_DOC has DOC score its moves.
 
 use super::*;
 
@@ -126,7 +126,6 @@ pub(crate) struct Settings {
     #[cfg(feature = "encoder")]
     doc: Option<doc::Reader>,
     doc_oracle: bool,
-    emit: bool,
     grammar: Option<grammar::Grammar>,
     pub(crate) confusions: HashMap<char, Vec<(char, f32)>>,
 }
@@ -181,7 +180,6 @@ impl Settings {
                 let times = std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some();
                 doc::Reader::load(&dir, reorder, times).map_err(|e| eprintln!("transition parser: {e}")).ok()
             }),
-            emit: std::env::var_os("LEGALPDF_TRANSITION_EMIT").is_some(),
             grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
         }
@@ -197,13 +195,9 @@ pub(crate) fn train_whole(problems: &Path, out: &Path, epochs: usize) -> std::re
 /// Whether the transition parser runs on this parse.
 pub(crate) fn enabled() -> bool {
     let s = settings();
-    s.dump.is_some() || s.labels.is_some() || s.emit
+    s.dump.is_some() || s.labels.is_some()
 }
 
-/// Whether the transition parser's reading is the parse's output (LEGALPDF_TRANSITION_EMIT).
-pub(crate) fn emitting() -> bool {
-    settings().emit
-}
 
 /// The confusion table at `path`: each misread character's meant ones, likeliest first.
 fn read_confusions(path: &Path) -> HashMap<char, Vec<(char, f32)>> {
@@ -430,6 +424,19 @@ pub(crate) fn run(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slot
     (table, locals, sheet, moves)
 }
 
+/// The moves the DOC tier reads of the document, where its reader is given (LEGALPDF_TRANSITION_DOC): what scores the
+/// moves in place of tier 0's decision, the document's output tier 0's all the same (`tier0::output`); with each line's
+/// marker readings the moves' `reading` names. None without it.
+pub(crate) fn doc_moves(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], sha256: &str) -> Option<(Vec<Move>, Vec<Vec<MarkerReading>>)> {
+    #[cfg(feature = "encoder")]
+    if settings().doc.is_some() {
+        let (table, _, _, moves) = run(analysis, pages, slots, evidence, fences, runs, outline, sha256);
+        return Some((moves, table.readings));
+    }
+    let _ = (analysis, pages, slots, evidence, fences, runs, outline, sha256);
+    None
+}
+
 /// Each line's local scores, read once.
 #[cfg_attr(not(feature = "encoder"), allow(unused_variables))]
 fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> Vec<Local> {
@@ -639,14 +646,6 @@ fn write_labels(s: &Settings, sha256: &str, ids: &[String], views: &[LineView], 
     }
 }
 
-/// The document's structure as the transition parser reads it, its reading through `emit`: what
-/// `derive` gives consumers in place of the stage parser's where LEGALPDF_TRANSITION_EMIT is set.
-pub(crate) fn output(analysis: &dyn StructureAnalysis, pages: &mut [Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], identity: &StructureIdentity) -> Result<StructureOutput> {
-    let (table, locals, sheet, moves) = run(analysis, pages, slots, evidence, fences, runs, outline, &identity.source_sha256);
-    let views = views_of(settings(), pages, slots, evidence, fences, &table, &locals, &sheet);
-    let (structure_graph, paragraphs, footnotes) = emit::structure_graph(pages, slots, evidence, fences, &table, &views, &moves, identity, None)?;
-    Ok(StructureOutput { paragraphs, footnotes, diagnostics: Vec::new(), structure_graph, heading_sources: HashMap::new() })
-}
 
 /// The best whole reading a beam of `width` keeps: every reading kept extended by each of the line's
 /// candidates, scored by the ranker's log-probability of the candidate among the line's (its scores

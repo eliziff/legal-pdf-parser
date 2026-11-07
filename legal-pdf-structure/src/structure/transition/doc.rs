@@ -197,46 +197,84 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
             _ => regions[read[i]][0],
         };
     }
-    // The unit each stream last read a line of.
+    // The unit each stream last read a line of, and the open marker frames per context for disambiguating
+    // Roman vs. alphabetic readings (e.g. `(i)`, `(v)`, `(x)`).
     let mut last_in_stream: HashMap<usize, usize> = HashMap::new();
+    let mut doc_id = 0u16;
+    let mut stacks: HashMap<u16, Open> = HashMap::new();
     for k in 0..n {
+        if lines.starts[k] {
+            doc_id = doc_id.saturating_add(1);
+        }
         let i = of_line[k];
         if i == usize::MAX {
             continue;
         }
         let region = roles[read[i]];
         let stream = stream_of(region);
-        let mv = &mut moves[k];
-        mv.region = region;
+        let ctx = doc_id.saturating_mul(2) + u16::from(views[k].translation);
         let stands = match (unit[i] == k, last_in_stream.insert(stream, unit[i])) {
             (true, _) => Stands::Opens,
             (false, Some(last)) if last == unit[i] => Stands::GoesOn(last),
             _ => Stands::Resumes(unit[i]),
         };
         if matches!(stands, Stands::Opens) {
+            let open = stacks.entry(ctx).or_default();
+            if region == QUOTE {
+                if !open.quoting {
+                    open.quoted.clear();
+                }
+                open.quoting = true;
+            } else if region == TEXT {
+                open.quoting = false;
+            }
+            let chosen_reading = if region != NOTE && region != NOTE_QUOTE && lines.marked[k] {
+                let t0_counted = views[k].count.and_then(|n| views[k].readings.iter().position(|r| r.value == n));
+                let stack_matched = if views[k].readings.len() > 1 {
+                    views[k].readings.iter().position(|r| {
+                        open.frames().iter().rev().any(|f| f.family == r.family && r.value == f.value + 1)
+                    })
+                } else {
+                    None
+                };
+                Some(match (views[k].margin, t0_counted, stack_matched, views[k].readings.is_empty()) {
+                    (Some(_), ..) => MARGIN,
+                    (_, Some(r), ..) => r as u8,
+                    (_, None, Some(r), false) => r as u8,
+                    (_, None, None, false) => 0,
+                    _ => OPENING,
+                })
+            } else {
+                None
+            };
+            if let Some(reading) = views[k].reading(chosen_reading) {
+                let next_frames = machine::counted(open.frames(), reading, region);
+                if open.quoting {
+                    open.quoted = next_frames;
+                } else {
+                    open.stack = next_frames;
+                }
+            }
+            let mv = &mut moves[k];
+            mv.region = region;
             mv.opens = true;
             if region == HEADING {
                 mv.level = units.level[i].clamp(1, 9) as i8;
             } else if BODY.contains(&region) {
                 mv.depth = units.level[i].clamp(1, 9) as u8;
             }
-            if region == NOTE {
+            if region == NOTE || region == NOTE_QUOTE {
                 mv.note = note_number(&views[k], texts[k]);
-            } else if lines.marked[k] {
-                // A unit opening on its marker counts on the margin's number where the margin numbers it, in either
-                // column; else on the number t0 reads it opening on; else on the line's first reading; a marker no
-                // reading makes out (a recognizer's "(2]") is its opening token, counting on nothing.
-                let counted = views[k].count.and_then(|n| views[k].readings.iter().position(|r| r.value == n));
-                mv.reading = Some(match (views[k].margin, counted, views[k].readings.is_empty()) {
-                    (Some(_), ..) => MARGIN,
-                    (_, Some(r), _) => r as u8,
-                    (_, _, false) => 0,
-                    _ => OPENING,
-                });
+            } else {
+                mv.reading = chosen_reading;
             }
-        } else if let Stands::Resumes(first) = stands {
-            mv.resume = true;
-            mv.resumes = Some(first as u32);
+        } else {
+            let mv = &mut moves[k];
+            mv.region = region;
+            if let Stands::Resumes(first) = stands {
+                mv.resume = true;
+                mv.resumes = Some(first as u32);
+            }
         }
     }
     for (i, target) in units.note.iter().enumerate() {
@@ -251,6 +289,10 @@ fn moves_of(lines: &Lines, regions: &[Vec<usize>], roles: &[u8], read: &[usize],
         let marks: Vec<(u32, u32, u32)> = regions[read[*target]].iter().filter(|&&k| only.is_none_or(|lines| lines[k]))
             .flat_map(|&k| views[k].references.iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, e)| (views[k].place, s, e)))
             .take(4).collect();
+        if marks.is_empty() {
+            moves[first].answers[0] = Some((u32::MAX, 0, 0));
+            continue;
+        }
         for (slot, mark) in moves[first].answers.iter_mut().zip(marks) {
             *slot = Some(mark);
         }
@@ -420,7 +462,7 @@ pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts
     let mut taken: HashSet<(usize, u32)> = HashSet::new();
     let note = (0..count).map(|i| {
         let k = first(i);
-        if roles[read[i]] != NOTE || before[i].is_some() {
+        if (roles[read[i]] != NOTE && roles[read[i]] != NOTE_QUOTE) || before[i].is_some() {
             return None;
         }
         let value = note_number(&views[k], texts[k])?;
@@ -526,6 +568,8 @@ mod model {
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
         gaps: [bool; 2],
+        /// Whether each tree's graph takes the pairwise grammar and geometry inputs (`family`).
+        tree_pairs: [bool; 2],
         /// Whether the reading's order is read off the successor head (by default the parser's order is kept:
         /// ordered region by region, a transcript's line numbers would leave their lines).
         reorder: bool,
@@ -594,10 +638,12 @@ mod model {
             }
             let first = Sessions::load(dir)?;
             let gaps = [&first.headings, &first.bodies].map(|s| s.outputs.iter().any(|o| o.name == "gap"));
+            let tree_pairs = [&first.headings, &first.bodies].map(|s| s.inputs.iter().any(|i| i.name == "family"));
             let reader = Self {
                 dir: dir.to_path_buf(),
                 sessions: Mutex::new(vec![first]),
                 gaps,
+                tree_pairs,
                 reorder,
                 times,
                 tokenizer,
@@ -781,7 +827,9 @@ mod model {
                     region_boxes[i * 4 + c] = region_boxes[i * 4 + c].min(boxes[k * 4 + c]);
                     region_boxes[i * 4 + c + 2] = region_boxes[i * 4 + c + 2].max(boxes[k * 4 + c + 2]);
                 }
-                marks[i].extend(views[k].references.iter().map(|&(v, ..)| v));
+                if REFERRING.contains(&roles[read[i]]) {
+                    marks[i].extend(views[k].references.iter().map(|&(v, ..)| v));
+                }
             }
             let region_pages: Vec<i64> = read.iter().map(|&r| pages[regions[r][0]] as i64).collect();
             let number: Vec<Option<u32>> = read.iter().map(|&r| {
@@ -803,12 +851,12 @@ mod model {
                     for &j in by_page.get(&near).into_iter().flatten() {
                         pair_i.push(i as i64);
                         pair_j.push(j as i64);
-                        pair_match.push(number[i].is_some_and(|v| marks[j].contains(&v)));
+                        pair_match.push(j != i && number[i].is_some_and(|v| marks[j].contains(&v)));
                     }
                 }
                 // A note's candidates are every region setting its number, however far (endnotes).
                 for &j in number[i].and_then(|v| setting.get(&v)).into_iter().flatten() {
-                    if (region_pages[j] - page).abs() > 1 {
+                    if j != i && (region_pages[j] - page).abs() > 1 {
                         pair_i.push(i as i64);
                         pair_j.push(j as i64);
                         pair_match.push(true);
@@ -866,7 +914,7 @@ mod model {
                 }
                 probs
             };
-            let (goes_on, successor) = (row_softmax(&goes_on), row_softmax(&successor));
+            let (goes_on, note_of, successor) = (row_softmax(&goes_on), row_softmax(&note_of), row_softmax(&successor));
             // A region's likeliest other region by a head, with its probability (itself, where it has no pairs).
             let best = |probs: &[f32], i: usize, open: &dyn Fn(usize) -> bool| -> Option<(usize, f32)> {
                 let (a, z) = rows[i];
@@ -907,9 +955,12 @@ mod model {
             let mut before = vec![None; count];
             let mut after = vec![false; count];
             for (i, j, _) in links {
-                // A paragraph the margin numbers, or t0 reads opening, opens: it goes on in no earlier one.
+                // A paragraph the margin numbers, or t0 reads opening, or in a different stream, opens: it goes on in no earlier one.
                 let opens = { let first = &views[regions[read[j]][0]]; first.margin.is_some() || first.count.is_some() };
-                if before[j].is_none() && !after[i] && !opens {
+                let same_stream = stream_of(roles[read[i]]) == stream_of(roles[read[j]])
+                    && (roles[read[i]] == HEADING) == (roles[read[j]] == HEADING)
+                    && !(regions[read[i]][0] + 1..=regions[read[j]][0]).any(|k| lines.starts[k]);
+                if before[j].is_none() && !after[i] && !opens && same_stream {
                     before[j] = Some(i);
                     after[i] = true;
                 }
@@ -917,18 +968,87 @@ mod model {
             goes_on_in_column(&mut before, &regions, &roles, &read, &lines.roles, views);
             lap(2, &mut since);
             // The trees over the regions that open a unit, headings and the body's apart.
-            let tree = |session: &mut Session, has_gap: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
+            let mut sections = vec![0i64; count];
+            let mut enclosing_heading = vec![None; count];
+            let mut section = 0i64;
+            let mut last_heading = None;
+            for i in 0..count {
+                let from = if i == 0 { 0 } else { regions[read[i - 1]][0] + 1 };
+                if (from..=regions[read[i]][0]).any(|k| lines.starts[k]) {
+                    section += 1;
+                    last_heading = None;
+                }
+                enclosing_heading[i] = last_heading;
+                if before[i].is_none() && roles[read[i]] == HEADING {
+                    section += 1;
+                    last_heading = Some(i);
+                }
+                sections[i] = section;
+            }
+            let feat_at = |name: &str| LINE_FEATURES.iter().position(|f| *f == name).unwrap_or(0);
+            let (idx_marker, idx_val, idx_pref, idx_c0, idx_w0, idx_x0, idx_size) = (
+                feat_at("marker"), feat_at("marker_value"), feat_at("marker_prefix"), feat_at("count_1"), feat_at("wrap_()"), feat_at("x0"), feat_at("size")
+            );
+            let line_family = |k: usize| -> (i64, i64, i64) {
+                let row = &table.features[k * ALL..(k + 1) * ALL];
+                if row[idx_marker] <= 0.5 {
+                    return (0, -1, 0);
+                }
+                let val = (row[idx_val].max(0.0).exp_m1()).round() as i64;
+                let pref = row[idx_pref].max(0.0).round() as i64;
+                let count_idx = argmax(&row[idx_c0..idx_c0 + 9]) as i64;
+                let wrap_idx = argmax(&row[idx_w0..idx_w0 + 5]) as i64;
+                (count_idx * 5 + wrap_idx + 1, val, pref)
+            };
+            let tree = |session: &mut Session, has_gap: bool, has_pairs: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
                 let h = nodes.len();
                 if h == 0 {
                     return Ok(Vec::new());
                 }
                 let x: Vec<f32> = nodes.iter().flat_map(|&i| region_states[i * d..(i + 1) * d].iter().copied()).collect();
                 let s = TensorRef::from_array_view(([h, d], &x[..])).map_err(|e| e.to_string())?;
+                let mut h_states = vec![0f32; h * d];
+                for (at, &i) in nodes.iter().enumerate() {
+                    if let Some(hd) = enclosing_heading[i] {
+                        h_states[at * d..(at + 1) * d].copy_from_slice(&region_states[hd * d..(hd + 1) * d]);
+                    }
+                }
                 let node_templates: Vec<i64> = nodes.iter().map(|&i| templates[regions[read[i]][0]]).collect();
                 let node_anchors: Vec<i64> = nodes.iter().map(|&i| anchors[regions[read[i]][0]]).collect();
                 let t = TensorRef::from_array_view(([h], &node_templates[..])).map_err(|e| e.to_string())?;
                 let a = TensorRef::from_array_view(([h], &node_anchors[..])).map_err(|e| e.to_string())?;
-                let outputs = session.run(ort::inputs!["states" => s, "templates" => t, "anchors" => a]).map_err(|e| format!("construct: {e}"))?;
+                let (mut node_fam, mut node_val, mut node_pref) = (Vec::with_capacity(h), Vec::with_capacity(h), Vec::with_capacity(h));
+                let (mut node_sec, mut node_x0, mut node_size) = (Vec::with_capacity(h), Vec::with_capacity(h), Vec::with_capacity(h));
+                let (mut node_looks, mut node_pages, mut node_roles) = (Vec::with_capacity(h), Vec::with_capacity(h), Vec::with_capacity(h));
+                for &i in nodes {
+                    let k = regions[read[i]][0];
+                    let (fam, val, pref) = line_family(k);
+                    node_fam.push(fam);
+                    node_val.push(val);
+                    node_pref.push(pref);
+                    node_sec.push(sections[i]);
+                    node_x0.push(table.features[k * ALL + idx_x0]);
+                    node_size.push(table.features[k * ALL + idx_size]);
+                    node_looks.push(i64::from(table.looks[k]));
+                    node_pages.push(pages[k] as i64);
+                    node_roles.push(i64::from(roles[read[i]]));
+                }
+                let outputs = if has_pairs {
+                    let ths = TensorRef::from_array_view(([h, d], &h_states[..])).map_err(|e| e.to_string())?;
+                    let tf = TensorRef::from_array_view(([h], &node_fam[..])).map_err(|e| e.to_string())?;
+                    let tv = TensorRef::from_array_view(([h], &node_val[..])).map_err(|e| e.to_string())?;
+                    let tp = TensorRef::from_array_view(([h], &node_pref[..])).map_err(|e| e.to_string())?;
+                    let ts = TensorRef::from_array_view(([h], &node_sec[..])).map_err(|e| e.to_string())?;
+                    let tx = TensorRef::from_array_view(([h], &node_x0[..])).map_err(|e| e.to_string())?;
+                    let tsz = TensorRef::from_array_view(([h], &node_size[..])).map_err(|e| e.to_string())?;
+                    let tl = TensorRef::from_array_view(([h], &node_looks[..])).map_err(|e| e.to_string())?;
+                    let tpg = TensorRef::from_array_view(([h], &node_pages[..])).map_err(|e| e.to_string())?;
+                    let tr = TensorRef::from_array_view(([h], &node_roles[..])).map_err(|e| e.to_string())?;
+                    session.run(ort::inputs!["states" => s, "heading_states" => ths, "templates" => t, "anchors" => a, "family" => tf, "value" => tv, "prefix" => tp,
+                        "section" => ts, "x0" => tx, "size" => tsz, "looks" => tl, "pages" => tpg, "roles" => tr]).map_err(|e| format!("construct: {e}"))?
+                } else {
+                    session.run(ort::inputs!["states" => s, "templates" => t, "anchors" => a]).map_err(|e| format!("construct: {e}"))?
+                };
                 let (_, parent) = outputs["parent"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 let (_, sibling) = outputs["sibling"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 // Each node's gap where the graph gives one (`gap`, GAPS a node), else one level.
@@ -944,17 +1064,33 @@ mod model {
             let headings: Vec<usize> = (0..count).filter(|&i| opening(i) && roles[read[i]] == HEADING).collect();
             let bodies: Vec<usize> = (0..count).filter(|&i| opening(i) && BODY.contains(&roles[read[i]])).collect();
             let mut level = vec![0usize; count];
-            for (&i, l) in headings.iter().zip(tree(&mut sessions.headings, self.gaps[0], &headings)?) {
+            for (&i, l) in headings.iter().zip(tree(&mut sessions.headings, self.gaps[0], self.tree_pairs[0], &headings)?) {
                 level[i] = l;
             }
-            for (&i, l) in bodies.iter().zip(tree(&mut sessions.bodies, self.gaps[1], &bodies)?) {
+            for (&i, l) in bodies.iter().zip(tree(&mut sessions.bodies, self.gaps[1], self.tree_pairs[1], &bodies)?) {
                 level[i] = l;
             }
-            // A note's region: the one its link names, where not itself.
-            let note = (0..count).map(|i| {
-                let target = best(&note_of, i, &|_| true).map_or(i, |(j, _)| j);
-                (roles[read[i]] == NOTE && target != i).then_some(target)
+            // A note's region: the one holding a mark of its number its link names, where not itself, surest notes first
+            // so two notes of a number in parallel or multi-part reports do not take the same region's mark.
+            let mut note = vec![None; count];
+            let mut note_candidates: Vec<(usize, f32)> = (0..count).filter(|&i| before[i].is_none() && (roles[read[i]] == NOTE || roles[read[i]] == NOTE_QUOTE) && number[i].is_some()).map(|i| {
+                let valid = |j: usize| j == i || number[i].is_some_and(|v| marks[j].contains(&v));
+                let p = best(&note_of, i, &valid).map_or(0.0, |(j, p)| if j != i { p } else { 0.0 });
+                (i, p)
             }).collect();
+            note_candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut claimed: HashSet<(usize, u32)> = HashSet::new();
+            for (i, _) in note_candidates {
+                let Some(val) = number[i] else { continue };
+                let valid = |j: usize| j == i || (marks[j].contains(&val) && !claimed.contains(&(j, val)));
+                let target = best(&note_of, i, &valid)
+                    .or_else(|| best(&note_of, i, &|j| j == i || marks[j].contains(&val)))
+                    .map_or(i, |(j, _)| j);
+                if target != i {
+                    claimed.insert((target, val));
+                    note[i] = Some(target);
+                }
+            }
             lap(3, &mut since);
             let mut moves = moves_of(&lines, &regions, &roles, &read, &Units { before, level, note }, views, texts, None);
             // Each line's rank: its region's place in the reading, then its place in the region.

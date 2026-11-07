@@ -371,6 +371,7 @@ impl LineTable {
             references.push(reference_spans(line, evidence.size[at]));
             look_ids.push(look_id(evidence, at));
         }
+        unmarked_notes(&order, slots, pages, evidence, &mut references);
         // The lines around each line, and the document's shape.
         let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER.start] > 0.0).count() as f32 / n.max(1) as f32;
         let labelled = (0..n).filter(|&k| evidence.label[order[k].index()].is_some()).count() as f32 / n.max(1) as f32;
@@ -452,6 +453,60 @@ fn look_id(evidence: &Evidence, at: usize) -> u32 {
 /// A line's markers as the numbering grammar reads them (`word`: it opens on a division's word): its text's, those of the
 /// print's run-ons taken apart, those of its text as recognized before the repair (`recognized`), and those of each likely
 /// misreading of a recognized line's characters.
+/// The marks a page's notes call for that no line of its body sets, found as recognition likely misread them: a note's
+/// number in figures read as letters ("3o" for 30, "Ioo" for 100, "l2" for 12) or standing loose after a word ("64"),
+/// and a note symbol read as another sign (a dagger as "t" or "+", a double dagger as "f", an asterisk as "^", "!", "?"
+/// or an unreadable sign), glued to a word's end, or alone on its line. The body is the page's lines read before its
+/// first note; each wanted note takes the first such place in it that is no mark yet.
+fn unmarked_notes(order: &[Slot], slots: &Slots, pages: &[Page], evidence: &Evidence, references: &mut [Vec<(u32, u32, u32)>]) {
+    static NUMBER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SYMBOL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let number = NUMBER.get_or_init(|| regex::Regex::new(r"(?:^|[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}'\s])([0-9oOIl|]{1,3})(?:[\s.,;:)\u{2014}-]|$)").unwrap());
+    let symbol = SYMBOL.get_or_init(|| regex::Regex::new(r"[\p{L}\p{N}.,;:)\]\u{201d}\u{2019}]([tf+^!?*\u{fffd}\u{2020}\u{2021}])(?:[\s.,;:]|$)").unwrap());
+    // The figures a run of confusable signs stands for; a run with no figure stands for a number only when longer than
+    // one sign ("Ioo"; a lone "I" is the pronoun).
+    let figures = |run: &str| -> Option<u32> {
+        let text: Option<String> = run.chars().map(|c| match c { '0'..='9' => Some(c), 'o' | 'O' => Some('0'), 'I' | 'l' | '|' => Some('1'), _ => None }).collect();
+        if !run.chars().any(|c| c.is_ascii_digit()) && run.chars().count() < 2 { return None; }
+        text?.parse().ok()
+    };
+    let mut by_page: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for (k, &slot) in order.iter().enumerate() {
+        by_page.entry(slots.page(slot)).or_default().push(k);
+    }
+    for lines in by_page.values() {
+        let Some(first_note) = lines.iter().position(|&k| evidence.label[order[k].index()].is_some()) else { continue };
+        let (body, notes) = lines.split_at(first_note);
+        for value in notes.iter().filter_map(|&k| evidence.label[order[k].index()].map(|label| label.value)) {
+            if body.iter().any(|&k| references[k].iter().any(|&(v, ..)| v == value)) {
+                continue;
+            }
+            'search: for &k in body {
+                let text = &slots.line(pages, order[k]).text;
+                let place = |start: usize, end: usize| (text[..start].chars().count() as u32, text[..end].chars().count() as u32);
+                let mut candidates: Vec<(u32, u32)> = Vec::new();
+                if value == 0 {
+                    if text.trim() == "*" {
+                        let start = text.find('*').unwrap_or(0);
+                        candidates.push(place(start, start + 1));
+                    }
+                    candidates.extend(symbol.captures_iter(text).filter_map(|c| c.get(1)).map(|m| place(m.start(), m.end())));
+                } else {
+                    candidates.extend(number.captures_iter(text).filter_map(|c| c.get(1))
+                        .filter(|m| figures(m.as_str()) == Some(value)).map(|m| place(m.start(), m.end())));
+                }
+                for (start, end) in candidates {
+                    if !references[k].iter().any(|&(_, a, b)| a < end && start < b) {
+                        references[k].push((value, start, end));
+                        references[k].sort_by_key(|&(_, start, _)| start);
+                        break 'search;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn line_readings(line: &Line, word: bool, recognized: Option<&str>, confusions: &HashMap<char, Vec<(char, f32)>>) -> Vec<MarkerReading> {
     let mut found = marker_readings(&line.text, word);
     let mut add = |readings: Vec<MarkerReading>| {

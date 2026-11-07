@@ -333,6 +333,22 @@ impl PdfDocument {
         self.pages.len()
     }
 
+    /// Each page's printed label (its page node's first alias), by page index; none where the page prints none read.
+    pub fn page_labels(&self) -> Vec<Option<String>> {
+        let mut labels = vec![None; self.summary.page_count];
+        for node in &self.structure.nodes {
+            if node.kind != legal_structure_model::NodeKind::Page {
+                continue;
+            }
+            if let (Some(index), Some(label)) = (node.page_indexes.first(), node.aliases.as_ref().and_then(|aliases| aliases.first())) {
+                if let Some(slot) = labels.get_mut(*index) {
+                    *slot = Some(label.clone());
+                }
+            }
+        }
+        labels
+    }
+
     pub fn summary(&self) -> &PdfSummary {
         &self.summary
     }

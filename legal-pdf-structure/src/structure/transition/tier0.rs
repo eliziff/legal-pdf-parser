@@ -385,6 +385,8 @@ pub(crate) fn output(
     identity: &StructureIdentity,
     trace: Option<&Path>,
 ) -> Result<StructureOutput> {
+    // The DOC tier's reading where it is given, read off the pages as they came, before this reading orders them.
+    let doc = super::doc_moves(analysis, pages, slots, evidence, &fences, runs, outline, &identity.source_sha256);
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before);
     let views = line_views(pages, slots, evidence, &fences, &table);
     let (mut notes, mut decision) = decide(analysis, pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
@@ -410,7 +412,23 @@ pub(crate) fn output(
     if give_back(pages, &footnotes) {
         build_regions(pages);
     }
-    let (moves, opened, within) = moves_of(slots, &fences, runs, &table, &views, &decision, &reading_regions(pages, &decided), &footnotes);
+    let (mut moves, opened, within) = moves_of(slots, &fences, runs, &table, &views, &decision, &reading_regions(pages, &decided), &footnotes);
+    // A tier scores the moves, the output stays this one: the DOC tier's move for each line, but for the notes, the
+    // pairer's (a line either reads as a note keeps this reading's move).
+    // DOC's reading of a marker is the one of this reading's views that counts as it does (DOC's line table reads the
+    // recognizer's misreadings too, so its readings may be more or in another order).
+    if let Some((read, readings)) = doc.filter(|(read, _)| read.len() == moves.len()) {
+        for (k, mut chosen) in read.into_iter().enumerate() {
+            if matches!(moves[k].region, NOTE | NOTE_QUOTE) || matches!(chosen.region, NOTE | NOTE_QUOTE) {
+                continue;
+            }
+            if let Some(r) = chosen.reading.filter(|&r| r != MARGIN && r != OPENING) {
+                chosen.reading = readings[k].get(usize::from(r)).map(|want| views[k].readings.iter()
+                    .position(|own| own.family == want.family && own.value == want.value).map_or(OPENING, |at| at as u8));
+            }
+            moves[k] = chosen;
+        }
+    }
     in_slot_order(pages, slots);
     let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
     let (structure_graph, paragraphs, mut footnotes) = emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, Some(settled))?;

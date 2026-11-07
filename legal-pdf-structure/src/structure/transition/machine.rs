@@ -33,7 +33,7 @@ pub(crate) const PROVISION: u8 = 16;
 /// Regions whose units count on a marker.
 const NUMBERED: [u8; 9] = [1, 2, 3, 4, 7, 8, 10, 14, 16];
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
-const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
+pub(crate) const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
 /// The body regions that take a depth (the tagger's ranked regions, headings aside).
 pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 /// A stack holds at most this many open units; headings run nine levels deep.
@@ -339,7 +339,7 @@ fn step(value: u32, frame: &Frame) -> f32 {
 }
 
 /// The stack after a reading counts: popped to the open frame of its family and replaced, else pushed.
-fn counted(stack: &[Frame], reading: &MarkerReading, region: u8) -> Vec<Frame> {
+pub(crate) fn counted(stack: &[Frame], reading: &MarkerReading, region: u8) -> Vec<Frame> {
     let frame = Frame { family: reading.family.clone(), value: reading.value, region };
     let mut after = stack.to_vec();
     match after.iter().rposition(|open| open.family == reading.family) {
