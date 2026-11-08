@@ -624,7 +624,6 @@ fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocum
         structure.schema_version.as_ref() == DOCUMENT_STRUCTURE_SCHEMA
             && summary.sha256 == source_hash
             && summary.parser_version == PARSER_VERSION
-            && summary.cache_key == key
     };
     let Some(cached) = cached.filter(current) else {
         let _ = fs::remove_file(path);
