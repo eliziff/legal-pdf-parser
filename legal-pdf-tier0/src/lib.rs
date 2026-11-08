@@ -64,10 +64,6 @@ fn worth(heard: &Heard, chosen: &Move) -> f32 {
     }
 }
 
-/// A move making nothing but its region and whether it opens.
-fn plain(region: u8, opens: bool) -> Move {
-    Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }
-}
 
 
 /// Each line as the state reads it, in reading order. No fitted reader runs here, so nothing asks for its stylesheet or
@@ -118,7 +114,7 @@ fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Opti
 /// A reading of the line as the move it would make: a unit's opening on its marker, a labelled note's opening on its
 /// number, a heading's opening at `level`, else the line going on.
 fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, reading: Option<(u32, u32)>, level: u8, joined: bool) -> Move {
-    let chosen = Move { reading: kind.and_then(|_| reading_of(view, runs, reading)), ..plain(region_of(role, kind), kind.is_some()) };
+    let chosen = Move { reading: kind.and_then(|_| reading_of(view, runs, reading)), ..Move::plain(region_of(role, kind), kind.is_some()) };
     match role {
         Role::Note => Move { opens: view.label.is_some(), note: view.label, ..chosen },
         Role::Heading => Move { opens: !joined, level: level.clamp(1, 9) as i8, ..chosen },
@@ -188,7 +184,7 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
             }
             decision.settle_line(slot, winner.as_ref().map(|(reading, ..)| *reading), &readings);
             weighed[context] = winner.as_ref().is_some_and(|(reading, ..)| reading.rule == Rule::Residual && reading.role == Role::Heading);
-            winner.map_or_else(|| plain(TEXT, false), |(_, chosen, _)| chosen)
+            winner.map_or_else(|| Move::plain(TEXT, false), |(_, chosen, _)| chosen)
         } else {
             candidate(view, runs, decision.role[at], None, None, 0, false)
         };
@@ -223,9 +219,9 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
         let Some(&first) = places.iter().min() else { continue };
         for &k in &places {
             moves[k] = Some(if k == first {
-                Move { note: Some(note.label.parse().unwrap_or(0)), ..plain(NOTE, true) }
+                Move { note: Some(note.label.parse().unwrap_or(0)), ..Move::plain(NOTE, true) }
             } else {
-                Move { resumes: Some(first as u32), ..plain(NOTE, false) }
+                Move { resumes: Some(first as u32), ..Move::plain(NOTE, false) }
             });
         }
     }
@@ -254,7 +250,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
             if k == first && carried.is_none() || kind.is_some() && !contents {
                 let mut opening = candidate(&views[k], runs, role, kind, reading, decision.level[at], false);
                 if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && contents {
-                    opening = plain(CONTENTS, true);
+                    opening = Move::plain(CONTENTS, true);
                 } else if let Some(member) = member.filter(|_| kind.is_some()) {
                     opened.insert(k, member);
                     let mark = |(run, at): (u32, u32)| runs.runs[run as usize].members[at as usize].marker[0];
@@ -270,7 +266,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
                 moves[k] = Some(opening);
                 open = (k, opening.region);
             } else {
-                moves[k] = Some(Move { resumes: Some(open.0 as u32), ..plain(open.1, false) });
+                moves[k] = Some(Move { resumes: Some(open.0 as u32), ..Move::plain(open.1, false) });
             }
         }
         if opened.contains_key(&open.0) {
@@ -282,7 +278,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
     let mut state = State::default();
     let mut walk = |(k, chosen): (usize, Option<Move>)| {
-        let mut chosen = chosen.unwrap_or_else(|| plain(region_of(decision.role[table.order[k].index()], None), true));
+        let mut chosen = chosen.unwrap_or_else(|| Move::plain(region_of(decision.role[table.order[k].index()], None), true));
         chosen.starts = starts.contains(&k);
         if chosen.opens && RANKED_BODY.contains(&chosen.region) {
             chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;

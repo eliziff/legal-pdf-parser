@@ -54,6 +54,11 @@ pub struct Move {
 }
 
 impl Move {
+    /// A move making nothing but its region and whether it opens.
+    pub fn plain(region: u8, opens: bool) -> Self {
+        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }
+    }
+
     /// The move's class among the region-and-opening moves the local scores rank (`region * 2 +
     /// opens`).
     pub fn class(&self) -> usize {
@@ -455,7 +460,7 @@ impl State {
         let mut out = Vec::new();
         for &class in classes {
             let (region, opens) = ((class / 2) as u8, class % 2 == 1);
-            let plain = Move { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] };
+            let plain = Move::plain(region, opens);
             let mut bases = Vec::new();
             if opens && region == NOTE {
                 // A note counts on a number: its label's, or an arabic reading's (a lettered note answers no

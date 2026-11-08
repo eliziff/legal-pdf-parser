@@ -164,6 +164,19 @@ pub(crate) fn text_quality(lines: &[Line]) -> f64 {
     ((quantity * printable_share).max(0.0) * 10_000.0).round_ties_even() / 10_000.0
 }
 
+/// What a recognizer is asked of the page at `page_index`: its size, the regions to read (none: the
+/// whole page), and, where `boxes`, its lines' and words' boxes.
+fn page_request(page_index: usize, page: &Page, regions: Vec<[f64; 4]>, boxes: bool) -> OcrPageRequest {
+    let lines = if boxes { page.lines.iter().map(|line| line.bbox).collect() } else { Vec::new() };
+    let words = if boxes { page.lines.iter().map(|line| line.words.iter().map(|word| word.bbox).collect()).collect() } else { Vec::new() };
+    OcrPageRequest { page_index, width: page.width, height: page.height, regions, lines, words }
+}
+
+/// A recognizer's lines read as the page's lines, numbered on from `first`.
+fn read_lines(lines: Vec<OcrLine>, page: &Page, first: usize) -> Vec<Line> {
+    lines.into_iter().enumerate().filter_map(|(offset, line)| make_ocr_line(line, page, first + offset)).collect()
+}
+
 /// Apply recognition to extracted pages without loading or extracting the PDF again.
 pub fn recognize_pdf(
     pdf: &[u8],
@@ -200,16 +213,7 @@ pub fn recognize_pdf(
             .iter()
             .map(|&page_index| (page_index, Vec::new()))
             .chain(picture_pages.iter().map(|(&page_index, regions)| (page_index, regions.to_vec())))
-            .filter_map(|(page_index, regions)| {
-                pages.get(page_index).map(|page| OcrPageRequest {
-                    page_index,
-                    width: page.width,
-                    height: page.height,
-                    regions,
-                    lines: Vec::new(),
-                    words: Vec::new(),
-                })
-            })
+            .filter_map(|(page_index, regions)| pages.get(page_index).map(|page| page_request(page_index, page, regions, false)))
             .collect();
         requests.sort_by_key(|request| request.page_index);
         let results = legal_pdf_core::profile::measure("extract.ocr", || {
@@ -243,24 +247,14 @@ pub fn recognize_pdf(
                     if total == 0.0 || sure < 0.97 * total {
                         continue;
                     }
-                    let mut read: Vec<_> = inside
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(offset, line)| make_ocr_line(line, page, first + offset))
-                        .collect();
+                    let mut read = read_lines(inside, page, first);
                     read.sort_by(|a, b| (a.bbox[1] + a.bbox[3]).total_cmp(&(b.bbox[1] + b.bbox[3])));
                     place_picture_lines(page, region, read);
                     reindex = true;
                 }
                 continue;
             }
-            let lines: Vec<_> = result
-                .lines
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, line)| make_ocr_line(line, page, index + 1))
-                .collect();
-            recognized.push((result.page_index, lines, result.separator_y));
+            recognized.push((result.page_index, read_lines(result.lines, page, 1), result.separator_y));
         }
         // A page that has a text layer of its own keeps it unless its recognition reads measurably
         // better by the same measure: noise words, and words the other reading never writes
@@ -316,14 +310,7 @@ pub fn recognize_pdf(
             .iter()
             .enumerate()
             .filter(|(index, page)| page.source == "ocr" && !page.lines.is_empty() && ocr_pages.is_none_or(|selected| selected.contains(index)))
-            .map(|(page_index, page)| OcrPageRequest {
-                page_index,
-                width: page.width,
-                height: page.height,
-                regions: Vec::new(),
-                lines: page.lines.iter().map(|line| line.bbox).collect(),
-                words: page.lines.iter().map(|line| line.words.iter().map(|word| word.bbox).collect()).collect(),
-            })
+            .map(|(page_index, page)| page_request(page_index, page, Vec::new(), true))
             .collect();
         if !requests.is_empty() {
             provider.separators(pdf, &requests);
@@ -334,16 +321,7 @@ pub fn recognize_pdf(
             .scanned_pages
             .iter()
             .filter(|&&index| pages.get(index).is_some_and(|page| page.source == "native" && !page.lines.is_empty()))
-            .filter_map(|&page_index| {
-                pages.get(page_index).map(|page| OcrPageRequest {
-                    page_index,
-                    width: page.width,
-                    height: page.height,
-                    regions: Vec::new(),
-                    lines: page.lines.iter().map(|line| line.bbox).collect(),
-                    words: page.lines.iter().map(|line| line.words.iter().map(|word| word.bbox).collect()).collect(),
-                })
-            })
+            .filter_map(|&page_index| pages.get(page_index).map(|page| page_request(page_index, page, Vec::new(), true)))
             .collect();
         if !requests.is_empty() {
             // The rule is the notes' only where a line below it opens as a note does, with its
@@ -374,17 +352,7 @@ pub fn recognize_pdf(
             .scanned_pages
             .iter()
             .filter_map(|&page_index| {
-                pages
-                    .get(page_index)
-                    .filter(|page| page.source == "native" && !page.lines.is_empty())
-                    .map(|page| OcrPageRequest {
-                        page_index,
-                        width: page.width,
-                        height: page.height,
-                        regions: Vec::new(),
-                        lines: Vec::new(),
-                        words: Vec::new(),
-                    })
+                pages.get(page_index).filter(|page| page.source == "native" && !page.lines.is_empty()).map(|page| page_request(page_index, page, Vec::new(), false))
             })
             .collect();
         if !requests.is_empty() {
@@ -392,12 +360,7 @@ pub fn recognize_pdf(
                 let Some(page) = pages.get_mut(result.page_index) else {
                     continue;
                 };
-                let recognized: Vec<_> = result
-                    .lines
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, line)| make_ocr_line(line, page, index + 1))
-                    .collect();
+                let recognized = read_lines(result.lines, page, 1);
                 for line in page.lines.iter_mut().filter(|line| line.source == "native") {
                     let read = crate::reread::reading_of(line, &recognized);
                     crate::reread::splice_numbers(line, &read);

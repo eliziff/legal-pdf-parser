@@ -74,17 +74,8 @@ impl<'a> Reading<'a> {
     }
 
     fn read(self) -> Paragraphs {
-        let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
+        let slots = self.slots;
         let mut paragraphs = Paragraphs { count: vec![None; slots.len()], held: vec![Vec::new(); slots.len()] };
-        // Development only: each line's fence and type, beside the streams.
-        if let Some(path) = std::env::var_os("LEGALPDF_JUDGMENT_STREAM") {
-            let lines = fences.order.iter().map(|&slot| {
-                let at = slot.index();
-                format!("{:?}\t{}\t{}\t{:.1}\t{:?}\t{}\t{:?}\t{:?}\t{}\n", fences.role[at], fences.band[at], fences.translation[at], evidence.size[at], fences.body, slot.index(),
-                    fences.margin_number[at].map(Slot::index), fences.margin_twin[at].map(Slot::index), slots.line(pages, slot).text)
-            }).collect::<String>();
-            let _ = std::fs::write(std::path::PathBuf::from(path).with_extension("lines.txt"), lines);
-        }
         let mut led = Vec::<(Slot, Slot)>::new();
         for (document, stream) in (0..self.counts.streams).flat_map(|count| Stream::BOTH.map(|stream| (count, stream))).filter(|stream| !self.counts.note_lists.contains(stream)) {
             let kept = self.kept(document, stream);
@@ -93,10 +84,6 @@ impl<'a> Reading<'a> {
             let text = String::from_utf16_lossy(&written.text);
             if text.trim().is_empty() {
                 continue;
-            }
-            // Development only: the stream the reader takes.
-            if let Some(path) = std::env::var_os("LEGALPDF_JUDGMENT_STREAM") {
-                let _ = std::fs::write(std::path::PathBuf::from(path).with_extension(if stream.is_translation() { "fr.txt" } else { "txt" }), &text);
             }
             self.hold(&text, &written, &kept, stream, &mut paragraphs);
         }
