@@ -258,7 +258,7 @@ pub fn weigh(pages: &[Page],
             let text = line(slot).text.trim();
             unsettled(at)
                 && matches!(evidence.tag[at], SourceTag::None | SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
-                && fences.quotation[at] == 0
+                && fences.at(at).quotation == 0
                 && (1..=160).contains(&text.chars().count())
                 && !text.starts_with(char::is_lowercase)
                 && !text.contains("___")

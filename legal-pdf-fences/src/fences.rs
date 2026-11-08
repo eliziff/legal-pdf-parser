@@ -17,7 +17,6 @@ use legal_pdf_tables::PageItems;
 pub mod band;
 pub mod columns;
 pub mod contents;
-pub mod contexts;
 pub mod continuations;
 pub mod documents;
 pub mod furniture;
@@ -40,15 +39,6 @@ pub enum Continuation {
     /// Set at its paragraph's leading under the line before it, a full line ending no sentence
     /// (`continues_prose_from`).
     Prose,
-}
-
-/// A reading context: a constituent document of the packet (0 for its own), its parallel
-/// translation or not, and a quotation in it (0 for none).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Context {
-    pub document: u16,
-    pub translation: bool,
-    pub quotation: u16,
 }
 
 /// The fences, contexts and reading order, by slot.
@@ -94,11 +84,9 @@ pub struct Fences {
     /// The body's type: the commonest face (an index into the evidence's faces) and half-point size
     /// of the lines no fence took outside the note band, by characters.
     pub body: Option<(u16, u16)>,
-    pub translation: Vec<bool>,
     pub starts: Vec<constituents::Start>,
-    pub document: Vec<u16>,
-    pub quotation: Vec<u16>,
-    /// Each line's reading context, an index into `contexts`.
+    /// Each line's reading context (its document, language and quotation), an index into `contexts`: what the fences
+    /// read of each, as they read it.
     pub ctx: Vec<u16>,
     pub contexts: Vec<Context>,
     /// A paragraph number printed in the margin (`read_margin_numbers`): the body line it numbers.
@@ -118,6 +106,27 @@ pub struct Fences {
 }
 
 impl Fences {
+    /// Puts the line in the context `change` makes of its own, the document's contexts holding each once.
+    fn recontext(&mut self, slot: Slot, change: impl FnOnce(&mut Context)) {
+        let mut context = self.context(slot);
+        change(&mut context);
+        let known = self.contexts.iter().position(|other| *other == context).unwrap_or_else(|| {
+            self.contexts.push(context);
+            self.contexts.len() - 1
+        });
+        self.ctx[slot.index()] = known as u16;
+    }
+
+    /// The reading context of the line at slot index `at`.
+    pub fn at(&self, at: usize) -> Context {
+        self.contexts[usize::from(self.ctx[at])]
+    }
+
+    /// The number of constituent documents: one past the last any line stands in.
+    pub fn documents(&self) -> usize {
+        usize::from((0..self.ctx.len()).map(|at| self.at(at).document).max().unwrap_or(0)) + 1
+    }
+
     /// Gives an open line a role, by a rule; a line some fence took already keeps its own.
     fn set(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
         let open = self.role[slot.index()] == Role::Open;
@@ -130,12 +139,12 @@ impl Fences {
 
     /// Whether the slot's constituent document is a transcript.
     pub fn transcript(&self, slot: Slot) -> bool {
-        self.transcripts.get(usize::from(self.document[slot.index()])).copied().unwrap_or(false)
+        self.transcripts.get(usize::from(self.at(slot.index()).document)).copied().unwrap_or(false)
     }
 
     /// Whether the slot's constituent document is a transcript's testimony throughout (`testimony`).
     pub fn testimony(&self, slot: Slot) -> bool {
-        self.testimony.get(usize::from(self.document[slot.index()])).copied().unwrap_or(false)
+        self.testimony.get(usize::from(self.at(slot.index()).document)).copied().unwrap_or(false)
     }
 
     /// The fences, contexts and reading order of the document's pages, measured (`evidence`), its
@@ -148,9 +157,8 @@ impl Fences {
             edge: vec![None; count],
             cell: vec![0; count],
             band: vec![false; count],
-            translation: vec![false; count],
-            document: vec![0; count],
-            quotation: vec![0; count],
+            ctx: vec![0; count],
+            contexts: vec![Context::default()],
             continues: vec![None; count],
             ..Self::default()
         };
@@ -191,11 +199,9 @@ impl Fences {
         if repaired {
             self.read_margin_numbers(pages, slots);
         }
-        self.read_contexts();
         self.read_continuations(pages, slots, evidence);
         self.read_paragraphs(pages, slots, evidence);
         if self.read_quotations(pages, slots) {
-            self.read_contexts();
             self.read_continuations(pages, slots, evidence);
         }
     }
@@ -208,5 +214,5 @@ impl Fences {
 
 /// The decision as the derivation reads it, from the fences (`Decided`).
 pub fn decided<'a>(pages: &[Page], slots: &'a Slots, fences: &'a Fences) -> Decided<'a> {
-    Decided::of(pages, slots, &fences.order, &fences.document, &fences.translation, &fences.ctx, &fences.quotation, &fences.paragraphs.held)
+    Decided::of(pages, slots, &fences.order, &fences.ctx, &fences.contexts, &fences.paragraphs.held)
 }

@@ -131,7 +131,7 @@ impl Fences {
                     let x = slots.line(pages, other).bbox[0];
                     // (A justified line's row may be split into its words: they are no edge of one another.)
                     let edge = body.iter().filter(|&&line| !level(line)).map(|&line| slots.line(pages, line).bbox[0]).filter(|edge| *edge <= x && x - edge < height * 3.0).fold(x, f64::min);
-                    let behind = words.iter().any(|&word| level(word) && self.translation[word.index()] == self.translation[other.index()] && slots.line(pages, word).bbox[2] <= x);
+                    let behind = words.iter().any(|&word| level(word) && self.at(word.index()).translation == self.at(other.index()).translation && slots.line(pages, word).bbox[2] <= x);
                     x - edge > height * 0.4 && !behind
                 };
                 // No paragraph opens on a lower-case word ("and dispassionate person in the community."): a stray
@@ -140,9 +140,9 @@ impl Fences {
                     || slots.line(pages, other).text.trim_start().chars().next().is_some_and(|c| !c.is_lowercase());
                 let row = words.iter().copied()
                     .filter(|&other| level(other) && opens(other) && (margin || slots.line(pages, other).bbox[0] >= line.bbox[2]))
-                    .min_by_key(|&other| (!indented(other), self.translation[other.index()], self.place[other.index()]));
+                    .min_by_key(|&other| (!indented(other), self.at(other.index()).translation, self.place[other.index()]));
                 if let Some(row) = row {
-                    let other_language = |other: Slot| self.translation[other.index()] != self.translation[row.index()];
+                    let other_language = |other: Slot| self.at(other.index()).translation != self.at(row.index()).translation;
                     let next = standing.iter().copied().find(|&top| top > line.bbox[1] + height * 0.5).unwrap_or(f64::MAX);
                     let twin = words.iter().copied()
                         .filter(|&other| level(other) && opens(other) && other_language(other))
@@ -183,8 +183,8 @@ impl Fences {
         for (&(_, margin, row, twin), _) in found.iter().zip(&kept).filter(|(_, kept)| **kept) {
             self.margin_number[margin.index()] = Some(row);
             self.margin_twin[margin.index()] = twin;
-            self.translation[margin.index()] = self.translation[row.index()];
-            self.document[margin.index()] = self.document[row.index()];
+            let own = self.context(row);
+            self.recontext(margin, |context| (context.translation, context.document) = (own.translation, own.document));
         }
         if !kept.contains(&true) {
             return;

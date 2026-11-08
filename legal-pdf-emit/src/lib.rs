@@ -235,7 +235,7 @@ pub fn structure_graph(pages: &[Page],
         let range = index.page_range(page.index).unwrap_or(ScalarRange { start: page_end, end: page_end });
         page_end = range.end;
         let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Native, None);
-        node.label = Some(format!("page{}", page.number));
+        node.label = Some(page.number.to_string());
         node.aliases = page.printed_label.clone().map(|label| vec![label]);
         node.anchor.clone_from(&page.printed_label_line_id);
         node.line_ids = page.lines.iter().map(|l| l.id.clone()).collect();
@@ -285,7 +285,7 @@ pub fn structure_graph(pages: &[Page],
         // grammar's value (a clause, a part, an article), its printing an alias; its marker and text where they stand.
         // Its marker is the run member's where the unit opens on one, else a heading's number as its text reads it, else
         // the unit's own (a note's none); its label a heading's text, else the member's, else the unit's own, a numbered
-        // paragraph's its number ("par12" for "[12]" or "12."), as every reader labels it.
+        // paragraph's its number ("12" for "[12]" or "12."), as the document prints it.
         node.marker_range = member.and_then(|member| scalar(member.marker[0]).zip(scalar(member.marker[1])))
             .map(|(start, end)| ScalarRange { start, end: end.max(start) })
             .or_else(|| match kind {
@@ -296,11 +296,11 @@ pub fn structure_graph(pages: &[Page],
         node.label = match (kind, member) {
             (NodeKind::Heading, _) => Some(lines.join(" ")),
             (NodeKind::Footnote, _) => None,
-            (NodeKind::Paragraph, Some(member)) => Some(format!("par{}", member.grammar_value)),
+            (NodeKind::Paragraph, Some(member)) => Some(member.grammar_value.clone()),
             (NodeKind::ListItem, Some(member)) => Some(member.label.clone()),
             (NodeKind::Section, Some(member)) => Some(member.grammar_value.clone()),
             (NodeKind::Paragraph, None) => unit.label.as_deref().map(|label| label.trim_matches(|c: char| !c.is_ascii_digit()))
-                .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).map(|digits| format!("par{digits}")),
+                .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).map(str::to_owned),
             _ => unit.label.clone(),
         };
         // (A heading's heading range is its reading context's, `outline_contexts`.)

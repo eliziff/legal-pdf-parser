@@ -26,7 +26,7 @@ impl Fences {
     /// The parallel translation, on the pages' columns.
     pub fn read_translation(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView]) {
         for slot in translation_lines(views, &self.columns, |slot| self.role[slot.index()] != Role::Open) {
-            self.translation[slot.index()] = true;
+            self.recontext(slot, |context| context.translation = true);
         }
         // A justified line the PDF sets a word at a time crosses the page's middle, in one language: a row of three or more
         // pieces of a word or two is one line, its language its first piece's.
@@ -46,9 +46,9 @@ impl Fences {
                     if !word_apart {
                         continue;
                     }
-                    let language = self.translation[pieces[0].index()];
+                    let language = self.context(pieces[0]).translation;
                     for slot in pieces {
-                        self.translation[slot.index()] = language;
+                        self.recontext(slot, |context| context.translation = language);
                     }
                 }
             }

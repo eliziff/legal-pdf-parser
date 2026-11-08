@@ -103,7 +103,7 @@ impl Notes {
         let separators = &fences.separators;
         let starts: Vec<usize> = (0..pages.len()).map(|page| slots.on(page).start as usize).collect();
         // Each document and language: its lines in page order, and each page's in reading order.
-        let group = |slot: Slot| (fences.document[slot.index()], fences.translation[slot.index()]);
+        let group = |slot: Slot| (fences.at(slot.index()).document, fences.at(slot.index()).translation);
         let mut groups: BTreeMap<(u16, bool), (Vec<Slot>, Vec<(usize, Vec<usize>)>)> = BTreeMap::new();
         for slot in (0..count).map(|at| Slot(at as u32)) {
             groups.entry(group(slot)).or_default().0.push(slot);

@@ -117,7 +117,7 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
     let count = slots.len();
     let role = &decision.role;
     let counted = |slot: Slot| matches!(class(role[slot.index()]), Class::Body | Class::Contents | Class::Table);
-    let group = |slot: Slot| (fences.document[slot.index()], fences.translation[slot.index()]);
+    let group = |slot: Slot| (fences.at(slot.index()).document, fences.at(slot.index()).translation);
     // Each document and language's measure (`measure_of`), on its counted lines page by page.
     let mut lines_of: Vec<((u16, bool), Vec<Vec<&Line>>)> = Vec::new();
     for page_slot in 0..pages.len() {
@@ -138,10 +138,10 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
     }
     let measures: Vec<((u16, bool), Measure)> = lines_of.iter().map(|(key, lines)| (*key, measure_of(lines))).collect();
     // Each document's front: its first page, and the place of its first unit in the reading order.
-    let documents = usize::from(fences.document.iter().copied().max().unwrap_or(0)) + 1;
+    let documents = fences.documents();
     let (mut opening, mut first_unit) = (vec![usize::MAX; documents], vec![u32::MAX; documents]);
     for (place, &slot) in fences.order.iter().enumerate() {
-        let document = usize::from(fences.document[slot.index()]);
+        let document = usize::from(fences.at(slot.index()).document);
         opening[document] = opening[document].min(slots.page(slot));
         if decision.unit[slot.index()].is_some() {
             first_unit[document] = first_unit[document].min(place as u32);
@@ -153,7 +153,7 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
     // an author's line or a lead-in's colon is no heading, and still the paragraph's it stands in.
     let caption = |slot: Slot, bits: u32| {
         let at = slot.index();
-        let document = usize::from(fences.document[at]);
+        let document = usize::from(fences.at(at).document);
         decision.rule[at] == Rule::FrontMatter
             && (slots.page(slot) < opening[document].saturating_add(2) || fences.place[at] < first_unit[document])
             && (evidence.words[at] & bits != 0 || bits & WORD_FIELD != 0 && legal_pdf_text::paragraphs::field_label(slots.line(pages, slot)))

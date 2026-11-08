@@ -15,7 +15,7 @@ impl Fences {
         let mut own = HashMap::<(u16, bool), HashSet<u32>>::new();
         for at in 0..self.paragraphs.count.len() {
             if let Some(number) = self.paragraphs.count[at] {
-                own.entry((self.document[at], self.translation[at])).or_default().insert(number);
+                own.entry((self.at(at).document, self.at(at).translation)).or_default().insert(number);
             }
         }
         let mut quotations = OpenQuotations::default();
@@ -25,11 +25,11 @@ impl Fences {
             if self.role[at] != Role::Open || self.band[at] {
                 continue;
             }
-            let stream = (self.document[at], self.translation[at]);
+            let stream = (self.at(at).document, self.at(at).translation);
             let text = slots.line(pages, slot).text.as_str();
             if let Some(quotation) = quotations.open_in(stream) {
                 if self.continues[at].is_some() || legal_structure_model::structure_analysis().editorial_line(text) {
-                    self.quotation[at] = quotation;
+                    self.recontext(slot, |context| context.quotation = quotation);
                     continue;
                 }
                 quotations.close(stream);
@@ -37,7 +37,8 @@ impl Fences {
             let quoted = self.paragraphs.count[at].is_none()
                 && legal_structure_model::structure_analysis().printed_paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
             if quoted {
-                self.quotation[at] = quotations.open(stream);
+                let quotation = quotations.open(stream);
+                self.recontext(slot, |context| context.quotation = quotation);
             }
         }
         quotations.last > 0

@@ -8,7 +8,7 @@ impl Fences {
             legal_pdf_tables::document_tables(
                 pages,
                 items,
-                &|id| slots.of_id(id).is_some_and(|slot| self.translation[slot.index()]),
+                &|id| slots.of_id(id).is_some_and(|slot| self.at(slot.index()).translation),
                 &TableReadings,
             )
         });

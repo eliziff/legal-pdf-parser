@@ -177,7 +177,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView],
         let Some(&first) = places.iter().min() else { continue };
         for &k in &places {
             moves[k] = Some(if k == first {
-                Move { note: Some(note.printed_label().parse().unwrap_or(0)), ..Move::plain(NOTE, true) }
+                Move { note: Some(note.label.as_deref().and_then(|label| label.parse().ok()).unwrap_or(0)), ..Move::plain(NOTE, true) }
             } else {
                 Move { resumes: Some(first as u32), ..Move::plain(NOTE, false) }
             });

@@ -13,7 +13,7 @@ impl Fences {
             matches!(role[slot.index()], Role::LineLabel | Role::Furniture | Role::PageLabel)
         });
         for (slot, document) in documents {
-            self.document[slot.index()] = document.min(usize::from(u16::MAX)) as u16;
+            self.recontext(slot, |context| context.document = document.min(usize::from(u16::MAX)) as u16);
         }
         self.starts = starts;
     }
@@ -23,7 +23,7 @@ impl Fences {
     /// (`numbered_row`).
     pub fn read_transcripts(&mut self, slots: &Slots, evidence: &Evidence) {
         let count = slots.len();
-        let documents = usize::from(self.document.iter().copied().max().unwrap_or(0)) + 1;
+        let documents = self.documents();
         let (mut numbered, mut speakers, mut lines) = (vec![0usize; documents], vec![0usize; documents], vec![0usize; documents]);
         // Each document's pages, and those printing its line numbers: (count, last page met).
         let (mut pages, mut numbered_pages) = (vec![(0usize, usize::MAX); documents], vec![(0usize, usize::MAX); documents]);
@@ -33,7 +33,7 @@ impl Fences {
             }
         };
         for slot in 0..count {
-            let document = usize::from(self.document[slot]);
+            let document = usize::from(self.at(slot).document);
             let page = slots.page(Slot(slot as u32));
             meet(&mut pages[document], page);
             if evidence.line_number[slot] {

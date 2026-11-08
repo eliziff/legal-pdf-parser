@@ -82,10 +82,10 @@ impl Fences {
     /// document's edges. A line no fence took is its furniture; a page that gains furniture and had
     /// no printed label takes its label from it.
     pub fn read_document_furniture(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, rows: &[&Rows]) {
-        let documents = usize::from(self.document.iter().copied().max().unwrap_or(0)) + 1;
+        let documents = self.documents();
         let mut lines: Vec<Vec<Slot>> = vec![Vec::new(); documents];
         for slot in 0..slots.len() {
-            lines[usize::from(self.document[slot])].push(Slot(slot as u32));
+            lines[usize::from(self.at(slot).document)].push(Slot(slot as u32));
         }
         let mut gained = vec![false; pages.len()];
         for lines in lines.iter().filter(|lines| !lines.is_empty()) {

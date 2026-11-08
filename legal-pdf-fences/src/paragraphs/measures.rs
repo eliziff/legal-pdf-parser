@@ -24,7 +24,7 @@ impl<'a> PageMeasures<'a> {
         let (mut body_end, mut band_top) = (vec![[f64::MIN; 2]; pages.len()], vec![[f64::MAX; 2]; pages.len()]);
         let mut cells_end = vec![[None::<f64>; 2]; pages.len()];
         for &slot in &fences.order {
-            let (page, language) = (slots.page(slot), usize::from(fences.translation[slot.index()]));
+            let (page, language) = (slots.page(slot), usize::from(fences.at(slot.index()).translation));
             if !fences.below_body(evidence, slot.index(), 0.95) && slots.line(pages, slot).text.split_whitespace().count() > 3 {
                 let end = slots.line(pages, slot).bbox[3];
                 match fences.role[slot.index()] {
@@ -42,7 +42,7 @@ impl<'a> PageMeasures<'a> {
         // quotation's: its line runs on in the paragraph quoting it rather than opening one.
         let mut edge = HashMap::<(usize, bool), f64>::new();
         for &slot in fences.order.iter().filter(|slot| fences.body_line(slot.index())) {
-            let left = edge.entry((slots.page(slot), fences.translation[slot.index()])).or_insert(f64::MAX);
+            let left = edge.entry((slots.page(slot), fences.at(slot.index()).translation)).or_insert(f64::MAX);
             *left = left.min(slots.line(pages, slot).bbox[0]);
         }
         // Where the document's running text stands on a page: most of its lines of words open there, odd pages and even apart.
@@ -51,8 +51,8 @@ impl<'a> PageMeasures<'a> {
         for &slot in fences.order.iter().filter(|slot| fences.body_line(slot.index())) {
             let line = slots.line(pages, slot);
             if line.text.split_whitespace().count() >= 5 {
-                *lefts.entry((slots.page(slot) % 2, fences.translation[slot.index()])).or_default().entry((line.bbox[0] / 3.0).round() as i64).or_default() += 1;
-                let right = right_edges.entry((slots.page(slot), fences.translation[slot.index()])).or_insert(f64::MIN);
+                *lefts.entry((slots.page(slot) % 2, fences.at(slot.index()).translation)).or_default().entry((line.bbox[0] / 3.0).round() as i64).or_default() += 1;
+                let right = right_edges.entry((slots.page(slot), fences.at(slot.index()).translation)).or_insert(f64::MIN);
                 *right = right.max(line.bbox[2]);
             }
         }
@@ -117,20 +117,20 @@ impl Numbers {
                 Some(row) if evidence.marker[slot.index()].is_some_and(|reading| reading.only) => slots.line(pages, row).bbox[0],
                 _ => line.words.get(1).map_or(line.bbox[0], |word| word.bbox[0]),
             };
-            words - edge.get(&(slots.page(slot), fences.translation[slot.index()])).copied().unwrap_or(0.0)
+            words - edge.get(&(slots.page(slot), fences.at(slot.index()).translation)).copied().unwrap_or(0.0)
         };
         let numbered: Vec<Slot> = fences.order.iter().copied()
             .filter(|slot| fences.body_line(slot.index()) && printed[slot.index()].is_some())
             .collect();
         let mut places = BTreeMap::<(bool, i64), usize>::new();
         for &slot in &numbered {
-            *places.entry((fences.translation[slot.index()], (indent(slot) / 3.0).round() as i64)).or_default() += 1;
+            *places.entry((fences.at(slot.index()).translation, (indent(slot) / 3.0).round() as i64)).or_default() += 1;
         }
         let own_place = [false, true].map(|translation| places.iter().filter(|((own, _), _)| *own == translation).max_by_key(|(_, count)| **count).map(|((_, at), _)| *at as f64 * 3.0));
         // Words set further in than the judgment's are a quotation's. Words closer to their number say nothing: the judgment's
         // own paragraphs may print so among quotations that print as it does (`quoted_runs` reads those by their counts).
-        let further = |slot: Slot| own_place[usize::from(fences.translation[slot.index()])].is_some_and(|own| indent(slot) - own > QUOTED_INDENT);
-        let number_of = |slot: Slot| (fences.translation[slot.index()], printed[slot.index()]);
+        let further = |slot: Slot| own_place[usize::from(fences.at(slot.index()).translation)].is_some_and(|own| indent(slot) - own > QUOTED_INDENT);
+        let number_of = |slot: Slot| (fences.at(slot.index()).translation, printed[slot.index()]);
         // A number no line at the judgment's own place prints is the judgment's, however it stands.
         let standing: HashSet<(bool, Option<usize>)> = numbered.iter().copied().filter(|&slot| !further(slot)).map(number_of).collect();
         let indented: HashSet<Slot> = numbered.iter().copied().filter(|&slot| further(slot) && standing.contains(&number_of(slot))).collect();

@@ -269,7 +269,7 @@ pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<Autho
     }).collect();
     units.extend(notes.iter().enumerate().map(|(at, node)| {
         let ordinal = at + 1;
-        let label = node.printed_label();
+        let label = node.label.as_deref().unwrap_or_default();
         let number = label.parse::<u32>().ok();
         let (mut text, mut mappings, _) = unit_text(structure, runs, &rendered, &node.rendered_membership, &[]);
         if text.is_empty() {

@@ -162,12 +162,12 @@ impl<'a> Reading<'a> {
         for page_slot in 0..pages.len() {
             let on: Vec<usize> = slots.on(page_slot).map(|slot| slot as usize).filter(|&at| fences.role[at] == Role::Open && !fences.band[at]).collect();
             for language in [false, true] {
-                let mut own: Vec<usize> = on.iter().copied().filter(|&at| fences.translation[at] == language).collect();
+                let mut own: Vec<usize> = on.iter().copied().filter(|&at| fences.at(at).translation == language).collect();
                 if own.iter().any(|&at| !paragraphs.held[at].is_empty()) {
                     continue;
                 }
                 let mut spans = BTreeMap::<(bool, u32), (f64, f64)>::new();
-                for &at in on.iter().filter(|&&at| fences.translation[at] != language) {
+                for &at in on.iter().filter(|&&at| fences.at(at).translation != language) {
                     let bbox = slots.line(pages, Slot(at as u32)).bbox;
                     for held in &paragraphs.held[at] {
                         let span = spans.entry((held.translation, held.number)).or_insert((bbox[1], bbox[3]));
@@ -236,15 +236,15 @@ impl Fences {
     fn streams(&self, printed: &[Option<usize>]) -> Vec<Stream> {
         // A judgment in one language may quote a statute in two, its columns side by side: the other language numbers
         // nothing, and its lines are the paragraph's quoting them. A parallel report prints its paragraphs in both.
-        let numbered_apart = |at: usize| self.margin_twin[at].is_some() || self.translation[at] && (self.margin_number[at].is_some()
+        let numbered_apart = |at: usize| self.margin_twin[at].is_some() || self.at(at).translation && (self.margin_number[at].is_some()
             || printed[at].is_some());
-        let translated = (0..printed.len()).filter(|&at| self.translation[at] && self.role[at] == Role::Open).count();
+        let translated = (0..printed.len()).filter(|&at| self.at(at).translation && self.role[at] == Role::Open).count();
         let open = (0..printed.len()).filter(|&at| self.role[at] == Role::Open).count();
         // (A quoted section's own number numbers no count: what counts is how few the other language prints.)
         let printed_number = |at: usize| self.margin_number[at].is_some() || printed[at].is_some();
-        let (apart, own) = ((0..printed.len()).filter(|&at| numbered_apart(at)).count(), (0..printed.len()).filter(|&at| !self.translation[at] && printed_number(at)).count());
+        let (apart, own) = ((0..printed.len()).filter(|&at| numbered_apart(at)).count(), (0..printed.len()).filter(|&at| !self.at(at).translation && printed_number(at)).count());
         let one_text = translated * 4 < open && apart * 4 < own;
-        self.translation.iter().map(|&translation| if translation && !one_text { Stream::Translation } else { Stream::Text }).collect()
+        (0..self.ctx.len()).map(|at| if self.at(at).translation && !one_text { Stream::Translation } else { Stream::Text }).collect()
     }
 
     /// Each row's marker, standing alone on its line: the margin's numbers by their rows, other markers by theirs.
@@ -257,7 +257,7 @@ impl Fences {
             for (k, row) in rows.into_iter().enumerate().filter_map(|(k, row)| Some((k, row?))) {
                 // A marker's row is the line beside it in its own language (the nearest line on a parallel report's
                 // row may be the other column's); only a margin number serves the other language's row.
-                if self.set_apart(row.index()) || k != 1 && self.translation[row.index()] != self.translation[at] {
+                if self.set_apart(row.index()) || k != 1 && self.at(row.index()).translation != self.at(at).translation {
                     continue;
                 }
                 // The twin row's language takes the margin's number as text the stream adds, not as its line. (A number of the

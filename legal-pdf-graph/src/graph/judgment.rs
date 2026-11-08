@@ -50,7 +50,7 @@ fn write_paragraphs(
     for ranges in paragraphs.values_mut() {
         ScalarRange::normalize_union(ranges);
     }
-    let number_of = |label: Option<&str>| label.and_then(|label| label.strip_prefix("par")).and_then(|value| value.parse::<usize>().ok());
+    let number_of = |label: Option<&str>| label.and_then(|label| label.parse::<usize>().ok());
     let in_language = |node: &StructureNode| !node.line_ids.is_empty() && node.line_ids.iter().all(|id| decided.translated(id)) == translation;
     let mut placed = HashSet::new();
     for node in structure.nodes.iter_mut().filter(|node| node.kind == NodeKind::Paragraph) {
@@ -79,7 +79,7 @@ fn write_paragraphs(
             Derivation::Heuristic,
             None,
         );
-        node.label = Some(format!("par{number}"));
+        node.label = Some(number.to_string());
         node.ranges = ranges.clone();
         node.extent = ranges;
         node.line_ids = printing.iter().map(|fragment| fragment.id.clone()).collect();

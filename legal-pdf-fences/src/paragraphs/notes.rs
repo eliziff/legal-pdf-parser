@@ -166,7 +166,7 @@ impl Reading<'_> {
     fn over_label(&self, reading_place: usize, notes: &NoteWalk) -> bool {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let slot = fences.order[reading_place];
-        let same_column = |next: &&Slot| slots.page(**next) == slots.page(slot) && fences.translation[next.index()] == fences.translation[slot.index()];
+        let same_column = |next: &&Slot| slots.page(**next) == slots.page(slot) && fences.at(next.index()).translation == fences.at(slot.index()).translation;
         let under: Vec<Slot> = fences.order[reading_place + 1..].iter().take_while(same_column).copied().collect();
         let mut above = slots.line(pages, slot).bbox;
         for (step, next) in under.iter().enumerate() {

@@ -7,6 +7,7 @@ pub use fences::*;
 pub mod paragraphs;
 
 use legal_pdf_evidence::*;
+pub use legal_pdf_structure_model::Context;
 use legal_pdf_structure_model::{Held, PageView, Paragraphs, Role, Rows, Rule, Slot, Slots};
 use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};

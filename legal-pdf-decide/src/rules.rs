@@ -249,7 +249,7 @@ impl Decision {
             };
             let line = text(slot);
             if transcript && words & WORD_WITNESS != 0 {
-                witnesses[usize::from(fences.document[at])] = true;
+                witnesses[usize::from(fences.at(at).document)] = true;
             }
             if notes.running_head[at] {
                 decision.fill(slot, Role::Furniture, Rule::EndnoteHead);
@@ -305,7 +305,7 @@ impl Decision {
         }
         for slot in examinations {
             if decision.fill(slot, Role::Heading, Rule::TranscriptPart) {
-                decision.given[slot.index()] = if witnesses[usize::from(fences.document[slot.index()])] { 2 } else { 1 };
+                decision.given[slot.index()] = if witnesses[usize::from(fences.at(slot.index()).document)] { 2 } else { 1 };
             }
         }
         decision.read_runs(pages, slots, evidence, fences, runs, &sequences);
@@ -333,8 +333,8 @@ impl Decision {
         let unnamed = |slot: Slot| {
             evidence.outline_complete
                 && anchoring.opened.iter().any(|&(document, translation, place)| {
-                    document == fences.document[slot.index()]
-                        && translation == fences.translation[slot.index()]
+                    document == fences.at(slot.index()).document
+                        && translation == fences.at(slot.index()).translation
                         && place <= fences.place[slot.index()]
                 })
         };
@@ -362,7 +362,7 @@ impl Decision {
         }
         for at in 0..self.role.len() {
             if self.role[at] == Role::Open {
-                self.role[at] = if fences.quotation[at] != 0 { Role::Quote } else { Role::Body };
+                self.role[at] = if fences.at(at).quotation != 0 { Role::Quote } else { Role::Body };
                 if self.rule[at] == Rule::None {
                     self.rule[at] = Rule::Body;
                 }
@@ -675,7 +675,7 @@ impl Decision {
                 continue;
             }
             for twin in slots.on(page).map(Slot) {
-                if fences.translation[twin.index()] != fences.translation[slot.index()]
+                if fences.at(twin.index()).translation != fences.at(slot.index()).translation
                     && evidence.row(slots, twin) == row
                     && self.open(twin)
                     && legal_structure_model::structure_analysis().marginal_note_shaped(text(twin))
@@ -796,8 +796,8 @@ fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
     let line = slots.line(pages, slot);
     let text = line.text.trim();
     let court = || {
-        let document = fences.document[slot.index()];
-        let opening = fences.order.iter().find(|first| fences.document[first.index()] == document).map_or(0, |first| slots.page(*first));
+        let document = fences.at(slot.index()).document;
+        let opening = fences.order.iter().find(|first| fences.at(first.index()).document == document).map_or(0, |first| slots.page(*first));
         let place = fences.place[slot.index()] as usize;
         slots.page(slot) < opening + 2
             || fences.order[place + 1..]

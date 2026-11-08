@@ -36,7 +36,7 @@ fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Sl
     let mut lines: Vec<Option<Line>> = pages.iter_mut().flat_map(|page| std::mem::take(&mut page.lines)).map(Some).collect();
     let mut groups: BTreeMap<(u16, bool), Vec<Slot>> = BTreeMap::new();
     for &slot in &fences.order {
-        groups.entry((fences.document[slot.index()], fences.translation[slot.index()])).or_default().push(slot);
+        groups.entry((fences.at(slot.index()).document, fences.at(slot.index()).translation)).or_default().push(slot);
     }
     let mut repaired = Vec::new();
     for group in groups.values() {

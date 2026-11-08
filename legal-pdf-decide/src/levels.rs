@@ -80,14 +80,14 @@ pub fn anchors(
     let together = |upper: Slot, lower: Slot| !apart(pages, slots, geometry, upper, lower);
     let eligible = |slot: Slot| {
         matches!(role[slot.index()], Role::Open | Role::Heading)
-            && fences.quotation[slot.index()] == 0
+            && fences.at(slot.index()).quotation == 0
             && !has_dot_leader(&slots.line(pages, slot).text)
     };
     let heading = |slot: Slot| {
         role[slot.index()] == Role::Heading
             || matches!(evidence.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
     };
-    let context = |slot: Slot| (fences.document[slot.index()], fences.translation[slot.index()]);
+    let context = |slot: Slot| (fences.at(slot.index()).document, fences.at(slot.index()).translation);
     // A page's lines in reading order.
     let order = |page: usize| {
         let range = slots.on(page);

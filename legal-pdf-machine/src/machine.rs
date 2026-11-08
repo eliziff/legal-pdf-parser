@@ -281,7 +281,7 @@ impl<'a> LineView<'a> {
 
     /// Whether the line reads in a parallel translation's column.
     pub fn translation(&self) -> bool {
-        self.fences.translation[self.slot().index()]
+        self.fences.at(self.slot().index()).translation
     }
 
     /// The line's marker's readings (`LineTable::readings`).

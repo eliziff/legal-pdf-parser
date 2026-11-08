@@ -25,7 +25,7 @@ impl Reading<'_> {
         held_lines.windows(2).enumerate().position(|(at, pair)| {
             let (before, line) = (slots.line(pages, pair[0]), slots.line(pages, pair[1]));
             // (A page all quotation has its edge there: the margin is no further in than the document's running text.)
-            let (page, language) = (slots.page(pair[1]), self.fences.translation[pair[1].index()]);
+            let (page, language) = (slots.page(pair[1]), self.fences.at(pair[1].index()).translation);
             let margin = edge.get(&(page, language)).copied().unwrap_or(0.0).min(self.measures.column(page, language));
             // (What a heading in a quotation heads stands further in, or smaller: an enactment's "Prohibited grounds". A
             // table's head stands over figures: "Township" / "2012".)
@@ -54,7 +54,7 @@ impl Reading<'_> {
         let marked = |slot: Slot, share: f64| self.marked(slot, share);
         (1..held_lines.len()).find(|&from| {
             let (run, line) = (&held_lines[from..], slots.line(pages, held_lines[from]));
-            let (page, language) = (slots.page(held_lines[from]), self.fences.translation[held_lines[from].index()]);
+            let (page, language) = (slots.page(held_lines[from]), self.fences.at(held_lines[from].index()).translation);
             let margin = edge.get(&(page, language)).copied().unwrap_or(0.0).min(self.measures.column(page, language));
             let enumerator = line.text.split_whitespace().next().is_some_and(|token| token.chars().count() <= 5 && token.ends_with(['.', ')']));
             let above = slots.line(pages, held_lines[from - 1]);
@@ -82,7 +82,7 @@ impl Reading<'_> {
             // (On this page: a report's margin alternates, and a paragraph over a page is no quotation for it. The page's own running
             // text stands no further in: a paragraph may open on the next page's quotation. A number hanging in the margin says
             // nothing of the text's edge.)
-            let language = self.fences.translation[last.index()];
+            let language = self.fences.at(last.index()).translation;
             let left = spans.keys().filter(|&&slot| slots.page(slot) == page && self.evidence.marker[slot.index()].is_none()).map(|&slot| slots.line(pages, slot).bbox[0]).fold(self.measures.column(page, language), f64::min);
             let from = kept_at.get(&last).copied().unwrap_or(kept.len());
             let in_quotation = bbox[0] - left > QUOTED_INDENT && held.len() >= 2 && ((held[held.len() - 2] - bbox[0]).abs() <= 3.0 || small);

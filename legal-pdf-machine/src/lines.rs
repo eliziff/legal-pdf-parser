@@ -299,7 +299,7 @@ impl LineTable {
                 flag(evidence.references[at] & REFERENCE_RAISED != 0), flag(evidence.references[at] & REFERENCE_GLUED != 0),
                 flag(evidence.title_shaped[at]), flag(evidence.beside[at].is_some()), flag(evidence.line_number[at]),
                 flag(repeated[k]), flag(fences.cell[at] > 0),
-                flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.translation[at]),
+                flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.at(at).translation),
             ]);
             let found = &readings[k];
             let mut marker = [0.0f64; 20];
@@ -378,7 +378,7 @@ impl LineTable {
             let goes_on = held.iter().any(|mine| last_held[usize::from(mine.translation)].iter().any(|other| other.number == mine.number));
             let flags = [fences.band[at], fences.paragraphs.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
                 margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some(), notes.note[at].is_some(),
-                fences.quotation[at] != 0, starts.contains(slots.line(pages, slot).id.as_str()), decision.unit[at].is_some(), decision.joined[at]];
+                fences.at(at).quotation != 0, starts.contains(slots.line(pages, slot).id.as_str()), decision.unit[at].is_some(), decision.joined[at]];
             for (cell, flag) in row[ROLES..].iter_mut().zip(flags) {
                 *cell = u8::from(flag);
             }

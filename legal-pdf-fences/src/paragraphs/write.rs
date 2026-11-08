@@ -113,7 +113,7 @@ impl Reading<'_> {
         // (Nor does a line go apart for ending a sentence where the next line's first word could not have stood on it, in the
         // paragraph the page prints: a last sentence with no stop of its own, "La liberté d'expression est nettement violée par cette interdiction".
         // A heading under a full line is no sentence: "Remedy", "Brossard J.A. (dissenting in part)".)
-        let room = self.measures.right_edge(slots.page(before), fences.translation[before.index()]) - above.bbox[2];
+        let room = self.measures.right_edge(slots.page(before), fences.at(before.index()).translation) - above.bbox[2];
         let full = slots.page(before) == slots.page(slot) && !here.recognized() && here.words.first().is_some_and(|word| word.bbox[2] - word.bbox[0] >= room) && in_body(&&slot) && in_body(&&before)
             && line.split_whitespace().filter(|word| word.starts_with(char::is_lowercase)).count() >= 4;
         let apart = closes && !plain && !initials && !(same && full) && flow.to_number[place] <= CLOSING_LINES;
