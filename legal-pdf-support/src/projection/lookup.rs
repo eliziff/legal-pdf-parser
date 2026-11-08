@@ -401,7 +401,6 @@ pub(crate) fn section_unit(
         provenance: match section.source {
             Derivation::Native => "native",
             Derivation::Heuristic => "legal-structure",
-            Derivation::Model => "model",
         }
         .to_owned(),
         proposition: None,
