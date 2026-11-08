@@ -92,15 +92,14 @@ pub fn opener(table: &LineTable, k: usize) -> bool {
 }
 
 impl Stylesheet {
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, outline: &[PdfOutlineEntry], table: &LineTable, locals: &[Local]) -> Self {
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, locals: &[Local]) -> Self {
         let n = table.order.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
         let template = template_ids(table);
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
-        let geometry = legal_pdf_decide::Geometry::of(pages);
         // The document's bookmarks alone: its printed contents the parser links itself (`State::answering`).
-        let anchoring = legal_pdf_decide::anchors(pages, slots, evidence, fences, &geometry, &fences.role, outline, &[]);
+        let anchoring = legal_pdf_decide::anchors(pages, slots, evidence, fences, geometry, &fences.role, outline, &[]);
         let place_of: HashMap<Slot, usize> = table.order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
         let mut anchor = vec![0u16; n];
         anchoring.anchors.iter().for_each(|found| found.lines.iter().filter_map(|slot| place_of.get(slot)).for_each(|&k| anchor[k] = found.level.max(1)));

@@ -115,6 +115,8 @@ pub fn derive_cached(pages: &mut [Page],
     let cached = cache
         .and_then(|path| legal_pdf_core::read_gzip_json::<Measured>(path).ok())
         .filter(|measured| measured.evidence.size.len() == slots.len());
+    // Each page's measures and columns, read once for every stage that reads the pages before they are written.
+    let geometry = decide::Geometry::of(pages);
     let Measured { evidence, fences, runs } = match cached {
         Some(mut measured) => {
             for (slot, text, words) in &measured.runs.edits {
@@ -130,7 +132,7 @@ pub fn derive_cached(pages: &mut [Page],
                 legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
             });
             let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline));
-            let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences))?;
+            let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
             let measured = Measured { evidence, fences, runs };
             if let Some(path) = cache {
                 let _ = legal_pdf_core::write_gzip_json(path, &measured);
@@ -140,7 +142,7 @@ pub fn derive_cached(pages: &mut [Page],
     };
     // The output is tier 0's; the transition walk over its reading (the DOC tier where it is given, the scorer's fitting)
     // runs inside it, once (`tier0::output`).
-    measure("derive.machine", || output(pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
+    measure("derive.machine", || output(pages, &slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
 }
 
 /// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
@@ -153,6 +155,7 @@ fn output(pages: &mut [Page],
     evidence: &Evidence,
     mut fences: Fences,
     runs: &Runs,
+    geometry: &decide::Geometry,
     outline: &[PdfOutlineEntry],
     identity: &StructureIdentity,
     trace: Option<&Path>,
@@ -160,10 +163,10 @@ fn output(pages: &mut [Page],
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let views = tier0::line_views(pages, slots, evidence, &fences, &table);
-    let (mut notes, mut decision) = tier0::decide(pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
+    let (mut notes, mut decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, &views, trace.is_some());
     // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
     // came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, outline, &identity.source_sha256, &notes, &decision, &table);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, &views);
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);

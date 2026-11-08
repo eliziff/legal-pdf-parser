@@ -749,7 +749,7 @@ impl Decision {
             if fences.contexts[ctx].quotation != 0 {
                 continue;
             }
-            let measure = |slot: Slot| &geometry.page(slots.page(slot)).0;
+            let measure = |slot: Slot| &geometry.page(pages, slots.page(slot)).0;
             let opens = lines.iter().position(|&slot| {
                 let line = slots.line(pages, slot);
                 let measure = measure(slot);

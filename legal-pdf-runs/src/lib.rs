@@ -252,7 +252,7 @@ struct Lines<'a> {
     slots: &'a Slots,
     evidence: &'a Evidence,
     fences: &'a Fences,
-    geometry: &'a Geometry<'a>,
+    geometry: &'a Geometry,
     view: &'a View,
     marked: &'a HashSet<Slot>,
 }
@@ -281,7 +281,7 @@ impl Lines<'_> {
     /// Whether a line fills its column's measure (85% of it or more).
     fn fills(&self, slot: Slot) -> bool {
         let page = self.slots.page(slot);
-        let (_, columns) = self.geometry.page(page);
+        let (_, columns) = self.geometry.page(self.pages, page);
         columns.place(self.slots.line(self.pages, slot), (slot.0 - self.slots.on(page).start) as usize).0 >= 0.85
     }
 
@@ -402,8 +402,9 @@ fn aligned_siblings(pages: &[Page], slots: &Slots, view: &View, run: &StructureC
 
 /// The runs of every reading context of the document's pages, measured (`evidence`) and fenced
 /// and ordered (`fences`), each marker resolved to the unit it opens; and, once the statute's
-/// spine is read, its running heads naming its sections fenced (`confirm_section_heads`).
-pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Runs> {
+/// spine is read, its running heads naming its sections fenced (`confirm_section_heads`). The pages' `geometry` is read
+/// once their markers are restored.
+pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences, geometry: &Geometry) -> Result<Runs> {
     let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
     let pages: &[Page] = pages;
     legal_pdf_evidence::reread(evidence, pages, slots, &repaired);
@@ -417,7 +418,6 @@ pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: 
     }
     let edits = repaired.iter().map(|(slot, _)| (*slot, slots.line(pages, *slot).text.clone(), slots.line(pages, *slot).words.clone())).collect();
     let evidence: &Evidence = evidence;
-    let geometry = Geometry::of(pages);
     // Each context's lines in reading order, its fenced lines left out.
     let mut by_context: Vec<Vec<Slot>> = vec![Vec::new(); fences.contexts.len()];
     for &slot in &fences.order {
@@ -450,7 +450,7 @@ pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: 
         let found = part_at_paragraphs(found, &view, evidence, fences);
         let marked: HashSet<Slot> =
             found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
-        let shown = Lines { pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
+        let shown = Lines { pages, slots, evidence, fences, geometry, view: &view, marked: &marked };
         let readings: Vec<Vec<Reading>> = found
             .iter()
             .map(|run| {

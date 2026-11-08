@@ -98,19 +98,20 @@ pub fn layout_labelled(line: &Line) -> bool {
     line.region_id.contains("-ppdoc-r")
 }
 
-/// Each page's measures and columns, read once a rule asks for them.
-pub struct Geometry<'a> {
-    pages: &'a [Page],
+/// Each page's measures and columns, read once, when a stage first asks for them, and kept for every stage that reads
+/// the pages after (the document's, made once where its stages are called, `legal_pdf_structure`): what they measure
+/// (the lines' boxes, sizes and text) stands until the lines are written.
+pub struct Geometry {
     read: Vec<OnceCell<(PageMeasure, Columns)>>,
 }
 
-impl<'a> Geometry<'a> {
-    pub fn of(pages: &'a [Page]) -> Self {
-        Self { pages, read: (0..pages.len()).map(|_| OnceCell::new()).collect() }
+impl Geometry {
+    pub fn of(pages: &[Page]) -> Self {
+        Self { read: (0..pages.len()).map(|_| OnceCell::new()).collect() }
     }
 
-    /// The page's measures (`PageMeasure`) and columns (`Columns`), by page slot.
-    pub fn page(&self, page: usize) -> &(PageMeasure, Columns) {
-        self.read[page].get_or_init(|| (PageMeasure::of(&self.pages[page]), Columns::of(&self.pages[page])))
+    /// The page's measures (`PageMeasure`) and columns (`Columns`), by page slot: `pages[page]`'s.
+    pub fn page(&self, pages: &[Page], page: usize) -> &(PageMeasure, Columns) {
+        self.read[page].get_or_init(|| (PageMeasure::of(&pages[page]), Columns::of(&pages[page])))
     }
 }

@@ -5,7 +5,8 @@
 //! a decision: every value is measured on the pages or read by an evidence reader.
 
 use super::*;
-use legal_pdf_core::{flag_share, text_shape, Columns, PageMeasure, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
+use legal_pdf_core::{flag_share, text_shape, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
+use legal_pdf_decide::Geometry;
 
 /// The names of a line's own features, in order.
 pub const LINE_FEATURES: &[&str] = &[
@@ -222,15 +223,15 @@ impl LineTable {
     }
 
     /// Each line's features and t0 row, measured over the table both tiers read (`plain`), for the DOC reader.
-    pub fn measure(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision) {
+    pub fn measure(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) {
         let (order, readings, margin_rows, margins) = (&self.order, &self.readings, &self.margin_rows, &self.margins);
         let n = order.len();
-        let measures: Vec<(PageMeasure, Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().map(|page| {
-            let measure = PageMeasure::of(page);
+        let measures: Vec<(&legal_pdf_core::PageMeasure, &legal_pdf_core::Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().enumerate().map(|(p, page)| {
+            let (measure, columns) = geometry.page(pages, p);
             let rank = measure.order.iter().enumerate().map(|(k, &line)| (line, k)).collect();
             let ink = legal_pdf_core::upper_median(page.lines.iter().map(|l| l.ink).filter(|ink| *ink > 0.0).collect());
             let weight = legal_pdf_core::upper_median(page.lines.iter().map(|l| l.weight).filter(|w| *w > 0.0).collect());
-            (measure, Columns::of(page), rank, ink, weight)
+            (measure, columns, rank, ink, weight)
         }).collect();
         let off_grid: Vec<usize> = pages.iter().map(|page| legal_pdf_core::off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
         let looks = Looks::tally(pages, slots, evidence);

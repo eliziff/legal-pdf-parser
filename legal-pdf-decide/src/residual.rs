@@ -124,7 +124,7 @@ pub fn look_of(
     let at = first.index();
     let page = slots.page(first);
     let line = slots.line(pages, first);
-    let (measure, columns) = geometry.page(page);
+    let (measure, columns) = geometry.page(pages, page);
     let (column_width, column_centre) = columns.place(line, (first.0 - slots.on(page).start) as usize);
     let place = if column_centre.abs() < 0.04 && column_width < 0.8 {
         2
@@ -182,7 +182,7 @@ pub fn marker_alone(evidence: &Evidence, slot: Slot, text: &str) -> bool {
 /// Two lines a blank of most of a line parts, or on two pages: two blocks.
 pub fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: Slot, lower: Slot) -> bool {
     slots.page(upper) != slots.page(lower)
-        || slots.line(pages, lower).bbox[1] - slots.line(pages, upper).bbox[3] > 0.8 * geometry.page(slots.page(lower)).0.height
+        || slots.line(pages, lower).bbox[1] - slots.line(pages, upper).bbox[3] > 0.8 * geometry.page(pages, slots.page(lower)).0.height
 }
 
 /// The residual's weights. A candidate's own evidence as log-odds: `OWN_BASE`, and each of its
@@ -232,7 +232,7 @@ pub fn weigh(pages: &[Page],
 ) {
     let mut families = Families::default();
     let line = |slot: Slot| slots.line(pages, slot);
-    let measure = |slot: Slot| &geometry.page(slots.page(slot)).0;
+    let measure = |slot: Slot| &geometry.page(pages, slots.page(slot)).0;
     let width = |slot: Slot| {
         let (line, measure) = (line(slot), measure(slot));
         (line.bbox[2] - line.bbox[0]) / (measure.right - measure.left).max(1.0)
@@ -312,7 +312,7 @@ pub fn weigh(pages: &[Page],
             // paragraph, a provision or a list's item: its text goes on, as a title's does not.
             let last = sequence[end - 1];
             let page = slots.page(last);
-            let (_, columns) = geometry.page(page);
+            let (_, columns) = geometry.page(pages, page);
             let (last_width, _) = columns.place(line(last), (last.0 - slots.on(page).start) as usize);
             if last_width >= 0.85 && sequence.get(end).is_some_and(|&next| !apart(last, next)) {
                 k = end;

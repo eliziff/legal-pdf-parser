@@ -169,6 +169,7 @@ impl Default for State {
 /// A line as the state reads it: whether it reads in a parallel translation's column, what speaks to its
 /// opening a constituent document, its marker's readings, its note label's value, its transcript line
 /// number, its look, the reference marks it sets, and its place in reading order.
+#[derive(Clone)]
 pub struct LineView<'a> {
     pub translation: bool,
     /// Whether the line may open a constituent document (near its page's top, or one the constituents

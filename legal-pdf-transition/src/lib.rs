@@ -61,7 +61,6 @@ mod joint;
 #[macro_use]
 mod encoder;
 mod doc;
-use legal_pdf_tier0 as tier0;
 
 /// A class the local scores hold below this probability competes only where the state proposes it: a
 /// guard on the parse's cost, not a judgement.
@@ -292,8 +291,9 @@ fn classes_of(state: &State, line: &LineView, local: &Local, gold: Option<&[i64;
     classes
 }
 
-/// Each line as the state reads it, in reading order: tier 0's view (`tier0::line_views`) with what the walk measures.
-fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable, locals: &[Local], sheet: &Stylesheet) -> Vec<LineView<'a>> {
+/// Each line as the state reads it, in reading order: tier 0's view of it (`tier0_views`, `tier0::line_views`, which
+/// reads nothing the walk measures) with what the walk measures.
+fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, fences: &Fences, table: &'a LineTable, tier0_views: &[LineView<'a>], locals: &[Local], sheet: &Stylesheet) -> Vec<LineView<'a>> {
     let grammar = s.grammar.as_ref();
     // Each look's lines as the local scores read them, before any move.
     let heading = usize::from(HEADING) * 2 + 1;
@@ -305,7 +305,7 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
     // The openings the constituents reader names, and each line's place among its page's lines.
     let proposed: HashMap<&str, u8> = fences.starts.iter().map(|start| (start.line_id.as_str(), start.kind_code())).collect();
     let mut on_page: HashMap<usize, u32> = HashMap::new();
-    tier0::line_views(pages, slots, evidence, fences, table).into_iter().enumerate().map(|(k, view)| {
+    tier0_views.iter().cloned().enumerate().map(|(k, view)| {
         let (sum, lines, likely) = looks[&table.looks[k]];
         let slot = table.order[k];
         let seen = on_page.entry(slots.page(slot)).or_default();
@@ -345,8 +345,8 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
 /// order, read twice: a first greedy reading, whose reading of each template the second reads; and, as its environment
 /// asks, what the scorer is fitted on and the labels the grader reads.
 #[allow(clippy::too_many_arguments)]
-pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, outline: &[PdfOutlineEntry], sha256: &str,
-    notes: &Notes, decision: &Decision, table: &LineTable) -> Option<Vec<Move>> {
+pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], sha256: &str,
+    notes: &Notes, decision: &Decision, table: &LineTable, tier0_views: &[LineView]) -> Option<Vec<Move>> {
     let s = settings();
     #[cfg(feature = "encoder")]
     let doc = s.doc.is_some();
@@ -354,10 +354,10 @@ pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
     let doc = false;
     if !doc && !enabled() { return None; }
     let mut table = table.clone();
-    table.measure(pages, slots, evidence, fences, notes, decision);
+    table.measure(pages, slots, evidence, fences, geometry, notes, decision);
     let locals = locals_of(s, pages, slots, &table, sha256);
-    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
-    let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
+    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, &table, &locals);
+    let moves = parse(s, pages, slots, fences, sha256, &table, tier0_views, &locals, &mut sheet);
     doc.then_some(moves)
 }
 
@@ -489,7 +489,7 @@ impl Reading {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
+fn parse(s: &Settings, pages: &[Page], slots: &Slots, fences: &Fences, sha256: &str, table: &LineTable, tier0_views: &[LineView], locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
     let n = table.order.len();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));
     // Each line's reading rank in the gold, -1 for none.
@@ -508,7 +508,7 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
         }
         row
     }).collect();
-    let views = views_of(s, pages, slots, evidence, fences, table, locals, sheet);
+    let views = views_of(s, pages, slots, fences, table, tier0_views, locals, sheet);
     let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
     let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
     // Detect-Order-Construct's decoding from the gold's answers: what it can hold.
@@ -527,7 +527,7 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
     sheet.read_back(&walk(table, &views, locals, None, None).0);
-    let views = views_of(s, pages, slots, evidence, fences, table, locals, sheet);
+    let views = views_of(s, pages, slots, fences, table, tier0_views, locals, sheet);
     let (moves, recorded, reading) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
     if let Some(folder) = &s.dump {
         let write = || -> std::io::Result<()> {
