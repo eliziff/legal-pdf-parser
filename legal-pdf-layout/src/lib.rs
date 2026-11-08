@@ -3,9 +3,10 @@
 
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{line_font_size, median, union_bbox, Diagnostic, Line, Page, Region};
+use legal_pdf_core::{line_font_size, median, union_bbox, Columns, Diagnostic, Line, Page, PageMeasure, Region};
 use regex::Regex;
 use std::{
+    cell::OnceCell,
     collections::{HashMap, HashSet},
     sync::OnceLock,
 };
@@ -97,4 +98,21 @@ fn line_center_y(line: &Line) -> f64 {
 /// Whether a page layout model labelled the line: its region is one of the model's.
 pub fn layout_labelled(line: &Line) -> bool {
     line.region_id.contains("-ppdoc-r")
+}
+
+/// Each page's measures and columns, read once a rule asks for them.
+pub struct Geometry<'a> {
+    pages: &'a [Page],
+    read: Vec<OnceCell<(PageMeasure, Columns)>>,
+}
+
+impl<'a> Geometry<'a> {
+    pub fn of(pages: &'a [Page]) -> Self {
+        Self { pages, read: (0..pages.len()).map(|_| OnceCell::new()).collect() }
+    }
+
+    /// The page's measures (`PageMeasure`) and columns (`Columns`), by page slot.
+    pub fn page(&self, page: usize) -> &(PageMeasure, Columns) {
+        self.read[page].get_or_init(|| (PageMeasure::of(&self.pages[page]), Columns::of(&self.pages[page])))
+    }
 }

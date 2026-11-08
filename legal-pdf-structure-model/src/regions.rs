@@ -60,3 +60,16 @@ pub fn page_region(region: u8, edge: Option<Edge>) -> &'static str {
         _ => "body",
     }
 }
+
+/// Regions whose units run on in one stream, as the gold's do (`labels::stream`): the body's, notes',
+/// marginal notes', furniture's, page and line labels'.
+pub fn stream_of(region: u8) -> usize {
+    match REGIONS[usize::from(region)] {
+        "note" | "note_quote" => 1,
+        "marginal_note" => 2,
+        "furniture" => 3,
+        "page_label" => 4,
+        "line_label" => 5,
+        _ => 0,
+    }
+}

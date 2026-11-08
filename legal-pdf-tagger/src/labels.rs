@@ -10,10 +10,7 @@ use crate::{SourceSpan};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-pub const REGIONS: [&str; 17] = [
-    "none", "text", "list_item", "heading", "quote", "note", "table", "contents", "caption", "headnote", "marginal_note",
-    "furniture", "page_label", "line_label", "title", "note_quote", "provision",
-];
+pub use legal_pdf_structure_model::regions::REGIONS;
 pub const STARTS: [&str; 3] = ["inside", "unit", "resume"];
 
 /// Characters [start, end) of one line of a frame.
@@ -77,15 +74,9 @@ fn index_of(values: &[&str], value: &str) -> usize {
 /// and line labels.
 const STREAMS: usize = 6;
 
+/// A region's stream (`regions::stream_of`).
 fn stream(region: usize) -> usize {
-    match REGIONS[region] {
-        "note" | "note_quote" => 1,
-        "marginal_note" => 2,
-        "furniture" => 3,
-        "page_label" => 4,
-        "line_label" => 5,
-        _ => 0,
-    }
+    legal_pdf_structure_model::regions::stream_of(region as u8)
 }
 
 fn spans_of(state: &State, spans: &[SourceSpan], line_ids: &[String]) -> Vec<SourceSpan> {

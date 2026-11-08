@@ -10,35 +10,31 @@
 //! document's outline is found on its lines and every heading levelled (`levels`), and the decision
 //! written to the pages once (`write`).
 
-use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
-use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, Error, Result};
-use legal_pdf_furniture::{compact_note_line, page_labels_among, Edge};
-use legal_pdf_headings::headings::native::{body_flow_edge, bold_char_share, carries_a_sentence_onto, continues_prose_from, date_line};
-use legal_pdf_headings::{captions, contents_lists, headings};
-use legal_pdf_layout::{columns_of, layout_labelled, page_order, translation_lines, ColumnModel, Stream, TableReadings};
+use legal_pdf_headings::headings::native::date_line;
+use legal_pdf_headings::headings;
+use legal_pdf_layout::layout_labelled;
 use legal_pdf_notes::notes::{
-    endnote_heading, label_is_raised, label_spans, read_band, reference_wrapped_onto, separator_beside_tables, separator_tolerance,
-    structural_reset_heading, verified_endnotes, BandLines, BandPage, NoteKind, BAND_CELL, BAND_EXCLUDED, BAND_FURNITURE, BAND_HEADED,
+    endnote_heading, read_band, separator_tolerance, verified_endnotes, BandLines, BandPage, NoteKind, BAND_CELL, BAND_EXCLUDED, BAND_FURNITURE, BAND_HEADED,
     BAND_LAYOUT, BAND_NOTED, BAND_PARAGRAPH,
 };
 use legal_pdf_text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
-use legal_pdf_text::text::{all_caps, enumerated, party_label, sentence_ended};
-use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, normalize_label};
-use legal_structure_model::{ResolutionRuleV2, StructureAnalysis};
+use legal_pdf_text::text::{all_caps, enumerated, sentence_ended};
+use legal_structure_model::text::{label_prefix, line_start_label_prefix, normalize_label};
+use legal_structure_model::StructureAnalysis;
 use pdf_inspector::markdown::has_dot_leaders as has_dot_leader;
 use regex::Regex;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-pub mod evidence;
+pub use legal_pdf_evidence as evidence;
 pub use evidence::*;
-pub mod paragraphs;
+pub use legal_pdf_fences::paragraphs;
 pub use paragraphs::{Held, Paragraphs};
-pub mod fences;
+pub use legal_pdf_fences::fences;
 pub use fences::*;
-pub mod runs;
+pub use legal_pdf_runs as runs;
 pub use runs::*;
 pub mod notes;
 pub use notes::*;

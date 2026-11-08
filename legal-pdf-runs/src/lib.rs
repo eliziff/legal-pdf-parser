@@ -13,11 +13,17 @@
 //! unit it opens and says whether its number counts. Every place a run names is a line's slot and a
 //! place in its text.
 
-use super::*;
+use legal_pdf_core::model::{Line, Page};
+use legal_pdf_core::{layout_analysis, Error, Result};
+use legal_pdf_evidence::Measure;
+use legal_pdf_fences::{Continuation, Fences};
+use legal_pdf_layout::Geometry;
+use legal_pdf_structure_model::{Evidence, Role, Slot, Slots, SourceTag};
+use std::collections::{BTreeMap, HashMap, HashSet};
 pub use legal_pdf_structure_model::{Member, Place, Run, Runs};
 use legal_structure_model::{
-    CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, StructureCandidateRun, StructureMarkerCandidate,
-    UnitRole,
+    CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, StructureAnalysis, StructureCandidateRun,
+    StructureMarkerCandidate, UnitRole,
 };
 
 /// The markers recognition misread, restored from the runs they stand in, in each document and

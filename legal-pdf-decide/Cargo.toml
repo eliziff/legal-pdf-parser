@@ -21,4 +21,7 @@ legal-pdf-notes = { path = "../legal-pdf-notes" }
 legal-pdf-furniture = { path = "../legal-pdf-furniture" }
 legal-pdf-constituents = { path = "../legal-pdf-constituents" }
 legal-pdf-graph = { path = "../legal-pdf-graph" }
+legal-pdf-evidence = { path = "../legal-pdf-evidence" }
+legal-pdf-fences = { path = "../legal-pdf-fences" }
+legal-pdf-runs = { path = "../legal-pdf-runs" }
 sha2 = "0.10"

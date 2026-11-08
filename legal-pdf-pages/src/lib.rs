@@ -662,6 +662,7 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
     let required = if total == 1 { 1 } else { 2 };
     let required_span = if total <= 4 { 1 } else { 2.max((total as f64 * 0.15).ceil() as usize) };
     let chosen = choose(&ranked, total, required, required_span);
+    let roman = roman_runs(bindings);
     let (shift, range) = match chosen {
         Some(best) => {
             let competitors = ranked.iter().filter(|row| !std::ptr::eq(*row, best)).take(7)
@@ -693,9 +694,9 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
         },
     };
     unconfirmed(bindings, range.clone());
-    for (binding, number) in bindings.iter_mut().zip(1i64..).skip(range.start).take(range.len()) {
+    for ((binding, number), in_roman) in bindings.iter_mut().zip(1i64..).zip(roman).skip(range.start).take(range.len()) {
         let number = number + shift;
-        if number < 1 || binding.status == "ambiguous" || binding.label.as_deref().is_some_and(|label| label.parse::<i64>().is_err()) {
+        if number < 1 || binding.status == "ambiguous" || in_roman {
             continue;
         }
         if binding.label.as_deref() != Some(number.to_string().as_str()) {
@@ -735,6 +736,75 @@ fn ranked_sequences(bindings: &[PdfPageBinding], pages: &[PageEvidence]) -> (Vec
     ranked.sort_by(|a, b| b.anchors.len().cmp(&a.anchors.len()).then(b.span_ratio.total_cmp(&a.span_ratio))
         .then(b.support.total_cmp(&a.support)).then(b.score.total_cmp(&a.score)).then(a.shift.abs().cmp(&b.shift.abs())));
     (candidates, ranked)
+}
+
+/// A roman numeral's value ("xiv" is 14), up to 100 (`roman_page_value`, `ROMAN_PAGE_MAX`).
+fn roman_value(label: &str) -> Option<i64> {
+    static ROMAN: OnceLock<Regex> = OnceLock::new();
+    let roman = ROMAN.get_or_init(|| Regex::new(r"(?i)^(?:c|xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$").unwrap());
+    let label = label.trim();
+    if label.is_empty() || !roman.is_match(label) {
+        return None;
+    }
+    let digit = |c: char| match c.to_ascii_lowercase() { 'i' => 1, 'v' => 5, 'x' => 10, 'l' => 50, 'c' => 100, _ => 0 };
+    let values: Vec<i64> = label.chars().map(digit).collect();
+    let total: i64 = values.iter().enumerate().map(|(at, &v)| if values.get(at + 1).is_some_and(|&next| next > v) { -v } else { v }).sum();
+    (1..=100).contains(&total).then_some(total)
+}
+
+/// The roman runs (Text-Fidelity's roman fit, safe mode): roman folios read on pages whose numbers agree with their
+/// places (two or more at one shift) number the pages from the first to the last of them; a roman folio read alone, or
+/// at odds with its neighbours, is no page number. Returns which pages a roman run holds.
+fn roman_runs(bindings: &mut [PdfPageBinding]) -> Vec<bool> {
+    let mut by_shift: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (at, binding) in bindings.iter().enumerate() {
+        if let Some(value) = binding.label.as_deref().filter(|_| binding.source.as_deref() == Some("detected")).and_then(roman_value) {
+            by_shift.entry(value - at as i64 - 1).or_default().push(at);
+        }
+    }
+    let mut held = vec![false; bindings.len()];
+    let mut runs: Vec<(usize, usize, i64, bool)> = by_shift.into_iter().filter(|(_, pages)| pages.len() >= 2)
+        .map(|(shift, pages)| (pages[0], *pages.last().unwrap(), shift, pages.iter().all(|&at| bindings[at].label.as_deref().is_some_and(|l| l.chars().all(|c| c.is_ascii_lowercase())))))
+        .collect();
+    runs.sort_by_key(|&(first, last, _, _)| std::cmp::Reverse(last - first));
+    for (first, last, shift, lower) in runs {
+        if held[first..=last].iter().any(|&h| h) {
+            continue;
+        }
+        for at in first..=last {
+            held[at] = true;
+            let value = at as i64 + 1 + shift;
+            if value < 1 {
+                continue;
+            }
+            let numeral = roman_numeral(value);
+            let numeral = if lower { numeral } else { numeral.to_uppercase() };
+            if bindings[at].label.as_deref() != Some(numeral.as_str()) {
+                bindings[at].label = Some(numeral);
+                bindings[at].source = Some("sequence".to_owned());
+                bindings[at].status = "resolved".to_owned();
+            }
+        }
+    }
+    for (at, binding) in bindings.iter_mut().enumerate() {
+        if !held[at] && binding.source.as_deref() == Some("detected") && binding.label.as_deref().and_then(roman_value).is_some() {
+            binding.label = None;
+            binding.source = None;
+            binding.status = "unknown".to_owned();
+        }
+    }
+    held
+}
+
+fn roman_numeral(mut value: i64) -> String {
+    let mut out = String::new();
+    for (arabic, roman) in [(100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+        while value >= arabic {
+            out.push_str(roman);
+            value -= arabic;
+        }
+    }
+    out
 }
 
 /// A folio read on a page the sequence does not number (`numbered`) stands on that one reading alone: the sequence fit

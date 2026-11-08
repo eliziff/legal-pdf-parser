@@ -23,7 +23,7 @@ struct KeyPage {
 
 #[derive(Deserialize)]
 struct Key {
-    id: i64,
+    id: serde_json::Value,
     map: Vec<KeyPage>,
     #[serde(default)]
     first_page: Option<serde_json::Value>,
@@ -34,7 +34,7 @@ struct Key {
 
 #[derive(Deserialize)]
 struct Evidence {
-    id: i64,
+    id: serde_json::Value,
     pages: Vec<PageEvidence>,
 }
 
@@ -55,9 +55,9 @@ fn main() {
     };
     let wrong_path = args.iter().position(|arg| arg == "--wrong").and_then(|at| args.get(at + 1));
     let with_starts = args.iter().any(|arg| arg == "--starts");
-    let mut starts_of: HashMap<i64, Vec<u32>> = HashMap::new();
-    let mut detected_of: HashMap<i64, HashMap<u32, String>> = HashMap::new();
-    let keys: HashMap<i64, HashMap<u32, Vec<String>>> = lines::<Key>(key).into_iter().map(|key| {
+    let mut starts_of: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut detected_of: HashMap<String, HashMap<u32, String>> = HashMap::new();
+    let keys: HashMap<String, HashMap<u32, Vec<String>>> = lines::<Key>(key).into_iter().map(|key| {
         let first = key.first_page.as_ref().and_then(|v| v.as_u64().map(|n| n as u32).or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
         if let Some(first) = first { starts_of.insert(key.id, vec![first]); }
         let label = |v: &serde_json::Value| v.as_str().map(|s| s.trim().to_owned()).or_else(|| v.as_i64().map(|n| n.to_string()));
@@ -70,7 +70,8 @@ fn main() {
     let mut tally: BTreeMap<&str, u64> = BTreeMap::new();
     let mut by_source: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut wrong = wrong_path.map(|path| std::fs::File::create(path).expect("--wrong"));
-    let explain: Option<i64> = args.iter().position(|arg| arg == "--explain").and_then(|at| args.get(at + 1)).and_then(|id| id.parse().ok());
+    let explain: Option<String> = args.iter().position(|arg| arg == "--explain").and_then(|at| args.get(at + 1)).map(|id| id.trim_matches('"').to_owned());
+    let name = |id: &serde_json::Value| id.as_str().map_or_else(|| id.to_string(), str::to_owned);
     for article in lines::<Evidence>(evidence) {
         let Some(expected) = keys.get(&article.id) else { continue };
         if explain == Some(article.id) {

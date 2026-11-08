@@ -6,7 +6,18 @@
 //! note label, its reference tokens, the lexicon its words match, and its citations; and the
 //! document's bookmarks, the page labels it declares and whether it is an instrument.
 
-use super::*;
+use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
+use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median};
+use legal_pdf_furniture::compact_note_line;
+use legal_pdf_headings::headings::native::{bold_char_share, date_line};
+use legal_pdf_headings::{captions, contents_lists, headings};
+use legal_pdf_notes::notes::{endnote_heading, label_is_raised, label_spans, reference_wrapped_onto, structural_reset_heading};
+use legal_pdf_text::text::{all_caps, party_label, sentence_ended};
+use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label};
+use legal_structure_model::StructureAnalysis;
+use regex::Regex;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 pub use legal_pdf_structure_model::evidence::*;
 pub use legal_pdf_structure_model::{NoteLabel, PageView, Rows, Slot, Slots, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
 use legal_pdf_core::{dominant_face, CitationSpan, ITALIC};

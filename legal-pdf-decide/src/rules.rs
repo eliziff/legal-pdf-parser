@@ -10,10 +10,9 @@
 //! it, and each marker the unit it opens.
 
 use super::*;
-use legal_pdf_core::{Columns, PageMeasure};
 use legal_pdf_text::heading_ladder::HeadingLadderStatus;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, UnitRole};
-use std::cell::OnceCell;
+pub use legal_pdf_layout::Geometry;
 
 /// A unit a line opens: its run (an index into the document's runs) and its kind.
 pub type Opening = (u32, UnitRole);
@@ -44,23 +43,6 @@ impl Sequences {
         }
         let lines = &self.lines[usize::from(fences.ctx[slot.index()])];
         at.checked_add_signed(step as i32).and_then(|at| lines.get(at as usize).copied())
-    }
-}
-
-/// Each page's measures and columns, read once a rule asks for them.
-pub struct Geometry<'a> {
-    pages: &'a [Page],
-    read: Vec<OnceCell<(PageMeasure, Columns)>>,
-}
-
-impl<'a> Geometry<'a> {
-    pub fn of(pages: &'a [Page]) -> Self {
-        Self { pages, read: (0..pages.len()).map(|_| OnceCell::new()).collect() }
-    }
-
-    /// The page's measures (`PageMeasure`) and columns (`Columns`), by page slot.
-    pub fn page(&self, page: usize) -> &(PageMeasure, Columns) {
-        self.read[page].get_or_init(|| (PageMeasure::of(&self.pages[page]), Columns::of(&self.pages[page])))
     }
 }
 
@@ -271,7 +253,7 @@ impl Decision {
         geometry: &Geometry,
         traced: bool,
     ) -> Self {
-        Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, geometry, traced, true)
+        Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, geometry, traced)
     }
 
     /// The rules up to and through the residual.
@@ -287,7 +269,6 @@ impl Decision {
         outline: &[PdfOutlineEntry],
         geometry: &Geometry,
         traced: bool,
-        hearing: bool,
     ) -> Self {
         let count = slots.len();
         let mut decision = Self {
@@ -299,8 +280,8 @@ impl Decision {
             given: vec![0; count],
             level: vec![0; count],
             anchor: vec![0; count],
-            hearing,
-            free: if hearing { fences.role.iter().map(|role| *role == Role::Open).collect() } else { Vec::new() },
+            hearing: true,
+            free: fences.role.iter().map(|role| *role == Role::Open).collect(),
             ..Self::default()
         };
         let text = |slot: Slot| slots.line(pages, slot).text.trim();
@@ -390,12 +371,9 @@ impl Decision {
         decision.read_runs(pages, slots, evidence, fences, runs, &sequences);
         decision.marginal_notes(analysis, pages, slots, evidence, fences, runs, &sequences);
         // Heard, the outline names a line a marker opens as well as any other.
-        let named: Vec<Role> = if hearing {
-            (0..count).map(|at| if matches!(decision.rule[at], Rule::Opener | Rule::Caption) { Role::Open } else { decision.role[at] }).collect()
-        } else {
-            Vec::new()
-        };
-        let anchoring = anchors(pages, slots, evidence, fences, geometry, if hearing { &named } else { &decision.role }, outline, &fences.contents_entries);
+        let named: Vec<Role> =
+            (0..count).map(|at| if matches!(decision.rule[at], Rule::Opener | Rule::Caption) { Role::Open } else { decision.role[at] }).collect();
+        let anchoring = anchors(pages, slots, evidence, fences, geometry, &named, outline, &fences.contents_entries);
         for (index, anchor) in anchoring.anchors.iter().enumerate() {
             for (k, &slot) in anchor.lines.iter().enumerate() {
                 let spoke = decision.claim(slot, Role::Heading, Rule::Anchor);
@@ -536,9 +514,6 @@ impl Decision {
                     continue;
                 }
                 let Some(kind) = member.kind else { continue };
-                if !self.hearing && (self.rule[at] == Rule::HistoryHeading || self.rule[at] == Rule::TitleOnly) {
-                    continue;
-                }
                 if member.carries_prose {
                     let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
                     if self.claim(member.slot, role, Rule::Opener) {

@@ -77,6 +77,7 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
 
 /// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
 /// paragraphs and footnotes the projection reads: what tier 0 wrote and paired before its moves (`settled`) stands.
+/// Each node's page indexes are its lines' pages, set with its exact membership (`outline_contexts`).
 pub fn structure_graph(
     pages: &mut [Page],
     slots: &Slots,
@@ -210,7 +211,6 @@ pub fn structure_graph(
         node.label = Some(format!("page{}", page.number));
         node.aliases = page.printed_label.clone().map(|label| vec![label]);
         node.anchor.clone_from(&page.printed_label_line_id);
-        node.page_indexes = vec![page.index];
         node.line_ids = page.lines.iter().map(|l| l.id.clone()).collect();
         nodes.push(node);
     }
@@ -247,8 +247,6 @@ pub fn structure_graph(
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
-        node.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&ids[k]).map(|l| l.page_index)).collect();
-        node.page_indexes.dedup();
         let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
         let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
         let lines: Vec<&str> = unit.lines.iter().map(|&k| texts[k].as_str()).collect();
@@ -323,13 +321,10 @@ pub fn structure_graph(
             above.range.end = start;
             above.ranges = above.ranges.iter().filter(|part| part.start < start).map(|part| ScalarRange { start: part.start, end: part.end.min(start) }).collect();
             above.line_ids.truncate(1);
-            above.page_indexes.truncate(1);
             let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, ORIGIN, Derivation::Native, Some(above.id.clone()));
             own.role = Some(PrimaryRole::Text);
             own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
             own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
-            own.page_indexes = unit.lines.iter().filter_map(|&k| index.line(&ids[k]).map(|l| l.page_index)).collect();
-            own.page_indexes.dedup();
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
             own.content_start = scalar(member.content);
             own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
@@ -366,7 +361,6 @@ pub fn structure_graph(
         let mut node = StructureNode::new(id.clone(), kind, claim.body.range, ORIGIN, Derivation::Heuristic, None);
         node.ranges = claim.body.ranges.clone();
         node.line_ids = claim.body.line_ids.clone();
-        node.page_indexes = claim.body.page_indexes.clone();
         node.grammar = Some("region:note".to_owned());
         nodes.push(node);
         notes.push(Note {
@@ -398,7 +392,6 @@ pub fn structure_graph(
         node.role = Some(PrimaryRole::Furniture);
         node.grammar = Some("region:furniture".to_owned());
         node.ranges = vec![range];
-        node.page_indexes = index.line(&ids[k]).map(|l| vec![l.page_index]).unwrap_or_default();
         node.line_ids = vec![id_of(k)];
         nodes.push(node);
     }

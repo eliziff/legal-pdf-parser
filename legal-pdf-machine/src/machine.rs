@@ -22,18 +22,6 @@ pub const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 const DEPTH: usize = 8;
 const LEVELS: i8 = 9;
 
-/// Regions whose units run on in one stream, as the gold's do (`labels::stream`): the body's, notes',
-/// marginal notes', furniture's, page and line labels'.
-pub fn stream_of(region: u8) -> usize {
-    match REGIONS[usize::from(region)] {
-        "note" | "note_quote" => 1,
-        "marginal_note" => 2,
-        "furniture" => 3,
-        "page_label" => 4,
-        "line_label" => 5,
-        _ => 0,
-    }
-}
 /// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
 /// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
