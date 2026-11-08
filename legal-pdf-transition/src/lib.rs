@@ -22,24 +22,11 @@
 //!   LEGALPDF_TRANSITION_LOCAL_SCORES, a folder of each document's local probabilities from another
 //!   tier's model (`<sha>.local.f32`, a line's `CLASSES` in reading order), or LEGALPDF_TRANSITION_ENCODER,
 //!   a folder holding tier 1's or tier 2's document encoder (`encoder`), run in the engine;
-//! - LEGALPDF_TRANSITION_RANKER, a ranker forest: its score, added to a candidate's local log-probability,
-//!   from the candidate's `RANKED` features;
-//! - LEGALPDF_TRANSITION_BEAM, how many whole readings a beam keeps (1, greedy, by default);
-//! - LEGALPDF_TRANSITION_WHOLE: the document read whole (`whole`): every line's move chosen at once by
-//!   its roles, numbers, notes and outline agreeing, in place of the walk; LEGALPDF_TRANSITION_HEADS, the
-//!   folder of its learned heads (LEGALPDF_TRANSITION_HEADS_FOLDS, a folder of k fitted out of fold,
-//!   fold0 ..., each document read by the one fitted without its fold); LEGALPDF_TRANSITION_WHOLE_WEIGHTS, its parts' weights trained on whole
-//!   documents (`train_whole`); LEGALPDF_TRANSITION_WHOLE_DUMP, a folder its problems and the heads'
-//!   training rows are written to (the gold given);
 //! - LEGALPDF_TRANSITION_DOC, a folder holding Detect-Order-Construct's stages as `docparse.py` exports
 //!   them (`doc`): the document read by them in place of the walk; LEGALPDF_TRANSITION_DOC_ORACLE, the gold
 //!   given: the document read by the same decoding from the heads' answers read off the gold (`doc::oracle`),
 //!   what the decoding and the moves can hold; LEGALPDF_TRANSITION_DOC_ORDER=on, the reading's order read off the
 //!   successor head; LEGALPDF_TRANSITION_DOC_TIMES, each document's stages' times;
-//! - LEGALPDF_TRANSITION_JOINT, `weight,penalty`: the reading the joint stylesheet solve makes (`joint`),
-//!   the template prior's term weighted `weight` and a move against its template's role costing
-//!   `penalty`; LEGALPDF_TRANSITION_PRIOR, the template prior's forest (none: the roles weighed on the
-//!   reading alone);
 //! - LEGALPDF_TRANSITION_GRAMMAR, the grammar tables counted over legal text (`grammar`);
 //! - LEGALPDF_TRANSITION_CONFUSIONS, how recognition misreads the characters of a line's opening marker,
 //!   counted over the gold's corrected lines ({read: {meant: share}}): a recognized line's marker is
@@ -69,7 +56,6 @@ pub use legal_pdf_machine::grammar::{self, Tables};
 mod stylesheet;
 pub use stylesheet::*;
 mod joint;
-mod whole;
 #[cfg(feature = "encoder")]
 mod encoder;
 mod doc;
@@ -109,19 +95,10 @@ enum LocalScores {
 /// What the transition parser is given: its models, the gold where it is fitted or measured, and what it writes.
 pub struct Settings {
     local: Option<LocalScores>,
-    ranker: Option<Forest>,
     gold: Option<GoldLabels>,
     dump: Option<PathBuf>,
     dump_lines: f64,
     labels: Option<PathBuf>,
-    beam: usize,
-    joint: Option<(f64, f64)>,
-    whole: bool,
-    heads: Option<whole::Heads>,
-    heads_folds: Vec<whole::Heads>,
-    whole_dump: Option<PathBuf>,
-    whole_weights: [f64; whole::WEIGHTS],
-    prior: Option<Forest>,
     #[cfg(feature = "encoder")]
     doc: Option<doc::Reader>,
     doc_oracle: bool,
@@ -155,23 +132,10 @@ impl Settings {
         };
         Settings {
             local,
-            ranker: var("LEGALPDF_TRANSITION_RANKER").and_then(|path| forest(path, RANKED, 1)),
             gold: var("LEGALPDF_TRANSITION_GOLD").map(|path| read_gold(&path)),
             dump: var("LEGALPDF_TRANSITION_DUMP"),
             dump_lines: std::env::var("LEGALPDF_TRANSITION_DUMP_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             labels: var("LEGALPDF_TRANSITION_LABELS"),
-            beam: std::env::var("LEGALPDF_TRANSITION_BEAM").ok().and_then(|w| w.parse().ok()).unwrap_or(1),
-            joint: std::env::var("LEGALPDF_TRANSITION_JOINT").ok().and_then(|v| {
-                let (weight, penalty) = v.split_once(',')?;
-                Some((weight.trim().parse().ok()?, penalty.trim().parse().ok()?))
-            }),
-            whole: std::env::var_os("LEGALPDF_TRANSITION_WHOLE").is_some(),
-            heads: var("LEGALPDF_TRANSITION_HEADS").and_then(|dir| whole::Heads::read(&dir).map_err(|e| eprintln!("transition parser: {e}")).ok()),
-            heads_folds: var("LEGALPDF_TRANSITION_HEADS_FOLDS").map(|dir| (0..).map(|k| dir.join(format!("fold{k}"))).take_while(|d| d.exists())
-                .filter_map(|d| whole::Heads::read(&d).map_err(|e| eprintln!("transition parser: {e}")).ok()).collect()).unwrap_or_default(),
-            whole_dump: var("LEGALPDF_TRANSITION_WHOLE_DUMP"),
-            whole_weights: var("LEGALPDF_TRANSITION_WHOLE_WEIGHTS").and_then(|path| whole::read_weights(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()).unwrap_or(whole::PRIOR_WEIGHTS),
-            prior: var("LEGALPDF_TRANSITION_PRIOR").and_then(|path| forest(path, joint::PRIOR, joint::ROLES)),
             doc_oracle: std::env::var_os("LEGALPDF_TRANSITION_DOC_ORACLE").is_some(),
             #[cfg(feature = "encoder")]
             doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| {
@@ -183,12 +147,6 @@ impl Settings {
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
         }
     }
-}
-
-/// The whole reading's weights trained on whole documents: the problems in `problems` (a dump's), read
-/// `epochs` times, the averaged weights written to `out` (`whole::train`).
-pub fn train_whole(problems: &Path, out: &Path, epochs: usize) -> std::result::Result<String, String> {
-    whole::train(problems, out, epochs)
 }
 
 /// Whether the transition parser runs on this parse.
@@ -498,7 +456,7 @@ fn drawn(sha256: &str, k: usize, share: f64) -> bool {
 /// where `gold` is given and reachable (the first round's rollout), else the local scores' best class,
 /// counting on nothing. With `record` (the document's sha256 and the share of its lines
 /// drawn), each drawn line's candidates as the scorer is fitted on them.
-fn walk(s: &Settings, table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded) {
+fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded) {
     let mut state = State::default();
     let mut moves = Vec::with_capacity(views.len());
     let mut recorded = Recorded::default();
@@ -507,16 +465,10 @@ fn walk(s: &Settings, table: &LineTable, views: &[LineView], locals: &[Local], g
         let candidates = state.candidates(line, &classes_of(&state, line, local, gold.map(|g| &g[k])));
         let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
         let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
-        let choice = match &s.ranker {
-            Some(ranker) => {
-                let scores: Vec<f64> = features.iter().map(|f| move_score(ranker, f)).collect();
-                (0..candidates.len()).max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a))).unwrap_or(0)
-            }
-            None => best_oracle.unwrap_or_else(|| {
-                candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume && !m.starts
-                    && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0)
-            }),
-        };
+        let choice = best_oracle.unwrap_or_else(|| {
+            candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume && !m.starts
+                && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0)
+        });
         if record.is_some_and(|(sha256, share)| drawn(sha256, k, share)) {
             for (c, f) in features.iter().enumerate() {
                 recorded.rows.extend_from_slice(f);
@@ -573,27 +525,14 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
             Err(error) => eprintln!("transition parser DOC {sha256}: {error}"),
         }
     }
-    // The document read whole: every line's move chosen at once from the evidence alone, no first reading.
-    if s.whole {
-        // Out of fold where fold heads are given (a training document read by heads fitted without it).
-        let heads = if s.heads_folds.is_empty() { s.heads.as_ref() } else { Some(&s.heads_folds[fold_of(sha256, s.heads_folds.len())]) };
-        let moves = whole::read(table, &views, locals, &sheet.template, heads, &s.whole_weights, gold.map(|_| &gold_rows[..]), s.whole_dump.as_deref().map(|folder| (folder, sha256)));
-        write_labels(s, sha256, &ids, &views, &moves);
-        return moves;
-    }
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
-    let first = walk(s, table, &views, locals, None, None).0;
+    let first = walk(table, &views, locals, None, None).0;
     sheet.read_back(&first);
     let views = views_of(s, pages, slots, evidence, fences, table, locals, sheet);
-    let moves = match (&s.ranker, s.beam) {
-        (Some(ranker), _) if s.dump.is_none() && s.joint.is_some() => {
-            let (weight, penalty) = s.joint.unwrap_or_default();
-            joint::solve(ranker, s.prior.as_ref(), weight, penalty, table, &views, locals, sheet)
-        }
-        (Some(ranker), width) if width > 1 && s.dump.is_none() => beam(ranker, width, table, &views, locals),
-        _ => {
-            let (moves, recorded) = walk(s, table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
+    let moves = {
+        {
+            let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
             let (move_rows, move_lines, move_classes, move_oracle) = (recorded.rows, recorded.lines, recorded.classes, recorded.oracle);
             if let Some(folder) = &s.dump {
                 let write = || -> std::io::Result<()> {
@@ -640,45 +579,6 @@ fn write_labels(s: &Settings, sha256: &str, ids: &[String], views: &[LineView], 
     }
 }
 
-
-/// The best whole reading a beam of `width` keeps: every reading kept extended by each of the line's
-/// candidates, scored by the ranker's log-probability of the candidate among the line's (its scores
-/// softmaxed per line) summed over the reading; the best `width` go on.
-fn beam(ranker: &Forest, width: usize, table: &LineTable, views: &[LineView], locals: &[Local]) -> Vec<Move> {
-    // Each move made, with the move before it on its reading.
-    let mut made: Vec<(Option<usize>, Move)> = Vec::new();
-    let mut readings: Vec<(State, f64, Option<usize>)> = vec![(State::default(), 0.0, None)];
-    for k in 0..views.len() {
-        let (line, local) = (&views[k], &locals[k]);
-        let mut extended: Vec<(usize, Move, f64)> = Vec::new();
-        for (r, (state, score, _)) in readings.iter().enumerate() {
-            let candidates = state.candidates(line, &classes_of(state, line, local, None));
-            let scores: Vec<f64> = candidates.iter().map(|m| move_score(ranker, &ranked_features(state, line, table.row(k), local, m))).collect();
-            let top = scores.iter().copied().fold(f64::MIN, f64::max);
-            let total: f64 = scores.iter().map(|x| (x - top).exp()).sum();
-            for (m, x) in candidates.into_iter().zip(scores) {
-                extended.push((r, m, score + (x - top) - total.ln()));
-            }
-        }
-        extended.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-        extended.truncate(width);
-        readings = extended.into_iter().map(|(r, m, score)| {
-            let mut state = readings[r].0.clone();
-            state.apply(line, &m);
-            made.push((readings[r].2, m));
-            (state, score, Some(made.len() - 1))
-        }).collect();
-    }
-    let mut moves = Vec::with_capacity(views.len());
-    let mut at = readings.first().and_then(|r| r.2);
-    while let Some(k) = at {
-        moves.push(made[k].1);
-        at = made[k].0;
-    }
-    moves.reverse();
-    moves
-}
-
 /// The moves as the grader's labels, the state replayed over them: region, opening, document start,
 /// paired reference (a line a note answered), a heading's level step, a marker, no resumption, a body
 /// unit's depth step.
@@ -708,12 +608,6 @@ fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
         labels[line][3] = 1;
     }
     labels
-}
-
-/// A candidate's score: its class's local log-probability, and the ranker's correction for its fit to the
-/// state (fitted from the local score as its base).
-fn move_score(ranker: &Forest, features: &[f32; RANKED]) -> f64 {
-    f64::from(features[0]) + ranker.scores(features)[0]
 }
 
 /// Which of `folds` folds a source falls in: the CRC-32 of its sha256 (zlib's), modulo `folds`.

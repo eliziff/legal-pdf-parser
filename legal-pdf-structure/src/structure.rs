@@ -41,10 +41,6 @@ use legal_pdf_machine::machine::{MARGIN, OPENING};
 use legal_pdf_structure_model::regions::{NOTE, NOTE_QUOTE};
 use std::path::Path;
 
-/// The transition parser's whole reading trained on whole documents (`transition::train_whole`).
-pub fn train_whole_reading(problems: &std::path::Path, out: &std::path::Path, epochs: usize) -> std::result::Result<String, String> {
-    transition::train_whole(problems, out, epochs)
-}
 use graph::map_note_pairs;
 use legal_pdf_core::model::{Diagnostic, Footnote, Page, Paragraph, PdfOutlineEntry};
 use legal_pdf_core::{Error, Result};
