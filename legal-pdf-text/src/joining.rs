@@ -42,15 +42,19 @@ pub fn seam(before: &str, after: &str, vocabulary: &Vocabulary) -> Join {
     }
 }
 
-/// The hyphens in a line's text that split one word, each its scalar offset: a hyphen between letters where no compound
-/// is written ("Companies' Cr-editors Arrangement Act"), a recognizer's read into the text, where pdf-inspector's
-/// `join_decision` reads the two parts as one word, the document writing it whole elsewhere. A compound whose second part
-/// opens with a capital or a digit ("Non-Renewable", "C-36"), or that the document never writes whole, keeps it.
+/// The hyphens in a line's text that split one word, each its UTF-16 offset in the line: a hyphen between letters where
+/// no compound is written ("Companies' Cr-editors Arrangement Act"), a recognizer's read into the text, where
+/// pdf-inspector's `join_decision` reads the two parts as one word, the document writing it whole elsewhere. A compound
+/// whose second part opens with a capital or a digit ("Non-Renewable", "C-36"), or that the document never writes whole,
+/// keeps it.
 pub fn split_words(text: &str, vocabulary: &Vocabulary) -> Vec<usize> {
     use pdf_inspector::markdown::join_decision;
     let characters: Vec<char> = text.chars().collect();
     let mut hyphens = Vec::new();
+    let mut unit = characters.first().map_or(0, |c| c.len_utf16());
     for at in 1..characters.len() {
+        let here = unit;
+        unit += characters[at].len_utf16();
         if characters[at] != '-' || !characters[at - 1].is_alphabetic() {
             continue;
         }
@@ -62,7 +66,7 @@ pub fn split_words(text: &str, vocabulary: &Vocabulary) -> Vec<usize> {
         let before: String = characters[at - first..at].iter().collect();
         let after: String = characters[at + 1..at + 1 + second].iter().collect();
         if join_decision(&before, &after, &vocabulary.0, &vocabulary.1) == Join::Plain {
-            hyphens.push(at);
+            hyphens.push(here);
         }
     }
     hyphens

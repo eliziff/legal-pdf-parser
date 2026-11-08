@@ -37,7 +37,7 @@ const TOLERANCE: f64 = 2.0;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CellPart {
     pub line_id: String,
-    /// Character offsets of the part within its line's text.
+    /// The part's UTF-16 offsets within its line's text.
     pub chars: Option<(usize, usize)>,
     text: String,
     bbox: [f64; 4],
@@ -123,7 +123,11 @@ fn cell_of(page: &Page, column: usize, mut pieces: Vec<Piece>) -> TableCell {
     let part = |piece: Piece| {
         let line = &page.lines[piece.line];
         let text = piece.chars.map_or_else(|| line.text.clone(), |(start, end)| line.text.chars().skip(start).take(end - start).collect());
-        CellPart { line_id: line.id.clone(), chars: piece.chars, text, bbox: piece.bbox }
+        // The words' characters (as the extraction places a word) stand in the line's UTF-16 code units, as the
+        // structure places text.
+        let units = |scalar: usize| line.text.chars().take(scalar).map(char::len_utf16).sum::<usize>();
+        let chars = piece.chars.map(|(start, end)| (units(start), units(end)));
+        CellPart { line_id: line.id.clone(), chars, text, bbox: piece.bbox }
     };
     TableCell { column, row_span: 1, column_span: 1, parts: keyed.into_iter().map(|(_, piece)| part(piece)).collect() }
 }

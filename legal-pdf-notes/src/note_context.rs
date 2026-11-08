@@ -9,41 +9,55 @@ use legal_pdf_structure_model::{Decided, DocumentContext};
 use legal_structure_model::text::normalize_label;
 use std::collections::{HashMap, HashSet};
 
-/// Each sentence's end in `chars`: its stop and the quotes or brackets closing it, where a space, a
-/// note's marker or the text's end follows.
-pub fn sentence_boundaries(chars: &[char]) -> Vec<(usize, usize)> {
+/// Whether a UTF-16 code unit is a white space character (half a surrogate pair never is).
+fn blank(unit: u16) -> bool {
+    char::from_u32(u32::from(unit)).is_some_and(char::is_whitespace)
+}
+
+/// The text of UTF-16 code units, trimmed.
+fn read(units: &[u16]) -> String {
+    String::from_utf16_lossy(units).trim().to_owned()
+}
+
+/// Each sentence's end in `units` (a text's UTF-16 code units): its stop and the quotes or brackets
+/// closing it, where a space, a note's marker or the text's end follows.
+pub fn sentence_boundaries(units: &[u16]) -> Vec<(usize, usize)> {
+    fn is(unit: Option<&u16>, characters: &[char]) -> bool {
+        unit.is_some_and(|&unit| characters.iter().any(|&c| u32::from(unit) == u32::from(c)))
+    }
+    let marker: Vec<u16> = "\u{27e6}FN:".encode_utf16().collect();
     let mut boundaries = Vec::<(usize, usize)>::new();
     let mut index = 0;
-    while index < chars.len() {
-        if !matches!(chars[index], '.' | '?' | '!') {
+    while index < units.len() {
+        if !is(units.get(index), &['.', '?', '!']) {
             index += 1;
             continue;
         }
         let start = index;
         index += 1;
-        while chars.get(index).is_some_and(|character| ['"', '\'', '”', '’', ')', ']'].contains(character)) {
+        while is(units.get(index), &['"', '\'', '\u{201d}', '\u{2019}', ')', ']']) {
             index += 1;
         }
-        if chars.get(index).is_none_or(|character| character.is_whitespace()) || chars[index..].starts_with(&['⟦', 'F', 'N', ':']) {
+        if units.get(index).is_none_or(|&unit| blank(unit)) || units[index..].starts_with(&marker) {
             boundaries.push((start, index));
         }
     }
     boundaries
 }
 
-pub fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize)], offset: usize) -> String {
+pub fn sentence_at_boundaries(units: &[u16], boundaries: &[(usize, usize)], offset: usize) -> String {
     let previous = &boundaries[..boundaries.partition_point(|(_, end)| *end <= offset)];
     let (start, end) = match previous.last() {
         // A reference after a sentence's stop is that sentence's.
-        Some(&(_, end)) if chars[end..offset.min(chars.len())].iter().all(|character| character.is_whitespace()) => {
+        Some(&(_, end)) if units[end..offset.min(units.len())].iter().all(|&unit| blank(unit)) => {
             (if previous.len() > 1 { previous[previous.len() - 2].1 } else { 0 }, end)
         }
         last => (
             last.map_or(0, |(_, end)| *end),
-            boundaries.iter().find(|(boundary_start, _)| *boundary_start >= offset).map_or(chars.len(), |(_, boundary_end)| *boundary_end),
+            boundaries.iter().find(|(boundary_start, _)| *boundary_start >= offset).map_or(units.len(), |(_, boundary_end)| *boundary_end),
         ),
     };
-    chars[start..end].iter().collect::<String>().trim().to_owned()
+    read(&units[start..end])
 }
 
 /// The document's notes in order, each its node.
@@ -67,20 +81,22 @@ pub fn attach_propositions(structure: &mut DocumentStructure, units: &[Authority
     for unit in units.iter().filter(|unit| unit.kind == "body") {
         let context = unit.source.as_ref().and_then(|source| source.line_ids.first()).map_or((0, false), |id| decided.document_context(id));
         let previous_tail = tails.entry(context).or_default();
-        let coordinates = ScalarText::new(&unit.text);
-        let chars: Vec<char> = unit.text.chars().collect();
-        let boundaries = sentence_boundaries(&chars);
+        let units: Vec<u16> = unit.text.encode_utf16().collect();
+        let boundaries = sentence_boundaries(&units);
         let mut previous_offset = 0;
         for &(ordinal, offset) in &unit.footnote_refs {
-            let Some(offset) = coordinates.scalar_at_utf16(offset) else { continue };
+            // (A mark past the text, or inside a character's surrogate pair, stands nowhere.)
+            if offset > units.len() || units.get(offset).is_some_and(|unit| (0xdc00..0xe000).contains(unit)) {
+                continue;
+            }
             let Some(&at) = usize::try_from(ordinal).ok().and_then(|ordinal| ordinal.checked_sub(1)).and_then(|at| ordered.get(at)) else { continue };
-            let passage = chars[previous_offset.min(offset)..offset].iter().collect::<String>().trim().to_owned();
+            let passage = read(&units[previous_offset.min(offset)..offset]);
             let properties = &mut structure.nodes[at].properties;
-            properties.insert("sentence".to_owned(), sentence_at_boundaries(&chars, &boundaries, offset).trim().to_owned());
+            properties.insert("sentence".to_owned(), sentence_at_boundaries(&units, &boundaries, offset));
             properties.insert("passage".to_owned(), if passage.is_empty() { previous_tail.clone() } else { passage });
             previous_offset = offset;
         }
-        *previous_tail = chars[previous_offset.min(chars.len())..].iter().collect::<String>().trim().to_owned();
+        *previous_tail = read(&units[previous_offset.min(units.len())..]);
     }
 }
 
@@ -93,8 +109,10 @@ pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], 
     let first_calls: HashSet<usize> = notes.iter().filter_map(|note| note.calls.first()).map(|call| call.start).collect();
     let mut diagnostics = Vec::new();
     for line in pages.iter().flat_map(|page| page.lines.iter()) {
+        // A detached reference's characters (as recognition places it) stand in the line's UTF-16 code units.
+        let units = |characters: usize| (characters <= line.text.chars().count()).then(|| line.text.chars().take(characters).map(char::len_utf16).sum::<usize>());
         for detached in &line.detached_references {
-            let placed = index.global_range(&line.id, detached.start_offset, detached.end_offset);
+            let placed = units(detached.start_offset).zip(units(detached.end_offset)).and_then(|(start, end)| index.global_range(&line.id, start, end));
             if !placed.is_some_and(|range| calls.contains(&(range.start, range.end))) {
                 diagnostics.push(Diagnostic::new("FOOTNOTE_UNMATCHED_REFERENCE", Some(line.page_index)));
             }

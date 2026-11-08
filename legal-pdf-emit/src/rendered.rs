@@ -31,8 +31,8 @@ fn note(node: &StructureNode) -> bool {
     matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)
 }
 
-/// A line's text with its manuscript edits applied (scalar offsets in the line), and the stretches of it left unchanged:
-/// each its start and end in the output and its start in the line, in UTF-16.
+/// A line's text with its manuscript edits applied (UTF-16 offsets in the line), and the stretches of it left
+/// unchanged: each its start and end in the output and its start in the line, in UTF-16.
 fn edited(text: &str, edits: &[(usize, usize, String)]) -> Result<(String, Vec<(usize, usize, usize)>)> {
     let source = ScalarText::new(text);
     let mut output = String::with_capacity(text.len());
@@ -42,21 +42,20 @@ fn edited(text: &str, edits: &[(usize, usize, String)]) -> Result<(String, Vec<(
         if start > end || *start < cursor || prior.is_some_and(|prior| *start <= prior) {
             return Err(fault("Invalid manuscript edit order"));
         }
-        let unchanged = source.slice(cursor..*start).ok_or_else(|| fault("Manuscript edit starts outside its source line"))?;
-        if source.utf16_at_scalar(*end).is_none() {
+        let unchanged = source.slice_utf16(cursor..*start).ok_or_else(|| fault("Manuscript edit starts outside its source line"))?;
+        if source.byte_at_utf16(*end).is_none() {
             return Err(fault("Manuscript edit ends outside its source line"));
         }
         let at = utf16_len(&output);
-        kept.push((at, at + utf16_len(unchanged), source.utf16_at_scalar(cursor).unwrap()));
+        kept.push((at, at + utf16_len(unchanged), cursor));
         output.push_str(unchanged);
         output.push_str(replacement);
         cursor = *end;
         prior = Some(*start);
     }
-    let from = source.utf16_at_scalar(cursor).unwrap();
-    let rest = source.slice_utf16(from..source.utf16_len()).unwrap();
+    let rest = source.slice_utf16(cursor..source.utf16_len()).unwrap();
     let at = utf16_len(&output);
-    kept.push((at, at + utf16_len(rest), from));
+    kept.push((at, at + utf16_len(rest), cursor));
     output.push_str(rest);
     Ok((output, kept))
 }

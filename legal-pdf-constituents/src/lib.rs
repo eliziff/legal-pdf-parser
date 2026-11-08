@@ -226,7 +226,7 @@ pub fn documents(views: &[PageView], starts: &[Start], furniture: impl Fn(Slot) 
 
 pub fn constituents(index: &PdfTextIndex, pages: &[Page], starts: &[Start]) -> Vec<StructureNode> {
     let starts = starts.iter().filter_map(|start| Some((index.line(&start.line_id)?.range.start, start.kind.as_str()))).collect::<Vec<_>>();
-    let end = index.text().chars().count();
+    let end = legal_structure_model::utf16_len(index.text());
     let page_of = pages.iter().flat_map(|page| page.lines.iter().map(move |line| (line.id.as_str(), page.index))).collect::<HashMap<_, _>>();
     starts
         .iter()

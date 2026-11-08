@@ -4,7 +4,7 @@ use crate::Slot;
 use legal_pdf_core::model::Word;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, UnitRole};
 
-/// A place in a line's text: the line's slot and the characters before the place.
+/// A place in a line's text: the line's slot and the UTF-16 code units before the place.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Place {
     pub slot: Slot,

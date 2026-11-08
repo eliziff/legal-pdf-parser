@@ -20,7 +20,7 @@ use legal_pdf_text::joining::{seam, split_words, Join};
 use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
 use legal_pdf_structure_model::{Decided, Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_structure_model::{ContinuationKind, NodeKind, ScalarRange, SourceContinuation, SourceJoin};
+use legal_structure_model::{utf16_len, ContinuationKind, NodeKind, ScalarRange, ScalarText, SourceContinuation, SourceJoin};
 use std::collections::{HashMap, HashSet};
 
 mod rendered;
@@ -50,26 +50,27 @@ struct Unit {
     page_start: Option<(usize, usize)>,
 }
 
-/// The opening token's characters in a line's text: its first and past-last, leading spaces skipped;
-/// with `word`, the token after it too ("PART II").
+/// The opening token in a line's text, in UTF-16 code units: its first and past-last, leading spaces
+/// skipped; with `word`, the token after it too ("PART II").
 fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
-    let chars: Vec<char> = text.chars().collect();
-    let start = chars.iter().position(|c| !c.is_whitespace())?;
-    let mut end = start + chars[start..].iter().take_while(|c| !c.is_whitespace()).count();
-    if word {
-        let next = end + chars[end..].iter().take_while(|c| c.is_whitespace()).count();
-        end = next + chars[next..].iter().take_while(|c| !c.is_whitespace()).count();
+    let past = |from: usize, blank: bool| from + text[from..].find(|c: char| c.is_whitespace() != blank).unwrap_or(text.len() - from);
+    let start = past(0, true);
+    if start == text.len() {
+        return None;
     }
-    Some((start, end))
+    let mut end = past(start, false);
+    if word {
+        end = past(past(end, true), false);
+    }
+    Some((utf16_len(&text[..start]), utf16_len(&text[..end])))
 }
 
-/// The figures a line's text opens on: what they read, and their first and past-last character.
+/// The figures a line's text opens on: what they read, and their first and past-last UTF-16 code unit.
 pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
-    let chars: Vec<char> = text.chars().collect();
-    let start = chars.iter().position(|c| !c.is_whitespace())?;
-    let length = chars[start..].iter().take_while(|c| c.is_ascii_digit()).count();
-    let figures: String = chars[start..start + length].iter().collect();
-    Some((figures.parse().ok()?, (start, start + length)))
+    let start = text.find(|c: char| !c.is_whitespace())?;
+    let length = text[start..].bytes().take_while(u8::is_ascii_digit).count();
+    let at = utf16_len(&text[..start]);
+    Some((text[start..start + length].parse().ok()?, (at, at + length)))
 }
 
 /// The document's structure from its lines (`table`) and the moves they make, in one walk: each line's move is
@@ -162,7 +163,7 @@ pub fn structure_graph(pages: &[Page],
             };
             // A unit's label is its marker as printed ("12", "(a)", "[4]"), a note's its number, a line
             // number's or page label's its text.
-            let printed = |(start, end): (usize, usize)| text.chars().skip(start).take(end - start).collect::<String>().trim().trim_end_matches('.').to_owned();
+            let printed = |(start, end): (usize, usize)| ScalarText::new(&text).slice_utf16(start..end).unwrap_or_default().trim().trim_end_matches('.').to_owned();
             let label = if single {
                 Some(text.trim().to_owned())
             } else if chosen.region == NOTE {
@@ -184,7 +185,8 @@ pub fn structure_graph(pages: &[Page],
                     let before = texts[j].trim();
                     let separator = match seam(before, written, &vocabulary) {
                         Join::Plain => {
-                            let at = texts[j].chars().take_while(|c| c.is_whitespace()).count() + before.chars().count() - 1;
+                            // The dropped hyphen's UTF-16 offset in its line, `before` being the line trimmed.
+                            let at = utf16_len(&texts[j][..texts[j].len() - texts[j].trim_start().len()]) + utf16_len(before) - 1;
                             edits.entry(ids[j].clone()).or_default().push((at, at + 1, String::new()));
                             ""
                         }
@@ -214,7 +216,8 @@ pub fn structure_graph(pages: &[Page],
             units[u].references.push((place as usize, start, end));
         }
     }
-    // Nodes, their ranges in scalar characters of the text; their parents are the outline's (`assemble_outline`).
+    // Nodes, their ranges in UTF-16 code units of the text, as the index places the lines; their parents are the
+    // outline's (`assemble_outline`).
     let line_range = |k: usize| index.line(&ids[k]).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
     // A written page's line set apart keeps the id its line's kind gives it, as the projection reads such lines.
@@ -279,14 +282,14 @@ pub fn structure_graph(pages: &[Page],
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
         let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
-        let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
+        let placed = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
         let lines: Vec<&str> = unit.lines.iter().map(|&k| texts[k].as_str()).collect();
         // A settled unit is addressed as the run it opens on reads it: a paragraph by its count, a provision by its
         // grammar's value (a clause, a part, an article), its printing an alias; its marker and text where they stand.
         // Its marker is the run member's where the unit opens on one, else a heading's number as its text reads it, else
         // the unit's own (a note's none); its label a heading's text, else the member's, else the unit's own, a numbered
         // paragraph's its number ("12" for "[12]" or "12."), as the document prints it.
-        node.marker_range = member.and_then(|member| scalar(member.marker[0]).zip(scalar(member.marker[1])))
+        node.marker_range = member.and_then(|member| placed(member.marker[0]).zip(placed(member.marker[1])))
             .map(|(start, end)| ScalarRange { start, end: end.max(start) })
             .or_else(|| match kind {
                 NodeKind::Footnote => None,
@@ -308,7 +311,7 @@ pub fn structure_graph(pages: &[Page],
             node.locator_kind = Some("section".to_owned());
         }
         if let Some(member) = member {
-            node.content_start = scalar(member.content);
+            node.content_start = placed(member.content);
             match kind {
                 NodeKind::Paragraph => node.aliases = Some(vec![member.label.clone()]),
                 NodeKind::Section => {
@@ -337,8 +340,8 @@ pub fn structure_graph(pages: &[Page],
         let mut holder = nodes.len() - 1;
         for &(run, at) in &opening.within {
             let member = &settled.runs.runs[run as usize].members[at as usize];
-            let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
-            let (Some((start, end)), Some(role)) = (scalar(member.marker[0]).zip(scalar(member.marker[1])), member.kind) else { continue };
+            let placed = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
+            let (Some((start, end)), Some(role)) = (placed(member.marker[0]).zip(placed(member.marker[1])), member.kind) else { continue };
             let kind = match role {
                 legal_structure_model::UnitRole::Section => NodeKind::Section,
                 legal_structure_model::UnitRole::Item => NodeKind::ListItem,
@@ -354,7 +357,7 @@ pub fn structure_graph(pages: &[Page],
             own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
             own.grammar.clone_from(&nodes[holder].grammar);
-            own.content_start = scalar(member.content);
+            own.content_start = placed(member.content);
             own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
             if kind == NodeKind::Section {
                 own.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
@@ -414,7 +417,6 @@ pub fn structure_graph(pages: &[Page],
     let mut structure = DocumentStructure::new(identity.document_id.clone(), "local-pdf", index.text().to_owned(), ORIGIN);
     structure.origins.push(Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() });
     structure.source_sha256 = Some(identity.source_sha256.clone());
-    DocumentStructure::project_scalar_parts(&legal_structure_model::ScalarText::new(&structure.text), &mut nodes);
     structure.nodes = nodes;
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();

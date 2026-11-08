@@ -1,13 +1,14 @@
 //! The structure graph's nodes from the parse: its paragraphs and headings.
 
 use super::*;
+use legal_structure_model::utf16_len;
 
 /// A heading's printed number, its first line `line` starting at `start` in the text and the heading holding `lines`
 /// lines: before its title on that line, or that whole line where the number stands alone over its title ("II." over
 /// "Background Facts").
 pub fn heading_marker(start: usize, line: &str, lines: usize) -> Option<ScalarRange> {
     let found = heading_marker_re().captures(line).or_else(|| (lines > 1).then(|| heading_marker_alone_re().captures(line)).flatten())?.get(1)?;
-    Some(ScalarRange { start: start + line[..found.start()].chars().count(), end: start + line[..found.end()].chars().count() })
+    Some(ScalarRange { start: start + utf16_len(&line[..found.start()]), end: start + utf16_len(&line[..found.end()]) })
 }
 
 /// The ranges of the lines `line_ids` names, as the index holds them.

@@ -92,7 +92,7 @@ fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Sl
 /// A reading context's lines as one text, line under line, a marker standing alone on its line
 /// run on with the line beside it that carries its text, and a citation wrapped from one line to the
 /// next run on as one ("[1997]" over "1 S.C.R. 748": the volume opening the line is no marker): each
-/// line's slot and where it begins and ends in the text, in scalars.
+/// line's slot and where it begins and ends in the text, in UTF-16 code units.
 struct View {
     text: String,
     lines: Vec<(Slot, usize, usize)>,
@@ -116,20 +116,20 @@ impl View {
             }
             let line = &slots.line(pages, slot).text;
             text.push_str(line);
-            let length = line.chars().count();
+            let length = legal_structure_model::utf16_len(line);
             placed.push((slot, cursor, cursor + length));
             cursor += length;
         }
         Self { text, lines: placed }
     }
 
-    /// The place of the line holding the scalar `at` (the line before, where `at` falls between
-    /// lines), by its index among the view's lines.
+    /// The place of the line holding the UTF-16 offset `at` (the line before, where `at` falls
+    /// between lines), by its index among the view's lines.
     fn line_at(&self, at: usize) -> usize {
         self.lines.partition_point(|&(_, start, _)| start <= at).saturating_sub(1)
     }
 
-    /// Where the scalar `at` falls, as a place in a line's text.
+    /// Where the UTF-16 offset `at` falls, as a place in a line's text.
     fn place(&self, at: usize) -> Place {
         let (slot, start, end) = self.lines[self.line_at(at)];
         Place { slot, offset: (at.clamp(start, end) - start) as u32 }
@@ -143,17 +143,25 @@ impl View {
     }
 }
 
+/// The byte in a line's text at its UTF-16 offset `offset`, the text's end past it.
+fn byte_at(text: &str, offset: u32) -> usize {
+    let mut units = 0;
+    text.char_indices().find(|&(_, c)| {
+        let past = units >= offset as usize;
+        units += c.len_utf16();
+        past
+    }).map_or(text.len(), |(byte, _)| byte)
+}
+
 /// The text from a place to its line's end.
 fn text_from<'p>(pages: &'p [Page], slots: &Slots, place: Place) -> &'p str {
     let text = &slots.line(pages, place.slot).text;
-    let byte = text.char_indices().nth(place.offset as usize).map_or(text.len(), |(byte, _)| byte);
-    &text[byte..]
+    &text[byte_at(text, place.offset)..]
 }
 
-/// The byte range of a line's characters `start..end`.
+/// The byte range of a line's UTF-16 code units `start..end`.
 fn bytes_of(text: &str, start: u32, end: u32) -> (u32, u32) {
-    let byte = |offset: u32| text.char_indices().nth(offset as usize).map_or(text.len(), |(byte, _)| byte) as u32;
-    (byte(start), byte(end))
+    (byte_at(text, start) as u32, byte_at(text, end) as u32)
 }
 
 /// The family a marker's label counts in and the value it counts, read on its last word

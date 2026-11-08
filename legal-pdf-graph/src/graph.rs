@@ -57,19 +57,19 @@ pub fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
     }
 }
 
-/// Each line's citations, as scalar spans of its text, by line id.
+/// Each line's citations, as spans of its text in UTF-16 code units, by line id.
 pub fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<ScalarRange>> {
     pages
         .iter()
         .flat_map(|page| &page.lines)
         .map(|line| {
-            let scalars = |byte: u32| line.text.char_indices().take_while(|(at, _)| *at < byte as usize).count();
+            let units = |byte: u32| line.text.char_indices().take_while(|(at, _)| *at < byte as usize).map(|(_, c)| c.len_utf16()).sum::<usize>();
             let mut spans: Vec<ScalarRange> = slots
                 .of_id(&line.id)
                 .map(|slot| evidence.citations_of(slot))
                 .unwrap_or_default()
                 .iter()
-                .map(|cited| ScalarRange { start: scalars(cited.core.0), end: scalars(cited.core.1) })
+                .map(|cited| ScalarRange { start: units(cited.core.0), end: units(cited.core.1) })
                 .filter(|span| span.start < span.end)
                 .collect();
             spans.sort_by_key(|span| (span.start, span.end));

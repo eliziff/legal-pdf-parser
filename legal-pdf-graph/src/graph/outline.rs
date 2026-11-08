@@ -105,7 +105,7 @@ pub fn assemble_outline(nodes: &mut [StructureNode], contexts: &[OutlineContext]
             Region::UnderHeading => heading,
             Region::ListItem => {
                 let node = &nodes[index];
-                let marker = node.marker_range.and_then(|range| coordinates.slice(range.start..range.end)).or(node.label.as_deref());
+                let marker = node.marker_range.and_then(|range| coordinates.slice_utf16(range.start..range.end)).or(node.label.as_deref());
                 let marker = marker.and_then(|value| legal_structure_model::structure_analysis().numbering_marker(value, outline.open_letter.as_ref()));
                 let family = marker.as_ref().map_or("", |marker| marker.family.as_str());
                 let found = outline.lists.iter().rposition(|(open, _)| !family.is_empty() && open == family);

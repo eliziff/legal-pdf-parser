@@ -224,7 +224,7 @@ pub fn reference_values(line: &Line, size: f64) -> Vec<u32> {
 }
 
 /// A line's reference marks (`reference_marks`) with where each stands in the line's text: its value
-/// (0 for a note symbol) and its first and past-last character. A mark is found by its span's text,
+/// (0 for a note symbol) and its first and past-last UTF-16 code unit. A mark is found by its span's text,
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
 /// detached reference stands where it says.
 pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
@@ -278,7 +278,10 @@ pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         found.push((value(&r.selected_text), start as u32, end as u32));
     }
     found.sort_by_key(|&(_, start, _)| start);
-    found
+    // Found among the line's characters (as recognition places a detached reference), each mark stands in the line's
+    // UTF-16 code units, as the structure places text.
+    let units: Vec<u32> = std::iter::once(0).chain(chars.iter().scan(0, |sum, c| { *sum += c.len_utf16() as u32; Some(*sum) })).collect();
+    found.into_iter().map(|(value, start, end)| (value, units[start as usize], units[end as usize])).collect()
 }
 
 /// A line's text with the space a recognizer leaves inside its opening bracket closed up ("[ 13] Having ...").
@@ -531,20 +534,20 @@ pub fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, li
     }
     // The window: each run of wanted lines a paragraph of its own, line under line.
     let mut window = String::new();
-    // Each windowed line's slot, and where it starts in the window, in bytes and in scalars.
+    // Each windowed line's slot, and where it starts in the window, in bytes and in UTF-16 code units.
     let mut placed: Vec<(Slot, usize, usize)> = Vec::new();
-    let mut scalars = 0;
+    let mut units = 0;
     let mut previous = None;
     for slot in (0..count).filter(|&slot| wanted[slot]) {
         if let Some(prior) = previous {
             let separator = if prior + 1 == slot { "\n" } else { "\n\n" };
             window.push_str(separator);
-            scalars += separator.len();
+            units += separator.len();
         }
         let text = &slots.line(pages, Slot(slot as u32)).text;
-        placed.push((Slot(slot as u32), window.len(), scalars));
+        placed.push((Slot(slot as u32), window.len(), units));
         window.push_str(text);
-        scalars += text.chars().count();
+        units += legal_structure_model::utf16_len(text);
         previous = Some(slot);
     }
     let mut found: Vec<Cited> = Vec::new();
@@ -571,18 +574,19 @@ pub fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, li
                 found.push(Cited { slot, range: (from, to), core: (core_from, core_to), protected: false });
             }
         }
-        // The protected spans, in scalars: each read back to bytes on its lines.
+        // The protected spans, in UTF-16 code units: each read back to bytes on its lines.
         for (start, end) in legal_structure_model::structure_analysis().protected_citation_spans(&window) {
-            let first = placed.partition_point(|&(_, _, scalar)| scalar <= start).saturating_sub(1);
+            let first = placed.partition_point(|&(_, _, unit)| unit <= start).saturating_sub(1);
             for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
-                let (slot, _, scalar) = placed[at];
+                let (slot, _, unit) = placed[at];
                 let text = line_text(at);
-                let length = text.chars().count();
-                let (from, to) = (start.max(scalar) - scalar, end.min(scalar + length).saturating_sub(scalar));
+                let length = legal_structure_model::utf16_len(text);
+                let (from, to) = (start.max(unit) - unit, end.min(unit + length).saturating_sub(unit));
                 if from >= to {
                     continue;
                 }
-                let byte = |offset: usize| text.char_indices().nth(offset).map_or(text.len(), |(byte, _)| byte) as u32;
+                let text = legal_structure_model::ScalarText::new(text);
+                let byte = |offset: usize| text.byte_at_utf16_floor(offset).unwrap_or(text.value.len()) as u32;
                 let range = (byte(from), byte(to));
                 found.push(Cited { slot, range, core: range, protected: true });
             }

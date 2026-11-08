@@ -200,7 +200,7 @@ fn marker_variants(text: &str) -> Vec<String> {
 /// line, then `ALL` with the lines around it and the document's shape.
 pub struct LineTable {
     pub readings: Vec<Vec<MarkerReading>>,
-    /// Each line's reference marks: value, first and past-last character (`reference_spans`).
+    /// Each line's reference marks: value, first and past-last UTF-16 code unit (`reference_spans`).
     pub references: Vec<Vec<(u32, u32, u32)>>,
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
     pub looks: Vec<u32>,
@@ -453,7 +453,7 @@ fn unmarked_notes(order: &[Slot], slots: &Slots, pages: &[Page], evidence: &Evid
             }
             'search: for &k in body {
                 let text = &slots.line(pages, order[k]).text;
-                let place = |start: usize, end: usize| (text[..start].chars().count() as u32, text[..end].chars().count() as u32);
+                let place = |start: usize, end: usize| (legal_structure_model::utf16_len(&text[..start]) as u32, legal_structure_model::utf16_len(&text[..end]) as u32);
                 let mut candidates: Vec<(u32, u32)> = Vec::new();
                 if value == 0 {
                     if text.trim() == "*" {

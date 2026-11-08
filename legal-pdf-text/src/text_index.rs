@@ -1,9 +1,9 @@
 //! The parse's text index: every line's place in the document's text, and the ranges of text
-//! each set of lines covers.
+//! each set of lines covers, in UTF-16 code units.
 
 use crate::line_numbers::line_labels;
 use legal_pdf_core::model::{Line, Page};
-use legal_structure_model::{ScalarRange, ScalarText};
+use legal_structure_model::{utf16_len, ScalarRange};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl PdfTextIndex {
                 previous = Some(line);
                 let start = cursor;
                 index.text.push_str(&line.text);
-                cursor += line.text.chars().count();
+                cursor += utf16_len(&line.text);
                 let range = ScalarRange { start, end: cursor };
                 page_start.get_or_insert(start);
                 page_end = range.end;
@@ -76,11 +76,10 @@ impl PdfTextIndex {
     }
 
     pub fn source_fragments(&self) -> Vec<legal_structure_model::SourceFragment> {
-        let text = ScalarText::new(&self.text);
         let fragment = |line: &IndexedPdfLine| legal_structure_model::SourceFragment {
             id: line.line_id.clone(),
             page_index: line.page_index,
-            range: ScalarRange { start: text.utf16(line.range.start), end: text.utf16(line.range.end) },
+            range: line.range,
         };
         self.lines.iter().map(fragment).collect()
     }
