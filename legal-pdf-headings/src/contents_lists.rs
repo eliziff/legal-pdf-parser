@@ -386,7 +386,7 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
         let unlocated = !accepted && (run.is_some() || (headed || continuing) && titled_rows.len() >= 5 && echoed(&titled_rows, slot, &recurrences));
         // Entries mostly citations, their locators in one column whatever their order: a table of
         // authorities (its locators are the paragraphs citing each authority, not its place).
-        let cites = |r: usize| citation(input.analysis, &rows[r].text) || r > 0 && citation(input.analysis, &format!("{} {}", rows[r - 1].text, rows[r].text));
+        let cites = |r: usize| citation(&rows[r].text) || r > 0 && citation(&format!("{} {}", rows[r - 1].text, rows[r].text));
         let authorities = !accepted && entries.len() >= 5 && entries.iter().filter(|&&r| cites(r)).count() * 5 >= entries.len() * 3;
         if accepted || unlocated {
             if let Some(title) = named {
