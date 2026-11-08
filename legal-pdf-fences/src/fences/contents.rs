@@ -35,16 +35,9 @@ impl Fences {
             })
             .collect();
         let lists = legal_pdf_core::profile::measure("classify.contents_lists", || {
-            let role = &self.role;
             contents_lists::read(
                 views,
-                &contents_lists::ListInput {
-                    line_label: &|slot| role[slot.index()] == Role::LineLabel,
-                    furniture: &|slot| matches!(role[slot.index()], Role::Furniture | Role::PageLabel),
-                    heading: &|slot| matches!(evidence.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle),
-                    claimed: &|slot| in_table[slot.index()],
-                    numbers: &numbers,
-                },
+                &contents_lists::ListInput { role: &self.role, tag: &evidence.tag, in_table, numbers: &numbers },
             )
         });
         let mut listed_contents = vec![false; slots.len()];

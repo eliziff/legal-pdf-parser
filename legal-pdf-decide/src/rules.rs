@@ -62,27 +62,36 @@ pub struct Heard {
 /// it in one heading, caption or unit, the level a rule gives it (0 for none) and its heading level
 /// once read (0 for none), the anchor naming it (an index among the anchors, plus one; 0 for none);
 /// the disagreements of strong rules; and, where the decision is traced, each residual candidate as
-/// the residual weighed it.
-#[derive(Debug, Default)]
+/// the residual weighed it. A trace holds its readings of the lines.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Decision {
     pub role: Vec<Role>,
     pub rule: Vec<Rule>,
+    #[serde(skip)]
     pub reading: Vec<Option<(u32, u32)>>,
     pub unit: Vec<Option<Opening>>,
     pub joined: Vec<bool>,
     pub given: Vec<u8>,
     pub level: Vec<u8>,
     pub anchor: Vec<u32>,
+    #[serde(skip)]
     pub anchors: Vec<OutlineAnchor>,
+    #[serde(skip)]
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip)]
     pub residual: Vec<ResidualRecord>,
+    #[serde(skip)]
     conflicts: Vec<(Rule, Rule, Slot)>,
+    #[serde(skip)]
     pub sequences: Sequences,
     /// While the rules are heard (`hear`): no rule's claim keeps another from a line, every line no fence took (`free`)
     /// is open to each rule, and what each says stands in `heard`. `role` and `rule` hold the first reading of each line
     /// meanwhile, what a rule asks of the lines around it.
+    #[serde(skip)]
     pub hearing: bool,
+    #[serde(skip)]
     free: Vec<bool>,
+    #[serde(skip)]
     pub heard: Vec<Heard>,
 }
 

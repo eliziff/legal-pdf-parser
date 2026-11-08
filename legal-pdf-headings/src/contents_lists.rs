@@ -12,7 +12,7 @@
 //! 0.91 F1, the gold's contents found 97% of the time.
 
 use crate::headings::bookmarks::normalize_title;
-use legal_pdf_structure_model::{PageView, Slot};
+use legal_pdf_structure_model::{PageView, Role, Slot, SourceTag};
 use legal_pdf_core::Line;
 use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
@@ -144,7 +144,7 @@ pub fn row_bands<T: Copy>(lines: &[T], bbox: impl Fn(T) -> [f64; 4]) -> Vec<Vec<
 
 /// A page's rows top to bottom, a locator alone on its row closing the title on the row above it.
 fn rows<'a>(view: &PageView<'a>, input: &ListInput) -> Vec<Row<'a>> {
-    let mut lines: Vec<&Line> = view.iter().filter(|(slot, line)| !line.text.trim().is_empty() && !(input.line_label)(*slot)).map(|(_, line)| line).collect();
+    let mut lines: Vec<&Line> = view.iter().filter(|(slot, line)| !line.text.trim().is_empty() && !input.line_label(*slot)).map(|(_, line)| line).collect();
     lines.sort_by(|a, b| a.bbox[1].total_cmp(&b.bbox[1]).then(a.bbox[0].total_cmp(&b.bbox[0])));
     let mut rows: Vec<Row> = Vec::new();
     for band in row_bands(&lines, |line: &Line| line.bbox) {
@@ -253,7 +253,7 @@ fn recurring_run(rows: &[Row], list_slot: usize, views: &[PageView], recurrences
         let view = &views[slot];
         let line = view.line(view.lines[at]);
         line.text.split_whitespace().count() <= 15
-            && ((input.heading)(view.lines[at]) || at == 0 || view.line(view.lines[at - 1]).block_index != line.block_index)
+            && (input.heading(view.lines[at]) || at == 0 || view.line(view.lines[at - 1]).block_index != line.block_index)
     };
     let landed: Vec<(usize, (usize, usize))> = short.iter().copied().filter_map(|r| {
         recurrences.get(&opening(&rows[r].text))
@@ -302,21 +302,32 @@ pub struct Lists {
     pub titles: Vec<Slot>,
 }
 
-/// What the lists are read against: which lines are a transcript's line numbers and which the
-/// page's furniture (running heads and feet, folios), which are headings already and which a table
-/// holds, and each view's page number (the label the PDF declares for it, else its folio's).
+/// What the lists are read against, by slot: each line's role so far (a transcript's line number, the page's
+/// furniture: running heads and feet, folios), the source's tag (a heading already), whether a table holds it; and
+/// each view's page number (the label the PDF declares for it, else its folio's).
 pub struct ListInput<'a> {
-    pub line_label: &'a dyn Fn(Slot) -> bool,
-    pub furniture: &'a dyn Fn(Slot) -> bool,
-    pub heading: &'a dyn Fn(Slot) -> bool,
-    pub claimed: &'a dyn Fn(Slot) -> bool,
+    pub role: &'a [Role],
+    pub tag: &'a [SourceTag],
+    pub in_table: &'a [bool],
     pub numbers: &'a [Option<u32>],
 }
 
 impl ListInput<'_> {
+    fn line_label(&self, slot: Slot) -> bool {
+        self.role[slot.index()] == Role::LineLabel
+    }
+
+    fn furniture(&self, slot: Slot) -> bool {
+        matches!(self.role[slot.index()], Role::Furniture | Role::PageLabel)
+    }
+
+    fn heading(&self, slot: Slot) -> bool {
+        matches!(self.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
+    }
+
     /// A transcript's line number or the page's furniture: no entry of a list.
     fn set_aside(&self, slot: Slot) -> bool {
-        (self.line_label)(slot) || (self.furniture)(slot)
+        self.line_label(slot) || self.furniture(slot)
     }
 }
 
@@ -355,7 +366,7 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
         // Named contents above the list, or in the page's running head.
         let named = rows.iter().take(entries.first().map_or(4, |&first| first + 1).max(4)).position(|row| names_contents(row));
         let headed = named.is_some()
-            || view.iter().any(|(line_slot, line)| (input.furniture)(line_slot) && contents_title(&line.text));
+            || view.iter().any(|(line_slot, line)| input.furniture(line_slot) && contents_title(&line.text));
         let column = entries.iter().map(|&r| right(r))
             .max_by_key(|&edge| entries.iter().filter(|&&r| (right(r) - edge).abs() <= 0.015 * width).count());
         let listed: Vec<usize> = column.map_or_else(Vec::new, |column| entries.iter().copied().filter(|&r| (right(r) - column).abs() <= 0.015 * width).collect());
@@ -366,7 +377,7 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
             let climbing = numbers.windows(2).filter(|pair| pair[1] >= pair[0]).count();
             let span = listed[listed.len() - 1] - listed[0] + 1;
             let bar = if continuing || headed { 0.3 } else { 0.6 };
-            let claimed = listed.iter().filter(|&&r| rows[r].lines.iter().any(|line| (input.claimed)(view.slot_of(line)))).count();
+            let claimed = listed.iter().filter(|&&r| rows[r].lines.iter().any(|line| input.in_table[view.slot_of(line).index()])).count();
             let titles: Vec<&str> = listed.iter().map(|&r| rows[r].title.as_str()).collect();
             // The list points where its titles are: confirmation whatever its layout.
             let agreed = checked >= 3 && agreeing * 2 >= checked;
@@ -430,12 +441,12 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
             }
         } else if let Some((first, last)) = run {
             for row in &rows[first..=last] {
-                lists.contents.extend(row.lines.iter().map(|line| view.slot_of(line)).filter(|&line_slot| !(input.furniture)(line_slot)));
+                lists.contents.extend(row.lines.iter().map(|line| view.slot_of(line)).filter(|&line_slot| !input.furniture(line_slot)));
                 lists.entries.push(Entry { title: row.title.clone(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });
             }
         } else if unlocated {
             for row in listing() {
-                lists.contents.extend(row.lines.iter().map(|line| view.slot_of(line)).filter(|&line_slot| !(input.furniture)(line_slot)));
+                lists.contents.extend(row.lines.iter().map(|line| view.slot_of(line)).filter(|&line_slot| !input.furniture(line_slot)));
                 // A row opening on its own number lists a provision ("1 | Short title"), which heads
                 // nothing; an unnumbered row a part or a group ("Short Title", "PART I").
                 if locator(&row.lines[0].text).is_none() {

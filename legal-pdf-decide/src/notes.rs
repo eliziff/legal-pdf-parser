@@ -37,15 +37,17 @@ pub struct NoteSegment {
 /// What the note band and its lanes read of a document, by slot: each note line's kind; the lines
 /// whose number the band read as a numbered paragraph's; the labels it read as no note's; an
 /// endnote page's running heads; the notes headings; each page's note segments; and the warnings
-/// of a band drawn on weak geometry.
-#[derive(Debug, Default)]
+/// of a band drawn on weak geometry. A trace holds its readings of the lines.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Notes {
     pub note: Vec<Option<NoteKind>>,
     pub paragraph_label: Vec<bool>,
     pub suppressed: Vec<bool>,
     pub running_head: Vec<bool>,
     pub heading: Vec<bool>,
+    #[serde(skip)]
     pub segments: Vec<NoteSegment>,
+    #[serde(skip)]
     pub diagnostics: Vec<Diagnostic>,
 }
 

@@ -47,26 +47,6 @@ pub const VETO_WORDS: u16 = 1 << 5;
 /// capitals, or not larger with more space under it than over it.
 pub const VETO_TAGGED: u16 = 1 << 6;
 
-#[derive(serde::Serialize)]
-struct NotesTrace<'a> {
-    note: &'a [Option<NoteKind>],
-    paragraph_label: &'a [bool],
-    suppressed: &'a [bool],
-    running_head: &'a [bool],
-    heading: &'a [bool],
-}
-
-#[derive(serde::Serialize)]
-struct DecisionTrace<'a> {
-    role: &'a [Role],
-    rule: &'a [Rule],
-    unit: &'a [Option<Opening>],
-    joined: &'a [bool],
-    given: &'a [u8],
-    level: &'a [u8],
-    anchor: &'a [u32],
-}
-
 /// A line as a decoder fitted on the trace reads it: its text; its opening marker's readings by the
 /// numbering grammar (family, value and dotted prefix), read alone and, where a letter is also a
 /// roman numeral, as the letter after the one before it, and a division word's number ("PART II")
@@ -92,8 +72,8 @@ struct Trace<'a> {
     evidence: &'a Evidence,
     fences: &'a Fences,
     runs: &'a Runs,
-    notes: NotesTrace<'a>,
-    decision: DecisionTrace<'a>,
+    notes: &'a Notes,
+    decision: &'a Decision,
     residual: &'a [ResidualRecord],
 }
 
@@ -129,22 +109,8 @@ pub fn write_trace(
         evidence,
         fences,
         runs,
-        notes: NotesTrace {
-            note: &notes.note,
-            paragraph_label: &notes.paragraph_label,
-            suppressed: &notes.suppressed,
-            running_head: &notes.running_head,
-            heading: &notes.heading,
-        },
-        decision: DecisionTrace {
-            role: &decision.role,
-            rule: &decision.rule,
-            unit: &decision.unit,
-            joined: &decision.joined,
-            given: &decision.given,
-            level: &decision.level,
-            anchor: &decision.anchor,
-        },
+        notes,
+        decision,
         residual: &decision.residual,
     };
     let path = folder.join(format!("{source_sha256}.trace.json.gz"));
