@@ -19,7 +19,10 @@ pub use engine::RecognitionProgress;
 #[cfg(feature = "pdf")]
 mod page_map;
 #[cfg(feature = "pdf")]
+pub use legal_pdf_pages::{reread, Bands};
 pub use page_map::{page_evidence, page_map, EdgeLine, PageEvidence, PdfPageBinding};
+#[cfg(feature = "ocr")]
+pub use legal_pdf_ocr::read_bands;
 #[cfg(feature = "ocr")]
 pub use page_map::page_evidence_read;
 #[cfg(feature = "pdf")]

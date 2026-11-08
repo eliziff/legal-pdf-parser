@@ -58,6 +58,62 @@ pub struct PdfPageBinding {
     pub source: Option<String>,
     /// "resolved", "ambiguous" (the page prints one number and the PDF labels it another), or "unknown".
     pub status: String,
+    /// Every other numbering the page prints, as printed: a record's Bates number ("000208"), an exhibit's or
+    /// appendix's page ("E-162"), a chapter's page ("5-1"), a second count of pages ("other"), the PDF's own count ("pdf").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numbers: Vec<PrintedNumber>,
+}
+
+/// One numbering a page prints besides its page number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrintedNumber {
+    /// "bates", "exhibit", "chapter", "other" or "pdf".
+    pub kind: String,
+    pub label: String,
+}
+
+/// The share of a page's height at its top and at its bottom whose lines are its head and its foot.
+pub const EDGE_BAND: f64 = 0.15;
+
+/// A page's head and foot (its top and bottom EDGE_BAND) as a recognizer reads them from its image, and the page's size.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bands {
+    pub width: f64,
+    pub height: f64,
+    pub head: Vec<EdgeLine>,
+    pub foot: Vec<EdgeLine>,
+}
+
+/// `pages`, each page `read_again` names read again in its head and foot (`read` gives the bands of the pages it is asked
+/// for): a scan's text layer can leave out the folio its image prints, and what the bands read stands for the text
+/// layer's lines there. Every other such page is read first, and the rest only where the page map still leaves them
+/// without a number (the folio sequence numbers the pages between its anchors).
+pub fn reread(mut pages: Vec<PageEvidence>, read: &mut dyn FnMut(&[usize]) -> Result<Vec<(usize, Bands)>, String>) -> Result<Vec<PageEvidence>, String> {
+    let again: Vec<usize> = read_again(&pages).into_iter().enumerate().filter_map(|(index, again)| again.then_some(index)).collect();
+    let first: Vec<usize> = again.iter().copied().step_by(2).collect();
+    for (index, bands) in read(&first)? {
+        merge_bands(&mut pages[index], bands);
+    }
+    let numbered = page_map(&pages, &[], &|_, _| false);
+    let rest: Vec<usize> = again.iter().copied().filter(|index| !first.contains(index) && numbered[*index].label.is_none()).collect();
+    for (index, bands) in read(&rest)? {
+        merge_bands(&mut pages[index], bands);
+    }
+    Ok(pages)
+}
+
+/// A page's lines with its bands as read standing for its text layer's in each band they read anything.
+fn merge_bands(page: &mut PageEvidence, bands: Bands) {
+    let height = bands.height;
+    let in_head = |line: &EdgeLine| line.rect[1] < height * EDGE_BAND;
+    let in_foot = |line: &EdgeLine| line.rect[3] > height * (1.0 - EDGE_BAND);
+    let head = if bands.head.is_empty() { page.lines.iter().filter(|line| in_head(line)).cloned().collect() } else { bands.head };
+    let foot = if bands.foot.is_empty() { page.lines.iter().filter(|line| in_foot(line) && !in_head(line)).cloned().collect() } else { bands.foot };
+    let middle: Vec<EdgeLine> = page.lines.iter().filter(|line| !in_head(line) && !in_foot(line)).cloned().collect();
+    page.lines = head.into_iter().chain(middle).chain(foot).collect();
+    if page.height <= 0.0 {
+        (page.width, page.height) = (bands.width, bands.height);
+    }
 }
 
 /// The page map (see the crate).
@@ -68,8 +124,27 @@ pub fn page_map(pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&st
     }
     let mut bindings = resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>());
     sequence(&mut bindings, pages, starts);
+    counters(&mut bindings, pages);
     anchor(&mut bindings, starts);
+    numberings(&mut bindings, pages);
     bindings
+}
+
+/// A page the sequence leaves without a number that names its place itself ("Page 1 of 1", "Page: 2", "1/4") is that
+/// page: a form or a decision bound with others counts its own pages, and no sequence runs through them.
+fn counters(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
+    for (binding, page) in bindings.iter_mut().zip(pages) {
+        if binding.label.is_some() {
+            continue;
+        }
+        let numbers: std::collections::BTreeSet<i64> = page_candidates(binding, Some(page)).iter()
+            .filter(|c| c.kind == Kind::Counter && sequence_anchor(c)).map(|c| c.number).collect();
+        if let [number] = numbers.into_iter().collect::<Vec<_>>()[..] {
+            binding.label = Some(number.to_string());
+            binding.source = Some("detected".to_owned());
+            binding.status = "resolved".to_owned();
+        }
+    }
 }
 
 /// Each page's binding from what it prints (`observed`) and the PDF's own labels (`embedded`), as rule 3 takes them.
@@ -91,7 +166,7 @@ fn resolve(observed: &[Option<String>], embedded: &[Option<String>]) -> Vec<PdfP
                 (false, None, None) => (None, None),
             };
             let status = if conflict { "ambiguous" } else if label.is_some() { "resolved" } else { "unknown" };
-            PdfPageBinding { pdf_page: index as u32 + 1, observed: detected, label, source: source.map(str::to_owned), status: status.to_owned() }
+            PdfPageBinding { pdf_page: index as u32 + 1, observed: detected, label, source: source.map(str::to_owned), status: status.to_owned(), numbers: Vec::new() }
         })
         .collect()
 }
@@ -110,6 +185,8 @@ enum Kind {
     /// The number opens or closes a longer line; `small` where it is 1 to 9.
     Leading { small: bool },
     Trailing { small: bool },
+    /// A number of any shape in a chain of pages each printing the next one at the same height (`folio_runs`).
+    Run,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,15 +225,21 @@ struct Candidate {
     y: Option<f64>,
     line: usize,
     text: String,
+    /// The whole row the line stands in (a running head's folio, title and citation): what it reads beside.
+    context: String,
+    /// The number beside a running head's own words (`running_heads`).
+    running: bool,
 }
 
-const EDGE_PUNCT: &str = " \t\r\n[](){}.,;:'\"`~_-=\u{2010}\u{2011}\u{2012}\u{2013}\u{2014}\u{2015}";
+// Text-Fidelity's EDGE_PUNCT, and the marks a folio is set between that a reading may give ("| 2 |", "• 2 •", "� 2 �")
+const EDGE_PUNCT: &str = " \t\r\n[](){}.,;:'\"`~_-=\u{2010}\u{2011}\u{2012}\u{2013}\u{2014}\u{2015}|\u{2022}\u{00b7}\u{fffd}";
 
 struct Patterns {
     leading: Regex,
     trailing: Regex,
     supplement: Regex,
     counter: Regex,
+    counter_end: Regex,
     header_trailing: Regex,
     month_or_volume: Regex,
     citation: Regex,
@@ -166,6 +249,7 @@ struct Patterns {
     dot_leader: Regex,
     header_separator: Regex,
     header_context: Regex,
+    report_head: Regex,
     note: Regex,
     small_leading_note: Regex,
     small_leading_gap: Regex,
@@ -183,8 +267,14 @@ fn patterns() -> &'static Patterns {
         Patterns {
             leading: Regex::new(&format!("^[{punct}]*(\\d+)")).unwrap(),
             trailing: Regex::new(&format!("(\\d+)[{punct}]*$")).unwrap(),
-            supplement: Regex::new(&format!("^[{punct}]*S(\\d{{1,4}})[{punct}]*$")).unwrap(),
-            counter: Regex::new(r"^\s*(\d{1,4})\s*[|/]\s*(\d{1,4})\s*$").unwrap(),
+            // "S12" (`SUPPLEMENT_EDGE_FOLIO_RE`), and an exhibit's or appendix's lettered page: "E-162", "A - 2"
+        supplement: Regex::new(&format!("^[{punct}]*(?:S|[A-Z]{{1,3}}\\s?-\\s?)(\\d{{1,6}})[{punct}]*$")).unwrap(),
+            // "12 / 30" (`PAGE_COUNTER_RE`), and a page named as one: "Page 12", "Page: 12 of 30", "p. 12"
+        // a line closing on its page's place in the document: "T-15.01 / 2 sur 46", "... Page 2 of 46"
+        counter_end: Regex::new(r"(?i)(?:^|\s)(\d{1,4})\s+(?:of|de|sur)\s+(\d{1,4})\s*$").unwrap(),
+        // the page word as a reading may give it ("P a g e", "Pa g e") and set off by a bar or colon, on either side:
+        // "Page | 2", "- Page 2 -", "1 | P a g e"
+        counter: Regex::new(r"(?i)^[\s\-–—|•·]*(?:(\d{1,4})\s*[|/]\s*(\d{1,4})|(?:p\s?a\s?g\s?e|pg\.?|p\.)\s*[:|]?\s*(\d{1,4})(?:\s*(?:of|/|de|sur)\s*(\d{1,4}))?|(\d{1,4})\s*\|?\s*p\s?a\s?g\s?e)[\s\-–—|•·]*$").unwrap(),
             header_trailing: Regex::new(r"(?i)\b(?:vol(?:ume)?|journal|review|law|legal|rights|quarterly|yearbook|annuaire|bulletin|appeal|forum)\b.{0,80}?(?:[%|•·–—]\s*|\s{2,})(\d{1,5})\s*$").unwrap(),
             month_or_volume: Regex::new(r"(?i)\b(vol(?:ume)?|issue|iss\.?|no\.?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|page)\b").unwrap(),
             citation: Regex::new(r"(?i)\b(v\.|vs\.|s\.c\.r\.|d\.l\.r\.|w\.w\.r\.|c\.c\.c\.|para\.|art\.|rev\.|l\.j\.)\b").unwrap(),
@@ -193,6 +283,9 @@ fn patterns() -> &'static Patterns {
             edge_space: Regex::new(r"\s{2,}|\t").unwrap(),
             dot_leader: Regex::new(r"(?:\.\s*){2,}").unwrap(),
             header_separator: Regex::new(r"^[\.\)]?\s+\S").unwrap(),
+            // a law report's running head names its report without a page ("[1983] 2 S.C.R." then the style of cause or
+            // nothing; a reading may take the bracket for a 1): a citation in the text gives the page after it
+            report_head: Regex::new(r"(?:\[|\b1)?[12]\d{3}\]\s*(?:\d{1,3}\s+)?[A-Z](?:\.?\s?[A-Z]){1,4}\.(?:\s*\((?:2d|3d|\d+th)\))?(?:\s*$|\s+[^\d\s])").unwrap(),
             header_context: Regex::new(r"(?i)\b(journal|review|law|legal|rights|quarterly|yearbook|annuaire|bulletin|vol(?:ume)?\.?|issue|no\.?)\b").unwrap(),
             note: Regex::new(r"^\s*\d{1,4}[\.\)](?:\s|\u{00a0}|\u{202f})+").unwrap(),
             small_leading_note: Regex::new(r"^\s*[\.\)]\s+\S").unwrap(),
@@ -229,15 +322,22 @@ fn trailing_number(text: &str) -> Option<(usize, usize)> {
 }
 
 fn isolated_number(text: &str) -> Option<i64> {
-    let compact: String = text.trim().chars().filter(|c| !EDGE_PUNCT.contains(*c)).collect();
-    if compact.is_empty() || compact.len() > 5 || !compact.chars().all(|c| c.is_ascii_digit()) {
+    // a hyphen, dash, point or tilde between two numbers joins two labels ("5-1" a chapter's page, "12-13" a spread,
+    // "12.6" a section, "4.16.3 ~ 1" a section's page), not one number's digits a reading spaced ("74 1")
+    static COMPOUND: OnceLock<Regex> = OnceLock::new();
+    if COMPOUND.get_or_init(|| Regex::new(r"\d\s*[-.~\u{2010}-\u{2015}]\s*\d").unwrap()).is_match(text) {
         return None;
     }
-    compact.parse().ok().filter(|n| (1..=5000).contains(n))
+    // any run of digits whose value is a page's (a Bates number "000208" is page 208)
+    let compact: String = text.trim().chars().filter(|c| !EDGE_PUNCT.contains(*c)).collect();
+    if compact.is_empty() || compact.len() > 12 || !compact.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    compact.parse::<i64>().ok().filter(|n| (1..=99_999).contains(n))
 }
 
 fn supplement_number(text: &str) -> Option<i64> {
-    patterns().supplement.captures(text.trim())?[1].parse().ok().filter(|n| (1..=5000).contains(n))
+    patterns().supplement.captures(text.trim())?[1].parse().ok().filter(|n| (1..=99_999).contains(n))
 }
 
 /// The line has a folio's shape: the number set apart from the rest by a gap, dot leaders, or a running head's title.
@@ -245,20 +345,20 @@ fn folio_shape(text: &str, kind: Kind) -> bool {
     let p = patterns();
     let value = text.trim();
     match kind {
-        Kind::Isolated => true,
-        Kind::Counter => p.counter.is_match(&collapse(value)),
+        Kind::Isolated | Kind::Run => true,
+        Kind::Counter => p.counter.is_match(&collapse(value)) || p.counter_end.is_match(&collapse(value)),
         Kind::HeaderTrailing => p.header_trailing.is_match(&collapse(value)),
         Kind::Supplement => supplement_number(value).is_some(),
         Kind::Leading { .. } => leading_number(value).is_some_and(|(_, end)| {
             let after = &value[end..];
             p.edge_space.find(after).is_some_and(|found| found.start() == 0)
-                || (p.header_separator.is_match(after) && p.header_context.is_match(after))
+                || (p.header_separator.is_match(after) && (p.header_context.is_match(after) || p.report_head.is_match(after)))
         }),
         Kind::Trailing { .. } => trailing_number(value).is_some_and(|(start, _)| {
             let before = &value[..start];
             p.edge_space.is_match(tail(before, 18))
                 || p.dot_leader.is_match(tail(before, 32))
-                || (p.text_before.is_match(before) && p.header_context.is_match(before))
+                || (p.text_before.is_match(before) && (p.header_context.is_match(before) || p.report_head.is_match(before)))
         }),
     }
 }
@@ -316,14 +416,19 @@ fn embedded_numbers(text: &str) -> Vec<(i64, Kind)> {
     if value.chars().count() > 140 {
         return Vec::new();
     }
-    if let Some(found) = p.counter.captures(&value) {
-        let (current, total): (i64, i64) = (found[1].parse().unwrap_or(0), found[2].parse().unwrap_or(0));
-        if current > 0 && current <= total + 10 && total <= 5000 {
-            return vec![(current, Kind::Counter)];
+    if let Some(found) = p.counter.captures(&value).or_else(|| p.counter_end.captures(&value)) {
+        let number = |k: usize| found.get(k).and_then(|m| m.as_str().parse::<i64>().ok());
+        let (current, total) = (number(1).or(number(3)).or(number(5)).unwrap_or(0), number(2).or(number(4)));
+        if current > 0 && total.is_none_or(|total| current <= total + 10 && total <= 99_999) {
+            // "Page | 4" a reading gives as "Page 14": the bar its 1; the page's run says which it is
+            static BAR: OnceLock<Regex> = OnceLock::new();
+            let bar = BAR.get_or_init(|| Regex::new(r"(?i)p\s?a\s?g\s?e\s*1\s?(\d{1,4})\b").unwrap());
+            let barred = bar.captures(&value).and_then(|c| c[1].parse::<i64>().ok()).filter(|&n| n >= 1 && total.is_none());
+            return std::iter::once((current, Kind::Counter)).chain(barred.map(|n| (n, Kind::Counter))).collect();
         }
     }
     let mut found: Vec<(i64, Kind, bool)> = Vec::new();
-    if let Some(number) = p.header_trailing.captures(&value).and_then(|c| c[1].parse::<i64>().ok()).filter(|n| (1..=5000).contains(n)) {
+    if let Some(number) = p.header_trailing.captures(&value).and_then(|c| c[1].parse::<i64>().ok()).filter(|n| (1..=99_999).contains(n)) {
         found.push((number, Kind::HeaderTrailing, false));
     }
     if let Some(number) = supplement_number(raw) {
@@ -332,7 +437,7 @@ fn embedded_numbers(text: &str) -> Vec<(i64, Kind)> {
     for (at_start, span) in [(true, leading_number(raw)), (false, trailing_number(raw))] {
         let Some(span) = span else { continue };
         let number: i64 = raw[span.0..span.1].parse().unwrap_or(0);
-        if !(1..=5000).contains(&number) {
+        if !(1..=99_999).contains(&number) {
             continue;
         }
         let small = number <= 9 && small_edge_folio(raw, at_start, span);
@@ -372,7 +477,8 @@ fn candidate(number: i64, kind: Kind, zone: Zone, text: &str, y: Option<f64>, li
     let folio = folio_shape(text, kind);
     let note = note_shape(text, kind);
     let title = title_folio_shape(text, kind, zone);
-    let citation_like = !small && ((note && !title) || p.citation.is_match(text) || p.bracket_year.is_match(text));
+    let head = zone.top() && p.report_head.is_match(text);
+    let citation_like = !small && !head && ((note && !title) || p.citation.is_match(text) || p.bracket_year.is_match(text));
     let mut base = match kind {
         Kind::Isolated => zone_score(zone, 1.0, 0.88, 0.82, 0.2),
         Kind::Supplement => zone_score(zone, 0.96, 0.86, 0.80, 0.12),
@@ -406,7 +512,7 @@ fn candidate(number: i64, kind: Kind, zone: Zone, text: &str, y: Option<f64>, li
     } else if citation_like && kind != Kind::Isolated {
         base *= 0.55;
     }
-    Candidate { number, kind, zone, score: (base * 10_000.0).round() / 10_000.0, year_like, citation_like, y, line, text: text.to_owned() }
+    Candidate { number, kind, zone, score: (base * 10_000.0).round() / 10_000.0, year_like, citation_like, y, line, text: text.to_owned(), context: text.to_owned(), running: false }
 }
 
 /// The candidates one line offers.
@@ -426,8 +532,10 @@ fn sequence_anchor(c: &Candidate) -> bool {
         return false;
     }
     match c.kind {
+        Kind::Run => return true,
         Kind::Isolated => return c.score >= FLOOR,
         Kind::Supplement => return folio_shape(&c.text, c.kind) && c.score >= FLOOR,
+        _ if c.running => return c.score >= FLOOR,
         _ => {}
     }
     if c.citation_like {
@@ -464,17 +572,26 @@ fn credible(c: &Candidate) -> bool {
 }
 
 fn structural(c: &Candidate) -> bool {
-    c.zone.edge()
+    c.kind == Kind::Run || c.zone.edge()
         && (matches!(c.kind, Kind::Counter | Kind::HeaderTrailing)
             || title_folio_shape(&c.text, c.kind, c.zone)
             || (matches!(c.kind, Kind::Trailing { .. }) && c.score >= 0.24)
             || (c.zone.top() && folio_shape(&c.text, c.kind)))
 }
 
-/// A page's lines as rows: the pieces a reader splits one printed line into (a running head's folio, title and volume;
-/// a note's number and its text) joined left to right with a gap between them, as a line of the page reads whole. Two
-/// pieces share a row where each overlaps half the other's height.
-fn rows(page: &PageEvidence) -> Vec<EdgeLine> {
+/// A page's lines as rows: the pieces a reader splits one printed line into, left to right. A row's cells are its pieces
+/// set apart by a gap wider than a line is high (a running head's folio, title and citation); pieces closer than that read
+/// as one. Two pieces share a row where each overlaps half the other's
+/// height.
+struct Row {
+    cells: Vec<EdgeLine>,
+    /// Each cell's pieces as the reader split them ("PAGE 6" beside "Mis à jour : 10 févr. 2012").
+    pieces: Vec<Vec<EdgeLine>>,
+    /// The row whole, its cells three spaces apart.
+    whole: EdgeLine,
+}
+
+fn rows(page: &PageEvidence) -> Vec<Row> {
     let mut lines: Vec<&EdgeLine> = page.lines.iter().filter(|l| !l.text.trim().is_empty()).collect();
     lines.sort_by(|a, b| a.rect[1].total_cmp(&b.rect[1]).then(a.rect[0].total_cmp(&b.rect[0])));
     let mut rows: Vec<Vec<&EdgeLine>> = Vec::new();
@@ -489,28 +606,42 @@ fn rows(page: &PageEvidence) -> Vec<EdgeLine> {
             None => rows.push(vec![line]),
         }
     }
-    let mut out: Vec<EdgeLine> = rows.into_iter().map(|mut row| {
+    let bounds = |pieces: &[&EdgeLine]| pieces.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |r, l| {
+        [r[0].min(l.rect[0]), r[1].min(l.rect[1]), r[2].max(l.rect[2]), r[3].max(l.rect[3])]
+    });
+    let mut out: Vec<Row> = rows.into_iter().map(|mut row| {
         row.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
-        let rect = row.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |r, l| {
-            [r[0].min(l.rect[0]), r[1].min(l.rect[1]), r[2].max(l.rect[2]), r[3].max(l.rect[3])]
-        });
-        EdgeLine { text: row.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join("   "), rect }
+        let mut groups: Vec<Vec<&EdgeLine>> = Vec::new();
+        for piece in row.iter().copied() {
+            let wide = groups.last().and_then(|group| group.last()).is_none_or(|before| {
+                let height = (piece.rect[3] - piece.rect[1]).min(before.rect[3] - before.rect[1]).max(0.1);
+                piece.rect[0] - before.rect[2] > height
+            });
+            if wide { groups.push(vec![piece]) } else { groups.last_mut().unwrap().push(piece) }
+        }
+        let cells: Vec<EdgeLine> = groups.iter().map(|group| EdgeLine {
+            text: group.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" "),
+            rect: bounds(group),
+        }).collect();
+        let whole = EdgeLine { text: cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>().join("   "), rect: bounds(&row) };
+        let pieces = groups.iter().map(|group| group.iter().map(|&piece| piece.clone()).collect()).collect();
+        Row { cells, pieces, whole }
     }).collect();
-    out.sort_by(|a, b| ((a.rect[1] * 10.0).round()).total_cmp(&((b.rect[1] * 10.0).round())).then(a.rect[0].total_cmp(&b.rect[0])));
+    out.sort_by(|a, b| ((a.whole.rect[1] * 10.0).round()).total_cmp(&((b.whole.rect[1] * 10.0).round())).then(a.whole.rect[0].total_cmp(&b.whole.rect[0])));
     out
 }
 
 /// One page's candidates, best first, its structural head and foot numbers kept and the rest up to eight.
 fn page_candidates(binding: &PdfPageBinding, page: Option<&PageEvidence>) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
-    if let Some(number) = binding.observed.as_deref().and_then(|l| l.parse::<i64>().ok()).filter(|n| (1..=5000).contains(n)) {
-        candidates.push(Candidate { number, kind: Kind::Isolated, zone: Zone::Top, score: 1.0, year_like: false, citation_like: false, y: None, line: 1_000_000, text: number.to_string() });
+    if let Some(number) = binding.observed.as_deref().and_then(|l| l.parse::<i64>().ok()).filter(|n| (1..=99_999).contains(n)) {
+        candidates.push(Candidate { number, kind: Kind::Isolated, zone: Zone::Top, score: 1.0, year_like: false, citation_like: false, y: None, line: 1_000_000, text: number.to_string(), context: number.to_string(), running: false });
     }
     if let Some(page) = page {
-        let lines = rows(page);
-        let lines: Vec<&EdgeLine> = lines.iter().collect();
-        let (count, height) = (lines.len(), page.height.max(1.0));
-        for (index, line) in lines.iter().enumerate() {
+        let rows = rows(page);
+        let (count, height) = (rows.len(), page.height.max(1.0));
+        for (index, row) in rows.iter().enumerate() {
+            let line = &row.whole;
             let y = (line.rect[1] + line.rect[3]) / 2.0 / height;
             let zone = if y <= 0.28 { Zone::Top }
                 else if y >= 0.72 { Zone::Bottom }
@@ -519,7 +650,29 @@ fn page_candidates(binding: &PdfPageBinding, page: Option<&PageEvidence>) -> Vec
                 else if index < 12 { Zone::OrderTop }
                 else if index + 12 >= count { Zone::OrderBottom }
                 else { Zone::Body };
-            candidates.extend(line_candidates(&line.text, zone, Some(y), index + 1));
+            // each cell as its own line, its row the context it reads beside
+            // a bare number opening a foot row that goes on in text, not a running title, is a note's number, read with its
+            // text (the row), as `credible_sequence_anchor` reads a foot line opening on a number
+            let note = |k: usize| zone.bottom() && k + 1 < row.cells.len() && isolated_number(&row.cells[k].text).is_some()
+                && row.cells[k + 1..].iter().any(|cell| cell.text.chars().any(char::is_alphabetic))
+                && !row.cells[k + 1..].iter().any(|cell| patterns().header_context.is_match(&cell.text));
+            for (k, cell) in row.cells.iter().enumerate().filter(|(k, _)| !note(*k)) {
+                candidates.extend(line_candidates(&cell.text, zone, Some(y), index + 1).into_iter().map(|mut c| {
+                    c.context = line.text.clone();
+                    c
+                }));
+                // where a cell joins several of the reader's pieces, a page counter among them reads alone ("PAGE 6"
+                // beside "Mis à jour : 10 févr. 2012")
+                let group = &row.pieces[k];
+                if group.len() > 1 {
+                    for piece in group {
+                        candidates.extend(line_candidates(&piece.text, zone, Some(y), index + 1).into_iter().filter(|c| c.kind == Kind::Counter).map(|mut c| {
+                            c.context = line.text.clone();
+                            c
+                        }));
+                    }
+                }
+            }
         }
     }
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.year_like.cmp(&b.year_like)).then(a.citation_like.cmp(&b.citation_like))
@@ -556,7 +709,8 @@ impl Sequence {
         let (coverage, span_ratio) = (anchors.len() as f64 / total, span as f64 / total);
         let edge = anchors.iter().filter(|(_, c)| c.zone.edge()).count() as f64;
         let isolated = anchors.iter().filter(|(_, c)| c.kind == Kind::Isolated).count() as f64;
-        let header_anchors = anchors.iter().filter(|(_, c)| c.kind != Kind::Isolated && c.zone.edge() && patterns().header_context.is_match(&c.text)).count();
+        // a number beside a running head's title (`candidate_has_running_header_context`), a cell of its row included
+        let header_anchors = anchors.iter().filter(|(_, c)| (c.kind != Kind::Isolated || c.context != c.text) && c.zone.edge() && patterns().header_context.is_match(&c.context)).count();
         let ys: Vec<f64> = anchors.iter().filter_map(|(_, c)| c.y).collect();
         let y_span = (ys.len() >= 2).then(|| ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - ys.iter().cloned().fold(f64::INFINITY, f64::min));
         let mut support = score + anchors.len() as f64 * 1.75 + span_ratio * 2.5 + coverage * 1.5 + edge * 0.15 + isolated * 0.10;
@@ -600,6 +754,11 @@ impl Sequence {
         let prefix: Vec<i64> = (0..first).map(|at| at as i64 + 1 + self.shift).collect();
         if prefix.is_empty() || (prefix.iter().all(|&label| label > 0) && self.allows_leading(&prefix)) {
             return 0..total;
+        }
+        // a volume's first page, its 1 unprinted, after front matter of no number in this sequence: the single missing
+        // first page the sequence infers (`sequence_allows_leading_projection`)
+        if first >= 1 && prefix[first - 1] == 1 {
+            return first - 1..total;
         }
         first..total
     }
@@ -660,9 +819,47 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
     }
     let (candidates, ranked) = ranked_sequences(bindings, pages);
     let required = if total == 1 { 1 } else { 2 };
+    // a PDF binding documents of their own numberings (a book of authorities, a volume's plates): each part its own run
+    let parts = parts(&ranked, total);
+    if parts.len() >= 2 {
+        let roman = roman_runs(bindings, pages);
+        let mut numbered = vec![false; total];
+        for part in &parts {
+            let (first, last) = (part.anchors[0].0, part.anchors.last().unwrap().0);
+            for at in first..=last {
+                numbered[at] = true;
+                let number = at as i64 + 1 + part.shift;
+                let binding = &mut bindings[at];
+                if number < 1 || roman[at] {
+                    continue;
+                }
+                if binding.label.as_deref() != Some(number.to_string().as_str()) {
+                    binding.label = Some(number.to_string());
+                    binding.source = Some("sequence".to_owned());
+                    binding.status = "resolved".to_owned();
+                }
+            }
+        }
+        for (at, binding) in bindings.iter_mut().enumerate() {
+            if !numbered[at] && binding.source.as_deref() == Some("detected") && binding.label.as_deref().is_some_and(|label| label.parse::<i64>().is_ok()) {
+                binding.label = None;
+                binding.source = None;
+                binding.status = "unknown".to_owned();
+            }
+        }
+        return;
+    }
     let required_span = if total <= 4 { 1 } else { 2.max((total as f64 * 0.15).ceil() as usize) };
     let chosen = choose(&ranked, total, required, required_span);
-    let roman = roman_runs(bindings);
+    // the PDF's own count of its pages (its 1 on the PDF's first page) says nothing the PDF's page does not: where another
+    // numbering is printed through the document, that numbering is the page's
+    let chosen = match chosen {
+        Some(best) if best.shift == 0 => ranked.iter().find(|row| row.shift != 0 && row.anchors.len() >= 3 && !row.fails(total, required, required_span)
+            // a numbering of its own: printed on half the pages the count is, at one place on them
+            && row.anchors.len() * 2 >= best.anchors.len() && row.y_span.is_none_or(|y| y <= 0.10)).or(Some(best)),
+        other => other,
+    };
+    let roman = roman_runs(bindings, pages);
     let (shift, range) = match chosen {
         Some(best) => {
             let competitors = ranked.iter().filter(|row| !std::ptr::eq(*row, best)).take(7)
@@ -683,20 +880,42 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
             let arbitrated = !starts.is_empty() && !compatible.is_empty()
                 && (opening.is_some() || rejected(best) || compatible.len() < hypotheses.len() || competitors);
             let best = if arbitrated { opening.unwrap_or(compatible[0]) } else { best };
-            if (competitors && !arbitrated) || rejected(best) {
+            // two numberings printed through the document (a journal's pages over a repository's count, Bates numbers
+            // over a filing's pages): each is printed, and the page takes one: not the PDF's own count of its pages, nor
+            // the document's own count at the foot where there is another; else the one its heads print, else the better
+            // supported
+            let best = if competitors && !arbitrated {
+                let rivals: Vec<&Sequence> = std::iter::once(best).chain(ranked.iter().filter(|row| !std::ptr::eq(*row, best)).take(7)
+                    .filter(|row| row.anchors.len() >= required && row.anchors.len() + 1 >= best.anchors.len() && row.support >= best.support * 0.85
+                        && !row.fails(total, required, required_span))).collect();
+                let heads = |row: &Sequence| row.anchors.iter().filter(|(_, c)| c.zone.top()).count();
+                let chosen = rivals.iter().copied().max_by(|a, b| (a.shift != 0).cmp(&(b.shift != 0)).then((!a.local_article_count(total)).cmp(&!b.local_article_count(total)))
+                    .then(heads(a).cmp(&heads(b))).then(a.anchors.len().cmp(&b.anchors.len())).then(a.support.total_cmp(&b.support)));
+                match chosen {
+                    Some(chosen) if rivals.len() >= 2 => chosen,
+                    _ => return unconfirmed(bindings, 0..0),
+                }
+            } else {
+                best
+            };
+            if rejected(best) {
                 return unconfirmed(bindings, 0..0);
             }
             (best.shift, best.projection(total))
         }
+        // no sequence forms (too few numbered pages): each folio as read stands
         None => match short_single_anchor(&candidates, total) {
             Some(shift) => (shift, 0..total),
-            None => return unconfirmed(bindings, 0..0),
+            None => return,
         },
     };
     unconfirmed(bindings, range.clone());
-    for ((binding, number), in_roman) in bindings.iter_mut().zip(1i64..).zip(roman).skip(range.start).take(range.len()) {
+    // a page the sequence's own folio stands on is the sequence's, a roman numeral there notwithstanding (a clause's "(i)")
+    let anchored: std::collections::HashSet<usize> = ranked.iter().find(|row| row.shift == shift).map(|row| row.anchors.iter().map(|(at, _)| *at).collect()).unwrap_or_default();
+    for (at, ((binding, number), in_roman)) in bindings.iter_mut().zip(1i64..).zip(roman).enumerate().skip(range.start).take(range.len()) {
         let number = number + shift;
-        if number < 1 || binding.status == "ambiguous" || in_roman {
+        // the sequence decides a page whose folio as read and the PDF's own label disagree
+        if number < 1 || (in_roman && !anchored.contains(&at)) {
             continue;
         }
         if binding.label.as_deref() != Some(number.to_string().as_str()) {
@@ -707,14 +926,217 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
     }
 }
 
+/// What a folio may print beside its number: the page word, its count of pages ("of 30", "/ 30", "sur 30").
+fn folio_dress() -> &'static Regex {
+    static DRESS: OnceLock<Regex> = OnceLock::new();
+    DRESS.get_or_init(|| Regex::new(r"(?i)\b(?:p\s?a\s?g\s?e|pg|pp?)\b\.?|\b(?:of|de|sur)\s+\d{1,5}\b|/\s*\d{1,5}").unwrap())
+}
+
+/// A run of numbers a document prints page after page, one higher each page, at one place on the page (`chains`).
+struct Chain {
+    /// "E" of "E-162", "5" of a chapter's "5-1", "ABC" of "ABC0001234"; empty for a bare number.
+    prefix: String,
+    /// The printed form's kind: "letter" (a prefix and a dash), "serial" (letters and digits run on), "chapter", "bare".
+    form: &'static str,
+    /// The digits' printed width where it is zero-padded ("000208": 6), else 0.
+    pad: usize,
+    /// Each page of the run: its index, its number, and the number's height and line.
+    pages: Vec<(usize, i64, f64, String)>,
+}
+
+/// The runs of numbers a document prints, whatever their shape or place: every number on a page ("12", "Page | 12",
+/// "- 12 -", "E-162", "000208", "5-1", a folio misread around), chained to the number one higher on the next page (or two
+/// higher two pages on, past a misread or a blank) with the same prefix at the same place (its height, and its side or
+/// the facing page's, or both centred). A chain of three pages on the outermost rows, or of five within the page where a
+/// text's own numbers stand, is a run. A year repeats on a running head rather than climbs, a transcript's line numbers
+/// start again on each page, and a note's numbers seldom climb one a page at one place.
+fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
+    static TOKEN: OnceLock<Regex> = OnceLock::new();
+    static NOT_A_PREFIX: OnceLock<Regex> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| Regex::new(r"(?:\b(?P<letters>[A-Za-z]{1,6})(?P<dash>\s?-\s?)?|\b(?P<chapter>\d{1,3})\s?-\s?)?\b(?P<digits>\d{1,8})\b").unwrap());
+    // words a number follows that name no numbering of pages: the page word itself, a statute's or a list's
+    let not_a_prefix = NOT_A_PREFIX.get_or_init(|| Regex::new(r"(?i)^(?:page|pages|pg|p|pp|no|nos|vol|art|arts|s|ss|ch|c|para|paras|at|n|fn|r|rr|tab|id|v)$").unwrap());
+    struct Token {
+        value: i64,
+        prefix: String,
+        form: &'static str,
+        pad: usize,
+        y: f64,
+        x: f64,
+        outer: bool,
+        text: String,
+    }
+    let tokens: Vec<Vec<Token>> = pages.iter().map(|page| {
+        let (height, width) = (page.height.max(1.0), page.width.max(1.0));
+        let mut found = Vec::new();
+        let rows = rows(page);
+        let count = rows.len();
+        for (index, row) in rows.iter().enumerate() {
+            let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
+            let outer = index < 2 || index + 2 >= count;
+            for piece in row.pieces.iter().flatten() {
+                let x = (piece.rect[0] + piece.rect[2]) / 2.0 / width;
+                let text = piece.text.trim();
+                for capture in token.captures_iter(text) {
+                    // a number standing as a folio stands: its line alone, in a folio's dress ("- 12 -", "Page 12", "12 of
+                    // 30", "E-162"), or opening or closing a head's or foot's outermost row (a running head's "48 UBC LAW
+                    // REVIEW"); a number within a sentence or a note's text is the text's
+                    let whole = capture.get(0).unwrap();
+                    let rest = format!("{} {}", &text[..whole.start()], &text[whole.end()..]);
+                    let dress = folio_dress().replace_all(&rest, "");
+                    let alone = dress.chars().all(|c| !c.is_alphanumeric());
+                    let edge = outer && (whole.start() == 0 || whole.end() == text.len() || text[..whole.start()].chars().all(|c| !c.is_alphanumeric())
+                        || text[whole.end()..].chars().all(|c| !c.is_alphanumeric()));
+                    if !alone && !edge {
+                        continue;
+                    }
+                    let digits = &capture["digits"];
+                    let Ok(value) = digits.parse::<i64>() else { continue };
+                    let letters = capture.name("letters").map(|m| m.as_str()).filter(|l| !not_a_prefix.is_match(l));
+                    let (prefix, form) = match (letters, capture.name("chapter")) {
+                        (Some(letters), _) if capture.name("dash").is_some() => (letters.to_uppercase(), "letter"),
+                        (Some(letters), _) if capture.name("dash").is_none() && digits.len() >= 4 => (letters.to_uppercase(), "serial"),
+                        (_, Some(chapter)) => (chapter.as_str().to_owned(), "chapter"),
+                        _ => (String::new(), "bare"),
+                    };
+                    let pad = if digits.len() >= 4 && digits.starts_with('0') { digits.len() } else { 0 };
+                    // a year is no page: it repeats on a running head, and a text's citations may climb one a page
+                    let year = form == "bare" && pad == 0 && digits.len() == 4 && (1800..=2099).contains(&value);
+                    if value >= 1 && !year {
+                        found.push(Token { value, prefix, form, pad, y, x, outer, text: piece.text.clone() });
+                    }
+                }
+            }
+        }
+        found
+    }).collect();
+    let total = pages.len();
+    let mut next: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    let mut linked: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for p in 0..total {
+        for (i, t) in tokens[p].iter().enumerate() {
+            for gap in 1..=2usize {
+                let q = p + gap;
+                if q >= total {
+                    break;
+                }
+                let best = tokens[q].iter().enumerate()
+                    .filter(|(j, u)| u.value == t.value + gap as i64 && u.prefix == t.prefix && u.form == t.form && (u.y - t.y).abs() <= 0.03
+                        && ((u.x - t.x).abs() <= 0.08 || (u.x - (1.0 - t.x)).abs() <= 0.08) && !linked.contains(&(q, *j)))
+                    .min_by(|(_, a), (_, b)| (a.y - t.y).abs().total_cmp(&(b.y - t.y).abs()));
+                if let Some((j, _)) = best {
+                    next.insert((p, i), (q, j));
+                    linked.insert((q, j));
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in 0..total {
+        for i in 0..tokens[p].len() {
+            if linked.contains(&(p, i)) {
+                continue;
+            }
+            let mut chain = vec![(p, i)];
+            while let Some(&after) = next.get(chain.last().unwrap()) {
+                chain.push(after);
+            }
+            let outer = chain.iter().all(|&(q, j)| tokens[q][j].outer);
+            if chain.len() < if outer { 3 } else { 5 } {
+                continue;
+            }
+            let first = &tokens[p][i];
+            out.push(Chain {
+                prefix: first.prefix.clone(),
+                form: first.form,
+                pad: chain.iter().map(|&(q, j)| tokens[q][j].pad).max().unwrap_or(0),
+                pages: chain.iter().map(|&(q, j)| (q, tokens[q][j].value, tokens[q][j].y, tokens[q][j].text.clone())).collect(),
+            });
+        }
+    }
+    out
+}
+
+/// The fit's candidates from the runs (`chains`) a page number may be: bare numbers and lettered pages ("E-162"), not a
+/// chapter's ("5-1") or a record's serial ("ABC0001234"), which are numberings of their own (`numberings`).
+fn folio_runs(pages: &[PageEvidence]) -> Vec<Vec<Candidate>> {
+    let mut out: Vec<Vec<Candidate>> = (0..pages.len()).map(|_| Vec::new()).collect();
+    for chain in chains(pages).into_iter().filter(|chain| matches!(chain.form, "bare" | "letter") && chain.pad == 0) {
+        for (q, value, y, text) in chain.pages {
+            let zone = if y <= 0.28 { Zone::Top } else if y >= 0.72 { Zone::Bottom } else if y <= 0.5 { Zone::NearTop } else { Zone::NearBottom };
+            if (1..=99_999).contains(&value) {
+                out[q].push(Candidate { number: value, kind: Kind::Run, zone, score: 1.0, year_like: false, citation_like: false, y: Some(y),
+                    line: 1_000_000, context: text.clone(), text, running: false });
+            }
+        }
+    }
+    out
+}
+
+/// Every numbering the pages print besides the page number, as printed (`PdfPageBinding::numbers`): each run of numbers
+/// (`chains`), its runs at one prefix and shift taken together, over the pages from its first to its last; a number the
+/// page's own label already gives is not repeated. The kind is the printed form's: a lettered page "exhibit", a serial or
+/// zero-padded number "bates", a chapter's page "chapter", the PDF's own count "pdf", another count of pages "other". A page
+/// the fit leaves without a number takes the strongest typed one (exhibit, bates, chapter) as its label.
+fn numberings(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
+    let mut runs: HashMap<(String, &'static str, usize, i64), (usize, usize, usize)> = HashMap::new();
+    for chain in chains(pages) {
+        let shift = chain.pages[0].1 - chain.pages[0].0 as i64 - 1;
+        let (first, last) = (chain.pages[0].0, chain.pages.last().unwrap().0);
+        let entry = runs.entry((chain.prefix.clone(), chain.form, chain.pad, shift)).or_insert((first, last, 0));
+        *entry = (entry.0.min(first), entry.1.max(last), entry.2 + chain.pages.len());
+    }
+    let mut runs: Vec<_> = runs.into_iter().filter(|(_, (_, _, count))| *count >= 3).collect();
+    runs.sort_by(|a, b| b.1 .2.cmp(&a.1 .2));
+    for ((prefix, form, pad, shift), (first, last, _)) in runs {
+        let kind = match form {
+            "letter" => "exhibit",
+            "serial" => "bates",
+            "chapter" => "chapter",
+            _ if pad > 0 => "bates",
+            _ if shift == 0 => "pdf",
+            _ => "other",
+        };
+        for (at, binding) in bindings.iter_mut().enumerate().take(last + 1).skip(first) {
+            let value = at as i64 + 1 + shift;
+            if value < 1 {
+                continue;
+            }
+            let digits = if pad > 0 { format!("{value:0pad$}") } else { value.to_string() };
+            let label = match form {
+                "letter" | "chapter" => format!("{prefix}-{digits}"),
+                "serial" => format!("{prefix}{digits}"),
+                _ => digits,
+            };
+            let own = binding.label.as_deref().is_some_and(|own| own == label || (form == "bare" && pad == 0 && own == value.to_string()));
+            // a page the fit leaves without a number takes the strongest typed numbering it prints; a bare count is one the
+            // fit already weighed against its own
+            if binding.label.is_none() && !matches!(kind, "pdf" | "other") {
+                binding.label = Some(label);
+                binding.source = Some("sequence".to_owned());
+                binding.status = "resolved".to_owned();
+                continue;
+            }
+            if !own && !binding.numbers.iter().any(|number| number.label == label) {
+                binding.numbers.push(PrintedNumber { kind: kind.to_owned(), label });
+            }
+        }
+    }
+}
+
 /// Each page's candidates, and the shifts their anchors support, best first (`ranked_delta_sequences`).
 fn ranked_sequences(bindings: &[PdfPageBinding], pages: &[PageEvidence]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
     let total = bindings.len();
-    let candidates: Vec<Vec<Candidate>> = bindings.iter().enumerate().map(|(at, binding)| page_candidates(binding, pages.get(at))).collect();
+    let mut candidates: Vec<Vec<Candidate>> = bindings.iter().enumerate().map(|(at, binding)| page_candidates(binding, pages.get(at))).collect();
+    for (page, chained) in candidates.iter_mut().zip(folio_runs(pages)) {
+        page.extend(chained);
+    }
+    running_heads(&mut candidates);
     let valid = |shift: i64| {
         let skipped = (1..=total as i64).filter(|page| page + shift <= 0).count();
         // pages before the sequence's 1 (an issue's front matter, a repository's cover) are left unnumbered
-        total as i64 + shift <= 5000 && (skipped == 0 || total - skipped >= 2)
+        total as i64 + shift <= 99_999 && (skipped == 0 || total - skipped >= 2)
     };
     let mut by_shift: HashMap<i64, Vec<(usize, Candidate)>> = HashMap::new();
     for (at, page) in candidates.iter().enumerate() {
@@ -738,6 +1160,44 @@ fn ranked_sequences(bindings: &[PdfPageBinding], pages: &[PageEvidence]) -> (Vec
     (candidates, ranked)
 }
 
+/// A running head's folio: a number opening or closing a head's or foot's line whose words the same edge of three pages
+/// or more prints alike (a fifth of the pages at least: a journal's title on its even pages, "40 Underneath the Golden
+/// Boy"), the numbers beside them three or more and not one repeated. Its words are the head's, not a sentence's, so the
+/// number is a folio's whatever the words name.
+fn running_heads(candidates: &mut [Vec<Candidate>]) {
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let word = WORD.get_or_init(|| Regex::new(r"[^\W\d_]{3,}").unwrap());
+    let key = |c: &Candidate| -> Option<(String, bool)> {
+        if !matches!(c.kind, Kind::Leading { small: false } | Kind::Trailing { small: false }) || !c.zone.edge() || c.year_like {
+            return None;
+        }
+        let words: Vec<String> = word.find_iter(&c.text).map(|w| w.as_str().to_lowercase()).collect();
+        (words.len() >= 2).then(|| (words.join(" "), c.zone.top()))
+    };
+    let mut seen: HashMap<(String, bool), (std::collections::HashSet<usize>, std::collections::HashSet<i64>)> = HashMap::new();
+    for (at, page) in candidates.iter().enumerate() {
+        for c in page {
+            if let Some(k) = key(c) {
+                let entry = seen.entry(k).or_default();
+                entry.0.insert(at);
+                entry.1.insert(c.number);
+            }
+        }
+    }
+    let total = candidates.len();
+    for page in candidates.iter_mut() {
+        for c in page.iter_mut() {
+            let Some(k) = key(c) else { continue };
+            let (on, numbers) = &seen[&k];
+            if on.len() >= 3 && on.len() * 5 >= total && numbers.len() * 10 >= on.len() * 9 {
+                c.running = true;
+                c.citation_like = false;
+                c.score = c.score.max(zone_score(c.zone, 0.86, 0.74, 0.70, 0.12));
+            }
+        }
+    }
+}
+
 /// A roman numeral's value ("xiv" is 14), up to 100 (`roman_page_value`, `ROMAN_PAGE_MAX`).
 fn roman_value(label: &str) -> Option<i64> {
     static ROMAN: OnceLock<Regex> = OnceLock::new();
@@ -755,16 +1215,55 @@ fn roman_value(label: &str) -> Option<i64> {
 /// The roman runs (Text-Fidelity's roman fit, safe mode): roman folios read on pages whose numbers agree with their
 /// places (two or more at one shift) number the pages from the first to the last of them; a roman folio read alone, or
 /// at odds with its neighbours, is no page number. Returns which pages a roman run holds.
-fn roman_runs(bindings: &mut [PdfPageBinding]) -> Vec<bool> {
+fn roman_runs(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) -> Vec<bool> {
+    // each page's roman folios: the one the structure read, and a cell of its head or foot that is a numeral alone, between
+    // marks perhaps ("(iv)", "- xii -"; `roman_candidate_text`)
     let mut by_shift: HashMap<i64, Vec<usize>> = HashMap::new();
+    let mut heights: HashMap<(i64, usize), f64> = HashMap::new();
     for (at, binding) in bindings.iter().enumerate() {
-        if let Some(value) = binding.label.as_deref().filter(|_| binding.source.as_deref() == Some("detected")).and_then(roman_value) {
+        let mut values: Vec<i64> = binding.label.as_deref().filter(|_| binding.source.as_deref() == Some("detected")).and_then(roman_value).into_iter().collect();
+        if let Some(page) = pages.get(at) {
+            let height = page.height.max(1.0);
+            for row in rows(page) {
+                let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
+                if y > 0.28 && y < 0.72 {
+                    continue;
+                }
+                for cell in &row.cells {
+                    let bare: String = cell.text.trim().chars().filter(|c| !EDGE_PUNCT.contains(*c)).collect();
+                    if let Some(value) = roman_value(&bare) {
+                        values.push(value);
+                        heights.insert((value - at as i64 - 1, at), y);
+                    }
+                }
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        for value in values {
             by_shift.entry(value - at as i64 - 1).or_default().push(at);
         }
     }
     let mut held = vec![false; bindings.len()];
-    let mut runs: Vec<(usize, usize, i64, bool)> = by_shift.into_iter().filter(|(_, pages)| pages.len() >= 2)
-        .map(|(shift, pages)| (pages[0], *pages.last().unwrap(), shift, pages.iter().all(|&at| bindings[at].label.as_deref().is_some_and(|l| l.chars().all(|c| c.is_ascii_lowercase())))))
+    // a run's numerals stand close (`safe_roman_anchor_segment`): two more than two pages apart begin another run
+    let mut segments: Vec<(i64, Vec<usize>)> = Vec::new();
+    for (shift, pages) in by_shift {
+        let mut segment: Vec<usize> = Vec::new();
+        for at in pages {
+            if segment.last().is_some_and(|&before| at - before > 3) {
+                segments.push((shift, std::mem::take(&mut segment)));
+            }
+            segment.push(at);
+        }
+        segments.push((shift, segment));
+    }
+    // a run's numerals stand where a folio stands, at one height (a clause's "(i)", "(ii)" wanders down its pages)
+    let steady = |shift: i64, held: &[usize]| {
+        let ys: Vec<f64> = held.iter().filter_map(|&at| heights.get(&(shift, at)).copied()).collect();
+        ys.len() < 2 || ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - ys.iter().cloned().fold(f64::INFINITY, f64::min) <= 0.10
+    };
+    let mut runs: Vec<(usize, usize, i64, bool)> = segments.into_iter().filter(|(shift, held)| held.len() >= 2 && steady(*shift, held))
+        .map(|(shift, held)| (held[0], *held.last().unwrap(), shift, held.iter().all(|&at| !bindings[at].label.as_deref().is_some_and(|l| l.chars().any(|c| c.is_ascii_uppercase())))))
         .collect();
     runs.sort_by_key(|&(first, last, _, _)| std::cmp::Reverse(last - first));
     for (first, last, shift, lower) in runs {
@@ -807,8 +1306,8 @@ fn roman_numeral(mut value: i64) -> String {
     out
 }
 
-/// A folio read on a page the sequence does not number (`numbered`) stands on that one reading alone: the sequence fit
-/// numbers what it numbers, and a reading it does not bear out is no page number (the page keeps it as `observed`).
+/// Where a sequence was weighed and ruled on, a folio read on a page it does not number (`numbered`) is one the fit did not
+/// bear out (a local count, a rival in doubt): no page number (the page keeps it as `observed`).
 fn unconfirmed(bindings: &mut [PdfPageBinding], numbered: std::ops::Range<usize>) {
     for (at, binding) in bindings.iter_mut().enumerate() {
         if !numbered.contains(&at) && binding.source.as_deref() == Some("detected") && binding.label.as_deref().is_some_and(|label| label.parse::<i64>().is_ok()) {
@@ -828,16 +1327,110 @@ pub fn weighed(pages: &[PageEvidence]) -> Vec<(i64, Vec<(usize, i64, String)>)> 
     ranked.into_iter().map(|row| (row.shift, row.anchors.into_iter().map(|(at, c)| (at + 1, c.number, c.text)).collect())).collect()
 }
 
-/// The pages whose head and foot a caller may read again: a page printing no number in a folio's shape there (nor
-/// a folio the structure read), and every page where the best sequence is the document's own count of its pages at
-/// the foot (`local_article_count`), as a repository's copy prints over the journal's page whose folio is in the
-/// image of its head.
-pub fn read_again(pages: &[PageEvidence]) -> Vec<bool> {
+/// Whether a page's lines print a number in a folio's shape (or the structure read its folio).
+pub fn prints_a_folio(page: &PageEvidence) -> bool {
+    let binding = PdfPageBinding { pdf_page: 1, observed: page.observed.clone(), label: None, source: None, status: String::new(), numbers: Vec::new() };
+    page_candidates(&binding, Some(page)).iter().any(sequence_anchor)
+}
+
+/// Each page's candidates (number, how it is printed, its zone, its score, whether it anchors a sequence, its line), for a
+/// person checking a page map.
+#[doc(hidden)]
+pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
     let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
     let bindings = resolve(&observed, &vec![None; pages.len()]);
-    let (candidates, ranked) = ranked_sequences(&bindings, pages);
+    bindings.iter().zip(pages).map(|(binding, page)| page_candidates(binding, Some(page)).iter()
+        .map(|c| format!("{} {:?} {:?} {:.2} {} | {}", c.number, c.kind, c.zone, c.score, if sequence_anchor(c) { "ANCHOR" } else { "-" }, c.text))
+        .collect()).collect()
+}
+
+/// The parts the fit finds (shift, first and last PDF page, anchors), for a person checking a page map.
+#[doc(hidden)]
+pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
+    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
+    let (_, ranked) = ranked_sequences(&resolve(&observed, &vec![None; pages.len()]), pages);
+    parts(&ranked, pages.len()).iter().map(|part| (part.shift, part.anchors[0].0 + 1, part.anchors.last().unwrap().0 + 1, part.anchors.len())).collect()
+}
+
+/// The pages whose head and foot a caller may read again: each page whose head and foot (its top and bottom 15%) show no
+/// number in a folio's shape, and every page where the best sequence is the document's
+/// own count of its pages at the foot (`local_article_count`), as a repository's copy prints over the journal's page whose
+/// folio is in the image of its head. A page the body's numbers seem to number is no page whose folio was read.
+pub fn read_again(pages: &[PageEvidence]) -> Vec<bool> {
+    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
+    let (_, ranked) = ranked_sequences(&resolve(&observed, &vec![None; pages.len()]), pages);
     let local = ranked.first().is_some_and(|best| best.local_article_count(pages.len()));
-    candidates.iter().map(|page| local || !page.iter().any(sequence_anchor)).collect()
+    pages.iter().map(|page| {
+        let band = PageEvidence {
+            lines: page.lines.iter().filter(|line| line.rect[3] <= page.height * EDGE_BAND || line.rect[1] >= page.height * (1.0 - EDGE_BAND)).cloned().collect(),
+            ..page.clone()
+        };
+        local || !prints_a_folio(&band)
+    }).collect()
+}
+
+/// The parts of a PDF that binds documents of their own numberings: each shift's anchors split where another shift has
+/// anchors on three or more of the pages between them; a stretch of three anchors or more, at consistent heights or dense
+/// over its pages, is a part, the
+/// strongest first, each over pages no stronger part holds. Fewer than two parts: the PDF is one numbering.
+fn parts(ranked: &[Sequence], total: usize) -> Vec<Sequence> {
+    let mut at_page: Vec<Vec<i64>> = vec![Vec::new(); total];
+    for row in ranked {
+        for (at, _) in &row.anchors {
+            at_page[*at].push(row.shift);
+        }
+    }
+    let mut stretches: Vec<Sequence> = Vec::new();
+    // a run of its own: three folios, or two clean ones on facing pages (a short document whose PDF skips a page)
+    let holds = |anchors: &[(usize, Candidate)]| anchors.len() >= 3
+        || anchors.len() == 2 && anchors[1].0 == anchors[0].0 + 1 && anchors.iter().all(|(_, c)| c.score >= 0.88);
+    for row in ranked.iter().filter(|row| row.anchors.len() >= 2) {
+        let mut stretch: Vec<(usize, Candidate)> = Vec::new();
+        for (at, c) in &row.anchors {
+            if let Some((before, _)) = stretch.last() {
+                // another numbering printed on three or more of the pages between (not misread numbers agreeing by chance)
+                let mut others: HashMap<i64, usize> = HashMap::new();
+                for p in *before + 1..*at {
+                    for &shift in at_page[p].iter().filter(|&&shift| shift != row.shift) {
+                        *others.entry(shift).or_default() += 1;
+                    }
+                }
+                if others.values().any(|&n| n >= 3) {
+                    stretches.push(Sequence::new(row.shift, std::mem::take(&mut stretch), total));
+                }
+            }
+            stretch.push((*at, c.clone()));
+        }
+        if !stretch.is_empty() {
+            stretches.push(Sequence::new(row.shift, stretch, total));
+        }
+    }
+    // anchors at one height, or dense enough over their stretch that their heights do not matter (`sequence_position_
+    // inconsistency_is_disqualifying`: 40% of the pages)
+    stretches.retain(|stretch| holds(&stretch.anchors)
+        && (stretch.y_span.is_none_or(|y| y <= 0.10) || stretch.anchors.len() as f64 >= stretch.span as f64 * 0.40));
+    stretches.sort_by(|a, b| b.anchors.len().cmp(&a.anchors.len()).then(b.support.total_cmp(&a.support)));
+    let mut held = vec![false; total];
+    let mut parts: Vec<Sequence> = Vec::new();
+    for stretch in stretches {
+        // a stretch reaching into a stronger part's pages (a misread folio there agreeing with it) keeps its own pages
+        let own: Vec<(usize, Candidate)> = stretch.anchors.iter().filter(|(at, _)| !held[*at]).cloned().collect();
+        if !holds(&own) {
+            continue;
+        }
+        let (first, last) = (own[0].0, own.last().unwrap().0);
+        if held[first..=last].iter().any(|&h| h) {
+            continue;
+        }
+        held[first..=last].iter_mut().for_each(|h| *h = true);
+        parts.push(Sequence::new(stretch.shift, own, total));
+    }
+    // a PDF of parts is the parts: together they cover most of it (a few short runs of list or note numbers do not)
+    let covered: usize = parts.iter().map(|part| part.anchors.last().unwrap().0 - part.anchors[0].0 + 1).sum();
+    if covered * 2 < total {
+        return Vec::new();
+    }
+    parts
 }
 
 /// The ranked sequence that numbers the document, if one may (`fit_sequence`'s gates).
@@ -887,7 +1480,7 @@ fn short_single_anchor(candidates: &[Vec<Candidate>], total: usize) -> Option<i6
         return None;
     }
     let shift = top.number - (*at as i64 + 1);
-    (1 + shift >= 1 && total as i64 + shift <= 5000).then_some(shift)
+    (1 + shift >= 1 && total as i64 + shift <= 99_999).then_some(shift)
 }
 
 /// Rule 4's anchors: each page printing a citation's first page numbers its run, up to the next anchor, where most of

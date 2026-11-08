@@ -167,23 +167,57 @@ impl OcrProvider {
     }
 }
 
+/// The scale a page's head and foot are read again at: the recognizer's own (Indra reads at 144 dpi).
+#[cfg(feature = "ocr")]
+pub const REREAD_SCALE: f64 = 2.0;
+
+/// `indices`' heads and feet (`legal_pdf_pages::EDGE_BAND`) read by `ocr` from their images, sixteen pages rendered at a
+/// time.
+#[cfg(feature = "ocr")]
+pub fn read_bands(pdf: &[u8], indices: &[usize], ocr: &mut OcrProvider) -> Result<Vec<(usize, legal_pdf_pages::Bands)>> {
+    use legal_pdf_pages::{Bands, EdgeLine, EDGE_BAND};
+    let mut out = Vec::new();
+    for batch in indices.chunks(16) {
+        for (index, render) in batch.iter().copied().zip(render_gray_pages_of(pdf, batch, REREAD_SCALE * 72.0)) {
+            let Some(render) = render else { continue };
+            let (width, height) = (render.0 as f64 / REREAD_SCALE, render.1 as f64 / REREAD_SCALE);
+            let mut read = |band: [f64; 4]| -> Result<Vec<EdgeLine>> {
+                Ok(ocr.read_rendered_region(&render, band, REREAD_SCALE)?.into_iter().filter(|line| !line.text.trim().is_empty())
+                    .map(|line| EdgeLine { text: line.text, rect: line.bbox }).collect())
+            };
+            let head = read([0.0, 0.0, width, height * EDGE_BAND])?;
+            let foot = read([0.0, height * (1.0 - EDGE_BAND), width, height])?;
+            out.push((index, Bands { width, height, head, foot }));
+        }
+    }
+    Ok(out)
+}
+
 /// One page of `pdf` rendered to 8-bit grey at `dpi`.
 #[cfg(feature = "ocr")]
 pub fn render_gray_page(pdf: &[u8], page_index: usize, dpi: f64) -> Option<GrayRender> {
+    render_gray_pages_of(pdf, &[page_index], dpi).pop().flatten()
+}
+
+/// The pages `indices` of `pdf` rendered to 8-bit grey at `dpi`, the document parsed once; none for a page it has not.
+#[cfg(feature = "ocr")]
+pub fn render_gray_pages_of(pdf: &[u8], indices: &[usize], dpi: f64) -> Vec<Option<GrayRender>> {
     use hayro::hayro_interpret::InterpreterSettings;
     use hayro::hayro_syntax::Pdf;
     use hayro::vello_cpu::color::palette::css::WHITE;
     use hayro::{render, RenderCache, RenderSettings};
 
-    let document = Pdf::new(pdf.to_vec()).ok()?;
+    let Ok(document) = Pdf::new(pdf.to_vec()) else { return vec![None; indices.len()] };
     let cache = RenderCache::new();
     let interpreter = InterpreterSettings::default();
     let scale = (dpi / 72.0) as f32;
     let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
     let pages = document.pages();
-    let page = pages.iter().nth(page_index)?;
-    let pixmap = render(page, &cache, &interpreter, &settings);
-    (pixmap.width() > 0 && pixmap.height() > 0).then(|| (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap)))
+    indices.iter().map(|&index| {
+        let page = pages.iter().nth(index)?;
+        let pixmap = render(page, &cache, &interpreter, &settings);
+        (pixmap.width() > 0 && pixmap.height() > 0).then(|| (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap)))
+    }).collect()
 }
 
 #[cfg(feature = "ocr")]

@@ -9,5 +9,3 @@ description = "A PDF's page map: each page's printed number from what its pages 
 [dependencies]
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
-# page-map-score reads its evidence and key
-serde_json = "1.0"

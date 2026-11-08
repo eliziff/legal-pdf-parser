@@ -24,7 +24,7 @@ pub use indra::{
 pub use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
 pub use ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
 #[cfg(feature = "ocr")]
-pub use ocr::{render_gray_page, GrayRender};
+pub use ocr::{read_bands, render_gray_page, render_gray_pages_of, GrayRender, REREAD_SCALE};
 pub use raster::{raster_page_rules, render_gray_pages};
 #[cfg(feature = "ocr")]
 pub use planning::RuntimePlan as IndraRuntimePlan;

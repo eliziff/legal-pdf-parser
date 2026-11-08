@@ -20,6 +20,7 @@ attribution = ["ocr"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-pages = { path = "../legal-pdf-pages" }
 hayro = { version = "0.7.0", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libloading = { version = "0.8", optional = true }
