@@ -70,12 +70,15 @@ pub struct PdfLookupNote {
     pub warnings: Vec<String>,
 }
 
+/// A unit a lookup returns: its node's id, its kind and its label as the document prints it ("12" of a paragraph, a
+/// page or a note, a provision's label), its text and the spans of the document's text it holds, its pages.
 #[derive(Serialize)]
 pub struct PdfLookupUnit {
     pub id: String,
     pub kind: &'static str,
     pub locator: String,
     pub text: String,
+    pub spans: Vec<ScalarRange>,
     pub page_numbers: Vec<u32>,
     pub confidence: Option<f64>,
     pub confidence_basis: &'static str,
@@ -271,8 +274,9 @@ pub(crate) fn printed_unit(
     PdfLookupUnit {
         id: nodes[0].id.clone(),
         kind: "paragraph",
-        locator: format!("paragraph {number}"),
+        locator: number.to_string(),
         text: range_text(text, &ranges),
+        spans: document.structure.query_ranges(nodes[0]).into_owned(),
         page_numbers,
         confidence: page.map(|page| page_confidence(&document.summary.page_text_quality, page)),
         confidence_basis: if page.is_some() {
@@ -290,8 +294,9 @@ pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, qua
     PdfLookupUnit {
         id: page.id.clone(),
         kind: "page",
-        locator: format!("[page {}]", page_number(page)),
+        locator: page_number(page).to_string(),
         text: rendered_slice(text, document, page),
+        spans: document.query_ranges(page).into_owned(),
         page_numbers: vec![page_number(page)],
         confidence: Some(page_confidence(quality, page)),
         confidence_basis: "page_text_quality",
@@ -302,13 +307,13 @@ pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, qua
 }
 
 /// A page's printed transcript lines in reading order: each line number the structure labels
-/// (its `LineLabel` nodes), its node's id, and the words set across its row; a number on a
+/// (its `LineLabel` nodes), its node, and the words set across its row; a number on a
 /// blank line is left out.
-pub(crate) fn transcript_lines(
-    document: &PdfDocument,
+pub(crate) fn transcript_lines<'a>(
+    document: &'a PdfDocument,
     page: &StructureNode,
     geometry: &Page,
-) -> Vec<(usize, String, String)> {
+) -> Vec<(usize, &'a StructureNode, String)> {
     let height = |rect: &[f64; 4]| (rect[3] - rect[1]).max(0.1);
     document
         .structure
@@ -339,7 +344,7 @@ pub(crate) fn transcript_lines(
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            (!text.is_empty()).then(|| (number, node.id.clone(), text))
+            (!text.is_empty()).then_some((number, node, text))
         })
         .collect()
 }
@@ -370,8 +375,9 @@ pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes
     PdfLookupUnit {
         id: note.id.clone(),
         kind: "footnote",
-        locator: format!("footnote {label}"),
+        locator: label.to_owned(),
         text: rendered_slice(text, &document.structure, note).trim().to_owned(),
+        spans: document.structure.query_ranges(note).into_owned(),
         page_numbers,
         confidence: None,
         confidence_basis: "footnote_pairing",
@@ -421,6 +427,7 @@ pub(crate) fn section_unit(
             .trim()
             .to_owned(),
         text: rendered_slice(text, document, section).trim().to_owned(),
+        spans: document.query_ranges(section).into_owned(),
         page_numbers,
         confidence,
         confidence_basis: if confidence.is_some() {
@@ -687,12 +694,13 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             return result(input, PdfLookupStatus::NotFound, None);
         };
         return finish(document, &text, input, lines.len(), start, end, |index| {
-            let (number, id, words) = &lines[index];
+            let (number, node, words) = &lines[index];
             PdfLookupUnit {
-                id: id.clone(),
+                id: node.id.clone(),
                 kind: "line",
-                locator: format!("page {}, line {number}", self::page_number(page)),
+                locator: number.to_string(),
                 text: words.clone(),
+                spans: document.structure.query_ranges(node).into_owned(),
                 page_numbers: vec![self::page_number(page)],
                 confidence: Some(page_confidence(&document.summary.page_text_quality, page)),
                 confidence_basis: "page_text_quality",
