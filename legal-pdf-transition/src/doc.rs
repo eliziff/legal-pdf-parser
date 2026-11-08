@@ -178,9 +178,7 @@ pub fn note_number(line: &LineView, text: &str) -> Option<u32> {
 /// unit another unit of its stream came before goes on with it by name (its first line); a note answers the
 /// marks of its number in the region its link names.
 fn moves_of(lines: &Lines, regions: &Regions, units: &Units, views: &[LineView], texts: &[&str], only: Option<&[bool]>) -> Vec<Move> {
-    let mut moves: Vec<Move> = lines.starts.iter().map(|&starts| {
-        Move { region: 0, opens: false, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts, answers: [None; 4] }
-    }).collect();
+    let mut moves: Vec<Move> = lines.starts.iter().map(|&starts| Move { starts, ..Move::plain(0, false) }).collect();
     // Each region's unit, its first line: a region going on in an earlier one's unit is in that unit.
     let mut unit: Vec<usize> = Vec::with_capacity(regions.read.len());
     regions.firsts.iter().enumerate().for_each(|(i, &first)| unit.push(units.before[i].filter(|&earlier| earlier < i).map_or(first, |earlier| unit[earlier])));
