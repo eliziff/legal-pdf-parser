@@ -197,6 +197,7 @@ fn marker_variants(text: &str) -> Vec<String> {
 
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
+#[derive(Clone)]
 pub struct LineTable {
     pub order: Vec<Slot>,
     pub readings: Vec<Vec<MarkerReading>>,
@@ -220,13 +221,9 @@ impl LineTable {
         &self.features[k * ALL..(k + 1) * ALL]
     }
 
-    /// `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
-    /// markers' readings stand beside the repaired text's, the parser's to choose between.
-    #[allow(clippy::too_many_arguments)]
-    /// The plain table's readings, marks, looks and margin numbers (with the recognizer's likely misreadings, `confusions`,
-    /// and the note marks recognition misread, `unmarked_notes`), and each line's features and t0 row.
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
-        let Self { order, readings, mut references, looks: look_ids, margin_rows, margins, .. } = Self::plain(pages, slots, evidence, fences, before, confusions);
+    /// Each line's features and t0 row, measured over the table both tiers read (`plain`), for the DOC reader.
+    pub fn measure(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision) {
+        let (order, readings, margin_rows, margins) = (&self.order, &self.readings, &self.margin_rows, &self.margins);
         let n = order.len();
         let measures: Vec<(PageMeasure, Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().map(|page| {
             let measure = PageMeasure::of(page);
@@ -338,7 +335,6 @@ impl LineTable {
                 row[LINE_FEATURES.len() + WORD_BITS + bit] = ((evidence.look[at] >> bit) & 1) as f32;
             }
         }
-        unmarked_notes(&order, slots, pages, evidence, &mut references);
         // The lines around each line, and the document's shape.
         let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER.start] > 0.0).count() as f32 / n.max(1) as f32;
         let labelled = (0..n).filter(|&k| evidence.label[order[k].index()].is_some()).count() as f32 / n.max(1) as f32;
@@ -391,11 +387,13 @@ impl LineTable {
                 last_held[usize::from(mine.translation)] = held;
             }
         }
-        Self { order, readings, references, looks: look_ids, features, margin_rows, margins, t0 }
+        (self.features, self.t0) = (features, t0);
     }
 
-    /// The table with nothing measured: each line's readings, marks, look and margin number, all a reader with no fitted
-    /// scorer asks of it (tier 0 reads no misreadings: `confusions` empty).
+    /// The table both tiers read, nothing measured: each line's readings (with the recognizer's likely misreadings,
+    /// `confusions`), its reference marks (with the note marks recognition misread, `unmarked_notes`), its look and its
+    /// margin number. `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
+    /// markers' readings stand beside the repaired text's, the parser's to choose between.
     pub fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
         let order: Vec<Slot> = fences.order.clone();
         let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
@@ -403,7 +401,8 @@ impl LineTable {
             let word = evidence.words[slot.index()] & WORD_DIVISION != 0;
             line_readings(slots.line(pages, slot), word, recognized.get(&slot).copied(), confusions)
         }).collect();
-        let references = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), evidence.size[slot.index()])).collect();
+        let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), evidence.size[slot.index()])).collect();
+        unmarked_notes(&order, slots, pages, evidence, &mut references);
         let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
         let (margin_rows, margins) = margin_lines(&order, &readings, fences);
         Self { order, readings, references, looks, features: Vec::new(), margin_rows, margins, t0: Vec::new() }

@@ -37,7 +37,6 @@ use legal_pdf_transition as transition;
 use legal_pdf_tier0 as tier0;
 use legal_pdf_emit::Settled;
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{MARGIN, OPENING};
 use legal_pdf_structure_model::regions::{NOTE, NOTE_QUOTE};
 use std::path::Path;
 
@@ -162,12 +161,13 @@ fn output(
     identity: &StructureIdentity,
     trace: Option<&Path>,
 ) -> Result<StructureOutput> {
-    let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, &HashMap::new());
+    // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
+    let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let views = tier0::line_views(pages, slots, evidence, &fences, &table);
     let (mut notes, mut decision) = tier0::decide(analysis, pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
     // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
     // came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, runs, outline, &identity.source_sha256, &notes, &decision);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, outline, &identity.source_sha256, &notes, &decision, &table);
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
     diagnostics.append(&mut decision.diagnostics);
@@ -192,19 +192,13 @@ fn output(
     }
     let (mut moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &footnotes);
     // A tier scores the moves, the output stays this one: the DOC tier's move for each line, but for the notes, the
-    // pairer's (a line either reads as a note keeps this reading's move).
-    // DOC's reading of a marker is the one of this reading's views that counts as it does (DOC's line table reads the
-    // recognizer's misreadings too, so its readings may be more or in another order).
-    if let Some((read, readings)) = doc.filter(|(read, _)| read.len() == moves.len()) {
-        for (k, mut chosen) in read.into_iter().enumerate() {
-            if matches!(moves[k].region, NOTE | NOTE_QUOTE) || matches!(chosen.region, NOTE | NOTE_QUOTE) {
-                continue;
+    // pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its reading of a
+    // marker names one of this reading's.
+    if let Some(read) = doc.filter(|read| read.len() == moves.len()) {
+        for (k, chosen) in read.into_iter().enumerate() {
+            if !(matches!(moves[k].region, NOTE | NOTE_QUOTE) || matches!(chosen.region, NOTE | NOTE_QUOTE)) {
+                moves[k] = chosen;
             }
-            if let Some(r) = chosen.reading.filter(|&r| r != MARGIN && r != OPENING) {
-                chosen.reading = readings[k].get(usize::from(r)).map(|want| views[k].readings.iter()
-                    .position(|own| own.family == want.family && own.value == want.value).map_or(OPENING, |at| at as u8));
-            }
-            moves[k] = chosen;
         }
     }
     tier0::in_slot_order(pages, slots);

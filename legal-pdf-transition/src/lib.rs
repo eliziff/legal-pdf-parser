@@ -43,8 +43,8 @@
 
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use legal_pdf_decide::{Decision, Fences, Notes};
-use legal_pdf_structure_model::evidence::{MarkerReading, WORD_SPEAKER};
-use legal_pdf_structure_model::{Evidence, Runs, Slot, Slots};
+use legal_pdf_structure_model::evidence::WORD_SPEAKER;
+use legal_pdf_structure_model::{Evidence, Slot, Slots};
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::OnceLock};
 
 pub use legal_pdf_machine::lines::*;
@@ -146,6 +146,12 @@ impl Settings {
 }
 
 /// Whether the transition parser runs on this parse.
+/// How recognition misreads the characters of a line's opening marker (LEGALPDF_TRANSITION_CONFUSIONS), for the line
+/// table both tiers read; none where it is not given.
+pub fn confusions() -> &'static HashMap<char, Vec<(char, f32)>> {
+    &settings().confusions
+}
+
 pub fn enabled() -> bool {
     settings().dump.is_some() || settings().labels.is_some()
 }
@@ -328,29 +334,30 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
 }
 
 /// The walk, where it is asked for: the moves the DOC tier reads of the document, where its reader is given
-/// (LEGALPDF_TRANSITION_DOC), with each line's marker readings the moves' `reading` names; and what the scorer is fitted
-/// on and the grader's labels, where those are asked (`enabled`). None where DOC is not given. The output is tier 0's
-/// all the same (`tier0::output`).
+/// (LEGALPDF_TRANSITION_DOC), each move's `reading` naming one of the line's readings in tier 0's table (`table`, which
+/// the walk measures in a copy of its own: each line's features and t0 row); and what the scorer is fitted on and the
+/// grader's labels, where those are asked (`enabled`). None where DOC is not given. The output is tier 0's all the same
+/// (`tier0::output`).
 ///
 /// The walk over tier 0's reading of a document (its notes and decision, read once by `tier0::output`): its lines read
 /// (`LineTable`, the decision among their evidence), its stylesheet (`Stylesheet`), and the moves they make in reading
-/// order (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide), read twice: a first
-/// greedy reading, whose reading of each template the second reads; and, as its environment asks, what the scorer is
-/// fitted on and the labels the grader reads.
+/// order, read twice: a first greedy reading, whose reading of each template the second reads; and, as its environment
+/// asks, what the scorer is fitted on and the labels the grader reads.
 #[allow(clippy::too_many_arguments)]
-pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry],
-    sha256: &str, notes: &Notes, decision: &Decision) -> Option<(Vec<Move>, Vec<Vec<MarkerReading>>)> {
+pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, outline: &[PdfOutlineEntry], sha256: &str,
+    notes: &Notes, decision: &Decision, table: &LineTable) -> Option<Vec<Move>> {
     let s = settings();
     #[cfg(feature = "encoder")]
     let doc = s.doc.is_some();
     #[cfg(not(feature = "encoder"))]
     let doc = false;
     if !doc && !enabled() { return None; }
-    let table = LineTable::read(pages, slots, evidence, fences, notes, decision, &runs.before, &s.confusions);
+    let mut table = table.clone();
+    table.measure(pages, slots, evidence, fences, notes, decision);
     let locals = locals_of(s, pages, slots, &table, sha256);
     let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
     let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
-    doc.then(|| (moves, table.readings))
+    doc.then_some(moves)
 }
 
 /// Each line's local scores, read once.
