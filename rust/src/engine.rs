@@ -452,21 +452,6 @@ fn derive_document(
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
         pages.clone_from(&extracted.pages);
-        // Each heading line's trail, and that of each line a rule took from the headings: the rule
-        // that decided it ("+anchor", "-marginal_note"), as regions of kind "heading_source" (id
-        // "heading-source:<trail>") on these pages only.
-        for page in pages.iter_mut() {
-            let mut by_source: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-            for line in &page.lines {
-                if let Some(source) = derived.heading_sources.get(&line.id) {
-                    by_source.entry(source.as_str()).or_default().push(line.id.clone());
-                }
-            }
-            for (source, line_ids) in by_source {
-                let id = format!("heading-source:{source}");
-                page.regions.push(legal_pdf_core::model::Region { id, page_index: page.index, kind: "heading_source".to_owned(), line_ids, bbox: [0.0; 4], reading_order: 0 });
-            }
-        }
     }
     Ok(profile::measure("project_document", || {
         let (metadata, pages) = (extracted.metadata, extracted.pages);

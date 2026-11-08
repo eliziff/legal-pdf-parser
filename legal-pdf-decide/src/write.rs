@@ -2,8 +2,7 @@
 //! the body (a transcript's line number), whether its number counts a numbered paragraph (no note's
 //! label then), whether its opening number is no note's label (a heading's, or one the note band
 //! refused), its place in its page's reading order and its block; each page's printed label and the
-//! line printing it; and each page's lines put in their reading order. Each heading's trail names
-//! the rule that decided it.
+//! line printing it.
 //!
 //! A block is one printed paragraph or unit: it starts where a unit opens (its marker and the line
 //! beside it one start), where a heading, title or marginal note starts (its wrapped lines going on
@@ -54,7 +53,7 @@ pub fn write_lines(
     fences: &Fences,
     notes: &Notes,
     decision: &Decision,
-) -> HashMap<String, String> {
+) {
     let count = slots.len();
     // A page's note lines that go on with the last note of the page before: its first, and those
     // after it up to the next label.
@@ -104,21 +103,6 @@ pub fn write_lines(
             }
         }
     }
-    // A heading's trail names the rule that made it one; a title's, a marginal note's and a line
-    // its source tagged a heading name the rule that took it from the headings.
-    (0..count)
-        .filter_map(|at| {
-            let (role, rule) = (decision.role[at], decision.rule[at]);
-            let tagged = matches!(evidence.tag[at], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle);
-            let mark = match role {
-                Role::Heading => '+',
-                Role::Title | Role::MarginalNote => '-',
-                _ if tagged => '-',
-                _ => return None,
-            };
-            Some((slots.line(pages, Slot(at as u32)).id.clone(), format!("{mark}{}", rule.name())))
-        })
-        .collect()
 }
 
 /// Whether two lines of a page stand on one row.

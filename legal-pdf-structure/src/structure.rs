@@ -53,9 +53,6 @@ pub struct StructureOutput {
     pub authority_text_units: Vec<serde_json::Value>,
     pub diagnostics: Vec<Diagnostic>,
     pub structure_graph: DocumentStructure,
-    /// Each heading line, and each line taken from the headings, with the rule that decided it
-    /// ("+anchor", "-marginal_note").
-    pub heading_sources: HashMap<String, String>,
 }
 
 /// What the measuring, fencing and numbering of a document read, cached by its input pages: the
@@ -173,7 +170,7 @@ fn output(pages: &mut [Page],
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
-    let heading_sources = write_lines(pages, slots, evidence, &fences, &notes, &decision);
+    write_lines(pages, slots, evidence, &fences, &notes, &decision);
     // The lines are read in reading order from here on, the pairer's and the output's: each page's put in it once.
     slots.read_in_order(pages, &fences.order);
     let slots: &Slots = slots;
@@ -196,5 +193,5 @@ fn output(pages: &mut [Page],
     let settled = Settled { index: &index, notes, runs, opened, within };
     let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &views, &moves, doc, identity, settled)?;
     diagnostics.extend(note_crossrefs(&structure_graph, &decided));
-    Ok(StructureOutput { authority_text_units, diagnostics, structure_graph, heading_sources })
+    Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })
 }
