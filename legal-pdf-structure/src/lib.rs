@@ -118,9 +118,9 @@ pub fn derive(pages: &mut [Page],
         }
         None => {
             let mut evidence = measure("derive.measure", || {
-                legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
+                legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, instrument)
             });
-            let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline));
+            let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline, &identity.page_labels));
             let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
             let measured = Measured { evidence, fences, runs };
             if let Some(path) = cache {

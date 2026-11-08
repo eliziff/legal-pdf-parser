@@ -5,12 +5,15 @@ impl Fences {
     /// The contents lists (`contents_lists::read`), pdf-inspector's contents among them, each from
     /// its first entry to its last, a table of authorities' lines aside; the row naming a list, its
     /// heading; the pages wholly contents. Returns the lines the lists read as contents (a table
-    /// more than half of whose lines they hold is that list).
+    /// more than half of whose lines they hold is that list). `page_labels`: the labels the PDF
+    /// declares, by page index.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_contents(
         &mut self,
         pages: &[Page],
         slots: &Slots,
         evidence: &Evidence,
+        page_labels: &[Option<String>],
         views: &[PageView],
         in_table: &[bool],
         listed: &HashSet<String>,
@@ -21,8 +24,7 @@ impl Fences {
             .iter()
             .zip(&self.folios)
             .map(|(page, folio)| {
-                evidence
-                    .page_labels
+                page_labels
                     .get(page.index)
                     .and_then(Option::as_deref)
                     .and_then(contents_lists::page_numeral)

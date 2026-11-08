@@ -139,8 +139,8 @@ impl Fences {
     }
 
     /// The fences, contexts and reading order of the document's pages, measured (`evidence`), its
-    /// bookmarks `outline`.
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, outline: &[PdfOutlineEntry]) -> Self {
+    /// bookmarks `outline` and the page labels it declares (`page_labels`, by page index).
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, outline: &[PdfOutlineEntry], page_labels: &[Option<String>]) -> Self {
         let count = slots.len();
         let mut fences = Self {
             role: vec![Role::Open; count],
@@ -164,7 +164,7 @@ impl Fences {
         let items = fences.read_columns(pages, slots, evidence);
         fences.read_translation(pages, slots, evidence, &views);
         let (tables, in_table, listed) = fences.find_tables(pages, slots, &items);
-        let listed_contents = fences.read_contents(pages, slots, evidence, &views, &in_table, &listed);
+        let listed_contents = fences.read_contents(pages, slots, evidence, page_labels, &views, &in_table, &listed);
         fences.read_tables(slots, tables, &listed_contents);
         fences.read_note_band(pages, slots, evidence);
         fences.read_body_type(pages, slots, evidence);

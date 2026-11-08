@@ -412,20 +412,18 @@ fn operative_words(text: &str) -> (usize, usize) {
 /// lines worth reading for them (`read_citations`), and what a line's text says read again where the runs' repair
 /// rewrote its marker (`reread`).
 /// Every page, line and the document measured once: `separators` holds each page's note
-/// separator as the extraction found it, `outline` the document's bookmarks, `page_labels` the
-/// page labels it declares (by page index), and `instrument` whether its caller knows it for an
-/// instrument.
+/// separator as the extraction found it, `outline` the document's bookmarks, and `instrument`
+/// whether its caller knows it for an instrument.
 pub fn measure(pages: &[Page],
     slots: &Slots,
     normalized: Normalized,
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
-    page_labels: &[Option<String>],
     instrument: bool,
 ) -> Evidence {
     let count = slots.len();
     let Normalized { line_numbers, items } = normalized;
-    let mut evidence = Evidence { beside: vec![None; count], page_labels: page_labels.to_vec(), ..Evidence::default() };
+    let mut evidence = Evidence { beside: vec![None; count], ..Evidence::default() };
     let (mut faces, mut families) = (Names::default(), Names::default());
     let (mut words, mut operative) = (0, 0);
     for (page_slot, page) in pages.iter().enumerate() {

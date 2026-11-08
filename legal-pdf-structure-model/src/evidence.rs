@@ -196,8 +196,6 @@ pub struct Evidence {
     /// (`bookmarks::complete`).
     pub outline_usable: bool,
     pub outline_complete: bool,
-    /// The page labels the PDF declares (`/PageLabels`), by page index.
-    pub page_labels: Vec<Option<String>>,
     /// An instrument: its operative words (`OPERATIVE`) six in a thousand of its words or more, over
     /// two hundred words; or its caller's profile says so.
     pub instrument: bool,
