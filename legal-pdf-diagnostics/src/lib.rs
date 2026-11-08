@@ -6,7 +6,6 @@ use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_furniture::printed_label;
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
-use legal_pdf_support::LegalDocument;
 use legal_pdf_text::text::{hyphen_continuation, hyphen_fragment_tail};
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange};
 use std::collections::{HashMap, HashSet};
@@ -123,14 +122,6 @@ pub fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {
         }
     }
     Ok(ids)
-}
-
-pub fn validate_document(document: &LegalDocument) -> Result<()> {
-    if document.page_count != document.pages.len() {
-        return invalid("document page_count does not match the page collection");
-    }
-    let document_id = &document.document_id;
-    validate_pdf_components(document_id, &document.source_sha256, &document.pages, &document.structure_graph)
 }
 
 pub fn validate_pdf_components(

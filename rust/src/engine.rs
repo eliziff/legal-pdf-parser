@@ -1,15 +1,14 @@
 use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
-use legal_pdf_support::LegalDocument;
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
-use legal_pdf_diagnostics::{status, validate_document, validate_pdf_components};
+use legal_pdf_diagnostics::{status, validate_pdf_components};
 use legal_pdf_structure::{StructureIdentity, StructureOutput};
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
-use legal_structure_model::{DetectionProfile, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
+use legal_structure_model::{DetectionProfile, DocumentStructure, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -327,21 +326,6 @@ fn validate_output_size(document: &PdfDocument, options: &ParseOptions) -> Resul
     }
 }
 
-fn engine_identity() -> &'static Value {
-    static IDENTITY: OnceLock<Value> = OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        json!({
-            "engine": "legal-pdf-parser-rust",
-            "engine_version": env!("CARGO_PKG_VERSION"),
-            "parser_version": PARSER_VERSION,
-            "native_extractor": "pdf-inspector",
-            "ocr_renderer": if cfg!(feature = "ocr") { "hayro 0.7.1" } else { "disabled" },
-            "engine_source_sha256": env!("LEGAL_PDF_ENGINE_SHA256"),
-            "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
-        })
-    })
-}
-
 fn document_identity() -> &'static Value {
     static IDENTITY: OnceLock<Value> = OnceLock::new();
     IDENTITY.get_or_init(|| {
@@ -571,50 +555,14 @@ pub fn gold_structure_document(
     derive_document(extracted, source_hash, "structure-gold", None, None, pages)
 }
 
-fn build_document(
-    source_name: String,
-    source_hash: &str,
-    key: &str,
-    identity: &Value,
-    providers: (Option<(&str, &str)>, Option<&str>, Option<&str>),
-    mut extracted: ExtractedPdf,
-) -> Result<LegalDocument> {
-    let (ocr_provider, layout_variant, layout_identity) = providers;
+/// A cached extraction through the structure stage, as a parse reads it, checked: the pages as the stage left them and the
+/// structure, its revision taken, with the extraction's diagnostics.
+fn corpus_structure(source_hash: &str, mut extracted: ExtractedPdf) -> Result<(ExtractedPdf, DocumentStructure)> {
     let document_id = format!("doc-{}", &source_hash[..20]);
     let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
-    // A parse completes its structure in its projection; this document stops before it.
     derived.structure_graph.refresh_revision()?;
-    let mut metadata = Map::new();
-    metadata.insert("pdf".to_owned(), serde_json::to_value(extracted.metadata)?);
-    let provenance = json!({
-        "engine": "legalpdf",
-        "native_extractor": "pdf-inspector",
-        "ocr_provider": ocr_provider.map(|provider| provider.0),
-        "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
-        "layout_provider": layout_identity.map(|_| "ppdoc-lite"),
-        "layout_variant": layout_variant,
-        "layout_provider_identity": layout_identity,
-        "deterministic_cache_key": key,
-        "engine_code": identity,
-    });
-    let Value::Object(provenance) = provenance else { unreachable!("an object") };
-    let status = status(&extracted.diagnostics, &extracted.pages);
-    let document = LegalDocument {
-        document_id,
-        source_name,
-        source_sha256: source_hash.to_owned(),
-        page_count: extracted.pages.len(),
-        status,
-        pages: extracted.pages,
-        structure_graph: derived.structure_graph,
-        diagnostics: extracted.diagnostics,
-        metadata,
-        provenance,
-        schema_version: SCHEMA_VERSION.to_owned(),
-        parser_version: PARSER_VERSION.to_owned(),
-    };
-    profile::measure("build.validate_document", || validate_document(&document))?;
-    Ok(document)
+    profile::measure("build.validate_document", || validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.structure_graph))?;
+    Ok((extracted, derived.structure_graph))
 }
 
 fn parse_cache_root(root: &Path) -> PathBuf {
@@ -878,17 +826,12 @@ fn serialization_sha256(value: &impl Serialize) -> Result<String> {
     Ok(legal_structure_model::serialization_sha256(value))
 }
 
-/// A node kind's name, as the graph writes it.
-fn kind_name(kind: legal_structure_model::NodeKind) -> String {
-    serde_json::to_value(kind).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn structure_examples(document: &LegalDocument) -> Value {
+fn structure_examples(graph: &DocumentStructure) -> Value {
     use legal_structure_model::NodeKind;
-    let text = ScalarText::new(&document.structure_graph.text);
+    let text = ScalarText::new(&graph.text);
     let mut examples = BTreeMap::<String, Vec<Value>>::new();
     for kind in [NodeKind::Heading, NodeKind::Section, NodeKind::Paragraph, NodeKind::ListItem, NodeKind::Footnote, NodeKind::Endnote] {
-        let nodes = document.structure_graph.nodes.iter().filter(|node| node.kind == kind).collect::<Vec<_>>();
+        let nodes = graph.nodes.iter().filter(|node| node.kind == kind).collect::<Vec<_>>();
         if nodes.is_empty() {
             continue;
         }
@@ -908,13 +851,13 @@ fn structure_examples(document: &LegalDocument) -> Value {
                 "rule": node.proof.as_ref().map(|proof| proof.rule),
             })
         };
-        examples.insert(kind_name(kind), slots.into_iter().map(example).collect());
+        examples.insert(kind.name().to_owned(), slots.into_iter().map(example).collect());
     }
     json!(examples)
 }
 
 #[doc(hidden)]
-pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: String) -> Result<Value> {
+pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> {
     let cached: CachedExtraction = read_gzip_json(input.as_ref())?;
     if cached.schema_version != EXTRACTION_CACHE_SCHEMA || cached.source_sha256.len() != 64 || cached.extraction.pages.len() != cached.extraction.separators.len() {
         return Err(Error::Message("invalid extraction cache".to_owned()));
@@ -922,8 +865,8 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: Stri
     let page_count = cached.extraction.pages.len();
     let line_count = cached.extraction.pages.iter().map(|page| page.lines.len()).sum::<usize>();
     let (source_sha256, cache_key) = (cached.source_sha256.clone(), cached.cache_key.clone());
-    let document = build_document(source_name, &source_sha256, &cache_key, engine_identity(), (None, None, None), cached.extraction)?;
-    let graph = &document.structure_graph;
+    let (extracted, graph) = corpus_structure(&source_sha256, cached.extraction)?;
+    let graph = &graph;
     // Each document's nodes, a line each, for reading two engines' graphs side by side.
     if let Some(directory) = std::env::var_os("LEGALPDF_CORPUS_NODES") {
         let line = |node: &legal_structure_model::StructureNode| {
@@ -936,7 +879,7 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: Stri
         *counts.entry(name).or_default() += 1;
         counts
     });
-    let by_kind = count(&mut graph.nodes.iter().map(|node| kind_name(node.kind)));
+    let by_kind = count(&mut graph.nodes.iter().map(|node| node.kind.name().to_owned()));
     let sections = graph.nodes.iter().filter(|node| node.kind == legal_structure_model::NodeKind::Section);
     let sections_by_locator_kind = count(&mut sections.map(|node| node.locator_kind.clone().unwrap_or_else(|| "unknown".to_owned())));
     let proofs = graph.nodes.iter().filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof))).collect::<Vec<_>>();
@@ -963,13 +906,13 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: Stri
         "partial_resolution_count": coded("structure_run_partially_resolved"),
         "graph_sha256": serialization_sha256(graph)?,
         "proofs_sha256": serialization_sha256(&proofs)?,
-        "examples": structure_examples(&document),
+        "examples": structure_examples(graph),
     });
     Ok(json!({
         "source_sha256": source_sha256,
         "page_count": page_count,
         "line_count": line_count,
-        "product_sha256": serialization_sha256(&document)?,
+        "product_sha256": serialization_sha256(&(&extracted.pages, graph, &extracted.diagnostics))?,
         "structure": structure,
     }))
 }

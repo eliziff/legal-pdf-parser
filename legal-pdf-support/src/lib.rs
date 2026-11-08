@@ -1,4 +1,3 @@
-mod document;
 #[cfg(feature = "ppdoc")]
 mod ppdoc;
 #[cfg(feature = "ppdoc")]
@@ -8,7 +7,6 @@ mod ppdoc_postprocess;
 pub use legal_pdf_core::profile;
 mod projection;
 
-pub use document::LegalDocument;
 #[cfg(feature = "ppdoc")]
 pub use ppdoc::{PPDocDetection, PPDocLayout, PPDocOptions, PreparedPPDoc};
 pub use projection::{
