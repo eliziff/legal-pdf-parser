@@ -48,20 +48,9 @@ fn repair_markers(analysis: &dyn StructureAnalysis, pages: &mut [Page], slots: &
         for (position, &slot) in group.iter().enumerate() {
             let page = &pages[slots.page(slot)];
             if view.last().is_none_or(|last| last.index != page.index) {
-                view.push(Page {
-                    id: page.id.clone(),
-                    index: page.index,
-                    number: page.number,
-                    width: page.width,
-                    height: page.height,
-                    lines: Vec::new(),
-                    regions: Vec::new(),
-                    source: page.source.clone(),
-                    text_quality: page.text_quality,
-                    printed_label: None,
-                    printed_label_source: None,
-                    printed_label_line_id: None,
-                });
+                // (The page's lines are taken already.)
+                let page = Page { regions: Vec::new(), printed_label: None, printed_label_source: None, printed_label_line_id: None, ..page.clone() };
+                view.push(page);
             }
             let Some(mut line) = lines[slot.index()].take() else {
                 continue;
@@ -346,24 +335,6 @@ impl Lines<'_> {
         let title_shaped = evidence.title_shaped[text_line.unwrap_or(slot).index()] && !tail.trim_start().starts_with(char::is_lowercase);
         let worded = letters >= 8 && tail.split_whitespace().take(3).count() == 3;
         let carries_prose = letters >= 8 && runs_on || worded && !title_shaped;
-        let mut observations = Vec::new();
-        let mut observe = |observation: CandidateObservationV2| {
-            if !observations.contains(&observation) {
-                observations.push(observation);
-            }
-        };
-        if carries_prose {
-            observe(CandidateObservationV2::BodyProseFlow);
-        }
-        if title_shaped || matches!(evidence.tag[at], SourceTag::Heading(_)) {
-            observe(CandidateObservationV2::SectionHeading);
-        }
-        if evidence.tag[at] == SourceTag::ListItem {
-            observe(CandidateObservationV2::SourceListItem);
-        }
-        if aligned && letters >= 4 && tail.split_whitespace().count() >= 2 {
-            observe(CandidateObservationV2::ListItemLayout);
-        }
         // The marker is a citation's number, a sentence's word wrapped onto its line, or a bare
         // period marker inside prose ("v." of a case name). A number the margin prints is a paragraph's by its place on
         // the page, whatever the citation reading of the page's raw line order ran into it ("[2002] 4 R.C.S." over "67").
@@ -376,27 +347,25 @@ impl Lines<'_> {
         let prose = run.grammar == CandidateGrammar::Enumerator
             && candidate.label.ends_with('.')
             && (continued || candidate.label == "v." && self.analysis.has_citation_signal(&line.text));
-        if cited || prose || opening && continued {
-            observe(CandidateObservationV2::CrossReference);
-        }
-        // A number the margin prints beside the row its text opens on, counting on with the document's others, is
-        // a report's paragraph number, never a section's (`Fences::read_margin_numbers`).
-        if fences.margin_number[at].is_some() {
-            observe(CandidateObservationV2::ComposedParagraph);
-        }
-        if fences.cell[at] != 0 || matches!(evidence.tag[at], SourceTag::Table | SourceTag::Visual) {
-            observe(CandidateObservationV2::TableOrForm);
-        }
-        if fences.context(slot).quotation != 0 {
-            observe(CandidateObservationV2::Quotation);
-        }
         // A list's item as its line reads it: a marker of a list's family (`UnitRole::of_family`:
         // never "[12]", "(2)", "3." or "A.") that is a bullet, or whose text, after it or on the
         // line carrying it, opens in lower case.
         let bullet = !candidate.label.chars().any(char::is_alphanumeric);
-        if UnitRole::of_family(&candidate.label) == UnitRole::Item && (bullet || tail.trim_start().starts_with(char::is_lowercase)) {
-            observe(CandidateObservationV2::ComposedListItem);
-        }
+        let item = UnitRole::of_family(&candidate.label) == UnitRole::Item && (bullet || tail.trim_start().starts_with(char::is_lowercase));
+        let observations = [
+            (CandidateObservationV2::BodyProseFlow, carries_prose),
+            (CandidateObservationV2::SectionHeading, title_shaped || matches!(evidence.tag[at], SourceTag::Heading(_))),
+            (CandidateObservationV2::SourceListItem, evidence.tag[at] == SourceTag::ListItem),
+            (CandidateObservationV2::ListItemLayout, aligned && letters >= 4 && tail.split_whitespace().count() >= 2),
+            (CandidateObservationV2::CrossReference, cited || prose || opening && continued),
+            // A number the margin prints beside the row its text opens on, counting on with the document's others, is
+            // a report's paragraph number, never a section's (`Fences::read_margin_numbers`).
+            (CandidateObservationV2::ComposedParagraph, fences.margin_number[at].is_some()),
+            (CandidateObservationV2::TableOrForm, fences.cell[at] != 0 || matches!(evidence.tag[at], SourceTag::Table | SourceTag::Visual)),
+            (CandidateObservationV2::Quotation, fences.context(slot).quotation != 0),
+            (CandidateObservationV2::ComposedListItem, item),
+        ];
+        let observations = observations.into_iter().filter(|(_, holds)| *holds).map(|(observation, _)| observation).collect();
         Reading { beside, text, observations, carries_prose, title_shaped, worded }
     }
 }
@@ -454,13 +423,7 @@ impl Numbering for Runs {
                 evidence.beside[at] = Some(*row);
             }
         }
-        let edits = repaired
-            .iter()
-            .map(|(slot, _)| {
-                let line = slots.line(pages, *slot);
-                (*slot, line.text.clone(), line.words.clone())
-            })
-            .collect();
+        let edits = repaired.iter().map(|(slot, _)| (*slot, slots.line(pages, *slot).text.clone(), slots.line(pages, *slot).words.clone())).collect();
         let evidence: &Evidence = evidence;
         let geometry = Geometry::of(pages);
         // Each context's lines in reading order, its fenced lines left out.
@@ -473,9 +436,7 @@ impl Numbering for Runs {
         let mut runs = Vec::new();
         for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
             let view = View::of(pages, slots, evidence, lines);
-            let found = legal_pdf_core::profile::measure("candidates.detect", || {
-                analysis.detect_structure_candidate_runs(&view.text, true)
-            });
+            let found = legal_pdf_core::profile::measure("candidates.detect", || analysis.detect_structure_candidate_runs(&view.text, true));
             // A provision ladder under one worded top-level marker that goes on with the sentence
             // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
             // question numbers under it are the count's, not its subsections. A list's items go on
@@ -511,31 +472,21 @@ impl Numbering for Runs {
                 .flat_map(|(run, readings)| run.markers.iter().zip(readings))
                 .map(|(candidate, reading)| {
                     let mut page_indexes: Vec<usize> = Vec::new();
-                    let line_ids = view
-                        .overlapping(candidate.range.start, candidate.range.end)
-                        .map(|index| {
-                            let slot = view.lines[index].0;
-                            let page = pages[slots.page(slot)].index;
-                            if !page_indexes.contains(&page) {
-                                page_indexes.push(page);
-                            }
-                            slots.line(pages, slot).id.clone()
-                        })
-                        .collect();
-                    CandidateEvidenceV2 {
-                        candidate_id: candidate.id.clone(),
-                        page_indexes,
-                        line_ids,
-                        observations: reading.observations.clone(),
-                    }
+                    let mut line_id = |index: usize| {
+                        let slot = view.lines[index].0;
+                        let page = pages[slots.page(slot)].index;
+                        if !page_indexes.contains(&page) {
+                            page_indexes.push(page);
+                        }
+                        slots.line(pages, slot).id.clone()
+                    };
+                    let line_ids = view.overlapping(candidate.range.start, candidate.range.end).map(&mut line_id).collect();
+                    CandidateEvidenceV2 { candidate_id: candidate.id.clone(), page_indexes, line_ids, observations: reading.observations.clone() }
                 })
                 .collect();
-            let roles = legal_pdf_core::profile::measure("runs.resolve", || {
-                analysis.resolve_candidates(&found, &candidate_evidence)
-            })
-            .map_err(|error| Error::Message(error.to_string()))?;
-            let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> =
-                roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
+            let roles = legal_pdf_core::profile::measure("runs.resolve", || analysis.resolve_candidates(&found, &candidate_evidence))
+                .map_err(|error| Error::Message(error.to_string()))?;
+            let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> = roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
             // A document read in more than one context names each context's candidates apart.
             let prefix = if fences.contexts.len() > 1 { format!("context-{ctx:06}-") } else { String::new() };
             for (run, readings) in found.iter().zip(readings) {

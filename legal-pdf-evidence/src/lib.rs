@@ -17,10 +17,9 @@ use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label}
 use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 pub use legal_pdf_structure_model::evidence::*;
 pub use legal_pdf_structure_model::{NoteLabel, PageView, Rows, Slot, Slots, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
-use legal_pdf_core::{dominant_face, CitationSpan, ITALIC};
+use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
 use legal_pdf_tables::PageItems;
 
 pub fn page_rows(page: &Page) -> Rows {
@@ -112,9 +111,17 @@ impl Names {
 
 /// An affidavit's jurat: "Sworn before me", "AFFIRMED BEFORE ME at Toronto".
 fn jurat(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\b(?:sworn|affirmed|declared)\b.{0,40}\bbefore\s+me\b").unwrap())
-        .is_match(text)
+    regex!(r"(?i)\b(?:sworn|affirmed|declared)\b.{0,40}\bbefore\s+me\b").is_match(text)
+}
+
+/// The bits of the flags that hold.
+fn bits<T: std::ops::BitOr<Output = T> + Default>(flags: impl IntoIterator<Item = (T, bool)>) -> T {
+    flags.into_iter().filter(|(_, holds)| *holds).fold(T::default(), |bits, (bit, _)| bits | bit)
+}
+
+/// A line's text shaped as a title: twelve words at most, ending no sentence or clause.
+fn title_shaped(text: &str) -> bool {
+    !text.is_empty() && text.split_whitespace().count() <= 12 && !sentence_ended(text) && !text.ends_with([',', ';', ':'])
 }
 
 /// A line opening with a division's word and number, as the heading ladder reads one
@@ -134,7 +141,6 @@ fn division_word(text: &str) -> bool {
 /// on after the name ("THE COURT ORDERS:", "the Court of Appeal's reasons", "Court of Appeal,"), a
 /// statute's title ("THE COURT OF KING'S BENCH ACT") and the word alone name none.
 fn court_name(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
     const NAME: &str = r"[\p{Lu}(][\p{L}'’.&,()-]*";
     const JOIN: &str = r"(?i:of|for|the|and|de|du|des|la|le|d'|d’|l'|l’)";
     const FRENCH: &str = r"(?i:sup[ée]rieure|supr[êe]me|f[ée]d[ée]rale|provinciale|municipale|d['’]appel)";
@@ -146,20 +152,16 @@ fn court_name(text: &str) -> bool {
         && !text.ends_with([',', ';', ':'])
         && !before.split_whitespace().any(|word| matches!(word, "from" | "on" | "to" | "by" | "of" | "at" | "and" | "et"))
         && !lower.split_whitespace().next_back().is_some_and(|word| matches!(word, "act" | "rules" | "regulations" | "loi"))
-        && RE
-            .get_or_init(|| {
-                Regex::new(&format!(
-                    r"^(?:(?:IN|In)\s+)?(?:(?:THE|The)\s+)?(?:{NAME}\s+){{0,5}}(?:COURT|Court)(?:\s+(?i:of|for)\s+(?:{JOIN}\s+|{NAME}\s*)+)?(?:\s*[-–—]\s*{NAME}(?:\s+{NAME})*)?\s*$|^(?:(?:LA|La)\s+)?(?:COUR|Cour)(?:\s+(?:{FRENCH}|{JOIN}|{NAME}))+\s*$"
-                ))
-                .unwrap()
-            })
-            .is_match(text)
+        && regex!(&format!(
+            r"^(?:(?:IN|In)\s+)?(?:(?:THE|The)\s+)?(?:{NAME}\s+){{0,5}}(?:COURT|Court)(?:\s+(?i:of|for)\s+(?:{JOIN}\s+|{NAME}\s*)+)?(?:\s*[-–—]\s*{NAME}(?:\s+{NAME})*)?\s*$|^(?:(?:LA|La)\s+)?(?:COUR|Cour)(?:\s+(?:{FRENCH}|{JOIN}|{NAME}))+\s*$"
+        ))
+        .is_match(text)
 }
 
 /// The lexicon a line's words match (`WORD_*`), the citation title aside.
 fn lexicon(analysis: &dyn StructureAnalysis, line: &Line) -> u32 {
     let text = line.text.trim();
-    [
+    bits([
         (WORD_LABEL, headings::rules::label(text)),
         (WORD_PARTY, party_label().is_match(text)),
         (WORD_JURAT, jurat(text)),
@@ -183,18 +185,13 @@ fn lexicon(analysis: &dyn StructureAnalysis, line: &Line) -> u32 {
         (WORD_HISTORY, analysis.history_note(text)),
         (WORD_DIVISION, division_word(text)),
         (WORD_COURT, court_name(text)),
-    ]
-    .into_iter()
-    .filter(|(_, holds)| *holds)
-    .fold(0, |bits, (bit, _)| bits | bit)
+    ])
 }
 
 /// Figures run on after a word's punctuation: "licensing.59", "Act;12". A decimal ("59.5") and a
 /// one-letter abbreviation's number ("p.12") are none.
-fn glued_reference(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\p{L}{2}[.,;:)\]\u{201d}\u{2019}]\d{1,3}(?:\s|$)").unwrap())
-        .is_match(text)
+fn glued_re() -> &'static Regex {
+    regex!(r"\p{L}{2}[.,;:)\]\u{201d}\u{2019}](\d{1,3})(?:\s|$)")
 }
 
 /// A line's spans of figures or note symbols set as references, its type set at `size`: each span's
@@ -232,7 +229,6 @@ pub fn reference_values(line: &Line, size: f64) -> Vec<u32> {
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
 /// detached reference stands where it says.
 pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
-    static GLUED: OnceLock<Regex> = OnceLock::new();
     let value = |text: &str| text.trim().parse().unwrap_or(0);
     let chars: Vec<char> = line.text.chars().collect();
     let marks: Vec<&str> = reference_marks(line, size).map(|(text, _)| text).collect();
@@ -258,20 +254,12 @@ pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         }
     }
     // Figures run on after a word's punctuation ("count.12 This", "Act;3"), where no span sets them apart.
-    let glued = GLUED.get_or_init(|| Regex::new(r"\p{L}{2}[.,;:)\]\u{201d}\u{2019}](\d{1,3})(?:\s|$)").unwrap());
-    for found_at in glued.captures_iter(&line.text).filter_map(|c| c.get(1)) {
-        let start = line.text[..found_at.start()].chars().count() as u32;
-        let end = start + found_at.as_str().chars().count() as u32;
-        if !found.iter().any(|&(_, a, b)| a < end && start < b) {
-            found.push((value(found_at.as_str()), start, end));
-        }
-    }
     // Recognition sets a raised mark on the line's own run of text: figures run straight on from a word or its
     // abbreviation ("Ontario1", "Reid J.2") are a mark for the notes to answer, or no one's.
-    static RECOGNIZED: OnceLock<Regex> = OnceLock::new();
-    if line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0) {
-        let run_on = RECOGNIZED.get_or_init(|| Regex::new(r"[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}](\d{1,3})(?:[\s.,;:)]|$)").unwrap());
-        for found_at in run_on.captures_iter(&line.text).filter_map(|c| c.get(1)) {
+    let recognized = line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0);
+    let run_on = regex!(r"[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}](\d{1,3})(?:[\s.,;:)]|$)");
+    for pattern in [Some(glued_re()), recognized.then_some(run_on)].into_iter().flatten() {
+        for found_at in pattern.captures_iter(&line.text).filter_map(|c| c.get(1)) {
             let start = line.text[..found_at.start()].chars().count() as u32;
             let end = start + found_at.as_str().chars().count() as u32;
             if !found.iter().any(|&(_, a, b)| a < end && start < b) {
@@ -341,17 +329,8 @@ pub fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
 
 /// A line's reference tokens (`REFERENCE_*`), its type set at `size`.
 fn reference_tokens(line: &Line, size: f64) -> u8 {
-    let mut found = 0;
-    if !line.detached_references.is_empty() {
-        found |= REFERENCE_DETACHED;
-    }
-    for (_, set) in reference_marks(line, size) {
-        found |= set;
-    }
-    if glued_reference(&line.text) {
-        found |= REFERENCE_GLUED;
-    }
-    found
+    let marks = reference_marks(line, size).fold(0, |found, (_, set)| found | set);
+    marks | bits([(REFERENCE_DETACHED, !line.detached_references.is_empty()), (REFERENCE_GLUED, glued_re().is_match(&line.text))])
 }
 
 /// The line's opening marker (`Marker`), its family named in `families`.
@@ -390,12 +369,12 @@ pub fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> 
                 let prefix = label_prefix(&format!("{}*{rest}", &line.text[..lead]))?;
                 (prefix, true)
             } else {
-            let figures = line.text[lead..].chars().take(3).take_while(char::is_ascii_digit).count();
-            let next = line.text[lead + figures..].chars().next()?;
-            if figures == 0 || !(next.is_uppercase() || "\u{201c}\u{2018}\"'".contains(next)) {
-                return None;
-            }
-            (label_prefix(&format!("{} {}", &line.text[..lead + figures], &line.text[lead + figures..]))?, true)
+                let figures = line.text[lead..].chars().take(3).take_while(char::is_ascii_digit).count();
+                let next = line.text[lead + figures..].chars().next()?;
+                if figures == 0 || !(next.is_uppercase() || "\u{201c}\u{2018}\"'".contains(next)) {
+                    return None;
+                }
+                (label_prefix(&format!("{} {}", &line.text[..lead + figures], &line.text[lead + figures..]))?, true)
             }
         }
     };
@@ -408,19 +387,12 @@ pub fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> 
     if glued && !raised && !(label_size > 0.0 && label_size <= size * 0.85) {
         return None;
     }
-    let mut suppress = 0;
-    if line.bbox[1] >= page.height * 0.94 {
-        suppress |= SUPPRESS_FOOT;
-    }
-    if line.bbox[1] >= page.height * 0.91 && line.bbox[0] >= page.width * 0.50 && !compact_note_line(&line.text) {
-        suppress |= SUPPRESS_CORNER;
-    }
-    if line.text.chars().nth(prefix.end) == Some(',') && !raised {
-        suppress |= SUPPRESS_COMMA;
-    }
-    if !raised && reference_wrapped_onto(&page.lines, sizes, slot) {
-        suppress |= SUPPRESS_WRAPPED;
-    }
+    let suppress = bits([
+        (SUPPRESS_FOOT, line.bbox[1] >= page.height * 0.94),
+        (SUPPRESS_CORNER, line.bbox[1] >= page.height * 0.91 && line.bbox[0] >= page.width * 0.50 && !compact_note_line(&line.text)),
+        (SUPPRESS_COMMA, line.text.chars().nth(prefix.end) == Some(',') && !raised),
+        (SUPPRESS_WRAPPED, !raised && reference_wrapped_onto(&page.lines, sizes, slot)),
+    ]);
     Some(NoteLabel {
         value: normalize_label(&prefix.label).parse().unwrap_or(0),
         end: prefix.end.min(usize::from(u16::MAX)) as u16,
@@ -435,11 +407,7 @@ const OPERATIVE: &str = r"(?i)\b(?:shall|hereby|herein|hereto|hereof|hereunder|h
 
 /// A text's words (two letters or more), and how many of them are operative (`OPERATIVE`).
 fn operative_words(text: &str) -> (usize, usize) {
-    static WORD: OnceLock<Regex> = OnceLock::new();
-    static WORDS: OnceLock<Regex> = OnceLock::new();
-    let word = WORD.get_or_init(|| Regex::new(r"[A-Za-zÀ-ÿ]{2,}").unwrap());
-    let operative = WORDS.get_or_init(|| Regex::new(OPERATIVE).unwrap());
-    (word.find_iter(text).count(), operative.find_iter(text).count())
+    (regex!(r"[A-Za-zÀ-ÿ]{2,}").find_iter(text).count(), regex!(OPERATIVE).find_iter(text).count())
 }
 
 /// The evidence read off the pages: every page, line and the document measured once (`measure`), the citations on the
@@ -470,22 +438,7 @@ impl Measure for Evidence {
     ) -> Self {
         let count = slots.len();
         let Normalized { line_numbers, items } = normalized;
-        let mut evidence = Self {
-            size: Vec::with_capacity(count),
-            face: Vec::with_capacity(count),
-            half_points: Vec::with_capacity(count),
-            look: Vec::with_capacity(count),
-            weight: Vec::with_capacity(count),
-            tag: Vec::with_capacity(count),
-            marker: Vec::with_capacity(count),
-            beside: vec![None; count],
-            label: Vec::with_capacity(count),
-            references: Vec::with_capacity(count),
-            title_shaped: Vec::with_capacity(count),
-            words: Vec::with_capacity(count),
-            page_labels: page_labels.to_vec(),
-            ..Self::default()
-        };
+        let mut evidence = Self { beside: vec![None; count], page_labels: page_labels.to_vec(), ..Self::default() };
         let (mut faces, mut families) = (Names::default(), Names::default());
         let (mut words, mut operative) = (0, 0);
         for (page_slot, page) in pages.iter().enumerate() {
@@ -499,28 +452,18 @@ impl Measure for Evidence {
                 evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
                 evidence.half_points.push(face.map_or(0, |(_, size)| (size * 2.0).round().clamp(0.0, f64::from(u16::MAX)) as u16));
                 let underlined = !line.words.is_empty() && line.words.iter().filter(|word| word.underlined).count() * 2 > line.words.len();
-                evidence.look.push(
-                    [
-                        (LOOK_BOLD, bold_char_share(line) >= 0.5),
-                        (LOOK_ITALIC, flag_share(line, ITALIC).unwrap_or(0.0) > 0.5),
-                        (LOOK_CAPS, all_caps(text)),
-                        (LOOK_UNDERLINED, underlined),
-                    ]
-                    .into_iter()
-                    .filter(|(_, holds)| *holds)
-                    .fold(0, |bits, (bit, _)| bits | bit),
-                );
+                evidence.look.push(bits([
+                    (LOOK_BOLD, bold_char_share(line) >= 0.5),
+                    (LOOK_ITALIC, flag_share(line, ITALIC).unwrap_or(0.0) > 0.5),
+                    (LOOK_CAPS, all_caps(text)),
+                    (LOOK_UNDERLINED, underlined),
+                ]));
                 evidence.weight.push(line.weight as f32);
                 evidence.tag.push(SourceTag::of(line));
                 evidence.marker.push(opening_marker(analysis, line, &mut families));
                 evidence.label.push(note_label(page, &sizes, at));
                 evidence.references.push(reference_tokens(line, sizes[at]));
-                evidence.title_shaped.push(
-                    !text.is_empty()
-                        && text.split_whitespace().count() <= 12
-                        && !sentence_ended(text)
-                        && !text.ends_with([',', ';', ':']),
-                );
+                evidence.title_shaped.push(title_shaped(text));
                 evidence.words.push(lexicon(analysis, line));
                 if !line_numbers[first + at] {
                     let (read, found) = operative_words(&line.text);
@@ -600,12 +543,8 @@ impl Measure for Evidence {
             .collect();
         let seeds = wanted.clone();
         for slot in (0..count).filter(|&slot| seeds[slot]) {
-            if slot > 0 {
-                wanted[slot - 1] = true;
-            }
-            if slot + 1 < count {
-                wanted[slot + 1] = true;
-            }
+            wanted[slot.saturating_sub(1)] = true;
+            wanted[(slot + 1).min(count - 1)] = true;
         }
         // The window: each run of wanted lines a paragraph of its own, line under line.
         let mut window = String::new();
@@ -721,8 +660,7 @@ impl Measure for Evidence {
             let text = line.text.trim();
             self.marker[at] = opening_marker(analysis, line, &mut families);
             self.label[at] = note_label(page, &self.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
-            self.title_shaped[at] =
-                !text.is_empty() && text.split_whitespace().count() <= 12 && !sentence_ended(text) && !text.ends_with([',', ';', ':']);
+            self.title_shaped[at] = title_shaped(text);
             self.words[at] = lexicon(analysis, line) | self.words[at] & WORD_CITATION_TITLE;
             // The words after the rewritten marker keep their citations, moved by what the marker
             // gained or lost.

@@ -97,30 +97,27 @@ fn cached_rasters(
 }
 
 #[cfg(feature = "ocr")]
+impl DeferredOcrProvider<'_> {
+    /// The recognizer, made from its preparation the first time it is asked for.
+    fn runtime(&mut self) -> Result<&mut OcrProvider> {
+        if self.runtime.is_none() {
+            let prepared = self.prepared.take().ok_or_else(|| Error::Message("OCR runtime preparation was already consumed".to_owned()))?;
+            self.runtime = Some(profile::measure("provider_runtime_ocr", || OcrProvider::from_prepared(self.options, prepared))?);
+        }
+        Ok(self.runtime.as_mut().expect("OCR runtime initialized"))
+    }
+}
+
+#[cfg(feature = "ocr")]
 impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
-    fn extract_pages(
-        &mut self,
-        pdf: &[u8],
-        requests: &[legal_pdf_core::OcrPageRequest],
-    ) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
+    fn extract_pages(&mut self, pdf: &[u8], requests: &[legal_pdf_core::OcrPageRequest]) -> Result<Vec<legal_pdf_core::OcrPageResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let mut results = Vec::new();
-        let mut missing = Vec::new();
-        let mut paths = BTreeMap::new();
+        let (mut results, mut missing, mut paths) = (Vec::new(), Vec::new(), BTreeMap::new());
         for request in requests {
-            let key = serialization_sha256(&(
-                &self.cache_identity,
-                request.page_index,
-                request.width,
-                request.height,
-                &request.regions,
-            ))?;
-            let path = self
-                .cache_root
-                .as_ref()
-                .map(|root| root.join(format!("{key}.json.gz")));
+            let key = serialization_sha256(&(&self.cache_identity, request.page_index, request.width, request.height, &request.regions))?;
+            let path = self.cache_root.as_ref().map(|root| root.join(format!("{key}.json.gz")));
             let cached = path
                 .as_ref()
                 .and_then(|path| read_gzip_json::<CachedOcrPage>(path).ok())
@@ -169,14 +166,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         if missing.is_empty() {
             return Ok(results);
         }
-        if self.runtime.is_none() {
-            let prepared = self.prepared.take().ok_or_else(|| {
-                Error::Message("OCR runtime preparation was already consumed".to_owned())
-            })?;
-            self.runtime = Some(profile::measure("provider_runtime_ocr", || {
-                OcrProvider::from_prepared(self.options, prepared)
-            })?);
-        }
+        self.runtime()?;
         // Progress is reported per window of 4, 8 and then 16 pages, one runtime throughout.
         let mut windows = Vec::new();
         let mut rest = missing.as_slice();
@@ -192,29 +182,15 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         let raster_identity = self.raster_identity.clone();
         std::thread::scope(|scope| -> Result<()> {
             // Keep the exact 150 dpi scanner, overlapping its existing cache fill with recognition.
-            let raster = raster_root.map(|root| scope.spawn(move || {
-                cached_rasters(Some(&root), &raster_identity, pdf, &raster_requests)
-            }));
+            let raster = raster_root.map(|root| scope.spawn(move || cached_rasters(Some(&root), &raster_identity, pdf, &raster_requests)));
             for window in windows {
-                let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(
-                    self.runtime.as_mut().expect("OCR runtime initialized"),
-                    pdf,
-                    window,
-                )?;
+                let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(self.runtime.as_mut().expect("OCR runtime initialized"), pdf, window)?;
                 for page in recognized {
                     let Some((key, path)) = paths.remove(&page.page_index) else {
-                        return Err(Error::Message(
-                            "OCR returned an unexpected or repeated page".to_owned(),
-                        ));
+                        return Err(Error::Message("OCR returned an unexpected or repeated page".to_owned()));
                     };
                     if let Some(path) = path {
-                        write_gzip_json(
-                            &path,
-                            &CachedOcrPage {
-                                key,
-                                page: page.clone(),
-                            },
-                        )?;
+                        write_gzip_json(&path, &CachedOcrPage { key, page: page.clone() })?;
                     }
                     results.push(page);
                 }
@@ -226,9 +202,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
             Ok(())
         })?;
         if !paths.is_empty() {
-            return Err(Error::Message(
-                "OCR did not return every requested page".to_owned(),
-            ));
+            return Err(Error::Message("OCR did not return every requested page".to_owned()));
         }
         results.sort_by_key(|page| page.page_index);
         Ok(results)
@@ -242,12 +216,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         if let Some(cached) = path.as_ref().and_then(|path| read_gzip_json::<CachedRegion>(path).ok()).filter(|cached| cached.key == key) {
             return Ok(cached.lines);
         }
-        if self.runtime.is_none() {
-            let prepared = self.prepared.take().ok_or_else(|| {
-                Error::Message("OCR runtime preparation was already consumed".to_owned())
-            })?;
-            self.runtime = Some(OcrProvider::from_prepared(self.options, prepared)?);
-        }
+        self.runtime()?;
         let scaled = (scale * 100.0).round() as i64;
         if self.region_render.as_ref().is_none_or(|(page, at, _)| (*page, *at) != (page_index, scaled)) {
             self.region_render = legal_pdf_ocr::render_gray_page(pdf, page_index, scale * 72.0).map(|render| (page_index, scaled, render));
@@ -359,15 +328,10 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn validate_output_size(document: &PdfDocument, options: &ParseOptions) -> Result<()> {
-    if options
-        .max_output_bytes
-        .is_some_and(|limit| document.structure().query_text().len() > limit)
-    {
-        return Err(Error::Message(
-            "PDF document text exceeds the read limit".to_owned(),
-        ));
+    match options.max_output_bytes {
+        Some(limit) if document.structure().query_text().len() > limit => Err(Error::Message("PDF document text exceeds the read limit".to_owned())),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn engine_identity() -> &'static Value {
@@ -437,21 +401,10 @@ fn derive_extracted(
 ) -> Result<StructureOutput> {
     // Reader state depends on source pages, navigation hints and the engine's layout services.
     let reader_cache = cache_root.and_then(|root| {
-        let key = serialization_sha256(&(
-            env!("LEGAL_PDF_READER_SHA256"),
-            legal_pdf_core::layout_analysis().source_sha256(),
-            semantic_profile,
-            &extracted.pages,
-            &extracted.separators,
-            &extracted.outline,
-            std::env::var("LEGALPDF_ABLATE").ok(),
-        ))
-        .ok()?;
-        Some(
-            parse_cache_root(root)
-                .join("reader")
-                .join(format!("{key}.json.gz")),
-        )
+        let analysis = legal_pdf_core::layout_analysis().source_sha256();
+        let ablated = std::env::var("LEGALPDF_ABLATE").ok();
+        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), analysis, semantic_profile, &extracted.pages, &extracted.separators, &extracted.outline, ablated)).ok()?;
+        Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
     });
     let mut derived = legal_pdf_structure::derive_cached(
         legal_structure_model::structure_analysis(),
@@ -495,13 +448,9 @@ fn finish_recognition(
             }
         }
         let number = page.number;
-        page.regions.extend(reading.strokes.into_iter().enumerate().map(|(n, bbox)| legal_pdf_core::model::Region {
-            id: format!("p{number:04}-stroke{:04}", n + 1),
-            page_index,
-            kind: "rule".to_owned(),
-            line_ids: Vec::new(),
-            bbox,
-            reading_order: 0,
+        page.regions.extend(reading.strokes.into_iter().enumerate().map(|(n, bbox)| {
+            let id = format!("p{number:04}-stroke{:04}", n + 1);
+            legal_pdf_core::model::Region { id, page_index, kind: "rule".to_owned(), line_ids: Vec::new(), bbox, reading_order: 0 }
         }));
     }
     for page in pages {
@@ -538,14 +487,7 @@ fn derive_document(
     #[cfg(feature = "tagger")]
     profile::measure("derive_document.tagger", || crate::tagger::retag(&mut derived.structure_graph, &extracted.pages, source_hash, tagger))?;
     profile::measure("build.validate_document", || {
-        validate_pdf_components(
-            &document_id,
-            source_hash,
-            &extracted.pages,
-            &derived.paragraphs,
-            &derived.footnotes,
-            &derived.structure_graph,
-        )
+        validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.paragraphs, &derived.footnotes, &derived.structure_graph)
     })?;
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
@@ -561,28 +503,14 @@ fn derive_document(
                 }
             }
             for (source, line_ids) in by_source {
-                page.regions.push(legal_pdf_core::model::Region {
-                    id: format!("heading-source:{source}"),
-                    page_index: page.index,
-                    kind: "heading_source".to_owned(),
-                    line_ids,
-                    bbox: [0.0; 4],
-                    reading_order: 0,
-                });
+                let id = format!("heading-source:{source}");
+                page.regions.push(legal_pdf_core::model::Region { id, page_index: page.index, kind: "heading_source".to_owned(), line_ids, bbox: [0.0; 4], reading_order: 0 });
             }
         }
     }
     let mut parsed = profile::measure("project_document", || {
-        PdfDocument::from_parts(
-            source_hash,
-            key,
-            document_status,
-            extracted.metadata,
-            extracted.pages,
-            derived.paragraphs,
-            derived.footnotes,
-            derived.structure_graph,
-        )
+        let (metadata, pages) = (extracted.metadata, extracted.pages);
+        PdfDocument::from_parts(source_hash, key, document_status, metadata, pages, derived.paragraphs, derived.footnotes, derived.structure_graph)
     })?;
     parsed.set_passage_evidence(passage_pages);
     Ok(parsed)
@@ -678,45 +606,24 @@ fn build_document(
     mut extracted: ExtractedPdf,
 ) -> Result<LegalDocument> {
     let (ocr_provider, layout_variant, layout_identity) = providers;
-    let provider_name = ocr_provider.map(|provider| provider.0.to_owned());
-    let provider_identity = ocr_provider.map(|provider| provider.1.to_owned());
     let document_id = format!("doc-{}", &source_hash[..20]);
     let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
     // A parse completes its structure in its projection; this document stops before it.
     derived.structure_graph.refresh_revision()?;
     let mut metadata = Map::new();
     metadata.insert("pdf".to_owned(), serde_json::to_value(extracted.metadata)?);
-    let mut provenance = Map::new();
-    provenance.insert("engine".to_owned(), Value::String("legalpdf".to_owned()));
-    provenance.insert(
-        "native_extractor".to_owned(),
-        Value::String("pdf-inspector".to_owned()),
-    );
-    provenance.insert(
-        "ocr_provider".to_owned(),
-        provider_name.map_or(Value::Null, Value::String),
-    );
-    provenance.insert(
-        "ocr_provider_identity".to_owned(),
-        provider_identity.map_or(Value::Null, Value::String),
-    );
-    provenance.insert(
-        "layout_provider".to_owned(),
-        layout_identity.map_or(Value::Null, |_| Value::String("ppdoc-lite".to_owned())),
-    );
-    provenance.insert(
-        "layout_variant".to_owned(),
-        layout_variant.map_or(Value::Null, |value| Value::String(value.to_owned())),
-    );
-    provenance.insert(
-        "layout_provider_identity".to_owned(),
-        layout_identity.map_or(Value::Null, |value| Value::String(value.to_owned())),
-    );
-    provenance.insert(
-        "deterministic_cache_key".to_owned(),
-        Value::String(key.to_owned()),
-    );
-    provenance.insert("engine_code".to_owned(), identity.clone());
+    let provenance = json!({
+        "engine": "legalpdf",
+        "native_extractor": "pdf-inspector",
+        "ocr_provider": ocr_provider.map(|provider| provider.0),
+        "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
+        "layout_provider": layout_identity.map(|_| "ppdoc-lite"),
+        "layout_variant": layout_variant,
+        "layout_provider_identity": layout_identity,
+        "deterministic_cache_key": key,
+        "engine_code": identity,
+    });
+    let Value::Object(provenance) = provenance else { unreachable!("an object") };
     let status = status(&extracted.diagnostics, &extracted.pages);
     let document = LegalDocument {
         document_id,
@@ -806,29 +713,24 @@ fn maybe_prune_document_cache(root: &Path, ocr_root: &Path) {
 }
 
 fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocument> {
-    let path = parse_cache_root(root)
-        .join("documents")
-        .join(format!("{key}.json.gz"));
+    let path = parse_cache_root(root).join("documents").join(format!("{key}.json.gz"));
     if !path.is_file() {
         return None;
     }
-    let cached = profile::measure("document_cache_read_decode", || {
-        read_gzip_json::<PdfDocument>(&path).ok()
-    });
-    let cached = match cached.filter(|cached| {
-        cached.structure().schema_version.as_ref() == DOCUMENT_STRUCTURE_SCHEMA
-            && cached.structure().source_sha256.as_deref() == Some(source_hash)
-            && cached.summary().sha256 == source_hash
-            && cached.summary().parser_version == PARSER_VERSION
-            && cached.summary().cache_key == key
-            && cached.summary().page_count == cached.page_count()
-            && cached.summary().projection_page_count == cached.page_count()
-    }) {
-        Some(cached) => cached,
-        None => {
-            let _ = fs::remove_file(path);
-            return None;
-        }
+    let cached = profile::measure("document_cache_read_decode", || read_gzip_json::<PdfDocument>(&path).ok());
+    let current = |cached: &PdfDocument| {
+        let (structure, summary) = (cached.structure(), cached.summary());
+        structure.schema_version.as_ref() == DOCUMENT_STRUCTURE_SCHEMA
+            && structure.source_sha256.as_deref() == Some(source_hash)
+            && summary.sha256 == source_hash
+            && summary.parser_version == PARSER_VERSION
+            && summary.cache_key == key
+            && summary.page_count == cached.page_count()
+            && summary.projection_page_count == cached.page_count()
+    };
+    let Some(cached) = cached.filter(current) else {
+        let _ = fs::remove_file(path);
+        return None;
     };
     touch_cache(&path);
     Some(cached)
@@ -841,37 +743,20 @@ pub(crate) fn parse_pdf(
 ) -> Result<Option<PdfDocument>> {
     let _profile = profile::scope("parse_pdf");
     let source_hash = if let Some(bytes) = bytes {
-        if bytes.is_empty()
-            || bytes.len() > 100 * 1024 * 1024
-            || !bytes[..bytes.len().min(1024)]
-                .windows(5)
-                .any(|window| window == b"%PDF-")
-        {
+        if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
             return Err(Error::Message("PDF source bytes are invalid".to_owned()));
         }
         let actual = profile::measure("source_sha256", || format!("{:x}", Sha256::digest(bytes)));
-        if options
-            .expected_source_sha256
-            .as_deref()
-            .is_some_and(|expected| expected != actual)
-        {
-            return Err(Error::Message(
-                "PDF source changed after preparation began".to_owned(),
-            ));
+        if options.expected_source_sha256.as_deref().is_some_and(|expected| expected != actual) {
+            return Err(Error::Message("PDF source changed after preparation began".to_owned()));
         }
         actual
     } else {
-        options.expected_source_sha256.clone().ok_or_else(|| {
-            Error::Message("PDF cache lookup requires expected_source_sha256".to_owned())
-        })?
+        options.expected_source_sha256.clone().ok_or_else(|| Error::Message("PDF cache lookup requires expected_source_sha256".to_owned()))?
     };
-    let cache_root = options
-        .use_cache
-        .then(|| options.cache_dir.clone().unwrap_or_else(default_cache_dir));
+    let cache_root = options.use_cache.then(|| options.cache_dir.clone().unwrap_or_else(default_cache_dir));
     if let Some(key) = options.cache_key.as_deref() {
-        let cached = cache_root
-            .as_deref()
-            .and_then(|root| cached_document(root, key, &source_hash));
+        let cached = cache_root.as_deref().and_then(|root| cached_document(root, key, &source_hash));
         if let Some(document) = &cached {
             validate_output_size(document, options)?;
         }
@@ -879,50 +764,30 @@ pub(crate) fn parse_pdf(
     }
     let identity = document_identity();
     #[cfg(feature = "ocr")]
-    let mut ocr_prepared = profile::measure("provider_identity_ocr", || {
-        options.ocr.as_ref().map(OcrProvider::prepare).transpose()
-    })?;
+    let mut ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())?;
     #[cfg(feature = "ocr")]
-    let ocr_identity = ocr_prepared
-        .as_ref()
-        .map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
+    let ocr_identity = ocr_prepared.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
     #[cfg(not(feature = "ocr"))]
     let ocr_identity: Option<(String, String)> = None;
     #[cfg(feature = "ppdoc")]
-    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || {
-        options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()
-    })?;
+    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose())?;
     #[cfg(feature = "ppdoc")]
-    let ppdoc_identity = ppdoc_prepared
-        .as_ref()
-        .map(|provider| provider.identity().to_owned());
+    let ppdoc_identity = ppdoc_prepared.as_ref().map(|provider| provider.identity().to_owned());
     #[cfg(not(feature = "ppdoc"))]
     let ppdoc_identity: Option<String> = None;
-    let ocr_identity = if let Some(supplied) = &options.supplied_ocr {
-        Some(("supplied".to_owned(), supplied.identity(&source_hash)?))
-    } else {
-        ocr_identity
+    let ocr_identity = match &options.supplied_ocr {
+        Some(supplied) => Some(("supplied".to_owned(), supplied.identity(&source_hash)?)),
+        None => ocr_identity,
     };
     #[cfg(feature = "tagger")]
     let tagger_identity = crate::tagger::identity(options.tagger.as_ref())?;
     #[cfg(not(feature = "tagger"))]
     let tagger_identity: Option<String> = None;
-    let key = cache_key(
-        &source_hash,
-        identity,
-        ocr_identity
-            .as_ref()
-            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-        ppdoc_identity.as_deref(),
-        options.ocr_pages.as_deref(),
-        options.profile,
-        tagger_identity.as_deref(),
-    )?;
-    if let Some(root) = &cache_root {
-        if let Some(cached) = cached_document(root, &key, &source_hash) {
-            validate_output_size(&cached, options)?;
-            return Ok(Some(cached));
-        }
+    let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
+    let key = cache_key(&source_hash, identity, ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile, tagger_identity.as_deref())?;
+    if let Some(cached) = cache_root.as_deref().and_then(|root| cached_document(root, &key, &source_hash)) {
+        validate_output_size(&cached, options)?;
+        return Ok(Some(cached));
     }
     let Some(bytes) = bytes else {
         return Ok(None);
@@ -942,12 +807,8 @@ pub(crate) fn parse_pdf(
     let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, tagger, None)?;
     validate_output_size(&parsed, options)?;
     if let Some(root) = &cache_root {
-        let cache_path = parse_cache_root(root)
-            .join("documents")
-            .join(format!("{key}.json.gz"));
-        match profile::measure("document_cache_write", || {
-            write_gzip_json(&cache_path, &parsed)
-        }) {
+        let cache_path = parse_cache_root(root).join("documents").join(format!("{key}.json.gz"));
+        match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {
             Ok(()) => maybe_prune_document_cache(root, &ocr_cache_root(root, options)),
             Err(error) if options.require_cache_write => return Err(error),
             Err(_) => {}
@@ -979,40 +840,25 @@ fn recognized_extraction(
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
 ) -> Result<ExtractedPdf> {
     #[cfg(feature = "ocr")]
-    let recognition_key = serialization_sha256(&(
-        "legalpdf.recognition-cache.v1",
-        source_hash,
-        env!("LEGAL_PDF_OCR_SHA256"),
-        providers
-            .ocr_identity
-            .as_ref()
-            .map(|provider| (provider.0.as_str(), provider.1.as_str())),
-    ))?;
+    let mut ocr_provider = {
+        let identity = providers.ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
+        let recognition_key = serialization_sha256(&("legalpdf.recognition-cache.v1", source_hash, env!("LEGAL_PDF_OCR_SHA256"), identity))?;
+        let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")))?;
+        let recognition_root = cache_root.map(|root| ocr_cache_root(root, options).join("recognition"));
+        options.ocr.as_ref().zip(providers.ocr).map(|(options, prepared)| DeferredOcrProvider {
+            options,
+            prepared: Some(prepared),
+            runtime: None,
+            cache_root: recognition_root,
+            cache_identity: recognition_key,
+            raster_identity: raster_key,
+            region_render: None,
+            progress,
+            rasters: BTreeMap::new(),
+        })
+    };
     #[cfg(feature = "ocr")]
-    let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")))?;
-    #[cfg(feature = "ocr")]
-    let recognition_root = cache_root.map(|root| ocr_cache_root(root, options).join("recognition"));
-    #[cfg(feature = "ocr")]
-    let mut ocr_provider =
-        options
-            .ocr
-            .as_ref()
-            .zip(providers.ocr)
-            .map(|(options, prepared)| DeferredOcrProvider {
-                options,
-                prepared: Some(prepared),
-                runtime: None,
-                cache_root: recognition_root,
-                cache_identity: recognition_key.clone(),
-                raster_identity: raster_key.clone(),
-                region_render: None,
-                progress,
-                rasters: BTreeMap::new(),
-            });
-    #[cfg(feature = "ocr")]
-    let selected_ocr = ocr_provider
-        .as_mut()
-        .map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
+    let selected_ocr = ocr_provider.as_mut().map(|provider| provider as &mut dyn legal_pdf_core::PdfOcrProvider);
     #[cfg(not(feature = "ocr"))]
     let selected_ocr = None;
     let mut supplied = options.supplied_ocr.as_ref();
@@ -1023,24 +869,13 @@ fn recognized_extraction(
     // A PDF's extraction is keyed by the PDF and the schema, never by a fingerprint of source files: work after
     // extraction never re-extracts, and a change to extraction itself bumps EXTRACTION_CACHE_SCHEMA.
     let extraction_key = serialization_sha256(&(EXTRACTION_CACHE_SCHEMA, source_hash))?;
-    let extraction_path = cache_root.map(|root| {
-        parse_cache_root(root)
-            .join("extractions")
-            .join(format!("{extraction_key}.json.gz"))
-    });
+    let extraction_path = cache_root.map(|root| parse_cache_root(root).join("extractions").join(format!("{extraction_key}.json.gz")));
     let cached = extraction_path
         .as_ref()
-        .and_then(|path| {
-            profile::measure("extraction_cache_read", || {
-                read_gzip_json::<CachedExtraction>(path)
-            })
-            .ok()
-        })
+        .and_then(|path| profile::measure("extraction_cache_read", || read_gzip_json::<CachedExtraction>(path)).ok())
         .filter(|cached| {
-            cached.schema_version == EXTRACTION_CACHE_SCHEMA
-                && cached.source_sha256 == source_hash
-                && !cached.extraction.pages.is_empty()
-                && cached.extraction.pages.len() == cached.extraction.separators.len()
+            let extraction = &cached.extraction;
+            cached.schema_version == EXTRACTION_CACHE_SCHEMA && cached.source_sha256 == source_hash && !extraction.pages.is_empty() && extraction.pages.len() == extraction.separators.len()
         });
     let mut extracted = if let Some(cached) = cached {
         if let Some(path) = &extraction_path {
@@ -1050,29 +885,15 @@ fn recognized_extraction(
     } else {
         let extracted = profile::measure("extract_pdf", || extract_pdf(bytes, None, None))?;
         if let Some(path) = &extraction_path {
-            let result = profile::measure("extraction_cache_write", || {
-                write_gzip_json(
-                    path,
-                    &CachedExtraction {
-                        schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(),
-                        source_sha256: source_hash.to_owned(),
-                        cache_key: extraction_key,
-                        extraction: &extracted,
-                    },
-                )
-            });
+            let entry = CachedExtraction { schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(), source_sha256: source_hash.to_owned(), cache_key: extraction_key, extraction: &extracted };
+            let result = profile::measure("extraction_cache_write", || write_gzip_json(path, &entry));
             if options.require_cache_write {
                 result?;
             }
         }
         extracted
     };
-    recognize_pdf(
-        bytes,
-        &mut extracted,
-        selected_ocr,
-        options.ocr_pages.as_deref(),
-    )?;
+    recognize_pdf(bytes, &mut extracted, selected_ocr, options.ocr_pages.as_deref())?;
     #[cfg(feature = "ocr")]
     let rasters = ocr_provider.as_mut().map(|provider| std::mem::take(&mut provider.rasters)).unwrap_or_default();
     #[cfg(not(feature = "ocr"))]
@@ -1080,20 +901,11 @@ fn recognized_extraction(
     finish_recognition(&mut extracted.pages, rasters);
     #[cfg(feature = "ppdoc")]
     let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
-        options
-            .ppdoc
-            .as_ref()
-            .zip(providers.ppdoc)
-            .map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared))
-            .transpose()
+        options.ppdoc.as_ref().zip(providers.ppdoc).map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared)).transpose()
     })?;
     #[cfg(feature = "ppdoc")]
     if let Some(provider) = ppdoc.as_mut() {
-        extracted
-            .diagnostics
-            .extend(profile::measure("ppdoc_annotate", || {
-                provider.annotate_pdf(bytes, &mut extracted.pages)
-            })?);
+        extracted.diagnostics.extend(profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))?);
     }
     Ok(extracted)
 }
@@ -1102,173 +914,90 @@ fn serialization_sha256(value: &impl Serialize) -> Result<String> {
     Ok(legal_structure_model::serialization_sha256(value))
 }
 
+/// A node kind's name, as the graph writes it.
+fn kind_name(kind: legal_structure_model::NodeKind) -> String {
+    serde_json::to_value(kind).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn structure_examples(document: &LegalDocument) -> Value {
+    use legal_structure_model::NodeKind;
     let text = ScalarText::new(&document.structure_graph.text);
     let mut examples = BTreeMap::<String, Vec<Value>>::new();
-    for kind in [
-        legal_structure_model::NodeKind::Heading,
-        legal_structure_model::NodeKind::Section,
-        legal_structure_model::NodeKind::Paragraph,
-        legal_structure_model::NodeKind::ListItem,
-        legal_structure_model::NodeKind::Footnote,
-        legal_structure_model::NodeKind::Endnote,
-    ] {
-        let nodes = document
-            .structure_graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == kind)
-            .collect::<Vec<_>>();
+    for kind in [NodeKind::Heading, NodeKind::Section, NodeKind::Paragraph, NodeKind::ListItem, NodeKind::Footnote, NodeKind::Endnote] {
+        let nodes = document.structure_graph.nodes.iter().filter(|node| node.kind == kind).collect::<Vec<_>>();
         if nodes.is_empty() {
             continue;
         }
         let mut slots = vec![0, nodes.len() / 2, nodes.len() - 1];
-        slots.sort_unstable();
         slots.dedup();
-        let values = slots
-            .into_iter()
-            .map(|slot| {
-                let node = nodes[slot];
-                let value = text
-                    .slice_utf16(node.range.start..node.range.end)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .chars()
-                    .take(240)
-                    .collect::<String>();
-                json!({
-                    "id": node.id,
-                    "text": value,
-                    "label": node.label,
-                    "locator_kind": node.locator_kind,
-                    "parent_id": node.parent_id,
-                    "page_indexes": node.page_indexes,
-                    "line_ids": node.line_ids,
-                    "rule": node.proof.as_ref().map(|proof| proof.rule),
-                })
+        let example = |slot: usize| {
+            let node = nodes[slot];
+            let words = text.slice_utf16(node.range.start..node.range.end).unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+            json!({
+                "id": node.id,
+                "text": words.chars().take(240).collect::<String>(),
+                "label": node.label,
+                "locator_kind": node.locator_kind,
+                "parent_id": node.parent_id,
+                "page_indexes": node.page_indexes,
+                "line_ids": node.line_ids,
+                "rule": node.proof.as_ref().map(|proof| proof.rule),
             })
-            .collect();
-        let name = serde_json::to_value(kind)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "unknown".to_owned());
-        examples.insert(name, values);
+        };
+        examples.insert(kind_name(kind), slots.into_iter().map(example).collect());
     }
     json!(examples)
 }
 
 #[doc(hidden)]
-pub fn corpus_check_cached_extraction(
-    input: impl AsRef<Path>,
-    source_name: String,
-) -> Result<Value> {
+pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: String) -> Result<Value> {
     let cached: CachedExtraction = read_gzip_json(input.as_ref())?;
-    if cached.schema_version != EXTRACTION_CACHE_SCHEMA
-        || cached.source_sha256.len() != 64
-        || cached.extraction.pages.len() != cached.extraction.separators.len()
-    {
+    if cached.schema_version != EXTRACTION_CACHE_SCHEMA || cached.source_sha256.len() != 64 || cached.extraction.pages.len() != cached.extraction.separators.len() {
         return Err(Error::Message("invalid extraction cache".to_owned()));
     }
     let page_count = cached.extraction.pages.len();
-    let line_count = cached
-        .extraction
-        .pages
-        .iter()
-        .map(|page| page.lines.len())
-        .sum::<usize>();
-    let source_sha256 = cached.source_sha256.clone();
-    let cache_key = cached.cache_key.clone();
-    let document = build_document(
-        source_name,
-        &source_sha256,
-        &cache_key,
-        engine_identity(),
-        (None, None, None),
-        cached.extraction,
-    )?;
+    let line_count = cached.extraction.pages.iter().map(|page| page.lines.len()).sum::<usize>();
+    let (source_sha256, cache_key) = (cached.source_sha256.clone(), cached.cache_key.clone());
+    let document = build_document(source_name, &source_sha256, &cache_key, engine_identity(), (None, None, None), cached.extraction)?;
+    let graph = &document.structure_graph;
     // Each document's nodes, a line each, for reading two engines' graphs side by side.
     if let Some(directory) = std::env::var_os("LEGALPDF_CORPUS_NODES") {
-        let lines = document.structure_graph.nodes.iter()
-            .map(|node| format!("{} {} {:?} {:?}\n", serde_json::to_value(node.kind).unwrap_or_default(),
-                node.label.as_deref().unwrap_or("_"), node.range, node.parent_id))
-            .collect::<String>();
-        std::fs::write(Path::new(&directory).join(format!("{}.nodes.txt", &source_sha256[..16])), lines)
-            .map_err(|error| Error::Message(error.to_string()))?;
+        let line = |node: &legal_structure_model::StructureNode| {
+            format!("{} {} {:?} {:?}\n", serde_json::to_value(node.kind).unwrap_or_default(), node.label.as_deref().unwrap_or("_"), node.range, node.parent_id)
+        };
+        let lines = graph.nodes.iter().map(line).collect::<String>();
+        std::fs::write(Path::new(&directory).join(format!("{}.nodes.txt", &source_sha256[..16])), lines).map_err(|error| Error::Message(error.to_string()))?;
     }
-    let mut by_kind = BTreeMap::<String, usize>::new();
-    let mut sections_by_locator_kind = BTreeMap::<String, usize>::new();
-    for node in &document.structure_graph.nodes {
-        let kind = serde_json::to_value(node.kind)?
-            .as_str()
-            .unwrap_or("unknown")
-            .to_owned();
-        *by_kind.entry(kind).or_default() += 1;
-        if node.kind == legal_structure_model::NodeKind::Section {
-            *sections_by_locator_kind
-                .entry(
-                    node.locator_kind
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_owned()),
-                )
-                .or_default() += 1;
-        }
-    }
-    let proofs = document
-        .structure_graph
+    let count = |names: &mut dyn Iterator<Item = String>| names.fold(BTreeMap::<String, usize>::new(), |mut counts, name| {
+        *counts.entry(name).or_default() += 1;
+        counts
+    });
+    let by_kind = count(&mut graph.nodes.iter().map(|node| kind_name(node.kind)));
+    let sections = graph.nodes.iter().filter(|node| node.kind == legal_structure_model::NodeKind::Section);
+    let sections_by_locator_kind = count(&mut sections.map(|node| node.locator_kind.clone().unwrap_or_else(|| "unknown".to_owned())));
+    let proofs = graph.nodes.iter().filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof))).collect::<Vec<_>>();
+    let name = |value: serde_json::Result<Value>| value.ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned());
+    let by_rule = count(&mut proofs.iter().map(|(_, proof)| name(serde_json::to_value(proof.rule))));
+    let coded = |code: &str| graph.diagnostics.iter().filter(|diagnostic| diagnostic.code == code).count();
+    let heading_derived_sections = graph
         .nodes
         .iter()
-        .filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof)))
-        .collect::<Vec<_>>();
-    let mut by_rule = BTreeMap::<String, usize>::new();
-    for (_, proof) in &proofs {
-        let rule = serde_json::to_value(proof.rule)?
-            .as_str()
-            .unwrap_or("unknown")
-            .to_owned();
-        *by_rule.entry(rule).or_default() += 1;
-    }
-    let abstentions = document
-        .structure_graph
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "structure_run_abstained")
+        .filter(|node| node.kind == legal_structure_model::NodeKind::Section && node.grammar.as_deref() == Some("accepted_heading"))
         .count();
-    let partial_resolutions = document
-        .structure_graph
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "structure_run_partially_resolved")
-        .count();
-    let heading_derived_sections = document
-        .structure_graph
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.kind == legal_structure_model::NodeKind::Section
-                && node.grammar.as_deref() == Some("accepted_heading")
-        })
-        .count();
-    let mut diagnostics_by_code = BTreeMap::<String, usize>::new();
-    for diagnostic in &document.structure_graph.diagnostics {
-        *diagnostics_by_code
-            .entry(diagnostic.code.clone())
-            .or_default() += 1;
-    }
+    let diagnostics_by_code = count(&mut graph.diagnostics.iter().map(|diagnostic| diagnostic.code.clone()));
     let structure = json!({
-        "schema_version": document.structure_graph.schema_version,
-        "node_count": document.structure_graph.nodes.len(),
-        "note_count": document.structure_graph.notes.len(),
-        "diagnostic_count": document.structure_graph.diagnostics.len(),
+        "schema_version": graph.schema_version,
+        "node_count": graph.nodes.len(),
+        "note_count": graph.notes.len(),
+        "diagnostic_count": graph.diagnostics.len(),
         "by_kind": by_kind,
         "by_rule": by_rule,
         "sections_by_locator_kind": sections_by_locator_kind,
         "diagnostics_by_code": diagnostics_by_code,
         "heading_derived_section_count": heading_derived_sections,
-        "abstention_count": abstentions,
-        "partial_resolution_count": partial_resolutions,
-        "graph_sha256": serialization_sha256(&document.structure_graph)?,
+        "abstention_count": coded("structure_run_abstained"),
+        "partial_resolution_count": coded("structure_run_partially_resolved"),
+        "graph_sha256": serialization_sha256(graph)?,
         "proofs_sha256": serialization_sha256(&proofs)?,
         "examples": structure_examples(&document),
     });
