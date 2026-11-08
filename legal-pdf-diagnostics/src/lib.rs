@@ -10,8 +10,6 @@ use legal_pdf_text::text::{hyphen_continuation, hyphen_fragment_tail};
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange};
 use std::collections::{HashMap, HashSet};
 
-const HARD_DIAGNOSTICS: &[&str] = &["COLUMN_ORDER_UNCERTAIN", "FOOTNOTE_UNMATCHED_LABEL", "FOOTNOTE_UNMATCHED_REFERENCE", "FOOTNOTE_REGION_UNCERTAIN", "TEXT_QUALITY_LOW"];
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Message(message.into()))
 }
@@ -29,9 +27,7 @@ pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {
     let ocr_pages: HashSet<Option<usize>> = diagnostics.iter().filter(ocr).map(|diagnostic| diagnostic.page_index).collect();
     if !pages.is_empty() && ocr_pages.len() == pages.len() {
         "ocr_required"
-    } else if diagnostics.iter().any(|diagnostic| {
-        matches!(diagnostic.severity.as_str(), "warning" | "error") && (ocr(&diagnostic) || HARD_DIAGNOSTICS.contains(&diagnostic.code.as_str()))
-    }) {
+    } else if !diagnostics.is_empty() {
         "degraded"
     } else {
         "ready"

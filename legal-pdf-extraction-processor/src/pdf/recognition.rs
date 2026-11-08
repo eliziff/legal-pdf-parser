@@ -380,11 +380,7 @@ pub fn recognize_pdf(
     }
     let unresolved_pages: Vec<_> = weak_pages.into_iter().collect();
     for &page_index in &unresolved_pages {
-        diagnostics.push(Diagnostic::warning(
-            "OCR_REQUIRED",
-            "Page has no reliable embedded text and no usable OCR result.",
-            Some(page_index),
-        ));
+        diagnostics.push(Diagnostic::new("OCR_REQUIRED", Some(page_index)));
     }
 
     metadata.pages_needing_ocr = unresolved_pages;

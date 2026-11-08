@@ -605,15 +605,7 @@ fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_pag
     }
     let confident = (first_label >= page.height * 0.58 || endnote_page) && selected_size.is_some_and(|size| size <= body_size * 0.90);
     if !confident {
-        let mut diagnostic = Diagnostic::warning(
-            "FOOTNOTE_REGION_UNCERTAIN",
-            "Footnote region inferred from weak label geometry without a separator.",
-            Some(page.index),
-        );
-        if let Some(place) = labels.iter().min_by(|left, right| sheet.line(**left).bbox[1].total_cmp(&sheet.line(**right).bbox[1])) {
-            diagnostic.line_ids.push(sheet.line(*place).id.clone());
-        }
-        diagnostics.push(diagnostic);
+        diagnostics.push(Diagnostic::new("FOOTNOTE_REGION_UNCERTAIN", Some(page.index)));
     }
     Some(first_label)
 }

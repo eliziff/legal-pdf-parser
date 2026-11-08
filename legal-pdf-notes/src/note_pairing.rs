@@ -61,20 +61,12 @@ pub fn pair_notes(pages: &mut [Page],
         for document in readings.values() {
             let mut part = legal_structure_model::structure_analysis().pair_footnotes(document, citations, false, &place);
             let mut sequences = 0;
-            let mut ids = HashMap::new();
             for (slot, note) in part.notes.iter_mut().enumerate() {
                 let id = format!("fnv2-pair-LEGALPDF-document-{:06}", result.notes.len() + slot + 1);
-                ids.insert(std::mem::replace(&mut note.id, id.clone()), id);
+                note.id = id;
                 let sequence = note.series.parse::<usize>().unwrap_or(0);
                 sequences = sequences.max(sequence);
                 note.series = (sequence + sequence_offset).to_string();
-            }
-            for diagnostic in &mut part.diagnostics {
-                if let Some(id) = diagnostic.details.get_mut("pair_id") {
-                    if let Some(mapped) = id.as_str().and_then(|id| ids.get(id)) {
-                        *id = serde_json::Value::String(mapped.clone());
-                    }
-                }
             }
             sequence_offset += sequences;
             result.notes.extend(part.notes);

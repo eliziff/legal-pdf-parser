@@ -220,18 +220,9 @@ pub fn page_order(
         body.extend(lane);
         decision
     };
-    let diagnostic = if decision.repair == OrderRepair::None && decision.source_switches > 2 {
-        let message = format!("Two-column page keeps an order that crosses columns {} times ({}).", decision.source_switches, decision.reason);
-        Some(Diagnostic::warning("COLUMN_ORDER_UNCERTAIN", message, Some(page.index)))
-    } else {
-        None
-    };
-    let diagnostics = diagnostic
+    let diagnostics = (decision.repair == OrderRepair::None && decision.source_switches > 2)
+        .then(|| Diagnostic::new("COLUMN_ORDER_UNCERTAIN", Some(page.index)))
         .into_iter()
-        .map(|mut diagnostic| {
-            diagnostic.line_ids = body.iter().take(20).map(|&slot| lines[slot].id.clone()).collect();
-            diagnostic
-        })
         .collect();
     order_note_lines(lines, &mut note, items, number);
     // A running head and foot read row by row.

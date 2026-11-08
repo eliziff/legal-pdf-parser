@@ -106,17 +106,9 @@ pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], 
     let mut diagnostics = Vec::new();
     for line in pages.iter().flat_map(|page| page.lines.iter()) {
         for detached in &line.detached_references {
-            let label = normalize_label(&detached.note_id);
             let placed = index.global_range(&line.id, detached.start_offset, detached.end_offset);
             if !placed.is_some_and(|range| calls.contains(&(range.start, range.end))) {
-                let mut diagnostic =
-                    Diagnostic::warning("FOOTNOTE_UNMATCHED_REFERENCE", format!("Detached superscript '{label}' has no paired label."), Some(line.page_index));
-                diagnostic.line_ids.push(line.id.clone());
-                if !detached.source_line_id.is_empty() {
-                    diagnostic.line_ids.push(detached.source_line_id.clone());
-                }
-                diagnostic.details.insert("label".to_owned(), json!(label));
-                diagnostics.push(diagnostic);
+                diagnostics.push(Diagnostic::new("FOOTNOTE_UNMATCHED_REFERENCE", Some(line.page_index)));
             }
         }
         let holds_first_call = index.line(&line.id).is_some_and(|placed| first_calls.iter().any(|&start| placed.range.start <= start && start < placed.range.end));
@@ -125,10 +117,7 @@ pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], 
         }
         let context = decided.document_context(&line.id);
         if line.spans.iter().any(|span| span.superscript && labels.contains(&(context, normalize_label(span.text.trim()).as_str()))) {
-            let message = "A superscript resembling a known note label was not paired.";
-            let mut diagnostic = Diagnostic::warning("FOOTNOTE_UNMATCHED_REFERENCE", message, Some(line.page_index));
-            diagnostic.line_ids.push(line.id.clone());
-            diagnostics.push(diagnostic);
+            diagnostics.push(Diagnostic::new("FOOTNOTE_UNMATCHED_REFERENCE", Some(line.page_index)));
         }
     }
     diagnostics
