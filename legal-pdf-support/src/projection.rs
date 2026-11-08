@@ -9,10 +9,9 @@ use legal_structure_model::{
     ScalarText,
 };
 use legal_structure_model::{
-    Derivation, DocumentStructure, NodeKind, StructureAnalysis, StructureNode,
+    Derivation, DocumentStructure, NodeKind, StructureNode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::Digest;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};

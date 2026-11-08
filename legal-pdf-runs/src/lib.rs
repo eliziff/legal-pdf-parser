@@ -21,7 +21,7 @@ use legal_pdf_structure_model::{Evidence, Role, Slot, Slots, SourceTag};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use legal_pdf_structure_model::{Member, Place, Run, Runs};
 use legal_structure_model::{
-    CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, StructureAnalysis, StructureCandidateRun,
+    CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, StructureCandidateRun,
     StructureMarkerCandidate, UnitRole,
 };
 

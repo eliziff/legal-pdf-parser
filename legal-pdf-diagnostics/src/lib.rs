@@ -6,7 +6,6 @@ use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_furniture::printed_label;
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
-use legal_pdf_text::text::{hyphen_continuation, hyphen_fragment_tail};
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange};
 use std::collections::{HashMap, HashSet};
 

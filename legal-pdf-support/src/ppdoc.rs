@@ -4,7 +4,7 @@ use crate::ppdoc_postprocess::{
     RegionDetection,
 };
 use image::{imageops, RgbImage};
-use legal_pdf_core::model::{Diagnostic, Page};
+use legal_pdf_core::model::Page;
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -460,7 +460,6 @@ impl PPDocLayout {
             ..Default::default()
         };
         let mut regions_by_page = vec![Vec::<RegionDetection>::new(); pages.len()];
-        let mut detection_count = 0;
         for (page_position, page) in pages.iter().enumerate() {
             if !page
                 .lines
@@ -488,7 +487,6 @@ impl PPDocLayout {
             let image = RgbImage::from_raw(width, height, pixels)
                 .expect("renderer dimensions match its pixel buffer");
             let detections = self.detect_rgb(&image)?;
-            detection_count += detections.len();
             regions_by_page[page_position] =
                 scale_detections(page.width, page.height, width, height, &detections);
         }

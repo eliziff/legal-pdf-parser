@@ -5,11 +5,8 @@ use legal_pdf_core::model::{Diagnostic, Page};
 use legal_pdf_core::AuthorityTextUnit;
 use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, StructureNode};
-use legal_pdf_core::regex;
 use legal_pdf_structure_model::{Decided, DocumentContext};
 use legal_structure_model::text::normalize_label;
-use regex::Regex;
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 /// Each sentence's end in `chars`: its stop and the quotes or brackets closing it, where a space, a
@@ -91,7 +88,7 @@ pub fn attach_propositions(structure: &mut DocumentStructure, units: &[Authority
 /// call stands on.
 pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], index: &PdfTextIndex, decided: &Decided) -> Vec<Diagnostic> {
     let context_of = |note: &StructureNode| note.line_ids.first().map_or((0, false), |id| decided.document_context(id));
-    let labels: HashSet<_> = notes.iter().map(|note| (context_of(note), note.printed_label())).collect();
+    let labels: HashSet<_> = notes.iter().map(|note| (context_of(note), note.label.as_deref().unwrap_or(""))).collect();
     let calls: HashSet<(usize, usize)> = notes.iter().flat_map(|note| &note.calls).map(|call| (call.start, call.end)).collect();
     let first_calls: HashSet<usize> = notes.iter().filter_map(|note| note.calls.first()).map(|call| call.start).collect();
     let mut diagnostics = Vec::new();
