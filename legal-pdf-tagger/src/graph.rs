@@ -53,13 +53,47 @@ fn placed(structure: &DocumentStructure) -> Result<HashMap<String, Placed>, Stri
     Ok(out)
 }
 
+impl Placed {
+    /// Characters `start..end` of the line (each at most its length), as a UTF-16 range in the text.
+    fn range(&self, start: usize, end: usize) -> ScalarRange {
+        let last = self.offsets.len() - 1;
+        ScalarRange { start: self.offsets[start.min(last)], end: self.offsets[end.min(last)] }
+    }
+}
+
+/// A span counted in characters of a line, as a UTF-16 range in the text, unless empty.
+fn span_range(lines: &HashMap<String, Placed>, span: &crate::SourceSpan) -> Option<ScalarRange> {
+    let range = lines.get(&span.line_id)?.range(span.start, span.end);
+    (range.start < range.end).then_some(range)
+}
+
+/// A unit's spans (its typed lines `typed`) as UTF-16 ranges in reading order, merged across the newline between lines:
+/// the ranges, each range's page, the unit's pages and its lines.
+fn unit_ranges(gold: &Gold, typed: &[usize], lines: &HashMap<String, Placed>) -> (Vec<ScalarRange>, Vec<usize>, BTreeSet<usize>, Vec<String>) {
+    let (mut ranges, mut range_page, mut pages, mut line_ids) = (Vec::<ScalarRange>::new(), Vec::new(), BTreeSet::new(), Vec::<String>::new());
+    for span in typed.iter().flat_map(|&t| &gold.typed[t].spans) {
+        let (Some(range), Some(line)) = (span_range(lines, span), lines.get(&span.line_id)) else { continue };
+        match ranges.last_mut() {
+            Some(previous) if range.start <= previous.end + 1 && range.start >= previous.start => previous.end = previous.end.max(range.end),
+            _ => {
+                ranges.push(range);
+                range_page.push(line.page);
+            }
+        }
+        pages.insert(line.page);
+        if line_ids.last() != Some(&span.line_id) {
+            line_ids.push(span.line_id.clone());
+        }
+    }
+    (ranges, range_page, pages, line_ids)
+}
+
 /// The node a unit of a region becomes; tables stay the parser's and notes are written apart
 /// (`notes`). The region itself is kept on the node (`grammar: region:<name>`) so the replay
 /// reads it back exactly.
 fn kind_of(region: &str) -> Option<(NodeKind, PrimaryRole)> {
     Some(match region {
-        "text" => (NodeKind::Paragraph, PrimaryRole::Text),
-        "provision" => (NodeKind::Paragraph, PrimaryRole::Text),
+        "text" | "provision" => (NodeKind::Paragraph, PrimaryRole::Text),
         "list_item" => (NodeKind::ListItem, PrimaryRole::Text),
         "heading" => (NodeKind::Heading, PrimaryRole::Heading),
         "title" => (NodeKind::Paragraph, PrimaryRole::Title),
@@ -92,12 +126,7 @@ fn replaced(node: &StructureNode) -> bool {
 /// decoder made from the parser's reference reading. The parser's footnote nodes and note records
 /// go: the model's notes read higher than the parser's on the main development set.
 fn notes(gold: &Gold, lines: &HashMap<String, Placed>, regions: &[&str]) -> (Vec<StructureNode>, Vec<Note>) {
-    let range_of = |span: &crate::SourceSpan| -> Option<ScalarRange> {
-        let line = lines.get(&span.line_id)?;
-        let last = line.offsets.len() - 1;
-        let (start, end) = (line.offsets[span.start.min(last)], line.offsets[span.end.min(last)]);
-        (start < end).then_some(ScalarRange { start, end })
-    };
+    let range_of = |span: &crate::SourceSpan| span_range(lines, span);
     let mut references_of: HashMap<usize, Vec<crate::SourceSpan>> = HashMap::new();
     for pair in &gold.notes {
         if let (Some(note), Some(r)) = (pair.note, pair.reference) {
@@ -106,31 +135,10 @@ fn notes(gold: &Gold, lines: &HashMap<String, Placed>, regions: &[&str]) -> (Vec
             }
         }
     }
-    let mut nodes = Vec::new();
-    let mut records = Vec::new();
-    for (u, unit) in gold.units.iter().enumerate() {
-        if regions[u] != "note" {
-            continue;
-        }
+    let (mut nodes, mut records) = (Vec::new(), Vec::new());
+    for (u, unit) in gold.units.iter().enumerate().filter(|(u, _)| regions[*u] == "note") {
         let head = &gold.typed[unit.lines[0]];
-        let mut ranges: Vec<ScalarRange> = Vec::new();
-        let mut pages = BTreeSet::new();
-        let mut line_ids: Vec<String> = Vec::new();
-        for &t in &unit.lines {
-            for span in &gold.typed[t].spans {
-                let Some(range) = range_of(span) else { continue };
-                match ranges.last_mut() {
-                    Some(previous) if range.start <= previous.end + 1 && range.start >= previous.start => previous.end = previous.end.max(range.end),
-                    _ => ranges.push(range),
-                }
-                if let Some(line) = lines.get(&span.line_id) {
-                    pages.insert(line.page);
-                }
-                if line_ids.last() != Some(&span.line_id) {
-                    line_ids.push(span.line_id.clone());
-                }
-            }
-        }
+        let (ranges, _, pages, line_ids) = unit_ranges(gold, &unit.lines, lines);
         let Some(&first) = ranges.first() else { continue };
         let hull = ScalarRange { start: first.start, end: ranges.last().unwrap().end };
         let id = format!("tag-note-{:06}", u + 1);
@@ -176,17 +184,11 @@ fn notes(gold: &Gold, lines: &HashMap<String, Placed>, regions: &[&str]) -> (Vec
 pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), String> {
     let lines = placed(structure)?;
     let regions: Vec<&str> = gold.units.iter().map(|u| gold.typed[u.lines[0]].region.as_str()).collect();
-    let node_id: Vec<Option<String>> = gold.units.iter().enumerate()
-        .map(|(u, _)| kind_of(regions[u]).map(|_| format!("tag-{:06}", u + 1))).collect();
+    let node_id: Vec<Option<String>> = (0..gold.units.len()).map(|u| kind_of(regions[u]).map(|_| format!("tag-{:06}", u + 1))).collect();
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut continuations: Vec<SourceContinuation> = Vec::new();
-    // A span counted in characters of a line, as a UTF-16 range in the text.
-    let range_of = |span: &crate::SourceSpan| -> Option<ScalarRange> {
-        let line = lines.get(&span.line_id)?;
-        let last = line.offsets.len() - 1;
-        let (start, end) = (line.offsets[span.start.min(last)], line.offsets[span.end.min(last)]);
-        (start < end).then_some(ScalarRange { start, end })
-    };
+    let range_of = |span: &crate::SourceSpan| span_range(&lines, span);
+    let text_units: Vec<u16> = structure.text.encode_utf16().collect();
     // Tables: a run of table units (the gold types a table one row at a time, cells joined) is one
     // Table node with Row children and their Cell children, as the composition reads a grid.
     let mut table_at: Vec<Option<usize>> = vec![None; gold.units.len()];
@@ -204,11 +206,8 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
         }
         tables += 1;
         let table_id = format!("tag-table-{tables:06}");
-        let mut table_ranges: Vec<ScalarRange> = Vec::new();
-        let mut table_pages = BTreeSet::new();
-        let mut table_lines: Vec<String> = Vec::new();
-        let mut rows: Vec<StructureNode> = Vec::new();
-        let mut cells: Vec<StructureNode> = Vec::new();
+        let (mut table_ranges, mut table_pages, mut table_lines) = (Vec::<ScalarRange>::new(), BTreeSet::new(), Vec::<String>::new());
+        let (mut rows, mut cells) = (Vec::<StructureNode>::new(), Vec::<StructureNode>::new());
         for (r, unit_index) in (first..u).enumerate() {
             let row_id = format!("tag-row-{tables:06}-{:04}", r + 1);
             let head = &gold.typed[gold.units[unit_index].lines[0]];
@@ -290,34 +289,7 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
     for (u, unit) in gold.units.iter().enumerate() {
         let Some((kind, role)) = kind_of(regions[u]) else { continue };
         let Some(id) = node_id[u].clone() else { continue };
-        // The unit's spans as UTF-16 ranges in reading order, merged across the newline between lines.
-        let mut ranges: Vec<ScalarRange> = Vec::new();
-        let mut range_page: Vec<usize> = Vec::new();
-        let mut pages = BTreeSet::new();
-        let mut line_ids: Vec<String> = Vec::new();
-        for &t in &unit.lines {
-            for span in &gold.typed[t].spans {
-                let Some(line) = lines.get(&span.line_id) else { continue };
-                let last = line.offsets.len() - 1;
-                let (start, end) = (line.offsets[span.start.min(last)], line.offsets[span.end.min(last)]);
-                if start >= end {
-                    continue;
-                }
-                match ranges.last_mut() {
-                    Some(previous) if start <= previous.end + 1 && start >= previous.start => {
-                        previous.end = previous.end.max(end);
-                    }
-                    _ => {
-                        ranges.push(ScalarRange { start, end });
-                        range_page.push(line.page);
-                    }
-                }
-                pages.insert(line.page);
-                if line_ids.last() != Some(&span.line_id) {
-                    line_ids.push(span.line_id.clone());
-                }
-            }
-        }
+        let (ranges, range_page, pages, line_ids) = unit_ranges(gold, &unit.lines, &lines);
         let Some(&first) = ranges.first() else { continue };
         let hull = ScalarRange { start: first.start, end: ranges.last().unwrap().end };
         let parent_id = unit.parent.and_then(|p| node_id.get(p).cloned().flatten());
@@ -334,16 +306,11 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
         }
         let head = &gold.typed[unit.lines[0]];
         if let Some(marker) = head.markers.first().and_then(|m| m.first()) {
-            if let Some(line) = lines.get(&marker.line_id) {
-                let last = line.offsets.len() - 1;
-                let range = ScalarRange { start: line.offsets[marker.start.min(last)], end: line.offsets[marker.end.min(last)] };
-                if range.start < range.end {
-                    let text: String = String::from_utf16_lossy(&structure.text.encode_utf16().collect::<Vec<_>>()[range.start..range.end]);
-                    node.marker_range = Some(range);
-                    node.label = Some(text.trim().to_owned());
-                    node.content_start = Some(range.end + 1);
-                    node.locator_kind = Some(match kind { NodeKind::ListItem => "list_item", _ => "paragraph" }.to_owned());
-                }
+            if let Some(range) = range_of(marker) {
+                node.marker_range = Some(range);
+                node.label = Some(String::from_utf16_lossy(&text_units[range.start..range.end]).trim().to_owned());
+                node.content_start = Some(range.end + 1);
+                node.locator_kind = Some(match kind { NodeKind::ListItem => "list_item", _ => "paragraph" }.to_owned());
             }
         } else if kind == NodeKind::ListItem {
             node.locator_kind = Some("list_item".to_owned());
@@ -358,10 +325,7 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
         let kind_of_link = match kind { NodeKind::Heading => ContinuationKind::Heading, NodeKind::ListItem => ContinuationKind::List, _ => ContinuationKind::Paragraph };
         let mut part_start = first.start;
         for (k, pair) in ranges.windows(2).enumerate() {
-            let apart = range_page[k] != range_page[k + 1]
-                || pair[1].start < pair[0].start
-                || other_between(u, pair[0].end, pair[1].start);
-            if apart {
+            if range_page[k] != range_page[k + 1] || pair[1].start < pair[0].start || other_between(u, pair[0].end, pair[1].start) {
                 continuations.push(SourceContinuation { kind: kind_of_link, from: part_start, to: pair[1].start, separator: Some(" ".to_owned()) });
                 part_start = pair[1].start;
             }
@@ -373,14 +337,9 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
     // unowned block the composition would make of it. Span by span, so a covered line's leftover
     // piece is covered too.
     let mut covered: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
-    for unit in &gold.units {
-        for &t in &unit.lines {
-            for span in &gold.typed[t].spans {
-                covered.entry(span.line_id.as_str()).or_default().push((span.start, span.end));
-            }
-        }
+    for span in gold.units.iter().flat_map(|unit| &unit.lines).flat_map(|&t| &gold.typed[t].spans) {
+        covered.entry(span.line_id.as_str()).or_default().push((span.start, span.end));
     }
-    let text_units: Vec<u16> = structure.text.encode_utf16().collect();
     let mut extra = 0;
     let mut ordered: Vec<(&String, &Placed)> = lines.iter().collect();
     ordered.sort_by_key(|(_, line)| line.start);
@@ -433,9 +392,7 @@ pub fn retag(structure: &mut DocumentStructure, gold: &Gold) -> Result<(), Strin
     }
     structure.nodes.extend(nodes);
     // The parser's note continuations named its notes; the tagger's notes carry none.
-    let mut links: Vec<SourceContinuation> = Vec::new();
-    links.extend(continuations);
-    structure.continuations = Some(links);
+    structure.continuations = Some(continuations);
     if !structure.origins.iter().any(|o| o.id == ORIGIN) {
         structure.origins.push(Origin { id: ORIGIN.to_owned() });
     }
