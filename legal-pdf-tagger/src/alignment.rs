@@ -47,12 +47,13 @@ fn surface(texts: &[Vec<char>], rows: &[usize]) -> (Vec<char>, Vec<(usize, usize
 /// font's private-use code points (Symbol's U+F0B7, Wingdings' U+F0A7 and U+F0D8), as the bullets
 /// they draw. One character for one, so positions hold.
 fn printed(text: &[char]) -> Vec<char> {
-    text.iter().map(|&c| match c {
+    let bullet = |c| match c {
         '\u{f0b7}' => '\u{2022}',
         '\u{f0a7}' => '\u{25aa}',
         '\u{f0d8}' => '\u{27a2}',
         other => other,
-    }).collect()
+    };
+    text.iter().copied().map(bullet).collect()
 }
 
 pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> {
@@ -107,18 +108,8 @@ pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> 
         }
         a.retain(|r| !used.contains(r));
         b.retain(|&c| mappings[c].is_empty());
-        a.sort_by(|&x, &y| {
-            reference.lines[x]
-                .spatial
-                .partial_cmp(&reference.lines[y].spatial)
-                .unwrap()
-        });
-        b.sort_by(|&x, &y| {
-            candidate.lines[x]
-                .spatial
-                .partial_cmp(&candidate.lines[y].spatial)
-                .unwrap()
-        });
+        a.sort_by(|&x, &y| reference.lines[x].spatial.partial_cmp(&reference.lines[y].spatial).unwrap());
+        b.sort_by(|&x, &y| candidate.lines[x].spatial.partial_cmp(&candidate.lines[y].spatial).unwrap());
         let (left, spans_a) = surface(&reference_text, &a);
         let (right, spans_b) = surface(&candidate_text, &b);
         let (mut ia, mut ib) = (0, 0);
@@ -144,16 +135,12 @@ pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> 
         spans.sort_unstable();
         spans.dedup();
         let mut end = 0;
-        spans.retain(|span| {
-            if span.0 < end {
-                return false;
-            }
+        spans.retain(|span| span.0 >= end && {
             end = span.1;
             true
         });
     }
-    let mut owners: Vec<Vec<Option<(usize, usize)>>> =
-        reference.lines.iter().map(|l| vec![None; l.text.len()]).collect();
+    let mut owners: Vec<Vec<Option<(usize, usize)>>> = reference.lines.iter().map(|l| vec![None; l.text.len()]).collect();
     for (c, spans) in mappings.iter().enumerate() {
         for &(lo, hi, r, offset, _) in spans {
             for k in 0..hi - lo {
@@ -202,13 +189,8 @@ pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> 
             cursor = cursor.max(end);
         }
     }
-    let coverage = |covered: usize, total: usize| {
-        if total == 0 {
-            1.0
-        } else {
-            covered as f64 / total as f64
-        }
-    };
+    let coverage = |covered: usize, total: usize| if total == 0 { 1.0 } else { covered as f64 / total as f64 };
+    let candidate_covered = mappings.iter().flatten().map(|m| m.1 - m.0).sum();
     let stats = Stats {
         method: "shared-witness-then-page-local-myers-unicode-scalars",
         elapsed_ms: started.elapsed().as_secs_f64() * 1e3,
@@ -218,18 +200,9 @@ pub fn align(reference: &State, candidate: &State) -> Result<Alignment, String> 
         unmatched_reference_sources: targets.iter().filter(|s| s.is_empty()).count(),
         unmatched_candidate_sources: mappings.iter().filter(|s| s.is_empty()).count(),
         split_reference_sources: targets.iter().filter(|s| s.len() > 1).count(),
-        merged_candidate_sources: mappings
-            .iter()
-            .filter(|s| s.iter().map(|m| m.2).collect::<HashSet<_>>().len() > 1)
-            .count(),
-        reference_character_coverage: coverage(
-            reference_covered,
-            reference.lines.iter().map(|l| l.text.len()).sum(),
-        ),
-        candidate_character_coverage: coverage(
-            mappings.iter().flatten().map(|m| m.1 - m.0).sum(),
-            candidate.lines.iter().map(|l| l.text.len()).sum(),
-        ),
+        merged_candidate_sources: mappings.iter().filter(|s| s.iter().map(|m| m.2).collect::<HashSet<_>>().len() > 1).count(),
+        reference_character_coverage: coverage(reference_covered, reference.lines.iter().map(|l| l.text.len()).sum()),
+        candidate_character_coverage: coverage(candidate_covered, candidate.lines.iter().map(|l| l.text.len()).sum()),
     };
     Ok(Alignment { mappings, owners, stats })
 }

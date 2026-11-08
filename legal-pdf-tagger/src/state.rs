@@ -35,22 +35,12 @@ impl State {
     }
 
     pub fn composition_lines(&self) -> Vec<FrameLine> {
-        self.lines
-            .iter()
-            .map(|line| FrameLine {
-                id: line.id.clone(),
-                text: line.text.iter().collect(),
-                page: line.page,
-                evidence: BTreeMap::new(),
-            })
-            .collect()
+        let line = |line: &Line| FrameLine { id: line.id.clone(), text: line.text.iter().collect(), page: line.page, evidence: BTreeMap::new() };
+        self.lines.iter().map(line).collect()
     }
 
     pub fn order_ids(&self) -> Vec<String> {
-        self.reading_order
-            .iter()
-            .map(|&n| self.lines[n].id.clone())
-            .collect()
+        self.reading_order.iter().map(|&n| self.lines[n].id.clone()).collect()
     }
 }
 
@@ -63,31 +53,46 @@ pub fn block_id(block: &FrameBlock) -> String {
     if !block.id.is_empty() {
         return block.id.clone();
     }
-    match block.spans.first() {
-        Some(span) => anchor(span),
-        None => format!("{}@0", block.line_ids[0]),
-    }
+    block.spans.first().map_or_else(|| format!("{}@0", block.line_ids[0]), anchor)
 }
 
 fn unique_ids(spans: &[SourceSpan]) -> Vec<String> {
     let mut seen = HashSet::new();
-    spans
-        .iter()
-        .filter(|s| seen.insert(s.line_id.clone()))
-        .map(|s| s.line_id.clone())
-        .collect()
+    spans.iter().filter(|s| seen.insert(s.line_id.clone())).map(|s| s.line_id.clone()).collect()
 }
 
 fn link(next: String, separator: Option<&str>, kind: &str) -> FrameLink {
-    FrameLink {
-        next,
-        separator: separator.map(str::to_owned),
-        attributes: BTreeMap::from([("kind".to_owned(), json!(kind))]),
+    FrameLink { next, separator: separator.map(str::to_owned), attributes: BTreeMap::from([("kind".to_owned(), json!(kind))]) }
+}
+
+/// Each part's first span linked to the next part's as `kind` goes on (with a space), and as a list
+/// goes on where the unit is a list's item.
+fn link_parts(continuations: &mut FrameLinks, heads: &[String], kind: &str, list: bool) {
+    for pair in heads.windows(2) {
+        continuations.entry(kind.into()).or_default().insert(pair[0].clone(), link(pair[1].clone(), Some(" "), kind));
+        if list {
+            continuations.entry("list".into()).or_default().insert(pair[0].clone(), link(pair[1].clone(), None, "list"));
+        }
     }
+}
+
+/// How many of the reading positions before each some unit holds text on (`held`, by position).
+fn held_before(held: &[bool]) -> Vec<usize> {
+    let mut before = vec![0usize; held.len() + 1];
+    for (p, &h) in held.iter().enumerate() {
+        before[p + 1] = before[p] + usize::from(h);
+    }
+    before
 }
 
 fn attributes(value: Value) -> Map<String, Value> {
     value.as_object().cloned().unwrap_or_default()
+}
+
+/// A document's annotation opening at `id` on `line_ids`, of `kind`, under `parent` as its `relationship`.
+fn document(id: String, line_ids: Vec<String>, spans: Vec<SourceSpan>, kind: Value, parent: Value, relationship: Value) -> FrameAnnotation {
+    let attributes = attributes(json!({"kind": kind, "parent": parent, "relationship": relationship, "title": [], "facets": {}}));
+    FrameAnnotation { id, kind: "document".into(), line_ids, spans, attributes }
 }
 
 #[derive(Deserialize)]
@@ -186,8 +191,7 @@ pub const V4: &str = "legal-structure-gold.v4";
 /// tables inside their annotations, list items with a list_item locator).
 fn kind_of(region: &str) -> &str {
     match region {
-        "title" | "heading" | "caption" | "headnote" | "marginal_note" | "furniture" | "page_label"
-        | "line_label" | "contents" => region,
+        "title" | "heading" | "caption" | "headnote" | "marginal_note" | "furniture" | "page_label" | "line_label" | "contents" => region,
         // A block quotation inside a note is scored as note until the parser tells them apart.
         "note_quote" => "note",
         _ => "text",
@@ -206,54 +210,48 @@ fn own(region: &str) -> bool {
 /// line's spans so cut, with the labels cut from them.
 pub fn line_labels(gold: &Gold) -> Vec<(Vec<SourceSpan>, Vec<SourceSpan>)> {
     let index: HashMap<&str, usize> = gold.lines.iter().enumerate().map(|(n, l)| (l.id.as_str(), n)).collect();
-    gold.typed.iter().map(|item| {
-        let (mut labels, mut spans) = (Vec::new(), item.spans.clone());
-        for number in &item.line_number {
-            let Some(&n) = index.get(number.line_id.as_str()) else { continue };
-            let line = &gold.lines[n];
-            let text: Vec<char> = line.corrected.as_deref().unwrap_or(&line.text).chars().collect();
-            let blank = |a: usize, b: usize| text.get(a..b).is_some_and(|gap| gap.iter().all(|c| c.is_whitespace()));
-            let Some(span) = spans.iter_mut().find(|s| s.line_id == number.line_id && s.start <= number.start && blank(s.start, number.start)) else {
-                continue;
-            };
-            let mut rest = number.end;
-            while rest < span.end && text.get(rest).is_some_and(|c| c.is_whitespace()) {
-                rest += 1;
+    gold.typed
+        .iter()
+        .map(|item| {
+            let (mut labels, mut spans) = (Vec::new(), item.spans.clone());
+            for number in &item.line_number {
+                let Some(&n) = index.get(number.line_id.as_str()) else { continue };
+                let line = &gold.lines[n];
+                let text: Vec<char> = line.corrected.as_deref().unwrap_or(&line.text).chars().collect();
+                let blank = |a: usize, b: usize| text.get(a..b).is_some_and(|gap| gap.iter().all(|c| c.is_whitespace()));
+                let Some(span) = spans.iter_mut().find(|s| s.line_id == number.line_id && s.start <= number.start && blank(s.start, number.start)) else {
+                    continue;
+                };
+                let mut rest = number.end;
+                while rest < span.end && text.get(rest).is_some_and(|c| c.is_whitespace()) {
+                    rest += 1;
+                }
+                if rest < span.end {
+                    span.start = rest;
+                    labels.push(number.clone());
+                }
             }
-            if rest < span.end {
-                span.start = rest;
-                labels.push(number.clone());
-            }
-        }
-        (labels, spans)
-    }).collect()
+            (labels, spans)
+        })
+        .collect()
 }
 
 pub fn projected(gold: &Gold) -> Result<State, String> {
     if gold.schema_version != V4 {
         return Err("Expected a legal-structure-gold.v4 file".into());
     }
-    let index: HashMap<String, usize> = gold
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(n, l)| (l.id.clone(), n))
-        .collect();
+    let index: HashMap<String, usize> = gold.lines.iter().enumerate().map(|(n, l)| (l.id.clone(), n)).collect();
     let cut = line_labels(gold);
     // Reading order: the typed order; a line never typed keeps its place after the typed line
     // before it in the extraction.
-    let mut typed_order = Vec::new();
-    let mut seen = HashSet::new();
-    let mut span_rank: HashMap<(usize, usize), usize> = HashMap::new();
-    for (labels, spans) in &cut {
-        for span in labels.iter().chain(spans) {
-            if seen.insert(span.line_id.as_str()) {
-                typed_order.push(span.line_id.as_str());
-            }
-            if let Some(&n) = index.get(&span.line_id) {
-                let rank = span_rank.len();
-                span_rank.entry((n, span.start)).or_insert(rank);
-            }
+    let (mut typed_order, mut seen, mut span_rank) = (Vec::new(), HashSet::new(), HashMap::<(usize, usize), usize>::new());
+    for span in cut.iter().flat_map(|(labels, spans)| labels.iter().chain(spans)) {
+        if seen.insert(span.line_id.as_str()) {
+            typed_order.push(span.line_id.as_str());
+        }
+        if let Some(&n) = index.get(&span.line_id) {
+            let rank = span_rank.len();
+            span_rank.entry((n, span.start)).or_insert(rank);
         }
     }
     let (mut leading, mut after, mut last) = (Vec::new(), HashMap::<&str, Vec<usize>>::new(), None);
@@ -278,30 +276,22 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
     for (k, &n) in order.iter().enumerate() {
         position[n] = k;
     }
-    let lines: Vec<Line> = gold
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(n, l)| Line {
-            id: l.id.clone(),
-            page: l.page,
-            text: l.corrected.as_deref().unwrap_or(&l.text).chars().collect(),
-            spatial: (l.page, position[n] as f64, 0.0),
-        })
-        .collect();
+    let line = |(n, l): (usize, &GoldLine)| Line {
+        id: l.id.clone(),
+        page: l.page,
+        text: l.corrected.as_deref().unwrap_or(&l.text).chars().collect(),
+        spatial: (l.page, position[n] as f64, 0.0),
+    };
+    let lines: Vec<Line> = gold.lines.iter().enumerate().map(line).collect();
     let at = |span: &SourceSpan| (position[index[&span.line_id]], span.start);
     // Reading rank of a span: its typed rank, finer than its line's position when columns or a
     // marginal note share a line with the unit.
     let rank_key = |span: &SourceSpan| {
         let n = index[&span.line_id];
-        match span_rank.get(&(n, span.start)) {
-            Some(&rank) => (0, rank, 0),
-            None => (1, position[n], span.start),
-        }
+        span_rank.get(&(n, span.start)).map_or((1, position[n], span.start), |&rank| (0, rank, 0))
     };
     let page_of = |span: &SourceSpan| gold.lines[index[&span.line_id]].page;
-    let typed = &gold.typed;
-    let units = &gold.units;
+    let (typed, units) = (&gold.typed, &gold.units);
     // A unit's spans in reading order, split at each page and at each line of another unit that
     // comes between: what the source shows, never how the gold happened to group its typed spans.
     let mut placed: Vec<((usize, usize), usize, &SourceSpan)> = units
@@ -316,23 +306,16 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
     for &((line, _), _, _) in &placed {
         held[line] = true;
     }
-    let mut before = vec![0usize; gold.lines.len() + 1];
-    for (p, &h) in held.iter().enumerate() {
-        before[p + 1] = before[p] + usize::from(h);
-    }
+    let before = held_before(&held);
     let mut parts: Vec<Vec<Vec<SourceSpan>>> = vec![Vec::new(); units.len()];
     let mut last: Vec<Option<(usize, &SourceSpan)>> = vec![None; units.len()];
     for &((line, _), u, span) in &placed {
-        let split = match last[u] {
-            None => true,
-            // A part's spans run forward in line position: the composition engine orders a block's
-            // spans by position and names it by the first, so a unit that reads backwards through
-            // the extraction (a second column, a marginal note typed first) takes a new part there.
-            Some((previous, prior)) => {
-                page_of(prior) != page_of(span) || line > previous + 1 && before[line] > before[previous + 1]
-                    || (line, span.start) < (previous, prior.start)
-            }
-        };
+        // A part's spans run forward in line position: the composition engine orders a block's
+        // spans by position and names it by the first, so a unit that reads backwards through
+        // the extraction (a second column, a marginal note typed first) takes a new part there.
+        let split = last[u].is_none_or(|(previous, prior)| {
+            page_of(prior) != page_of(span) || line > previous + 1 && before[line] > before[previous + 1] || (line, span.start) < (previous, prior.start)
+        });
         if split {
             parts[u].push(Vec::new());
         }
@@ -342,9 +325,7 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
     let region = regions(gold);
     // The gold's hierarchy is the levels the model gave: a heading's level, and a body unit's
     // depth. The scorer reads them as given; nothing derives a tree.
-    let mut groups = Vec::new();
-    let mut annotations = Vec::new();
-    let mut continuations = FrameLinks::new();
+    let (mut groups, mut annotations, mut continuations) = (Vec::new(), Vec::new(), FrameLinks::new());
     let mut notes: HashMap<usize, usize> = HashMap::new();
     for (u, unit) in units.iter().enumerate() {
         let first = &typed[unit.lines[0]];
@@ -361,10 +342,7 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
             }
             if region[u] == "list_item" {
                 attrs.insert("locator_kind".into(), json!("list_item"));
-                attrs.insert(
-                    "marker".into(),
-                    json!(if k == 0 { marker.clone() } else { Vec::new() }),
-                );
+                attrs.insert("marker".into(), json!(if k == 0 { marker.clone() } else { Vec::new() }));
             } else if k == 0 && !marker.is_empty() && matches!(region[u], "text" | "provision" | "quote") {
                 attrs.insert("locator_kind".into(), json!("paragraph"));
                 attrs.insert("marker".into(), json!(marker));
@@ -373,108 +351,57 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
             }
             // Line numbers and speaker labels the unit's lines print, on its first part.
             if k == 0 {
-                for (key, found) in [("line_number", unit.lines.iter()
-                                         .flat_map(|&n| typed[n].line_number.iter().filter(|s| !cut[n].0.contains(s)).cloned().collect::<Vec<_>>())
-                                         .collect::<Vec<_>>()),
-                                     ("speaker", unit.lines.iter().flat_map(|&n| typed[n].speaker.iter()).cloned().collect())] {
+                let numbers: Vec<SourceSpan> = unit.lines.iter().flat_map(|&n| typed[n].line_number.iter().filter(|s| !cut[n].0.contains(s)).cloned().collect::<Vec<_>>()).collect();
+                let speakers: Vec<SourceSpan> = unit.lines.iter().flat_map(|&n| typed[n].speaker.iter()).cloned().collect();
+                for (key, found) in [("line_number", numbers), ("speaker", speakers)] {
                     if !found.is_empty() {
                         attrs.insert(key.into(), json!(found));
                     }
                 }
             }
-            groups.push(FrameBlock {
-                id: String::new(),
-                kind: kind_of(region[u]).to_owned(),
-                line_ids: unique_ids(spans),
-                spans: spans.clone(),
-                attributes: attrs,
-                document: None,
-            });
+            groups.push(FrameBlock { id: String::new(), kind: kind_of(region[u]).to_owned(), line_ids: unique_ids(spans), spans: spans.clone(), attributes: attrs, document: None });
             if region[u] == "note" {
-                let label = if k == 0 {
-                    first.markers.first().cloned().unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let label = if k == 0 { first.markers.first().cloned().unwrap_or_default() } else { Vec::new() };
                 annotations.push(FrameAnnotation {
                     id: format!("note:{}", anchor(&spans[0])),
                     kind: "note".into(),
                     line_ids: unique_ids(spans),
                     spans: spans.clone(),
-                    attributes: attributes(
-                        json!({"kind": "footnote", "label": label, "references": []}),
-                    ),
+                    attributes: attributes(json!({"kind": "footnote", "label": label, "references": []})),
                 });
                 if k == 0 {
                     notes.insert(u, annotations.len() - 1);
                 }
             }
         }
-        if own(region[u]) {
-            continue;
-        }
-        let kind = match region[u] {
-            "heading" => "heading",
-            "note" => "note",
-            _ => "paragraph",
-        };
-        for pair in parts[u].windows(2) {
-            let (left, right) = (anchor(&pair[0][0]), anchor(&pair[1][0]));
-            continuations
-                .entry(kind.into())
-                .or_default()
-                .insert(left.clone(), link(right.clone(), Some(" "), kind));
-            if region[u] == "list_item" {
-                continuations
-                    .entry("list".into())
-                    .or_default()
-                    .insert(left, link(right, None, "list"));
-            }
+        if !own(region[u]) {
+            let kind = match region[u] {
+                "heading" => "heading",
+                "note" => "note",
+                _ => "paragraph",
+            };
+            let heads: Vec<String> = parts[u].iter().map(|part| anchor(&part[0])).collect();
+            link_parts(&mut continuations, &heads, kind, region[u] == "list_item");
         }
     }
     // The line numbers cut from the lines they number, each a label of its own.
     for label in cut.iter().flat_map(|(labels, _)| labels) {
-        groups.push(FrameBlock {
-            id: String::new(),
-            kind: "line_label".into(),
-            line_ids: vec![label.line_id.clone()],
-            spans: vec![label.clone()],
-            attributes: Map::from_iter([("region".to_owned(), json!("line_label"))]),
-            document: None,
-        });
+        let attributes = Map::from_iter([("region".to_owned(), json!("line_label"))]);
+        groups.push(FrameBlock { id: String::new(), kind: "line_label".into(), line_ids: vec![label.line_id.clone()], spans: vec![label.clone()], attributes, document: None });
     }
     // Documents: the first block opens the source's own; each unit holding a document start opens
     // another under it. Each is of the type the document pass gave its first unit (the source's own
     // takes the type given before any start).
-    let opened: Vec<usize> = (0..units.len())
-        .filter(|&u| !parts[u].is_empty() && units[u].starts_document)
-        .collect();
-    let start = parts
-        .iter()
-        .filter_map(|found| found.first().map(|spans| &spans[0]))
-        .min_by_key(|s| at(s));
-    if let Some(start) = start {
+    let opened: Vec<usize> = (0..units.len()).filter(|&u| !parts[u].is_empty() && units[u].starts_document).collect();
+    if let Some(start) = parts.iter().filter_map(|found| found.first().map(|spans| &spans[0])).min_by_key(|s| at(s)) {
         let root = format!("document:{}", anchor(start));
-        let first_type = units.iter().take(opened.first().copied().unwrap_or(units.len()).max(1))
-            .find_map(|u| u.document_type.clone());
+        let first_type = units.iter().take(opened.first().copied().unwrap_or(units.len()).max(1)).find_map(|u| u.document_type.clone());
         let mut openings = vec![(start.clone(), first_type)];
-        openings.extend(
-            opened
-                .iter()
-                .map(|&u| (parts[u][0][0].clone(), units[u].document_type.clone()))
-                .filter(|(s, _)| s != start),
-        );
+        openings.extend(opened.iter().map(|&u| (parts[u][0][0].clone(), units[u].document_type.clone())).filter(|(s, _)| s != start));
         for (opening, kind) in openings {
-            let parent = if &opening == start {
-                Value::Null
-            } else {
-                json!(root)
-            };
-            annotations.push(FrameAnnotation {
-                id: format!("document:{}", anchor(&opening)), kind: "document".into(), line_ids: vec![opening.line_id.clone()],
-                spans: vec![opening],
-                attributes: attributes(json!({"kind": kind, "parent": parent, "relationship": null, "title": [], "facets": {}})),
-            });
+            let parent = if &opening == start { Value::Null } else { json!(root) };
+            let id = format!("document:{}", anchor(&opening));
+            annotations.push(document(id, vec![opening.line_id.clone()], vec![opening], json!(kind), parent, Value::Null));
         }
     }
     // Each note reference with the note the notes pass paired it with.
@@ -486,19 +413,13 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
             continue;
         };
         let spans = &typed[pair.line].references[reference].spans;
-        let references = annotations[annotation]
-            .attributes
-            .get_mut("references")
-            .unwrap()
-            .as_array_mut()
-            .unwrap();
+        let references = annotations[annotation].attributes.get_mut("references").unwrap().as_array_mut().unwrap();
         references.extend(spans.iter().map(|s| json!(s)));
     }
     // Tables: table rows consecutive in reading order, with only furniture, page labels and notes
     // between, form one table, one grid per page linked across pages; a row is on the page of its
     // first cell. A unit without text stands nowhere and separates nothing.
-    let mut tables: Vec<Vec<usize>> = Vec::new();
-    let mut current = false;
+    let (mut tables, mut current): (Vec<Vec<usize>>, bool) = (Vec::new(), false);
     let mut in_order: Vec<usize> = (0..units.len()).filter(|&u| !parts[u].is_empty()).collect();
     in_order.sort_by_key(|&u| (rank_key(&parts[u][0][0]), u));
     for u in in_order {
@@ -523,8 +444,7 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
                 let line_cells = typed[n].cells.iter().flatten().collect::<Vec<_>>();
                 let wrapped = columns >= 2 && line_cells.len() == 1;
                 for (c, spans) in line_cells.into_iter().enumerate() {
-                    let column = if wrapped { columns - 1 } else { c };
-                    cells.entry(column).or_default().extend(spans.iter().cloned());
+                    cells.entry(if wrapped { columns - 1 } else { c }).or_default().extend(spans.iter().cloned());
                 }
             }
             // A cell's text in reading order.
@@ -548,11 +468,7 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
         if pages.is_empty() {
             continue;
         }
-        let width = pages
-            .iter()
-            .flat_map(|(_, grid)| grid.iter().map(Vec::len))
-            .max()
-            .unwrap_or(0);
+        let width = pages.iter().flat_map(|(_, grid)| grid.iter().map(Vec::len)).max().unwrap_or(0);
         let mut chain = Vec::new();
         for (_, grid) in pages {
             let grid: Vec<Vec<Vec<SourceSpan>>> = grid
@@ -574,21 +490,10 @@ pub fn projected(gold: &Gold) -> Result<State, String> {
             chain.push(first);
         }
         for pair in chain.windows(2) {
-            continuations
-                .entry("table".into())
-                .or_default()
-                .insert(pair[0].clone(), link(pair[1].clone(), None, "table"));
+            continuations.entry("table".into()).or_default().insert(pair[0].clone(), link(pair[1].clone(), None, "table"));
         }
     }
-    Ok(State {
-        lines,
-        index,
-        reading_order: order,
-        span_rank,
-        groups,
-        annotations,
-        continuations,
-    })
+    Ok(State { lines, index, reading_order: order, span_rank, groups, annotations, continuations })
 }
 
 /// A parser structure in the scorer's frame, through the same composition the apps read.
@@ -598,31 +503,16 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
     }
     let units: Vec<u16> = structure.text.encode_utf16().collect();
     let slice = |start: usize, end: usize| -> Result<String, String> {
-        String::from_utf16(
-            units
-                .get(start..end)
-                .ok_or("Invalid native source fragment")?,
-        )
-        .map_err(|e| e.to_string())
+        String::from_utf16(units.get(start..end).ok_or("Invalid native source fragment")?).map_err(|e| e.to_string())
     };
     let mut sources: Vec<(String, String, usize, usize, usize)> = Vec::new();
     if !structure.source_fragments.is_empty() {
         for fragment in &structure.source_fragments {
             let (start, end) = (fragment.range.start, fragment.range.end);
-            sources.push((
-                fragment.id.clone(),
-                slice(start, end)?,
-                fragment.page_index + 1,
-                start,
-                end,
-            ));
+            sources.push((fragment.id.clone(), slice(start, end)?, fragment.page_index + 1, start, end));
         }
     } else {
-        for page in structure
-            .nodes
-            .iter()
-            .filter(|n| n.kind == legal_structure_model::NodeKind::Page)
-        {
+        for page in structure.nodes.iter().filter(|n| n.kind == legal_structure_model::NodeKind::Page) {
             let (mut start, end) = (page.range.start, page.range.end);
             let content = slice(start, end)?;
             if page.line_ids.is_empty() && content.split('\n').next().unwrap_or("").is_empty() {
@@ -634,62 +524,29 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
             }
             for (id, text) in page.line_ids.iter().zip(pieces) {
                 let stop = start + text.encode_utf16().count();
-                sources.push((
-                    id.clone(),
-                    text.to_owned(),
-                    page.page_indexes[0] + 1,
-                    start,
-                    stop,
-                ));
+                sources.push((id.clone(), text.to_owned(), page.page_indexes[0] + 1, start, stop));
                 start = stop + 1;
             }
         }
     }
-    if sources
-        .iter()
-        .map(|s| s.0.as_str())
-        .collect::<HashSet<_>>()
-        .len()
-        != sources.len()
-    {
+    if sources.iter().map(|s| s.0.as_str()).collect::<HashSet<_>>().len() != sources.len() {
         return Err("Duplicate native line ID".into());
     }
-    let mut lines = Vec::new();
-    let mut composition = Vec::new();
+    let (mut lines, mut composition) = (Vec::new(), Vec::new());
     for (k, (id, text, page, start, end)) in sources.iter().enumerate() {
         // The parser's reading order is its text order, so the alignment's page-local diff follows it,
         // as it follows the gold's typed order on the other side; box geometry would interleave the
         // columns of a two-column page.
-        lines.push(Line {
-            id: id.clone(),
-            page: *page,
-            text: text.chars().collect(),
-            spatial: (*page, k as f64, 0.0),
-        });
-        composition.push(FrameLine {
-            id: id.clone(),
-            text: text.clone(),
-            page: *page,
-            evidence: BTreeMap::from([("range".to_owned(), json!({"start": start, "end": end}))]),
-        });
+        lines.push(Line { id: id.clone(), page: *page, text: text.chars().collect(), spatial: (*page, k as f64, 0.0) });
+        let evidence = BTreeMap::from([("range".to_owned(), json!({"start": start, "end": end}))]);
+        composition.push(FrameLine { id: id.clone(), text: text.clone(), page: *page, evidence });
     }
-    let prepared = crate::parser_frame(
-        crate::ParserFrameRequest {
-            structure: structure.clone(),
-            lines: composition,
-        },
-    )?;
-    let index: HashMap<String, usize> = lines
-        .iter()
-        .enumerate()
-        .map(|(n, l)| (l.id.clone(), n))
-        .collect();
+    let prepared = crate::parser_frame(crate::ParserFrameRequest { structure: structure.clone(), lines: composition })?;
+    let index: HashMap<String, usize> = lines.iter().enumerate().map(|(n, l)| (l.id.clone(), n)).collect();
     let mut groups = prepared.groups;
     // A node that states its region (a tagger's, the transition parser's: its grammar `region:<name>`)
     // is read so; reading list items off the locator (parser_list_item) is for the stage parser's nodes.
-    let tagged: HashMap<&str, &str> = structure.nodes.iter()
-        .filter_map(|n| crate::graph::region_of(n).map(|region| (n.id.as_str(), region)))
-        .collect();
+    let tagged: HashMap<&str, &str> = structure.nodes.iter().filter_map(|n| crate::graph::region_of(n).map(|region| (n.id.as_str(), region))).collect();
     for group in &mut groups {
         if let Some(region) = group.attributes.get("native_id").and_then(Value::as_str).and_then(|id| tagged.get(id)) {
             group.attributes.insert("region".into(), json!(region));
@@ -707,42 +564,33 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
         g.line_ids.iter().filter_map(|id| index.get(id).map(|&n| SourceSpan { line_id: id.clone(), start: 0, end: lines[n].text.len() })).collect()
     };
     let mut held = vec![false; lines.len()];
-    for g in &groups {
-        for s in members_of(g) {
-            held[index[&s.line_id]] = true;
-        }
+    for s in groups.iter().flat_map(members_of) {
+        held[index[&s.line_id]] = true;
     }
-    let mut before = vec![0usize; lines.len() + 1];
-    for (p, &h) in held.iter().enumerate() {
-        before[p + 1] = before[p] + usize::from(h);
-    }
+    let before = held_before(&held);
     let mut parted = Vec::with_capacity(groups.len());
     for g in groups {
         let mut spans = members_of(&g);
         spans.sort_by_key(|s| (index[&s.line_id], s.start));
-        let mut parts: Vec<Vec<SourceSpan>> = Vec::new();
-        let mut last: Option<usize> = None;
+        let (mut parts, mut last): (Vec<Vec<SourceSpan>>, Option<usize>) = (Vec::new(), None);
         for s in spans {
             let line = index[&s.line_id];
-            let split = last.is_none_or(|previous| lines[previous].page != lines[line].page || line > previous + 1 && before[line] > before[previous + 1]);
-            if split {
+            if last.is_none_or(|previous| lines[previous].page != lines[line].page || line > previous + 1 && before[line] > before[previous + 1]) {
                 parts.push(Vec::new());
             }
             parts.last_mut().expect("part").push(s);
             last = Some(line);
         }
         let kind = match g.kind.as_str() {
-            "heading" => Some("heading"),
-            "note" => Some("note"),
-            "furniture" | "page_label" | "line_label" => None,
-            _ => Some("paragraph"),
+            "heading" => "heading",
+            "note" => "note",
+            "furniture" | "page_label" | "line_label" => "",
+            _ => "paragraph",
         };
-        if parts.len() <= 1 || kind.is_none() {
+        if parts.len() <= 1 || kind.is_empty() {
             parted.push(g);
             continue;
         }
-        let kind = kind.expect("checked");
-        let list = parser_list_item(&g);
         let heads: Vec<String> = parts.iter().map(|p| anchor(&p[0])).collect();
         // A link the block already had onward leaves from its last part.
         for layer in continuations.values_mut() {
@@ -750,12 +598,7 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
                 layer.insert(heads[heads.len() - 1].clone(), onward);
             }
         }
-        for pair in heads.windows(2) {
-            continuations.entry(kind.into()).or_default().insert(pair[0].clone(), link(pair[1].clone(), Some(" "), kind));
-            if list {
-                continuations.entry("list".into()).or_default().insert(pair[0].clone(), link(pair[1].clone(), None, "list"));
-            }
-        }
+        link_parts(&mut continuations, &heads, kind, parser_list_item(&g));
         for (k, spans) in parts.into_iter().enumerate() {
             let mut part = g.clone();
             // A later part is known by its first span, as the links to it name it.
@@ -774,28 +617,20 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
             parted.push(part);
         }
     }
-    let groups = parted;
     // A PDF parser's constituents are sections under the package's own document.
     let mut annotations = prepared.annotations;
-    let roots: Vec<FrameAnnotation> = annotations
-        .iter()
-        .filter(|a| a.kind == "document")
-        .cloned()
-        .collect();
+    let root = annotations.iter().find(|a| a.kind == "document").cloned();
     annotations.retain(|a| a.kind != "document");
-    if let Some(root) = roots.into_iter().next() {
+    if let Some(root) = root {
         let first = root.line_ids[0].clone();
         annotations.push(root);
         // One document opens on a line: a constituent opening where the root or an earlier
         // constituent opens is that document (as the gold's projection reads its starts).
         let mut opened: HashSet<String> = HashSet::from([first.clone()]);
-        for node in structure.nodes.iter().filter(|n| {
-            n.kind == legal_structure_model::NodeKind::Section
-                && n.grammar
-                    .as_deref()
-                    .is_some_and(|g| g.starts_with("constituent_"))
-                && !n.line_ids.is_empty()
-        }) {
+        let constituent = |n: &&legal_structure_model::StructureNode| {
+            n.kind == legal_structure_model::NodeKind::Section && n.grammar.as_deref().is_some_and(|g| g.starts_with("constituent_")) && !n.line_ids.is_empty()
+        };
+        for node in structure.nodes.iter().filter(constituent) {
             if !opened.insert(node.line_ids[0].clone()) {
                 continue;
             }
@@ -806,20 +641,9 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
                 "annex" => "attachment",
                 _ => "component",
             };
-            annotations.push(FrameAnnotation {
-                id: node.id.clone(), kind: "document".into(), line_ids: node.line_ids.clone(), spans: Vec::new(),
-                attributes: attributes(json!({"kind": kind, "parent": first, "relationship": relationship, "title": [], "facets": {}})),
-            });
+            annotations.push(document(node.id.clone(), node.line_ids.clone(), Vec::new(), json!(kind), json!(first), json!(relationship)));
         }
     }
     let reading_order = (0..lines.len()).collect();
-    Ok(State {
-        lines,
-        index,
-        reading_order,
-        span_rank: HashMap::new(),
-        groups,
-        annotations,
-        continuations,
-    })
+    Ok(State { lines, index, reading_order, span_rank: HashMap::new(), groups: parted, annotations, continuations })
 }
