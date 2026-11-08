@@ -7,19 +7,19 @@
 //! `Footnote` with its pair (its label, its body, the reference marks it answered), a line set apart a
 //! `Prose` of its role (furniture, a page label, a transcript's line number each a line labelled by its
 //! text, a title, a marginal note, a caption, a headnote), and the tables the parser read as tables
-//! with their rows and cells. Each page carries its printed label as its alias. Parents follow the
-//! gold's own hierarchy rule (the engine's `assemble_parents`).
+//! with their rows and cells. Each page carries its printed label as its alias. Parents are the
+//! outline's (`assemble_outline`), and a provision's path alias follows them.
 
 use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::{Footnote, Line, Page, Paragraph};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_decide::{decided, Fences};
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
+use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING};
 use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, PAGE_LABEL, REGIONS, TABLE};
 use legal_pdf_structure_model::{Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_structure_model::{NodeKind, ScalarRange};
+use legal_structure_model::{NodeKind, ScalarRange, StructureAnalysis};
 use std::collections::{HashMap, HashSet};
 
 use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NotePairClaimV2, NoteReference, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
@@ -46,10 +46,8 @@ struct Unit {
     /// The line `marker` stands on: the unit's first, or the margin's line numbering it.
     marker_line: usize,
     label: Option<String>,
-    /// A heading's level, a body unit's depth (0 for neither).
+    /// A heading's level (0 for none).
     level: usize,
-    depth: usize,
-    starts_document: bool,
     references: Vec<(usize, u32, u32)>,
 }
 
@@ -79,6 +77,7 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
 /// paragraphs and footnotes the projection reads: what tier 0 wrote and paired before its moves (`settled`) stands.
 /// Each node's page indexes are its lines' pages, set with its exact membership (`outline_contexts`).
 pub fn structure_graph(
+    analysis: &dyn StructureAnalysis,
     pages: &mut [Page],
     slots: &Slots,
     evidence: &Evidence,
@@ -94,10 +93,7 @@ pub fn structure_graph(
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let text_of = |k: usize| texts[k].clone();
     let id_of = |k: usize| ids[k].clone();
-    // Units, each line joining the unit open in its stream, resuming the one it held before, or opening
-    // one. Their parents follow the gold's own rule (the engine's `assemble_parents`): from each unit's region, its
-    // opening text, a heading's level, a body unit's depth among the body units open on the stack, and
-    // whether it opens a constituent document.
+    // Units, each line joining the unit open in its stream, resuming the one it held before, or opening one.
     let mut state = State::default();
     let mut units: Vec<Unit> = Vec::new();
     let mut streams = Streams::default();
@@ -154,9 +150,7 @@ pub fn structure_graph(
                 marker.map(printed)
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
-            let depth = if chosen.opens && RANKED_BODY.contains(&chosen.region) { usize::from(chosen.depth.max(1)) } else { 0 };
-            let starts_document = started.last().is_some_and(|&line| units.last().is_none_or(|unit: &Unit| unit.lines[0] < line));
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, depth, starts_document, references: Vec::new() });
+            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, references: Vec::new() });
             unit_at.insert(k, units.len() - 1);
             units.len() - 1
         };
@@ -167,29 +161,7 @@ pub fn structure_graph(
             units[u].references.push((place as usize, start, end));
         }
     }
-    let parents = {
-        let regions: Vec<&str> = units.iter().map(|unit| REGIONS[usize::from(unit.region)]).collect();
-        // A unit's opening text: its first lines joined, a marker often standing on a line of its own.
-        let texts: Vec<String> = units.iter().map(|unit| unit.lines.iter().take(3).map(|&k| text_of(k)).collect::<Vec<_>>().join(" ")).collect();
-        let levels: Vec<usize> = units.iter().map(|unit| unit.level).collect();
-        let depths: Vec<usize> = units.iter().map(|unit| unit.depth).collect();
-        let starts: Vec<bool> = units.iter().map(|unit| unit.starts_document).collect();
-        legal_structure_model::structure_analysis().assemble_parents(&regions, &texts, &levels, &depths, &starts)
-    };
-    // A provision's path from the outermost provision it stands in: "12(1)(a)".
-    let section_path = |u: usize| {
-        let mut chain = vec![u];
-        while let Some(parent) = parents[*chain.last().unwrap()].filter(|&p| REGIONS[usize::from(units[p].region)] == "provision") {
-            chain.push(parent);
-        }
-        let labels: Vec<&str> = chain.iter().rev().filter_map(|&u| units[u].label.as_deref()).collect();
-        (labels.len() > 1).then(|| {
-            labels.iter().enumerate().map(|(at, label)| {
-                if at == 0 || label.starts_with('(') { (*label).to_owned() } else { format!("({label})") }
-            }).collect::<String>()
-        })
-    };
-    // Nodes, their ranges in scalar characters of the text.
+    // Nodes, their ranges in scalar characters of the text; their parents are the outline's (`assemble_outline`).
     let line_range = |k: usize| index.line(&ids[k]).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
@@ -243,7 +215,7 @@ pub fn structure_graph(
         };
         // A unit is the document's own, as tier 0's are; a heading is read from its look.
         let derivation = if kind != NodeKind::Heading { Derivation::Native } else { Derivation::Heuristic };
-        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, derivation, parents[u].map(node_id));
+        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, derivation, None);
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -275,7 +247,6 @@ pub fn structure_graph(
         // (A heading's heading range is its reading context's, `outline_contexts`.)
         if kind == NodeKind::Section {
             node.locator_kind = Some("section".to_owned());
-            node.aliases = section_path(u).map(|path| vec![path]);
         }
         if let Some(member) = member {
             node.content_start = scalar(member.content);
@@ -284,7 +255,7 @@ pub fn structure_graph(
                 NodeKind::Section => {
                     node.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
                     let printed = (member.label != member.grammar_value).then(|| member.label.clone());
-                    node.aliases = Some(printed.into_iter().chain(node.aliases.take().into_iter().flatten()).collect()).filter(|aliases: &Vec<String>| !aliases.is_empty());
+                    node.aliases = printed.map(|printed| vec![printed]);
                     if role == Some(PrimaryRole::Heading) {
                         node.heading_range = Some(range);
                     }
@@ -448,7 +419,23 @@ pub fn structure_graph(
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
     let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, &decided);
-    legal_pdf_graph::graph::assemble_outline(legal_structure_model::structure_analysis(), &mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
+    legal_pdf_graph::graph::assemble_outline(analysis, &mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
+    // A provision's path from the outermost provision it stands in ("12(1)(a)"), by the parents the outline kept, after
+    // its printing's alias where it has one: each unit's printed label along the chain.
+    let label_of: HashMap<&str, &str> = units.iter().enumerate().filter_map(|(u, unit)| Some((unit_ids[u].as_str(), unit.label.as_deref()?))).collect();
+    let provisions: HashSet<&str> = units.iter().enumerate().filter(|(_, unit)| REGIONS[usize::from(unit.region)] == "provision").map(|(u, _)| unit_ids[u].as_str()).collect();
+    let parent_of: HashMap<String, String> = structure.nodes.iter().filter_map(|node| Some((node.id.clone(), node.parent_id.clone()?))).collect();
+    for node in structure.nodes.iter_mut().filter(|node| node.kind == NodeKind::Section && label_of.contains_key(node.id.as_str())) {
+        let mut chain = vec![node.id.as_str()];
+        while let Some(parent) = parent_of.get(*chain.last().unwrap()).map(String::as_str).filter(|parent| provisions.contains(parent) && !chain.contains(parent)) {
+            chain.push(parent);
+        }
+        let labels: Vec<&str> = chain.iter().rev().filter_map(|id| label_of.get(id).copied()).collect();
+        if labels.len() > 1 {
+            let path = labels.iter().enumerate().map(|(at, label)| if at == 0 || label.starts_with('(') { (*label).to_owned() } else { format!("({label})") }).collect::<String>();
+            node.aliases.get_or_insert_with(Vec::new).push(path);
+        }
+    }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
     // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The

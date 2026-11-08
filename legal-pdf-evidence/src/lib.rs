@@ -333,19 +333,17 @@ fn reference_tokens(line: &Line, size: f64) -> u8 {
     marks | bits([(REFERENCE_DETACHED, !line.detached_references.is_empty()), (REFERENCE_GLUED, glued_re().is_match(&line.text))])
 }
 
-/// The line's opening marker (`Marker`), its family named in `families`.
-fn opening_marker(analysis: &dyn StructureAnalysis, line: &Line, families: &mut Names) -> Option<Marker> {
+/// The line's opening marker (`Marker`): the first of its token's readings (`marker_readings`), its family named in
+/// `families`.
+fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
+    let reading = marker_readings(&line.text, false).into_iter().next()?;
     let text = closed_up(&line.text);
     let text = text.trim_start();
     let token = text.split_whitespace().next()?;
-    if token.chars().count() > 12 {
-        return None;
-    }
-    let reading = analysis.numbering_marker(token, None)?;
     let end = line.text.len() - text.len() + token.len();
     Some(Marker {
         family: families.id(&reading.family),
-        value: reading.ordinal,
+        value: reading.value,
         depth: reading.prefix.len().min(usize::from(u8::MAX)) as u8,
         end: end.min(usize::from(u16::MAX)) as u16,
         only: text.trim_end() == token || legal_pdf_text::paragraphs::marker_only_re().is_match(&line.text),
@@ -460,7 +458,7 @@ impl Measure for Evidence {
                 ]));
                 evidence.weight.push(line.weight as f32);
                 evidence.tag.push(SourceTag::of(line));
-                evidence.marker.push(opening_marker(analysis, line, &mut families));
+                evidence.marker.push(opening_marker(line, &mut families));
                 evidence.label.push(note_label(page, &sizes, at));
                 evidence.references.push(reference_tokens(line, sizes[at]));
                 evidence.title_shaped.push(title_shaped(text));
@@ -658,7 +656,7 @@ impl Measure for Evidence {
             let page = &pages[page_slot];
             let line = slots.line(pages, *slot);
             let text = line.text.trim();
-            self.marker[at] = opening_marker(analysis, line, &mut families);
+            self.marker[at] = opening_marker(line, &mut families);
             self.label[at] = note_label(page, &self.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
             self.title_shaped[at] = title_shaped(text);
             self.words[at] = lexicon(analysis, line) | self.words[at] & WORD_CITATION_TITLE;

@@ -203,7 +203,7 @@ fn output(
     }
     tier0::in_slot_order(pages, slots);
     let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
-    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
+    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(analysis, pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
     diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
     attach_propositions(&mut footnotes, &paragraphs, &decided);
     attach_crossrefs(analysis, &mut footnotes, &mut diagnostics, &decided);
