@@ -178,7 +178,7 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-support/Cargo.toml",
         "legal-pdf-support/src/lib.rs",
         "legal-pdf-support/src/projection.rs",
-        "legal-pdf-support/src/adapters.rs",
+        "legal-pdf-support/src/projection",
     ]);
     // The structure stage reads pdf-inspector's layout too (columns, furniture, leaders, words'
     // joins, heading tiers, tables).
