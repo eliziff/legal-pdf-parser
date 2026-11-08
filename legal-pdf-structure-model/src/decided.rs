@@ -1,7 +1,7 @@
 //! The decision as what comes after it reads it, by line id (`Decided`).
 
 use crate::{Held, Slot, Slots};
-use legal_pdf_core::model::{Footnote, Page};
+use legal_pdf_core::model::Page;
 
 /// A document or embedded reading and its parallel sequence; primary text is (0, false).
 pub type DocumentContext = (usize, bool);
@@ -59,13 +59,6 @@ impl<'a> Decided<'a> {
         self.slot(id).map_or((0, false), |slot| {
             (usize::from(self.ctx[slot.index()]), self.translation[slot.index()])
         })
-    }
-
-    /// The document context of a note's first line.
-    pub fn note_context(&self, note: &Footnote) -> DocumentContext {
-        note.body_line_ids
-            .first()
-            .map_or((0, false), |id| self.document_context(id))
     }
 
     /// The line is in the French column of a parallel English and French text.

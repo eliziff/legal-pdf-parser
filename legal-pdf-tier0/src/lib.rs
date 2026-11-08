@@ -16,7 +16,7 @@
 //! - the moves (`moves_of`): each of the document's reading regions a unit, each note a unit, each line set apart a
 //!   unit of its own.
 
-use legal_pdf_core::model::{Footnote, Line, Page, PdfOutlineEntry};
+use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
 use legal_pdf_fences::Fences;
 use legal_pdf_graph::graph;
@@ -25,7 +25,7 @@ use legal_pdf_machine::machine::{LineView, Move, State, TemplateView, CANDIDATE}
 use legal_pdf_structure_model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
 use legal_pdf_structure_model::{Decided, DocumentContext, Evidence, Role, Rule, Runs, Slot, Slots};
 use std::collections::{HashMap, HashSet};
-use legal_structure_model::UnitRole;
+use legal_structure_model::{StructureNode, UnitRole};
 
 /// A marker going on from the number open in its family.
 const COUNTS_ON: f32 = 1.0;
@@ -200,7 +200,7 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
 /// other line stands alone; a body unit's depth is the walk's to read (`emit`). With the moves, the run member each unit
 /// opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
-pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[Footnote]) -> (Vec<Move>, HashMap<usize, (u32, u32)>, HashMap<usize, Vec<(u32, u32)>>) {
+pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[StructureNode]) -> (Vec<Move>, HashMap<usize, (u32, u32)>, HashMap<usize, Vec<(u32, u32)>>) {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     let mut opened = HashMap::new();
@@ -215,11 +215,11 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
     let mut within = HashMap::<usize, Vec<(u32, u32)>>::new();
     // The pairer's lines are its notes', a line it took from the body among them.
     for note in notes {
-        let places: Vec<usize> = note.body_line_ids.iter().filter_map(|id| place(id)).collect();
+        let places: Vec<usize> = note.line_ids.iter().filter_map(|id| place(id)).collect();
         let Some(&first) = places.iter().min() else { continue };
         for &k in &places {
             moves[k] = Some(if k == first {
-                Move { note: Some(note.label.parse().unwrap_or(0)), ..Move::plain(NOTE, true) }
+                Move { note: Some(note.printed_label().parse().unwrap_or(0)), ..Move::plain(NOTE, true) }
             } else {
                 Move { resumes: Some(first as u32), ..Move::plain(NOTE, false) }
             });

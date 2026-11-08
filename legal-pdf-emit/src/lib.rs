@@ -11,7 +11,7 @@
 //! outline's (`assemble_outline`), and a provision's path alias follows them.
 
 use legal_pdf_constituents as constituents;
-use legal_pdf_core::model::{Footnote, Page};
+use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_fences::{decided, Fences};
 use legal_pdf_machine::lines::LineTable;
@@ -34,7 +34,6 @@ use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, 
 pub struct Settled<'a> {
     pub index: &'a PdfTextIndex,
     pub notes: Vec<StructureNode>,
-    pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<StructureDiagnostic>,
     pub runs: &'a Runs,
     pub opened: HashMap<usize, (u32, u32)>,
@@ -95,7 +94,7 @@ pub fn structure_graph(pages: &mut [Page],
     doc: Option<Vec<Move>>,
     identity: &StructureIdentity,
     mut settled: Settled,
-) -> Result<(DocumentStructure, Vec<Value>, Vec<Footnote>)> {
+) -> Result<(DocumentStructure, Vec<Value>)> {
     let index = settled.index;
     let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
@@ -425,7 +424,7 @@ pub fn structure_graph(pages: &mut [Page],
         digest,
         Some(identity.source_sha256.clone()),
         Scope::complete(),
-        vec![Origin { id: ORIGIN.to_owned() }],
+        vec![Origin { id: ORIGIN.to_owned() }, Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() }],
         nodes,
         std::mem::take(&mut settled.diagnostics),
     );
@@ -470,7 +469,8 @@ pub fn structure_graph(pages: &mut [Page],
     legal_pdf_graph::graph::read_judgment_paragraphs(&mut structure, pages, &decided, &HashSet::new());
     structure.profile = identity.profile;
     let runs = rendered::render(pages, &mut structure)?;
-    let units = rendered::authority_units(&structure, &runs, &settled.footnotes);
+    let units = rendered::authority_units(&structure, &runs);
+    legal_pdf_notes::note_context::attach_propositions(&mut structure, &units, &decided);
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
-    Ok((structure, units, settled.footnotes))
+    Ok((structure, units))
 }

@@ -42,8 +42,8 @@ use legal_pdf_emit::Settled;
 use legal_pdf_machine::lines::LineTable;
 use std::path::Path;
 
-use graph::map_note_pairs;
-use legal_pdf_core::model::{Diagnostic, Footnote, Page, PdfOutlineEntry};
+use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
+use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
 use std::collections::{HashMap, HashSet};
@@ -51,7 +51,6 @@ use std::collections::{HashMap, HashSet};
 pub struct StructureOutput {
     /// The authority units, read off the rendered text (`emit`).
     pub authority_text_units: Vec<serde_json::Value>,
-    pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
     pub structure_graph: DocumentStructure,
     /// Each heading line, and each line taken from the headings, with the rule that decided it
@@ -72,8 +71,8 @@ struct Measured {
 /// A line written in the note band that no note holds (the pairer made no note of its label, or
 /// bounded the note's body short of it) is the body's, and joins its paragraph rather than
 /// standing alone: on the gold, 6,825 such lines were no notes, 2,146 were. Whether any was.
-fn give_back(pages: &mut [Page], footnotes: &[Footnote]) -> bool {
-    let held: HashSet<&str> = footnotes.iter().flat_map(|note| &note.body_line_ids).map(String::as_str).collect();
+fn give_back(pages: &mut [Page], notes: &[StructureNode]) -> bool {
+    let held: HashSet<&str> = notes.iter().flat_map(|note| &note.line_ids).map(String::as_str).collect();
     let mut given_back = false;
     for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
         if line.region_type == "footnote" && !held.contains(line.id.as_str()) {
@@ -180,23 +179,20 @@ fn output(pages: &mut [Page],
     let index = PdfTextIndex::from_pages(pages);
     let citations = graph::citation_spans(pages, slots, evidence);
     let pairing = note_pairing::pair_notes(pages, &decided, &citations, &index);
-    let (notes, graph_diagnostics) = map_note_pairs(&index, &pairing.pair_claims)?;
-    let anchors = pairing.anchors;
-    let footnotes = pairing.footnotes;
+    let notes = pairing.notes;
     diagnostics.extend(pairing.diagnostics);
-    if give_back(pages, &footnotes) {
+    if give_back(pages, &notes) {
         build_regions(pages);
     }
-    let (moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &footnotes);
+    diagnostics.extend(unmatched_reference_diagnostics(pages, &notes, &index, &decided));
+    let (moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &notes);
     // A tier scores the moves, the output stays this one: the walk takes the DOC tier's move for each line, but for the
     // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
     // reading of a marker names one of this reading's.
     tier0::in_slot_order(pages, slots);
-    let settled = Settled { index: &index, notes, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
-    let (structure_graph, authority_text_units, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, doc, identity, settled)?;
-    diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
-    attach_propositions(&mut footnotes, &authority_text_units, &decided);
-    attach_crossrefs(&mut footnotes, &mut diagnostics, &decided);
+    let settled = Settled { index: &index, notes, diagnostics: Vec::new(), runs, opened, within };
+    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, doc, identity, settled)?;
+    diagnostics.extend(note_crossrefs(&structure_graph, &decided));
     in_reading_order(pages, slots, &fences);
-    Ok(StructureOutput { authority_text_units, footnotes, diagnostics, structure_graph, heading_sources })
+    Ok(StructureOutput { authority_text_units, diagnostics, structure_graph, heading_sources })
 }

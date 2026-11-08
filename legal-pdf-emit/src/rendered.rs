@@ -2,7 +2,7 @@
 //! before by its join, a space within one unit's lines and a blank line between units, a page's notes after its body;
 //! each node's place in it; and the authority units read off it.
 
-use legal_pdf_core::model::{Footnote, Page};
+use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText, StructureNode};
@@ -22,7 +22,7 @@ fn fault(message: &str) -> Error {
 
 /// A unit's text node, or a note: the nodes whose lines are theirs in the rendered text.
 fn owns_text(node: &StructureNode) -> bool {
-    node.origin_id == TRANSITION_ORIGIN && !node.line_ids.is_empty()
+    (node.origin_id == TRANSITION_ORIGIN || note(node)) && !node.line_ids.is_empty()
         && matches!(node.kind, NodeKind::Paragraph | NodeKind::Heading | NodeKind::Section | NodeKind::ListItem
             | NodeKind::Prose | NodeKind::Footnote | NodeKind::Endnote)
 }
@@ -232,16 +232,14 @@ fn source_of(structure: &DocumentStructure, node: &StructureNode, mappings: &[Va
         "nodeIds": [node.id], "lineIds": node.line_ids, "ranges": ranges, "mappings": mappings})
 }
 
-/// The authority units: each body unit's text, its notes' reference marks left out and where each stood; then each note's
-/// body, a note with its own mark (an author's "*") keeping the mark as the document prints it.
-pub fn authority_units(structure: &DocumentStructure, runs: &[Run], footnotes: &[Footnote]) -> Vec<Value> {
+/// The authority units: each body unit's text, its notes' marks left out and where each stood; then each note's body, a
+/// note with its own mark (an author's "*") keeping the mark as the document prints it.
+pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<Value> {
     let rendered = ScalarText::new(structure.rendered_text.as_deref().unwrap_or(&structure.text));
     let by_source = by_source(runs);
-    let ordinal: HashMap<&str, usize> = footnotes.iter().enumerate().map(|(at, note)| (note.pair_id.as_str(), at + 1)).collect();
-    let notes: HashMap<&str, &StructureNode> = structure.nodes.iter().filter(|node| note(node)).map(|node| (node.id.as_str(), node)).collect();
-    let mut cuts: Vec<(ScalarRange, usize)> = notes.values()
-        .filter_map(|node| Some((node, *ordinal.get(node.id.as_str())?)))
-        .flat_map(|(node, ordinal)| project(runs, &by_source, &rendered, &node.calls).into_iter().map(move |cut| (cut, ordinal)))
+    let notes: Vec<&StructureNode> = structure.nodes.iter().filter(|node| note(node)).collect();
+    let mut cuts: Vec<(ScalarRange, usize)> = notes.iter().enumerate()
+        .flat_map(|(at, node)| project(runs, &by_source, &rendered, &node.calls).into_iter().map(move |cut| (cut, at + 1)))
         .collect();
     cuts.sort_by_key(|(cut, _)| cut.start);
     let mut body: Vec<&StructureNode> = structure.nodes.iter()
@@ -255,49 +253,25 @@ pub fn authority_units(structure: &DocumentStructure, runs: &[Run], footnotes: &
             "footnote_id": Value::Null, "page_numbers": node.page_indexes.first().map(|page| vec![page + 1]).unwrap_or_default(),
             "text": text, "footnote_refs": references})
     }).collect();
-    units.extend(footnotes.iter().enumerate().map(|(at, footnote)| {
+    units.extend(notes.iter().enumerate().map(|(at, node)| {
         let ordinal = at + 1;
-        let mut pages = footnote.body_pages.clone();
-        if pages.is_empty() {
-            pages.extend(footnote.reference_page);
-        }
-        pages.sort_unstable();
-        pages.dedup();
-        let number = footnote.label.parse::<u32>().ok();
-        // The body opens after the label and what sets it off (".", ")", a space).
-        let (mut text, mut mappings, source) = match notes.get(footnote.pair_id.as_str()) {
-            Some(node) => {
-                let label_end = node.marker_range.map(|label| project(runs, &by_source, &rendered, &[label])).and_then(|label| label.last().map(|range| range.end));
-                let mut start = label_end.unwrap_or(0);
-                while rendered.slice_utf16(start..start + 1).is_some_and(|c| c.chars().all(|c| c.is_whitespace() || ".)],:;-".contains(c))) {
-                    start += 1;
-                }
-                let pieces: Vec<ScalarRange> = node.rendered_membership.iter().filter(|piece| piece.end > start)
-                    .map(|piece| ScalarRange { start: piece.start.max(start), end: piece.end }).collect();
-                let (text, mappings, _) = unit_text(structure, runs, &rendered, &pieces, &[]);
-                let source = source_of(structure, node, &mappings);
-                (text, mappings, source)
-            }
-            None => (footnote.body.clone(), Vec::new(), Value::Null),
-        };
+        let label = node.printed_label();
+        let number = label.parse::<u32>().ok();
+        let (mut text, mut mappings, _) = unit_text(structure, runs, &rendered, &node.rendered_membership, &[]);
         if text.is_empty() {
-            text.clone_from(&footnote.label);
+            text = label.to_owned();
         }
-        if number.is_none() && !footnote.label.is_empty() && text != footnote.label {
-            let prefix = utf16_len(&footnote.label) + 1;
-            text = format!("{} {text}", footnote.label);
+        if number.is_none() && !label.is_empty() && text != label {
+            let prefix = utf16_len(label) + 1;
+            text = format!("{label} {text}");
             for mapping in &mut mappings {
                 mapping["start"] = json!(mapping["start"].as_u64().unwrap_or(0) as usize + prefix);
                 mapping["end"] = json!(mapping["end"].as_u64().unwrap_or(0) as usize + prefix);
             }
         }
-        let mut source = source;
-        if let Some(source) = source.as_object_mut() {
-            source.insert("mappings".to_owned(), Value::Array(mappings));
-        }
-        json!({"key": format!("footnote:{ordinal}"), "source": source, "kind": "footnote", "ordinal": ordinal,
-            "footnote_id": ordinal, "note_number": number, "restart_sequence": footnote.restart_sequence,
-            "page_numbers": pages, "text": text, "footnote_refs": []})
+        json!({"key": format!("footnote:{ordinal}"), "source": source_of(structure, node, &mappings), "kind": "footnote",
+            "ordinal": ordinal, "footnote_id": ordinal, "note_number": number, "restart_sequence": node.series.parse::<usize>().unwrap_or(0),
+            "page_numbers": node.page_indexes.iter().map(|page| page + 1).collect::<Vec<_>>(), "text": text, "footnote_refs": []})
     }));
     units
 }

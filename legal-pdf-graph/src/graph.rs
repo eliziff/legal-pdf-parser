@@ -5,11 +5,10 @@
 //! (`contexts`), and the outline its units hang in (`outline`).
 
 use legal_pdf_structure_model::{Decided, Evidence, Role, Rule, Run, Slots};
-use legal_pdf_core::model::{NotePairClaim, NotePairKind, Page, PdfSourceSpan};
+use legal_pdf_core::model::{Page, PdfSourceSpan};
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
-    CandidateGrammar, Derivation, DiagnosticSeverity, NodeKind, ScalarRange, ScalarText,
-    StructureDiagnostic, StructureNode,
+    CandidateGrammar, Derivation, NodeKind, ScalarRange, ScalarText, StructureNode,
 };
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};

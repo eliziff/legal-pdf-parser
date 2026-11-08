@@ -6,7 +6,6 @@ use super::*;
 pub struct PdfDocument {
     pub(crate) structure: legal_structure_model::DocumentStructure,
     pub(crate) pages: Vec<ProjectionPage>,
-    pub(crate) footnotes: Vec<ProjectionFootnote>,
     pub(crate) authority_text_units: Vec<Value>,
     pub(crate) summary: PdfSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,22 +90,6 @@ pub(crate) struct ProjectionPage {
     pub(crate) text_quality: f64,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct ProjectionFootnote {
-    pub(crate) pair_id: String,
-    pub(crate) label: String,
-    pub(crate) occurrence: usize,
-    pub(crate) restart_sequence: usize,
-    pub(crate) reference_page: Option<u32>,
-    pub(crate) body_pages: Vec<u32>,
-    pub(crate) body: String,
-    pub(crate) sentence_proposition: String,
-    pub(crate) passage_since_prior_note: String,
-    pub(crate) confidence: f64,
-    pub(crate) provenance: String,
-    pub(crate) warnings: Vec<String>,
-}
-
 pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
     let mut writer = DigestWriter::default();
     writer.0.update(b"{\"units\":");
@@ -148,21 +131,10 @@ impl PdfDocument {
         status: String,
         metadata: PdfExtractionMetadata,
         pages: Vec<Page>,
-        footnotes: Vec<Footnote>,
         authority_text_units: Vec<Value>,
         structure: DocumentStructure,
     ) -> Self {
         let summary = summary(source_sha256, cache_key, pages.len(), status, metadata);
-        Self::project(pages, footnotes, authority_text_units, structure, summary)
-    }
-
-    pub(crate) fn project(
-        pages: Vec<Page>,
-        footnotes: Vec<Footnote>,
-        authority_text_units: Vec<Value>,
-        structure: DocumentStructure,
-        summary: PdfSummary,
-    ) -> Self {
         let recognized_pages = pages
             .iter()
             .filter(|page| page.source != "native")
@@ -191,39 +163,6 @@ impl PdfDocument {
                         evidence_text: join_page_lines(lines),
                         source,
                         text_quality,
-                    },
-                )
-                .collect(),
-            footnotes: footnotes
-                .into_iter()
-                .map(
-                    |Footnote {
-                         pair_id,
-                         label,
-                         occurrence,
-                         restart_sequence,
-                         reference_page,
-                         body_pages,
-                         body,
-                         sentence_proposition,
-                         passage_since_prior_note,
-                         confidence,
-                         provenance,
-                         warnings,
-                         ..
-                     }| ProjectionFootnote {
-                        pair_id,
-                        label,
-                        occurrence,
-                        restart_sequence,
-                        reference_page,
-                        body_pages,
-                        body,
-                        sentence_proposition,
-                        passage_since_prior_note,
-                        confidence,
-                        provenance,
-                        warnings,
                     },
                 )
                 .collect(),
@@ -327,7 +266,6 @@ impl PdfDocument {
         let mut fingerprint = document_fingerprint(&self.structure);
         let product = serialization_sha256(&(
             &self.pages,
-            &self.footnotes,
             &self.summary,
             &self.passage_pages,
             &self.recognized_pages,

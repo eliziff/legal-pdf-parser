@@ -321,40 +321,47 @@ pub(crate) fn transcript_lines(
         .collect()
 }
 
-pub(crate) fn footnote_unit(note: &ProjectionFootnote) -> PdfLookupUnit {
-    let mut page_numbers = Vec::new();
-    if let Some(page) = note.reference_page {
-        page_numbers.push(page);
-    }
-    for page in &note.body_pages {
-        if !page_numbers.contains(page) {
-            page_numbers.push(*page);
-        }
-    }
+/// The document's notes, in order.
+pub(crate) fn notes(document: &PdfDocument) -> Vec<&StructureNode> {
+    document.structure.nodes.iter().filter(|node| matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)).collect()
+}
+
+/// The page (counted from 1) whose text holds `offset`.
+fn page_at(document: &PdfDocument, offset: usize) -> Option<u32> {
+    document.structure.nodes.iter()
+        .find(|node| node.kind == NodeKind::Page && node.range.start <= offset && offset < node.range.end)
+        .and_then(|node| node.page_indexes.first())
+        .map(|page| *page as u32 + 1)
+}
+
+/// A note as a lookup returns it: its body, the page its first call stands on and those its body does, the times its label
+/// was printed before it and once more, its numbering's restart, and its proposition.
+pub(crate) fn footnote_unit(document: &PdfDocument, notes: &[&StructureNode], at: usize) -> PdfLookupUnit {
+    let note = notes[at];
+    let label = note.printed_label();
+    let reference_page = note.calls.first().and_then(|call| page_at(document, call.start));
+    let body_pages: Vec<u32> = note.page_indexes.iter().map(|page| *page as u32 + 1).collect();
+    let mut page_numbers: Vec<u32> = reference_page.into_iter().collect();
+    page_numbers.extend(body_pages.iter().filter(|page| Some(**page) != reference_page));
+    let text = ScalarText::new(document.structure.query_text());
+    let property = |name: &str| note.properties.get(name).map_or("", String::as_str).to_owned();
     PdfLookupUnit {
-        id: note.pair_id.clone(),
+        id: note.id.clone(),
         kind: "footnote",
-        locator: format!("footnote {}", note.label),
-        text: note.body.trim().to_owned(),
+        locator: format!("footnote {label}"),
+        text: rendered_slice(&text, &document.structure, note).trim().to_owned(),
         page_numbers,
-        confidence: Some(note.confidence.clamp(0.0, 1.0)),
+        confidence: None,
         confidence_basis: "footnote_pairing",
-        provenance: if note.provenance.is_empty() {
-            "unknown".to_owned()
-        } else {
-            note.provenance.clone()
-        },
-        proposition: Some(PdfLookupProposition {
-            sentence: note.sentence_proposition.trim().to_owned(),
-            passage_since_prior_note: note.passage_since_prior_note.trim().to_owned(),
-        }),
+        provenance: note.properties.get("provenance").cloned().unwrap_or_else(|| "unknown".to_owned()),
+        proposition: Some(PdfLookupProposition { sentence: property("sentence"), passage_since_prior_note: property("passage") }),
         note: Some(PdfLookupNote {
-            label: note.label.clone(),
-            occurrence: note.occurrence,
-            restart_sequence: note.restart_sequence,
-            reference_page: note.reference_page,
-            body_pages: note.body_pages.clone(),
-            warnings: note.warnings.clone(),
+            label: label.to_owned(),
+            occurrence: notes[..=at].iter().filter(|other| other.printed_label() == label).count(),
+            restart_sequence: note.series.parse().unwrap_or(0),
+            reference_page,
+            body_pages,
+            warnings: if note.calls.is_empty() { vec!["label_only".to_owned()] } else { Vec::new() },
         }),
     }
 }
@@ -478,28 +485,16 @@ pub(crate) fn section_matches(section: &StructureNode,
         .any(|value| section_alias(value) == requested)
 }
 
-pub(crate) fn exact_footnotes(
-    document: &PdfDocument,
-    locator: &str,
-    input: &PdfLookupRequest,
-) -> Vec<usize> {
+pub(crate) fn exact_footnotes(document: &PdfDocument, notes: &[&StructureNode], locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
     let query = normalize_footnote(locator);
-    document
-        .footnotes
-        .iter()
-        .enumerate()
-        .filter(|(_, note)| {
-            input
-                .occurrence
-                .is_none_or(|number| note.occurrence == number)
-                && input.page.is_none_or(|number| {
-                    note.reference_page == Some(number) || note.body_pages.contains(&number)
-                })
-                && (normalize_footnote(&note.pair_id) == query
-                    || normalize_footnote(&note.label) == query)
-        })
-        .map(|(index, _)| index)
-        .collect()
+    (0..notes.len()).filter(|&at| {
+        let note = notes[at];
+        let label = note.printed_label();
+        input.occurrence.is_none_or(|number| notes[..=at].iter().filter(|other| other.printed_label() == label).count() == number)
+            && input.page.is_none_or(|number| note.calls.first().and_then(|call| page_at(document, call.start)) == Some(number)
+                || note.page_indexes.iter().any(|page| *page as u32 + 1 == number))
+            && (normalize_footnote(&note.id) == query || normalize_footnote(label) == query)
+    }).collect()
 }
 
 /// Both ends of a range found, the first not after the last.
@@ -743,15 +738,16 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         });
     }
     if kind == "footnote" {
-        let start = exact_footnotes(document, &input.locator, input);
-        let end = end_locator.map(|locator| exact_footnotes(document, locator, input));
+        let notes = notes(document);
+        let start = exact_footnotes(document, &notes, &input.locator, input);
+        let end = end_locator.map(|locator| exact_footnotes(document, &notes, locator, input));
         let end_matches = end.as_deref().unwrap_or(&start);
         if start.len() > 1 || end_matches.len() > 1 {
             let mut lookup = result(input, PdfLookupStatus::Ambiguous, None);
             for pair_id in start
                 .iter()
                 .chain(end.iter().flatten())
-                .map(|index| document.footnotes[*index].pair_id.as_str())
+                .map(|index| notes[*index].id.as_str())
             {
                 if !lookup.matches.iter().any(|item| item == pair_id) {
                     lookup.matches.push(pair_id.to_owned());
@@ -766,10 +762,10 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         return finish(
             document,
             input,
-            document.footnotes.len(),
+            notes.len(),
             start,
             end,
-            |index| footnote_unit(&document.footnotes[index]),
+            |index| footnote_unit(document, &notes, index),
         );
     }
     if end_locator.is_some() {
