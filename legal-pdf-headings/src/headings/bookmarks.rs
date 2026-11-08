@@ -19,9 +19,9 @@
 
 use legal_pdf_core::model::PdfOutlineEntry;
 use legal_structure_model::StructureAnalysis;
+use legal_pdf_core::regex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// Words that number the constituents of a filed package.
 const PACKAGE_UNITS: &[&str] = &["tab", "exhibit", "schedule", "appendix", "annex", "attachment"];
@@ -53,28 +53,16 @@ pub struct Entry {
 
 /// A bookmark named for its page alone ("12", "Page 12").
 pub fn generic_title() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(?:page\s*)?\d+$").expect("generic title"))
+    regex!(r"(?i)^(?:page\s*)?\d+$")
 }
 
 /// A numbering label left over beside a title: "1", "a", "part4", "tab12".
 fn label_remainder() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^(?:part|chapter|article|section|division|title|book|schedule|appendix|annex|tab|exhibit)?(?:[0-9]+[a-z]?|[a-z])$",
-        )
-        .expect("label remainder")
-    })
+    regex!(r"^(?:part|chapter|article|section|division|title|book|schedule|appendix|annex|tab|exhibit)?(?:[0-9]+[a-z]?|[a-z])$")
 }
 
 fn tokens(title: &str) -> Vec<String> {
-    title
-        .to_lowercase()
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect()
+    title.to_lowercase().split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()).map(str::to_owned).collect()
 }
 
 fn roman(token: &str) -> Option<u32> {
@@ -83,39 +71,27 @@ fn roman(token: &str) -> Option<u32> {
 
 /// Lowercased, LaTeX dropped, punctuation stripped, roman numerals as digits.
 pub fn normalize_title(title: &str) -> String {
-    tokens(title)
-        .into_iter()
-        .map(|token| {
-            roman(&token).map_or(token, |value| value.to_string())
-        })
-        .collect()
+    tokens(title).into_iter().map(|token| roman(&token).map_or(token, |value| value.to_string())).collect()
 }
 
 /// Every counter (digit run or roman token) collapsed to `#`.
 fn title_template(title: &str) -> String {
-    tokens(title)
-        .into_iter()
-        .map(|token| {
-            if roman(&token).is_some() {
-                "#".to_owned()
-            } else {
-                let mut out = String::new();
-                let mut digits = false;
-                for character in token.chars() {
-                    if character.is_ascii_digit() {
-                        if !digits {
-                            out.push('#');
-                        }
-                        digits = true;
-                    } else {
-                        out.push(character);
-                        digits = false;
-                    }
-                }
-                out
+    let template = |token: String| {
+        if roman(&token).is_some() {
+            return "#".to_owned();
+        }
+        let (mut out, mut digits) = (String::new(), false);
+        for character in token.chars() {
+            if !character.is_ascii_digit() {
+                out.push(character);
+            } else if !digits {
+                out.push('#');
             }
-        })
-        .collect()
+            digits = character.is_ascii_digit();
+        }
+        out
+    };
+    tokens(title).into_iter().map(template).collect()
 }
 
 /// How nearly two normalized titles are one, as the share of their character pairs they hold in
@@ -136,19 +112,13 @@ fn similarity(a: &str, b: &str) -> f64 {
 
 /// Entries must walk forward through the document; levels are re-stacked over the survivors.
 pub fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
-    let mut kept = Vec::new();
-    let mut last_page = 0;
+    let (mut kept, mut last_page) = (Vec::new(), 0);
     for entry in outline {
         let page = entry.page_index + 1;
-        if !(1..=pages).contains(&page) || page < last_page {
-            continue;
+        if (1..=pages).contains(&page) && page >= last_page {
+            kept.push(Entry { title: entry.title.clone(), level: entry.level, page });
+            last_page = page;
         }
-        kept.push(Entry {
-            title: entry.title.clone(),
-            level: entry.level,
-            page,
-        });
-        last_page = page;
     }
     restack(&mut kept);
     kept
@@ -164,15 +134,9 @@ pub fn package_targets(analysis: &dyn StructureAnalysis, outline: &[PdfOutlineEn
             let words = tokens(&entry.title);
             let unit = words.first()?;
             let counter = words.get(1)?;
-            let kind = if PACKAGE_UNITS.contains(&unit.as_str())
-                && (label_remainder().is_match(counter) || roman(counter).is_some())
-            {
+            let kind = if PACKAGE_UNITS.contains(&unit.as_str()) && (label_remainder().is_match(counter) || roman(counter).is_some()) {
                 unit.clone()
-            } else if authorities == Some(entry.level)
-                && analysis
-                    .numbering_marker(entry.title.split_whitespace().next()?, None)
-                    .is_some()
-            {
+            } else if authorities == Some(entry.level) && analysis.numbering_marker(entry.title.split_whitespace().next()?, None).is_some() {
                 "authority".to_owned()
             } else {
                 return None;
@@ -206,10 +170,7 @@ pub fn classify(entries: &[Entry], pages: usize) -> Tier {
     if entries.len() < 3 {
         return Tier::Ignore;
     }
-    let generic = entries
-        .iter()
-        .filter(|entry| generic_title().is_match(&entry.title))
-        .count();
+    let generic = entries.iter().filter(|entry| generic_title().is_match(&entry.title)).count();
     if 2 * generic >= entries.len() {
         return Tier::Ignore;
     }
@@ -222,11 +183,7 @@ pub fn classify(entries: &[Entry], pages: usize) -> Tier {
             None => counts.push((template, 1)),
         }
     }
-    let (top_template, top_count) =
-        counts.iter().fold(
-            &counts[0],
-            |best, item| if item.1 > best.1 { item } else { best },
-        );
+    let (top_template, top_count) = counts.iter().fold(&counts[0], |best, item| if item.1 > best.1 { item } else { best });
     let unit = top_template.replace('#', "");
     let counters = top_template.matches('#').count();
     if top_template.contains('#')
@@ -236,19 +193,12 @@ pub fn classify(entries: &[Entry], pages: usize) -> Tier {
     {
         return Tier::Ignore;
     }
-    let distinct = entries
-        .iter()
-        .map(|entry| normalize_title(&entry.title))
-        .collect::<HashSet<_>>();
+    let distinct = entries.iter().map(|entry| normalize_title(&entry.title)).collect::<HashSet<_>>();
     if 4 * distinct.len() <= entries.len() {
         return Tier::Ignore;
     }
     let max_level = entries.iter().map(|entry| entry.level).max().unwrap_or(0);
-    if max_level >= 2 && entries.len() >= 6.max(pages / 20) {
-        Tier::Full
-    } else {
-        Tier::Skeleton
-    }
+    if max_level >= 2 && entries.len() >= 6.max(pages / 20) { Tier::Full } else { Tier::Skeleton }
 }
 
 pub fn same_title(found: &str, title: &str, heading: bool) -> bool {
@@ -262,10 +212,7 @@ pub fn same_title(found: &str, title: &str, heading: bool) -> bool {
         return found.ends_with(title) || title.ends_with(found) || similarity(found, title) >= REPAIR_SIMILARITY;
     }
     // Body lines carry the title whole, or with a numbering label only one side prints.
-    let labelled = |long: &str, short: &str| {
-        long.strip_suffix(short)
-            .is_some_and(|label| label_remainder().is_match(label))
-    };
+    let labelled = |long: &str, short: &str| long.strip_suffix(short).is_some_and(|label| label_remainder().is_match(label));
     labelled(found, title) || labelled(title, found)
 }
 
@@ -287,13 +234,8 @@ pub fn complete(outline: &[PdfOutlineEntry], pages: usize) -> bool {
 /// The level of a book or bundle of authorities' bookmark on its first page, where its bookmarks
 /// open with one.
 fn authorities_level(entries: &[Entry]) -> Option<usize> {
-    entries
-        .iter()
-        .find(|entry| {
-            entry.page == 1
-                && tokens(&entry.title).windows(3).any(|words| words == ["book", "of", "authorities"] || words == ["bundle", "of", "authorities"])
-        })
-        .map(|entry| entry.level)
+    let book = |words: &[String]| words == ["book", "of", "authorities"] || words == ["bundle", "of", "authorities"];
+    entries.iter().find(|entry| entry.page == 1 && tokens(&entry.title).windows(3).any(book)).map(|entry| entry.level)
 }
 
 /// The document's bookmarks and its printed contents list as one outline. A listed entry the

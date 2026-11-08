@@ -14,15 +14,10 @@ pub fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usiz
         "d",
     ];
     let (mut english, mut french) = (0, 0);
-    for line in lines {
-        for word in line
-            .text
-            .split(|character: char| !character.is_alphabetic())
-        {
-            let word = word.to_lowercase();
-            english += usize::from(ENGLISH.contains(&word.as_str()));
-            french += usize::from(FRENCH.contains(&word.as_str()));
-        }
+    for word in lines.flat_map(|line| line.text.split(|character: char| !character.is_alphabetic())) {
+        let word = word.to_lowercase();
+        english += usize::from(ENGLISH.contains(&word.as_str()));
+        french += usize::from(FRENCH.contains(&word.as_str()));
     }
     (english, french)
 }
@@ -45,11 +40,7 @@ pub fn column_language((english, french): (usize, usize), minimum: usize) -> Opt
 /// French side of every page is the translation wherever its own words are French.
 /// `models` are the pages' column models, by view; lines `set_aside` holds (a transcript's line
 /// numbers, furniture) are no column's text.
-pub fn translation_lines(
-    views: &[PageView],
-    models: &[ColumnModel],
-    set_aside: impl Fn(Slot) -> bool,
-) -> Vec<Slot> {
+pub fn translation_lines(views: &[PageView], models: &[ColumnModel], set_aside: impl Fn(Slot) -> bool) -> Vec<Slot> {
     let body = |&(slot, line): &(Slot, &Line)| has_valid_bbox(line) && !set_aside(slot);
     // A page's lines may show its two columns where its model does not (a margin lane read as a third): most of its lines
     // of words stand clear to one side of the body's middle.
@@ -77,18 +68,8 @@ pub fn translation_lines(
         .zip(&splits)
         .filter_map(|(view, split)| {
             let split = (*split)?;
-            let votes = |right: bool| {
-                language_votes(
-                    view.iter()
-                        .filter(body)
-                        .map(|(_, line)| line)
-                        .filter(|line| side(line, split) == Some(right)),
-                )
-            };
-            match (
-                column_language(votes(false), 8),
-                column_language(votes(true), 8),
-            ) {
+            let votes = |right: bool| language_votes(view.iter().filter(body).map(|(_, line)| line).filter(|line| side(line, split) == Some(right)));
+            match (column_language(votes(false), 8), column_language(votes(true), 8)) {
                 (Some(false), Some(true)) => Some((view.page.index, split, true)),
                 (Some(true), Some(false)) => Some((view.page.index, split, false)),
                 _ => None,
@@ -100,27 +81,15 @@ pub fn translation_lines(
     }
     let french_right = parallel.iter().filter(|(_, _, right)| *right).count() * 2 >= parallel.len();
     let split = median(parallel.iter().map(|(_, split, _)| *split).collect());
-    let confirmed = parallel
-        .iter()
-        .filter(|(_, _, right)| *right == french_right)
-        .map(|(index, _, _)| *index)
-        .collect::<HashSet<_>>();
+    let confirmed = parallel.iter().filter(|(_, _, right)| *right == french_right).map(|(index, _, _)| *index).collect::<HashSet<_>>();
     let mut translation = Vec::new();
     for (view, page_split) in views.iter().zip(&splits) {
         let split = page_split.unwrap_or(split);
-        let mut french = view
-            .iter()
-            .filter(body)
-            .filter(|(_, line)| side(line, split) == Some(french_right))
-            .collect::<Vec<_>>();
+        let mut french = view.iter().filter(body).filter(|(_, line)| side(line, split) == Some(french_right)).collect::<Vec<_>>();
         // What stands apart above the English column, a cover page's file number or a
         // memo's title, is no part of the translation beside it.
-        let english_top = view
-            .iter()
-            .filter(body)
-            .filter(|(_, line)| (line_center_x(line) >= split) != french_right)
-            .map(|(_, line)| line.bbox[1])
-            .min_by(f64::total_cmp);
+        let english = view.iter().filter(body).filter(|(_, line)| (line_center_x(line) >= split) != french_right);
+        let english_top = english.map(|(_, line)| line.bbox[1]).min_by(f64::total_cmp);
         if let Some(top) = english_top {
             french.sort_by(|(_, a), (_, b)| a.bbox[1].total_cmp(&b.bbox[1]));
             let apart = french

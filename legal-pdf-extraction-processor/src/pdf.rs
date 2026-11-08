@@ -10,11 +10,10 @@ use legal_pdf_core::{median, profile, union_bbox, OcrLine, OcrPageRequest, PdfOc
 use lopdf::{Document, Object, ObjectId};
 use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, PdfRect, TextItem, TextLine};
 use pdf_inspector::PdfTypeResult;
-use regex::Regex;
+use legal_pdf_core::regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
 
 mod geometry;
 pub use geometry::*;
@@ -56,11 +55,7 @@ pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
 }
 
 pub fn page_geometries(document: &Document) -> PageGeometryMap {
-    document
-        .get_pages()
-        .into_iter()
-        .map(|(page, id)| (page, (id, page_geometry(document, id))))
-        .collect()
+    document.get_pages().into_iter().map(|(page, id)| (page, (id, page_geometry(document, id)))).collect()
 }
 
 pub fn assemble_pdf(
@@ -103,41 +98,30 @@ pub fn assemble_pdf(
         by_page.entry(line.page).or_default().push(line);
     }
 
-    let mut pages = Vec::with_capacity(geometries.len());
-    let diagnostics = Vec::new();
-    let mut source_offset = 0;
-    let mut weak_pages = BTreeSet::<usize>::new();
+    let (mut pages, diagnostics, mut source_offset, mut weak_pages) = (Vec::with_capacity(geometries.len()), Vec::new(), 0, BTreeSet::<usize>::new());
     for (&number, &(_, geometry)) in geometries {
         let page_index = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
         let mut lines = Vec::new();
         for text_line in by_page.remove(&number).unwrap_or_default() {
             let local_index = lines.len() + 1;
-            if let Some(line) = make_line(
-                text_line,
-                page_index,
-                local_index,
-                source_offset + local_index,
-                geometry.height,
-            ) {
-                lines.push(line);
-            }
+            lines.extend(make_line(text_line, page_index, local_index, source_offset + local_index, geometry.height));
         }
         // A page pdf-inspector reads as decoding garbage holds no usable text, whatever prints.
-        let garbled = detection.ocr_reasons_by_page.get(&number).is_some_and(|reasons| {
-            reasons.iter().any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT)
-        });
+        let reasons = detection.ocr_reasons_by_page.get(&number);
+        let garbled = reasons.is_some_and(|reasons| reasons.iter().any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT));
         let quality = if garbled { 0.0 } else { text_quality(&lines) };
         // A scan's invisible text layer that reads poorly is recognized again.
         if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) && !layer_reads_well(&lines) {
             weak_pages.insert(page_index);
         }
         source_offset += lines.len();
+        let (id, width, height) = (format!("p{number:04}"), round3(geometry.width), round3(geometry.height));
         pages.push(Page {
-            id: format!("p{number:04}"),
+            id,
             index: page_index,
             number,
-            width: round3(geometry.width),
-            height: round3(geometry.height),
+            width,
+            height,
             lines,
             regions: vec![],
             source: "native".to_owned(),
@@ -151,25 +135,12 @@ pub fn assemble_pdf(
     for rule in painted_rules {
         rules_by_page.entry(rule.page).or_default().push(rule);
     }
+    let rules = |number: &u32| rules_by_page.get(number).map_or(&[][..], Vec::as_slice);
     let separators = profile::measure("extract.separators", || {
-        geometries
-            .iter()
-            .zip(&pages)
-            .map(|((&number, &(_, geometry)), page)| {
-                separator_y(
-                    geometry,
-                    &page.lines,
-                    rules_by_page.get(&number).map_or(&[], Vec::as_slice),
-                )
-            })
-            .collect::<Vec<_>>()
+        geometries.iter().zip(&pages).map(|((number, &(_, geometry)), page)| separator_y(geometry, &page.lines, rules(number))).collect::<Vec<_>>()
     });
-    for ((&number, &(_, geometry)), page) in geometries.iter().zip(&mut pages) {
-        page.regions = rule_regions(
-            geometry,
-            page,
-            rules_by_page.get(&number).map_or(&[], Vec::as_slice),
-        );
+    for ((number, &(_, geometry)), page) in geometries.iter().zip(&mut pages) {
+        page.regions = rule_regions(geometry, page, rules(number));
     }
 
     for page in &detection.pages_needing_ocr {
@@ -194,19 +165,8 @@ pub fn assemble_pdf(
     }));
     crate::paragraph_recovery::picture_numbers(&mut pages, &pictures, &weak_pages);
     let image_regions = image_regions(&pages, pictures, &weak_pages);
-    let mut extracted = ExtractedPdf {
-        pages,
-        separators,
-        diagnostics,
-        outline: Vec::new(),
-        image_regions,
-        metadata: PdfExtractionMetadata {
-            embedded_page_labels: Vec::new(),
-            pages_needing_ocr: weak_pages.into_iter().collect(),
-            ocr_routed_pages: Vec::new(),
-            scanned_pages,
-        },
-    };
+    let metadata = PdfExtractionMetadata { embedded_page_labels: Vec::new(), pages_needing_ocr: weak_pages.into_iter().collect(), ocr_routed_pages: Vec::new(), scanned_pages };
+    let mut extracted = ExtractedPdf { pages, separators, diagnostics, outline: Vec::new(), image_regions, metadata };
     recognize_pdf(pdf, &mut extracted, ocr, ocr_pages)?;
     Ok(extracted)
 }

@@ -17,52 +17,27 @@ pub fn outline_contexts(
         if let Some(marker) = node.marker_range {
             node.ranges.push(marker);
         }
-        node.ranges.sort_by_key(|range| (range.start, range.end));
-        let mut merged: Vec<legal_structure_model::ScalarRange> = Vec::new();
-        for range in node.ranges.drain(..) {
-            if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
-                last.end = last.end.max(range.end);
-            } else {
-                merged.push(range);
-            }
-        }
-        node.ranges = merged;
+        node.ranges = source_membership(std::mem::take(&mut node.ranges));
         // Keep owned source fragments when the envelope spans intervening columns.
         if node.kind != NodeKind::Page && !node.line_ids.is_empty() {
-            let mut source = node
-                .line_ids
-                .iter()
-                .filter_map(|id| index.line(id).map(|line| line.range))
-                .collect::<Vec<_>>();
+            let mut source = node.line_ids.iter().filter_map(|id| index.line(id).map(|line| line.range)).collect::<Vec<_>>();
             if let Some(marker) = node.marker_range {
                 let ids = index.line_ids(marker);
                 if let Some(first) = ids.first() {
                     let context = decided.reading_context(first);
-                    source.extend(
-                        ids.iter()
-                            .filter(|id| decided.reading_context(id) == context)
-                            .filter_map(|id| index.line(id))
-                            .map(|line| ScalarRange {
-                                start: marker.start.max(line.range.start),
-                                end: marker.end.min(line.range.end),
-                            })
-                            .filter(|part| part.start < part.end),
-                    );
+                    let within = ids.iter().filter(|id| decided.reading_context(id) == context).filter_map(|id| index.line(id));
+                    let parts = within.map(|line| ScalarRange { start: marker.start.max(line.range.start), end: marker.end.min(line.range.end) });
+                    source.extend(parts.filter(|part| part.start < part.end));
                 }
             }
             let source = source_membership(source);
-            let mut owned = Vec::new();
-            let mut at = 0;
+            let (mut owned, mut at) = (Vec::new(), 0);
             for range in &node.ranges {
                 while at < source.len() && source[at].end <= range.start {
                     at += 1;
                 }
-                for part in source[at..]
-                    .iter()
-                    .take_while(|part| part.start < range.end)
-                {
-                    let start = range.start.max(part.start);
-                    let end = range.end.min(part.end);
+                for part in source[at..].iter().take_while(|part| part.start < range.end) {
+                    let (start, end) = (range.start.max(part.start), range.end.min(part.end));
                     if start < end {
                         owned.push(ScalarRange { start, end });
                     }
@@ -98,23 +73,12 @@ pub fn outline_contexts(
             if node.kind == NodeKind::Heading {
                 node.role = Some(PrimaryRole::Heading);
                 node.heading_range = (node.ranges.len() == 1).then_some(node.range);
-            } else if matches!(
-                node.kind,
-                NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose
-            ) {
+            } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
                 node.role.get_or_insert(PrimaryRole::Text);
             }
             let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| {
-                holders
-                    .iter()
-                    .filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges))
-                    .min_by_key(|(_, ranges)| {
-                        ranges
-                            .iter()
-                            .map(|range| range.end - range.start)
-                            .sum::<usize>()
-                    })
-                    .map(|(id, _)| id.clone())
+                let holding = holders.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges));
+                holding.min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _)| id.clone())
             };
             // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
             // belonging to its quotation or note: it names only its document.
@@ -126,18 +90,9 @@ pub fn outline_contexts(
                     node.line_ids.iter().all(|line| decided.quotation(line) == Some(id)).then(|| id.to_owned())
                 })
                 .flatten();
-            let translated = unit
-                && !node.line_ids.is_empty()
-                && node.line_ids.iter().all(|id| decided.translated(id));
-            let container = smallest(&cells)
-                .filter(|_| unit)
-                .map(|id| format!("object:{id}"))
-                .or_else(|| translated.then(|| "translation".to_owned()));
-            (
-                smallest(&constituents).unwrap_or_else(|| document_id.to_owned()),
-                quotation,
-                container,
-            )
+            let translated = unit && !node.line_ids.is_empty() && node.line_ids.iter().all(|id| decided.translated(id));
+            let container = smallest(&cells).filter(|_| unit).map(|id| format!("object:{id}")).or_else(|| translated.then(|| "translation".to_owned()));
+            (smallest(&constituents).unwrap_or_else(|| document_id.to_owned()), quotation, container)
         })
         .collect()
 }

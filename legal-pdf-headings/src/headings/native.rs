@@ -11,9 +11,8 @@ use legal_pdf_text::text::{
     starts_note_or_list,
 };
 use legal_structure_model::StructureAnalysis;
-use regex::Regex;
+use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// A line set at its paragraph's leading under the line before it (`prior`), a full line that ends
 /// no sentence, carries that sentence on ("... Hogg and" / "A. A. Bushell, ..."): its initial is no
@@ -146,12 +145,8 @@ fn inline_enumeration(text: &str) -> bool {
 
 /// Whether the line after one ending on a word no sentence ends on opens something of its own.
 fn opens_after_dangling(previous: &Line, current: &Line) -> bool {
-    static NAMED: OnceLock<Regex> = OnceLock::new();
-    static JUDGE: OnceLock<Regex> = OnceLock::new();
-    let named = NAMED.get_or_init(|| Regex::new(r"(?i)(?:(?:delivered|given|rendered|written) by|rendue? par):?$").unwrap());
-    let judge = JUDGE.get_or_init(|| {
-        Regex::new(r"\b(?:J|JJ|C\.J|J\.A|JJ\.A|C\.J\.[A-Z]+|J\.C\.[A-Z])\.?(?:\s*[-\u{2014}\u{2013}:]\s*)?$|^(?:LE |LA |LES )?JUGES?\b").unwrap()
-    });
+    let named = regex!(r"(?i)(?:(?:delivered|given|rendered|written) by|rendue? par):?$");
+    let judge = regex!(r"\b(?:J|JJ|C\.J|J\.A|JJ\.A|C\.J\.[A-Z]+|J\.C\.[A-Z])\.?(?:\s*[-\u{2014}\u{2013}:]\s*)?$|^(?:LE |LA |LES )?JUGES?\b");
     let text = current.text.trim();
     let (size, before) = (line_font_size(current), line_font_size(previous));
     legal_pdf_text::paragraphs::opens_item(text)
@@ -164,14 +159,10 @@ fn opens_after_dangling(previous: &Line, current: &Line) -> bool {
 
 /// A line that is only a date: "10 JUNE 2026", "DATED 11 JUNE 2026", "June 29, 2020", "1/4/2025".
 pub fn date_line(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        let month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre)";
-        Regex::new(&format!(
-            r"(?i)^(?:dated\s+(?:this\s+)?|le\s+)?(?:\d{{1,2}}(?:st|nd|rd|th|er)?\s+(?:day\s+of\s+)?{month}\.?,?\s+\d{{4}}|{month}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})$"
-        ))
-        .unwrap()
-    })
+    const MONTH: &str = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre)";
+    regex!(&format!(
+        r"(?i)^(?:dated\s+(?:this\s+)?|le\s+)?(?:\d{{1,2}}(?:st|nd|rd|th|er)?\s+(?:day\s+of\s+)?{MONTH}\.?,?\s+\d{{4}}|{MONTH}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})$"
+    ))
     .is_match(text.trim())
 }
 

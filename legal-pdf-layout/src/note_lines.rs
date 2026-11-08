@@ -4,11 +4,7 @@
 use super::*;
 
 pub fn band_geometry_top(line: &Line) -> f64 {
-    line.words
-        .iter()
-        .map(|word| word.bbox[1])
-        .min_by(f64::total_cmp)
-        .unwrap_or(line.bbox[1])
+    line.words.iter().map(|word| word.bbox[1]).min_by(f64::total_cmp).unwrap_or(line.bbox[1])
 }
 
 /// Lines (`members`, slots of `lines`) in rows, top to bottom, each row left to right: taken by
@@ -30,13 +26,11 @@ pub fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -
             _ => rows.push((middle, vec![slot])),
         }
     }
-    *members = rows
-        .into_iter()
-        .flat_map(|(_, mut row)| {
-            row.sort_by(|&left, &right| lines[left].bbox[0].total_cmp(&lines[right].bbox[0]));
-            row
-        })
-        .collect();
+    let row = |(_, mut row): (f64, Vec<usize>)| {
+        row.sort_by(|&left, &right| lines[left].bbox[0].total_cmp(&lines[right].bbox[0]));
+        row
+    };
+    *members = rows.into_iter().flat_map(row).collect();
 }
 
 pub fn standalone_note_label(line: &Line) -> bool {
@@ -59,20 +53,12 @@ pub fn aligned_note_body(label: &Line, body: &Line) -> bool {
 /// note's text stands beside: on the label's row, at or right of it, nearest it.
 pub fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<Item = usize>, label_index: usize) -> Option<usize> {
     let label = &lines[label_index];
+    let (gap, drop) = (|body: &Line| (body.bbox[0] - label.bbox[2]).max(0.0), |body: &Line| (body.bbox[1] - label.bbox[1]).abs());
     among
         .into_iter()
         .map(|index| (index, &lines[index]))
         .filter(|(_, body)| aligned_note_body(label, body))
-        .min_by(|(_, left), (_, right)| {
-            (left.bbox[0] - label.bbox[2])
-                .max(0.0)
-                .total_cmp(&(right.bbox[0] - label.bbox[2]).max(0.0))
-                .then(
-                    (left.bbox[1] - label.bbox[1])
-                        .abs()
-                        .total_cmp(&(right.bbox[1] - label.bbox[1]).abs()),
-                )
-        })
+        .min_by(|(_, left), (_, right)| gap(left).total_cmp(&gap(right)).then(drop(left).total_cmp(&drop(right))))
         .map(|(index, _)| index)
 }
 
@@ -99,25 +85,16 @@ pub fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &legal_pdf
 
 /// A page's body and note band (slots of `lines`) read together: on a page of two columns, each
 /// column's notes after that column's body. `items` are the page's (on page `number`).
-pub fn weave_note_columns(
-    lines: &[Line],
-    mut body: Vec<usize>,
-    note: Vec<usize>,
-    items: &legal_pdf_tables::PageItems,
-    page_width: f64,
-    number: u32,
-) -> Vec<usize> {
+pub fn weave_note_columns(lines: &[Line], mut body: Vec<usize>, note: Vec<usize>, items: &legal_pdf_tables::PageItems, page_width: f64, number: u32) -> Vec<usize> {
     if note.is_empty() {
         return body;
     }
     let note_columns = note_column_model(lines, &note, items, number);
-    let body_model = {
-        let mut kept = vec![false; lines.len()];
-        for &slot in &body {
-            kept[slot] = true;
-        }
-        columns_of(lines, body.iter().copied(), &kept_items(items, |slot| kept[slot]), number)
-    };
+    let mut kept = vec![false; lines.len()];
+    for &slot in &body {
+        kept[slot] = true;
+    }
+    let body_model = columns_of(lines, body.iter().copied(), &kept_items(items, |slot| kept[slot]), number);
     let split_x = if note_columns.kind == "two_column" {
         note_columns.split_x
     } else if body_model.kind == "two_column" {
@@ -128,31 +105,24 @@ pub fn weave_note_columns(
     };
     let narrow = |slot: &&usize| line_width(&lines[**slot]) / page_width <= 0.55;
     let side = |slot: usize| usize::from(line_center_x(&lines[slot]) >= split_x);
-    let note_sides = note.iter().filter(narrow).fold([0_usize; 2], |mut counts, &slot| {
-        counts[side(slot)] += 1;
-        counts
-    });
-    if note_sides.contains(&0) {
+    // How many of the narrow lines among `slots` stand on each side.
+    let sides = |slots: &[usize]| {
+        slots.iter().filter(narrow).fold([0_usize; 2], |mut counts, &slot| {
+            counts[side(slot)] += 1;
+            counts
+        })
+    };
+    if sides(&note).contains(&0) {
         body.extend(note);
         return body;
     }
     let (left_notes, right_notes): (Vec<_>, Vec<_>) = note.into_iter().partition(|&slot| side(slot) == 0);
-    let body_columns = body.iter().filter(narrow).fold([0_usize; 2], |mut counts, &slot| {
-        counts[side(slot)] += 1;
-        counts
-    });
-    if left_notes.is_empty()
-        || right_notes.is_empty()
-        || body_columns.iter().any(|count| *count < 3)
-    {
+    if left_notes.is_empty() || right_notes.is_empty() || sides(&body).iter().any(|count| *count < 3) {
         body.extend(left_notes);
         body.extend(right_notes);
         return body;
     }
-    let insert_at = body
-        .iter()
-        .rposition(|&slot| line_width(&lines[slot]) / page_width <= 0.55 && side(slot) == 0)
-        .map_or(0, |index| index + 1);
+    let insert_at = body.iter().rposition(|&slot| line_width(&lines[slot]) / page_width <= 0.55 && side(slot) == 0).map_or(0, |index| index + 1);
     let right_body = body.split_off(insert_at);
     body.extend(left_notes);
     body.extend(right_body);

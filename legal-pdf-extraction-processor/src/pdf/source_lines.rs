@@ -2,23 +2,9 @@
 
 use super::*;
 
-pub(crate) fn make_line(
-    text_line: TextLine,
-    page_index: usize,
-    local_index: usize,
-    source_index: usize,
-    page_height: f64,
-) -> Option<Line> {
-    let block_index = text_line
-        .items
-        .iter()
-        .find_map(|item| {
-            item.fidelity
-                .as_ref()
-                .map(|value| value.renderer_block as usize)
-        })
-        .filter(|value| *value > 0)
-        .unwrap_or(local_index);
+pub(crate) fn make_line(text_line: TextLine, page_index: usize, local_index: usize, source_index: usize, page_height: f64) -> Option<Line> {
+    let renderer_block = text_line.items.iter().find_map(|item| item.fidelity.as_ref().map(|value| value.renderer_block as usize));
+    let block_index = renderer_block.filter(|value| *value > 0).unwrap_or(local_index);
     let assembled = assemble_line(&text_line);
     if assembled.text.is_empty() {
         return None;
@@ -27,14 +13,8 @@ pub(crate) fn make_line(
     let spans = line_spans(&text_line, &assembled, page_height, &id);
     // MuPDF's line bbox includes source whitespace and other retained runs
     // even when they do not survive as product spans.
-    let bbox = union_bbox(
-        text_line
-            .items
-            .iter()
-            .map(|item| item_bbox(item, page_height)),
-    );
+    let bbox = union_bbox(text_line.items.iter().map(|item| item_bbox(item, page_height)));
     let words = line_words(&assembled.text, &text_line, &assembled, page_height, &id);
-    let text = assembled.text;
     Some(Line {
         id,
         page_index,
@@ -42,7 +22,7 @@ pub(crate) fn make_line(
         source_index,
         reading_order: source_index,
         block_index,
-        text,
+        text: assembled.text,
         bbox,
         spans,
         words,
@@ -62,10 +42,7 @@ pub(crate) fn make_line(
 }
 
 pub(crate) fn shares_source_line(line: &TextLine, item: &TextItem) -> bool {
-    if line.page != item.page {
-        return false;
-    }
-    let Some(prior) = line.items.last() else {
+    let Some(prior) = line.items.last().filter(|_| line.page == item.page) else {
         return false;
     };
     if let (Some(prior), Some(current)) = (prior.fidelity.as_ref(), item.fidelity.as_ref()) {
@@ -84,17 +61,8 @@ pub(crate) fn shares_source_line(line: &TextLine, item: &TextItem) -> bool {
     if (item_baseline(prior) - item_baseline(item)).abs() > line_em * BASE_MAX_DIST {
         return false;
     }
-    let rtl = pdf_inspector::text_utils::is_rtl_text(
-        line.items
-            .iter()
-            .map(|value| value.text.as_str())
-            .chain(std::iter::once(item.text.as_str())),
-    );
-    let gap = if rtl {
-        f64::from(prior.x - (item.x + item.width))
-    } else {
-        f64::from(item.x - (prior.x + prior.width))
-    };
+    let rtl = pdf_inspector::text_utils::is_rtl_text(line.items.iter().map(|value| value.text.as_str()).chain(std::iter::once(item.text.as_str())));
+    let gap = if rtl { f64::from(prior.x - (item.x + item.width)) } else { f64::from(item.x - (prior.x + prior.width)) };
     (-line_em..=line_em * SPACE_MAX_DIST).contains(&gap)
 }
 
@@ -104,19 +72,9 @@ pub(crate) fn shares_source_line(line: &TextLine, item: &TextItem) -> bool {
 pub(crate) fn group_source_order_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     let mut lines = Vec::<TextLine>::new();
     for item in items {
-        if lines
-            .last()
-            .is_some_and(|line| shares_source_line(line, &item))
-        {
-            let line = lines.last_mut().expect("line exists");
-            line.items.push(item);
-        } else {
-            lines.push(TextLine {
-                y: item.y,
-                page: item.page,
-                items: vec![item],
-                adaptive_threshold: 0.1,
-            });
+        match lines.last_mut().filter(|line| shares_source_line(line, &item)) {
+            Some(line) => line.items.push(item),
+            None => lines.push(TextLine { y: item.y, page: item.page, items: vec![item], adaptive_threshold: 0.1 }),
         }
     }
     lines
