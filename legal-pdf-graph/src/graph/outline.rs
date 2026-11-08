@@ -3,7 +3,7 @@
 //! locators stay unchanged.
 
 use super::*;
-use legal_structure_model::{NumberingMarker, PrimaryRole, StructureAnalysis};
+use legal_structure_model::{NumberingMarker, PrimaryRole};
 
 /// A unit's document, quotation, and note, table cell or parallel text membership.
 pub type OutlineContext = (String, Option<String>, Option<String>);

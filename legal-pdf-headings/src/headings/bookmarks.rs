@@ -18,7 +18,6 @@
 //! - a set whose titles are mostly passages indexes paragraphs: it promotes no line to a heading.
 
 use legal_pdf_core::model::PdfOutlineEntry;
-use legal_structure_model::StructureAnalysis;
 use legal_pdf_core::regex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};

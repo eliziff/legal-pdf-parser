@@ -32,7 +32,6 @@ use legal_pdf_layout::{
 use legal_pdf_structure_model::{NoteLabel, PageView, Slot, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
 use legal_pdf_text::text::all_caps;
 use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, LabelPrefix};
-use legal_structure_model::StructureAnalysis;
 use std::collections::BTreeSet;
 
 /// A line the band never reads: a transcript's line number, a line held out of the body.

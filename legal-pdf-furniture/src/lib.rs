@@ -10,7 +10,6 @@ pub use legal_pdf_structure_model::Edge;
 use legal_pdf_structure_model::{PageView, Rows, Rule, Slot};
 use legal_pdf_text::text::{arabic_page_number, heading_standalone_re, scalar_suffix, standalone_paragraph_number};
 use legal_structure_model::text::line_start_label_prefix;
-use legal_structure_model::StructureAnalysis;
 use std::collections::{HashMap, HashSet};
 
 const FOLIO_MIN_SEQUENCE_PAGES: usize = 4;

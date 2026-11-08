@@ -19,7 +19,6 @@ use legal_pdf_core::{
     model::{Line, Page},
     regex,
 };
-use legal_structure_model::StructureAnalysis;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const SEPARATOR_Y_TOLERANCE: f64 = 0.006;

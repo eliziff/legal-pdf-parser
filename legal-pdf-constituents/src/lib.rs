@@ -15,7 +15,7 @@ use legal_pdf_headings::headings;
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_pdf_text::text::{arabic_page_number, party_label};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureAnalysis, StructureNode};
+use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 

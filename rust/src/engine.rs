@@ -463,7 +463,7 @@ fn derive_document(
         derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile)
     })?;
     profile::measure("build.validate_document", || {
-        validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.paragraphs, &derived.footnotes, &derived.structure_graph)
+        validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.footnotes, &derived.structure_graph)
     })?;
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
@@ -486,8 +486,8 @@ fn derive_document(
     }
     let mut parsed = profile::measure("project_document", || {
         let (metadata, pages) = (extracted.metadata, extracted.pages);
-        PdfDocument::from_parts(source_hash, key, document_status, metadata, pages, derived.paragraphs, derived.footnotes, derived.structure_graph)
-    })?;
+        PdfDocument::from_parts(source_hash, key, document_status, metadata, pages, derived.footnotes, derived.authority_text_units, derived.structure_graph)
+    });
     parsed.set_passage_evidence(passage_pages);
     Ok(parsed)
 }
@@ -608,7 +608,6 @@ fn build_document(
         page_count: extracted.pages.len(),
         status,
         pages: extracted.pages,
-        paragraphs: derived.paragraphs,
         footnotes: derived.footnotes,
         structure_graph: derived.structure_graph,
         diagnostics: extracted.diagnostics,

@@ -40,17 +40,17 @@ use legal_pdf_transition as transition;
 use legal_pdf_tier0 as tier0;
 use legal_pdf_emit::Settled;
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_structure_model::regions::{NOTE, NOTE_QUOTE};
 use std::path::Path;
 
 use graph::map_note_pairs;
-use legal_pdf_core::model::{Diagnostic, Footnote, Page, Paragraph, PdfOutlineEntry};
+use legal_pdf_core::model::{Diagnostic, Footnote, Page, PdfOutlineEntry};
 use legal_pdf_core::{Error, Result};
-use legal_structure_model::{DocumentStructure, StructureAnalysis};
+use legal_structure_model::DocumentStructure;
 use std::collections::{HashMap, HashSet};
 
 pub struct StructureOutput {
-    pub paragraphs: Vec<Paragraph>,
+    /// The authority units, read off the rendered text (`emit`).
+    pub authority_text_units: Vec<serde_json::Value>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<Diagnostic>,
     pub structure_graph: DocumentStructure,
@@ -187,23 +187,16 @@ fn output(pages: &mut [Page],
     if give_back(pages, &footnotes) {
         build_regions(pages);
     }
-    let (mut moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &footnotes);
-    // A tier scores the moves, the output stays this one: the DOC tier's move for each line, but for the notes, the
-    // pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its reading of a
-    // marker names one of this reading's.
-    if let Some(read) = doc.filter(|read| read.len() == moves.len()) {
-        for (k, chosen) in read.into_iter().enumerate() {
-            if !(matches!(moves[k].region, NOTE | NOTE_QUOTE) || matches!(chosen.region, NOTE | NOTE_QUOTE)) {
-                moves[k] = chosen;
-            }
-        }
-    }
+    let (moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &footnotes);
+    // A tier scores the moves, the output stays this one: the walk takes the DOC tier's move for each line, but for the
+    // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
+    // reading of a marker names one of this reading's.
     tier0::in_slot_order(pages, slots);
-    let settled = Settled { index: &index, notes, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
-    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
+    let settled = Settled { index: &index, notes, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
+    let (structure_graph, authority_text_units, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, doc, identity, settled)?;
     diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
-    attach_propositions(&mut footnotes, &paragraphs, &decided);
+    attach_propositions(&mut footnotes, &authority_text_units, &decided);
     attach_crossrefs(&mut footnotes, &mut diagnostics, &decided);
     in_reading_order(pages, slots, &fences);
-    Ok(StructureOutput { paragraphs, footnotes, diagnostics, structure_graph, heading_sources })
+    Ok(StructureOutput { authority_text_units, footnotes, diagnostics, structure_graph, heading_sources })
 }

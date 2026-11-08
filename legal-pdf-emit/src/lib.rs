@@ -11,26 +11,29 @@
 //! outline's (`assemble_outline`), and a provision's path alias follows them.
 
 use legal_pdf_constituents as constituents;
-use legal_pdf_core::model::{Footnote, Line, Page, Paragraph};
+use legal_pdf_core::model::{Footnote, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_fences::{decided, Fences};
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING};
-use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, PAGE_LABEL, REGIONS, TABLE};
+use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
+use legal_pdf_text::joining::{seam, split_words, Join};
+use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
 use legal_pdf_structure_model::{Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_structure_model::{NodeKind, ScalarRange, StructureAnalysis};
+use legal_structure_model::{ContinuationKind, NodeKind, ScalarRange, SourceContinuation, SourceJoin};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+
+mod rendered;
 
 use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
-/// its notes the pairer's: their nodes, their reference marks by line, the projection's notes, the claims left aside;
-/// and the run member each unit opens on, by the unit's first line (`runs`).
+/// its notes the pairer's: their nodes, the projection's notes, the claims left aside; and the run member each unit opens
+/// on, by the unit's first line (`runs`).
 pub struct Settled<'a> {
     pub index: &'a PdfTextIndex,
     pub notes: Vec<StructureNode>,
-    pub anchors: &'a HashMap<String, Vec<legal_pdf_core::Anchor>>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<StructureDiagnostic>,
     pub runs: &'a Runs,
@@ -49,6 +52,9 @@ struct Unit {
     /// A heading's level (0 for none).
     level: usize,
     references: Vec<(usize, u32, u32)>,
+    /// The unit's last line with text, and the page it holds lines on now with where its first there starts.
+    last: Option<usize>,
+    page_start: Option<(usize, usize)>,
 }
 
 /// The opening token's characters in a line's text: its first and past-last, leading spaces skipped;
@@ -73,24 +79,39 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
     Some((figures.parse().ok()?, (start, start + length)))
 }
 
-/// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
-/// paragraphs and footnotes the projection reads: what tier 0 wrote and paired before its moves (`settled`) stands.
-/// Each node's page indexes are its lines' pages, set with its exact membership (`outline_contexts`).
+/// The document's structure from its lines (`table`, `views`) and the moves they make, in one walk: each line's move is
+/// DOC's reading where it read one (`doc`), but for the notes, which are tier 0's (`tier0`), a body unit tier 0 opens
+/// taking its numbering's depth (`State::stack_depth`). As a line joins its unit the walk writes the seam with the unit's
+/// line before it (`joining::seam`): a dropped hyphen a manuscript edit, a join with no space a join, a page crossed a
+/// continuation; and each hyphen inside a line that splits a word (`joining::split_words`) an edit. What tier 0 wrote and
+/// paired before its moves (`settled`) stands. With the authority units read off the rendered text, and the notes.
 pub fn structure_graph(pages: &mut [Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
     table: &LineTable,
     views: &[LineView],
-    moves: &[Move],
+    tier0: &[Move],
+    doc: Option<Vec<Move>>,
     identity: &StructureIdentity,
     mut settled: Settled,
-) -> Result<(DocumentStructure, Vec<Paragraph>, Vec<Footnote>)> {
+) -> Result<(DocumentStructure, Vec<Value>, Vec<Footnote>)> {
     let index = settled.index;
     let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let text_of = |k: usize| texts[k].clone();
     let id_of = |k: usize| ids[k].clone();
+    // Each line's source fragment (UTF-16) and page, what a seam is written in.
+    let source_fragments = index.source_fragments();
+    let fragment: HashMap<&str, (ScalarRange, usize)> = source_fragments.iter().map(|f| (f.id.as_str(), (f.range, f.page_index))).collect();
+    let vocabulary = legal_pdf_text::joining::vocabulary(pages);
+    let mut edits: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+    let mut joins: Vec<SourceJoin> = Vec::new();
+    let mut continuations: Vec<SourceContinuation> = Vec::new();
+    let place_of: HashMap<&str, usize> = ids.iter().enumerate().map(|(k, id)| (id.as_str(), k)).collect();
+    let note_move = |m: &Move| matches!(m.region, NOTE | NOTE_QUOTE);
+    let doc = doc.filter(|read| read.len() == tier0.len());
+    let mut moves: Vec<Move> = Vec::with_capacity(tier0.len());
     // Units, each line joining the unit open in its stream, resuming the one it held before, or opening one.
     let mut state = State::default();
     let mut units: Vec<Unit> = Vec::new();
@@ -99,7 +120,14 @@ pub fn structure_graph(pages: &mut [Page],
     let mut unit_at: HashMap<usize, usize> = HashMap::new();
     // The lines the parser opened a constituent document on; a start on a line of no region passes to the next unit.
     let mut started: Vec<usize> = Vec::new();
-    for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
+    for (k, line) in views.iter().enumerate() {
+        let read = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&tier0[k])).copied();
+        let mut chosen = read.unwrap_or(tier0[k]);
+        if read.is_none() && chosen.opens && RANKED_BODY.contains(&chosen.region) {
+            chosen.depth = state.stack_depth(line, &chosen).min(9) as u8;
+        }
+        moves.push(chosen);
+        let chosen = &chosen;
         let made = state.apply(line, chosen);
         if chosen.starts {
             started.push(k);
@@ -148,11 +176,43 @@ pub fn structure_graph(pages: &mut [Page],
                 marker.map(printed)
             };
             let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, references: Vec::new() });
+            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, references: Vec::new(), last: None, page_start: None });
             unit_at.insert(k, units.len() - 1);
             units.len() - 1
         };
         units[u].lines.push(k);
+        let written = texts[k].trim();
+        if chosen.region != NOTE && !matches!(REGIONS[usize::from(chosen.region)], "furniture" | "page_label" | "line_label") && !written.is_empty() {
+            if let Some(&(range, page)) = fragment.get(ids[k].as_str()) {
+                let unit = &mut units[u];
+                if let Some(j) = unit.last {
+                    let before = texts[j].trim();
+                    let separator = match seam(before, written, &vocabulary) {
+                        Join::Plain => {
+                            let at = texts[j].chars().take_while(|c| c.is_whitespace()).count() + before.chars().count() - 1;
+                            edits.entry(ids[j].clone()).or_default().push((at, at + 1, String::new()));
+                            ""
+                        }
+                        Join::Hyphen => "",
+                        Join::Keep => " ",
+                    };
+                    if separator.is_empty() {
+                        joins.push(SourceJoin { from: fragment[ids[j].as_str()].0.start, to: range.start, separator: String::new() });
+                    }
+                    if let Some((_, from)) = unit.page_start.filter(|&(held, _)| held != page) {
+                        let kind = if unit.region == HEADING { ContinuationKind::Heading } else { ContinuationKind::Paragraph };
+                        continuations.push(SourceContinuation { kind, from, to: range.start, separator: Some(separator.to_owned()) });
+                    }
+                }
+                if unit.page_start.is_none_or(|(held, _)| held != page) {
+                    unit.page_start = Some((page, range.start));
+                }
+                unit.last = Some(k);
+            }
+            for at in split_words(&texts[k], &vocabulary) {
+                edits.entry(ids[k].clone()).or_default().push((at, at + 1, String::new()));
+            }
+        }
         streams.step(key, chosen.region, if held.is_some() { stands } else { Stands::Opens }, k);
         // The reference mark the note this line opens answered.
         for (place, start, end) in made.paired.into_iter().chain(made.also.into_iter().flatten()) {
@@ -311,7 +371,24 @@ pub fn structure_graph(pages: &mut [Page],
             }
         }
     }
-    // The pairer's notes, over the lines they claim, whatever the moves made of them.
+    // The pairer's notes, over the lines they claim, whatever the moves made of them: a note over a page goes on with a
+    // space, and a hyphen inside its line that splits a word is an edit.
+    for note in &settled.notes {
+        let mut held: Option<(usize, usize)> = None;
+        for id in &note.line_ids {
+            let Some(&(range, page)) = fragment.get(id.as_str()) else { continue };
+            if let Some((_, from)) = held.filter(|&(on, _)| on != page) {
+                continuations.push(SourceContinuation { kind: ContinuationKind::Note, from, to: range.start, separator: Some(" ".to_owned()) });
+            }
+            if held.is_none_or(|(on, _)| on != page) {
+                held = Some((page, range.start));
+            }
+            let Some(&k) = place_of.get(id.as_str()) else { continue };
+            for at in split_words(&texts[k], &vocabulary) {
+                edits.entry(id.clone()).or_default().push((at, at + 1, String::new()));
+            }
+        }
+    }
     nodes.append(&mut settled.notes);
     nodes.extend(legal_pdf_graph::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
     nodes.extend(legal_pdf_graph::graph::quotation_nodes(index, &decided, ORIGIN)?);
@@ -336,31 +413,6 @@ pub fn structure_graph(pages: &mut [Page],
         constituents::Start::new(id, &kind)
     }).collect();
     nodes.extend(constituents::constituents(index, pages, &starts));
-    // The paragraphs and footnotes the projection reads (authority units, lookups): every body unit's text,
-    // each line's span in it and where its paired notes' reference marks stand; every note's.
-    let page_of = |k: usize| slots.page(table.order[k]);
-    // A unit's lines joined as the stage's paragraphs join them (hyphenation by the document's words).
-    let vocabulary = legal_pdf_text::joining::vocabulary(pages);
-    let marks = settled.anchors;
-    let mut paragraphs = Vec::new();
-    for (u, unit) in units.iter().enumerate() {
-        let region = REGIONS[usize::from(unit.region)];
-        if matches!(region, "furniture" | "page_label" | "line_label" | "none") || unit.region == NOTE {
-            continue;
-        }
-        // The paragraph's text as the stage writes it: each paired reference mark its note's marker.
-        let lines: Vec<&Line> = unit.lines.iter().map(|&k| slots.line(pages, table.order[k])).collect();
-        let Some((text, anchors, spans)) = legal_pdf_text::joining::anchored_text(&lines, &vocabulary, marks) else { continue };
-        paragraphs.push(Paragraph {
-            source_spans: spans,
-            id: node_id(u),
-            page_index: pages[page_of(unit.lines[0])].index,
-            region_type: if unit.region == HEADING || matches!(region, "title" | "marginal_note") { region.to_owned() } else { "body".to_owned() },
-            text,
-            line_ids: unit.lines.iter().map(|&k| id_of(k)).collect(),
-            anchors,
-        });
-    }
     let text = index.text().to_owned();
     let digest = {
         use sha2::Digest;
@@ -403,9 +455,22 @@ pub fn structure_graph(pages: &mut [Page],
     // reading is the fences', all `Decided` reads for it. On a line a model reads as a provision the number is the
     // provision's: a contract's clauses count as paragraphs do, and no paragraph stands over them. Tier 0's rules read
     // the same numbers, and nothing here overrules them.
-    structure.source_fragments = index.source_fragments();
+    structure.source_fragments = source_fragments;
+    for (line, written) in edits {
+        let held = structure.manuscript_edits.entry(line).or_default();
+        for edit in written {
+            if !held.iter().any(|other| other.0 < edit.1 && edit.0 < other.1 || *other == edit) {
+                held.push(edit);
+            }
+        }
+        held.sort_by_key(|edit| (edit.0, edit.1));
+    }
+    structure.joins.extend(joins);
+    structure.continuations = Some(continuations);
     legal_pdf_graph::graph::read_judgment_paragraphs(&mut structure, pages, &decided, &HashSet::new());
     structure.profile = identity.profile;
+    let runs = rendered::render(pages, &mut structure)?;
+    let units = rendered::authority_units(&structure, &runs, &settled.footnotes);
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
-    Ok((structure, paragraphs, settled.footnotes))
+    Ok((structure, units, settled.footnotes))
 }

@@ -1,9 +1,9 @@
-//! Paragraphs assembled from lines: words a line breaks rejoined, and each paragraph's source runs.
+//! How a unit's lines join: the seam between two of its lines, and the hyphens inside a line that split a word.
 
-use legal_pdf_core::model::{Line, Page, ParagraphAnchor};
-use legal_pdf_core::Anchor;
-use legal_structure_model::ScalarText;
-use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::Page;
+use std::collections::HashSet;
+
+pub use pdf_inspector::markdown::Join;
 
 /// A document's own dictionary for rejoining words its lines break: its words and its hyphenated
 /// compounds (pdf-inspector's `document_vocabulary`).
@@ -14,122 +14,56 @@ pub fn vocabulary(pages: &[Page]) -> Vocabulary {
     pdf_inspector::markdown::document_vocabulary(&text.join(" "))
 }
 
-/// A paragraph's lines joined into its text, with the source run of each. A word broken over two
-/// lines is rejoined as pdf-inspector rejoins it: plain where the document writes it whole
-/// ("de- fendant"), with its hyphen where it writes the compound or the continuation is
-/// capitalized ("six- month", "Third- Party"), and otherwise plain before a lowercase continuation
-/// ("judg- ment"), the paragraph's lines being one column's; a soft hyphen always joins.
-pub fn join_lines(lines: &[&Line], vocabulary: &Vocabulary) -> (String, Vec<legal_pdf_core::model::SourceTextSpan>) {
-    use pdf_inspector::markdown::{join_decision, Join};
-    let mut text = String::new();
-    let mut source_spans: Vec<legal_pdf_core::model::SourceTextSpan> = Vec::new();
-    for line in lines {
-        let value = line.text.trim();
-        if value.is_empty() {
-            continue;
-        }
-        let first: &str = value.split(|c: char| !c.is_alphabetic()).next().unwrap_or("");
-        let join = match text.chars().next_back() {
-            Some('\u{00ad}') if !first.is_empty() => Join::Plain,
-            Some(hyphen @ ('-' | '\u{00ac}')) => {
-                let before = &text[..text.len() - hyphen.len_utf8()];
-                let last = before.rsplit(|c: char| !c.is_alphabetic()).next().unwrap_or("");
-                let decision = if last.chars().count() >= 2 && first.chars().count() >= 2 {
-                    join_decision(last, first, &vocabulary.0, &vocabulary.1)
-                } else {
-                    Join::Keep
-                };
-                // Without the document's evidence, a lowercase continuation in one column's
-                // paragraph is the word going on.
-                match decision {
-                    Join::Keep if !last.is_empty() && first.chars().next().is_some_and(char::is_lowercase) => Join::Plain,
-                    decision => decision,
-                }
+/// The seam between a unit's line (`before`, trimmed) and its next (`after`, trimmed). A word broken over the two is
+/// rejoined as pdf-inspector rejoins it: plain where the document writes it whole ("de- fendant"), with its hyphen where
+/// it writes the compound or the continuation is capitalized ("six- month", "Third- Party"), and otherwise plain before a
+/// lowercase continuation ("judg- ment"), the unit's lines being one column's; a soft hyphen always joins. `Plain` drops
+/// `before`'s last character, `Hyphen` keeps it with no space, `Keep` is a space.
+pub fn seam(before: &str, after: &str, vocabulary: &Vocabulary) -> Join {
+    use pdf_inspector::markdown::join_decision;
+    let first: &str = after.split(|c: char| !c.is_alphabetic()).next().unwrap_or("");
+    match before.chars().next_back() {
+        Some('\u{00ad}') if !first.is_empty() => Join::Plain,
+        Some(hyphen @ ('-' | '\u{00ac}')) => {
+            let stem = &before[..before.len() - hyphen.len_utf8()];
+            let last = stem.rsplit(|c: char| !c.is_alphabetic()).next().unwrap_or("");
+            let decision = if last.chars().count() >= 2 && first.chars().count() >= 2 {
+                join_decision(last, first, &vocabulary.0, &vocabulary.1)
+            } else {
+                Join::Keep
+            };
+            // Without the document's evidence, a lowercase continuation in one column's unit is the word going on.
+            match decision {
+                Join::Keep if !last.is_empty() && first.chars().next().is_some_and(char::is_lowercase) => Join::Plain,
+                decision => decision,
             }
-            _ => Join::Keep,
-        };
-        match join {
-            Join::Plain => {
-                text.pop();
-                if let Some(last) = source_spans.last_mut() { last.end -= 1; last.source_end -= 1; }
-                source_spans.retain(|span| span.start < span.end);
-            }
-            Join::Hyphen => {}
-            Join::Keep if !text.is_empty() => text.push(' '),
-            Join::Keep => {}
         }
-        let output_start = legal_structure_model::utf16_len(&text);
-        let source_start = legal_structure_model::utf16_len(&line.text[..line.text.len() - line.text.trim_start().len()]);
-        let length = legal_structure_model::utf16_len(value);
-        source_spans.push(legal_pdf_core::model::SourceTextSpan {start:output_start,end:output_start+length,
-            line_id:line.id.clone(),source_start,source_end:source_start+length});
-        text.push_str(value);
+        _ => Join::Keep,
     }
-    (text, source_spans)
 }
 
-
-/// A paragraph's lines joined (`join_lines`), each paired reference mark `anchors` names (by line id)
-/// replaced by its note's marker, `⟦FN:pair⟧`, an anchor at its offset; with each source run kept.
-/// None where the lines hold no text.
-pub fn anchored_text(
-    lines: &[&Line],
-    vocabulary: &Vocabulary,
-    anchors: &HashMap<String, Vec<Anchor>>,
-) -> Option<(String, Vec<ParagraphAnchor>, Vec<legal_pdf_core::model::SourceTextSpan>)> {
-    let (text, source_spans) = join_lines(lines, vocabulary);
-    if text.is_empty() {
-        return None;
-    }
-    {
-        let mut events = Vec::new();
-        let joined_coordinates = ScalarText::new(&text);
-        for line in lines {
-            let coordinates = ScalarText::new(&line.text);
-            for anchor in anchors.get(&line.id).into_iter().flatten() {
-                let start = coordinates.utf16(anchor.start);
-                let end = coordinates.utf16(anchor.end);
-                let Some(run) = source_spans.iter().find(|span| span.line_id == line.id
-                    && span.source_start <= start && end <= span.source_end) else { continue; };
-                let start = joined_coordinates.scalar_at_utf16(run.start + start - run.source_start).unwrap();
-                let end = joined_coordinates.scalar_at_utf16(run.start + end - run.source_start).unwrap();
-                events.push((start,end,anchor.pair_id.as_str(),anchor.label.as_str()));
-            }
+/// The hyphens in a line's text that split one word, each its scalar offset: a hyphen between letters where no compound
+/// is written ("Companies' Cr-editors Arrangement Act"), a recognizer's read into the text, where pdf-inspector's
+/// `join_decision` reads the two parts as one word, the document writing it whole elsewhere. A compound whose second part
+/// opens with a capital or a digit ("Non-Renewable", "C-36"), or that the document never writes whole, keeps it.
+pub fn split_words(text: &str, vocabulary: &Vocabulary) -> Vec<usize> {
+    use pdf_inspector::markdown::join_decision;
+    let characters: Vec<char> = text.chars().collect();
+    let mut hyphens = Vec::new();
+    for at in 1..characters.len() {
+        if characters[at] != '-' || !characters[at - 1].is_alphabetic() {
+            continue;
         }
-        events.sort_by_key(|event| (event.0, event.1));
-        let (rendered, output_anchors, source_spans) = if events.is_empty() {
-            (text, Vec::new(), source_spans)
-        } else {
-            let coordinates = ScalarText::new(&text);
-            let text_len = coordinates.len();
-            let mut rendered = String::with_capacity(text.len());
-            let mut output_anchors = Vec::with_capacity(events.len());
-            let mut retained_spans = Vec::new();
-            let (mut cursor, mut rendered_len) = (0, 0);
-            for (start, end, pair_id, label) in events {
-                let start = start.max(cursor).min(text_len);
-                let end = end.max(start).min(text_len);
-                let output_start = legal_structure_model::utf16_len(&rendered);
-                retained_spans.extend(source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),coordinates.utf16(start),output_start)));
-                rendered.push_str(coordinates.slice(cursor..start).unwrap());
-                rendered_len += start - cursor;
-                let offset = rendered_len;
-                rendered.push_str("⟦FN:");
-                rendered.push_str(&pair_id);
-                rendered.push('⟧');
-                rendered_len += 5 + pair_id.chars().count();
-                output_anchors.push(ParagraphAnchor {
-                    pair_id: pair_id.to_owned(),
-                    label: label.to_owned(),
-                    offset,
-                });
-                cursor = end;
-            }
-            let output_start = legal_structure_model::utf16_len(&rendered);
-            retained_spans.extend(source_spans.iter().filter_map(|span| span.retain(coordinates.utf16(cursor),coordinates.utf16(text_len),output_start)));
-            rendered.push_str(coordinates.slice(cursor..text_len).unwrap());
-            (rendered, output_anchors, retained_spans)
-        };
-        Some((rendered, output_anchors, source_spans))
+        let first = characters[..at].iter().rev().take_while(|c| c.is_alphabetic()).count();
+        let second = characters[at + 1..].iter().take_while(|c| c.is_alphabetic()).count();
+        if second < 2 || at > first && characters[at - first - 1] == '-' {
+            continue;
+        }
+        let before: String = characters[at - first..at].iter().collect();
+        let after: String = characters[at + 1..at + 1 + second].iter().collect();
+        if join_decision(&before, &after, &vocabulary.0, &vocabulary.1) == Join::Plain {
+            hyphens.push(at);
+        }
     }
+    hyphens
 }

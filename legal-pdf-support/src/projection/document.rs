@@ -148,27 +148,12 @@ impl PdfDocument {
         status: String,
         metadata: PdfExtractionMetadata,
         pages: Vec<Page>,
-        paragraphs: Vec<Paragraph>,
         footnotes: Vec<Footnote>,
-        mut structure: DocumentStructure,
-    ) -> legal_pdf_core::Result<Self> {
-        let authority_text_units =
-            crate::adapters::to_toa_text_units_from_parts(&paragraphs, &footnotes, &structure)?;
-        let joins = attach_manuscript_edits(&paragraphs, &mut structure);
-        attach_source_continuations(&paragraphs, &footnotes, &mut structure);
-        let continuations = structure.continuations.as_deref().unwrap_or_default();
-        structure.joins.extend(joins.into_iter().filter(|(_, required)|
-            required.as_ref().is_none_or(|link| continuations.contains(link))).map(|(join, _)| join));
-        attach_rendered_text(&paragraphs, &pages, &footnotes, &mut structure)?;
-        let page_count = pages.len();
-        let summary = summary(source_sha256, cache_key, page_count, status, metadata);
-        Ok(Self::project(
-            pages,
-            footnotes,
-            authority_text_units,
-            structure,
-            summary,
-        ))
+        authority_text_units: Vec<Value>,
+        structure: DocumentStructure,
+    ) -> Self {
+        let summary = summary(source_sha256, cache_key, pages.len(), status, metadata);
+        Self::project(pages, footnotes, authority_text_units, structure, summary)
     }
 
     pub(crate) fn project(

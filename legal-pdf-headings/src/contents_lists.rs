@@ -14,7 +14,6 @@
 use crate::headings::bookmarks::normalize_title;
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_pdf_core::Line;
-use legal_structure_model::StructureAnalysis;
 use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
 

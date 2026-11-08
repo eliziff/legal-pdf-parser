@@ -1,8 +1,8 @@
 //! The parsed PDF as applications read it: the projected document (`document`), lookups by locator
-//! (`lookup`), and its rendered text (`rendered`).
+//! (`lookup`).
 
 use legal_pdf_core::model::{
-    Footnote, Line, Page, Paragraph, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
+    Footnote, Line, Page, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
 };
 use legal_structure_model::{
     document_fingerprint, serialization_sha256, utf16_len, DigestWriter, DocumentFingerprint,
@@ -23,8 +23,6 @@ mod document;
 pub use document::*;
 mod lookup;
 pub use lookup::*;
-mod rendered;
-pub(crate) use rendered::*;
 
 const MAX_UNITS: usize = 20;
 const MAX_CONTEXT: usize = 2;

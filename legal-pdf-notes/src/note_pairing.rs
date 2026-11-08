@@ -2,7 +2,6 @@
 
 use legal_pdf_structure_model::{Decided, DocumentContext};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_structure_model::StructureAnalysis;
 use legal_pdf_core::model::{Line, Page, PairingOutput, PdfSourceSpan};
 use std::collections::{BTreeMap, HashMap};
 

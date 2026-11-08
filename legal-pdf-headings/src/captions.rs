@@ -4,7 +4,6 @@
 
 use legal_pdf_text::text::party_label;
 use legal_pdf_core::{CitationSpan, Line};
-use legal_structure_model::StructureAnalysis;
 
 /// A caption's labelled field.
 #[derive(Clone, Copy, PartialEq, Eq)]

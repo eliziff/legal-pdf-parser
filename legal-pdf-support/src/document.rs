@@ -1,7 +1,7 @@
 //! A parsed PDF: its pages, paragraphs and notes, and the structure graph the engine reads from
 //! them.
 
-use legal_pdf_core::model::{Diagnostic, Footnote, Page, Paragraph, PARSER_VERSION, SCHEMA_VERSION};
+use legal_pdf_core::model::{Diagnostic, Footnote, Page, PARSER_VERSION, SCHEMA_VERSION};
 use legal_structure_model::DocumentStructure;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -14,7 +14,6 @@ pub struct LegalDocument {
     pub page_count: usize,
     pub status: String,
     pub pages: Vec<Page>,
-    pub paragraphs: Vec<Paragraph>,
     pub footnotes: Vec<Footnote>,
     pub structure_graph: DocumentStructure,
     pub diagnostics: Vec<Diagnostic>,

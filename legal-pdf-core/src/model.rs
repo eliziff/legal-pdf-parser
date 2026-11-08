@@ -57,26 +57,6 @@ pub fn tagged_line_role<'a>(
     line.text[bytes[covered]..].trim().is_empty().then_some(tag)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ParagraphAnchor {
-    pub pair_id: String,
-    pub label: String,
-    pub offset: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Paragraph {
-    #[serde(default)]
-    pub source_spans: Vec<SourceTextSpan>,
-    pub id: String,
-    pub page_index: usize,
-    pub region_type: String,
-    pub text: String,
-    pub line_ids: Vec<String>,
-    #[serde(default)]
-    pub anchors: Vec<ParagraphAnchor>,
-}
-
 /// One bookmark of the PDF's own outline, in outline order: a navigation hint whose title and
 /// target may be stale. `level` counts from 1 at the outline's top; `page_index` is the target's
 /// physical page, counted from 0.

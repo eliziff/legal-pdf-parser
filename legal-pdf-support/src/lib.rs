@@ -1,4 +1,3 @@
-mod adapters;
 mod document;
 #[cfg(feature = "ppdoc")]
 mod ppdoc;

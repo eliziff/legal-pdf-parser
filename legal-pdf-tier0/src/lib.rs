@@ -21,10 +21,9 @@ use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
 use legal_pdf_fences::Fences;
 use legal_pdf_graph::graph;
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{LineView, Move, State, TemplateView, CANDIDATE, RANKED_BODY};
+use legal_pdf_machine::machine::{LineView, Move, State, TemplateView, CANDIDATE};
 use legal_pdf_structure_model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
 use legal_pdf_structure_model::{Decided, DocumentContext, Evidence, Role, Rule, Runs, Slot, Slots};
-use legal_structure_model::StructureAnalysis;
 use std::collections::{HashMap, HashSet};
 use legal_structure_model::UnitRole;
 
@@ -199,8 +198,8 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 /// a unit further down it (a page's leading may not part them); its other lines go on in the unit they follow by name, and
 /// a region going on from the last (`Fences::continues`) goes on in the numbered unit that region ended in, over a page. A contents
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
-/// other line stands alone. A body unit's depth is its numbering's (`State::stack_depth`). With the moves, the run member
-/// each unit opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
+/// other line stands alone; a body unit's depth is the walk's to read (`emit`). With the moves, the run member each unit
+/// opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
 pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[Footnote]) -> (Vec<Move>, HashMap<usize, (u32, u32)>, HashMap<usize, Vec<(u32, u32)>>) {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
@@ -277,17 +276,11 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
         }
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
-    let mut state = State::default();
-    let mut walk = |(k, chosen): (usize, Option<Move>)| {
-        let mut chosen = chosen.unwrap_or_else(|| Move::plain(region_of(decision.role[table.order[k].index()], None), true));
-        chosen.starts = starts.contains(&k);
-        if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-            chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;
-        }
-        state.apply(&views[k], &chosen);
-        chosen
-    };
-    (moves.into_iter().enumerate().map(&mut walk).collect(), opened, within)
+    let moves = moves.into_iter().enumerate().map(|(k, chosen)| Move {
+        starts: starts.contains(&k),
+        ..chosen.unwrap_or_else(|| Move::plain(region_of(decision.role[table.order[k].index()], None), true))
+    }).collect();
+    (moves, opened, within)
 }
 
 /// Each page's lines back in their slots, which `emit` addresses them by.

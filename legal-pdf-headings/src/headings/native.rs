@@ -10,7 +10,6 @@ use legal_pdf_text::text::{
     bracket_excess, closes_before_opening, dangling_end, enumerated, hyphen_continuation, hyphen_fragment_tail, sentence_ended,
     starts_note_or_list,
 };
-use legal_structure_model::StructureAnalysis;
 use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
 

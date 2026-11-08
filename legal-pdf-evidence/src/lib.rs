@@ -18,7 +18,7 @@ use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::collections::HashMap;
 pub use legal_pdf_structure_model::evidence::*;
-use legal_pdf_structure_model::{NoteLabel, PageView, Rows, Slot, Slots, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
+use legal_pdf_structure_model::{NoteLabel, Rows, Slot, Slots, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
 use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
 use legal_pdf_tables::PageItems;
 

@@ -2,7 +2,7 @@
 //! passes.
 
 use legal_pdf_constituents as constituents;
-use legal_pdf_core::model::{Diagnostic, Footnote, Line, Page, Paragraph};
+use legal_pdf_core::model::{Diagnostic, Footnote, Line, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_furniture::printed_label;
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
@@ -130,14 +130,13 @@ pub fn validate_document(document: &LegalDocument) -> Result<()> {
         return invalid("document page_count does not match the page collection");
     }
     let document_id = &document.document_id;
-    validate_pdf_components(document_id, &document.source_sha256, &document.pages, &document.paragraphs, &document.footnotes, &document.structure_graph)
+    validate_pdf_components(document_id, &document.source_sha256, &document.pages, &document.footnotes, &document.structure_graph)
 }
 
 pub fn validate_pdf_components(
     document_id: &str,
     source_sha256: &str,
     pages: &[Page],
-    paragraphs: &[Paragraph],
     footnotes: &[Footnote],
     structure_graph: &DocumentStructure,
 ) -> Result<()> {
@@ -152,12 +151,6 @@ pub fn validate_pdf_components(
         }
         if footnote.reference_line_id.as_ref().is_some_and(unknown_line) || footnote.body_line_ids.iter().any(unknown_line) {
             return invalid(format!("footnote {} contains an unknown source line", footnote.pair_id));
-        }
-    }
-    let mut paragraph_ids = HashSet::new();
-    for paragraph in paragraphs {
-        if !paragraph_ids.insert(&paragraph.id) || paragraph.line_ids.iter().any(unknown_line) {
-            return invalid(format!("paragraph {} is invalid", paragraph.id));
         }
     }
     if structure_graph.document_id != document_id || structure_graph.source_sha256.as_deref() != Some(source_sha256) {

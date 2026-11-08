@@ -1,11 +1,10 @@
 //! What a note says of the text around it: its proposition (the sentence it attaches to), its
 //! cross-references to other notes, and the references no note answers.
 
-use legal_pdf_core::model::{Diagnostic, Footnote, FootnoteCrossref, Page, Paragraph};
+use legal_pdf_core::model::{Diagnostic, Footnote, FootnoteCrossref, Page};
 use legal_pdf_core::{regex, Anchor};
 use legal_pdf_structure_model::{Decided, DocumentContext};
 use legal_structure_model::text::normalize_label;
-use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -55,27 +54,28 @@ pub fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize)], off
     clean_markers(&chars[start..end].iter().collect::<String>())
 }
 
-pub fn attach_propositions(footnotes: &mut [Footnote], paragraphs: &[Paragraph], decided: &Decided) {
-    let by_pair: HashMap<String, usize> = footnotes.iter().enumerate().map(|(index, footnote)| (footnote.pair_id.clone(), index)).collect();
+/// Each note's sentence and the passage since the note before it, read off the body authority units: their text, their
+/// notes' marks left out, and where each mark stood (`footnote_refs`, each a note's ordinal and a UTF-16 offset).
+pub fn attach_propositions(footnotes: &mut [Footnote], units: &[serde_json::Value], decided: &Decided) {
     let mut tails = HashMap::<DocumentContext, String>::new();
-    for paragraph in paragraphs {
-        let context = paragraph.line_ids.first().map_or((0, false), |id| decided.document_context(id));
+    for unit in units.iter().filter(|unit| unit["kind"] == "body") {
+        let context = unit["source"]["lineIds"].get(0).and_then(serde_json::Value::as_str).map_or((0, false), |id| decided.document_context(id));
         let previous_tail = tails.entry(context).or_default();
-        let chars: Vec<char> = paragraph.text.chars().collect();
+        let text = unit["text"].as_str().unwrap_or_default();
+        let coordinates = legal_structure_model::ScalarText::new(text);
+        let chars: Vec<char> = text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
-        let clip = |at: usize| at.min(chars.len());
         let mut previous_offset = 0;
-        for anchor in &paragraph.anchors {
-            let Some(&index) = by_pair.get(&anchor.pair_id) else {
-                continue;
-            };
-            let offset = anchor.offset;
-            footnotes[index].sentence_proposition = sentence_at_boundaries(&chars, &boundaries, offset);
-            let passage = clean_markers(&chars[clip(previous_offset)..clip(offset)].iter().collect::<String>());
-            footnotes[index].passage_since_prior_note = if passage.is_empty() { previous_tail.clone() } else { passage };
-            previous_offset = offset + 5 + anchor.pair_id.chars().count();
+        for reference in unit["footnote_refs"].as_array().into_iter().flatten() {
+            let (Some(ordinal), Some(offset)) = (reference[0].as_u64(), reference[1].as_u64()) else { continue };
+            let Some(offset) = coordinates.scalar_at_utf16(offset as usize) else { continue };
+            let Some(note) = (ordinal as usize).checked_sub(1).and_then(|at| footnotes.get_mut(at)) else { continue };
+            note.sentence_proposition = sentence_at_boundaries(&chars, &boundaries, offset);
+            let passage = clean_markers(&chars[previous_offset.min(offset)..offset].iter().collect::<String>());
+            note.passage_since_prior_note = if passage.is_empty() { previous_tail.clone() } else { passage };
+            previous_offset = offset;
         }
-        *previous_tail = chars[clip(previous_offset)..].iter().collect::<String>().trim().to_owned();
+        *previous_tail = chars[previous_offset.min(chars.len())..].iter().collect::<String>().trim().to_owned();
     }
 }
 

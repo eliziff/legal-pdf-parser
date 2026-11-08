@@ -5,7 +5,6 @@ use legal_pdf_core::regex;
 use legal_pdf_core::model::{Line, Page, Span};
 use legal_pdf_text::text::scalar_suffix;
 use legal_structure_model::text::{is_note_symbol, normalize_label, LabelPrefix};
-use legal_structure_model::StructureAnalysis;
 use regex::Regex;
 use std::sync::OnceLock;
 
