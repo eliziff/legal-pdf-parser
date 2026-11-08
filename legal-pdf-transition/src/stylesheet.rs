@@ -47,13 +47,13 @@ fn commonest<K: Copy + Ord + Into<f32>>(counts: &HashMap<K, u32>) -> f32 {
 /// Each line's template, numbered from 0 in order of first appearance: its look, where it stands (at
 /// the margin, indented a little or more, centred, set right) and the numbering family its marker
 /// counts in.
-pub fn template_ids(table: &LineTable) -> Vec<u32> {
+pub fn template_ids(table: &LineTable, measures: &Measures) -> Vec<u32> {
     let (indent, centre, width, right) = (feature("indent"), feature("centre"), feature("width"), feature("right_gap"));
     let counts: Vec<usize> = ["count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet"]
         .iter().map(|name| feature(name)).collect();
     let mut ids: HashMap<(u32, u8, u8), u32> = HashMap::new();
     (0..table.readings.len()).map(|k| {
-        let row = table.row(k);
+        let row = measures.row(k);
         let place = if row[centre].abs() < 0.04 && row[width] < 0.85 { 3 } else if row[indent] > 0.4 && row[right] < 0.05 { 4 }
             else if row[indent] < 0.02 { 0 } else if row[indent] < 0.08 { 1 } else { 2 };
         let family = counts.iter().position(|&c| row[c] > 0.5).map_or(9, |c| c as u8);
@@ -86,13 +86,13 @@ pub fn contents_rows(pages: &[Page], slots: &Slots, fences: &Fences) -> Vec<Opti
 
 /// Whether a line may open a unit as the encoder's attention reads the document: it opens on a marker,
 /// or it is short (sixty characters or fewer).
-pub fn opener(table: &LineTable, k: usize) -> bool {
-    !table.readings[k].is_empty() || table.row(k)[feature("length")] <= 0.8222
+pub fn opener(table: &LineTable, measures: &Measures, k: usize) -> bool {
+    !table.readings[k].is_empty() || measures.row(k)[feature("length")] <= 0.8222
 }
 
 impl Stylesheet {
     /// The stylesheet of the lines `table` reads, each line's template `template` (`template_ids`).
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, template: Vec<u32>, locals: &[Local]) -> Self {
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, measures: &Measures, template: Vec<u32>, locals: &[Local]) -> Self {
         let n = table.readings.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
@@ -117,7 +117,7 @@ impl Stylesheet {
         let mut weight = vec![0f32; count];
         for k in 0..n {
             let t = template[k] as usize;
-            let row = table.row(k);
+            let row = measures.row(k);
             let view = &mut views[t];
             view.lines += 1.0;
             view.heading += locals[k].probabilities[heading_class] as f32;

@@ -245,8 +245,8 @@ pub struct Style {
 }
 
 impl Style {
-    pub fn of(sheet: &Stylesheet, table: &LineTable) -> Self {
-        let rows = joint::template_rows(sheet, table);
+    pub fn of(sheet: &Stylesheet, table: &LineTable, measures: &Measures) -> Self {
+        let rows = joint::template_rows(sheet, table, measures);
         let width = rows.first().map_or(1, |r| r.len());
         let rows = if rows.is_empty() { vec![0.0; width] } else {
             rows.iter().flat_map(|r| {
@@ -515,20 +515,20 @@ mod model {
 
         /// The document's moves, a line each in reading order: `texts` and `pages` each line's; read with a set of
         /// sessions of the reader's own, given back after.
-        pub fn read(&self, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
+        pub fn read(&self, table: &LineTable, measures: &Measures, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
             let mut sessions = self.sessions.lock().ok().and_then(|mut pool| pool.pop()).map_or_else(|| Sessions::load(&self.dir), Ok)?;
-            let moves = self.read_with(&mut sessions, table, views, texts, pages, style);
+            let moves = self.read_with(&mut sessions, table, measures, views, texts, pages, style);
             if let Ok(mut pool) = self.sessions.lock() { pool.push(sessions); }
             moves
         }
 
-        fn read_with(&self, sessions: &mut Sessions, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
+        fn read_with(&self, sessions: &mut Sessions, table: &LineTable, measures: &Measures, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
             let n = views.len();
             let (d, m) = (self.meta.d, &self.meta);
             if n == 0 { return Ok(Vec::new()); }
-            let features: Vec<f32> = table.features.iter().enumerate().map(|(at, &v)| ((v - m.mean[at % ALL]) / m.std[at % ALL]).clamp(-8.0, 8.0)).collect();
+            let features: Vec<f32> = measures.features.iter().enumerate().map(|(at, &v)| ((v - m.mean[at % ALL]) / m.std[at % ALL]).clamp(-8.0, 8.0)).collect();
             let corners = [feature("x0"), feature("y0"), feature("x1"), feature("y1")];
-            let boxes: Vec<f32> = (0..n).flat_map(|k| corners.map(|c| table.features[k * ALL + c])).collect();
+            let boxes: Vec<f32> = (0..n).flat_map(|k| corners.map(|c| measures.features[k * ALL + c])).collect();
             let mut stages = [0f64; 5];
             let mut lap = |stage: usize, since: &mut std::time::Instant| { stages[stage] += since.elapsed().as_secs_f64(); *since = std::time::Instant::now(); };
             let mut since = std::time::Instant::now();
@@ -537,7 +537,7 @@ mod model {
             // Detect's encoder, a page at a time; the stylesheet over the document; Detect's heads, a page at a time.
             let anchors: Vec<i64> = style.anchors.iter().map(|&a| i64::from(a.min(9))).collect();
             let templates: Vec<i64> = style.templates.iter().map(|&t| i64::from(t)).collect();
-            let t0: Vec<f32> = table.t0.iter().map(|&v| f32::from(v)).collect();
+            let t0: Vec<f32> = measures.t0.iter().map(|&v| f32::from(v)).collect();
             let runs: Vec<(usize, usize)> = pages[..n].chunk_by(|a, b| a == b).scan(0, |end, run| { *end += run.len(); Some((*end - run.len(), *end)) }).collect();
             let mut states = vec![0f32; n * d];
             for &(start, end) in &runs {
@@ -704,7 +704,7 @@ mod model {
                 (feature("marker"), feature("marker_value"), feature("marker_prefix"), feature("count_1"), feature("wrap_()"), feature("x0"), feature("size"));
             // A line's marker: its numbering's family (its count and wrap), value and prefix.
             let line_family = |k: usize| -> (i64, i64, i64) {
-                let row = &table.features[k * ALL..(k + 1) * ALL];
+                let row = measures.row(k);
                 if row[idx_marker] <= 0.5 { return (0, -1, 0); }
                 let (count_idx, wrap_idx) = (argmax(&row[idx_c0..idx_c0 + 9]) as i64, argmax(&row[idx_w0..idx_w0 + 5]) as i64);
                 (count_idx * 5 + wrap_idx + 1, (row[idx_val].max(0.0).exp_m1()).round() as i64, row[idx_pref].max(0.0).round() as i64)
@@ -714,7 +714,7 @@ mod model {
                 if h == 0 { return Ok(Vec::new()); }
                 // Each node's measure: of its region (`i`) and its first line (`k`).
                 let node = |value: &dyn Fn(usize, usize) -> i64| -> Vec<i64> { nodes.iter().map(|&i| value(i, firsts[i])).collect() };
-                let node_f32 = |at: usize| -> Vec<f32> { nodes.iter().map(|&i| table.features[firsts[i] * ALL + at]).collect() };
+                let node_f32 = |at: usize| -> Vec<f32> { nodes.iter().map(|&i| measures.features[firsts[i] * ALL + at]).collect() };
                 let x: Vec<f32> = nodes.iter().flat_map(|&i| region_states[i * d..(i + 1) * d].iter().copied()).collect();
                 let mut h_states = vec![0f32; h * d];
                 nodes.iter().enumerate().filter_map(|(at, &i)| Some((at, enclosing_heading[i]?)))

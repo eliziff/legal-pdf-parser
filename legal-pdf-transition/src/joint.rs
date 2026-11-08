@@ -16,14 +16,14 @@ pub const PRIOR: usize = 20;
 const HELD: usize = 16;
 /// Each template's measures as the prior reads them: its stylesheet view, the mean of its lines' look and
 /// place, the share of them opening on a marker, and where in the document it first stands.
-pub fn template_rows(sheet: &Stylesheet, table: &LineTable) -> Vec<[f32; PRIOR]> {
+pub fn template_rows(sheet: &Stylesheet, table: &LineTable, measures: &Measures) -> Vec<[f32; PRIOR]> {
     let count = sheet.templates.len();
     let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
     let n = table.readings.len();
     let (mut sums, mut lines, mut first) = (vec![[0f32; 8]; count], vec![0f32; count], vec![None; count]);
     for k in 0..n {
         let t = sheet.template[k] as usize;
-        let row = table.row(k);
+        let row = measures.row(k);
         sums[t].iter_mut().zip(&at).for_each(|(sum, &f)| *sum += row[f]);
         sums[t][7] += f32::from(u8::from(!table.readings[k].is_empty()));
         lines[t] += 1.0;

@@ -10,7 +10,7 @@
 //! depth step.
 
 use super::*;
-use crate::lines::LineTable;
+use crate::lines::{LineTable, Measures};
 
 pub use legal_pdf_structure_model::regions::*;
 /// Regions whose units count on a marker.
@@ -179,6 +179,7 @@ impl Default for State {
 /// likelier a heading's opening than not, log); and each line's text normalized as a title is matched
 /// (`bookmarks::normalize_title`, empty for a long line).
 pub struct Walked<'a> {
+    pub measures: &'a Measures,
     pub grammar: Option<&'a Grammar>,
     pub template: &'a [u32],
     pub templates: &'a [TemplateView],
@@ -388,9 +389,9 @@ impl<'a> LineView<'a> {
         self.walked.and_then(|walked| walked.contents_titles[self.k()].as_deref())
     }
 
-    /// Where the line starts on its page, a share of the page's width (`LineTable::row`'s x0), where the walk reads it.
+    /// Where the line starts on its page, a share of the page's width (`Measures::row`'s x0), where the walk reads it.
     pub fn left(&self) -> f32 {
-        self.walked.map_or(0.0, |_| self.table.row(self.k())[0])
+        self.walked.map_or(0.0, |walked| walked.measures.row(self.k())[0])
     }
 
     /// The reading a move's `reading` names: one of the line's own, the margin's number (`MARGIN`), or none (`OPENING`).

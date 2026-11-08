@@ -294,7 +294,7 @@ fn classes_of(state: &State, line: &LineView, local: &Local, gold: Option<&[i64;
 /// What the walk reads of the document's lines beyond tier 0's records (`Walked`): the grammar tables, the stylesheet's
 /// reading of each line, how far its first word is a heading's by each table, each look's view as the local scores read
 /// its lines before any move, and each line's title key.
-fn walked<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, fences: &Fences, table: &LineTable, locals: &[Local], sheet: &'a Stylesheet) -> Walked<'a> {
+fn walked<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, fences: &Fences, table: &LineTable, measures: &'a Measures, locals: &[Local], sheet: &'a Stylesheet) -> Walked<'a> {
     let grammar = s.grammar.as_ref();
     let heading = usize::from(HEADING) * 2 + 1;
     let mut looks: HashMap<u32, (f64, usize, usize)> = HashMap::new();
@@ -310,6 +310,7 @@ fn walked<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, fences: &Fences, t
         (words, key)
     }).unzip();
     Walked {
+        measures,
         grammar,
         template: &sheet.template,
         templates: &sheet.templates,
@@ -341,19 +342,18 @@ pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
     #[cfg(not(feature = "encoder"))]
     let doc = false;
     if !doc && !enabled() { return None; }
-    let mut table = table.clone();
-    table.measure(pages, slots, evidence, fences, geometry, notes, decision);
+    let measures = table.measure(pages, slots, evidence, fences, geometry, notes, decision);
     // Each line's template, which the local scores and the stylesheet both read.
-    let template = template_ids(&table);
-    let locals = locals_of(s, pages, slots, fences, &table, &template, sha256);
-    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, &table, template, &locals);
-    let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
+    let template = template_ids(table, &measures);
+    let locals = locals_of(s, pages, slots, fences, table, &measures, &template, sha256);
+    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, table, &measures, template, &locals);
+    let moves = parse(s, pages, slots, evidence, fences, sha256, table, &measures, &locals, &mut sheet);
     doc.then_some(moves)
 }
 
 /// Each line's local scores, read once.
 #[cfg_attr(not(feature = "encoder"), allow(unused_variables))]
-fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, fences: &Fences, table: &LineTable, template: &[u32], sha256: &str) -> Vec<Local> {
+fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, fences: &Fences, table: &LineTable, measures: &Measures, template: &[u32], sha256: &str) -> Vec<Local> {
     let n = table.readings.len();
     // Another tier's probabilities, where they cover the document's lines.
     let read = |path: PathBuf, width: usize| -> Option<Vec<f32>> {
@@ -365,7 +365,7 @@ fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, fences: &Fences, table
         #[cfg(feature = "encoder")]
         Some(LocalScores::Encoder(model)) => {
             let texts: Vec<&str> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
-            model.probabilities(table, &texts, template).map_or_else(|e| {
+            model.probabilities(table, measures, &texts, template).map_or_else(|e| {
                 eprintln!("transition parser {sha256}: {e}");
                 (None, None)
             }, |(classes, levels)| (Some(classes), Some(levels)))
@@ -375,8 +375,8 @@ fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, fences: &Fences, table
     };
     (0..n).map(|k| {
         let probabilities = match (&s.local, &precomputed) {
-            (Some(LocalScores::One(forest)), _) => forest.probabilities(table.row(k)),
-            (Some(LocalScores::Folds(folds)), _) => folds[fold_of(sha256, folds.len())].probabilities(table.row(k)),
+            (Some(LocalScores::One(forest)), _) => forest.probabilities(measures.row(k)),
+            (Some(LocalScores::Folds(folds)), _) => folds[fold_of(sha256, folds.len())].probabilities(measures.row(k)),
             (_, Some(precomputed)) => precomputed[k * CLASSES..(k + 1) * CLASSES].iter().map(|&p| f64::from(p)).collect(),
             _ => vec![1.0 / CLASSES as f64; CLASSES],
         };
@@ -407,14 +407,14 @@ fn drawn(sha256: &str, k: usize, share: f64) -> bool {
 /// where `gold` is given and reachable (the first round's rollout), else the local scores' best class,
 /// counting on nothing. With `record` (the document's sha256 and the share of its lines
 /// drawn), each drawn line's candidates as the scorer is fitted on them.
-fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded, Reading) {
+fn walk(measures: &Measures, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded, Reading) {
     let mut reading = Reading::default();
     let mut moves = Vec::with_capacity(views.len());
     let mut recorded = Recorded::default();
     for k in 0..views.len() {
         let (line, local, state) = (&views[k], &locals[k], &reading.state);
         let candidates = state.candidates(line, &classes_of(&state, line, local, gold.map(|g| &g[k])));
-        let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
+        let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, measures.row(k), local, m)).collect();
         let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
         let choice = best_oracle.unwrap_or_else(|| candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1
             && !m.resume && !m.starts && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0));
@@ -479,7 +479,7 @@ impl Reading {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
+fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, measures: &Measures, locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
     let n = table.readings.len();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));
     // Each line's reading rank in the gold, -1 for none.
@@ -501,14 +501,14 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
     let texts: Vec<&str> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
     let line_pages: Vec<usize> = fences.order.iter().map(|&slot| slots.page(slot)).collect();
     let first = {
-        let walked = walked(s, pages, slots, fences, table, locals, sheet);
+        let walked = walked(s, pages, slots, fences, table, measures, locals, sheet);
         let views = LineView::all(pages, slots, evidence, fences, table, Some(&walked));
         // Detect-Order-Construct's decoding from the gold's answers: what it can hold.
         let read = (s.doc_oracle && gold.is_some()).then(|| doc::oracle(&gold_rows, &ranks_of(), &views, &texts, &line_pages));
         // Detect-Order-Construct's reading, where its stages are given.
         #[cfg(feature = "encoder")]
         let read = read.or_else(|| s.doc.as_ref().and_then(|reader| {
-            reader.read(table, &views, &texts, &line_pages, &doc::Style::of(sheet, table)).map_err(|error| eprintln!("transition parser DOC {sha256}: {error}")).ok()
+            reader.read(table, measures, &views, &texts, &line_pages, &doc::Style::of(sheet, table, measures)).map_err(|error| eprintln!("transition parser DOC {sha256}: {error}")).ok()
         }));
         if let Some(moves) = read {
             if s.labels.is_some() {
@@ -518,23 +518,23 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
         }
         // The first reading, never the oracle's (the gold would read into the second's view of the
         // templates); each template then carries how it read.
-        walk(table, &views, locals, None, None).0
+        walk(measures, &views, locals, None, None).0
     };
     sheet.read_back(&first);
-    let walked = walked(s, pages, slots, fences, table, locals, sheet);
+    let walked = walked(s, pages, slots, fences, table, measures, locals, sheet);
     let views = LineView::all(pages, slots, evidence, fences, table, Some(&walked));
-    let (moves, recorded, reading) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
+    let (moves, recorded, reading) = walk(measures, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
     if let Some(folder) = &s.dump {
         let write = || -> std::io::Result<()> {
             std::fs::create_dir_all(folder)?;
             let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
-            std::fs::write(folder.join(format!("{sha256}.lines.f32")), bytes(&table.features))?;
+            std::fs::write(folder.join(format!("{sha256}.lines.f32")), bytes(&measures.features))?;
             std::fs::write(folder.join(format!("{sha256}.moves.f32")), bytes(&recorded.rows))?;
             let meta = serde_json::json!({
                 "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
                 "texts": texts, "looks": &table.looks, "pages": line_pages, "references": &table.references, "ranks": ranks_of(), "templates": &sheet.template,
-                "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
-                "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(), "anchors": &sheet.anchor, "t0": &table.t0,
+                "template_rows": joint::template_rows(sheet, table, measures), "held": joint::held_templates(sheet),
+                "openers": (0..n).map(|k| opener(table, measures, k)).collect::<Vec<_>>(), "anchors": &sheet.anchor, "t0": &measures.t0,
                 "note_numbers": (0..n).map(|k| doc::note_number(&views[k], texts[k]).map_or(-1, i64::from)).collect::<Vec<_>>(),
                 "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
                 "gold": gold_rows, "move_lines": recorded.lines, "move_classes": recorded.classes, "move_oracle": recorded.oracle,

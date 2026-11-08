@@ -198,31 +198,37 @@ fn marker_variants(text: &str) -> Vec<String> {
 
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
-#[derive(Clone)]
 pub struct LineTable {
     pub readings: Vec<Vec<MarkerReading>>,
     /// Each line's reference marks: value, first and past-last character (`reference_spans`).
     pub references: Vec<Vec<(u32, u32, u32)>>,
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
     pub looks: Vec<u32>,
-    pub features: Vec<f32>,
     /// Each paragraph number the margin prints (`Fences::read_margin_numbers`), by its line's place: the place of
     /// the row's line it numbers, and of its twin's in the other language's column, where it has one.
     pub margin_rows: HashMap<usize, (usize, Option<usize>)>,
     /// Each line a margin number numbers (a row's or a twin's), and each margin number's own line, by its place: the
     /// margin line's place.
     pub margins: HashMap<usize, usize>,
-    /// What t0 decided of each line (`T0` a line), the DOC reader's input.
+}
+
+/// What the walk measures over the line table, in reading order: each line's features (`ALL` a line) and what t0
+/// decided of it (`T0` a line), the DOC reader's input.
+pub struct Measures {
+    pub features: Vec<f32>,
     pub t0: Vec<u8>,
 }
 
-impl LineTable {
+impl Measures {
+    /// The line's features.
     pub fn row(&self, k: usize) -> &[f32] {
         &self.features[k * ALL..(k + 1) * ALL]
     }
+}
 
+impl LineTable {
     /// Each line's features and t0 row, measured over the table both tiers read (`plain`), for the DOC reader.
-    pub fn measure(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) {
+    pub fn measure(&self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) -> Measures {
         let (order, readings, margin_rows, margins) = (&fences.order, &self.readings, &self.margin_rows, &self.margins);
         let n = order.len();
         let measures: Vec<(&legal_pdf_core::PageMeasure, &legal_pdf_core::Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().enumerate().map(|(p, page)| {
@@ -387,7 +393,7 @@ impl LineTable {
                 last_held[usize::from(mine.translation)] = held;
             }
         }
-        (self.features, self.t0) = (features, t0);
+        Measures { features, t0 }
     }
 
     /// The table both tiers read, nothing measured: each line's readings (with the recognizer's likely misreadings,
@@ -405,7 +411,7 @@ impl LineTable {
         unmarked_notes(order, slots, pages, evidence, &mut references);
         let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
         let (margin_rows, margins) = margin_lines(order, &readings, fences);
-        Self { readings, references, looks, features: Vec::new(), margin_rows, margins, t0: Vec::new() }
+        Self { readings, references, looks, margin_rows, margins }
     }
 }
 
