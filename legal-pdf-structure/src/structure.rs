@@ -125,10 +125,10 @@ pub fn derive_cached(pages: &mut [Page],
         }
         None => {
             let mut evidence = measure("derive.measure", || {
-                Evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
+                legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
             });
             let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline));
-            let runs = measure("derive.runs", || Runs::read(pages, &slots, &mut evidence, &mut fences))?;
+            let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences))?;
             let measured = Measured { evidence, fences, runs };
             if let Some(path) = cache {
                 let _ = legal_pdf_core::write_gzip_json(path, &measured);

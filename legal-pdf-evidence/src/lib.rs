@@ -411,268 +411,259 @@ fn operative_words(text: &str) -> (usize, usize) {
 /// The evidence read off the pages: every page, line and the document measured once (`measure`), the citations on the
 /// lines worth reading for them (`read_citations`), and what a line's text says read again where the runs' repair
 /// rewrote its marker (`reread`).
-pub trait Measure {
-    #[allow(clippy::too_many_arguments)]
-    fn measure(pages: &[Page], slots: &Slots, normalized: Normalized, separators: &[Option<f64>],
-        outline: &[PdfOutlineEntry], page_labels: &[Option<String>], instrument: bool) -> Self;
-    fn read_citations(&mut self, pages: &[Page], slots: &Slots, line_numbers: &[bool]);
-    fn reread(&mut self, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]);
+/// Every page, line and the document measured once: `separators` holds each page's note
+/// separator as the extraction found it, `outline` the document's bookmarks, `page_labels` the
+/// page labels it declares (by page index), and `instrument` whether its caller knows it for an
+/// instrument.
+pub fn measure(pages: &[Page],
+    slots: &Slots,
+    normalized: Normalized,
+    separators: &[Option<f64>],
+    outline: &[PdfOutlineEntry],
+    page_labels: &[Option<String>],
+    instrument: bool,
+) -> Evidence {
+    let count = slots.len();
+    let Normalized { line_numbers, items } = normalized;
+    let mut evidence = Evidence { beside: vec![None; count], page_labels: page_labels.to_vec(), ..Evidence::default() };
+    let (mut faces, mut families) = (Names::default(), Names::default());
+    let (mut words, mut operative) = (0, 0);
+    for (page_slot, page) in pages.iter().enumerate() {
+        let first = slots.on(page_slot).start as usize;
+        let rows = page_rows(page);
+        let sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
+        for (at, line) in page.lines.iter().enumerate() {
+            let text = line.text.trim();
+            let face = dominant_face(line);
+            evidence.size.push(sizes[at]);
+            evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
+            evidence.half_points.push(face.map_or(0, |(_, size)| (size * 2.0).round().clamp(0.0, f64::from(u16::MAX)) as u16));
+            let underlined = !line.words.is_empty() && line.words.iter().filter(|word| word.underlined).count() * 2 > line.words.len();
+            evidence.look.push(bits([
+                (LOOK_BOLD, bold_char_share(line) >= 0.5),
+                (LOOK_ITALIC, flag_share(line, ITALIC).unwrap_or(0.0) > 0.5),
+                (LOOK_CAPS, all_caps(text)),
+                (LOOK_UNDERLINED, underlined),
+            ]));
+            evidence.weight.push(line.weight as f32);
+            evidence.tag.push(SourceTag::of(line));
+            evidence.marker.push(opening_marker(line, &mut families));
+            evidence.label.push(note_label(page, &sizes, at));
+            evidence.references.push(reference_tokens(line, sizes[at]));
+            evidence.title_shaped.push(title_shaped(text));
+            evidence.words.push(lexicon(line));
+            if !line_numbers[first + at] {
+                let (read, found) = operative_words(&line.text);
+                words += read;
+                operative += found;
+            }
+        }
+        // A marker alone on its line, its text on the line beside it on its row.
+        let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); rows.count as usize];
+        for (at, &row) in rows.of.iter().enumerate() {
+            if row != u32::MAX {
+                by_row[row as usize].push(at);
+            }
+        }
+        for (at, marker) in page.lines.iter().enumerate() {
+            let only = evidence.marker[first + at].is_some_and(|reading| reading.only);
+            if !only || line_numbers[first + at] || rows.of[at] == u32::MAX {
+                continue;
+            }
+            evidence.beside[first + at] = by_row[rows.of[at] as usize]
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    let line = &page.lines[other];
+                    other != at
+                        && !line_numbers[first + other]
+                        && !line.text.trim().is_empty()
+                        && legal_pdf_text::paragraphs::same_row(marker, line)
+                        && line.bbox[0] >= marker.bbox[2] - if line.recognized() { line.bbox[3] - line.bbox[1] } else { 1.0 }
+                })
+                .min_by(|&a, &b| page.lines[a].bbox[0].total_cmp(&page.lines[b].bbox[0]))
+                .map(|other| slots.at(page_slot, other));
+        }
+        evidence.pages.push(PageEvidence { rows, separator: separators.get(page_slot).copied().flatten() });
+    }
+    // A heading tag on so many of the tagged lines that it marks the body is no heading's.
+    let overused = headings::overused_tags(pages, &items, |page, line| {
+        let slot = slots.at(page, line).index();
+        (!line_numbers[slot] && evidence.tag[slot] != SourceTag::None).then(|| evidence.tag[slot].name())
+    });
+    if !overused.is_empty() {
+        for tag in &mut evidence.tag {
+            if matches!(tag, SourceTag::Heading(_)) && overused.contains(tag.name()) {
+                *tag = SourceTag::None;
+            }
+        }
+    }
+    read_citations(&mut evidence, pages, slots, &line_numbers);
+    evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
+    evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
+    evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
+    evidence.operative = if instrument { 1000.0 } else if words >= 200 { (operative * 1000) as f32 / words as f32 } else { 0.0 };
+    evidence.faces = faces.names;
+    evidence.families = families.names;
+    evidence.line_number = line_numbers;
+    evidence.items = items;
+    evidence
 }
 
-impl Measure for Evidence {
-    /// Every page, line and the document measured once: `separators` holds each page's note
-    /// separator as the extraction found it, `outline` the document's bookmarks, `page_labels` the
-    /// page labels it declares (by page index), and `instrument` whether its caller knows it for an
-    /// instrument.
-    fn measure(pages: &[Page],
-        slots: &Slots,
-        normalized: Normalized,
-        separators: &[Option<f64>],
-        outline: &[PdfOutlineEntry],
-        page_labels: &[Option<String>],
-        instrument: bool,
-    ) -> Self {
-        let count = slots.len();
-        let Normalized { line_numbers, items } = normalized;
-        let mut evidence = Self { beside: vec![None; count], page_labels: page_labels.to_vec(), ..Self::default() };
-        let (mut faces, mut families) = (Names::default(), Names::default());
-        let (mut words, mut operative) = (0, 0);
-        for (page_slot, page) in pages.iter().enumerate() {
-            let first = slots.on(page_slot).start as usize;
-            let rows = page_rows(page);
-            let sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
-            for (at, line) in page.lines.iter().enumerate() {
-                let text = line.text.trim();
-                let face = dominant_face(line);
-                evidence.size.push(sizes[at]);
-                evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
-                evidence.half_points.push(face.map_or(0, |(_, size)| (size * 2.0).round().clamp(0.0, f64::from(u16::MAX)) as u16));
-                let underlined = !line.words.is_empty() && line.words.iter().filter(|word| word.underlined).count() * 2 > line.words.len();
-                evidence.look.push(bits([
-                    (LOOK_BOLD, bold_char_share(line) >= 0.5),
-                    (LOOK_ITALIC, flag_share(line, ITALIC).unwrap_or(0.0) > 0.5),
-                    (LOOK_CAPS, all_caps(text)),
-                    (LOOK_UNDERLINED, underlined),
-                ]));
-                evidence.weight.push(line.weight as f32);
-                evidence.tag.push(SourceTag::of(line));
-                evidence.marker.push(opening_marker(line, &mut families));
-                evidence.label.push(note_label(page, &sizes, at));
-                evidence.references.push(reference_tokens(line, sizes[at]));
-                evidence.title_shaped.push(title_shaped(text));
-                evidence.words.push(lexicon(line));
-                if !line_numbers[first + at] {
-                    let (read, found) = operative_words(&line.text);
-                    words += read;
-                    operative += found;
-                }
+/// The citations on the lines worth reading for them, read in one window: each line carrying a
+/// marker, a note label, a reference token or a figure (a number the note pairer could read as a
+/// reference, which a citation holding it protects), or shaped as a title, and every line of the
+/// first two pages, each with the line either side of it; then which of the first two pages'
+/// lines name the case by its citation.
+pub fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
+    let count = slots.len();
+    let mut wanted: Vec<bool> = (0..count)
+        .map(|slot| {
+            !line_numbers[slot]
+                && (evidence.marker[slot].is_some()
+                    || evidence.label[slot].is_some()
+                    || evidence.references[slot] != 0
+                    || evidence.title_shaped[slot]
+                    || slots.page(Slot(slot as u32)) < 2
+                    || slots.line(pages, Slot(slot as u32)).text.chars().any(char::is_numeric))
+        })
+        .collect();
+    let seeds = wanted.clone();
+    for slot in (0..count).filter(|&slot| seeds[slot]) {
+        wanted[slot.saturating_sub(1)] = true;
+        wanted[(slot + 1).min(count - 1)] = true;
+    }
+    // The window: each run of wanted lines a paragraph of its own, line under line.
+    let mut window = String::new();
+    // Each windowed line's slot, and where it starts in the window, in bytes and in scalars.
+    let mut placed: Vec<(Slot, usize, usize)> = Vec::new();
+    let mut scalars = 0;
+    let mut previous = None;
+    for slot in (0..count).filter(|&slot| wanted[slot]) {
+        if let Some(prior) = previous {
+            let separator = if prior + 1 == slot { "\n" } else { "\n\n" };
+            window.push_str(separator);
+            scalars += separator.len();
+        }
+        let text = &slots.line(pages, Slot(slot as u32)).text;
+        placed.push((Slot(slot as u32), window.len(), scalars));
+        window.push_str(text);
+        scalars += text.chars().count();
+        previous = Some(slot);
+    }
+    let mut found: Vec<Cited> = Vec::new();
+    if !window.is_empty() {
+        let placed = &placed;
+        let line_text = |at: usize| &slots.line(pages, placed[at].0).text;
+        // Each windowed line a byte range overlaps, where the line starts in the window, and the
+        // range's part on it.
+        let on_lines = |start: usize, end: usize| {
+            let first = placed.partition_point(|&(_, byte, _)| byte <= start).saturating_sub(1);
+            (first..placed.len())
+                .take_while(move |&at| placed[at].1 < end)
+                .filter_map(move |at| {
+                    let (slot, byte, _) = placed[at];
+                    let length = line_text(at).len();
+                    let (from, to) = (start.max(byte), end.min(byte + length));
+                    (from < to).then(|| (slot, byte as u32, (from - byte) as u32, (to - byte) as u32))
+                })
+        };
+        for citation in legal_structure_model::structure_analysis().citations(&window) {
+            for (slot, byte, from, to) in on_lines(citation.range.start, citation.range.end) {
+                let core_from = (citation.core_range.start as u32).saturating_sub(byte).clamp(from, to);
+                let core_to = (citation.core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
+                found.push(Cited { slot, range: (from, to), core: (core_from, core_to), protected: false });
             }
-            // A marker alone on its line, its text on the line beside it on its row.
-            let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); rows.count as usize];
-            for (at, &row) in rows.of.iter().enumerate() {
-                if row != u32::MAX {
-                    by_row[row as usize].push(at);
-                }
-            }
-            for (at, marker) in page.lines.iter().enumerate() {
-                let only = evidence.marker[first + at].is_some_and(|reading| reading.only);
-                if !only || line_numbers[first + at] || rows.of[at] == u32::MAX {
+        }
+        // The protected spans, in scalars: each read back to bytes on its lines.
+        for (start, end) in legal_structure_model::structure_analysis().protected_citation_spans(&window) {
+            let first = placed.partition_point(|&(_, _, scalar)| scalar <= start).saturating_sub(1);
+            for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
+                let (slot, _, scalar) = placed[at];
+                let text = line_text(at);
+                let length = text.chars().count();
+                let (from, to) = (start.max(scalar) - scalar, end.min(scalar + length).saturating_sub(scalar));
+                if from >= to {
                     continue;
                 }
-                evidence.beside[first + at] = by_row[rows.of[at] as usize]
-                    .iter()
-                    .copied()
-                    .filter(|&other| {
-                        let line = &page.lines[other];
-                        other != at
-                            && !line_numbers[first + other]
-                            && !line.text.trim().is_empty()
-                            && legal_pdf_text::paragraphs::same_row(marker, line)
-                            && line.bbox[0] >= marker.bbox[2] - if line.recognized() { line.bbox[3] - line.bbox[1] } else { 1.0 }
-                    })
-                    .min_by(|&a, &b| page.lines[a].bbox[0].total_cmp(&page.lines[b].bbox[0]))
-                    .map(|other| slots.at(page_slot, other));
+                let byte = |offset: usize| text.char_indices().nth(offset).map_or(text.len(), |(byte, _)| byte) as u32;
+                let range = (byte(from), byte(to));
+                found.push(Cited { slot, range, core: range, protected: true });
             }
-            evidence.pages.push(PageEvidence { rows, separator: separators.get(page_slot).copied().flatten() });
         }
-        // A heading tag on so many of the tagged lines that it marks the body is no heading's.
-        let overused = headings::overused_tags(pages, &items, |page, line| {
-            let slot = slots.at(page, line).index();
-            (!line_numbers[slot] && evidence.tag[slot] != SourceTag::None).then(|| evidence.tag[slot].name())
+    }
+    found.sort_by_key(|cited| (cited.slot, cited.range.0, cited.range.1));
+    let mut cited = Vec::with_capacity(count + 1);
+    let mut at = 0;
+    for slot in 0..count {
+        cited.push(at as u32);
+        while at < found.len() && found[at].slot.index() == slot {
+            at += 1;
+        }
+    }
+    cited.push(found.len() as u32);
+    evidence.citations = found;
+    evidence.cited = cited;
+    // A citation naming the case on the first two pages.
+    let opening = if pages.is_empty() { 0 } else { slots.on(pages.len().min(2) - 1).end as usize };
+    for slot in (0..opening).filter(|&slot| !line_numbers[slot]) {
+        let line = slots.line(pages, Slot(slot as u32));
+        let cites = evidence.citations_of(Slot(slot as u32));
+        let titled = captions::citation_title(line, |text, offset| {
+            let (start, end) = (offset as u32, (offset + text.len()) as u32);
+            cites
+                .iter()
+                .filter(|cited| !cited.protected && cited.range.0 >= start && cited.range.1 <= end)
+                .map(|cited| CitationSpan {
+                    range: (cited.range.0 - start) as usize..(cited.range.1 - start) as usize,
+                    core_range: (cited.core.0.max(start) - start) as usize..(cited.core.1.max(start) - start) as usize,
+                    text: String::new(),
+                })
+                .collect()
         });
-        if !overused.is_empty() {
-            for tag in &mut evidence.tag {
-                if matches!(tag, SourceTag::Heading(_)) && overused.contains(tag.name()) {
-                    *tag = SourceTag::None;
-                }
-            }
+        if titled.is_some() {
+            evidence.words[slot] |= WORD_CITATION_TITLE;
         }
-        evidence.read_citations(pages, slots, &line_numbers);
-        evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
-        evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
-        evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
-        evidence.operative = if instrument { 1000.0 } else if words >= 200 { (operative * 1000) as f32 / words as f32 } else { 0.0 };
-        evidence.faces = faces.names;
-        evidence.families = families.names;
-        evidence.line_number = line_numbers;
-        evidence.items = items;
-        evidence
-    }
-
-    /// The citations on the lines worth reading for them, read in one window: each line carrying a
-    /// marker, a note label, a reference token or a figure (a number the note pairer could read as a
-    /// reference, which a citation holding it protects), or shaped as a title, and every line of the
-    /// first two pages, each with the line either side of it; then which of the first two pages'
-    /// lines name the case by its citation.
-    fn read_citations(&mut self, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
-        let count = slots.len();
-        let mut wanted: Vec<bool> = (0..count)
-            .map(|slot| {
-                !line_numbers[slot]
-                    && (self.marker[slot].is_some()
-                        || self.label[slot].is_some()
-                        || self.references[slot] != 0
-                        || self.title_shaped[slot]
-                        || slots.page(Slot(slot as u32)) < 2
-                        || slots.line(pages, Slot(slot as u32)).text.chars().any(char::is_numeric))
-            })
-            .collect();
-        let seeds = wanted.clone();
-        for slot in (0..count).filter(|&slot| seeds[slot]) {
-            wanted[slot.saturating_sub(1)] = true;
-            wanted[(slot + 1).min(count - 1)] = true;
-        }
-        // The window: each run of wanted lines a paragraph of its own, line under line.
-        let mut window = String::new();
-        // Each windowed line's slot, and where it starts in the window, in bytes and in scalars.
-        let mut placed: Vec<(Slot, usize, usize)> = Vec::new();
-        let mut scalars = 0;
-        let mut previous = None;
-        for slot in (0..count).filter(|&slot| wanted[slot]) {
-            if let Some(prior) = previous {
-                let separator = if prior + 1 == slot { "\n" } else { "\n\n" };
-                window.push_str(separator);
-                scalars += separator.len();
-            }
-            let text = &slots.line(pages, Slot(slot as u32)).text;
-            placed.push((Slot(slot as u32), window.len(), scalars));
-            window.push_str(text);
-            scalars += text.chars().count();
-            previous = Some(slot);
-        }
-        let mut found: Vec<Cited> = Vec::new();
-        if !window.is_empty() {
-            let placed = &placed;
-            let line_text = |at: usize| &slots.line(pages, placed[at].0).text;
-            // Each windowed line a byte range overlaps, where the line starts in the window, and the
-            // range's part on it.
-            let on_lines = |start: usize, end: usize| {
-                let first = placed.partition_point(|&(_, byte, _)| byte <= start).saturating_sub(1);
-                (first..placed.len())
-                    .take_while(move |&at| placed[at].1 < end)
-                    .filter_map(move |at| {
-                        let (slot, byte, _) = placed[at];
-                        let length = line_text(at).len();
-                        let (from, to) = (start.max(byte), end.min(byte + length));
-                        (from < to).then(|| (slot, byte as u32, (from - byte) as u32, (to - byte) as u32))
-                    })
-            };
-            for citation in legal_structure_model::structure_analysis().citations(&window) {
-                for (slot, byte, from, to) in on_lines(citation.range.start, citation.range.end) {
-                    let core_from = (citation.core_range.start as u32).saturating_sub(byte).clamp(from, to);
-                    let core_to = (citation.core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
-                    found.push(Cited { slot, range: (from, to), core: (core_from, core_to), protected: false });
-                }
-            }
-            // The protected spans, in scalars: each read back to bytes on its lines.
-            for (start, end) in legal_structure_model::structure_analysis().protected_citation_spans(&window) {
-                let first = placed.partition_point(|&(_, _, scalar)| scalar <= start).saturating_sub(1);
-                for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
-                    let (slot, _, scalar) = placed[at];
-                    let text = line_text(at);
-                    let length = text.chars().count();
-                    let (from, to) = (start.max(scalar) - scalar, end.min(scalar + length).saturating_sub(scalar));
-                    if from >= to {
-                        continue;
-                    }
-                    let byte = |offset: usize| text.char_indices().nth(offset).map_or(text.len(), |(byte, _)| byte) as u32;
-                    let range = (byte(from), byte(to));
-                    found.push(Cited { slot, range, core: range, protected: true });
-                }
-            }
-        }
-        found.sort_by_key(|cited| (cited.slot, cited.range.0, cited.range.1));
-        let mut cited = Vec::with_capacity(count + 1);
-        let mut at = 0;
-        for slot in 0..count {
-            cited.push(at as u32);
-            while at < found.len() && found[at].slot.index() == slot {
-                at += 1;
-            }
-        }
-        cited.push(found.len() as u32);
-        self.citations = found;
-        self.cited = cited;
-        // A citation naming the case on the first two pages.
-        let opening = if pages.is_empty() { 0 } else { slots.on(pages.len().min(2) - 1).end as usize };
-        for slot in (0..opening).filter(|&slot| !line_numbers[slot]) {
-            let line = slots.line(pages, Slot(slot as u32));
-            let cites = self.citations_of(Slot(slot as u32));
-            let titled = captions::citation_title(line, |text, offset| {
-                let (start, end) = (offset as u32, (offset + text.len()) as u32);
-                cites
-                    .iter()
-                    .filter(|cited| !cited.protected && cited.range.0 >= start && cited.range.1 <= end)
-                    .map(|cited| CitationSpan {
-                        range: (cited.range.0 - start) as usize..(cited.range.1 - start) as usize,
-                        core_range: (cited.core.0.max(start) - start) as usize..(cited.core.1.max(start) - start) as usize,
-                        text: String::new(),
-                    })
-                    .collect()
-            });
-            if titled.is_some() {
-                self.words[slot] |= WORD_CITATION_TITLE;
-            }
-        }
-    }
-
-    /// Reads again what a line's text says of it, for the lines whose opening marker the runs'
-    /// repair rewrote (`repaired`: each slot with its text before): its marker, note label, shape and
-    /// lexicon, and its citations moved with the words after the marker.
-    fn reread(&mut self, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
-        if repaired.is_empty() {
-            return;
-        }
-        let mut families = Names {
-            ids: self.families.iter().enumerate().map(|(id, name)| (name.clone(), id as u16)).collect(),
-            names: std::mem::take(&mut self.families),
-        };
-        for (slot, before) in repaired {
-            let at = slot.index();
-            let page_slot = slots.page(*slot);
-            let range = slots.on(page_slot);
-            let page = &pages[page_slot];
-            let line = slots.line(pages, *slot);
-            let text = line.text.trim();
-            self.marker[at] = opening_marker(line, &mut families);
-            self.label[at] = note_label(page, &self.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
-            self.title_shaped[at] = title_shaped(text);
-            self.words[at] = lexicon(line) | self.words[at] & WORD_CITATION_TITLE;
-            // The words after the rewritten marker keep their citations, moved by what the marker
-            // gained or lost.
-            let after = before.len() - before.bytes().rev().zip(line.text.bytes().rev()).take_while(|(a, b)| a == b).count();
-            let shift = line.text.len() as i64 - before.len() as i64;
-            let length = line.text.len() as u32;
-            let moved = |offset: u32| {
-                let offset = if offset as usize >= after { (i64::from(offset) + shift).max(0) as u32 } else { offset };
-                offset.min(length)
-            };
-            let (start, end) = (self.cited[at] as usize, self.cited[at + 1] as usize);
-            for cited in &mut self.citations[start..end] {
-                cited.range = (moved(cited.range.0), moved(cited.range.1));
-                cited.core = (moved(cited.core.0), moved(cited.core.1));
-            }
-        }
-        self.families = families.names;
     }
 }
+
+/// Reads again what a line's text says of it, for the lines whose opening marker the runs'
+/// repair rewrote (`repaired`: each slot with its text before): its marker, note label, shape and
+/// lexicon, and its citations moved with the words after the marker.
+pub fn reread(evidence: &mut Evidence, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
+    if repaired.is_empty() {
+        return;
+    }
+    let mut families = Names {
+        ids: evidence.families.iter().enumerate().map(|(id, name)| (name.clone(), id as u16)).collect(),
+        names: std::mem::take(&mut evidence.families),
+    };
+    for (slot, before) in repaired {
+        let at = slot.index();
+        let page_slot = slots.page(*slot);
+        let range = slots.on(page_slot);
+        let page = &pages[page_slot];
+        let line = slots.line(pages, *slot);
+        let text = line.text.trim();
+        evidence.marker[at] = opening_marker(line, &mut families);
+        evidence.label[at] = note_label(page, &evidence.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
+        evidence.title_shaped[at] = title_shaped(text);
+        evidence.words[at] = lexicon(line) | evidence.words[at] & WORD_CITATION_TITLE;
+        // The words after the rewritten marker keep their citations, moved by what the marker
+        // gained or lost.
+        let after = before.len() - before.bytes().rev().zip(line.text.bytes().rev()).take_while(|(a, b)| a == b).count();
+        let shift = line.text.len() as i64 - before.len() as i64;
+        let length = line.text.len() as u32;
+        let moved = |offset: u32| {
+            let offset = if offset as usize >= after { (i64::from(offset) + shift).max(0) as u32 } else { offset };
+            offset.min(length)
+        };
+        let (start, end) = (evidence.cited[at] as usize, evidence.cited[at + 1] as usize);
+        for cited in &mut evidence.citations[start..end] {
+            cited.range = (moved(cited.range.0), moved(cited.range.1));
+            cited.core = (moved(cited.core.0), moved(cited.core.1));
+        }
+    }
+    evidence.families = families.names;
+}
+

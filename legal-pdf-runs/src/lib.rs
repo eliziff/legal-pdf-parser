@@ -15,7 +15,6 @@
 
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{layout_analysis, Error, Result};
-use legal_pdf_evidence::Measure;
 use legal_pdf_fences::{Continuation, Fences};
 use legal_pdf_layout::Geometry;
 use legal_pdf_structure_model::{Evidence, Role, Slot, Slots, SourceTag};
@@ -401,176 +400,170 @@ fn aligned_siblings(pages: &[Page], slots: &Slots, view: &View, run: &StructureC
         .collect()
 }
 
-/// The runs of every reading context, read once the pages are measured and fenced (`read`).
-pub trait Numbering: Sized {
-    fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Self>;
+/// The runs of every reading context of the document's pages, measured (`evidence`) and fenced
+/// and ordered (`fences`), each marker resolved to the unit it opens; and, once the statute's
+/// spine is read, its running heads naming its sections fenced (`confirm_section_heads`).
+pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Runs> {
+    let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
+    let pages: &[Page] = pages;
+    legal_pdf_evidence::reread(evidence, pages, slots, &repaired);
+    fences.read_numbers(pages, slots, evidence, !repaired.is_empty());
+    // A paragraph number in the margin stands beside the line of its row it numbers, as one printed line
+    // (`Fences::read_margin_numbers`): the numbering reads it opening that line, not ending the one before.
+    for (at, row) in fences.margin_number.iter().enumerate() {
+        if let Some(row) = row {
+            evidence.beside[at] = Some(*row);
+        }
+    }
+    let edits = repaired.iter().map(|(slot, _)| (*slot, slots.line(pages, *slot).text.clone(), slots.line(pages, *slot).words.clone())).collect();
+    let evidence: &Evidence = evidence;
+    let geometry = Geometry::of(pages);
+    // Each context's lines in reading order, its fenced lines left out.
+    let mut by_context: Vec<Vec<Slot>> = vec![Vec::new(); fences.contexts.len()];
+    for &slot in &fences.order {
+        if !matches!(fences.role[slot.index()], Role::LineLabel | Role::PageLabel | Role::Furniture | Role::Contents) {
+            by_context[usize::from(fences.ctx[slot.index()])].push(slot);
+        }
+    }
+    let mut runs = Vec::new();
+    for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
+        let view = View::of(pages, slots, evidence, lines);
+        let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true));
+        // A provision ladder under one worded top-level marker that goes on with the sentence
+        // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
+        // question numbers under it are the count's, not its subsections. A list's items go on
+        // with their sentence too ("; and" / "b."), each its own top-level marker, and stand.
+        let found: Vec<StructureCandidateRun> = found
+            .into_iter()
+            .filter(|run| {
+                let mut roots = run.markers.iter().filter(|candidate| candidate.parent_candidate_id.is_none());
+                let (Some(root), None) = (roots.next(), roots.next()) else { return true };
+                let worded = root.label.chars().take_while(char::is_ascii_alphabetic).count() >= 3;
+                run.grammar != CandidateGrammar::Hierarchy
+                    || !worded
+                    || fences.continues[view.place(root.marker_range.start).slot.index()].is_none()
+            })
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        let found = part_at_paragraphs(found, &view, evidence, fences);
+        let marked: HashSet<Slot> =
+            found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
+        let shown = Lines { pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
+        let readings: Vec<Vec<Reading>> = found
+            .iter()
+            .map(|run| {
+                let aligned = aligned_siblings(pages, slots, &view, run);
+                run.markers.iter().zip(aligned).map(|(candidate, aligned)| shown.read(run, candidate, aligned)).collect()
+            })
+            .collect();
+        let candidate_evidence: Vec<CandidateEvidenceV2> = found
+            .iter()
+            .zip(&readings)
+            .flat_map(|(run, readings)| run.markers.iter().zip(readings))
+            .map(|(candidate, reading)| {
+                let mut page_indexes: Vec<usize> = Vec::new();
+                let mut line_id = |index: usize| {
+                    let slot = view.lines[index].0;
+                    let page = pages[slots.page(slot)].index;
+                    if !page_indexes.contains(&page) {
+                        page_indexes.push(page);
+                    }
+                    slots.line(pages, slot).id.clone()
+                };
+                let line_ids = view.overlapping(candidate.range.start, candidate.range.end).map(&mut line_id).collect();
+                CandidateEvidenceV2 { candidate_id: candidate.id.clone(), page_indexes, line_ids, observations: reading.observations.clone() }
+            })
+            .collect();
+        let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure_model::structure_analysis().resolve_candidates(&found, &candidate_evidence))
+            .map_err(|error| Error::Message(error.to_string()))?;
+        let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> = roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
+        // A document read in more than one context names each context's candidates apart.
+        let prefix = if fences.contexts.len() > 1 { format!("context-{ctx:06}-") } else { String::new() };
+        for (run, readings) in found.iter().zip(readings) {
+            let members = run
+                .markers
+                .iter()
+                .zip(readings)
+                .enumerate()
+                .map(|(at, (candidate, reading))| {
+                    let role = role_of.get(candidate.id.as_str());
+                    let marker = [view.place(candidate.marker_range.start), view.place(candidate.marker_range.end)];
+                    Member {
+                        id: format!("{prefix}{}", candidate.id),
+                        label: candidate.label.clone(),
+                        grammar_value: candidate.grammar_value.clone(),
+                        slot: marker[0].slot,
+                        beside: reading.beside,
+                        text: reading.text,
+                        parent: candidate
+                            .parent_candidate_id
+                            .as_ref()
+                            .and_then(|parent| run.markers[..at].iter().rposition(|other| other.id == *parent))
+                            .map(|parent| parent as u32),
+                        level: candidate.level.min(usize::from(u16::MAX)) as u16,
+                        value: label_value(&candidate.label),
+                        marker,
+                        content: view.place(candidate.content_start),
+                        end: view.place(candidate.range.end),
+                        counted: role.is_some_and(|role| role.counted),
+                        kind: role.and_then(|role| role.role),
+                        rule: role.map_or(ResolutionRuleV2::InsufficientEvidence, |role| role.rule),
+                        observations: reading.observations,
+                        carries_prose: reading.carries_prose,
+                        title_shaped: reading.title_shaped,
+                        worded: reading.worded,
+                    }
+                })
+                .collect();
+            runs.push(Run {
+                ctx: ctx as u16,
+                id: format!("{prefix}{}", run.id),
+                grammar: run.grammar,
+                rooted: run.rooted,
+                consecutive: run.consecutive,
+                family: run.markers.first().and_then(|first| label_reading(&first.label)).map_or_else(String::new, |(family, _)| family),
+                members,
+            });
+        }
+    }
+    // The document's paragraphs are the count the reading took (`Fences::read_paragraphs`): a quoted decision's
+    // numbers, a list's, the other language's issue list are none of it.
+    let paragraph = Some(legal_structure_model::UnitRole::Paragraph);
+    let counted = |member: &Member| member.kind == paragraph;
+    let members: Vec<(usize, usize)> = runs.iter().enumerate()
+        .flat_map(|(r, run)| run.members.iter().enumerate().filter(|(_, member)| counted(member)).map(move |(m, _)| (r, m)))
+        .collect();
+    for &(r, m) in &members {
+        let member = &mut runs[r].members[m];
+        let own = fences.paragraphs.count[member.slot.index()].is_some();
+        (member.kind, member.rule) = if own {
+            (paragraph, ResolutionRuleV2::RootedNumericProse)
+        } else {
+            (Some(legal_structure_model::UnitRole::Item), ResolutionRuleV2::OffCount)
+        };
+    }
+    // A statute's running head naming its page's sections is the page's furniture where the
+    // spine (its rooted, consecutive provisions, counted and opening prose) opens a section it
+    // names there or on the page before; the head itself bears out nothing.
+    if !fences.section_heads.is_empty() {
+        let mut spine: Vec<Vec<u32>> = vec![Vec::new(); pages.len()];
+        for member in runs
+            .iter()
+            .filter(|run| run.grammar == CandidateGrammar::Hierarchy && run.rooted && run.consecutive)
+            .flat_map(|run| &run.members)
+            .filter(|member| {
+                member.parent.is_none()
+                    && member.counted
+                    && member.carries_prose
+                    && !fences.section_heads.iter().any(|(head, _, _)| *head == member.slot)
+            })
+        {
+            spine[slots.page(member.slot)].push(member.value);
+        }
+        fences.confirm_section_heads(pages, slots, evidence, |page, number| spine[page].contains(&number));
+    }
+    Ok(Runs { runs, edits, before: repaired })
 }
 
-impl Numbering for Runs {
-    /// The runs of every reading context of the document's pages, measured (`evidence`) and fenced
-    /// and ordered (`fences`), each marker resolved to the unit it opens; and, once the statute's
-    /// spine is read, its running heads naming its sections fenced (`confirm_section_heads`).
-    fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences) -> Result<Self> {
-        let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
-        let pages: &[Page] = pages;
-        evidence.reread(pages, slots, &repaired);
-        fences.read_numbers(pages, slots, evidence, !repaired.is_empty());
-        // A paragraph number in the margin stands beside the line of its row it numbers, as one printed line
-        // (`Fences::read_margin_numbers`): the numbering reads it opening that line, not ending the one before.
-        for (at, row) in fences.margin_number.iter().enumerate() {
-            if let Some(row) = row {
-                evidence.beside[at] = Some(*row);
-            }
-        }
-        let edits = repaired.iter().map(|(slot, _)| (*slot, slots.line(pages, *slot).text.clone(), slots.line(pages, *slot).words.clone())).collect();
-        let evidence: &Evidence = evidence;
-        let geometry = Geometry::of(pages);
-        // Each context's lines in reading order, its fenced lines left out.
-        let mut by_context: Vec<Vec<Slot>> = vec![Vec::new(); fences.contexts.len()];
-        for &slot in &fences.order {
-            if !matches!(fences.role[slot.index()], Role::LineLabel | Role::PageLabel | Role::Furniture | Role::Contents) {
-                by_context[usize::from(fences.ctx[slot.index()])].push(slot);
-            }
-        }
-        let mut runs = Vec::new();
-        for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
-            let view = View::of(pages, slots, evidence, lines);
-            let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true));
-            // A provision ladder under one worded top-level marker that goes on with the sentence
-            // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
-            // question numbers under it are the count's, not its subsections. A list's items go on
-            // with their sentence too ("; and" / "b."), each its own top-level marker, and stand.
-            let found: Vec<StructureCandidateRun> = found
-                .into_iter()
-                .filter(|run| {
-                    let mut roots = run.markers.iter().filter(|candidate| candidate.parent_candidate_id.is_none());
-                    let (Some(root), None) = (roots.next(), roots.next()) else { return true };
-                    let worded = root.label.chars().take_while(char::is_ascii_alphabetic).count() >= 3;
-                    run.grammar != CandidateGrammar::Hierarchy
-                        || !worded
-                        || fences.continues[view.place(root.marker_range.start).slot.index()].is_none()
-                })
-                .collect();
-            if found.is_empty() {
-                continue;
-            }
-            let found = part_at_paragraphs(found, &view, evidence, fences);
-            let marked: HashSet<Slot> =
-                found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
-            let shown = Lines { pages, slots, evidence, fences, geometry: &geometry, view: &view, marked: &marked };
-            let readings: Vec<Vec<Reading>> = found
-                .iter()
-                .map(|run| {
-                    let aligned = aligned_siblings(pages, slots, &view, run);
-                    run.markers.iter().zip(aligned).map(|(candidate, aligned)| shown.read(run, candidate, aligned)).collect()
-                })
-                .collect();
-            let candidate_evidence: Vec<CandidateEvidenceV2> = found
-                .iter()
-                .zip(&readings)
-                .flat_map(|(run, readings)| run.markers.iter().zip(readings))
-                .map(|(candidate, reading)| {
-                    let mut page_indexes: Vec<usize> = Vec::new();
-                    let mut line_id = |index: usize| {
-                        let slot = view.lines[index].0;
-                        let page = pages[slots.page(slot)].index;
-                        if !page_indexes.contains(&page) {
-                            page_indexes.push(page);
-                        }
-                        slots.line(pages, slot).id.clone()
-                    };
-                    let line_ids = view.overlapping(candidate.range.start, candidate.range.end).map(&mut line_id).collect();
-                    CandidateEvidenceV2 { candidate_id: candidate.id.clone(), page_indexes, line_ids, observations: reading.observations.clone() }
-                })
-                .collect();
-            let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure_model::structure_analysis().resolve_candidates(&found, &candidate_evidence))
-                .map_err(|error| Error::Message(error.to_string()))?;
-            let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> = roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
-            // A document read in more than one context names each context's candidates apart.
-            let prefix = if fences.contexts.len() > 1 { format!("context-{ctx:06}-") } else { String::new() };
-            for (run, readings) in found.iter().zip(readings) {
-                let members = run
-                    .markers
-                    .iter()
-                    .zip(readings)
-                    .enumerate()
-                    .map(|(at, (candidate, reading))| {
-                        let role = role_of.get(candidate.id.as_str());
-                        let marker = [view.place(candidate.marker_range.start), view.place(candidate.marker_range.end)];
-                        Member {
-                            id: format!("{prefix}{}", candidate.id),
-                            label: candidate.label.clone(),
-                            grammar_value: candidate.grammar_value.clone(),
-                            slot: marker[0].slot,
-                            beside: reading.beside,
-                            text: reading.text,
-                            parent: candidate
-                                .parent_candidate_id
-                                .as_ref()
-                                .and_then(|parent| run.markers[..at].iter().rposition(|other| other.id == *parent))
-                                .map(|parent| parent as u32),
-                            level: candidate.level.min(usize::from(u16::MAX)) as u16,
-                            value: label_value(&candidate.label),
-                            marker,
-                            content: view.place(candidate.content_start),
-                            end: view.place(candidate.range.end),
-                            counted: role.is_some_and(|role| role.counted),
-                            kind: role.and_then(|role| role.role),
-                            rule: role.map_or(ResolutionRuleV2::InsufficientEvidence, |role| role.rule),
-                            observations: reading.observations,
-                            carries_prose: reading.carries_prose,
-                            title_shaped: reading.title_shaped,
-                            worded: reading.worded,
-                        }
-                    })
-                    .collect();
-                runs.push(Run {
-                    ctx: ctx as u16,
-                    id: format!("{prefix}{}", run.id),
-                    grammar: run.grammar,
-                    rooted: run.rooted,
-                    consecutive: run.consecutive,
-                    family: run.markers.first().and_then(|first| label_reading(&first.label)).map_or_else(String::new, |(family, _)| family),
-                    members,
-                });
-            }
-        }
-        // The document's paragraphs are the count the reading took (`Fences::read_paragraphs`): a quoted decision's
-        // numbers, a list's, the other language's issue list are none of it.
-        let paragraph = Some(legal_structure_model::UnitRole::Paragraph);
-        let counted = |member: &Member| member.kind == paragraph;
-        let members: Vec<(usize, usize)> = runs.iter().enumerate()
-            .flat_map(|(r, run)| run.members.iter().enumerate().filter(|(_, member)| counted(member)).map(move |(m, _)| (r, m)))
-            .collect();
-        for &(r, m) in &members {
-            let member = &mut runs[r].members[m];
-            let own = fences.paragraphs.count[member.slot.index()].is_some();
-            (member.kind, member.rule) = if own {
-                (paragraph, ResolutionRuleV2::RootedNumericProse)
-            } else {
-                (Some(legal_structure_model::UnitRole::Item), ResolutionRuleV2::OffCount)
-            };
-        }
-        // A statute's running head naming its page's sections is the page's furniture where the
-        // spine (its rooted, consecutive provisions, counted and opening prose) opens a section it
-        // names there or on the page before; the head itself bears out nothing.
-        if !fences.section_heads.is_empty() {
-            let mut spine: Vec<Vec<u32>> = vec![Vec::new(); pages.len()];
-            for member in runs
-                .iter()
-                .filter(|run| run.grammar == CandidateGrammar::Hierarchy && run.rooted && run.consecutive)
-                .flat_map(|run| &run.members)
-                .filter(|member| {
-                    member.parent.is_none()
-                        && member.counted
-                        && member.carries_prose
-                        && !fences.section_heads.iter().any(|(head, _, _)| *head == member.slot)
-                })
-            {
-                spine[slots.page(member.slot)].push(member.value);
-            }
-            fences.confirm_section_heads(pages, slots, evidence, |page, number| spine[page].contains(&number));
-        }
-        Ok(Self { runs, edits, before: repaired })
-    }
-}
