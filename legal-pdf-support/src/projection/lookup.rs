@@ -252,9 +252,9 @@ fn instrument_scope(document: &PdfDocument, text: &ScalarText<'_>, instrument: &
     Some((*start, end))
 }
 
-/// The label a Part, Division or Schedule's heading takes in the instrument grammar ("part2", "div2", "schedA"): a
-/// Part's or Division's number in figures or capital roman numerals. None for another kind; an empty label for a
-/// number neither reads.
+/// The place a Part, Division or Schedule takes as the instrument grammar reads its heading, its kind's mark and label
+/// ("part2", "div2", "scheda": `StructureNode::fragment`): a Part's or Division's number in figures or capital roman
+/// numerals. None for another kind; an empty place for a number neither reads.
 fn container_label(kind: &str, locator: &str) -> Option<String> {
     match kind {
         "part" | "division" => {
@@ -434,10 +434,13 @@ pub(crate) fn section_matches(section: &StructureNode,
     {
         return true;
     }
+    // (A provision is named by its place, its kind's mark and label, a section by its label too, or as it is printed.)
+    let section_label = (legal_structure_model::provision_mark(section.locator_kind.as_deref()) == "sec").then_some(section.label.as_deref()).flatten();
     section
-        .label
+        .fragment()
         .iter()
         .map(String::as_str)
+        .chain(section_label)
         .chain(section.aliases.iter().flatten().map(String::as_str))
         .any(|value| section_alias(value) == requested)
 }
@@ -715,7 +718,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         let label = container_label(kind, locator);
         let requested = section_alias(locator);
         (0..sections.len()).filter(|&index| match &label {
-            Some(label) => !label.is_empty() && sections[index].label.as_deref() == Some(label.as_str()),
+            Some(place) => !place.is_empty() && sections[index].fragment().as_deref() == Some(place.as_str()),
             None => section_matches(sections[index], kind, &requested),
         }).collect()
     };

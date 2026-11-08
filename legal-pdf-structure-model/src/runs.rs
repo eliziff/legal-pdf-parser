@@ -39,6 +39,10 @@ pub struct Member {
     pub id: String,
     pub label: String,
     pub grammar_value: String,
+    /// A provision's kind as the grammar read its marker ("section", "part", ...); none for a clause read by its
+    /// number alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator_kind: Option<String>,
     pub slot: Slot,
     pub beside: Option<Slot>,
     pub text: Option<Slot>,

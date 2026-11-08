@@ -502,6 +502,7 @@ pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: 
                         id: format!("{prefix}{}", candidate.id),
                         label: candidate.label.clone(),
                         grammar_value: candidate.grammar_value.clone(),
+                        locator_kind: candidate.locator_kind.clone(),
                         slot: marker[0].slot,
                         beside: reading.beside,
                         text: reading.text,

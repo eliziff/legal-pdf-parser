@@ -315,7 +315,7 @@ pub fn structure_graph(pages: &[Page],
             match kind {
                 NodeKind::Paragraph => node.aliases = Some(vec![member.label.clone()]),
                 NodeKind::Section => {
-                    node.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
+                    node.locator_kind = Some(legal_structure_model::provision_locator(member.locator_kind.as_deref(), usize::from(member.level)).to_owned());
                     let printed = (member.label != member.grammar_value).then(|| member.label.clone());
                     node.aliases = printed.map(|printed| vec![printed]);
                     if role == Some(PrimaryRole::Heading) {
@@ -360,7 +360,7 @@ pub fn structure_graph(pages: &[Page],
             own.content_start = placed(member.content);
             own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
             if kind == NodeKind::Section {
-                own.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
+                own.locator_kind = Some(legal_structure_model::provision_locator(member.locator_kind.as_deref(), usize::from(member.level)).to_owned());
             }
             nodes.push(own);
             holder = nodes.len() - 1;
