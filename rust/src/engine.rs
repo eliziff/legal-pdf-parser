@@ -380,7 +380,7 @@ fn derive_extracted(
         let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), analysis, semantic_profile, &extracted.pages, &extracted.separators, &extracted.outline, ablated)).ok()?;
         Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
     });
-    let mut derived = legal_pdf_structure::derive_cached(
+    let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,
         &extracted.separators,
         &extracted.outline,
