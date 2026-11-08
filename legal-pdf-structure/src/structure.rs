@@ -82,23 +82,19 @@ fn give_back(pages: &mut [Page], footnotes: &[Footnote]) -> bool {
     given_back
 }
 
-pub fn derive(
-    analysis: &dyn StructureAnalysis,
-    pages: &mut [Page],
+pub fn derive(pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
 ) -> Result<StructureOutput> {
-    derive_cached(analysis, pages, separators, outline, identity, None, None)
+    derive_cached(pages, separators, outline, identity, None, None)
 }
 
 /// `derive`, reading what the measuring, fencing and numbering read from `cache` where it is there
 /// (a file named for the input pages and the code that reads them) and writing it there where not.
 /// The notes, the decision and everything after it are read on every run. With `trace`, the decision is also written
 /// to that folder (`decide::trace`); the parse is the same.
-pub fn derive_cached(
-    analysis: &dyn StructureAnalysis,
-    pages: &mut [Page],
+pub fn derive_cached(pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
@@ -129,10 +125,10 @@ pub fn derive_cached(
         }
         None => {
             let mut evidence = measure("derive.measure", || {
-                Evidence::measure(analysis, pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
+                Evidence::measure(pages, &slots, normalized, separators, outline, &identity.page_labels, instrument)
             });
-            let mut fences = measure("derive.fences", || Fences::read(analysis, pages, &slots, &evidence, outline));
-            let runs = measure("derive.runs", || Runs::read(analysis, pages, &slots, &mut evidence, &mut fences))?;
+            let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline));
+            let runs = measure("derive.runs", || Runs::read(pages, &slots, &mut evidence, &mut fences))?;
             let measured = Measured { evidence, fences, runs };
             if let Some(path) = cache {
                 let _ = legal_pdf_core::write_gzip_json(path, &measured);
@@ -142,7 +138,7 @@ pub fn derive_cached(
     };
     // The output is tier 0's; the transition walk over its reading (the DOC tier where it is given, the scorer's fitting)
     // runs inside it, once (`tier0::output`).
-    measure("derive.machine", || output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
+    measure("derive.machine", || output(pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
 }
 
 /// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
@@ -150,9 +146,7 @@ pub fn derive_cached(
 /// Tier 0's reading of the document written: its decision (`tier0::decide`), the walk over it where DOC or the scorer's
 /// fitting asks (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's
 /// in their place where it is given) and emitted as the structure graph (`legal_pdf_emit`).
-fn output(
-    analysis: &dyn StructureAnalysis,
-    pages: &mut [Page],
+fn output(pages: &mut [Page],
     slots: &Slots,
     evidence: &Evidence,
     mut fences: Fences,
@@ -164,7 +158,7 @@ fn output(
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let views = tier0::line_views(pages, slots, evidence, &fences, &table);
-    let (mut notes, mut decision) = tier0::decide(analysis, pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
+    let (mut notes, mut decision) = tier0::decide(pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
     // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
     // came, before this reading writes and orders them.
     let doc = transition::over_tier0(pages, slots, evidence, &fences, outline, &identity.source_sha256, &notes, &decision, &table);
@@ -182,7 +176,7 @@ fn output(
     diagnostics.extend(text_flow_faults(pages));
     let index = PdfTextIndex::from_pages(pages);
     let citations = graph::citation_spans(pages, slots, evidence);
-    let pairing = note_pairing::pair_notes(analysis, pages, &decided, &citations, &index);
+    let pairing = note_pairing::pair_notes(pages, &decided, &citations, &index);
     let (notes, graph_diagnostics) = map_note_pairs(&index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
     let footnotes = pairing.footnotes;
@@ -203,10 +197,10 @@ fn output(
     }
     tier0::in_slot_order(pages, slots);
     let settled = Settled { index: &index, notes, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
-    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(analysis, pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
+    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
     diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
     attach_propositions(&mut footnotes, &paragraphs, &decided);
-    attach_crossrefs(analysis, &mut footnotes, &mut diagnostics, &decided);
+    attach_crossrefs(&mut footnotes, &mut diagnostics, &decided);
     in_reading_order(pages, slots, &fences);
     Ok(StructureOutput { paragraphs, footnotes, diagnostics, structure_graph, heading_sources })
 }

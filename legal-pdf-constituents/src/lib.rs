@@ -157,11 +157,11 @@ pub fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Vec<Start
 
 /// Package bookmarks supply opening pages before the readers calibrate each document; a line
 /// `set_aside` holds (a transcript's line number, furniture, a note) opens none.
-pub fn bookmarked_starts(analysis: &dyn StructureAnalysis, views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+pub fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
     let by_index = views.iter().map(|view| (view.page.index, view)).collect::<HashMap<_, _>>();
     // Version stamps contain letters but supply no word of an opening.
     let worded = |line: &Line| line.text.split(|c: char| !c.is_alphanumeric()).any(|word| !word.is_empty() && word.chars().all(char::is_alphabetic));
-    headings::bookmarks::package_targets(analysis, outline, views.len())
+    headings::bookmarks::package_targets(outline, views.len())
         .into_iter()
         .filter_map(|(page, kind)| {
             let (_, line) = by_index.get(&page)?.iter().filter(|(slot, line)| !set_aside(*slot) && worded(line)).min_by(|(_, a), (_, b)| reading(a, b))?;

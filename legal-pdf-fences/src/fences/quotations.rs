@@ -7,7 +7,7 @@ impl Fences {
     /// count takes at another line (a number nothing else prints is the count's own, however it broke the count: a
     /// misread digit), with the lines its block goes on into (`continues`) and the editorial lines under it ("[Emphasis
     /// added]"), each a quotation of its own. Whether it found any.
-    pub fn read_quotations(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots) -> bool {
+    pub fn read_quotations(&mut self, pages: &[Page], slots: &Slots) -> bool {
         // LEGALPDF_ABLATE=sequence leaves the quotations out, for their measure under the tagger.
         if legal_structure_model::ablated("sequence") {
             return false;
@@ -28,14 +28,14 @@ impl Fences {
             let stream = (self.document[at], self.translation[at]);
             let text = slots.line(pages, slot).text.as_str();
             if let Some(quotation) = quotations.open_in(stream) {
-                if self.continues[at].is_some() || analysis.editorial_line(text) {
+                if self.continues[at].is_some() || legal_structure_model::structure_analysis().editorial_line(text) {
                     self.quotation[at] = quotation;
                     continue;
                 }
                 quotations.close(stream);
             }
             let quoted = self.paragraphs.count[at].is_none()
-                && analysis.printed_paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
+                && legal_structure_model::structure_analysis().printed_paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
             if quoted {
                 self.quotation[at] = quotations.open(stream);
             }

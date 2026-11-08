@@ -247,9 +247,9 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 
 /// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
-pub fn note_promotions(analysis: &dyn StructureAnalysis, lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
+pub fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
     let lines = DocumentLines::new(lines);
-    let rerouted = post_footnote_reroute(analysis, &lines);
+    let rerouted = post_footnote_reroute(&lines);
     let mut claims = band_closure(&lines, &rerouted).into_iter().chain(rerouted).collect::<BTreeSet<_>>();
     let band = note_band(&lines, separators, &claims);
     claims.extend(band.iter().map(|promotion| promotion.line));
@@ -262,7 +262,7 @@ pub fn note_promotions(analysis: &dyn StructureAnalysis, lines: LaneLines<'_>, s
 /// marker, a printed label continuing the page's note numbers, or the unfinished sentence of the
 /// note before them where a later note or a citation's shape anchors it. Declining a line breaks
 /// the chain, so the body below a page's notes inherits nothing.
-fn post_footnote_reroute(analysis: &dyn StructureAnalysis, lines: &DocumentLines<'_>) -> Vec<LineRef> {
+fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
     let mut claims = Vec::new();
     for (_, refs) in lines.pages() {
         let Some(first_note) = refs.iter().position(|line| lines.is_note(*line)) else {
@@ -298,7 +298,7 @@ fn post_footnote_reroute(analysis: &dyn StructureAnalysis, lines: &DocumentLines
             let number = if bare || marker { leading_note_number(&fold) } else { None };
             let bare_claim = bare && number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
             let continuation = *anchored && !sentence_ended(last_text);
-            let anchored_citation = position < last_note && !analysis.protected_citation_spans(text).is_empty();
+            let anchored_citation = position < last_note && !legal_structure_model::structure_analysis().protected_citation_spans(text).is_empty();
             if (bare && !bare_claim) || !(marker || continuation || anchored_citation || bare_claim) {
                 trail = Trail::Broken;
                 continue;

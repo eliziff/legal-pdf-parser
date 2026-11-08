@@ -63,9 +63,9 @@ fn value(token: &str) -> u32 {
 }
 
 /// Mostly a citation, its leader and locator aside: an authority's entry.
-fn citation(analysis: &dyn StructureAnalysis, text: &str) -> bool {
+fn citation(text: &str) -> bool {
     let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]–-]*$").replace(text.trim(), "");
-    let citations = analysis.citations(&title);
+    let citations = legal_structure_model::structure_analysis().citations(&title);
     let cited: usize = citations.iter().map(|found| found.range.len()).sum();
     !citations.is_empty() && cited * 3 >= title.trim().len()
 }

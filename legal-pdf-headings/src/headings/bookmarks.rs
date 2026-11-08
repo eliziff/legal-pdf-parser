@@ -125,7 +125,7 @@ pub fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
 }
 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
-pub fn package_targets(analysis: &dyn StructureAnalysis, outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+pub fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
     let entries = validate(outline, pages);
     let authorities = authorities_level(&entries);
     let entries = entries
@@ -136,7 +136,7 @@ pub fn package_targets(analysis: &dyn StructureAnalysis, outline: &[PdfOutlineEn
             let counter = words.get(1)?;
             let kind = if PACKAGE_UNITS.contains(&unit.as_str()) && (label_remainder().is_match(counter) || roman(counter).is_some()) {
                 unit.clone()
-            } else if authorities == Some(entry.level) && analysis.numbering_marker(entry.title.split_whitespace().next()?, None).is_some() {
+            } else if authorities == Some(entry.level) && legal_structure_model::structure_analysis().numbering_marker(entry.title.split_whitespace().next()?, None).is_some() {
                 "authority".to_owned()
             } else {
                 return None;

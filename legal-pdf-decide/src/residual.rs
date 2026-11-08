@@ -220,9 +220,7 @@ struct Candidate {
 /// and examinations), its anchors' and its contents' title, never the residual's: throughout a
 /// transcript that is testimony throughout (`Fences::testimony`), and on a transcript's pages of
 /// speakers' turns. `unnamed` holds the lines bookmarks naming every heading leave unnamed.
-pub fn weigh(
-    analysis: &dyn StructureAnalysis,
-    pages: &[Page],
+pub fn weigh(pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
@@ -347,9 +345,9 @@ pub fn weigh(
             let runs_on = alone
                 && (sentence_ended(&text) || next.is_some_and(|next| fences.continues[next.index()].is_some()));
             let vetoes = [
-                (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(analysis, &text))),
+                (VETO_TESTIMONY, fences.testimony(first) || fences.transcript(first) && (spoken[slots.page(first)] || headings::rules::turn_or_event(&text))),
                 (VETO_RUNS_ON, runs_on),
-                (VETO_EDITORIAL, analysis.editorial_line(&text)),
+                (VETO_EDITORIAL, legal_structure_model::structure_analysis().editorial_line(&text)),
                 (VETO_ENDS, text.ends_with(['.', ',', ';'])),
                 (VETO_LABEL, headings::rules::label(&text) || date_line(&text)),
                 (VETO_WORDS, words > 20),

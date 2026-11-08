@@ -96,7 +96,7 @@ impl EndnoteRun {
 impl Notes {
     /// The notes of the document's pages, measured (`evidence`), fenced and ordered (`fences`), its
     /// numbering runs read (`runs`).
-    pub fn read(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
         let count = slots.len();
         let separators = &fences.separators;
         let starts: Vec<usize> = (0..pages.len()).map(|page| slots.on(page).start as usize).collect();
@@ -174,7 +174,7 @@ impl Notes {
                     }
                 })
                 .collect();
-            let reading = legal_pdf_core::profile::measure("notes.band", || read_band(analysis, &band_pages, &lines));
+            let reading = legal_pdf_core::profile::measure("notes.band", || read_band(&band_pages, &lines));
             for &(slot, kind) in &reading.notes {
                 notes.note[slot.index()] = Some(kind);
             }
@@ -258,7 +258,7 @@ impl Notes {
                 .fold(0, |bits, (bit, _)| bits | bit);
             }
             let promoted = legal_pdf_core::profile::measure("notes.lanes", || {
-                note_promotions(analysis, LaneLines { pages, order: &order, starts: &starts, flags: &lane_flags }, &separators)
+                note_promotions(LaneLines { pages, order: &order, starts: &starts, flags: &lane_flags }, &separators)
             });
             for (page, place) in promoted {
                 notes.note[starts[page] + place].get_or_insert(NoteKind::Footnote);

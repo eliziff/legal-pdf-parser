@@ -159,7 +159,7 @@ fn court_name(text: &str) -> bool {
 }
 
 /// The lexicon a line's words match (`WORD_*`), the citation title aside.
-fn lexicon(analysis: &dyn StructureAnalysis, line: &Line) -> u32 {
+fn lexicon(line: &Line) -> u32 {
     let text = line.text.trim();
     bits([
         (WORD_LABEL, headings::rules::label(text)),
@@ -168,21 +168,21 @@ fn lexicon(analysis: &dyn StructureAnalysis, line: &Line) -> u32 {
         (WORD_DATE, date_line(text)),
         (WORD_FIELD, captions::field(&line.text).is_some()),
         (WORD_CLOSING, captions::closing(&line.text)),
-        (WORD_REASONS, captions::reasons(analysis, line)),
-        (WORD_SIGNATURE, analysis.signature_line(text)),
-        (WORD_AUTHOR, analysis.author_line(text)),
+        (WORD_REASONS, captions::reasons(line)),
+        (WORD_SIGNATURE, legal_structure_model::structure_analysis().signature_line(text)),
+        (WORD_AUTHOR, legal_structure_model::structure_analysis().author_line(text)),
         (WORD_WITNESS, headings::rules::witness(text)),
         (WORD_EXAMINATION, headings::rules::examination(text)),
         (WORD_TRANSCRIPT_PART, headings::rules::transcript_part(text)),
         (WORD_HEARING_PART, headings::rules::hearing_part(text)),
-        (WORD_TURN, headings::rules::turn_or_event(analysis, text)),
+        (WORD_TURN, headings::rules::turn_or_event(text)),
         (WORD_INDEX_ENTRY, headings::rules::index_entry(text)),
-        (WORD_SPEAKER, analysis.speaker_label(text).is_some()),
+        (WORD_SPEAKER, legal_structure_model::structure_analysis().speaker_label(text).is_some()),
         (WORD_NOTES_HEADING, endnote_heading(text)),
         (WORD_RESET_HEADING, structural_reset_heading(text)),
         (WORD_CONTENTS_TITLE, contents_lists::contents_title(text)),
         (WORD_INDEX_LETTER, contents_lists::index_letter(text)),
-        (WORD_HISTORY, analysis.history_note(text)),
+        (WORD_HISTORY, legal_structure_model::structure_analysis().history_note(text)),
         (WORD_DIVISION, division_word(text)),
         (WORD_COURT, court_name(text)),
     ])
@@ -413,10 +413,10 @@ fn operative_words(text: &str) -> (usize, usize) {
 /// rewrote its marker (`reread`).
 pub trait Measure {
     #[allow(clippy::too_many_arguments)]
-    fn measure(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, normalized: Normalized, separators: &[Option<f64>],
+    fn measure(pages: &[Page], slots: &Slots, normalized: Normalized, separators: &[Option<f64>],
         outline: &[PdfOutlineEntry], page_labels: &[Option<String>], instrument: bool) -> Self;
-    fn read_citations(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, line_numbers: &[bool]);
-    fn reread(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]);
+    fn read_citations(&mut self, pages: &[Page], slots: &Slots, line_numbers: &[bool]);
+    fn reread(&mut self, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]);
 }
 
 impl Measure for Evidence {
@@ -424,9 +424,7 @@ impl Measure for Evidence {
     /// separator as the extraction found it, `outline` the document's bookmarks, `page_labels` the
     /// page labels it declares (by page index), and `instrument` whether its caller knows it for an
     /// instrument.
-    fn measure(
-        analysis: &dyn StructureAnalysis,
-        pages: &[Page],
+    fn measure(pages: &[Page],
         slots: &Slots,
         normalized: Normalized,
         separators: &[Option<f64>],
@@ -462,7 +460,7 @@ impl Measure for Evidence {
                 evidence.label.push(note_label(page, &sizes, at));
                 evidence.references.push(reference_tokens(line, sizes[at]));
                 evidence.title_shaped.push(title_shaped(text));
-                evidence.words.push(lexicon(analysis, line));
+                evidence.words.push(lexicon(line));
                 if !line_numbers[first + at] {
                     let (read, found) = operative_words(&line.text);
                     words += read;
@@ -509,7 +507,7 @@ impl Measure for Evidence {
                 }
             }
         }
-        evidence.read_citations(analysis, pages, slots, &line_numbers);
+        evidence.read_citations(pages, slots, &line_numbers);
         evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
         evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
         evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
@@ -526,7 +524,7 @@ impl Measure for Evidence {
     /// reference, which a citation holding it protects), or shaped as a title, and every line of the
     /// first two pages, each with the line either side of it; then which of the first two pages'
     /// lines name the case by its citation.
-    fn read_citations(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
+    fn read_citations(&mut self, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
         let count = slots.len();
         let mut wanted: Vec<bool> = (0..count)
             .map(|slot| {
@@ -579,7 +577,7 @@ impl Measure for Evidence {
                         (from < to).then(|| (slot, byte as u32, (from - byte) as u32, (to - byte) as u32))
                     })
             };
-            for citation in analysis.citations(&window) {
+            for citation in legal_structure_model::structure_analysis().citations(&window) {
                 for (slot, byte, from, to) in on_lines(citation.range.start, citation.range.end) {
                     let core_from = (citation.core_range.start as u32).saturating_sub(byte).clamp(from, to);
                     let core_to = (citation.core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
@@ -587,7 +585,7 @@ impl Measure for Evidence {
                 }
             }
             // The protected spans, in scalars: each read back to bytes on its lines.
-            for (start, end) in analysis.protected_citation_spans(&window) {
+            for (start, end) in legal_structure_model::structure_analysis().protected_citation_spans(&window) {
                 let first = placed.partition_point(|&(_, _, scalar)| scalar <= start).saturating_sub(1);
                 for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
                     let (slot, _, scalar) = placed[at];
@@ -641,7 +639,7 @@ impl Measure for Evidence {
     /// Reads again what a line's text says of it, for the lines whose opening marker the runs'
     /// repair rewrote (`repaired`: each slot with its text before): its marker, note label, shape and
     /// lexicon, and its citations moved with the words after the marker.
-    fn reread(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
+    fn reread(&mut self, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
         if repaired.is_empty() {
             return;
         }
@@ -659,7 +657,7 @@ impl Measure for Evidence {
             self.marker[at] = opening_marker(line, &mut families);
             self.label[at] = note_label(page, &self.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
             self.title_shaped[at] = title_shaped(text);
-            self.words[at] = lexicon(analysis, line) | self.words[at] & WORD_CITATION_TITLE;
+            self.words[at] = lexicon(line) | self.words[at] & WORD_CITATION_TITLE;
             // The words after the rewritten marker keep their citations, moved by what the marker
             // gained or lost.
             let after = before.len() - before.bytes().rev().zip(line.text.bytes().rev()).take_while(|(a, b)| a == b).count();

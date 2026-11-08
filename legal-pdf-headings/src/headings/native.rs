@@ -54,7 +54,7 @@ fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bo
 /// finishes ("1. IAEA, Safety Standards Series, Geological Disposal Facilities for" /
 /// "Radioactive Waste, Vienna, 2011.") opens a paragraph or an entry, not a heading: the line at
 /// `slot` onto the line `next` (slots of the page's lines), the page's body lines those `body` names.
-pub fn carries_a_sentence_onto(analysis: &dyn StructureAnalysis, page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
+pub fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
     let line = &page.lines[slot];
     let height = line.bbox[3] - line.bbox[1];
     let followed_by_body = body(next);
@@ -71,7 +71,7 @@ pub fn carries_a_sentence_onto(analysis: &dyn StructureAnalysis, page: &Page, sl
         && sentence_ended(following)
         && !following.ends_with('?')
         && runs_the_column(page, line, body)
-        && !analysis.has_citation_signal(&format!("{text} {following}"))
+        && !legal_structure_model::structure_analysis().has_citation_signal(&format!("{text} {following}"))
 }
 
 /// The share of a line's characters its face sets bold.

@@ -4,10 +4,10 @@ use super::*;
 impl Fences {
     /// Each line's constituent document: the openings the document's bookmarks name, and those its
     /// own lines show, read on the lines no fence took and the note band left.
-    pub fn read_documents(&mut self, analysis: &dyn StructureAnalysis, views: &[PageView], outline: &[PdfOutlineEntry]) {
+    pub fn read_documents(&mut self, views: &[PageView], outline: &[PdfOutlineEntry]) {
         let (role, band) = (&self.role, &self.band);
         let set_aside = |slot: Slot| role[slot.index()] != Role::Open || band[slot.index()];
-        let mut starts = constituents::bookmarked_starts(analysis, views, outline, set_aside);
+        let mut starts = constituents::bookmarked_starts(views, outline, set_aside);
         constituents::reconcile_starts(views, &mut starts, set_aside);
         let documents = constituents::documents(views, &starts, |slot| {
             matches!(role[slot.index()], Role::LineLabel | Role::Furniture | Role::PageLabel)

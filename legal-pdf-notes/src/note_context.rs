@@ -113,7 +113,7 @@ pub fn unmatched_reference_diagnostics(pages: &[Page], footnotes: &[Footnote], a
     diagnostics
 }
 
-pub fn attach_crossrefs(analysis: &dyn StructureAnalysis, footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic>, decided: &Decided) {
+pub fn attach_crossrefs(footnotes: &mut [Footnote], diagnostics: &mut Vec<Diagnostic>, decided: &Decided) {
     let pattern = regex!(r"(?i)\b(?:(supra|infra),?\s+(?:foot)?notes?|(op)\.?\s*cit\.?,?\s+(?:foot)?notes?|(see)\s+(?:also\s+)?footnote)\s+(\d{1,3})\b");
     let mut by_number: HashMap<(DocumentContext, u32), Vec<(usize, String)>> = HashMap::new();
     for footnote in footnotes.iter() {
@@ -148,7 +148,7 @@ pub fn attach_crossrefs(analysis: &dyn StructureAnalysis, footnotes: &mut [Footn
                 source_pair_id: footnote.pair_id.clone(),
                 kind,
                 number,
-                shortform: analysis.crossref_short_form(&footnote.body, found.start()),
+                shortform: legal_structure_model::structure_analysis().crossref_short_form(&footnote.body, found.start()),
                 start,
                 end,
                 resolved: !target_pair_id.is_empty(),

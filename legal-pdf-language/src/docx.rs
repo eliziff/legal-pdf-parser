@@ -1253,7 +1253,7 @@ fn docx_structure_input(bytes: &[u8], include_tables: bool) -> Result<(Vec<Strin
 }
 
 /// Return the accepted model-visible DOCX text without running structure
-/// detection. Drafting mode uses the same Pandoc adaptation as full analysis.
+/// detection. Drafting mode uses the same Pandoc adaptation as full legal_structure_model::structure_analysis().
 pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
     if drafting {
         drafting_docx_text(bytes)
@@ -1264,9 +1264,9 @@ pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
 
 /// Parse the accepted DOCX text and authoritative table coordinates once, then
 /// feed the canonical Rust detector directly.
-pub fn analyze_docx_bytes(analysis: &dyn legal_structure_model::StructureAnalysis, bytes: &[u8], document_id: String) -> Result<legal_structure_model::DocumentStructure> {
+pub fn analyze_docx_bytes(bytes: &[u8], document_id: String) -> Result<legal_structure_model::DocumentStructure> {
     let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
-    analysis.analyze_docx(document_id, paragraphs, &table_cells).map_err(|error| Error::Message(error.to_string()))
+    legal_structure_model::structure_analysis().analyze_docx(document_id, paragraphs, &table_cells).map_err(|error| Error::Message(error.to_string()))
 }
 
 fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
@@ -1296,6 +1296,6 @@ fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
 
 /// Build the model-visible drafting document in one Rust operation. OOXML and
 /// Pandoc adaptation stay here; the resulting text uses the canonical detector.
-pub fn analyze_docx_drafting_bytes(analysis: &dyn legal_structure_model::StructureAnalysis, bytes: &[u8], document_id: String) -> Result<legal_structure_model::DocumentStructure> {
-    analysis.analyze_instrument(drafting_docx_text(bytes)?, document_id, &[], true).map_err(|error| Error::Message(error.to_string()))
+pub fn analyze_docx_drafting_bytes(bytes: &[u8], document_id: String) -> Result<legal_structure_model::DocumentStructure> {
+    legal_structure_model::structure_analysis().analyze_instrument(drafting_docx_text(bytes)?, document_id, &[], true).map_err(|error| Error::Message(error.to_string()))
 }

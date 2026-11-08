@@ -105,7 +105,7 @@ impl Reading<'_> {
                     let marked = self.marker_of.contains_key(&(kept[at], self.stream_of[kept[at].index()]));
                     // (A line closing the reasons stands at a first line's indent: "Appeal allowed with costs.", "Solicitors for the appellants: ...".
                     // It stands apart: at the quotation's own leading it is the quotation's, a quoted order's "Counsel for the Applicant".)
-                    let closing = under.bbox[1] - row[1] > leading * 1.15 && (self.analysis.disposition_line(&under.text) || self.analysis.end_matter(&under.text) || self.analysis.author_line(&under.text));
+                    let closing = under.bbox[1] - row[1] > leading * 1.15 && (legal_structure_model::structure_analysis().disposition_line(&under.text) || legal_structure_model::structure_analysis().end_matter(&under.text) || legal_structure_model::structure_analysis().author_line(&under.text));
                     if opens.contains(&kept[at]) || closing || marked && !quoted || slots.page(kept[at]) != page || (under.bbox[0] - bbox[0]).abs() > 3.0 && !same_row && !(quoted && under.bbox[0] > bbox[0]) || enumerator && !quoted {
                         break;
                     }

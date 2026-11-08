@@ -8,7 +8,6 @@ impl Fences {
     /// more than half of whose lines they hold is that list).
     pub fn read_contents(
         &mut self,
-        analysis: &dyn StructureAnalysis,
         pages: &[Page],
         slots: &Slots,
         evidence: &Evidence,
@@ -40,7 +39,6 @@ impl Fences {
             contents_lists::read(
                 views,
                 &contents_lists::ListInput {
-                    analysis,
                     line_label: &|slot| role[slot.index()] == Role::LineLabel,
                     furniture: &|slot| matches!(role[slot.index()], Role::Furniture | Role::PageLabel),
                     heading: &|slot| matches!(evidence.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle),

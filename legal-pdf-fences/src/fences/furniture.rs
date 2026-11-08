@@ -7,9 +7,9 @@ impl Fences {
     /// offset, tallied over every label each page's furniture prints; each page's printed label
     /// from its furniture (`page_label`), its line the page's label; and the edge lines naming their
     /// page's sections.
-    pub fn read_furniture(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView], rows: &[&Rows]) {
+    pub fn read_furniture(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView], rows: &[&Rows]) {
         let found = legal_pdf_core::profile::measure("prepare.furniture", || {
-            legal_pdf_furniture::read(analysis, views, rows, |slot| evidence.line_number[slot.index()])
+            legal_pdf_furniture::read(views, rows, |slot| evidence.line_number[slot.index()])
         });
         for (slot, edge, rule) in found {
             if self.set(slot, Role::Furniture, rule) {
@@ -89,7 +89,7 @@ impl Fences {
     /// (`furniture::read`): the running heads and feet it repeats on its own pages, a short
     /// document's edges. A line no fence took is its furniture; a page that gains furniture and had
     /// no printed label takes its label from it.
-    pub fn read_document_furniture(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, rows: &[&Rows]) {
+    pub fn read_document_furniture(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, rows: &[&Rows]) {
         let documents = usize::from(self.document.iter().copied().max().unwrap_or(0)) + 1;
         let mut lines: Vec<Vec<Slot>> = vec![Vec::new(); documents];
         for slot in 0..slots.len() {
@@ -100,7 +100,7 @@ impl Fences {
             let views = PageView::of_slots(pages, slots, lines);
             let rows: Vec<&Rows> = views.iter().map(|view| rows[slots.page(view.lines[0])]).collect();
             let found = legal_pdf_core::profile::measure("prepare.furniture", || {
-                legal_pdf_furniture::read(analysis, &views, &rows, |slot| evidence.line_number[slot.index()])
+                legal_pdf_furniture::read(&views, &rows, |slot| evidence.line_number[slot.index()])
             });
             for (slot, edge, rule) in found {
                 if self.set(slot, Role::Furniture, rule) {

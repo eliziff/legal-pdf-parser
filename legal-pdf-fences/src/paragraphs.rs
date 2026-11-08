@@ -40,7 +40,6 @@ const QUOTED_INDENT: f64 = 9.0;
 /// The lines a judgment's paragraphs are read from, and what was measured of them: read once, for all its streams.
 struct Reading<'a> {
     fences: &'a Fences,
-    analysis: &'a dyn StructureAnalysis,
     pages: &'a [Page],
     slots: &'a Slots,
     evidence: &'a Evidence,
@@ -53,16 +52,16 @@ struct Reading<'a> {
 }
 
 impl<'a> Reading<'a> {
-    fn new(fences: &'a Fences, analysis: &'a dyn StructureAnalysis, pages: &'a [Page], slots: &'a Slots, evidence: &'a Evidence) -> Self {
+    fn new(fences: &'a Fences, pages: &'a [Page], slots: &'a Slots, evidence: &'a Evidence) -> Self {
         // (Each line's printed number, read once.)
-        let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| analysis.printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
+        let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| legal_structure_model::structure_analysis().printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
         let stream_of = fences.streams(&printed);
         let marker_of = fences.marker_rows(evidence, slots, &stream_of);
         let attached = marker_of.values().filter(|(_, added)| !added).map(|(marker, _)| *marker).collect();
         let measures = PageMeasures::of(fences, pages, slots, evidence);
         let numbers = Numbers::of(fences, pages, slots, evidence, &printed, &stream_of, &measures.edge);
         let counts = Counts::of(fences, pages, slots, evidence, &stream_of, &numbers);
-        Self { fences, analysis, pages, slots, evidence, stream_of, marker_of, attached, measures, numbers, counts }
+        Self { fences, pages, slots, evidence, stream_of, marker_of, attached, measures, numbers, counts }
     }
 
     fn small(&self, at: usize) -> bool {
@@ -96,7 +95,7 @@ impl<'a> Reading<'a> {
     fn hold(&self, text: &str, written: &Written, kept: &[Slot], stream: Stream, paragraphs: &mut Paragraphs) {
         let (pages, slots, place) = (self.pages, self.slots, &written.place);
         let kept_at: HashMap<Slot, usize> = kept.iter().enumerate().map(|(at, slot)| (*slot, at)).collect();
-        let read = self.analysis.judgment_paragraphs(text);
+        let read = legal_structure_model::structure_analysis().judgment_paragraphs(text);
         // (The lines the numbers open on: a marker opening any other line is a quotation's or a list's.)
         let mut opens: HashSet<Slot> = read.iter().filter_map(|(_, ranges)| ranges.first()).filter_map(|range| {
             place.get(range.start..range.end.min(place.len())).unwrap_or_default().iter().flatten().next().map(|(slot, _)| *slot)
@@ -219,14 +218,14 @@ impl Fences {
     /// decision's text (`judgment_paragraphs`) reads it, and its paragraphs come back to the lines as `paragraphs`.
     /// Each judgment's numbered paragraphs: which lines each number holds, and the line each opens on. Reading and
     /// storing are apart: only the margin's small figures are cleared before it, and the answer is stored once after.
-    pub fn read_paragraphs(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub fn read_paragraphs(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for at in 0..slots.len() {
             if self.note_label(evidence, at, self.margin_number[at]) {
                 self.margin_number[at] = None;
                 self.margin_twin[at] = None;
             }
         }
-        self.paragraphs = Reading::new(self, analysis, pages, slots, evidence).read();
+        self.paragraphs = Reading::new(self, pages, slots, evidence).read();
     }
 
     /// A line no paragraph holds: a fence took it.

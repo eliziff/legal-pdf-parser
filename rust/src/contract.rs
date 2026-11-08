@@ -237,12 +237,10 @@ fn finish_pdf_document(
     Ok(document)
 }
 
-pub fn query_pdf_document(
-    analysis: &dyn legal_structure_model::StructureAnalysis,
-    document: &PdfDocument,
+pub fn query_pdf_document(document: &PdfDocument,
     query: &PdfLookupRequest,
 ) -> PdfStructureLookup {
-    document.lookup(analysis, query)
+    document.lookup(query)
 }
 
 pub fn pdf_document_summary(document: &PdfDocument) -> &PdfSummary {

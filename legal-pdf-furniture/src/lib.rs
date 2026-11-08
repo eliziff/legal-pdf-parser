@@ -278,7 +278,7 @@ pub fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Edge, u32
 /// heading alone on its line ("PART 50") whose text no other line prints, and on a row of no other
 /// furniture, is no running head. Lines `line_label` holds are a transcript's line numbers, never
 /// furniture. Each line read as furniture, with its edge and the rule that read it.
-pub fn read(analysis: &dyn StructureAnalysis, views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
+pub fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
     // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
     if legal_structure_model::ablated("furniture") {
         return Vec::new();
@@ -388,7 +388,7 @@ pub fn read(analysis: &dyn StructureAnalysis, views: &[PageView], rows: &[&Rows]
                 }
                 let body_index = aligned_note_body_among(&page.lines, members.iter().copied(), index)?;
                 let body = &page.lines[body_index];
-                (body.bbox[1] > page.height * 0.86 && line_sizes[body_index] < body_size * 0.90 && analysis.has_citation_signal(&body.text))
+                (body.bbox[1] > page.height * 0.86 && line_sizes[body_index] < body_size * 0.90 && legal_structure_model::structure_analysis().has_citation_signal(&body.text))
                     .then_some([index, body_index])
             }).flatten());
             for (&slot, &index) in view.lines.iter().zip(&members) {

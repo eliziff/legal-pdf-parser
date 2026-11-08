@@ -67,21 +67,21 @@ pub fn closing(text: &str) -> bool {
         || text.starts_with("reasons for decision")
 }
 
-fn numbered_start(analysis: &dyn StructureAnalysis, marker: &str) -> bool {
-    analysis
+fn numbered_start(marker: &str) -> bool {
+    legal_structure_model::structure_analysis()
         .numbering_marker(marker, None)
         .is_some_and(|marker| marker.ordinal == 1)
 }
 
-pub fn reasons(analysis: &dyn StructureAnalysis, line: &Line) -> bool {
+pub fn reasons(line: &Line) -> bool {
     let value = line.text.trim();
-    if value.starts_with('[') && value.ends_with(']') && numbered_start(analysis, value) {
+    if value.starts_with('[') && value.ends_with(']') && numbered_start(value) {
         return true;
     }
     let Some((marker, text)) = value.split_once(char::is_whitespace) else {
         return false;
     };
-    text.trim().chars().count() >= 24 && numbered_start(analysis, marker)
+    text.trim().chars().count() >= 24 && numbered_start(marker)
 }
 
 /// A dedicated citation line can name the case; a reference inside another field cannot.

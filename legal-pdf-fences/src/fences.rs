@@ -141,7 +141,7 @@ impl Fences {
 
     /// The fences, contexts and reading order of the document's pages, measured (`evidence`), its
     /// bookmarks `outline`.
-    pub fn read(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, outline: &[PdfOutlineEntry]) -> Self {
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, outline: &[PdfOutlineEntry]) -> Self {
         let count = slots.len();
         let mut fences = Self {
             role: vec![Role::Open; count],
@@ -161,19 +161,19 @@ impl Fences {
         for slot in (0..count).filter(|&slot| evidence.line_number[slot]) {
             fences.set(Slot(slot as u32), Role::LineLabel, Rule::LineNumber);
         }
-        fences.read_furniture(analysis, pages, slots, evidence, &views, &rows);
+        fences.read_furniture(pages, slots, evidence, &views, &rows);
         let items = fences.read_columns(pages, slots, evidence);
         fences.read_translation(pages, slots, evidence, &views);
         let (tables, in_table, listed) = fences.find_tables(pages, slots, &items);
-        let listed_contents = fences.read_contents(analysis, pages, slots, evidence, &views, &in_table, &listed);
+        let listed_contents = fences.read_contents(pages, slots, evidence, &views, &in_table, &listed);
         fences.read_tables(slots, tables, &listed_contents);
         fences.read_note_band(pages, slots, evidence);
         fences.read_body_type(pages, slots, evidence);
         fences.clear_false_bands(pages, slots, evidence);
         let mut voided = fences.free_noted_cells(pages, slots, evidence);
-        fences.read_documents(analysis, &views, outline);
+        fences.read_documents(&views, outline);
         if !fences.starts.is_empty() {
-            fences.read_document_furniture(analysis, pages, slots, evidence, &rows);
+            fences.read_document_furniture(pages, slots, evidence, &rows);
         }
         fences.read_transcripts(slots, evidence);
         voided |= fences.free_spoken_cells(slots, evidence);
@@ -188,16 +188,16 @@ impl Fences {
     /// The document's paragraph numbers, read once its misread markers are restored (`Runs::read`), the margin's again
     /// where any was. The judgment's paragraphs are counted on the lines' continuations, and the printed numbers the
     /// count does not take are another writing's, quoted: their passages are contexts of their own, read with the lines again.
-    pub fn read_numbers(&mut self, analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, repaired: bool) {
+    pub fn read_numbers(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, repaired: bool) {
         if repaired {
             self.read_margin_numbers(pages, slots);
         }
         self.read_contexts();
-        self.read_continuations(analysis, pages, slots, evidence);
-        self.read_paragraphs(analysis, pages, slots, evidence);
-        if self.read_quotations(analysis, pages, slots) {
+        self.read_continuations(pages, slots, evidence);
+        self.read_paragraphs(pages, slots, evidence);
+        if self.read_quotations(pages, slots) {
             self.read_contexts();
-            self.read_continuations(analysis, pages, slots, evidence);
+            self.read_continuations(pages, slots, evidence);
         }
     }
 

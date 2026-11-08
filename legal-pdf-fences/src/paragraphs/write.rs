@@ -78,7 +78,7 @@ impl Reading<'_> {
 
     /// Whether the line at `place` goes on from the line before it.
     fn joins(&self, kept: &[Slot], flow: &Flow, place: usize, before: Slot, marker: Option<(Slot, bool)>, last_advance: &mut f64, led: &mut Vec<(Slot, Slot)>) -> bool {
-        let (fences, analysis, pages, slots, evidence) = (self.fences, self.analysis, self.pages, self.slots, self.evidence);
+        let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let (slot, at) = (kept[place], kept[place].index());
         let line = &slots.line(pages, slot).text;
         let (above, here) = (slots.line(pages, before), slots.line(pages, slot));
@@ -122,7 +122,7 @@ impl Reading<'_> {
         let advance = here.bbox[1] - above.bbox[1];
         let level = (here.bbox[0] - above.bbox[0]).abs() <= here.bbox[3] - here.bbox[1];
         // (Asked only where it can tell: after the last number, or under a sentence's end.)
-        let closing = (flow.to_number[place] == usize::MAX || closes) && (analysis.signature_line(line) || analysis.end_matter(line) || analysis.author_line(line) || analysis.date_line(line) || analysis.disposition_line(line));
+        let closing = (flow.to_number[place] == usize::MAX || closes) && (legal_structure_model::structure_analysis().signature_line(line) || legal_structure_model::structure_analysis().end_matter(line) || legal_structure_model::structure_analysis().author_line(line) || legal_structure_model::structure_analysis().date_line(line) || legal_structure_model::structure_analysis().disposition_line(line));
         let last_goes_on = flow.to_number[place] == usize::MAX && level && !closing && *last_advance > 0.0 && advance > 0.0 && advance <= *last_advance * 1.15;
         let same = same || last_goes_on;
         if level && advance > 0.0 {
@@ -132,11 +132,11 @@ impl Reading<'_> {
         // (Under a sentence's end they do wherever they stand: a schedule's numbers may follow.)
         // (An author's line stands on its own wherever it does: a column's last word may have gone over the gutter.)
         // (A signer's name over the title under it too: "... signée en son nom par Claude Roy" / "Vice-president".)
-        let signer = line.split_whitespace().count() <= 4 && line.split_whitespace().all(|word| word.starts_with(char::is_uppercase)) && !line.trim_end().ends_with('.') && kept.get(place + 1).is_some_and(|next| analysis.signature_line(&slots.line(pages, *next).text));
+        let signer = line.split_whitespace().count() <= 4 && line.split_whitespace().all(|word| word.starts_with(char::is_uppercase)) && !line.trim_end().ends_with('.') && kept.get(place + 1).is_some_and(|next| legal_structure_model::structure_analysis().signature_line(&slots.line(pages, *next).text));
         // (A line further out than the line above, whose first word would have fit on it, goes on from no sentence: a quotation's or a list's
         // last line stopped short of the column, "... V6T 1Z1" / "The Security Guard Unit", "7. R. v. Slemko, [2017] B.C.J. No. 2667" / "Legal Parameters and Principles.".)
         let stopped_short = slots.page(before) == slots.page(slot) && above.bbox[0] - here.bbox[0] > here.bbox[3] - here.bbox[1] && here.words.first().is_some_and(|word| word.bbox[2] - word.bbox[0] < room) && !here.recognized();
-        let apart = apart || (closing || signer) && (flow.to_number[place] == usize::MAX || closes) || analysis.author_line(line) || stopped_short;
+        let apart = apart || (closing || signer) && (flow.to_number[place] == usize::MAX || closes) || legal_structure_model::structure_analysis().author_line(line) || stopped_short;
         let fused = place > 0 && self.drop_capital(kept, place - 1);
         let joined = marker.is_none() && (alone || fused || !apart && (same || fences.continues[at].is_some())) || self.numbers.indented.contains(&slot);
         if alone && marker.is_none() {

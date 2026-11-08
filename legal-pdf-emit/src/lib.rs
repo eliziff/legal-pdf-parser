@@ -76,9 +76,7 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
 /// The document's structure graph from its lines (`table`, `views`) and the moves they made, with the
 /// paragraphs and footnotes the projection reads: what tier 0 wrote and paired before its moves (`settled`) stands.
 /// Each node's page indexes are its lines' pages, set with its exact membership (`outline_contexts`).
-pub fn structure_graph(
-    analysis: &dyn StructureAnalysis,
-    pages: &mut [Page],
+pub fn structure_graph(pages: &mut [Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
@@ -382,7 +380,7 @@ pub fn structure_graph(
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
     let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, &decided);
-    legal_pdf_graph::graph::assemble_outline(analysis, &mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
+    legal_pdf_graph::graph::assemble_outline(&mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
     // A provision's path from the outermost provision it stands in ("12(1)(a)"), by the parents the outline kept, after
     // its printing's alias where it has one: each unit's printed label along the chain.
     let label_of: HashMap<&str, &str> = units.iter().enumerate().filter_map(|(u, unit)| Some((unit_ids[u].as_str(), unit.label.as_deref()?))).collect();

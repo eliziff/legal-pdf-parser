@@ -27,9 +27,7 @@ fn without_lines(page: &Page) -> Page {
 /// The document's notes paired on the pages as the decision wrote them (their regions and note
 /// modes), each constituent document and language on its own lines; the pages' lines are left as
 /// they stand.
-pub fn pair_notes(
-    analysis: &dyn StructureAnalysis,
-    pages: &mut [Page],
+pub fn pair_notes(pages: &mut [Page],
     decided: &Decided,
     citations: &BTreeMap<String, Vec<PdfSourceSpan>>,
     index: &PdfTextIndex,
@@ -40,7 +38,7 @@ pub fn pair_notes(
         .collect();
     let first = contexts.iter().flatten().next().copied();
     if contexts.iter().flatten().all(|context| Some(*context) == first) {
-        return analysis.pair_footnotes(pages, citations, false);
+        return legal_structure_model::structure_analysis().pair_footnotes(pages, citations, false);
     }
     // Each document and language's lines, moved into pages of their own and back after.
     let mut readings = BTreeMap::<DocumentContext, Vec<Page>>::new();
@@ -66,7 +64,7 @@ pub fn pair_notes(
     };
     let mut sequence_offset = 0;
     for document in readings.values() {
-        let mut part = analysis.pair_footnotes(document, citations, false);
+        let mut part = legal_structure_model::structure_analysis().pair_footnotes(document, citations, false);
         let sequences = part
             .footnotes
             .iter()
