@@ -107,13 +107,11 @@ impl OpenVinoFunctions {
         }
         let detail = unsafe {
             let message = (self.last_error)();
-            if message.is_null() {
-                None
-            } else {
+            (!message.is_null()).then(|| {
                 let detail = CStr::from_ptr(message).to_string_lossy().into_owned();
                 (self.free)(message);
-                Some(detail)
-            }
+                detail
+            })
         };
         Err(Error::Message(match detail {
             Some(detail) if !detail.is_empty() => {
@@ -171,12 +169,9 @@ impl OpenVinoSession {
         let device = CString::new(device)
             .map_err(|_| Error::Message("OpenVINO device contains a NUL byte".to_owned()))?;
         let mut compiled_model = ptr::null_mut();
-        let performance_key = c"PERFORMANCE_HINT";
-        let latency = c"LATENCY";
-        let precision_key = c"INFERENCE_PRECISION_HINT";
-        let f32_precision = c"f32";
-        let streams_key = c"NUM_STREAMS";
-        let one_stream = c"1";
+        let (performance_key, latency, precision_key) =
+            (c"PERFORMANCE_HINT", c"LATENCY", c"INFERENCE_PRECISION_HINT");
+        let (f32_precision, streams_key, one_stream) = (c"f32", c"NUM_STREAMS", c"1");
         let cache_dir = cache_dir
             .map(|path| path_string(path, "cache directory"))
             .transpose()?;
@@ -284,9 +279,11 @@ impl OpenVinoSession {
             "infer-request creation",
         ) {
             unsafe {
-                (functions.compiled_model_free)(compiled_model);
-                (functions.core_free)(core);
-            }
+                (
+                    (functions.compiled_model_free)(compiled_model),
+                    (functions.core_free)(core),
+                )
+            };
             return Err(error);
         }
         Ok(Self {
@@ -359,7 +356,6 @@ impl OpenVinoSession {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn infer(
         &mut self,
         inputs: &[String],
@@ -500,11 +496,9 @@ impl OpenVinoSession {
             match element_type {
                 OV_I32 => i64::from(*data.cast::<i32>()),
                 OV_I64 => *data.cast::<i64>(),
-                _ => {
-                    return Err(Error::Message(format!(
+                _ => return Err(Error::Message(format!(
                     "PPdoc OpenVINO count output {name:?} is not i32 or i64 (type {element_type})"
-                )))
-                }
+                ))),
             }
         };
         Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))

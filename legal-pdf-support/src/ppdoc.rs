@@ -1,6 +1,7 @@
 use crate::ppdoc_openvino::OpenVinoSession;
 use crate::ppdoc_postprocess::{
-    best_region_index, nearest_region_index, postprocess_document, scale_detections, RegionDetection,
+    best_region_index, nearest_region_index, postprocess_document, scale_detections,
+    RegionDetection,
 };
 use image::{imageops, RgbImage};
 use legal_pdf_core::model::{Diagnostic, Page};
@@ -118,25 +119,31 @@ impl Default for ModelNmsManifest {
 const fn default_nms_score_threshold() -> f32 {
     0.01
 }
-
 const fn default_nms_threshold() -> f32 {
     0.7
 }
-
 const fn default_nms_top_k() -> usize {
     1_000
 }
-
 fn default_backend() -> String {
     "onnx".to_owned()
 }
-
 const fn default_detections_per_image() -> usize {
     300
 }
-
 const fn default_output_width() -> usize {
     7
+}
+const fn default_scale() -> f32 {
+    1.0 / 255.0
+}
+fn default_interpolation() -> String {
+    "opencv_cubic".to_owned()
+}
+
+/// A failure the pack, the options or the model's outputs make.
+fn fail<T>(message: impl Into<String>) -> Result<T> {
+    Err(Error::Message(message.into()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,14 +155,6 @@ struct InputManifest {
     scale: f32,
     mean: [f32; 3],
     std: [f32; 3],
-}
-
-const fn default_scale() -> f32 {
-    1.0 / 255.0
-}
-
-fn default_interpolation() -> String {
-    "opencv_cubic".to_owned()
 }
 
 struct ModelPack {
@@ -172,138 +171,106 @@ impl ModelPack {
         let manifest: Manifest = serde_json::from_reader(BufReader::new(
             File::open(&manifest_path).map_err(|source| Error::io(&manifest_path, source))?,
         ))?;
+        let (model, input, nms) = (
+            &manifest.model,
+            &manifest.input,
+            &manifest.postprocess.model_nms,
+        );
+        let unit = |value: f32| value.is_finite() && (0.0..=1.0).contains(&value);
+        let ir = matches!(model.backend.as_str(), "onnx" | "openvino");
         if manifest.format != PACK_FORMAT || manifest.variant_id.trim().is_empty() {
-            return Err(Error::Message(
-                "PPdoc model pack has an unsupported format or empty variant ID".to_owned(),
-            ));
+            return fail("PPdoc model pack has an unsupported format or empty variant ID");
         }
         if manifest.labels.is_empty() || manifest.labels.iter().any(|label| label.trim().is_empty())
         {
-            return Err(Error::Message(
-                "PPdoc model pack has no usable labels".to_owned(),
-            ));
+            return fail("PPdoc model pack has no usable labels");
         }
-        if manifest.input.target_size.contains(&0)
-            || manifest.input.mean.iter().any(|value| !value.is_finite())
-            || manifest
-                .input
+        if input.target_size.contains(&0)
+            || input.mean.iter().any(|value| !value.is_finite())
+            || input
                 .std
                 .iter()
                 .any(|value| !value.is_finite() || *value == 0.0)
         {
-            return Err(Error::Message(
-                "PPdoc model pack has invalid preprocessing values".to_owned(),
-            ));
+            return fail("PPdoc model pack has invalid preprocessing values");
         }
-        if manifest
-            .model
-            .inputs
-            .iter()
-            .any(|name| name.trim().is_empty())
-            || manifest
-                .model
+        if model.inputs.iter().any(|name| name.trim().is_empty())
+            || model
                 .inputs
                 .iter()
                 .enumerate()
-                .any(|(index, name)| manifest.model.inputs[index + 1..].contains(name))
-            || !matches!(
-                manifest.input.interpolation.as_str(),
-                "opencv_cubic" | "bilinear"
-            )
+                .any(|(index, name)| model.inputs[index + 1..].contains(name))
+            || !matches!(input.interpolation.as_str(), "opencv_cubic" | "bilinear")
         {
-            return Err(Error::Message(
-                "PPdoc model pack has invalid input names or preprocessing interpolation"
-                    .to_owned(),
-            ));
+            return fail("PPdoc model pack has invalid input names or preprocessing interpolation");
         }
-        if !matches!(manifest.model.inputs.as_slice(), [_image])
-            && !matches!(manifest.model.inputs.as_slice(), [image, scale] if image == "image" && scale == "scale_factor")
-            && !matches!(manifest.model.inputs.as_slice(), [shape, image, scale] if shape == "im_shape" && image == "image" && scale == "scale_factor")
+        if !matches!(model.inputs.as_slice(), [_image])
+            && !matches!(model.inputs.as_slice(), [image, scale] if image == "image" && scale == "scale_factor")
+            && !matches!(model.inputs.as_slice(), [shape, image, scale] if shape == "im_shape" && image == "image" && scale == "scale_factor")
         {
-            return Err(Error::Message(format!(
+            return fail(format!(
                 "PPdoc model inputs are unsupported: {:?}",
-                manifest.model.inputs
-            )));
+                model.inputs
+            ));
         }
-        match manifest.model.outputs.get("contract").map(String::as_str) {
-            Some("decoded_boxes") if manifest.model.outputs.contains_key("boxes") => {}
-            Some("rtdetr_raw")
-                if matches!(manifest.model.backend.as_str(), "onnx" | "openvino")
-                    && manifest.model.outputs.contains_key("boxes")
-                    && manifest.model.outputs.contains_key("logits") => {}
-            Some("ppyoloe_raw")
-                if matches!(manifest.model.backend.as_str(), "onnx" | "openvino")
-                    && manifest.model.outputs.contains_key("boxes")
-                    && manifest.model.outputs.contains_key("scores") => {}
-            contract => {
-                return Err(Error::Message(format!(
-                    "unsupported PPdoc output contract: {contract:?}"
-                )))
-            }
+        let has = |output: &str| model.outputs.contains_key(output);
+        let contract = model.outputs.get("contract").map(String::as_str);
+        match contract {
+            Some("decoded_boxes") if has("boxes") => {}
+            Some("rtdetr_raw") if ir && has("boxes") && has("logits") => {}
+            Some("ppyoloe_raw") if ir && has("boxes") && has("scores") => {}
+            contract => return fail(format!("unsupported PPdoc output contract: {contract:?}")),
         }
-        if !matches!(manifest.model.backend.as_str(), "onnx" | "openvino") || manifest.model.params.is_some() {
-            return Err(Error::Message(format!(
+        if !ir || model.params.is_some() {
+            return fail(format!(
                 "OpenVINO requires an ONNX or OpenVINO IR model pack, not {}",
-                manifest.model.backend
-            )));
-        }
-        if manifest.model.detections_per_image == 0 || manifest.model.output_width < 6 {
-            return Err(Error::Message(
-                "PPdoc model has invalid decoded-box dimensions".to_owned(),
+                model.backend
             ));
         }
-        if manifest.model.outputs.get("contract").map(String::as_str) == Some("ppyoloe_raw")
-            && (!manifest.postprocess.model_nms.score_threshold.is_finite()
-                || !(0.0..=1.0).contains(&manifest.postprocess.model_nms.score_threshold)
-                || !manifest.postprocess.model_nms.nms_threshold.is_finite()
-                || !(0.0..=1.0).contains(&manifest.postprocess.model_nms.nms_threshold)
-                || manifest.postprocess.model_nms.nms_top_k == 0)
+        if model.detections_per_image == 0 || model.output_width < 6 {
+            return fail("PPdoc model has invalid decoded-box dimensions");
+        }
+        if contract == Some("ppyoloe_raw")
+            && (!unit(nms.score_threshold) || !unit(nms.nms_threshold) || nms.nms_top_k == 0)
         {
-            return Err(Error::Message(
-                "PPdoc PP-YOLOE pack has invalid model NMS settings".to_owned(),
-            ));
+            return fail("PPdoc PP-YOLOE pack has invalid model NMS settings");
         }
         if manifest
             .postprocess
             .score_threshold
-            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            .is_some_and(|value| !unit(value))
         {
-            return Err(Error::Message(
-                "PPdoc model pack has an invalid postprocess score threshold".to_owned(),
+            return fail("PPdoc model pack has an invalid postprocess score threshold");
+        }
+        let model_path = pack_file(&root, &model.file, "model")?;
+        let model_sha256 = provider_asset_sha256(&model_path)?;
+        if model_sha256 != model.sha256.to_ascii_lowercase() {
+            return fail(format!(
+                "PPdoc model hash mismatch: expected {}, found {model_sha256}",
+                model.sha256
             ));
         }
-        let model = pack_file(&root, &manifest.model.file, "model")?;
-        let model_sha256 = provider_asset_sha256(&model)?;
-        if model_sha256 != manifest.model.sha256.to_ascii_lowercase() {
-            return Err(Error::Message(format!(
-                "PPdoc model hash mismatch: expected {}, found {model_sha256}",
-                manifest.model.sha256
-            )));
-        }
-        let companion_sha256 = manifest
-            .model
+        let companion_sha256 = model
             .files
             .iter()
             .map(|companion| {
-                let path = pack_file(&root, &companion.file, "companion")?;
-                let actual = provider_asset_sha256(&path)?;
+                let actual =
+                    provider_asset_sha256(&pack_file(&root, &companion.file, "companion")?)?;
                 if actual != companion.sha256.to_ascii_lowercase() {
-                    return Err(Error::Message(format!(
+                    return fail(format!(
                         "PPdoc companion hash mismatch for {}: expected {}, found {actual}",
                         companion.file, companion.sha256
-                    )));
+                    ));
                 }
                 Ok(actual)
             })
             .collect::<Result<Vec<_>>>()?;
-        if manifest.model.backend == "openvino" && companion_sha256.is_empty() {
-            return Err(Error::Message(
-                "OpenVINO IR model packs require a hash-checked companion file".to_owned(),
-            ));
+        if model.backend == "openvino" && companion_sha256.is_empty() {
+            return fail("OpenVINO IR model packs require a hash-checked companion file");
         }
         Ok(Self {
             manifest,
-            model,
+            model: model_path,
             model_sha256,
             companion_sha256,
         })
@@ -344,36 +311,41 @@ impl PPDocLayout {
 
     pub fn prepare(options: &PPDocOptions) -> Result<PreparedPPDoc> {
         if !(0.0..=1.0).contains(&options.threshold) || !options.threshold.is_finite() {
-            return Err(Error::Message(
-                "PPdoc threshold must be between zero and one".to_owned(),
-            ));
+            return fail("PPdoc threshold must be between zero and one");
         }
         if !(72..=600).contains(&options.render_dpi) {
-            return Err(Error::Message(
-                "PPdoc render DPI must be between 72 and 600".to_owned(),
-            ));
+            return fail("PPdoc render DPI must be between 72 and 600");
         }
-        let pack_path = required_path(
+        let pack = ModelPack::load(&required_path(
             &options.model_pack,
             "LEGALPDF_PPDOC_MODEL_PACK",
             "PPdoc model pack",
+        )?)?;
+        let runtime = required_path(
+            &options.runtime,
+            "LEGALPDF_OPENVINO_RUNTIME",
+            "OpenVINO C runtime library",
         )?;
-        let pack = ModelPack::load(&pack_path)?;
-        let runtime = required_path(&options.runtime, "LEGALPDF_OPENVINO_RUNTIME", "OpenVINO C runtime library")?;
         let runtime = canonical_file(&runtime, "OpenVINO C runtime library")?;
         let cache_dir = options
             .cache_dir
             .clone()
-            .or_else(|| std::env::var_os("LEGALPDF_PPDOC_CACHE_DIR").map(PathBuf::from))
+            .or_else(|| std::env::var_os("LEGALPDF_PPDOC_CACHE_DIR").map(PathBuf::from));
+        let cache_dir = cache_dir
             .filter(|path| !path.as_os_str().is_empty())
             .map(|path| {
                 fs::create_dir_all(&path).map_err(|source| Error::io(&path, source))?;
                 fs::canonicalize(&path).map_err(|source| Error::io(&path, source))
             })
             .transpose()?;
-        let device = options.device.as_deref().unwrap_or("default").trim().to_owned();
+        let device = options
+            .device
+            .as_deref()
+            .unwrap_or("default")
+            .trim()
+            .to_owned();
         if device.is_empty() {
-            return Err(Error::Message("OpenVINO device cannot be empty".to_owned()));
+            return fail("OpenVINO device cannot be empty");
         }
         let threshold = options.threshold.max(
             pack.manifest
@@ -381,32 +353,26 @@ impl PPDocLayout {
                 .score_threshold
                 .unwrap_or_default(),
         );
-        let identity = format!(
-            "ppdoc-lite-rust-v5:variant={}:model_backend={}:execution_backend=openvino:device={}:fallback=none:model={}:companions={}:params=none:runtime={}:onednn=false:threshold={:.6}:render_dpi={}:input={}:interpolation={}",
-            pack.manifest.variant_id,
-            pack.manifest.model.backend,
-            device,
-            pack.model_sha256,
+        let (manifest, companions) = (
+            &pack.manifest,
             if pack.companion_sha256.is_empty() {
                 "none".to_owned()
             } else {
                 pack.companion_sha256.join(",")
             },
-            provider_asset_sha256(&runtime)?,
-            threshold,
-            options.render_dpi,
-            pack.manifest.model.inputs.join(","),
-            pack.manifest.input.interpolation,
         );
-        if options
+        let identity = format!(
+            "ppdoc-lite-rust-v5:variant={}:model_backend={}:execution_backend=openvino:device={device}:fallback=none:model={}:companions={companions}:params=none:runtime={}:onednn=false:threshold={threshold:.6}:render_dpi={}:input={}:interpolation={}",
+            manifest.variant_id, manifest.model.backend, pack.model_sha256, provider_asset_sha256(&runtime)?, options.render_dpi, manifest.model.inputs.join(","), manifest.input.interpolation,
+        );
+        if let Some(expected) = options
             .expected_identity
             .as_deref()
-            .is_some_and(|expected| expected != identity)
+            .filter(|expected| *expected != identity)
         {
-            return Err(Error::Message(format!(
-                "PPdoc identity changed before inference: expected {}, found {identity}",
-                options.expected_identity.as_deref().unwrap_or_default()
-            )));
+            return fail(format!(
+                "PPdoc identity changed before inference: expected {expected}, found {identity}"
+            ));
         }
         Ok(PreparedPPDoc {
             pack,
@@ -427,7 +393,13 @@ impl PPDocLayout {
             threshold,
             identity,
         } = prepared;
-        let session = OpenVinoSession::new(&runtime, &pack.model, &device, options.threads, cache_dir.as_deref())?;
+        let session = OpenVinoSession::new(
+            &runtime,
+            &pack.model,
+            &device,
+            options.threads,
+            cache_dir.as_deref(),
+        )?;
         Ok(Self {
             session,
             pack,
@@ -450,7 +422,8 @@ impl PPDocLayout {
             return Err(Error::Message("PPdoc input image is empty".to_owned()));
         }
         let [target_height, target_width] = self.pack.manifest.input.target_size;
-        let input = &self.pack.manifest.input;
+        let manifest = &self.pack.manifest;
+        let input = &manifest.input;
         let pixels = match input.interpolation.as_str() {
             "opencv_cubic" => resize_opencv_cubic_nchw(
                 image,
@@ -475,11 +448,16 @@ impl PPDocLayout {
             target_height as f32 / image.height() as f32,
             target_width as f32 / image.width() as f32,
         ];
+        let (model, nms, classes) = (
+            &manifest.model,
+            &manifest.postprocess.model_nms,
+            manifest.labels.len(),
+        );
         let (values, width, count) = run_openvino(
             &mut self.session,
-            &self.pack.manifest.model,
-            &self.pack.manifest.postprocess.model_nms,
-            self.pack.manifest.labels.len(),
+            model,
+            nms,
+            classes,
             self.threshold,
             pixels,
             target_height,
@@ -491,7 +469,7 @@ impl PPDocLayout {
             &values,
             width,
             count,
-            &self.pack.manifest.labels,
+            &manifest.labels,
             image.width(),
             image.height(),
             self.threshold,
@@ -518,7 +496,6 @@ impl PPDocLayout {
         };
         let mut regions_by_page = vec![Vec::<RegionDetection>::new(); pages.len()];
         let mut detection_count = 0;
-
         for (page_position, page) in pages.iter().enumerate() {
             if !page
                 .lines
@@ -531,13 +508,12 @@ impl PPDocLayout {
                 Error::Message(format!("PDF page index is out of range: {}", page.index))
             })?;
             let pixmap = render(pdf_page, &cache, &interpreter, &settings);
-            let width = u32::from(pixmap.width());
-            let height = u32::from(pixmap.height());
+            let (width, height) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
             if width == 0 || height == 0 {
-                return Err(Error::Message(format!(
+                return fail(format!(
                     "PPdoc renderer produced an empty page image for page {}",
                     page.number
-                )));
+                ));
             }
             let pixels = pixmap
                 .data_as_u8_slice()
@@ -555,14 +531,15 @@ impl PPDocLayout {
         crate::profile::measure("ppdoc_postprocess", || {
             postprocess_document(pages, &mut regions_by_page)
         });
-        let mut pending = Vec::<(usize, usize, String, String)>::new();
-        let mut unmatched = Vec::new();
+        let (mut pending, mut unmatched) =
+            (Vec::<(usize, usize, String, String)>::new(), Vec::new());
         for (page_position, page) in pages.iter().enumerate() {
             for (line_index, line) in page.lines.iter().enumerate() {
-                if line.exclude_from_body || line.text.trim().is_empty() {
-                    continue;
-                }
-                if legal_pdf_core::is_heading_role(&line.region_type) || line.region_type == "LI" {
+                if line.exclude_from_body
+                    || line.text.trim().is_empty()
+                    || legal_pdf_core::is_heading_role(&line.region_type)
+                    || line.region_type == "LI"
+                {
                     continue;
                 }
                 let regions = &regions_by_page[page_position];
@@ -583,7 +560,6 @@ impl PPDocLayout {
                 ));
             }
         }
-
         if !unmatched.is_empty() {
             let mut diagnostic = Diagnostic::warning(
                 "PPDOC_LAYOUT_INCOMPLETE",
@@ -599,11 +575,9 @@ impl PPDocLayout {
                 .insert("matched_lines".to_owned(), serde_json::json!(pending.len()));
             return Ok(vec![diagnostic]);
         }
-
         for (page_index, line_index, label, region_id) in pending {
             let line = &mut pages[page_index].lines[line_index];
-            line.region_type = label;
-            line.region_id = region_id;
+            (line.region_type, line.region_id) = (label, region_id);
         }
         Ok(Vec::new())
     }
@@ -624,10 +598,11 @@ fn run_openvino(
 ) -> Result<(Vec<f32>, usize, usize)> {
     let contract = model.outputs.get("contract").map(String::as_str);
     if contract == Some("decoded_boxes") {
+        let counts = model.outputs.get("counts").map(String::as_str);
         let outputs = session.run_decoded(
             &model.inputs,
             &model.outputs["boxes"],
-            model.outputs.get("counts").map(String::as_str),
+            counts,
             pixels,
             target_height,
             target_width,
@@ -638,31 +613,46 @@ fn run_openvino(
             decoded_output_dimensions(&outputs.boxes_shape, outputs.boxes.len(), outputs.count)?;
         return Ok((outputs.boxes, width, count));
     }
-    if contract == Some("ppyoloe_raw") {
-        let outputs = session.run_raw(
-            &model.inputs,
-            &model.outputs["boxes"],
-            &model.outputs["scores"],
-            pixels,
-            target_height,
-            target_width,
-            im_shape_values,
-            scale_values,
-        )?;
-        if outputs.boxes_shape.len() != 3
-            || outputs.logits_shape.len() != 3
-            || outputs.boxes_shape[0] != 1
-            || outputs.logits_shape[0] != 1
-            || outputs.boxes_shape[2] != 4
-            || outputs.logits_shape[1] != class_count as i64
-            || outputs.boxes_shape[1] != outputs.logits_shape[2]
-        {
-            return Err(Error::Message(format!(
-                "PPdoc PP-YOLOE outputs have unexpected shapes: boxes={:?}, scores={:?}",
-                outputs.boxes_shape, outputs.logits_shape
-            )));
-        }
-        let query_count = usize::try_from(outputs.boxes_shape[1]).unwrap_or(0);
+    // Both raw contracts give boxes [1, queries, 4] beside the classes' scores: PP-YOLOE's [1, classes, queries], RT-DETR's
+    // logits [1, queries, classes].
+    let yoloe = contract == Some("ppyoloe_raw");
+    if !yoloe && contract != Some("rtdetr_raw") {
+        return fail(
+            "native OpenVINO requires a decoded-box, RT-DETR raw, or PP-YOLOE raw output contract",
+        );
+    }
+    let scores = &model.outputs[if yoloe { "scores" } else { "logits" }];
+    let outputs = session.run_raw(
+        &model.inputs,
+        &model.outputs["boxes"],
+        scores,
+        pixels,
+        target_height,
+        target_width,
+        im_shape_values,
+        scale_values,
+    )?;
+    let (boxes, logits) = (&outputs.boxes_shape, &outputs.logits_shape);
+    let (classes, queries) = if yoloe { (1, 2) } else { (2, 1) };
+    if boxes.len() != 3
+        || logits.len() != 3
+        || boxes[0] != 1
+        || logits[0] != 1
+        || boxes[2] != 4
+        || logits[classes] != class_count as i64
+        || boxes[1] != logits[queries]
+    {
+        let (name, scores) = if yoloe {
+            ("PP-YOLOE", "scores")
+        } else {
+            ("OpenVINO", "logits")
+        };
+        return fail(format!(
+            "PPdoc {name} outputs have unexpected shapes: boxes={boxes:?}, {scores}={logits:?}"
+        ));
+    }
+    let query_count = usize::try_from(outputs.boxes_shape[1]).unwrap_or(0);
+    if yoloe {
         let decoded = decode_ppyoloe_raw(
             &outputs.boxes,
             &outputs.logits,
@@ -675,36 +665,6 @@ fn run_openvino(
         let count = decoded.len() / 7;
         return Ok((decoded, 7, count));
     }
-    if contract != Some("rtdetr_raw") {
-        return Err(Error::Message(
-            "native OpenVINO requires a decoded-box, RT-DETR raw, or PP-YOLOE raw output contract"
-                .to_owned(),
-        ));
-    }
-    let outputs = session.run_raw(
-        &model.inputs,
-        &model.outputs["boxes"],
-        &model.outputs["logits"],
-        pixels,
-        target_height,
-        target_width,
-        im_shape_values,
-        scale_values,
-    )?;
-    if outputs.boxes_shape.len() != 3
-        || outputs.logits_shape.len() != 3
-        || outputs.boxes_shape[0] != 1
-        || outputs.logits_shape[0] != 1
-        || outputs.boxes_shape[2] != 4
-        || outputs.boxes_shape[1] != outputs.logits_shape[1]
-        || outputs.logits_shape[2] != class_count as i64
-    {
-        return Err(Error::Message(format!(
-            "PPdoc OpenVINO outputs have unexpected shapes: boxes={:?}, logits={:?}",
-            outputs.boxes_shape, outputs.logits_shape
-        )));
-    }
-    let query_count = usize::try_from(outputs.boxes_shape[1]).unwrap_or(0);
     let image_height = (im_shape_values[0] / scale_values[0] + 0.5).floor();
     let image_width = (im_shape_values[1] / scale_values[1] + 0.5).floor();
     let decoded = decode_rtdetr_raw(
@@ -746,7 +706,6 @@ struct PPYoloeCandidate {
     bbox: [f32; 4],
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_ppyoloe_raw(
     boxes: &[f32],
     scores: &[f32],
@@ -757,9 +716,7 @@ fn decode_ppyoloe_raw(
     requested_threshold: f32,
 ) -> Result<Vec<f32>> {
     if boxes.len() != query_count * 4 || scores.len() != class_count * query_count {
-        return Err(Error::Message(
-            "PPdoc PP-YOLOE tensor lengths do not match their shapes".to_owned(),
-        ));
+        return fail("PPdoc PP-YOLOE tensor lengths do not match their shapes");
     }
     let score_threshold = nms.score_threshold.max(requested_threshold);
     let mut candidates_by_class = Vec::with_capacity(class_count);
@@ -854,9 +811,7 @@ fn decode_rtdetr_raw(
     image_height: f32,
 ) -> Result<Vec<f32>> {
     if boxes.len() != query_count * 4 || logits.len() != query_count * class_count {
-        return Err(Error::Message(
-            "PPdoc raw tensor lengths do not match their shapes".to_owned(),
-        ));
+        return fail("PPdoc raw tensor lengths do not match their shapes");
     }
     let scores: Vec<f32> = logits
         .iter()
@@ -869,15 +824,17 @@ fn decode_rtdetr_raw(
             .then_with(|| left.cmp(right))
     });
     ranked.truncate(top_k.min(ranked.len()));
-
     let mut decoded = Vec::with_capacity(ranked.len() * 7);
     for flat_index in ranked {
-        let query = flat_index / class_count;
-        let label = flat_index % class_count;
-        let cx = boxes[query * 4] * image_width;
-        let cy = boxes[query * 4 + 1] * image_height;
-        let half_width = boxes[query * 4 + 2] * image_width * 0.5;
-        let half_height = boxes[query * 4 + 3] * image_height * 0.5;
+        let (query, label) = (flat_index / class_count, flat_index % class_count);
+        let (cx, cy) = (
+            boxes[query * 4] * image_width,
+            boxes[query * 4 + 1] * image_height,
+        );
+        let (half_width, half_height) = (
+            boxes[query * 4 + 2] * image_width * 0.5,
+            boxes[query * 4 + 3] * image_height * 0.5,
+        );
         decoded.extend_from_slice(&[
             label as f32,
             scores[flat_index],
@@ -901,15 +858,12 @@ pub(crate) enum ModelInput {
 }
 
 pub(crate) fn input_kind(inputs: &[String], name: &str) -> ModelInput {
-    if inputs.len() == 1 {
-        ModelInput::Image
-    } else {
-        match name {
-            "image" => ModelInput::Image,
-            "im_shape" => ModelInput::Shape,
-            "scale_factor" => ModelInput::Scale,
-            _ => unreachable!("model inputs validated when the pack was loaded"),
-        }
+    match name {
+        _ if inputs.len() == 1 => ModelInput::Image,
+        "image" => ModelInput::Image,
+        "im_shape" => ModelInput::Shape,
+        "scale_factor" => ModelInput::Scale,
+        _ => unreachable!("model inputs validated when the pack was loaded"),
     }
 }
 
@@ -947,19 +901,21 @@ fn resize_opencv_cubic_nchw(
                         .iter()
                         .zip(x_sample.coefficients)
                         .map(|(source_x, coefficient)| {
-                            let offset = ((*source_y as usize * source_width + *source_x as usize)
-                                * 3)
-                                + channel;
-                            i32::from(source[offset]) * i32::from(coefficient)
+                            i32::from(
+                                source[((*source_y as usize * source_width + *source_x as usize)
+                                    * 3)
+                                    + channel],
+                            ) * i32::from(coefficient)
                         })
                         .sum();
                 }
+                let weight = |row: usize| f32::from(y_sample.coefficients[row]) * coefficient_scale;
                 let weighted = (horizontal[0] as f32).mul_add(
-                    f32::from(y_sample.coefficients[0]) * coefficient_scale,
+                    weight(0),
                     (horizontal[1] as f32).mul_add(
-                        f32::from(y_sample.coefficients[1]) * coefficient_scale,
+                        weight(1),
                         (horizontal[2] as f32).mul_add(
-                            f32::from(y_sample.coefficients[2]) * coefficient_scale,
+                            weight(2),
                             horizontal[3] as f32
                                 * f32::from(y_sample.coefficients[3])
                                 * coefficient_scale,
@@ -1037,6 +993,7 @@ fn postprocess(
     image_height: u32,
     threshold: f32,
 ) -> Vec<PPDocDetection> {
+    let (width, height) = (image_width as f32, image_height as f32);
     let mut detections: Vec<(f32, PPDocDetection)> = values
         .chunks_exact(row_width)
         .take(count)
@@ -1046,15 +1003,15 @@ fn postprocess(
             if label_id < 0 || row[1] <= threshold || label_id as usize >= labels.len() {
                 return None;
             }
-            let bbox = [
-                row[2].round_ties_even().clamp(0.0, image_width as f32),
-                row[3].round_ties_even().clamp(0.0, image_height as f32),
-                row[4].round_ties_even().clamp(0.0, image_width as f32),
-                row[5].round_ties_even().clamp(0.0, image_height as f32),
-            ];
+            let bbox: [f32; 4] = std::array::from_fn(|at| {
+                row[2 + at]
+                    .round_ties_even()
+                    .clamp(0.0, if at % 2 == 0 { width } else { height })
+            });
+            let order = if row_width >= 7 { row[6] } else { index as f32 };
             (bbox[2] > bbox[0] && bbox[3] > bbox[1]).then(|| {
                 (
-                    if row_width >= 7 { row[6] } else { index as f32 },
+                    order,
                     PPDocDetection {
                         label_id: label_id as usize,
                         label: labels[label_id as usize].clone(),
@@ -1077,11 +1034,10 @@ fn postprocess(
         };
         let filtered: Vec<_> = detections
             .iter()
-            .filter(|(_, detection)| {
-                detection.label != "image"
-                    || (detection.bbox[2] - detection.bbox[0])
-                        * (detection.bbox[3] - detection.bbox[1])
-                        <= area_threshold * image_width as f32 * image_height as f32
+            .filter(|(_, found)| {
+                found.label != "image"
+                    || (found.bbox[2] - found.bbox[0]) * (found.bbox[3] - found.bbox[1])
+                        <= area_threshold * width * height
             })
             .cloned()
             .collect();
@@ -1090,15 +1046,16 @@ fn postprocess(
         }
     }
     let mut next_order = 1;
+    let mut ordered = |mut detection: PPDocDetection| {
+        if !skips_reading_order(&detection.label) {
+            detection.order = Some(next_order);
+            next_order += 1;
+        }
+        detection
+    };
     detections
         .into_iter()
-        .map(|(_, mut detection)| {
-            if !skips_reading_order(&detection.label) {
-                detection.order = Some(next_order);
-                next_order += 1;
-            }
-            detection
-        })
+        .map(|(_, detection)| ordered(detection))
         .collect()
 }
 
@@ -1120,40 +1077,33 @@ fn skips_reading_order(label: &str) -> bool {
 }
 
 fn required_path(value: &Option<PathBuf>, variable: &str, label: &str) -> Result<PathBuf> {
-    value
+    let path = value
         .clone()
         .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| {
-            Error::Message(format!(
-                "{label} is required; pass it explicitly or set {variable}"
-            ))
-        })
+        .filter(|path| !path.as_os_str().is_empty());
+    path.ok_or_else(|| {
+        Error::Message(format!(
+            "{label} is required; pass it explicitly or set {variable}"
+        ))
+    })
 }
 
 fn pack_file(root: &Path, relative: &str, label: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     if relative.is_absolute() {
-        return Err(Error::Message(format!(
-            "PPdoc {label} path must be relative to its pack"
-        )));
+        return fail(format!("PPdoc {label} path must be relative to its pack"));
     }
     let path = fs::canonicalize(root.join(relative))
         .map_err(|source| Error::io(root.join(relative), source))?;
     if !path.starts_with(root) {
-        return Err(Error::Message(format!(
-            "PPdoc {label} path escapes its pack"
-        )));
+        return fail(format!("PPdoc {label} path escapes its pack"));
     }
     Ok(path)
 }
 
 fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
     if !path.is_file() {
-        return Err(Error::Message(format!(
-            "{label} does not exist: {}",
-            path.display()
-        )));
+        return fail(format!("{label} does not exist: {}", path.display()));
     }
     fs::canonicalize(path).map_err(|source| Error::io(path, source))
 }

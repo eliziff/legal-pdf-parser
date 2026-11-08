@@ -4,12 +4,13 @@
 use legal_pdf_core::model::{
     Footnote, Line, Page, Paragraph, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
 };
-use legal_structure_model::{Derivation, DocumentStructure, NodeKind, StructureAnalysis, StructureNode};
 use legal_structure_model::{
-    document_fingerprint, serialization_sha256, utf16_len,
-    DigestWriter, DocumentFingerprint, ScalarText,
+    document_fingerprint, serialization_sha256, utf16_len, DigestWriter, DocumentFingerprint,
+    ScalarText,
 };
-use regex::Regex;
+use legal_structure_model::{
+    Derivation, DocumentStructure, NodeKind, StructureAnalysis, StructureNode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;

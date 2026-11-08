@@ -14,11 +14,6 @@ pub fn is_heading_role(role: &str) -> bool {
         })
 }
 
-/// Heading labels from a layout provider or the PDF's own structure tree.
-pub fn is_heading_region(region: &str) -> bool {
-    matches!(region, "heading" | "paragraph_title" | "doc_title") || is_heading_role(region)
-}
-
 /// The heading role covering a whole source line. Mixed roles, gaps containing text and
 /// unanchored spans cannot turn a run-in heading into a heading for the entire paragraph.
 pub fn tagged_heading<'a>(
@@ -44,7 +39,7 @@ pub fn tagged_line_role<'a>(
         .text
         .char_indices()
         .map(|(byte, _)| byte)
-        .chain(std::iter::once(line.text.len()))
+        .chain([line.text.len()])
         .collect::<Vec<_>>();
     let mut covered = 0;
     for span in spans {

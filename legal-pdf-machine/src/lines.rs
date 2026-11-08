@@ -5,7 +5,7 @@
 //! a decision: every value is measured on the pages or read by an evidence reader.
 
 use super::*;
-use legal_pdf_core::{flag_share, Columns, PageMeasure, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
+use legal_pdf_core::{flag_share, text_shape, Columns, PageMeasure, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
 
 /// The names of a line's own features, in order.
 pub const LINE_FEATURES: &[&str] = &[
@@ -40,34 +40,6 @@ pub const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
 const ROLES: usize = 14;
 /// What t0 decided of a line: its role, one of `ROLES`, twelve flags and its heading's level (`docparse.T0`).
 pub const T0: usize = ROLES + 13;
-
-/// The shape of a line's text: its length, its share of capitals, figures, punctuation and spaces,
-/// how it opens and how it ends.
-fn text_shape(text: &str) -> [f64; 15] {
-    let chars: Vec<char> = text.trim().chars().collect();
-    let n = chars.len().max(1) as f64;
-    let letters = chars.iter().filter(|c| c.is_alphabetic()).count().max(1) as f64;
-    let first = chars.first().copied().unwrap_or(' ');
-    let last = chars.last().copied().unwrap_or(' ');
-    let flag = |b: bool| f64::from(u8::from(b));
-    [
-        (1.0 + chars.len() as f64).ln() / 5.0,
-        chars.iter().filter(|c| c.is_uppercase()).count() as f64 / letters,
-        chars.iter().filter(|c| c.is_ascii_digit()).count() as f64 / n,
-        chars.iter().filter(|c| c.is_ascii_punctuation()).count() as f64 / n,
-        chars.iter().filter(|c| c.is_whitespace()).count() as f64 / n,
-        flag(first.is_ascii_digit()),
-        flag(first.is_uppercase()),
-        flag(first.is_lowercase()),
-        flag("([{".contains(first)),
-        flag("•·▪–—-*†‡§¶".contains(first)),
-        flag(last == '.'),
-        flag(last == ':'),
-        flag(last == ',' || last == ';'),
-        flag(last == '-' || last == '\u{00AD}'),
-        flag(last.is_ascii_digit()),
-    ]
-}
 
 /// How common each look is across the document: a heading's look is rare and set apart, the body's
 /// the commonest. A look is a style (face and half-point size) and its bold, italic and capitals.

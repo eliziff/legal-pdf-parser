@@ -136,27 +136,21 @@ impl<'a> Sheet<'a> {
         }
     }
 
-    fn line(&self, place: usize) -> &'a Line {
-        &self.page.lines[place]
-    }
+    fn line(&self, place: usize) -> &'a Line { &self.page.lines[place] }
+    fn flagged(&self, place: usize, flag: u8) -> bool { self.flags[place] & flag != 0 }
+    /// A running head or foot, a folio.
+    fn furniture(&self, place: usize) -> bool { self.flagged(place, BAND_FURNITURE) }
+    /// A line the band never reads.
+    fn excluded(&self, place: usize) -> bool { self.flagged(place, BAND_EXCLUDED) }
 
     /// The document's lines on the page, with their places.
     fn lines(&self) -> impl Iterator<Item = (usize, &'a Line)> + '_ {
         self.members.iter().map(|&place| (place, &self.page.lines[place]))
     }
 
-    fn flagged(&self, place: usize, flag: u8) -> bool {
-        self.flags[place] & flag != 0
-    }
-
-    /// A running head or foot, a folio.
-    fn furniture(&self, place: usize) -> bool {
-        self.flagged(place, BAND_FURNITURE)
-    }
-
-    /// A line the band never reads.
-    fn excluded(&self, place: usize) -> bool {
-        self.flagged(place, BAND_EXCLUDED)
+    /// The type sizes of the page's lines `keep` holds (by place and line), those set from 4 to 24 points.
+    fn sizes_where(&self, keep: impl Fn(usize, &Line) -> bool) -> Vec<f64> {
+        self.lines().filter(|&(place, line)| keep(place, line)).map(|(place, _)| self.sizes[place]).filter(|size| (4.0..=24.0).contains(size)).collect()
     }
 }
 
@@ -173,8 +167,7 @@ impl EndnoteRun {
     /// A page that does not follow the last one continues no sequence.
     fn enter(&mut self, page: usize) {
         if self.previous_page.is_some_and(|prior| prior.checked_add(1) != Some(page)) {
-            self.expected = None;
-            self.size = None;
+            (self.expected, self.size) = (None, None);
         }
         self.previous_page = Some(page);
     }
@@ -183,16 +176,10 @@ impl EndnoteRun {
     /// `endnotes` are the places of the page's endnote lines, in page order.
     fn leave(&mut self, sheet: &Sheet, endnotes: &[usize]) {
         if endnotes.is_empty() {
-            self.expected = None;
-            self.size = None;
+            (self.expected, self.size) = (None, None);
             return;
         }
-        if let Some(last) = endnotes
-            .iter()
-            .rev()
-            .filter_map(|&place| label_prefix(&sheet.line(place).text)?.label.parse::<u32>().ok())
-            .next()
-        {
+        if let Some(last) = endnotes.iter().rev().filter_map(|&place| label_prefix(&sheet.line(place).text)?.label.parse::<u32>().ok()).next() {
             self.expected = Some(last + 1);
         }
         let size = median(endnotes.iter().map(|&place| sheet.sizes[place]).filter(|size| *size > 0.0).collect());
@@ -221,33 +208,14 @@ fn page_reading(sheet: &Sheet, separator: Option<f64>, document_body: f64) -> Pa
     let body_size = if document_body > 0.0 && sheet.members.iter().any(|&place| sheet.sizes[place] > 0.0) {
         document_body
     } else {
-        median(
-            sheet
-                .lines()
-                .filter(|&(place, line)| {
-                    !sheet.furniture(place)
-                        && !sheet.excluded(place)
-                        && !table_cells[place]
-                        && page.height * 0.10 <= line.bbox[1]
-                        && line.bbox[1] <= page.height * 0.75
-                })
-                .map(|(place, _)| sheet.sizes[place])
-                .filter(|size| (4.0..=24.0).contains(size))
-                .collect(),
-        )
+        median(sheet.sizes_where(|place, line| {
+            !sheet.furniture(place) && !sheet.excluded(place) && !table_cells[place] && page.height * 0.10 <= line.bbox[1] && line.bbox[1] <= page.height * 0.75
+        }))
     };
     let body_size = if body_size > 0.0 { body_size } else { 10.0 };
-    let wide_sizes: Vec<_> = sheet
-        .lines()
-        .filter(|&(place, line)| {
-            !sheet.excluded(place)
-                && !table_cells[place]
-                && line_width(line) >= page.width * 0.30
-                && line.text.chars().filter(|character| character.is_alphabetic()).take(4).count() == 4
-        })
-        .map(|(place, _)| sheet.sizes[place])
-        .filter(|size| (4.0..=24.0).contains(size))
-        .collect();
+    let wide_sizes = sheet.sizes_where(|place, line| {
+        !sheet.excluded(place) && !table_cells[place] && line_width(line) >= page.width * 0.30 && line.text.chars().filter(|character| character.is_alphabetic()).take(4).count() == 4
+    });
     let note_size = if wide_sizes.len() >= 3 { median(wide_sizes) } else { body_size };
     let tolerance = separator_tolerance(page);
     let separator = separator_beside_tables(page, separator, (0..page.lines.len()).filter(|&place| table_cells[place]).map(|place| &page.lines[place]));
@@ -255,9 +223,7 @@ fn page_reading(sheet: &Sheet, separator: Option<f64>, document_body: f64) -> Pa
 }
 
 /// How far from a page's note separator a line still stands at it.
-pub fn separator_tolerance(page: &Page) -> f64 {
-    (page.height * 0.004).max(1.0)
-}
+pub fn separator_tolerance(page: &Page) -> f64 { (page.height * 0.004).max(1.0) }
 
 /// The page's note separator rule, unless it runs through the band its table cells (`cells`) fill.
 pub fn separator_beside_tables<'a>(page: &Page, separator: Option<f64>, cells: impl Iterator<Item = &'a Line>) -> Option<f64> {
@@ -302,10 +268,8 @@ type Candidate = (usize, LabelPrefix, bool);
 /// a page number in the corner, a number before a comma, a reference's number wrapped onto the
 /// next line, or a label set larger than the body.
 fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) -> (Vec<Candidate>, Vec<usize>) {
-    let page = sheet.page;
-    let body_size = reading.body_size;
-    let mut candidates = Vec::new();
-    let mut suppress = Vec::new();
+    let (page, body_size) = (sheet.page, reading.body_size);
+    let (mut candidates, mut suppress) = (Vec::new(), Vec::new());
     for (place, line) in sheet.lines() {
         if paragraph[place] {
             continue;
@@ -317,12 +281,7 @@ fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) ->
         if sheet.furniture(place) || sheet.excluded(place) {
             continue;
         }
-        let Some(label) = sheet.labels[place] else {
-            continue;
-        };
-        let Some(prefix) = label_prefix(&line.text) else {
-            continue;
-        };
+        let (Some(label), Some(prefix)) = (sheet.labels[place], label_prefix(&line.text)) else { continue };
         let typographic = label.typographic(body_size)
             || (standalone_note_label(line)
                 && aligned_note_body_among(&page.lines, sheet.members.iter().copied(), place).is_some_and(|body| {
@@ -338,12 +297,7 @@ fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) ->
         // Supp.), s" / "13.") is that reference's number, wrapped.
         let wrapped_reference = label.suppress & SUPPRESS_WRAPPED != 0;
         let below_separator = reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance);
-        let suppressed = (label.suppress & SUPPRESS_FOOT != 0 && !(below_separator && typographic))
-            || bottom_right
-            || comma_tail
-            || wrapped_reference
-            || size > body_size * 1.15;
-        if suppressed {
+        if (label.suppress & SUPPRESS_FOOT != 0 && !(below_separator && typographic)) || bottom_right || comma_tail || wrapped_reference || size > body_size * 1.15 {
             suppress.push(place);
             continue;
         }
@@ -500,12 +454,7 @@ fn continue_endnotes(analysis: &dyn StructureAnalysis, sheet: &Sheet, candidates
             }
         }
     }
-    let content_sizes: Vec<f64> = sheet
-        .lines()
-        .filter(|&(place, _)| !sheet.furniture(place) && !sheet.excluded(place))
-        .map(|(place, _)| sheet.sizes[place])
-        .filter(|size| *size > 0.0)
-        .collect();
+    let content_sizes: Vec<f64> = sheet.lines().filter(|&(place, _)| !sheet.furniture(place) && !sheet.excluded(place)).map(|(place, _)| sheet.sizes[place]).filter(|size| *size > 0.0).collect();
     let content_size = (!content_sizes.is_empty()).then(|| median(content_sizes));
     let size_matches = run.size.is_none_or(|size| content_size.is_none_or(|content| content <= size * 1.15));
     let label_free = run.expected.is_some() && candidates.is_empty() && !facts.structural_reset && size_matches;
@@ -539,15 +488,8 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
         .map(|(place, _, _)| *place)
         .collect();
     let margin_labels = if longest_label_run(&margin_numeric) >= 3 { &margin_candidates } else { &supported };
-    let model = margin_note_model(
-        &page.lines,
-        &sheet.members,
-        |place| sheet.furniture(place) || sheet.excluded(place),
-        margin_labels,
-        page.width,
-        note_size,
-        if margin_labels.len() >= 3 { 3 } else { 2 },
-    )?;
+    let set_aside = |place| sheet.furniture(place) || sheet.excluded(place);
+    let model = margin_note_model(&page.lines, &sheet.members, set_aside, margin_labels, page.width, note_size, if margin_labels.len() >= 3 { 3 } else { 2 })?;
     let side = usize::from(margin_labels.iter().filter(|place| line_center_x(sheet.line(**place)) >= model.split_x).count() * 2 >= margin_labels.len());
     Some((model, side))
 }
@@ -557,18 +499,9 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
 /// separator) set as labels, backed by a reference above, or in a run of small labels; and, with no
 /// separator, a small label numbered next after the document's notes so far (`next_label`) whose
 /// reference stands above it, anywhere on the page.
-fn labels(
-    sheet: &Sheet,
-    reading: &PageReading,
-    candidates: &[Candidate],
-    facts: &PageFacts,
-    endnote_page: bool,
-    margin: Option<(ColumnModel, usize)>,
-    next_label: u32,
-) -> Vec<usize> {
+fn labels(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate], facts: &PageFacts, endnote_page: bool, margin: Option<(ColumnModel, usize)>, mut next_label: u32) -> Vec<usize> {
     let page = sheet.page;
     let (sizes, body_size, separator) = (sheet.sizes, reading.body_size, reading.separator);
-    let mut next_label = next_label;
     candidates
         .iter()
         .filter_map(|(place, prefix, typographic)| {
@@ -633,17 +566,7 @@ fn running_heads(sheet: &Sheet, labels: &[usize]) -> Vec<usize> {
 /// type starts under it), else at the first label, warned of where that rests on weak geometry.
 /// `furniture` holds the page's running heads and feet.
 #[allow(clippy::too_many_arguments)]
-fn note_cut(
-    sheet: &Sheet,
-    reading: &PageReading,
-    labels: &[usize],
-    contents_page: bool,
-    endnote_page: bool,
-    continuation: &Continuation,
-    run: &EndnoteRun,
-    furniture: &dyn Fn(usize) -> bool,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<f64> {
+fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_page: bool, endnote_page: bool, continuation: &Continuation, run: &EndnoteRun, furniture: &dyn Fn(usize) -> bool, diagnostics: &mut Vec<Diagnostic>) -> Option<f64> {
     let page = sheet.page;
     let (sizes, body_size, separator, tolerance) = (sheet.sizes, reading.body_size, reading.separator, reading.tolerance);
     let eligible_top = || {
@@ -699,15 +622,7 @@ fn note_cut(
 /// Where the band begins in each column of a two-column page or beside a margin column: at each
 /// column's first label (or the note body it aligns with), and under a notes heading at the
 /// column's first line. `furniture` holds the page's running heads and feet.
-fn column_cuts(
-    sheet: &Sheet,
-    labels: &[usize],
-    columns: ColumnModel,
-    has_margin: bool,
-    endnote_page: bool,
-    facts: &PageFacts,
-    furniture: &dyn Fn(usize) -> bool,
-) -> Option<[Option<f64>; 2]> {
+fn column_cuts(sheet: &Sheet, labels: &[usize], columns: ColumnModel, has_margin: bool, endnote_page: bool, facts: &PageFacts, furniture: &dyn Fn(usize) -> bool) -> Option<[Option<f64>; 2]> {
     if !((columns.kind == "two_column" || has_margin) && (!endnote_page || facts.endnote_heading_y.is_some())) {
         return None;
     }
@@ -786,13 +701,11 @@ fn verify_endnotes(sheets: &[Sheet], notes: &mut [Vec<(usize, NoteKind)>]) {
         let endnotes = |at: usize| notes[at].iter().filter(|(_, kind)| *kind == NoteKind::Endnote).map(move |(place, _)| sheets[at].line(*place));
         let labels: BTreeSet<String> = (slot..end).flat_map(endnotes).filter_map(|line| label_prefix(&line.text).map(|prefix| prefix.label)).collect();
         let first_note = endnotes(slot).map(|line| line.bbox[1]).min_by(f64::total_cmp).unwrap_or(0.0);
-        let referenced = labels
-            .iter()
-            .filter(|label| {
-                sheets[..slot].iter().any(|sheet| has_prior_reference(sheet.lines().map(|(_, line)| line), label, f64::INFINITY))
-                    || has_prior_reference(sheets[slot].lines().map(|(_, line)| line), label, first_note)
-            })
-            .count();
+        let referenced = |label: &&String| {
+            sheets[..slot].iter().any(|sheet| has_prior_reference(sheet.lines().map(|(_, line)| line), label, f64::INFINITY))
+                || has_prior_reference(sheets[slot].lines().map(|(_, line)| line), label, first_note)
+        };
+        let referenced = labels.iter().filter(referenced).count();
         if !headed && referenced * 2 < labels.len().max(1) {
             for page in &mut notes[slot..end] {
                 page.retain(|(_, kind)| *kind != NoteKind::Endnote);
@@ -825,12 +738,7 @@ pub fn read_band(analysis: &dyn StructureAnalysis, pages: &[BandPage], lines: &B
         let margin = margin_notes(sheet, &reading, &candidates);
         let endnote_page = facts.endnote_heading_y.is_some()
             || continuation.continuing
-            || (reading.separator.is_none()
-                && margin.is_none()
-                && !candidates.is_empty()
-                && facts.early_labels
-                && facts.best_run >= 3
-                && facts.label_size.is_some_and(|size| size <= reading.body_size * 0.90));
+            || (reading.separator.is_none() && margin.is_none() && !candidates.is_empty() && facts.early_labels && facts.best_run >= 3 && facts.label_size.is_some_and(|size| size <= reading.body_size * 0.90));
         let labels = labels(sheet, &reading, &candidates[continuation.selected_start..], &facts, endnote_page, margin, next_label);
         let heads = if endnote_page && !labels.is_empty() { running_heads(sheet, &labels) } else { Vec::new() };
         found.running_heads.extend(heads.iter().map(|&place| sheet.view.slot(place)));
@@ -838,22 +746,14 @@ pub fn read_band(analysis: &dyn StructureAnalysis, pages: &[BandPage], lines: &B
         let cut = note_cut(sheet, &reading, &labels, band.contents, endnote_page, &continuation, &run, &furniture, &mut found.diagnostics);
         found.pages.last_mut().expect("the page's reading").cut = cut;
         let columns = margin.map_or(facts.columns, |(model, _)| model);
-        let band = Band {
-            endnote_page,
-            cut,
-            column_cuts: column_cuts(sheet, &labels, columns, margin.is_some(), endnote_page, &facts, &furniture),
-            columns,
-            endnote_heading_source: facts.endnote_heading_source,
-        };
+        let column_cuts = column_cuts(sheet, &labels, columns, margin.is_some(), endnote_page, &facts, &furniture);
+        let band = Band { endnote_page, cut, column_cuts, columns, endnote_heading_source: facts.endnote_heading_source };
         // Each line's reading: a notes heading is a heading, a table's cell body text, furniture
         // stays, a source's heading survives, a line a layout model labelled keeps its reading of
         // note or text, a numbered paragraph's line is body, and the rest are note or body by the band.
         let kind = if endnote_page { NoteKind::Endnote } else { NoteKind::Footnote };
         let mut page_notes = Vec::new();
-        for (place, line) in sheet.lines() {
-            if sheet.excluded(place) {
-                continue;
-            }
+        for (place, line) in sheet.lines().filter(|&(place, _)| !sheet.excluded(place)) {
             if endnote_heading(&line.text) {
                 found.headings.push(sheet.view.slot(place));
             } else if reading.table_cells[place] || furniture(place) || sheet.flagged(place, BAND_HEADED) {

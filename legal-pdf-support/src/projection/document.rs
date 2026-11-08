@@ -181,14 +181,7 @@ impl PdfDocument {
         let recognized_pages = pages
             .iter()
             .filter(|page| page.source != "native")
-            .map(|page| PdfTextPage {
-                page_number: page.number,
-                source: page.source.clone(),
-                width: page.width,
-                height: page.height,
-                regions: page.regions.clone(),
-                lines: page.lines.iter().map(physical_text_line).collect(),
-            })
+            .map(text_page)
             .collect();
         Self {
             passage_pages: Arc::new(Vec::new()),
@@ -260,19 +253,7 @@ impl PdfDocument {
 
     /// Capture extraction witnesses before structural derivation rewrites lines.
     pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<PdfTextPage>> {
-        Arc::new(
-            pages
-                .iter()
-                .map(|page| PdfTextPage {
-                    page_number: page.number,
-                    source: page.source.clone(),
-                    width: page.width,
-                    height: page.height,
-                    regions: page.regions.clone(),
-                    lines: page.lines.iter().map(physical_text_line).collect(),
-                })
-                .collect(),
-        )
+        Arc::new(pages.iter().map(text_page).collect())
     }
 
     pub fn set_passage_evidence(&mut self, pages: Arc<Vec<PdfTextPage>>) {
@@ -468,15 +449,41 @@ impl PdfDocument {
     }
 }
 
-pub(crate) fn physical_text_line(line:&Line)->PdfTextLine {
+/// A page's extraction witness: its size, regions and lines as extracted.
+fn text_page(page: &Page) -> PdfTextPage {
+    PdfTextPage {
+        page_number: page.number,
+        source: page.source.clone(),
+        width: page.width,
+        height: page.height,
+        regions: page.regions.clone(),
+        lines: page.lines.iter().map(physical_text_line).collect(),
+    }
+}
+
+pub(crate) fn physical_text_line(line: &Line) -> PdfTextLine {
     PdfTextLine {
-        id:line.id.clone(),text:line.text.clone(),rect:line.bbox,
-        spans:line.spans.clone(),ocr:line.ocr.clone(),region_id:line.region_id.clone(),
-        region_type:line.region_type.clone(),source:line.source.clone(),
-        words:line.words.iter().map(|word|PdfTextWord {
-            id:word.id.clone(),text:word.text.clone(),rect:word.bbox,
-            start:Some(word.start),end:Some(word.end),inferred_geometry:false,underlined:word.underlined,
-        }).collect(),
+        id: line.id.clone(),
+        text: line.text.clone(),
+        rect: line.bbox,
+        spans: line.spans.clone(),
+        ocr: line.ocr.clone(),
+        region_id: line.region_id.clone(),
+        region_type: line.region_type.clone(),
+        source: line.source.clone(),
+        words: line
+            .words
+            .iter()
+            .map(|word| PdfTextWord {
+                id: word.id.clone(),
+                text: word.text.clone(),
+                rect: word.bbox,
+                start: Some(word.start),
+                end: Some(word.end),
+                inferred_geometry: false,
+                underlined: word.underlined,
+            })
+            .collect(),
     }
 }
 

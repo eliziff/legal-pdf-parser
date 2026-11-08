@@ -1,9 +1,8 @@
 use crate::ppdoc::PPDocDetection;
 use legal_pdf_core::model::{Line, Page};
-use regex::Regex;
+use legal_pdf_core::regex;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 
 // Exact production-default port of Text-Fidelity-Project's
 // tools/ocr/layout_regioning/ppdoc/region_postprocess.py at clean HEAD
@@ -54,20 +53,17 @@ pub(crate) fn scale_detections(
     if page_width <= 0.0 || page_height <= 0.0 || image_width == 0 || image_height == 0 {
         return Vec::new();
     }
-    let x_scale = page_width / f64::from(image_width);
-    let y_scale = page_height / f64::from(image_height);
+    let scales = [
+        page_width / f64::from(image_width),
+        page_height / f64::from(image_height),
+    ];
     let mut regions = detections
         .iter()
         .enumerate()
         .map(|(index, detection)| RegionDetection {
             label: detection.label.clone(),
             score: detection.score,
-            bbox: [
-                f64::from(detection.bbox[0]) * x_scale,
-                f64::from(detection.bbox[1]) * y_scale,
-                f64::from(detection.bbox[2]) * x_scale,
-                f64::from(detection.bbox[3]) * y_scale,
-            ],
+            bbox: std::array::from_fn(|at| f64::from(detection.bbox[at]) * scales[at % 2]),
             raw_index: index + 1,
             order: index,
         })
@@ -232,38 +228,33 @@ fn apply_block_quote_heuristic(
         return;
     }
     rows.sort_by(|left, right| {
-        region_order_values(left.bbox, "text", left.raw_index, page.height).cmp(
-            &region_order_values(right.bbox, "text", right.raw_index, page.height),
+        order_values_cmp(
+            region_order_values(left.bbox, "text", left.raw_index, page.height),
+            region_order_values(right.bbox, "text", right.raw_index, page.height),
         )
     });
     for (position, row) in rows.iter_mut().enumerate() {
         row.position = position;
     }
-
     let mut refs = HashMap::<usize, (f64, f64, f64)>::new();
     for column in 0..=1 {
         let column_rows: Vec<&TextRow> = rows.iter().filter(|row| row.column == column).collect();
         if column_rows.len() < 3 {
             continue;
         }
+        let at = |fraction: f64, default: f64, value: fn(&TextRow) -> f64| {
+            percentile(column_rows.iter().map(|row| value(row)), fraction, default)
+        };
+        let full = page.width.max(1.0);
         refs.insert(
             column,
             (
-                percentile(column_rows.iter().map(|row| row.bbox[0]), 0.10, 0.0),
-                percentile(
-                    column_rows.iter().map(|row| row.bbox[2]),
-                    0.90,
-                    page.width.max(1.0),
-                ),
-                percentile(
-                    column_rows.iter().map(|row| row.width),
-                    0.90,
-                    page.width.max(1.0),
-                ),
+                at(0.10, 0.0, |row| row.bbox[0]),
+                at(0.90, full, |row| row.bbox[2]),
+                at(0.90, full, |row| row.width),
             ),
         );
     }
-
     let page_width = page.width.max(1.0);
     let mut scored_positions = Vec::new();
     for row in &mut rows {
@@ -315,20 +306,20 @@ fn apply_block_quote_heuristic(
         let body_after = after.is_some_and(|row| row.column == column && !row.is_inset);
         let surrounded = body_before && body_after;
         let adjacent = body_before || body_after;
-        let group_bbox = group.iter().fold(
+        let group_bbox = group.iter().map(|position| rows[*position].bbox).fold(
             [
                 f64::INFINITY,
                 f64::INFINITY,
                 f64::NEG_INFINITY,
                 f64::NEG_INFINITY,
             ],
-            |mut bbox, position| {
-                let row = &rows[*position];
-                bbox[0] = bbox[0].min(row.bbox[0]);
-                bbox[1] = bbox[1].min(row.bbox[1]);
-                bbox[2] = bbox[2].max(row.bbox[2]);
-                bbox[3] = bbox[3].max(row.bbox[3]);
-                bbox
+            |bbox, row| {
+                [
+                    bbox[0].min(row[0]),
+                    bbox[1].min(row[1]),
+                    bbox[2].max(row[2]),
+                    bbox[3].max(row[3]),
+                ]
             },
         );
         let footnote_boundary = body_before
@@ -658,25 +649,24 @@ fn apply_full_width_block_quote_demotion(
                 .flat_map(|context| context.line_bboxes.iter().copied())
                 .map(bbox_height)
         });
+        let at = |fraction: f64, default: f64, value: fn([f64; 4]) -> f64| {
+            percentile(
+                body.iter().map(|index| value(regions[*index].bbox)),
+                fraction,
+                default,
+            )
+        };
+        let full = page.width.max(1.0);
         refs.insert(
             column,
             (
-                percentile(body.iter().map(|index| regions[*index].bbox[0]), 0.10, 0.0),
-                percentile(
-                    body.iter().map(|index| regions[*index].bbox[2]),
-                    0.90,
-                    page.width.max(1.0),
-                ),
-                percentile(
-                    body.iter().map(|index| bbox_width(regions[*index].bbox)),
-                    0.90,
-                    page.width.max(1.0),
-                ),
+                at(0.10, 0.0, |bbox| bbox[0]),
+                at(0.90, full, |bbox| bbox[2]),
+                at(0.90, full, bbox_width),
                 percentile(line_heights, 0.50, 0.0),
             ),
         );
     }
-
     let mut rows_by_column = [Vec::<usize>::new(), Vec::<usize>::new()];
     for index in ordered {
         rows_by_column[region_column(&regions[index], page.width)].push(index);
@@ -801,48 +791,25 @@ fn order_regions(regions: &mut [RegionDetection], width: f64, height: f64) {
 }
 
 fn region_order_cmp(left: &RegionDetection, right: &RegionDetection, height: f64) -> Ordering {
-    region_order_values(left.bbox, &left.label, left.raw_index, height).cmp(&region_order_values(
-        right.bbox,
-        &right.label,
-        right.raw_index,
-        height,
-    ))
+    order_values_cmp(
+        region_order_values(left.bbox, &left.label, left.raw_index, height),
+        region_order_values(right.bbox, &right.label, right.raw_index, height),
+    )
 }
 
-#[derive(Debug)]
-struct RegionOrderValues(usize, f64, f64, f64, usize);
+/// A region's place in reading order: its band, its top, its centre, its left edge and its raw index.
+type OrderValues = (usize, f64, f64, f64, usize);
 
-impl PartialEq for RegionOrderValues {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
+fn order_values_cmp(left: OrderValues, right: OrderValues) -> Ordering {
+    left.0
+        .cmp(&right.0)
+        .then_with(|| left.1.total_cmp(&right.1))
+        .then_with(|| left.2.total_cmp(&right.2))
+        .then_with(|| left.3.total_cmp(&right.3))
+        .then_with(|| left.4.cmp(&right.4))
 }
 
-impl Eq for RegionOrderValues {}
-
-impl PartialOrd for RegionOrderValues {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RegionOrderValues {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .cmp(&other.0)
-            .then_with(|| self.1.total_cmp(&other.1))
-            .then_with(|| self.2.total_cmp(&other.2))
-            .then_with(|| self.3.total_cmp(&other.3))
-            .then_with(|| self.4.cmp(&other.4))
-    }
-}
-
-fn region_order_values(
-    bbox: [f64; 4],
-    label: &str,
-    raw_index: usize,
-    height: f64,
-) -> RegionOrderValues {
+fn region_order_values(bbox: [f64; 4], label: &str, raw_index: usize, height: f64) -> OrderValues {
     let height = height.max(1.0);
     let y_ratio = (bbox[1] + bbox[3]) * 0.5 / height;
     let y0_ratio = bbox[1] / height;
@@ -860,7 +827,7 @@ fn region_order_values(
     } else {
         1
     };
-    RegionOrderValues(
+    (
         group,
         bbox[1],
         (bbox[0] + bbox[2]) * 0.5,
@@ -876,25 +843,29 @@ fn overlap_rank_cmp(left: &RegionDetection, right: &RegionDetection) -> Ordering
         .then_with(|| bbox_area(right.bbox).total_cmp(&bbox_area(left.bbox)))
 }
 
+/// Which of two overlapping regions stays: the one whose label comes first here.
 fn overlap_priority(label: &str) -> usize {
-    match label {
-        "footnote" => 0,
-        "reference_content" => 1,
-        "vision_footnote" => 2,
-        "reference" => 3,
-        "block_quote" => 4,
-        "paragraph_title" => 5,
-        "doc_title" => 6,
-        "byline" => 7,
-        "text" => 8,
-        "content" => 9,
-        "vertical_text" => 10,
-        "header" => 11,
-        "footer" => 12,
-        "number" => 13,
-        "formula_number" => 14,
-        _ => 999,
-    }
+    const PRIORITY: [&str; 15] = [
+        "footnote",
+        "reference_content",
+        "vision_footnote",
+        "reference",
+        "block_quote",
+        "paragraph_title",
+        "doc_title",
+        "byline",
+        "text",
+        "content",
+        "vertical_text",
+        "header",
+        "footer",
+        "number",
+        "formula_number",
+    ];
+    PRIORITY
+        .iter()
+        .position(|named| *named == label)
+        .unwrap_or(999)
 }
 
 fn region_by_raw_mut(
@@ -909,38 +880,37 @@ fn region_by_raw_mut(
 fn bbox_area(bbox: [f64; 4]) -> f64 {
     (bbox[2] - bbox[0]).max(0.0) * (bbox[3] - bbox[1]).max(0.0)
 }
-
 fn bbox_width(bbox: [f64; 4]) -> f64 {
     (bbox[2] - bbox[0]).max(0.0)
 }
-
 fn bbox_height(bbox: [f64; 4]) -> f64 {
     (bbox[3] - bbox[1]).max(0.0)
 }
-
 fn bbox_center(bbox: [f64; 4]) -> (f64, f64) {
     ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5)
 }
-
 fn contains_point(bbox: [f64; 4], point: (f64, f64)) -> bool {
     bbox[0] <= point.0 && point.0 <= bbox[2] && bbox[1] <= point.1 && point.1 <= bbox[3]
+}
+fn region_y_ratio(region: &RegionDetection, height: f64) -> f64 {
+    bbox_center(region.bbox).1 / height.max(1.0)
+}
+fn region_column(region: &RegionDetection, width: f64) -> usize {
+    usize::from(width > 0.0 && bbox_center(region.bbox).0 > width * 0.54)
+}
+fn in_middle_half(region: &RegionDetection, height: f64) -> bool {
+    (0.25..=0.75).contains(&region_y_ratio(region, height))
+}
+fn clamp01(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+fn digit_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn intersection_area(left: [f64; 4], right: [f64; 4]) -> f64 {
     (left[2].min(right[2]) - left[0].max(right[0])).max(0.0)
         * (left[3].min(right[3]) - left[1].max(right[1])).max(0.0)
-}
-
-fn region_y_ratio(region: &RegionDetection, height: f64) -> f64 {
-    bbox_center(region.bbox).1 / height.max(1.0)
-}
-
-fn region_column(region: &RegionDetection, width: f64) -> usize {
-    usize::from(width > 0.0 && bbox_center(region.bbox).0 > width * 0.54)
-}
-
-fn in_middle_half(region: &RegionDetection, height: f64) -> bool {
-    (0.25..=0.75).contains(&region_y_ratio(region, height))
 }
 
 fn horizontal_overlap_ratio(left: [f64; 4], right: [f64; 4]) -> f64 {
@@ -981,19 +951,12 @@ fn median(values: &mut [f64], default: f64) -> f64 {
         return default;
     }
     values.sort_by(f64::total_cmp);
+    let half = values.len() / 2;
     if values.len() % 2 == 1 {
-        values[values.len() / 2]
+        values[half]
     } else {
-        (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
+        (values[half - 1] + values[half]) * 0.5
     }
-}
-
-fn clamp01(value: f64) -> f64 {
-    value.clamp(0.0, 1.0)
-}
-
-fn digit_text(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn exact_page_digits(text: &str) -> Option<i64> {
@@ -1004,7 +967,7 @@ fn exact_page_digits(text: &str) -> Option<i64> {
 
 fn repeat_text_key(text: &str) -> String {
     let lowercase = text.to_ascii_lowercase();
-    let tokens: Vec<&str> = ascii_words_regex()
+    let tokens: Vec<&str> = regex!(r"[a-z]+")
         .find_iter(&lowercase)
         .map(|matched| matched.as_str())
         .collect();
@@ -1016,27 +979,31 @@ fn repeat_text_key(text: &str) -> String {
 }
 
 fn roman_title_text(text: &str) -> bool {
-    roman_title_regex().is_match(text)
+    regex!(r"(?i)^\s*(?:I|II)[).]\s+").is_match(text)
 }
-
 fn list_item_text(text: &str) -> bool {
-    list_item_regex().is_match(text)
+    regex!(r"^\s*(?:[•*.-]|\(?[A-Za-z0-9]{1,3}[).])\s+").is_match(text)
 }
 
 fn heading_style_corroborated(text: &str) -> bool {
-    let compact = whitespace_regex().replace_all(text, " ");
+    let compact = regex!(r"\s+").replace_all(text, " ");
     let compact = compact.trim();
-    if compact.is_empty() || compact.len() > 90 || footnote_marker_regex().is_match(compact) {
+    if compact.is_empty()
+        || compact.len() > 90
+        || regex!(r"^\s*(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S").is_match(compact)
+    {
         return false;
     }
     let letters: Vec<char> = compact.chars().filter(|ch| ch.is_alphabetic()).collect();
     if !letters.is_empty() && letters.iter().all(|ch| ch.is_uppercase()) {
         return true;
     }
-    if !heading_enumerator_regex().is_match(compact) || compact.ends_with('.') {
+    if !regex!(r"^\s*(?:[IVXLC]{1,6}|[A-Za-z]|\d{1,2})\s*[.)]\s+\S").is_match(compact)
+        || compact.ends_with('.')
+    {
         return false;
     }
-    let tokens: Vec<&str> = heading_token_regex()
+    let tokens: Vec<&str> = regex!(r"[A-Za-z][A-Za-z'`-]+")
         .find_iter(compact)
         .map(|matched| matched.as_str())
         .collect();
@@ -1052,68 +1019,24 @@ fn heading_style_corroborated(text: &str) -> bool {
 fn candidate_number(label: &str) -> bool {
     !is_footnote(label) && !is_visual(label) && label != "number"
 }
-
 fn repeat_candidate(label: &str) -> bool {
     !is_footnote(label) && !is_page_number(label) && !is_visual(label)
 }
-
 fn is_footnote(label: &str) -> bool {
     matches!(
         label,
         "footnote" | "vision_footnote" | "reference" | "reference_content"
     )
 }
-
 fn is_page_number(label: &str) -> bool {
     matches!(label, "number" | "formula_number")
 }
-
 fn is_visual(label: &str) -> bool {
     matches!(
         label,
         "image" | "chart" | "header_image" | "footer_image" | "seal" | "table"
     )
 }
-
 fn is_footnote_sandwich_protected(label: &str) -> bool {
     is_footnote(label) || matches!(label, "header" | "footer" | "number" | "formula_number")
-}
-
-fn regex_once(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(pattern).expect("static PPdoc regex is valid"))
-}
-
-fn whitespace_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"\s+")
-}
-
-fn ascii_words_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"[a-z]+")
-}
-
-fn roman_title_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"(?i)^\s*(?:I|II)[).]\s+")
-}
-
-fn list_item_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"^\s*(?:[•*.-]|\(?[A-Za-z0-9]{1,3}[).])\s+")
-}
-
-fn footnote_marker_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"^\s*(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S")
-}
-
-fn heading_enumerator_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"^\s*(?:[IVXLC]{1,6}|[A-Za-z]|\d{1,2})\s*[.)]\s+\S")
-}
-
-fn heading_token_regex() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    regex_once(&VALUE, r"[A-Za-z][A-Za-z'`-]+")
 }

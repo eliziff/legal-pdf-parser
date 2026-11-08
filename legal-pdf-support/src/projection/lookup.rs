@@ -175,11 +175,19 @@ pub(crate) fn join_page_lines(lines: Vec<Line>) -> String {
 }
 
 pub(crate) fn range_text(text: &ScalarText<'_>, ranges: &[ScalarRange]) -> String {
-    ranges.iter().filter_map(|range| text.slice_utf16(range.start..range.end))
-        .filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n")
+    ranges
+        .iter()
+        .filter_map(|range| text.slice_utf16(range.start..range.end))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-pub(crate) fn rendered_slice(text: &ScalarText<'_>, document: &DocumentStructure, node: &StructureNode) -> String {
+pub(crate) fn rendered_slice(
+    text: &ScalarText<'_>,
+    document: &DocumentStructure,
+    node: &StructureNode,
+) -> String {
     range_text(text, &document.query_ranges(node))
 }
 
@@ -402,10 +410,6 @@ pub(crate) fn section_unit(
 }
 
 pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
-    static RANGE: OnceLock<Regex> = OnceLock::new();
-    static PAGE_PREFIX: OnceLock<Regex> = OnceLock::new();
-    static PARAGRAPH_PREFIX: OnceLock<Regex> = OnceLock::new();
-    static LINE_PREFIX: OnceLock<Regex> = OnceLock::new();
     let value = nfkc_text(raw);
     let value = value
         .trim()
@@ -414,35 +418,27 @@ pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim();
-    let prefix = if kind == "page" {
-        PAGE_PREFIX.get_or_init(|| Regex::new(r"(?i)^(?:pages?|pp?\.?)[\s:_=-]*").unwrap())
-    } else if kind == "line" {
-        LINE_PREFIX.get_or_init(|| Regex::new(r"(?i)^(?:lines?|ll?\.?)[\s:_=-]*").unwrap())
-    } else {
-        PARAGRAPH_PREFIX
-            .get_or_init(|| Regex::new(r"(?i)^(?:paragraphs?|paras?|pars?)\.?[\s:_=-]*").unwrap())
+    let prefix = match kind {
+        "page" => legal_pdf_core::regex!(r"(?i)^(?:pages?|pp?\.?)[\s:_=-]*"),
+        "line" => legal_pdf_core::regex!(r"(?i)^(?:lines?|ll?\.?)[\s:_=-]*"),
+        _ => legal_pdf_core::regex!(r"(?i)^(?:paragraphs?|paras?|pars?)\.?[\s:_=-]*"),
     };
     let stripped = prefix.replace(value, "");
-    let captures = RANGE
-        .get_or_init(|| Regex::new(r"(?i)^(\d{1,6})\s*(?:-|–|—|\.\.|to)\s*(\d{1,6})$").unwrap())
+    let captures = legal_pdf_core::regex!(r"(?i)^(\d{1,6})\s*(?:-|–|—|\.\.|to)\s*(\d{1,6})$")
         .captures(&stripped)?;
     Some((captures[1].parse().ok()?, captures[2].parse().ok()?))
 }
 
 pub(crate) fn normalize_footnote(raw: &str) -> String {
-    static PREFIX: OnceLock<Regex> = OnceLock::new();
     let value = nfkc_text(raw);
-    PREFIX
-        .get_or_init(|| Regex::new(r"(?i)^(?:footnotes?|notes?|fn)\s*[#.:_-]?\s*").unwrap())
+    legal_pdf_core::regex!(r"(?i)^(?:footnotes?|notes?|fn)\s*[#.:_-]?\s*")
         .replace(value.trim(), "")
         .to_lowercase()
 }
 
 pub(crate) fn normalized_section(analysis: &dyn StructureAnalysis, raw: &str) -> Option<String> {
-    static PREFIX: OnceLock<Regex> = OnceLock::new();
     let value = nfkc_text(raw);
-    let compact: String = PREFIX
-        .get_or_init(|| Regex::new(r"(?i)^(?:ss?\.?|sections?)\s*").unwrap())
+    let compact: String = legal_pdf_core::regex!(r"(?i)^(?:ss?\.?|sections?)\s*")
         .replace(value.trim(), "")
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -462,7 +458,12 @@ pub(crate) fn section_alias(analysis: &dyn StructureAnalysis, raw: &str) -> Stri
     })
 }
 
-pub(crate) fn section_matches(analysis: &dyn StructureAnalysis, section: &StructureNode, requested_kind: &str, requested: &str) -> bool {
+pub(crate) fn section_matches(
+    analysis: &dyn StructureAnalysis,
+    section: &StructureNode,
+    requested_kind: &str,
+    requested: &str,
+) -> bool {
     if requested_kind != "section" && section.locator_kind.as_deref() != Some(requested_kind) {
         return false;
     }
@@ -480,7 +481,11 @@ pub(crate) fn section_matches(analysis: &dyn StructureAnalysis, section: &Struct
         .any(|value| section_alias(analysis, value) == requested)
 }
 
-pub(crate) fn exact_footnotes(document: &PdfDocument, locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
+pub(crate) fn exact_footnotes(
+    document: &PdfDocument,
+    locator: &str,
+    input: &PdfLookupRequest,
+) -> Vec<usize> {
     let query = normalize_footnote(locator);
     document
         .footnotes
@@ -498,6 +503,11 @@ pub(crate) fn exact_footnotes(document: &PdfDocument, locator: &str, input: &Pdf
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Both ends of a range found, the first not after the last.
+fn ordered(start: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
+    start.zip(end).filter(|(start, end)| start <= end)
 }
 
 pub(crate) fn finish<F>(
@@ -578,7 +588,11 @@ where
     lookup
 }
 
-pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfDocument, input: &PdfLookupRequest) -> PdfStructureLookup {
+pub(crate) fn structure_lookup(
+    analysis: &dyn StructureAnalysis,
+    document: &PdfDocument,
+    input: &PdfLookupRequest,
+) -> PdfStructureLookup {
     if !input.valid() {
         return result(
             input,
@@ -594,6 +608,24 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
         .end_locator
         .as_deref()
         .filter(|value| !value.is_empty());
+    // The numbers a page, paragraph or line locator runs from and to, in order.
+    let numbers = || {
+        let inline = numeric_range(kind, &input.locator);
+        let start_number = inline
+            .map(|item| item.0)
+            .or_else(|| analysis.parse_ordinal(kind, &input.locator));
+        let end_number = end_locator
+            .map(|end| analysis.parse_ordinal(kind, end))
+            .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
+        match (start_number, end_number) {
+            (Some(start), Some(end)) if start <= end => Ok((start, end)),
+            _ => Err(result(
+                input,
+                PdfLookupStatus::Invalid,
+                Some("Invalid exact range".to_owned()),
+            )),
+        }
+    };
     if kind == "line" {
         // A transcript's printed line numbers on one page ("p. 451, ll. 12-20"): each numbered
         // line that carries words, read across the row its number opens.
@@ -604,27 +636,10 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
                 Some("A line locator needs its page".to_owned()),
             );
         };
-        let inline = numeric_range(kind, &input.locator);
-        let start_number = inline
-            .map(|item| item.0)
-            .or_else(|| analysis.parse_ordinal(kind, &input.locator));
-        let end_number = end_locator
-            .map(|end| analysis.parse_ordinal(kind, end))
-            .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
-        let (Some(start_number), Some(end_number)) = (start_number, end_number) else {
-            return result(
-                input,
-                PdfLookupStatus::Invalid,
-                Some("Invalid exact range".to_owned()),
-            );
+        let (start_number, end_number) = match numbers() {
+            Ok(numbers) => numbers,
+            Err(invalid) => return invalid,
         };
-        if start_number > end_number {
-            return result(
-                input,
-                PdfLookupStatus::Invalid,
-                Some("Invalid exact range".to_owned()),
-            );
-        }
         // The page a reader cites is the one printed with that number; a PDF whose pages print
         // none is read by its own page numbers.
         let printed = page_number.to_string();
@@ -633,7 +648,9 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
             .nodes
             .iter()
             .find(|node| {
-                node.label.as_deref().is_some_and(|label| label.starts_with("page"))
+                node.label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("page"))
                     && node
                         .aliases
                         .as_ref()
@@ -641,7 +658,12 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
             })
             .and_then(|node| node.page_indexes.first())
             .and_then(|index| document.pages.iter().find(|page| page.index == *index))
-            .or_else(|| document.pages.iter().find(|page| page.number == page_number));
+            .or_else(|| {
+                document
+                    .pages
+                    .iter()
+                    .find(|page| page.number == page_number)
+            });
         let Some((page, geometry)) = page.and_then(|page| {
             document
                 .passage_pages
@@ -660,12 +682,9 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
             );
         }
         let at = |number| lines.iter().position(|line| line.0 == number);
-        let (Some(start), Some(end)) = (at(start_number), at(end_number)) else {
+        let Some((start, end)) = ordered(at(start_number), at(end_number)) else {
             return result(input, PdfLookupStatus::NotFound, None);
         };
-        if end < start {
-            return result(input, PdfLookupStatus::NotFound, None);
-        }
         return finish(document, input, lines.len(), start, end, |index| {
             let (number, id, text) = &lines[index];
             PdfLookupUnit {
@@ -687,39 +706,19 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
         });
     }
     if kind == "page" || kind == "paragraph" {
-        let inline = numeric_range(kind, &input.locator);
-        let start_number = inline
-            .map(|item| item.0)
-            .or_else(|| analysis.parse_ordinal(kind, &input.locator));
-        let end_number = end_locator
-            .map(|end| analysis.parse_ordinal(kind, end))
-            .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
-        let (Some(start_number), Some(end_number)) = (start_number, end_number) else {
-            return result(
-                input,
-                PdfLookupStatus::Invalid,
-                Some("Invalid exact range".to_owned()),
-            );
+        let (start_number, end_number) = match numbers() {
+            Ok(numbers) => numbers,
+            Err(invalid) => return invalid,
         };
-        if start_number > end_number {
-            return result(
-                input,
-                PdfLookupStatus::Invalid,
-                Some("Invalid exact range".to_owned()),
-            );
-        }
         if kind == "page" {
             let position = |number| {
                 u32::try_from(number)
                     .ok()
                     .and_then(|number| document.pages.iter().position(|page| page.number == number))
             };
-            let (Some(start), Some(end)) = (position(start_number), position(end_number)) else {
+            let Some((start, end)) = ordered(position(start_number), position(end_number)) else {
                 return result(input, PdfLookupStatus::NotFound, None);
             };
-            if end < start {
-                return result(input, PdfLookupStatus::NotFound, None);
-            }
             let text = ScalarText::new(document.structure.query_text());
             let nodes = nodes_by_id(document);
             return finish(document, input, document.pages.len(), start, end, |index| {
@@ -765,13 +764,10 @@ pub(crate) fn structure_lookup(analysis: &dyn StructureAnalysis, document: &PdfD
             }
             return lookup;
         }
-        let (Some(start), Some(end)) = (start.first().copied(), end_matches.first().copied())
+        let Some((start, end)) = ordered(start.first().copied(), end_matches.first().copied())
         else {
             return result(input, PdfLookupStatus::NotFound, None);
         };
-        if end < start {
-            return result(input, PdfLookupStatus::NotFound, None);
-        }
         return finish(
             document,
             input,

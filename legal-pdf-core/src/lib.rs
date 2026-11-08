@@ -32,3 +32,31 @@ macro_rules! regex {
         RE.get_or_init(|| ::regex::Regex::new($pattern).expect("regex"))
     }};
 }
+
+/// The shape of a line's text: its length, its share of capitals, figures, punctuation and spaces,
+/// how it opens and how it ends.
+pub fn text_shape(text: &str) -> [f64; 15] {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let n = chars.len().max(1) as f64;
+    let letters = chars.iter().filter(|c| c.is_alphabetic()).count().max(1) as f64;
+    let first = chars.first().copied().unwrap_or(' ');
+    let last = chars.last().copied().unwrap_or(' ');
+    let flag = |b: bool| f64::from(u8::from(b));
+    [
+        (1.0 + chars.len() as f64).ln() / 5.0,
+        chars.iter().filter(|c| c.is_uppercase()).count() as f64 / letters,
+        chars.iter().filter(|c| c.is_ascii_digit()).count() as f64 / n,
+        chars.iter().filter(|c| c.is_ascii_punctuation()).count() as f64 / n,
+        chars.iter().filter(|c| c.is_whitespace()).count() as f64 / n,
+        flag(first.is_ascii_digit()),
+        flag(first.is_uppercase()),
+        flag(first.is_lowercase()),
+        flag("([{".contains(first)),
+        flag("•·▪–—-*†‡§¶".contains(first)),
+        flag(last == '.'),
+        flag(last == ':'),
+        flag(last == ',' || last == ';'),
+        flag(last == '-' || last == '\u{00AD}'),
+        flag(last.is_ascii_digit()),
+    ]
+}
