@@ -126,9 +126,7 @@ pub fn assemble_pdf(
             regions: vec![],
             source: "native".to_owned(),
             text_quality: quality,
-            printed_label: None,
-            printed_label_source: None,
-            printed_label_line_id: None,
+            ..Default::default()
         });
     }
     let mut rules_by_page = HashMap::<u32, Vec<PdfLine>>::new();

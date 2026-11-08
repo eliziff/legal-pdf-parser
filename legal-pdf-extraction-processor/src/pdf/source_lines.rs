@@ -27,17 +27,9 @@ pub(crate) fn make_line(text_line: TextLine, page_index: usize, local_index: usi
         spans,
         words,
         detached_references: vec![],
-        ocr: None,
-        exclude_from_body: false,
-        ink: 0.0,
-        weight: 0.0,
-        cap_height: 0.0,
-        suppress_footnote_label: false,
-        paragraph_label_candidate: false,
-        note_region_mode: String::new(),
-        region_id: String::new(),
         region_type: "text".to_owned(),
         source: "native".to_owned(),
+        ..Default::default()
     })
 }
 

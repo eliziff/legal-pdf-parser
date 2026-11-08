@@ -50,16 +50,10 @@ pub(crate) fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) ->
             boundary: result.boundary,
             marker: None,
         }),
-        exclude_from_body: false,
-        ink: 0.0,
-        weight: 0.0,
-        cap_height: 0.0,
-        suppress_footnote_label: false,
-        paragraph_label_candidate: false,
-        note_region_mode: String::new(),
         region_id: result.region_id,
         region_type: result.region_type,
         source: "ocr".to_owned(),
+        ..Default::default()
     })
 }
 

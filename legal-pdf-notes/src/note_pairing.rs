@@ -15,12 +15,12 @@ fn without_lines(page: &Page) -> Page {
         width: page.width,
         height: page.height,
         lines: Vec::new(),
-        regions: Vec::new(),
         source: page.source.clone(),
         text_quality: page.text_quality,
         printed_label: page.printed_label.clone(),
         printed_label_source: page.printed_label_source.clone(),
         printed_label_line_id: page.printed_label_line_id.clone(),
+        ..Default::default()
     }
 }
 
