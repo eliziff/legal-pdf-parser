@@ -5,7 +5,7 @@
 //! (`contexts`), and the outline its units hang in (`outline`).
 
 use legal_pdf_structure_model::{Decided, Evidence, Role, Rule, Run, Slots};
-use legal_pdf_core::model::{Page, PdfSourceSpan};
+use legal_pdf_core::model::{Page, ScalarRange};
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
     CandidateGrammar, Derivation, NodeKind, ScalarRange, ScalarText, StructureNode,
@@ -58,18 +58,18 @@ pub fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
 }
 
 /// Each line's citations, as scalar spans of its text, by line id.
-pub fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<PdfSourceSpan>> {
+pub fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<ScalarRange>> {
     pages
         .iter()
         .flat_map(|page| &page.lines)
         .map(|line| {
             let scalars = |byte: u32| line.text.char_indices().take_while(|(at, _)| *at < byte as usize).count();
-            let mut spans: Vec<PdfSourceSpan> = slots
+            let mut spans: Vec<ScalarRange> = slots
                 .of_id(&line.id)
                 .map(|slot| evidence.citations_of(slot))
                 .unwrap_or_default()
                 .iter()
-                .map(|cited| PdfSourceSpan { start: scalars(cited.core.0), end: scalars(cited.core.1) })
+                .map(|cited| ScalarRange { start: scalars(cited.core.0), end: scalars(cited.core.1) })
                 .filter(|span| span.start < span.end)
                 .collect();
             spans.sort_by_key(|span| (span.start, span.end));

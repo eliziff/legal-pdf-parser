@@ -2,7 +2,7 @@
 
 use legal_pdf_structure_model::{Decided, DocumentContext};
 use legal_pdf_text::text_index::PdfTextIndex;
-use legal_pdf_core::model::{Line, Page, PdfSourceSpan};
+use legal_pdf_core::model::{Line, Page, ScalarRange};
 use legal_structure_model::NotePairing;
 use std::collections::{BTreeMap, HashMap};
 
@@ -29,7 +29,7 @@ fn without_lines(page: &Page) -> Page {
 /// they stand. A note's id is the document's, and its numbering's restarts count on across the documents.
 pub fn pair_notes(pages: &mut [Page],
     decided: &Decided,
-    citations: &BTreeMap<String, Vec<PdfSourceSpan>>,
+    citations: &BTreeMap<String, Vec<ScalarRange>>,
     index: &PdfTextIndex,
 ) -> NotePairing {
     let place = |id: &str, start: usize, end: usize| index.global_range(id, start, end);
