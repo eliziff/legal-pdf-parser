@@ -9,7 +9,7 @@ use legal_structure_model::{
     ScalarText,
 };
 use legal_structure_model::{
-    Derivation, DocumentStructure, NodeKind, StructureNode,
+    DocumentStructure, NodeKind, StructureNode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest;

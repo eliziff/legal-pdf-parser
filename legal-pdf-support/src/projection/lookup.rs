@@ -54,39 +54,38 @@ impl PdfLookupRequest {
     }
 }
 
-#[derive(Serialize)]
-pub struct PdfLookupProposition {
-    pub sentence: String,
-    pub passage_since_prior_note: String,
-}
-
-#[derive(Serialize)]
-pub struct PdfLookupNote {
-    pub label: String,
-    pub occurrence: usize,
-    pub restart_sequence: usize,
-    pub reference_page: Option<u32>,
-    pub body_pages: Vec<u32>,
-    pub warnings: Vec<String>,
-}
-
-/// A unit a lookup returns: its node's id, its kind and its label as the document prints it ("12" of a paragraph, a
-/// page or a note, a provision's label), its text and the spans of the document's text it holds, its pages.
+/// A unit a lookup returns: its node, as the model serializes it, and what no node holds: its text as the lookup reads
+/// it, how far its pages' text is trusted, a numbered paragraph's other printings (a parallel report's columns), and a
+/// note's count of its label's printings up to it and the page its first call stands on.
 #[derive(Serialize)]
 pub struct PdfLookupUnit {
-    pub id: String,
-    pub kind: &'static str,
-    pub locator: String,
+    pub node: StructureNode,
     pub text: String,
-    pub spans: Vec<ScalarRange>,
-    pub page_numbers: Vec<u32>,
     pub confidence: Option<f64>,
-    pub confidence_basis: &'static str,
-    pub provenance: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub printings: Vec<StructureNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposition: Option<PdfLookupProposition>,
+    pub occurrence: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<PdfLookupNote>,
+    pub reference_page: Option<u32>,
+}
+
+impl PdfLookupUnit {
+    fn new(node: &StructureNode, text: String, confidence: Option<f64>) -> Self {
+        Self { node: node.clone(), text, confidence, printings: Vec::new(), occurrence: None, reference_page: None }
+    }
+
+    /// The pages (from 1) the unit stands on: its note's first call's, then its node's and its printings'.
+    pub fn page_numbers(&self) -> Vec<u32> {
+        let mut pages: Vec<u32> = self.reference_page.into_iter().collect();
+        for page in std::iter::once(&self.node).chain(&self.printings).flat_map(|node| &node.page_indexes) {
+            let page = *page as u32 + 1;
+            if !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+        pages
+    }
 }
 
 #[derive(Serialize)]
@@ -109,6 +108,8 @@ pub enum PdfLookupStatus {
 pub struct PdfStructureLookup {
     pub schema_version: &'static str,
     pub requested: PdfLookupRequest,
+    /// The kind of unit the request asks for: a page, a transcript's line, a paragraph, a note or a provision.
+    pub kind: &'static str,
     pub units: Vec<PdfLookupUnit>,
     pub before: Vec<PdfLookupUnit>,
     pub after: Vec<PdfLookupUnit>,
@@ -135,6 +136,13 @@ pub(crate) fn result(
     }
     PdfStructureLookup {
         schema_version: "legalpdf.structure-lookup.v1",
+        kind: match input.locator_kind.as_str() {
+            "page" => "page",
+            "line" => "line",
+            "paragraph" => "paragraph",
+            "footnote" => "footnote",
+            _ => "section",
+        },
         requested,
         units: Vec::new(),
         before: Vec::new(),
@@ -256,54 +264,26 @@ fn container_label(kind: &str, locator: &str) -> Option<String> {
     }
 }
 
-/// A declared paragraph as a lookup unit, retaining its graph identity: its printings' text and pages.
+/// A declared paragraph as a lookup unit: its first printing, with its other printings and the text of them all; trusted
+/// as its first page's text is.
 pub(crate) fn printed_unit(
     text: &ScalarText<'_>,
     document: &PdfDocument,
-    (number, printings): &PrintedParagraph,
+    (_, printings): &PrintedParagraph,
 ) -> PdfLookupUnit {
     let nodes: Vec<&StructureNode> = printings.iter().map(|&index| &document.structure.nodes[index]).collect();
     let mut ranges: Vec<ScalarRange> = nodes.iter().flat_map(|node| document.structure.query_ranges(node).into_owned()).collect();
     ScalarRange::normalize_union(&mut ranges);
-    let mut page_numbers: Vec<u32> = nodes.iter().flat_map(|node| node.page_indexes.iter().map(|page| (*page + 1) as u32)).collect();
-    page_numbers.sort_unstable();
-    page_numbers.dedup();
-    let page = page_numbers
-        .first()
-        .and_then(|number| document.page_nodes().find(|page| page_number(page) == *number));
-    PdfLookupUnit {
-        id: nodes[0].id.clone(),
-        kind: "paragraph",
-        locator: number.to_string(),
-        text: range_text(text, &ranges),
-        spans: document.structure.query_ranges(nodes[0]).into_owned(),
-        page_numbers,
-        confidence: page.map(|page| page_confidence(&document.summary.page_text_quality, page)),
-        confidence_basis: if page.is_some() {
-            "page_text_quality"
-        } else {
-            "unavailable"
-        },
-        provenance: "legalpdf:printed".to_owned(),
-        proposition: None,
-        note: None,
-    }
+    let first = nodes.iter().flat_map(|node| node.page_indexes.iter().copied()).min();
+    let page = first.and_then(|index| document.page_nodes().find(|page| page_index(page) == index));
+    let mut unit = PdfLookupUnit::new(nodes[0], range_text(text, &ranges),
+        page.map(|page| page_confidence(&document.summary.page_text_quality, page)));
+    unit.printings = nodes[1..].iter().map(|node| (*node).clone()).collect();
+    unit
 }
 
 pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, quality: &[f64], page: &StructureNode) -> PdfLookupUnit {
-    PdfLookupUnit {
-        id: page.id.clone(),
-        kind: "page",
-        locator: page_number(page).to_string(),
-        text: rendered_slice(text, document, page),
-        spans: document.query_ranges(page).into_owned(),
-        page_numbers: vec![page_number(page)],
-        confidence: Some(page_confidence(quality, page)),
-        confidence_basis: "page_text_quality",
-        provenance: page_provenance(page),
-        proposition: None,
-        note: None,
-    }
+    PdfLookupUnit::new(page, rendered_slice(text, document, page), Some(page_confidence(quality, page)))
 }
 
 /// A page's printed transcript lines in reading order: each line number the structure labels
@@ -362,87 +342,27 @@ fn page_at(document: &PdfDocument, offset: usize) -> Option<u32> {
         .map(|page| *page as u32 + 1)
 }
 
-/// A note as a lookup returns it: its body, the page its first call stands on and those its body does, the times its label
-/// was printed before it and once more, its numbering's restart, and its proposition.
+/// A note as a lookup returns it: its body, the times its label was printed up to it, and the page its first call stands
+/// on.
 pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes: &[&StructureNode], at: usize) -> PdfLookupUnit {
     let note = notes[at];
-    let label = note.label.as_deref().unwrap_or("");
-    let reference_page = note.calls.first().and_then(|call| page_at(document, call.start));
-    let body_pages: Vec<u32> = note.page_indexes.iter().map(|page| *page as u32 + 1).collect();
-    let mut page_numbers: Vec<u32> = reference_page.into_iter().collect();
-    page_numbers.extend(body_pages.iter().filter(|page| Some(**page) != reference_page));
-    let property = |name: &str| note.properties.get(name).map_or("", String::as_str).to_owned();
-    PdfLookupUnit {
-        id: note.id.clone(),
-        kind: "footnote",
-        locator: label.to_owned(),
-        text: rendered_slice(text, &document.structure, note).trim().to_owned(),
-        spans: document.structure.query_ranges(note).into_owned(),
-        page_numbers,
-        confidence: None,
-        confidence_basis: "footnote_pairing",
-        provenance: note.properties.get("provenance").cloned().unwrap_or_else(|| "unknown".to_owned()),
-        proposition: Some(PdfLookupProposition { sentence: property("sentence"), passage_since_prior_note: property("passage") }),
-        note: Some(PdfLookupNote {
-            label: label.to_owned(),
-            occurrence: notes[..=at].iter().filter(|other| other.label.as_deref().unwrap_or("") == label).count(),
-            restart_sequence: note.series.parse().unwrap_or(0),
-            reference_page,
-            body_pages,
-            warnings: if note.calls.is_empty() { vec!["label_only".to_owned()] } else { Vec::new() },
-        }),
-    }
+    let mut unit = PdfLookupUnit::new(note, rendered_slice(text, &document.structure, note).trim().to_owned(), None);
+    unit.occurrence = Some(notes[..=at].iter().filter(|other| other.label == note.label).count());
+    unit.reference_page = note.calls.first().and_then(|call| page_at(document, call.start));
+    unit
 }
 
+/// A provision as a lookup returns it, trusted as the least trusted of its pages.
 pub(crate) fn section_unit(
     document: &DocumentStructure,
     text: &ScalarText<'_>,
     quality: &[f64],
     pages: &HashMap<usize, &StructureNode>,
     section: &StructureNode,
-    index: usize,
 ) -> PdfLookupUnit {
-    let mut page_numbers = Vec::new();
-    let mut confidence: Option<f64> = None;
-    for page_index in &section.page_indexes {
-        if let Some(page) = pages.get(page_index) {
-            if !page_numbers.contains(&page_number(page)) {
-                page_numbers.push(page_number(page));
-            }
-            let trusted = page_confidence(quality, page);
-            confidence = Some(confidence.map_or(trusted, |value| value.min(trusted)));
-        }
-    }
-    PdfLookupUnit {
-        id: if section.id.is_empty() {
-            format!("section-{}", index + 1)
-        } else {
-            section.id.clone()
-        },
-        kind: "section",
-        locator: section
-            .label
-            .as_deref()
-            .unwrap_or(&section.id)
-            .trim()
-            .to_owned(),
-        text: rendered_slice(text, document, section).trim().to_owned(),
-        spans: document.query_ranges(section).into_owned(),
-        page_numbers,
-        confidence,
-        confidence_basis: if confidence.is_some() {
-            "minimum_page_text_quality"
-        } else {
-            "unavailable"
-        },
-        provenance: match section.source {
-            Derivation::Native => "native",
-            Derivation::Heuristic => "legal-structure",
-        }
-        .to_owned(),
-        proposition: None,
-        note: None,
-    }
+    let confidence = section.page_indexes.iter().filter_map(|index| pages.get(index))
+        .map(|page| page_confidence(quality, page)).reduce(f64::min);
+    PdfLookupUnit::new(section, rendered_slice(text, document, section).trim().to_owned(), confidence)
 }
 
 pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
@@ -589,7 +509,7 @@ where
         .iter()
         .chain(selected.iter())
         .chain(after.iter())
-        .flat_map(|unit| unit.page_numbers.iter().copied())
+        .flat_map(PdfLookupUnit::page_numbers)
         .collect();
     // The text of each page a unit is on, as a page lookup returns it (`PdfDocument::page_texts`).
     let pages = document
@@ -600,7 +520,7 @@ where
             (!text.is_empty()).then_some(PdfLookupPage { page_number: page_number(page), text })
         })
         .collect();
-    let matches = selected.iter().map(|unit| unit.id.clone()).collect();
+    let matches = selected.iter().map(|unit| unit.node.id.clone()).collect();
     let mut lookup = result(input, PdfLookupStatus::Found, None);
     lookup.units = selected;
     lookup.before = before;
@@ -694,20 +614,8 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             return result(input, PdfLookupStatus::NotFound, None);
         };
         return finish(document, &text, input, lines.len(), start, end, |index| {
-            let (number, node, words) = &lines[index];
-            PdfLookupUnit {
-                id: node.id.clone(),
-                kind: "line",
-                locator: number.to_string(),
-                text: words.clone(),
-                spans: document.structure.query_ranges(node).into_owned(),
-                page_numbers: vec![self::page_number(page)],
-                confidence: Some(page_confidence(&document.summary.page_text_quality, page)),
-                confidence_basis: "page_text_quality",
-                provenance: page_provenance(page),
-                proposition: None,
-                note: None,
-            }
+            let (_, node, words) = &lines[index];
+            PdfLookupUnit::new(node, words.clone(), Some(page_confidence(&document.summary.page_text_quality, page)))
         });
     }
     if kind == "page" || kind == "paragraph" {
@@ -829,7 +737,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
     let pages: HashMap<_, _> = document.page_nodes().map(|page| (page_index(page), page)).collect();
     if first == last {
         return finish(document, &text, input, sections.len(), first, first, |index| {
-            section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, sections[index], index)
+            section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, sections[index])
         });
     }
     // A range's provisions are the outermost from its first through its last, each with what it holds.
@@ -838,6 +746,6 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         .filter(|section| section.parent_id.as_deref().is_none_or(|parent| !spanned.contains(parent)))
         .collect();
     finish(document, &text, input, span.len(), 0, span.len() - 1, |index| {
-        section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, span[index], index)
+        section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, span[index])
     })
 }

@@ -46,11 +46,6 @@ pub(crate) fn page_confidence(quality: &[f64], page: &StructureNode) -> f64 {
     quality.get(page_index(page)).copied().unwrap_or(0.0).clamp(0.0, 1.0)
 }
 
-/// Where a page's text was read from ("unknown" where it does not say).
-pub(crate) fn page_provenance(page: &StructureNode) -> String {
-    page.properties.get("source").filter(|source| !source.is_empty()).cloned().unwrap_or_else(|| "unknown".to_owned())
-}
-
 pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
     let mut writer = DigestWriter::default();
     writer.0.update(b"{\"units\":");
