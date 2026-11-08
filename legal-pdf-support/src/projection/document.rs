@@ -71,7 +71,6 @@ pub struct PdfSummary {
     pub parser_version: String,
     pub cache_key: String,
     pub page_count: usize,
-    pub projection_page_count: usize,
     pub status: String,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
@@ -86,6 +85,18 @@ pub(crate) struct ProjectionPage {
     pub(crate) number: u32,
     pub(crate) source: String,
     pub(crate) text_quality: f64,
+}
+
+impl ProjectionPage {
+    /// How far the page's text is to be trusted, from 0 to 1.
+    pub(crate) fn confidence(&self) -> f64 {
+        self.text_quality.clamp(0.0, 1.0)
+    }
+
+    /// Where the page's text was read from ("unknown" where it does not say).
+    pub(crate) fn provenance(&self) -> String {
+        if self.source.is_empty() { "unknown".to_owned() } else { self.source.clone() }
+    }
 }
 
 pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
@@ -113,7 +124,6 @@ pub(crate) fn summary(
         parser_version: PARSER_VERSION.to_owned(),
         cache_key: cache_key.to_owned(),
         page_count,
-        projection_page_count: page_count,
         status,
         pages_needing_ocr: pdf_metadata.pages_needing_ocr,
         ocr_routed_pages: pdf_metadata.ocr_routed_pages,
