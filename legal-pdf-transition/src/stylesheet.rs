@@ -100,9 +100,12 @@ impl Stylesheet {
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
         // The document's bookmarks alone: its printed contents the parser links itself (`State::answering`).
         let anchoring = legal_pdf_decide::anchors(pages, slots, evidence, fences, geometry, &fences.role, outline, &[]);
-        let place_of: HashMap<Slot, usize> = table.order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
         let mut anchor = vec![0u16; n];
-        anchoring.anchors.iter().for_each(|found| found.lines.iter().filter_map(|slot| place_of.get(slot)).for_each(|&k| anchor[k] = found.level.max(1)));
+        for found in &anchoring.anchors {
+            for slot in &found.lines {
+                anchor[fences.place[slot.index()] as usize] = found.level.max(1);
+            }
+        }
         // A line on a row that reads as a contents list's: a title and the locator it prints.
         let contents_titles = contents_rows(pages, slots, table);
         let listed: Vec<bool> = contents_titles.iter().map(Option::is_some).collect();

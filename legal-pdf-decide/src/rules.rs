@@ -6,8 +6,7 @@
 //! contents list name; the front matter and the lines that go on with the line before, which are
 //! no headings; the residual weighing of the lines still open (`residual`); the title; and the
 //! levels (`levels`). A rule fills only an open line: where two strong rules disagree on one, the
-//! first keeps it and the document's diagnostics name both. Each line keeps the rule that decided
-//! it, and each marker the unit it opens.
+//! first keeps it. Each line keeps the rule that decided it, and each marker the unit it opens.
 
 use super::*;
 use legal_pdf_text::heading_ladder::HeadingLadderStatus;
@@ -61,8 +60,8 @@ pub struct Heard {
 /// that may open its unit (`readings`) and the unit it opens, whether it goes on with the line above
 /// it in one heading, caption or unit, the level a rule gives it (0 for none) and its heading level
 /// once read (0 for none), the anchor naming it (an index among the anchors, plus one; 0 for none);
-/// the disagreements of strong rules; and, where the decision is traced, each residual candidate as
-/// the residual weighed it. A trace holds its readings of the lines.
+/// and, where the decision is traced, each residual candidate as the residual weighed it. A trace
+/// holds its readings of the lines.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Decision {
     pub role: Vec<Role>,
@@ -76,8 +75,6 @@ pub struct Decision {
     pub anchor: Vec<u32>,
     #[serde(skip)]
     pub anchors: Vec<OutlineAnchor>,
-    #[serde(skip)]
-    pub diagnostics: Vec<Diagnostic>,
     #[serde(skip)]
     pub residual: Vec<ResidualRecord>,
     #[serde(skip)]

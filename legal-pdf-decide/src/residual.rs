@@ -138,9 +138,9 @@ pub fn look_of(
     let faceless = evidence.face[at] == u16::MAX;
     let (larger, smaller) = if faceless {
         let on_page = slots.on(page);
-        let size = positive_median(on_page.clone().map(|slot| evidence.size[slot as usize]).collect());
-        let weight = positive_median(on_page.map(|slot| f64::from(evidence.weight[slot as usize])).collect());
-        bold |= weight > 0.0 && f64::from(evidence.weight[at]) >= weight * 1.2;
+        let size = positive_median(on_page.map(|slot| evidence.size[slot as usize]).collect());
+        let weight = positive_median(pages[page].lines.iter().map(|other| other.weight).collect());
+        bold |= weight > 0.0 && line.weight >= weight * 1.2;
         (size > 0.0 && evidence.size[at] >= size * 1.1, size > 0.0 && evidence.size[at] < size * 0.95)
     } else {
         let size = f64::from(evidence.half_points[at]) / 2.0;

@@ -445,7 +445,6 @@ pub fn measure(pages: &[Page],
                 (LOOK_CAPS, all_caps(text)),
                 (LOOK_UNDERLINED, underlined),
             ]));
-            evidence.weight.push(line.weight as f32);
             evidence.tag.push(SourceTag::of(line));
             evidence.marker.push(opening_marker(line, &mut families));
             evidence.label.push(note_label(page, &sizes, at));

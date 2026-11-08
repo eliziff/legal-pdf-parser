@@ -499,15 +499,15 @@ fn line_readings(line: &Line, word: bool, recognized: Option<&str>, confusions: 
 /// lines read in the parse. Each number's place with its row's and twin's; and each line a number numbers, and each
 /// number's own line, with the number's place.
 fn margin_lines(order: &[Slot], readings: &[Vec<MarkerReading>], fences: &Fences) -> (HashMap<usize, (usize, Option<usize>)>, HashMap<usize, usize>) {
-    let place: HashMap<Slot, usize> = order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
+    let place = |slot: Slot| fences.place[slot.index()] as usize;
     let mut margin_rows = HashMap::new();
     let mut margins = HashMap::new();
     for (k, &slot) in order.iter().enumerate() {
-        let Some(row) = fences.margin_number[slot.index()].and_then(|row| place.get(&row).copied()) else { continue };
+        let Some(row) = fences.margin_number[slot.index()].map(place) else { continue };
         if readings[k].is_empty() {
             continue;
         }
-        let twin = fences.margin_twin[slot.index()].and_then(|twin| place.get(&twin).copied()).filter(|&twin| twin != row);
+        let twin = fences.margin_twin[slot.index()].map(place).filter(|&twin| twin != row);
         margin_rows.insert(k, (row, twin));
         for opened in [k, row].into_iter().chain(twin) {
             margins.insert(opened, k);

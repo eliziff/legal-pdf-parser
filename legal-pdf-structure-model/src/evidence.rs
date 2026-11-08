@@ -176,8 +176,6 @@ pub struct Evidence {
     pub half_points: Vec<u16>,
     /// `LOOK_*`.
     pub look: Vec<u8>,
-    /// The stroke weight measured on a recognized page's image (`Line::weight`).
-    pub weight: Vec<f32>,
     pub tag: Vec<SourceTag>,
     pub marker: Vec<Option<Marker>>,
     /// The line on a marker's row carrying its text, where the marker stands alone on its line.
