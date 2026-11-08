@@ -255,8 +255,10 @@ static CUSTOM_MARK: LazyLock<Regex> = LazyLock::new(|| literal(r"(?-u:\b)w:custo
 static BOOKMARK_ID: LazyLock<Regex> = LazyLock::new(|| literal(r#"<w:bookmark(?:Start|End)\b[^>]*\bw:id=(?:"([0-9]+)"|'([0-9]+)')"#));
 static BOOKMARK_NAME: LazyLock<Regex> = LazyLock::new(|| literal(r#"<w:bookmarkStart\b[^>]*\bw:name=(?:"([^"]*)"|'([^']*)')"#));
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct DocxSupraCleanup {
+    /// The document as rewritten, returned beside its counts.
+    #[serde(skip)]
     pub bytes: Vec<u8>,
     pub detected: usize,
     pub converted: usize,

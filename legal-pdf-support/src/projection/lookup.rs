@@ -8,17 +8,21 @@ use super::*;
 /// reads them (`paragraph_printings`).
 pub type PrintedParagraph = (usize, Vec<usize>);
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PdfLookupRequest {
     pub locator_kind: String,
     pub locator: String,
+    #[serde(default)]
     pub end_locator: Option<String>,
+    #[serde(default)]
     pub context_blocks: usize,
+    #[serde(default)]
     pub page: Option<u32>,
+    #[serde(default)]
     pub occurrence: Option<usize>,
     /// The instrument a provision is of, where the PDF prints several ("Canadian Charter of Rights and Freedoms" in
     /// "The Constitution Acts 1867 to 1982").
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<String>,
 }
 
