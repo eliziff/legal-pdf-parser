@@ -10,9 +10,16 @@ pub enum Error {
     Lopdf(#[from] lopdf::Error),
 }
 
+/// A PDF the reader cannot open is password-protected or corrupt.
 impl From<Error> for legal_pdf_core::Error {
     fn from(error: Error) -> Self {
-        Self::Message(error.to_string())
+        use legal_pdf_core::FailureKind;
+        match error {
+            Error::Core(error) => error,
+            Error::Message(message) => Self::Message(message),
+            Error::Pdf(pdf_inspector::PdfError::Encrypted) => Self::Message(error.to_string()).failure(FailureKind::Encrypted),
+            Error::Pdf(_) | Error::Lopdf(_) => Self::Message(error.to_string()).failure(FailureKind::Corrupt),
+        }
     }
 }
 

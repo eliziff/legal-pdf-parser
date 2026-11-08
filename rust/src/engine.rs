@@ -1,5 +1,5 @@
 use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
-use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
+use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, FailureKind, Result};
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
@@ -100,7 +100,8 @@ impl DeferredOcrProvider<'_> {
     fn runtime(&mut self) -> Result<&mut OcrProvider> {
         if self.runtime.is_none() {
             let prepared = self.prepared.take().ok_or_else(|| Error::Message("OCR runtime preparation was already consumed".to_owned()))?;
-            self.runtime = Some(profile::measure("provider_runtime_ocr", || OcrProvider::from_prepared(self.options, prepared))?);
+            self.runtime = Some(profile::measure("provider_runtime_ocr", || OcrProvider::from_prepared(self.options, prepared))
+                .map_err(|error| error.failure(FailureKind::OcrRuntime))?);
         }
         Ok(self.runtime.as_mut().expect("OCR runtime initialized"))
     }
@@ -182,7 +183,8 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
             // Keep the exact 150 dpi scanner, overlapping its existing cache fill with recognition.
             let raster = raster_root.map(|root| scope.spawn(move || cached_rasters(Some(&root), &raster_identity, pdf, &raster_requests)));
             for window in windows {
-                let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(self.runtime.as_mut().expect("OCR runtime initialized"), pdf, window)?;
+                let recognized = legal_pdf_core::PdfOcrProvider::extract_pages(self.runtime.as_mut().expect("OCR runtime initialized"), pdf, window)
+                    .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
                 for page in recognized {
                     let Some((key, path)) = paths.remove(&page.page_index) else {
                         return Err(Error::Message("OCR returned an unexpected or repeated page".to_owned()));
@@ -222,7 +224,8 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         let Some((_, _, render)) = &self.region_render else {
             return Ok(Vec::new());
         };
-        let lines = self.runtime.as_mut().expect("OCR runtime initialized").read_rendered_region(render, region, scale)?;
+        let lines = self.runtime.as_mut().expect("OCR runtime initialized").read_rendered_region(render, region, scale)
+            .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
         if let Some(path) = &path {
             write_gzip_json(path, &CachedRegion { key, lines: lines.clone() })?;
         }
@@ -637,11 +640,11 @@ pub(crate) fn parse_pdf(
     let _profile = profile::scope("parse_pdf");
     let source_hash = if let Some(bytes) = bytes {
         if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
-            return Err(Error::Message("PDF source bytes are invalid".to_owned()));
+            return Err(Error::Message("PDF source bytes are invalid".to_owned()).failure(FailureKind::Corrupt));
         }
         let actual = profile::measure("source_sha256", || format!("{:x}", Sha256::digest(bytes)));
         if options.expected_source_sha256.as_deref().is_some_and(|expected| expected != actual) {
-            return Err(Error::Message("PDF source changed after preparation began".to_owned()));
+            return Err(Error::Message("PDF source changed after preparation began".to_owned()).failure(FailureKind::SourceChanged));
         }
         actual
     } else {
@@ -657,13 +660,15 @@ pub(crate) fn parse_pdf(
     }
     let identity = document_identity();
     #[cfg(feature = "ocr")]
-    let mut ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())?;
+    let mut ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())
+        .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
     #[cfg(feature = "ocr")]
     let ocr_identity = ocr_prepared.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
     #[cfg(not(feature = "ocr"))]
     let ocr_identity: Option<(String, String)> = None;
     #[cfg(feature = "ppdoc")]
-    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::new).transpose())?;
+    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::new).transpose())
+        .map_err(|error| error.failure(FailureKind::LayoutRuntime))?;
     #[cfg(feature = "ppdoc")]
     let ppdoc_identity = ppdoc_prepared.as_ref().map(|provider| provider.identity().to_owned());
     #[cfg(not(feature = "ppdoc"))]
@@ -786,7 +791,8 @@ fn recognized_extraction(
     finish_recognition(&mut extracted.pages, rasters);
     #[cfg(feature = "ppdoc")]
     if let Some(provider) = providers.ppdoc.as_mut() {
-        profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))?;
+        profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))
+            .map_err(|error| error.failure(FailureKind::LayoutRuntime))?;
     }
     Ok(extracted)
 }
