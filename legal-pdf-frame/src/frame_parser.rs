@@ -62,9 +62,6 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
     // Each unit's own membership (a heading's heading text), the most specific owning a span. A
     // table row is a unit too (the gold types a table one row at a time, cells joined): its lines
     // are one block, under any paragraph or item read inside it.
-    // A tagger's graph owns its text through the tagger's units; the parser's section containers
-    // (statute provisions, kept for lookups) then stay out of block ownership.
-    let tagged = structure.origins.iter().any(|origin| origin.id == "legal-structure-tagger.v1");
     // A row is a container: what the parser reads inside it (a cell's paragraph, a heading) stays
     // the row's, as the gold types a table one row at a time.
     let mut rows: Vec<ScalarRange> = structure.nodes.iter().filter(|node| node.kind == NodeKind::Row)
@@ -78,9 +75,6 @@ pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> 
         });
     let mut candidates = Vec::new();
     for node in &structure.nodes {
-        if tagged && node.kind == NodeKind::Section {
-            continue;
-        }
         if node.kind != NodeKind::Row && in_row(if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }) {
             continue;
         }

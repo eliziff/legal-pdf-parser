@@ -546,7 +546,7 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
     let mut groups = prepared.groups;
     // A node that states its region (a tagger's, the transition parser's: its grammar `region:<name>`)
     // is read so; reading list items off the locator (parser_list_item) is for the stage parser's nodes.
-    let tagged: HashMap<&str, &str> = structure.nodes.iter().filter_map(|n| crate::graph::region_of(n).map(|region| (n.id.as_str(), region))).collect();
+    let tagged: HashMap<&str, &str> = structure.nodes.iter().filter_map(|n| region_of(n).map(|region| (n.id.as_str(), region))).collect();
     for group in &mut groups {
         if let Some(region) = group.attributes.get("native_id").and_then(Value::as_str).and_then(|id| tagged.get(id)) {
             group.attributes.insert("region".into(), json!(region));
@@ -646,4 +646,9 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
     }
     let reading_order = (0..lines.len()).collect();
     Ok(State { lines, index, reading_order, span_rank: HashMap::new(), groups: parted, annotations, continuations })
+}
+
+/// The region a node states it reads as, from `grammar: region:<name>` (the transition parser's nodes).
+pub fn region_of(node: &legal_structure_model::StructureNode) -> Option<&str> {
+    node.grammar.as_deref().and_then(|grammar| grammar.strip_prefix("region:"))
 }

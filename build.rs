@@ -225,7 +225,6 @@ fn main() {
         (enabled("LANGUAGE"), "language"),
         (enabled("OCR"), "ocr"),
         (pdf, "support"),
-        (enabled("TAGGER"), "tagger"),
     ] {
         if !active {
             continue;
