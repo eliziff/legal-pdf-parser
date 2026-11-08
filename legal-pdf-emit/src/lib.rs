@@ -436,6 +436,10 @@ pub fn structure_graph(pages: &[Page],
             node.aliases.get_or_insert_with(Vec::new).push(path);
         }
     }
+    // A statute is addressed by its printed labels, each provision under the outermost its label's chain reaches.
+    if identity.profile == Some(legal_structure_model::DetectionProfile::Legislation) {
+        legal_structure_model::legislation_outline(&mut structure.nodes);
+    }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
     // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The
