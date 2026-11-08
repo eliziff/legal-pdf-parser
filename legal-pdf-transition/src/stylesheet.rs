@@ -15,7 +15,6 @@
 //! constituent document the first reading opened.
 
 use super::*;
-pub use legal_pdf_machine::machine::TemplateView;
 
 pub struct Stylesheet {
     /// Each line's template, in reading order.
@@ -36,8 +35,14 @@ pub struct Stylesheet {
     opens: Vec<[bool; 4]>,
 }
 
-fn feature(name: &str) -> usize {
+/// A line feature's place among `LINE_FEATURES`.
+pub(crate) fn feature(name: &str) -> usize {
     LINE_FEATURES.iter().position(|n| *n == name).expect("a line feature")
+}
+
+/// The commonest of the counted keys (the least of those as common), 0 for none.
+fn commonest<K: Copy + Ord + Into<f32>>(counts: &HashMap<K, u32>) -> f32 {
+    counts.iter().max_by_key(|(key, n)| (**n, std::cmp::Reverse(**key))).map_or(0.0, |(key, _)| (*key).into())
 }
 
 /// Each line's template, numbered from 0 in order of first appearance: its look, where it stands (at
@@ -50,17 +55,8 @@ pub fn template_ids(table: &LineTable) -> Vec<u32> {
     let mut ids: HashMap<(u32, u8, u8), u32> = HashMap::new();
     (0..table.order.len()).map(|k| {
         let row = table.row(k);
-        let place = if row[centre].abs() < 0.04 && row[width] < 0.85 {
-            3
-        } else if row[indent] > 0.4 && row[right] < 0.05 {
-            4
-        } else if row[indent] < 0.02 {
-            0
-        } else if row[indent] < 0.08 {
-            1
-        } else {
-            2
-        };
+        let place = if row[centre].abs() < 0.04 && row[width] < 0.85 { 3 } else if row[indent] > 0.4 && row[right] < 0.05 { 4 }
+            else if row[indent] < 0.02 { 0 } else if row[indent] < 0.08 { 1 } else { 2 };
         let family = counts.iter().position(|&c| row[c] > 0.5).map_or(9, |c| c as u8);
         let next = ids.len() as u32;
         *ids.entry((table.looks[k], place, family)).or_insert(next)
@@ -71,21 +67,18 @@ pub fn template_ids(table: &LineTable) -> Vec<u32> {
 /// band holds on its page, in reading order): its title normalized as titles are matched
 /// (`bookmarks::normalize_title`), three characters or more.
 pub fn contents_rows(pages: &[Page], slots: &Slots, table: &LineTable) -> Vec<Option<String>> {
+    use legal_pdf_headings::contents_lists::{row_bands, row_of};
     let n = table.order.len();
+    let line = |at: usize| slots.line(pages, table.order[at]);
     let mut titles = vec![None; n];
     let mut k = 0;
     while k < n {
         let page = slots.page(table.order[k]);
         let end = (k..n).find(|&e| slots.page(table.order[e]) != page).unwrap_or(n);
-        let places: Vec<usize> = (k..end).collect();
-        for band in legal_pdf_headings::contents_lists::row_bands(&places, |at| slots.line(pages, table.order[at]).bbox) {
-            let row = legal_pdf_headings::contents_lists::row_of(band.iter().map(|&at| slots.line(pages, table.order[at])).collect());
-            if row.locator.is_some() {
-                let title = legal_pdf_headings::headings::bookmarks::normalize_title(&row.title);
-                if title.chars().count() >= 3 {
-                    titles[band[0]] = Some(title);
-                }
-            }
+        for band in row_bands(&(k..end).collect::<Vec<usize>>(), |at| line(at).bbox) {
+            let row = row_of(band.iter().map(|&at| line(at)).collect());
+            let title = row.locator.is_some().then(|| legal_pdf_headings::headings::bookmarks::normalize_title(&row.title));
+            if let Some(title) = title.filter(|title| title.chars().count() >= 3) { titles[band[0]] = Some(title); }
         }
         k = end;
     }
@@ -99,18 +92,9 @@ pub fn opener(table: &LineTable, k: usize) -> bool {
 }
 
 impl Stylesheet {
-    pub fn read(
-        pages: &[Page],
-        slots: &Slots,
-        evidence: &Evidence,
-        fences: &Fences,
-        outline: &[PdfOutlineEntry],
-        table: &LineTable,
-        locals: &[Local],
-    ) -> Self {
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, outline: &[PdfOutlineEntry], table: &LineTable, locals: &[Local]) -> Self {
         let n = table.order.len();
-        let at = |name: &str| feature(name);
-        let (size, bold, upper, edge, beside) = (at("size"), at("bold"), at("upper"), at("edge_repeated"), at("beside"));
+        let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
         let template = template_ids(table);
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
@@ -119,19 +103,10 @@ impl Stylesheet {
         let anchoring = legal_pdf_decide::anchors(pages, slots, evidence, fences, &geometry, &fences.role, outline, &[]);
         let place_of: HashMap<Slot, usize> = table.order.iter().enumerate().map(|(k, &slot)| (slot, k)).collect();
         let mut anchor = vec![0u16; n];
-        for found in &anchoring.anchors {
-            for slot in &found.lines {
-                if let Some(&k) = place_of.get(slot) {
-                    anchor[k] = found.level.max(1);
-                }
-            }
-        }
+        anchoring.anchors.iter().for_each(|found| found.lines.iter().filter_map(|slot| place_of.get(slot)).for_each(|&k| anchor[k] = found.level.max(1)));
         // A line on a row that reads as a contents list's: a title and the locator it prints.
         let contents_titles = contents_rows(pages, slots, table);
-        let mut listed = vec![false; n];
-        for (k, title) in contents_titles.iter().enumerate() {
-            listed[k] = title.is_some();
-        }
+        let listed: Vec<bool> = contents_titles.iter().map(Option::is_some).collect();
         // Each template's measures.
         let heading_class = usize::from(HEADING) * 2 + 1;
         let mut views = vec![TemplateView::default(); count];
@@ -162,20 +137,20 @@ impl Stylesheet {
             }
             weight[t] += row[size] * 4.0 + row[bold] * 2.0 + row[upper];
         }
-        for t in 0..count {
-            let lines = views[t].lines.max(1.0);
-            views[t].heading /= lines;
-            views[t].edge /= lines;
-            views[t].beside /= lines;
-            views[t].anchored /= lines;
+        for (t, view) in views.iter_mut().enumerate() {
+            let lines = view.lines.max(1.0);
+            view.heading /= lines;
+            view.edge /= lines;
+            view.beside /= lines;
+            view.anchored /= lines;
             weight[t] /= lines;
-            views[t].monotone = if counted[t].1 > 0 { counted[t].0 as f32 / counted[t].1 as f32 } else { -1.0 };
-            views[t].anchor_level = anchor_levels[t].iter().max_by_key(|(level, n)| (**n, std::cmp::Reverse(**level))).map_or(0.0, |(level, _)| f32::from(*level));
-            views[t].pages = page_sets[t].len() as f32;
+            view.monotone = if counted[t].1 > 0 { counted[t].0 as f32 / counted[t].1 as f32 } else { -1.0 };
+            view.anchor_level = commonest(&anchor_levels[t]);
+            view.pages = page_sets[t].len() as f32;
         }
         let levels = order_templates(&template, table, &views, &weight);
-        for (t, view) in views.iter_mut().enumerate() {
-            view.level = levels[t];
+        for (view, level) in views.iter_mut().zip(levels) {
+            view.level = level;
             view.lines = (1.0 + view.lines).ln();
             view.pages = (1.0 + view.pages).ln();
         }
@@ -204,11 +179,7 @@ impl Stylesheet {
             let (from, to) = (pair[0], pair[1]);
             let lines = (to - from).max(1) as f32;
             let mut shares = [0f32; 4];
-            for k in from..to {
-                for (share, open) in shares.iter_mut().zip(self.opens[k]) {
-                    *share += f32::from(u8::from(open)) / lines;
-                }
-            }
+            (from..to).for_each(|k| shares.iter_mut().zip(self.opens[k]).for_each(|(share, open)| *share += f32::from(u8::from(open)) / lines));
             self.regime[from..to].fill(shares);
         }
     }
@@ -219,8 +190,7 @@ impl Stylesheet {
         let starts: Vec<usize> = moves.iter().enumerate().filter(|(_, m)| m.starts).map(|(k, _)| k).collect();
         self.regimes(&starts);
         let count = self.templates.len();
-        let mut headings = vec![0f32; count];
-        let mut lines = vec![0f32; count];
+        let (mut headings, mut lines) = (vec![0f32; count], vec![0f32; count]);
         let mut levels: Vec<HashMap<i8, u32>> = vec![HashMap::new(); count];
         for (k, m) in moves.iter().enumerate() {
             let t = self.template[k] as usize;
@@ -230,9 +200,9 @@ impl Stylesheet {
                 *levels[t].entry(m.level).or_default() += 1;
             }
         }
-        for t in 0..count {
-            self.templates[t].read_heading = headings[t] / lines[t].max(1.0);
-            self.templates[t].read_level = levels[t].iter().max_by_key(|(level, n)| (**n, std::cmp::Reverse(**level))).map_or(0.0, |(level, _)| f32::from(*level));
+        for (t, view) in self.templates.iter_mut().enumerate() {
+            view.read_heading = headings[t] / lines[t].max(1.0);
+            view.read_level = commonest(&levels[t]);
         }
     }
 
@@ -249,9 +219,7 @@ impl Stylesheet {
 fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], weight: &[f32]) -> Vec<f32> {
     let count = views.len();
     let candidates: Vec<usize> = (0..count).filter(|&t| views[t].heading >= 0.25 || views[t].anchored >= 0.3).collect();
-    if candidates.is_empty() {
-        return vec![0.0; count];
-    }
+    if candidates.is_empty() { return vec![0.0; count]; }
     let index: HashMap<usize, usize> = candidates.iter().enumerate().map(|(i, &t)| (t, i)).collect();
     let m = candidates.len();
     // Restarts: after an occurrence of a, whether b's next marker reads 1; and nesting: whether b
@@ -264,10 +232,7 @@ fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], 
     for k in 0..template.len() {
         let Some(&b) = index.get(&(template[k] as usize)) else { continue };
         let first = table.readings[k].first().map(|r| r.value);
-        for a in 0..m {
-            if a == b || !occurred[a] {
-                continue;
-            }
+        for a in (0..m).filter(|&a| a != b && occurred[a]) {
             if after[a][b] {
                 if let Some(value) = first {
                     restarts[a][b].1 += 1;
@@ -278,11 +243,8 @@ fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], 
             seen_since[a][b] = true;
         }
         for other in 0..m {
-            if other != b && seen_since[b][other] {
-                between[b][other] += 1;
-            }
-            seen_since[b][other] = false;
-            after[b][other] = true;
+            between[b][other] += u32::from(other != b && seen_since[b][other]);
+            (seen_since[b][other], after[b][other]) = (false, true);
         }
         occurred[b] = true;
     }
@@ -297,20 +259,12 @@ fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], 
     let mut standing: Vec<(f32, usize)> = (0..m).map(|a| ((0..m).filter(|&b| b != a).map(|b| above(a, b).signum()).sum(), a)).collect();
     standing.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
     let mut levels = vec![0.0; count];
-    let mut level = 0.0;
-    let mut previous = f32::INFINITY;
+    let (mut level, mut previous) = (0.0, f32::INFINITY);
     for &(score, a) in &standing {
-        if score < previous {
-            level += 1.0;
-            previous = score;
-        }
+        if score < previous { (level, previous) = (level + 1.0, score); }
         levels[candidates[a]] = level;
     }
     // The outline's levels stand where it names a template.
-    for &t in &candidates {
-        if views[t].anchored >= 0.3 && views[t].anchor_level > 0.0 {
-            levels[t] = views[t].anchor_level;
-        }
-    }
+    candidates.iter().filter(|&&t| views[t].anchored >= 0.3 && views[t].anchor_level > 0.0).for_each(|&t| levels[t] = views[t].anchor_level);
     levels
 }

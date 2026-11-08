@@ -29,8 +29,7 @@ pub fn geometry_order(lines: &[Line], members: &mut [usize]) {
 pub fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> Vec<usize> {
     let mut sorted = members.to_vec();
     geometry_order(lines, &mut sorted);
-    let mut ordered = Vec::with_capacity(sorted.len());
-    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let (mut ordered, mut left, mut right) = (Vec::with_capacity(sorted.len()), Vec::new(), Vec::new());
     for slot in sorted {
         let line = &lines[slot];
         if !has_valid_bbox(line) || line_width(line) / page_width > 0.55 {
@@ -48,65 +47,35 @@ pub fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnMod
     ordered
 }
 
+/// The lines ending on a hyphen after two letters or more, and of them those the next line goes on
+/// from with two letters or more.
 pub fn hyphen_join_score(lines: &[Line], members: &[usize]) -> (usize, usize) {
-    let mut candidates = 0;
-    let mut satisfied = 0;
+    let letters = |text: &mut dyn Iterator<Item = char>| text.take_while(char::is_ascii_alphabetic).count();
+    let (mut candidates, mut satisfied) = (0, 0);
     for (index, &slot) in members.iter().enumerate() {
         let text = lines[slot].text.trim_end();
-        let Some(last) = text
-            .chars()
-            .last()
-            .filter(|character| matches!(character, '-' | '\u{00ad}' | '\u{00ac}'))
-        else {
+        let Some(last) = text.chars().last().filter(|character| matches!(character, '-' | '\u{00ad}' | '\u{00ac}')) else {
             continue;
         };
-        let prefix = &text[..text.len() - last.len_utf8()];
-        if prefix
-            .chars()
-            .rev()
-            .take_while(|character| character.is_ascii_alphabetic())
-            .count()
-            < 2
-        {
+        if letters(&mut text[..text.len() - last.len_utf8()].chars().rev()) < 2 {
             continue;
         }
         candidates += 1;
-        if members.get(index + 1).is_some_and(|&next| {
-            lines[next]
-                .text
-                .trim_start()
-                .chars()
-                .take_while(|character| character.is_ascii_alphabetic())
-                .count()
-                >= 2
-        }) {
-            satisfied += 1;
-        }
+        satisfied += usize::from(members.get(index + 1).is_some_and(|&next| letters(&mut lines[next].text.trim_start().chars()) >= 2));
     }
     (candidates, satisfied)
 }
 
 pub fn y_regressions(lines: &[Line], members: &[usize]) -> usize {
     let boxed: Vec<&Line> = members.iter().map(|&slot| &lines[slot]).filter(|line| has_valid_bbox(line)).collect();
-    let tolerance = median(boxed
-        .iter()
-        .map(|line| (line.bbox[3] - line.bbox[1]).max(0.0))
-        .collect());
-    boxed
-        .windows(2)
-        .filter(|pair| line_center_y(pair[1]) < line_center_y(pair[0]) - tolerance)
-        .count()
+    let tolerance = median(boxed.iter().map(|line| (line.bbox[3] - line.bbox[1]).max(0.0)).collect());
+    boxed.windows(2).filter(|pair| line_center_y(pair[1]) < line_center_y(pair[0]) - tolerance).count()
 }
 
 /// The body's order (`body`, slots of the page's lines): the source's, unless the page's columns
 /// (`columns`) read interleaved where pdf-inspector's order of the page's `items` reads them
 /// through, or a single column's lines run up the page where their geometry reads down it.
-pub fn arbitrate_body_order(
-    page: &Page,
-    body: &mut Vec<usize>,
-    items: &legal_pdf_tables::PageItems,
-    columns: ColumnModel,
-) -> OrderDecision {
+pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pdf_tables::PageItems, model: ColumnModel) -> OrderDecision {
     let (lines, page_width, page_height) = (&page.lines, page.width, page.height);
     let boxed = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot])).count();
     if body.len() < 8 || boxed * 5 < body.len() * 4 || page_width <= 0.0 || page_height <= 0.0 {
@@ -115,7 +84,8 @@ pub fn arbitrate_body_order(
     if has_table_caption(body.iter().map(|&slot| &lines[slot])) {
         return OrderDecision::keep("table_grid");
     }
-    let model = columns;
+    // Hyphenated words left broken: those ending lines, less those the next line goes on from.
+    let broken = |(candidates, satisfied): (usize, usize)| candidates.saturating_sub(satisfied);
     if model.kind == "two_column" {
         let source_switches = column_switches(lines, body, model, page_width);
         let source_run = median_column_run(lines, body, model, page_width);
@@ -126,25 +96,16 @@ pub fn arbitrate_body_order(
         for &slot in body.iter() {
             kept[slot] = true;
         }
-        let challenger = inspected_order(body, kept_items(items, |slot| kept[slot]), lines.len());
+        let mut challenger = inspected_order(body, kept_items(items, |slot| kept[slot]), lines.len());
         // Where pdf-inspector's order still crosses the columns (columns set line for line on one baseline, which it
         // reads as one line), the columns' geometry read one after the other.
-        let challenger = if column_switches(lines, &challenger, model, page_width) > 2 {
-            column_geometry_order(lines, body, model, page_width)
-        } else {
-            challenger
-        };
+        if column_switches(lines, &challenger, model, page_width) > 2 {
+            challenger = column_geometry_order(lines, body, model, page_width);
+        }
         let challenger_switches = column_switches(lines, &challenger, model, page_width);
         let challenger_hyphens = hyphen_join_score(lines, &challenger);
-        let (left_count, right_count) = body
-            .iter()
-            .map(|&slot| &lines[slot])
-            .filter(|line| has_valid_bbox(line) && !line.exclude_from_body)
-            .fold((0, 0), |(left, right), line| {
-                if line_center_x(line) < model.split_x { (left + 1, right) } else { (left, right + 1) }
-            });
-        let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }
-            .max(((left_count + right_count) as f64 * 0.10) as usize);
+        let boxed_body = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot]) && !lines[slot].exclude_from_body).count();
+        let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }.max((boxed_body as f64 * 0.10) as usize);
         // A source changing column at nearly every line (half its column runs a line or two long) reads the page's
         // rows across both columns: its hyphen joins pair one column's word with the other's line, and prove
         // nothing; the challenger reading the columns one after the other stands.
@@ -155,62 +116,35 @@ pub fn arbitrate_body_order(
                 && challenger_switches <= 2
                 && source_switches.saturating_sub(challenger_switches) >= 2
                 && challenger_hyphens.1 >= source_hyphens.1
-                && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
-                    <= source_hyphens.0.saturating_sub(source_hyphens.1)
+                && broken(challenger_hyphens) <= broken(source_hyphens)
         {
             *body = challenger;
-            return OrderDecision {
-                repair: OrderRepair::Column,
-                source_switches,
-                strategy: "column-geometry",
-                reason: "column_interleave_repair",
-            };
+            return OrderDecision { repair: OrderRepair::Column, source_switches, strategy: "column-geometry", reason: "column_interleave_repair" };
         }
-        return OrderDecision {
-            repair: OrderRepair::None,
-            source_switches,
-            strategy: "kraken-native",
-            reason: "two_column_kraken_coherent",
-        };
+        return OrderDecision { repair: OrderRepair::None, source_switches, strategy: "kraken-native", reason: "two_column_kraken_coherent" };
     }
-    if model.kind == "single" {
-        let source_regressions = y_regressions(lines, body);
-        let source_hyphens = hyphen_join_score(lines, body);
-        let mut challenger = body.clone();
-        geometry_order(lines, &mut challenger);
-        let challenger_regressions = y_regressions(lines, &challenger);
-        let challenger_hyphens = hyphen_join_score(lines, &challenger);
-        let threshold = 3.max((boxed as f64 * 0.08) as usize);
-        if source_regressions >= threshold
-            && challenger_regressions <= source_regressions / 3
-            && challenger_hyphens.1 > source_hyphens.1
-            && challenger_hyphens.0.saturating_sub(challenger_hyphens.1)
-                < source_hyphens.0.saturating_sub(source_hyphens.1)
-        {
-            *body = challenger;
-            return OrderDecision {
-                repair: OrderRepair::Geometry,
-                source_switches: 0,
-                strategy: "geometry",
-                reason: "kraken_order_scrambled",
-            };
-        }
+    if model.kind != "single" {
+        return OrderDecision::keep("non_two_column");
     }
-    OrderDecision::keep(if model.kind == "single" {
-        "single_column_kraken_coherent"
-    } else {
-        "non_two_column"
-    })
+    let (source_regressions, source_hyphens) = (y_regressions(lines, body), hyphen_join_score(lines, body));
+    let mut challenger = body.clone();
+    geometry_order(lines, &mut challenger);
+    let (challenger_regressions, challenger_hyphens) = (y_regressions(lines, &challenger), hyphen_join_score(lines, &challenger));
+    if source_regressions >= 3.max((boxed as f64 * 0.08) as usize)
+        && challenger_regressions <= source_regressions / 3
+        && challenger_hyphens.1 > source_hyphens.1
+        && broken(challenger_hyphens) < broken(source_hyphens)
+    {
+        *body = challenger;
+        return OrderDecision { repair: OrderRepair::Geometry, source_switches: 0, strategy: "geometry", reason: "kraken_order_scrambled" };
+    }
+    OrderDecision::keep("single_column_kraken_coherent")
 }
 
 /// A drop cap (a single large letter beside the start of its paragraph) moved to before the line it
 /// begins; `members` are slots of `lines`.
 pub fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
-    let body_size = median(members
-        .iter()
-        .map(|&slot| line_font_size(&lines[slot]))
-        .filter(|size| (4.0..=24.0).contains(size))
-        .collect());
+    let body_size = median(members.iter().map(|&slot| line_font_size(&lines[slot])).filter(|size| (4.0..=24.0).contains(size)).collect());
     if body_size <= 0.0 {
         return;
     }
@@ -218,10 +152,7 @@ pub fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
     for (index, &slot) in members.iter().enumerate() {
         let line = &lines[slot];
         let text = line.text.trim();
-        if text.chars().count() != 1
-            || !text.chars().all(char::is_alphabetic)
-            || line_font_size(line) < body_size * 1.8
-        {
+        if text.chars().count() != 1 || !text.chars().all(char::is_alphabetic) || line_font_size(line) < body_size * 1.8 {
             continue;
         }
         let target = members
@@ -236,15 +167,9 @@ pub fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
                     && candidate.bbox[1] < line.bbox[3]
                     && candidate.bbox[3] > line.bbox[1]
             })
-            .min_by(|&(_, &left), &(_, &right)| {
-                lines[left].bbox[1]
-                    .total_cmp(&lines[right].bbox[1])
-                    .then(lines[left].bbox[0].total_cmp(&lines[right].bbox[0]))
-            })
+            .min_by(|&(_, &left), &(_, &right)| lines[left].bbox[1].total_cmp(&lines[right].bbox[1]).then(lines[left].bbox[0].total_cmp(&lines[right].bbox[0])))
             .map(|(target, _)| target);
-        if let Some(target) = target.filter(|target| *target < index) {
-            moves.push((index, target));
-        }
+        moves.extend(target.filter(|target| *target < index).map(|target| (index, target)));
     }
     for (index, target) in moves.into_iter().rev() {
         let slot = members.remove(index);
@@ -268,29 +193,21 @@ pub fn page_order(
 ) -> (Vec<usize>, Vec<Diagnostic>) {
     let lines = &page.lines;
     let number = page.index as u32 + 1;
-    let mut diagnostics = Vec::new();
-    let mut header = Vec::new();
-    let mut body = Vec::new();
-    let mut note = Vec::new();
-    let mut footer = Vec::new();
+    let (mut header, mut body, mut note, mut footer) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for slot in 0..lines.len() {
         match stream(slot) {
-            Stream::Header => header.push(slot),
-            Stream::Note => note.push(slot),
-            Stream::Footer => footer.push(slot),
-            Stream::Body => body.push(slot),
+            Stream::Header => &mut header,
+            Stream::Note => &mut note,
+            Stream::Footer => &mut footer,
+            Stream::Body => &mut body,
         }
+        .push(slot);
     }
     repair_drop_caps(lines, &mut body);
     let contents = table_page && contents && !has_table_caption(body.iter().map(|&slot| &lines[slot]));
     let decision = if contents && y_regressions(lines, &body) > 0 {
         geometry_order(lines, &mut body);
-        OrderDecision {
-            repair: OrderRepair::Geometry,
-            source_switches: 0,
-            strategy: "table-row-geometry",
-            reason: "table_source_order_scrambled",
-        }
+        OrderDecision { repair: OrderRepair::Geometry, source_switches: 0, strategy: "table-row-geometry", reason: "table_source_order_scrambled" }
     } else if table_page {
         OrderDecision::keep("table_grid")
     } else {
@@ -303,29 +220,22 @@ pub fn page_order(
         body.extend(lane);
         decision
     };
-    if decision.repair != OrderRepair::None {
-        let mut diagnostic = Diagnostic::info(
-            "COLUMN_ORDER_REPAIRED",
-            format!(
-                "Extraction order replaced by {}: {}.",
-                decision.strategy, decision.reason
-            ),
-            Some(page.index),
-        );
-        diagnostic.line_ids = body.iter().take(20).map(|&slot| lines[slot].id.clone()).collect();
-        diagnostics.push(diagnostic);
+    let diagnostic = if decision.repair != OrderRepair::None {
+        let message = format!("Extraction order replaced by {}: {}.", decision.strategy, decision.reason);
+        Some(Diagnostic::info("COLUMN_ORDER_REPAIRED", message, Some(page.index)))
     } else if decision.source_switches > 2 {
-        let mut diagnostic = Diagnostic::warning(
-            "COLUMN_ORDER_UNCERTAIN",
-            format!(
-                "Two-column page keeps an order that crosses columns {} times ({}).",
-                decision.source_switches, decision.reason
-            ),
-            Some(page.index),
-        );
-        diagnostic.line_ids = body.iter().take(20).map(|&slot| lines[slot].id.clone()).collect();
-        diagnostics.push(diagnostic);
-    }
+        let message = format!("Two-column page keeps an order that crosses columns {} times ({}).", decision.source_switches, decision.reason);
+        Some(Diagnostic::warning("COLUMN_ORDER_UNCERTAIN", message, Some(page.index)))
+    } else {
+        None
+    };
+    let diagnostics = diagnostic
+        .into_iter()
+        .map(|mut diagnostic| {
+            diagnostic.line_ids = body.iter().take(20).map(|&slot| lines[slot].id.clone()).collect();
+            diagnostic
+        })
+        .collect();
     order_note_lines(lines, &mut note, items, number);
     // A running head and foot read row by row.
     read_rows(lines, &mut header, |slot| band_geometry_top(&lines[slot]));

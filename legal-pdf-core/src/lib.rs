@@ -23,3 +23,12 @@ pub use ort_backend::OrtBackend;
 pub use ort_runtime::init as init_ort_runtime;
 pub use storage::{read_gzip_json, write_gzip_json};
 
+
+/// The regular expression `pattern`, compiled once, at its first use (the caller depends on `regex`).
+#[macro_export]
+macro_rules! regex {
+    ($pattern:expr) => {{
+        static RE: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+        RE.get_or_init(|| ::regex::Regex::new($pattern).expect("regex"))
+    }};
+}

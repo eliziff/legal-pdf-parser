@@ -18,18 +18,13 @@ const HELD: usize = 16;
 /// place, the share of them opening on a marker, and where in the document it first stands.
 pub fn template_rows(sheet: &Stylesheet, table: &LineTable) -> Vec<[f32; PRIOR]> {
     let count = sheet.templates.len();
-    let names = ["size", "bold", "upper", "centre", "indent", "length", "width"];
-    let at: Vec<usize> = names.iter().map(|name| LINE_FEATURES.iter().position(|n| n == name).expect("a line feature")).collect();
+    let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
     let n = table.order.len();
-    let mut sums = vec![[0f32; 8]; count];
-    let mut lines = vec![0f32; count];
-    let mut first = vec![None; count];
+    let (mut sums, mut lines, mut first) = (vec![[0f32; 8]; count], vec![0f32; count], vec![None; count]);
     for k in 0..n {
         let t = sheet.template[k] as usize;
         let row = table.row(k);
-        for (sum, &f) in sums[t].iter_mut().zip(&at) {
-            *sum += row[f];
-        }
+        sums[t].iter_mut().zip(&at).for_each(|(sum, &f)| *sum += row[f]);
         sums[t][7] += f32::from(u8::from(!table.readings[k].is_empty()));
         lines[t] += 1.0;
         first[t].get_or_insert(k);
@@ -38,9 +33,7 @@ pub fn template_rows(sheet: &Stylesheet, table: &LineTable) -> Vec<[f32; PRIOR]>
         let v = &sheet.templates[t];
         let mut r = [0f32; PRIOR];
         r[..11].copy_from_slice(&[v.lines, v.pages, v.heading, v.monotone, v.anchored, v.anchor_level, v.level, v.edge, v.beside, v.read_heading, v.read_level]);
-        for (out, sum) in r[11..19].iter_mut().zip(sums[t]) {
-            *out = sum / lines[t].max(1.0);
-        }
+        r[11..19].iter_mut().zip(sums[t]).for_each(|(out, sum)| *out = sum / lines[t].max(1.0));
         r[19] = first[t].map_or(1.0, |k| k as f32 / n.max(1) as f32);
         r
     }).collect()

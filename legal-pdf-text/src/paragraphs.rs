@@ -15,31 +15,27 @@
 //! as a short line before a wider blank does; a line going on with a sentence or a hyphened word
 //! opens nothing.
 
-use legal_pdf_core::{flag_share, line_font_size, upper_median as median, quantile, Line, BOLD, ITALIC};
+use legal_pdf_core::{flag_share, line_font_size, quantile, regex, upper_median as median, Line, BOLD, ITALIC};
 use regex::Regex;
-use std::{collections::HashMap, sync::OnceLock};
+use std::collections::HashMap;
 
 const BULLETS: &str = "\u{2022}\u{25cf}\u{25aa}\u{25e6}\u{2023}\u{2043}\u{25a0}\u{25a1}\u{f0b7}\u{f0a7}\u{f0d8}\u{2013}\u{2014}\\-\\*\u{b7}";
 const ENUMERATOR: &str = r"(\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\([ivxlcdm]{1,6}\)|[ivxlcdm]{1,6}\.|\[\d{1,3}\]|\d{1,3}(\.\d{1,3})+\.?)";
 
 /// Bullet glyphs proper, which recognition can run into the item's first word.
-const GLYPHS: &str =
-    "\u{2022}\u{25cf}\u{25aa}\u{25e6}\u{2023}\u{2043}\u{25a0}\u{25a1}\u{f0b7}\u{f0a7}\u{f0d8}";
+const GLYPHS: &str = "\u{2022}\u{25cf}\u{25aa}\u{25e6}\u{2023}\u{2043}\u{25a0}\u{25a1}\u{f0b7}\u{f0a7}\u{f0d8}";
 
 fn bullet_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&format!(r"^\s*(([{BULLETS}]|o)\s+\S|[{GLYPHS}]\s*\S)")).unwrap())
+    regex!(&format!(r"^\s*(([{BULLETS}]|o)\s+\S|[{GLYPHS}]\s*\S)"))
 }
 
 fn enumerator_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&format!(r"^\s*{ENUMERATOR}\s+\S")).unwrap())
+    regex!(&format!(r"^\s*{ENUMERATOR}\s+\S"))
 }
 
 /// A line that is nothing but a bullet or an enumerator.
 pub fn marker_only_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&format!(r"^\s*([{BULLETS}o]|{ENUMERATOR})\s*$")).unwrap())
+    regex!(&format!(r"^\s*([{BULLETS}o]|{ENUMERATOR})\s*$"))
 }
 
 /// A line opening with a bullet or an enumerator, or nothing but one: an item's first line.
@@ -47,34 +43,29 @@ pub fn opens_item(text: &str) -> bool {
     bullet_re().is_match(text) || enumerator_re().is_match(text) || marker_only_re().is_match(text)
 }
 
-fn terminal_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?$").unwrap())
+fn terminal(text: &str) -> bool {
+    regex!("[.:;!?][\"\u{201d}\u{2019})\\]]?$").is_match(text.trim())
 }
 
-/// A sentence end with a note's number after it ("an injunction.1").
-fn noted_terminal_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new("[.:;!?][\"\u{201d}\u{2019})\\]]?\\d{1,3}\\*?$").unwrap())
+/// A sentence end, or one with a note's number after it ("an injunction.1").
+fn ended(text: &str) -> bool {
+    terminal(text) || regex!("[.:;!?][\"\u{201d}\u{2019})\\]]?\\d{1,3}\\*?$").is_match(text.trim())
+}
+
+/// A line opening a sentence: in capitals or with a figure.
+fn opens_sentence(line: &Line) -> bool {
+    line.text.trim_start().chars().next().is_some_and(|c| c.is_uppercase() || c.is_ascii_digit())
 }
 
 /// A contents entry's leader: dots running to the line's end or to the locator that ends it (dots
 /// inside a line are an ellipsis), or a rule before a locator (alone it is a form's blank).
 pub fn contents_leader_re() -> &'static Regex {
-    static LEADER: OnceLock<Regex> = OnceLock::new();
-    LEADER.get_or_init(|| {
-        Regex::new(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
-            .expect("contents leader regex")
-    })
+    regex!(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
 }
 
 fn size(line: &Line) -> f64 {
     let size = line_font_size(line);
-    if size > 0.0 {
-        size
-    } else {
-        height(line)
-    }
+    if size > 0.0 { size } else { height(line) }
 }
 
 fn height(line: &Line) -> f64 {
@@ -94,6 +85,15 @@ fn char_width(line: &Line) -> f64 {
     width(line) / line.text.trim().chars().count().max(1) as f64
 }
 
+fn centre(line: &Line) -> f64 {
+    (line.bbox[1] + line.bbox[3]) / 2.0
+}
+
+/// The leftmost of the lines' left edges.
+fn left_edge(lines: &[&Line]) -> f64 {
+    lines.iter().map(|line| line.bbox[0]).fold(f64::MAX, f64::min)
+}
+
 /// Shares of the line's visible characters set in bold and italic, when its spans say.
 fn font_shares(line: &Line) -> Option<(f64, f64)> {
     Some((flag_share(line, BOLD)?, flag_share(line, ITALIC)?))
@@ -102,27 +102,13 @@ fn font_shares(line: &Line) -> Option<(f64, f64)> {
 fn first_word_width(line: &Line) -> f64 {
     let text = line.text.trim();
     // A bullet set or read against the word is no part of the word that would have fitted.
-    let bullet = text.chars().next().is_some_and(|c| GLYPHS.contains(c));
     let glyph = |w: &str| w.trim().chars().next().is_some_and(|c| GLYPHS.contains(c));
-    let word = line
-        .words
-        .iter()
-        .find(|w| !w.text.trim().chars().all(|c| GLYPHS.contains(c)));
+    let word = line.words.iter().find(|w| !w.text.trim().chars().all(|c| GLYPHS.contains(c)));
     if let Some(word) = word.filter(|w| !glyph(&w.text)) {
         return word.bbox[2] - word.bbox[0];
     }
-    let words = if bullet {
-        &text[text.chars().next().map_or(0, char::len_utf8)..]
-    } else {
-        text
-    };
-    let first = words
-        .trim_start()
-        .split(' ')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .count();
+    let words = if glyph(text) { &text[text.chars().next().map_or(0, char::len_utf8)..] } else { text };
+    let first = words.trim_start().split(' ').next().unwrap_or_default().chars().count();
     width(line) * first as f64 / text.chars().count().max(1) as f64
 }
 
@@ -130,11 +116,10 @@ fn first_word_width(line: &Line) -> f64 {
 /// set beside or under it belongs with it, whatever the layout says.
 pub fn field_label(line: &Line) -> bool {
     let text = line.text.trim();
-    text.ends_with(':')
-        && text.chars().count() <= 24
-        && text.split_whitespace().count() <= 3
-        && !text[..text.len() - 1].contains([':', ';'])
-        && !text[..text.len() - 1].trim_end_matches('.').contains('.')
+    let Some(name) = text.strip_suffix(':') else {
+        return false;
+    };
+    text.chars().count() <= 24 && text.split_whitespace().count() <= 3 && !name.contains([':', ';']) && !name.trim_end_matches('.').contains('.')
 }
 
 pub fn same_row(a: &Line, b: &Line) -> bool {
@@ -152,16 +137,17 @@ fn advance(a: &Line, b: &Line) -> f64 {
 /// evidence, grows with its ascenders and descenders.
 fn resized(a: &Line, b: &Line) -> bool {
     let (sa, sb) = (size(a), size(b));
-    let tolerance = if a.spans.is_empty() || b.spans.is_empty() {
-        0.35
-    } else {
-        0.12
-    };
+    let tolerance = if a.spans.is_empty() || b.spans.is_empty() { 0.35 } else { 0.12 };
     (sa - sb).abs() > 1.0_f64.max(tolerance * sa.max(sb))
 }
 
 fn size_key(value: f64) -> i64 {
     (value * 2.0).round() as i64
+}
+
+/// Do two lines stacked one over the other share some of their width?
+fn stacked(a: &Line, b: &Line) -> bool {
+    b.bbox[0] < a.bbox[2] && a.bbox[0] < b.bbox[2]
 }
 
 /// The page's typical baseline-to-baseline pitch, by text size, and its column edges: left
@@ -198,41 +184,20 @@ pub struct Measure {
 /// width most of them reach, and on a scan its line height, paragraph gap and line pitch.
 pub fn measure_of(pages: &[Vec<&Line>]) -> Measure {
     let width = quantile(pages.iter().flatten().map(|line| width(line)).collect(), 0.9);
-    let scans = || {
-        pages.iter().map(|lines| {
-            lines
-                .iter()
-                .copied()
-                .filter(|line| scanned(line) && height(line) > 0.0)
-                .collect::<Vec<_>>()
-        })
-    };
+    let scans = || pages.iter().map(|lines| lines.iter().copied().filter(|line| scanned(line) && height(line) > 0.0).collect::<Vec<_>>());
     let line_height = median(scans().flatten().map(height).collect());
-    let gap = median(
-        scans()
-            .flat_map(|lines| {
-                lines
-                    .windows(2)
-                    .filter(|pair| pair[1].bbox[0] < pair[0].bbox[2] && pair[0].bbox[0] < pair[1].bbox[2])
-                    .map(|pair| pair[1].bbox[1] - pair[0].bbox[3])
-                    .filter(|gap| (0.0..=1.25 * line_height).contains(gap))
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-    );
-    let centre = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
-    let pitch = median(
-        scans()
-            .flat_map(|lines| {
-                lines
-                    .windows(2)
-                    .filter(|pair| pair[1].bbox[0] < pair[0].bbox[2] && pair[0].bbox[0] < pair[1].bbox[2])
-                    .map(|pair| centre(pair[1]) - centre(pair[0]))
-                    .filter(|advance| (0.25 * line_height..=1.75 * line_height).contains(advance))
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-    );
+    // A measure between each two scanned lines stacked in one column, within its bounds.
+    let between = |measure: &dyn Fn(&Line, &Line) -> f64, low: f64, high: f64| {
+        median(
+            scans()
+                .flat_map(|lines| {
+                    lines.windows(2).filter(|pair| stacked(pair[0], pair[1])).map(|pair| measure(pair[0], pair[1])).filter(|value| (low..=high).contains(value)).collect::<Vec<_>>()
+                })
+                .collect(),
+        )
+    };
+    let gap = between(&|a, b| b.bbox[1] - a.bbox[3], 0.0, 1.25 * line_height);
+    let pitch = between(&|a, b| centre(b) - centre(a), 0.25 * line_height, 1.75 * line_height);
     Measure { width, line: line_height, gap, pitch }
 }
 
@@ -241,46 +206,28 @@ impl Pitch {
         let mut samples: HashMap<i64, Vec<f64>> = HashMap::new();
         for pair in lines.windows(2) {
             let (a, b) = (pair[0], pair[1]);
-            if b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0] {
-                continue;
-            }
             let pitch = advance(a, b);
-            if pitch > 0.5 * height(a) && pitch < 3.0 * height(a) {
-                samples
-                    .entry(size_key(size(a).min(size(b))))
-                    .or_default()
-                    .push(pitch);
+            if !(b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0]) && pitch > 0.5 * height(a) && pitch < 3.0 * height(a) {
+                samples.entry(size_key(size(a).min(size(b)))).or_default().push(pitch);
             }
         }
         let all: Vec<f64> = samples.values().flatten().copied().collect();
         let mut lefts: HashMap<i64, (usize, f64)> = HashMap::new();
         for line in lines {
             let slot = lefts.entry((line.bbox[0] / 3.0).round() as i64).or_default();
-            slot.0 += 1;
-            slot.1 += line.bbox[0];
+            (slot.0, slot.1) = (slot.0 + 1, slot.1 + line.bbox[0]);
         }
         Self {
-            edges: lefts
-                .values()
-                .filter(|(count, _)| *count >= 3)
-                .map(|(count, sum)| sum / *count as f64)
-                .collect(),
+            edges: lefts.values().filter(|(count, _)| *count >= 3).map(|(count, sum)| sum / *count as f64).collect(),
             any: if all.is_empty() { 14.0 } else { median(all) },
             measure,
             scan: lines.iter().filter(|line| scanned(line)).count() * 2 > lines.len(),
-            by_size: samples
-                .into_iter()
-                .filter(|(_, values)| values.len() >= 2)
-                .map(|(key, values)| (key, median(values)))
-                .collect(),
+            by_size: samples.into_iter().filter(|(_, values)| values.len() >= 2).map(|(key, values)| (key, median(values))).collect(),
         }
     }
 
     fn typical(&self, size: f64) -> f64 {
-        self.by_size
-            .get(&size_key(size))
-            .copied()
-            .unwrap_or(self.any)
+        self.by_size.get(&size_key(size)).copied().unwrap_or(self.any)
     }
 
     /// A line well short of the page's measure: a label, a value, an address or caption line.
@@ -291,11 +238,7 @@ impl Pitch {
     /// Are two lines on one row? A scan's boxes swell and overlap their neighbours, so there its
     /// lines share a row when their centres are within half the document's line pitch.
     fn same_row(&self, a: &Line, b: &Line) -> bool {
-        if !self.scan || self.measure.pitch <= 0.0 {
-            return same_row(a, b);
-        }
-        let centre = |line: &Line| (line.bbox[1] + line.bbox[3]) / 2.0;
-        (centre(a) - centre(b)).abs() < 0.5 * self.measure.pitch
+        if !self.scan || self.measure.pitch <= 0.0 { same_row(a, b) } else { (centre(a) - centre(b)).abs() < 0.5 * self.measure.pitch }
     }
 
     /// Does a column of the page start within `tolerance` of `x`?
@@ -306,18 +249,14 @@ impl Pitch {
 
 /// Does `b` begin a new visual block after `a`? The rule that says so, by name.
 fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
+    let both_short = pitch.short(a) && pitch.short(b);
     if pitch.same_row(a, b) {
         // A marker set apart from its text on the text's row ("1." then the paragraph).
         let text = a.text.trim();
-        let marker = marker_only_re().is_match(&a.text)
-            || (text.chars().count() <= 4 && !text.contains(' '));
+        let marker = marker_only_re().is_match(&a.text) || (text.chars().count() <= 4 && !text.contains(' '));
         // An item opens with its marker and its text; a marker alone at the row's end ("[63]" after a
         // citation, a cell's number) and a value after a field label ("Tel.:") open nothing.
-        if !marker
-            && !field_label(a)
-            && !marker_only_re().is_match(&b.text)
-            && (bullet_re().is_match(&b.text) || enumerator_re().is_match(&b.text))
-        {
+        if !marker && !field_label(a) && !marker_only_re().is_match(&b.text) && (bullet_re().is_match(&b.text) || enumerator_re().is_match(&b.text)) {
             return Some("row-marker");
         }
         // The extractor uses MuPDF's 0.8-em inter-run spacing for one printed line; a wider
@@ -327,23 +266,15 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         // overlap by a little.
         let em = size(a).max(size(b));
         let gap = b.bbox[0] - a.bbox[2];
-        let adjacent = gap <= 0.8 * em
-            || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em))
-            || (pitch.short(a) && pitch.short(b));
-        let overlap_allowed = if goes_on(b) || (pitch.short(a) && pitch.short(b)) { 2.0 * em } else { 1.0 };
-        return (!(b.bbox[0] >= a.bbox[2] - overlap_allowed && (marker || adjacent || field_label(a))))
-            .then_some("row-apart");
+        let adjacent = gap <= 0.8 * em || (gap <= 3.0 * em && !pitch.at_edge(b.bbox[0], 0.5 * em)) || both_short;
+        let overlap_allowed = if goes_on(b) || both_short { 2.0 * em } else { 1.0 };
+        return (!(b.bbox[0] >= a.bbox[2] - overlap_allowed && (marker || adjacent || field_label(a)))).then_some("row-apart");
     }
     // Two short lines, the first ending no sentence, stack as one block (an address, a caption, a
     // signature block, a label and its value): a change of column, weight or face parts them no
     // more than it parts the lines of a paragraph. A gap still does.
-    let stacked = pitch.short(a) && pitch.short(b) && !terminal_re().is_match(a.text.trim());
-    let goes_on = goes_on(b) || field_label(a) || stacked;
-    if (b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0])
-        && !goes_on
-        && pitch.at_edge(b.bbox[0], 0.5 * size(b))
-        && (b.bbox[0] - a.bbox[0]).abs() > 3.0 * char_width(a)
-    {
+    let goes_on = goes_on(b) || field_label(a) || (both_short && !terminal(&a.text));
+    if (b.bbox[0] > a.bbox[2] || b.bbox[2] < a.bbox[0]) && !goes_on && pitch.at_edge(b.bbox[0], 0.5 * size(b)) && (b.bbox[0] - a.bbox[0]).abs() > 3.0 * char_width(a) {
         return Some("column");
     }
     if pitch.scan {
@@ -355,11 +286,7 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
     }
     // A typeset page keeps its leading exactly, so a quarter more marks a break; a
     // recognized line's box wanders more.
-    let gap = if a.spans.is_empty() || b.spans.is_empty() {
-        1.4
-    } else {
-        1.25
-    };
+    let gap = if a.spans.is_empty() || b.spans.is_empty() { 1.4 } else { 1.25 };
     if resized(a, b) && !goes_on {
         return Some("resized");
     }
@@ -367,10 +294,8 @@ fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
         return Some("gap");
     }
     let contrast = |a: f64, b: f64| (a > 0.8 && b < 0.2) || (a < 0.2 && b > 0.8);
-    (!goes_on
-        && matches!((font_shares(a), font_shares(b)), (Some((a, ai)), Some((b, bi)))
-            if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi)))
-    .then_some("font-contrast")
+    let shares = (font_shares(a), font_shares(b));
+    (!goes_on && matches!(shares, (Some((a, ai)), Some((b, bi))) if contrast(a, b) || a > 0.8 && b > 0.8 && contrast(ai, bi))).then_some("font-contrast")
 }
 
 /// Does `b` begin a new visual block after `a` on a scanned page? Only its leading says: a blank
@@ -386,45 +311,30 @@ fn scan_starts_block(a: &Line, b: &Line, goes_on: bool, pitch: &Pitch) -> Option
     if goes_on || open || (text.ends_with('-') && !text.ends_with(" -")) {
         return None;
     }
-    let blank = b.bbox[1] - a.bbox[3];
-    (blank >= (0.85 * line).max(2.0 * pitch.measure.gap + 0.25).max(2.0)).then_some("gap")
+    (b.bbox[1] - a.bbox[3] >= (0.85 * line).max(2.0 * pitch.measure.gap + 0.25).max(2.0)).then_some("gap")
 }
 
 /// The left margin around the block's `slot`th line: the leftmost of its neighbours, so a
 /// scan's skew does not set lines in.
 fn margin_at(block: &[&Line], slot: usize) -> f64 {
-    block[slot.saturating_sub(3)..(slot + 4).min(block.len())]
-        .iter()
-        .map(|line| line.bbox[0])
-        .fold(f64::MAX, f64::min)
+    left_edge(&block[slot.saturating_sub(3)..(slot + 4).min(block.len())])
 }
 
 /// Does the block set its paragraphs' first lines in? Two lines indented from the
 /// margin with the next line back at it show the style.
 fn indents_first_lines(block: &[&Line]) -> bool {
-    (1..block.len())
-        .filter(|&slot| {
-            let (line, next) = (block[slot - 1], block[slot]);
-            let left = margin_at(block, slot);
-            let cw = char_width(line);
-            let indent = line.bbox[0] - left;
-            indent > 1.5 * cw && indent <= 12.0 * cw && (next.bbox[0] - left).abs() < 1.5 * cw
-        })
-        .count()
-        >= 2
+    let indented = |slot: usize| {
+        let (line, next, left) = (block[slot - 1], block[slot], margin_at(block, slot));
+        let (cw, indent) = (char_width(line), line.bbox[0] - left);
+        indent > 1.5 * cw && indent <= 12.0 * cw && (next.bbox[0] - left).abs() < 1.5 * cw
+    };
+    (1..block.len()).filter(|&slot| indented(slot)).count() >= 2
 }
 
 /// Does `b` begin a new paragraph after `a` inside one visual block? The rule that says so,
 /// by name. Where first lines are set in from the `margin`, every line set in begins one and
 /// a short line ends none by itself.
-fn starts_paragraph(
-    a: &Line,
-    b: &Line,
-    block: &[&Line],
-    after: Option<&Line>,
-    margin: Option<f64>,
-    pitch: &Pitch,
-) -> Option<&'static str> {
+fn starts_paragraph(a: &Line, b: &Line, block: &[&Line], after: Option<&Line>, margin: Option<f64>, pitch: &Pitch) -> Option<&'static str> {
     if pitch.same_row(a, b) {
         return None;
     }
@@ -439,21 +349,12 @@ fn starts_paragraph(
         return None;
     }
     let cw = char_width(a);
-    let terminal = terminal_re().is_match(a.text.trim());
-    let centered = ((a.bbox[0] + a.bbox[2]) / 2.0 - (b.bbox[0] + b.bbox[2]) / 2.0).abs() < 2.0 * cw
-        && (a.bbox[0] - b.bbox[0]).abs() > 1.5 * cw;
+    let terminal = terminal(&a.text);
+    let centered = ((a.bbox[0] + a.bbox[2]) / 2.0 - (b.bbox[0] + b.bbox[2]) / 2.0).abs() < 2.0 * cw && (a.bbox[0] - b.bbox[0]).abs() > 1.5 * cw;
     let following = first_word_width(b) + 1.5 * cw;
+    let measure = block.iter().map(|line| width(line)).fold(0.0, f64::max);
     // Would b's first word have fit at the end of a?
-    let fits = if centered {
-        width(a) + following < block.iter().map(|line| width(line)).fold(0.0, f64::max)
-    } else {
-        block
-            .iter()
-            .map(|line| line.bbox[2])
-            .fold(f64::MIN, f64::max)
-            - a.bbox[2]
-            > following
-    };
+    let fits = if centered { width(a) + following < measure } else { block.iter().map(|line| line.bbox[2]).fold(f64::MIN, f64::max) - a.bbox[2] > following };
     if enumerator_re().is_match(&b.text) && (terminal || fits) {
         return Some("enumerator");
     }
@@ -463,6 +364,7 @@ fn starts_paragraph(
     if goes_on(b) || field_label(a) {
         return None;
     }
+    let ended = ended(&a.text);
     if pitch.scan {
         // A scan's paragraph opens where a sentence ended and the next line is set in from the
         // block's flush-left edge (its first quartile of left edges) by 1.8% of the measure; where
@@ -478,8 +380,6 @@ fn starts_paragraph(
         let mut lefts = block.iter().map(|line| line.bbox[0]).collect::<Vec<_>>();
         lefts.sort_by(f64::total_cmp);
         let flush = lefts[lefts.len() / 4];
-        let ended = terminal || noted_terminal_re().is_match(a.text.trim());
-        let opens = b.text.trim_start().chars().next().is_some_and(|c| c.is_uppercase() || c.is_ascii_digit());
         let short = pitch.measure.width > 0.0 && width(a) < 0.75 * pitch.measure.width;
         let line = if pitch.measure.line > 0.0 { pitch.measure.line } else { height(a).max(height(b)) };
         let blank = b.bbox[1] - a.bbox[3];
@@ -490,23 +390,15 @@ fn starts_paragraph(
         if ended && (short || wider >= 0.15 * line) {
             return Some("sentence-end");
         }
-        let broken = a.text.trim_end().ends_with('-');
-        let wide_next = width(b) >= 0.6 * pitch.measure.width;
-        if short && !broken && (wider >= 0.4 * line || opens && wide_next && blank > 0.3 * height(a).max(height(b)))
-        {
-            return Some("short-line");
-        }
-        return None;
+        let (broken, wide_next) = (a.text.trim_end().ends_with('-'), width(b) >= 0.6 * pitch.measure.width);
+        let opens = opens_sentence(b) && wide_next && blank > 0.3 * height(a).max(height(b));
+        return (short && !broken && (wider >= 0.4 * line || opens)).then_some("short-line");
     }
-    let marker = bullet_re().is_match(&a.text)
-        || enumerator_re().is_match(&a.text)
-        || marker_only_re().is_match(&a.text);
+    let marker = opens_item(&a.text);
     let first_line_indent = !centered
         && !marker
         && b.bbox[0] > a.bbox[0] + 1.5 * cw
-        && (terminal
-            || fits
-            || after.is_some_and(|line| (line.bbox[0] - a.bbox[0]).abs() < 1.5 * cw));
+        && (terminal || fits || after.is_some_and(|line| (line.bbox[0] - a.bbox[0]).abs() < 1.5 * cw));
     if first_line_indent {
         return Some("first-line-indent");
     }
@@ -515,15 +407,7 @@ fn starts_paragraph(
     }
     // A short line ends its paragraph with its sentence. Recognition drops a line's last period,
     // so a recognized line well short of the measure ends one when the next line opens a sentence.
-    let ended = terminal || noted_terminal_re().is_match(a.text.trim());
-    let measure = block.iter().map(|line| width(line)).fold(0.0, f64::max);
-    let opens = b
-        .text
-        .trim_start()
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_uppercase() || c.is_ascii_digit());
-    let recognized_end = a.spans.is_empty() && width(a) < 0.6 * measure && opens;
+    let recognized_end = a.spans.is_empty() && width(a) < 0.6 * measure && opens_sentence(b);
     (fits && (ended || recognized_end) && !a.text.trim_end().ends_with('-')).then_some("short-line")
 }
 
@@ -532,11 +416,7 @@ fn starts_paragraph(
 /// Chaoulli" / ". In that case"); an ellipsis may open a paragraph.
 fn goes_on(line: &Line) -> bool {
     let text = line.text.trim_start();
-    text.chars().next().is_some_and(|c| {
-        c.is_lowercase()
-            || ",;:)]}\u{2019}\u{201d}%".contains(c)
-            || (c == '.' && !text.starts_with("..") && !text.starts_with(". ."))
-    })
+    text.chars().next().is_some_and(|c| c.is_lowercase() || ",;:)]}\u{2019}\u{201d}%".contains(c) || (c == '.' && !text.starts_with("..") && !text.starts_with(". .")))
 }
 
 /// Does the next page's first paragraph go on with this page's last one? It does when the
@@ -546,83 +426,58 @@ pub fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     let (Some(a), Some(b)) = (previous.last(), next.first()) else {
         return false;
     };
-    if a.page_index.checked_add(1) != Some(b.page_index) {
-        return false;
-    }
     let text = b.text.trim_start();
-    if opens_item(text) {
+    if a.page_index.checked_add(1) != Some(b.page_index) || opens_item(text) {
         return false;
     }
     let lower = text.chars().next().is_some_and(char::is_lowercase);
     // A scan's paragraph goes on over the page unless its last line ended a sentence and the
     // next page opens in capitals: its boxes and sizes say nothing.
     if scanned(a) && scanned(b) {
-        return !terminal_re().is_match(a.text.trim()) || lower;
+        return !terminal(&a.text) || lower;
     }
     if resized(a, b) {
         return false;
     }
-    let cw = char_width(a);
-    let left = previous
-        .iter()
-        .map(|line| line.bbox[0])
-        .fold(f64::MAX, f64::min);
-    let next_left = next
-        .iter()
-        .map(|line| line.bbox[0])
-        .fold(f64::MAX, f64::min);
+    let (cw, left, next_left) = (char_width(a), left_edge(previous), left_edge(next));
     // Columns at different places on the two pages, or a first line set in from the next
     // page's own margin, start something new.
     if (left - next_left).abs() > 3.0 * cw || (next.len() > 1 && b.bbox[0] > next_left + 1.5 * cw) {
         return false;
     }
-    let right = previous
-        .iter()
-        .chain(next)
-        .map(|line| line.bbox[2])
-        .fold(f64::MIN, f64::max);
-    let full = right - a.bbox[2] <= first_word_width(b) + 1.5 * cw;
-    full && (!terminal_re().is_match(a.text.trim()) || lower)
+    let right = previous.iter().chain(next).map(|line| line.bbox[2]).fold(f64::MIN, f64::max);
+    right - a.bbox[2] <= first_word_width(b) + 1.5 * cw && (!terminal(&a.text) || lower)
 }
 
 /// Each of a page's `lines` (in reading order) `counted` holds numbered by its printed paragraph,
 /// from 0 in order; none for the others, which part the runs of counted lines.
 pub fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
-    let mut next = 0;
     let body: Vec<&Line> = lines.iter().zip(counted).filter(|(_, counted)| **counted).map(|(line, _)| *line).collect();
     let pitch = Pitch::of(&body, measure);
-    let mut assigned = vec![None; lines.len()];
-    let mut start = 0;
-    while start < lines.len() {
-        if !counted[start] {
-            start += 1;
+    let (mut assigned, mut next, mut start) = (vec![None; lines.len()], 0, 0);
+    for run in counted.chunk_by(|left, right| left == right) {
+        let (from, counted) = (start, run[0]);
+        start += run.len();
+        if !counted {
             continue;
         }
-        let mut end = start + 1;
-        while end < lines.len() && counted[end] {
-            end += 1;
-        }
-        let run = &lines[start..end];
+        let run = &lines[from..start];
         let mut block_start = 0;
         for k in 1..=run.len() {
             if k < run.len() && starts_block(run[k - 1], run[k], &pitch).is_none() {
                 continue;
             }
-            let block: Vec<&Line> = run[block_start..k].to_vec();
-            assigned[start + block_start] = Some(next);
-            let indented = indents_first_lines(&block);
+            let block = &run[block_start..k];
+            assigned[from + block_start] = Some(next);
+            let indented = indents_first_lines(block);
             for j in 1..block.len() {
-                let after = block.get(j + 1).copied();
-                let margin = indented.then(|| margin_at(&block, j));
-                if starts_paragraph(block[j - 1], block[j], &block, after, margin, &pitch).is_some() {
-                    next += 1;
-                }
-                assigned[start + block_start + j] = Some(next);
+                let margin = indented.then(|| margin_at(block, j));
+                next += usize::from(starts_paragraph(block[j - 1], block[j], block, block.get(j + 1).copied(), margin, &pitch).is_some());
+                assigned[from + block_start + j] = Some(next);
             }
             next += 1;
             block_start = k;
         }
-        start = end;
     }
     assigned
 }

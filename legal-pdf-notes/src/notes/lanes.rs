@@ -13,14 +13,14 @@
 //! ladder, the layout prior over every page whose notes end their band, and the bridge from one
 //! page's unfinished note to the next page's band.
 
+use super::sentence_ended;
 use legal_pdf_core::{
     line_font_size,
     model::{Line, Page},
+    regex,
 };
 use legal_structure_model::StructureAnalysis;
-use regex::Regex;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
 
 const SEPARATOR_Y_TOLERANCE: f64 = 0.006;
 const MAX_NUMERIC_LABEL_STEP: i64 = 5;
@@ -32,69 +32,22 @@ const CLOSURE_MAX_TAIL_LINES: usize = 12;
 /// A line, by its page and its place among the page's lines.
 pub type LineRef = (usize, usize);
 
-fn marker_start_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S").expect("marker regex")
-    })
-}
-
-fn numeric_head_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\(?(\d{1,3})\)?[.)]?").expect("numeric head regex"))
-}
-
-fn bare_numeric_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\(?(\d{1,3})\)?[.)]?$").expect("bare numeric regex"))
-}
-
-fn leading_number_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^\s*\(?(\d{1,3})\)?[.)]?(?:\s|$)").expect("leading number regex")
-    })
-}
-
-fn page_label_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:[-\u{2013}\u{2014}]\s*)?(?:\d{1,4}|[ivxlcdmIVXLCDM]{1,12})(?:\s*[-\u{2013}\u{2014}])?\s*$")
-            .expect("page label regex")
-    })
-}
-
-
-fn trailing_page_number_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s\d{1,4}$").expect("trailing page number regex"))
-}
-
 /// The line as marker evidence judges it: superscript labels ("²² See") read as plain digits.
 fn folded(text: &str) -> String {
-    text.chars()
-        .map(|character| match character {
-            '⁰' => '0',
-            '¹' => '1',
-            '²' => '2',
-            '³' => '3',
-            '⁴' => '4',
-            '⁵' => '5',
-            '⁶' => '6',
-            '⁷' => '7',
-            '⁸' => '8',
-            '⁹' => '9',
-            '⁽' => '(',
-            '⁾' => ')',
-            other => other,
-        })
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    let fold = |c| match c {
+        '⁽' => '(',
+        '⁾' => ')',
+        _ => "⁰¹²³⁴⁵⁶⁷⁸⁹".chars().position(|digit| digit == c).map_or(c, |digit| char::from(b'0' + digit as u8)),
+    };
+    text.chars().map(fold).collect::<String>().trim().to_owned()
 }
 
 fn marker_match(text: &str) -> bool {
-    marker_start_re().is_match(text)
+    regex!(r"^\s*(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S").is_match(text)
+}
+
+fn page_label(text: &str) -> bool {
+    regex!(r"^\s*(?:[-\u{2013}\u{2014}]\s*)?(?:\d{1,4}|[ivxlcdmIVXLCDM]{1,12})(?:\s*[-\u{2013}\u{2014}])?\s*$").is_match(text)
 }
 
 enum Marker {
@@ -107,14 +60,17 @@ enum Marker {
 fn marker_label(text: &str) -> Marker {
     let head = text.trim_start();
     if head.starts_with(|c: char| SYMBOL_MARKER_CHARS.contains(c)) {
-        let rest = head.trim_start_matches(|c: char| SYMBOL_MARKER_CHARS.contains(c));
-        return Marker::Symbol(rest.trim().to_owned());
+        return Marker::Symbol(head.trim_start_matches(|c: char| SYMBOL_MARKER_CHARS.contains(c)).trim().to_owned());
     }
-    if let Some(found) = numeric_head_re().captures(head) {
-        let value = found[1].parse().unwrap_or(0);
-        return Marker::Numeric(value);
+    regex!(r"^\(?(\d{1,3})\)?[.)]?").captures(head).map_or(Marker::Other, |found| Marker::Numeric(found[1].parse().unwrap_or(0)))
+}
+
+/// The number a line opening as a note does prints, where it prints one.
+fn marker_number(text: &str) -> Option<i64> {
+    match marker_label(text) {
+        Marker::Numeric(label) if marker_match(text) => Some(label),
+        _ => None,
     }
-    Marker::Other
 }
 
 /// A line that is nothing but a note's label: its number, or a symbol run.
@@ -126,80 +82,40 @@ fn bare_label(text: &str) -> Option<Option<i64>> {
     if text.chars().all(|c| SYMBOL_MARKER_CHARS.contains(c)) {
         return Some(None);
     }
-    bare_numeric_re()
-        .captures(&text)
-        .map(|found| Some(found[1].parse().unwrap_or(0)))
+    regex!(r"^\(?(\d{1,3})\)?[.)]?$").captures(&text).map(|found| Some(found[1].parse().unwrap_or(0)))
 }
 
 fn leading_note_number(text: &str) -> Option<i64> {
-    leading_number_re()
-        .captures(text)
-        .and_then(|found| found[1].parse().ok())
-}
-
-fn strict_citation(analysis: &dyn StructureAnalysis, text: &str) -> bool {
-    !analysis.protected_citation_spans(text).is_empty()
+    regex!(r"^\s*\(?(\d{1,3})\)?[.)]?(?:\s|$)").captures(text).and_then(|found| found[1].parse().ok())
 }
 
 fn citation_shaped(text: &str) -> bool {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    static ABBREVIATION: OnceLock<Regex> = OnceLock::new();
-    static TAIL: OnceLock<Regex> = OnceLock::new();
     let text = folded(text);
-    let patterns = PATTERNS.get_or_init(|| {
-        [
-            r"(?i)\bsupra\s+note\b",
-            r"(?i)\bibid\b",
-            r"^\(\d{4}\)",
-            r"\beds?\.(\s|$|,)",
-            r"\(.+\b\d{4}\)\.?$",
-        ]
-        .iter()
-        .map(|pattern| Regex::new(pattern).expect("citation shape regex"))
-        .collect()
-    });
-    if patterns.iter().any(|pattern| pattern.is_match(&text)) {
+    if regex!(r"(?i:\bsupra\s+note\b|\bibid\b)|^\(\d{4}\)|\beds?\.(\s|$|,)|\(.+\b\d{4}\)\.?$").is_match(&text) {
         return true;
     }
-    let abbreviation = ABBREVIATION.get_or_init(|| {
-        Regex::new(r"^(?:[A-Z][A-Za-z]{0,3}\.|(?:[A-Z]\.){1,3})$").expect("abbreviation regex")
-    });
+    let abbreviation = regex!(r"^(?:[A-Z][A-Za-z]{0,3}\.|(?:[A-Z]\.){1,3})$");
     let tokens = text.split_whitespace().collect::<Vec<_>>();
-    if tokens
-        .iter()
-        .filter(|token| abbreviation.is_match(token.trim_end_matches([',', ';'])))
-        .count()
-        >= 2
-    {
-        return true;
-    }
-    tokens.len() <= 4
-        && TAIL
-            .get_or_init(|| Regex::new(r"\d+\)?[.,]?$").expect("citation tail regex"))
-            .is_match(&text)
+    tokens.iter().filter(|token| abbreviation.is_match(token.trim_end_matches([',', ';']))).count() >= 2
+        || (tokens.len() <= 4 && regex!(r"\d+\)?[.,]?$").is_match(&text))
 }
 
 /// The order-tolerant note ladder: the longest chain of labels each within a few of the one
 /// before it (a two-column band shuffles reading order).
 fn ladder_consensus(labels: &[i64]) -> HashSet<usize> {
-    if labels.is_empty() {
-        return HashSet::new();
-    }
     let mut best = vec![1usize; labels.len()];
     let mut predecessor = vec![None; labels.len()];
     for index in 0..labels.len() {
         for earlier in 0..index {
-            if (labels[index] - labels[earlier]).abs() <= MAX_NUMERIC_LABEL_STEP
-                && best[earlier] + 1 > best[index]
-            {
+            if (labels[index] - labels[earlier]).abs() <= MAX_NUMERIC_LABEL_STEP && best[earlier] + 1 > best[index] {
                 best[index] = best[earlier] + 1;
                 predecessor[index] = Some(earlier);
             }
         }
     }
-    let mut end = (0..labels.len())
-        .max_by(|left, right| best[*left].cmp(&best[*right]).then(right.cmp(left)))
-        .unwrap();
+    let Some(mut end) = (0..labels.len()).max_by(|left, right| best[*left].cmp(&best[*right]).then(right.cmp(left))) else {
+        return HashSet::new();
+    };
     let mut consensus = HashSet::from([end]);
     while let Some(previous) = predecessor[end] {
         consensus.insert(previous);
@@ -209,10 +125,7 @@ fn ladder_consensus(labels: &[i64]) -> HashSet<usize> {
 }
 
 fn dense(labels: &[i64]) -> bool {
-    labels.len() >= 2
-        && labels
-            .windows(2)
-            .all(|pair| (1..=MAX_NUMERIC_LABEL_STEP).contains(&(pair[1] - pair[0])))
+    labels.len() >= 2 && labels.windows(2).all(|pair| (1..=MAX_NUMERIC_LABEL_STEP).contains(&(pair[1] - pair[0])))
 }
 
 /// A note's line: the note band's.
@@ -236,37 +149,33 @@ pub struct LaneLines<'a> {
 }
 
 struct DocumentLines<'a> {
-    pages: &'a [Page],
-    /// Each page's lines in reading order: (page slot, line slots).
-    order: &'a [(usize, Vec<usize>)],
-    starts: &'a [usize],
-    flags: &'a [u8],
+    lines: LaneLines<'a>,
     /// Native font sizes and recognized glyph heights are distinct measurements.
     note_sizes: [Option<f64>; 2],
 }
 
 impl<'a> DocumentLines<'a> {
     fn new(lines: LaneLines<'a>) -> Self {
-        let LaneLines { pages, order, starts, flags } = lines;
-        let mut document = Self { pages, order, starts, flags, note_sizes: [None; 2] };
+        let mut document = Self { lines, note_sizes: [None; 2] };
         document.note_sizes = note_type_sizes(&document);
         document
     }
 
+    /// Each page's slot and its lines in reading order.
+    fn pages(&self) -> impl Iterator<Item = (usize, Vec<LineRef>)> + 'a {
+        self.lines.order.iter().map(|(page, slots)| (*page, slots.iter().map(|slot| (*page, *slot)).collect()))
+    }
+
     fn line(&self, (page, line): LineRef) -> &'a Line {
-        &self.pages[page].lines[line]
+        &self.lines.pages[page].lines[line]
     }
 
     fn flagged(&self, (page, line): LineRef, flag: u8) -> bool {
-        self.flags[self.starts[page] + line] & flag != 0
+        self.lines.flags[self.lines.starts[page] + line] & flag != 0
     }
 
     fn text(&self, line: LineRef) -> &'a str {
         self.line(line).text.trim()
-    }
-
-    fn furniture(&self, line: LineRef) -> bool {
-        self.flagged(line, LANE_FURNITURE)
     }
 
     fn is_note(&self, line: LineRef) -> bool {
@@ -284,54 +193,43 @@ impl<'a> DocumentLines<'a> {
     }
 
     fn y_ratio(&self, at: LineRef) -> f64 {
-        let page = &self.pages[at.0];
+        let (height, bbox) = (self.lines.pages[at.0].height, self.line(at).bbox);
+        if height > 0.0 { (bbox[1] + bbox[3]) / 2.0 / height } else { 0.0 }
+    }
+
+    /// The line's size beside the document's note type for its measurement, where that type is known.
+    fn note_type(&self, at: LineRef) -> Option<(f64, f64)> {
         let line = self.line(at);
-        if page.height > 0.0 {
-            (line.bbox[1] + line.bbox[3]) / 2.0 / page.height
-        } else {
-            0.0
-        }
+        self.note_sizes[usize::from(line.spans.is_empty())].map(|note| (note_text_size(line), note))
     }
 
     /// A line set larger than the document's note type, where that type is known: body text a
     /// band below a rule must not take (a statute's sections under their heading's rule, with the
     /// small source notes between them).
     fn body_type(&self, at: LineRef) -> bool {
-        let line = self.line(at);
-        let size = note_text_size(line);
-        self.note_sizes[usize::from(line.spans.is_empty())]
-            .is_some_and(|note| size > note + 0.6)
+        self.note_type(at).is_some_and(|(size, note)| size > note + 0.6)
     }
 
     /// The line set in the document's note type.
     fn matches_note_type(&self, at: LineRef) -> bool {
-        let line = self.line(at);
-        let size = note_text_size(line);
-        self.note_sizes[usize::from(line.spans.is_empty())]
-            .is_some_and(|note| size > 0.0 && (size - note).abs() <= 0.6)
+        self.note_type(at).is_some_and(|(size, note)| size > 0.0 && (size - note).abs() <= 0.6)
     }
 }
 
 fn note_text_size(line: &Line) -> f64 {
-    if line.spans.is_empty() {
-        line.bbox[3] - line.bbox[1]
-    } else {
-        line_font_size(line)
-    }
+    if line.spans.is_empty() { line.bbox[3] - line.bbox[1] } else { line_font_size(line) }
 }
 
 /// The document's note type, smaller than its body's. Learn font sizes and recognized glyph
 /// heights separately over the whole document, never borrowing one measurement for the other.
 fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
-    let mut notes = [Vec::new(), Vec::new()];
-    let mut body = [Vec::new(), Vec::new()];
-    for at in lines.order.iter().flat_map(|(page, places)| places.iter().map(move |place| (*page, *place))) {
+    let (mut notes, mut body) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+    for at in lines.pages().flat_map(|(_, refs)| refs) {
         let line = lines.line(at);
-        let size = note_text_size(line);
+        let (size, source) = (note_text_size(line), usize::from(line.spans.is_empty()));
         if size <= 0.0 {
             continue;
         }
-        let source = usize::from(line.spans.is_empty());
         if lines.is_note(at) {
             notes[source].push(size);
         } else if lines.flagged(at, LANE_BODY | LANE_PARAGRAPH) {
@@ -351,15 +249,12 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
 pub fn note_promotions(analysis: &dyn StructureAnalysis, lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
     let lines = DocumentLines::new(lines);
-    let mut claims = BTreeSet::<LineRef>::new();
     let rerouted = post_footnote_reroute(analysis, &lines);
-    let closed = band_closure(&lines, &rerouted);
-    claims.extend(rerouted.iter().chain(&closed));
-    let reserved = claims.iter().copied().collect::<HashSet<_>>();
-    let band = note_band(&lines, separators, &reserved);
-    claims.extend(band.promoted.iter().map(|promotion| promotion.line));
-    let reserved = claims.iter().copied().collect::<HashSet<_>>();
-    claims.extend(font_role_strands(&lines, separators, &reserved, &band));
+    let mut claims = band_closure(&lines, &rerouted).into_iter().chain(rerouted).collect::<BTreeSet<_>>();
+    let band = note_band(&lines, separators, &claims);
+    claims.extend(band.iter().map(|promotion| promotion.line));
+    let strands = font_role_strands(&lines, separators, &claims, &band);
+    claims.extend(strands);
     claims.into_iter().collect()
 }
 
@@ -369,22 +264,18 @@ pub fn note_promotions(analysis: &dyn StructureAnalysis, lines: LaneLines<'_>, s
 /// the chain, so the body below a page's notes inherits nothing.
 fn post_footnote_reroute(analysis: &dyn StructureAnalysis, lines: &DocumentLines<'_>) -> Vec<LineRef> {
     let mut claims = Vec::new();
-    for (page, slots) in lines.order {
-        let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
+    for (_, refs) in lines.pages() {
         let Some(first_note) = refs.iter().position(|line| lines.is_note(*line)) else {
             continue;
         };
-        let last_note = refs
-            .iter()
-            .rposition(|line| lines.is_note(*line))
-            .unwrap_or(first_note);
+        let last_note = refs.iter().rposition(|line| lines.is_note(*line)).unwrap_or(first_note);
         let mut trail = Trail::Broken;
         for (position, &line) in refs.iter().enumerate() {
+            let text = lines.text(line);
             if lines.is_note(line) {
-                trail = trail.past_note(lines.text(line));
+                trail = trail.past_note(text);
                 continue;
             }
-            let text = lines.text(line);
             if position < first_note || text.is_empty() {
                 continue;
             }
@@ -399,38 +290,22 @@ fn post_footnote_reroute(analysis: &dyn StructureAnalysis, lines: &DocumentLines
                 continue;
             }
             let fold = folded(text);
-            let bare = fold.len() <= 3
-                && !fold.is_empty()
-                && fold.bytes().all(|byte| byte.is_ascii_digit());
-            if page_label_re().is_match(text) && !bare {
+            let bare = fold.len() <= 3 && !fold.is_empty() && fold.bytes().all(|byte| byte.is_ascii_digit());
+            if page_label(text) && !bare {
                 continue;
             }
             let marker = marker_match(&fold);
-            let sandwiched = position < last_note;
-            let continuation = *anchored && !super::sentence_ended(last_text);
-            let citation = strict_citation(analysis, text);
-            let number = (bare || marker)
-                .then(|| leading_note_number(&fold))
-                .flatten();
-            let continues =
-                number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
-            let bare_claim = bare && continues;
-            if bare && !bare_claim {
-                trail = Trail::Broken;
-                continue;
-            }
-            let anchored_citation = citation && sandwiched;
-            if !(marker || continuation || anchored_citation || bare_claim) {
+            let number = if bare || marker { leading_note_number(&fold) } else { None };
+            let bare_claim = bare && number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
+            let continuation = *anchored && !sentence_ended(last_text);
+            let anchored_citation = position < last_note && !analysis.protected_citation_spans(text).is_empty();
+            if (bare && !bare_claim) || !(marker || continuation || anchored_citation || bare_claim) {
                 trail = Trail::Broken;
                 continue;
             }
             claims.push(line);
             let numbered = marker || bare_claim;
-            trail = Trail::Note {
-                text: text.to_owned(),
-                anchored: numbered,
-                number: number.filter(|_| numbered).or(*last_number),
-            };
+            trail = Trail::Note { text: text.to_owned(), anchored: numbered, number: number.filter(|_| numbered).or(*last_number) };
         }
     }
     claims
@@ -448,10 +323,7 @@ enum Trail {
 impl Trail {
     /// The trail past a line of a note, whose own number, where it prints one, replaces the last.
     fn past_note(self, text: &str) -> Self {
-        let last = match self {
-            Self::Note { number, .. } => number,
-            Self::Broken => None,
-        };
+        let last = if let Self::Note { number, .. } = self { number } else { None };
         Self::Note { text: text.to_owned(), anchored: true, number: leading_note_number(&folded(text)).or(last) }
     }
 }
@@ -461,26 +333,18 @@ impl Trail {
 /// notes end finished, most must have nothing after them. A tail must absorb whole.
 fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef> {
     let rerouted = rerouted.iter().copied().collect::<HashSet<_>>();
-    struct State {
-        last_terminated: bool,
-        tail: Vec<LineRef>,
-        broken: bool,
-    }
+    // Each page with a note: whether its last note's sentence ends, the text after it, and whether a
+    // line that keeps its role breaks that text.
     let mut states = Vec::new();
-    for (page, slots) in lines.order {
-        let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
+    for (_, refs) in lines.pages() {
         let note = |line: &LineRef| lines.is_note(*line) || rerouted.contains(line);
         let Some(last) = refs.iter().rposition(note) else {
             continue;
         };
-        let mut tail = Vec::new();
-        let mut broken = false;
+        let (mut tail, mut broken) = (Vec::new(), false);
         for &line in &refs[last + 1..] {
             let text = lines.text(line);
-            if note(&line) || text.is_empty() {
-                continue;
-            }
-            if lines.furniture(line) || page_label_re().is_match(text) {
+            if note(&line) || text.is_empty() || lines.flagged(line, LANE_FURNITURE) || page_label(text) {
                 continue;
             }
             if !lines.mutable(line) {
@@ -489,47 +353,19 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
             }
             tail.push(line);
         }
-        states.push(State {
-            last_terminated: super::sentence_ended(lines.text(refs[last])),
-            tail,
-            broken,
-        });
+        states.push((sentence_ended(lines.text(refs[last])), tail, broken));
     }
-    let prior = states
-        .iter()
-        .filter(|state| state.last_terminated)
-        .collect::<Vec<_>>();
-    let terminal = prior
-        .iter()
-        .filter(|state| state.tail.is_empty() && !state.broken)
-        .count();
-    if prior.len() < CLOSURE_MIN_PRIOR_PAGES
-        || (terminal as f64) / (prior.len() as f64) < CLOSURE_MIN_PRIOR_RATIO
-    {
+    let prior = states.iter().filter(|state| state.0).collect::<Vec<_>>();
+    let terminal = prior.iter().filter(|state| state.1.is_empty() && !state.2).count();
+    if prior.len() < CLOSURE_MIN_PRIOR_PAGES || (terminal as f64) / (prior.len() as f64) < CLOSURE_MIN_PRIOR_RATIO {
         return Vec::new();
     }
     let mut claims = Vec::new();
-    for state in states {
-        if state.last_terminated
-            || state.broken
-            || state.tail.is_empty()
-            || state.tail.len() > CLOSURE_MAX_TAIL_LINES
-        {
-            continue;
+    for (terminated, tail, broken) in states {
+        let whole = !tail.iter().position(|line| sentence_ended(lines.text(*line))).is_some_and(|end| end + 1 < tail.len());
+        if !terminated && !broken && !tail.is_empty() && tail.len() <= CLOSURE_MAX_TAIL_LINES && whole {
+            claims.extend(tail);
         }
-        let mut taken = Vec::new();
-        let mut ended = false;
-        for &line in &state.tail {
-            taken.push(line);
-            if super::sentence_ended(lines.text(line)) {
-                ended = true;
-                break;
-            }
-        }
-        if ended && taken.len() < state.tail.len() {
-            continue;
-        }
-        claims.extend(taken);
     }
     claims
 }
@@ -539,224 +375,128 @@ struct Promotion {
     label: Option<i64>,
 }
 
-struct BandFindings {
-    promoted: Vec<Promotion>,
-}
-
 /// The printed separator's band. Below the rule, a text line opening as a note does is a note
 /// where the page's note ladder (its own note lines' labels with the candidates') takes its number;
 /// a markerless line below the rule is the wrapped text of the note above it, the topmost labelled
 /// line its ceiling. A page whose band has no label of its own continues the previous page's note
 /// when that page's band broke off mid-sentence.
-fn note_band(
-    lines: &DocumentLines<'_>,
-    separators: &[Option<f64>],
-    reserved: &HashSet<LineRef>,
-) -> BandFindings {
-    struct Candidate {
-        line: LineRef,
-        y: f64,
-    }
-    let mut findings = BandFindings {
-        promoted: Vec::new(),
-    };
+fn note_band(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &BTreeSet<LineRef>) -> Vec<Promotion> {
+    let mut promoted = Vec::new();
+    // Each page's band, by page index: whether it holds a line, and its lowest line's place and text.
     let mut states = HashMap::<usize, (bool, f64, String)>::new();
-    let mut deferred = Vec::<(usize, Vec<Candidate>)>::new();
-    for (page, slots) in lines.order {
-        let Some(separator) = separators.get(*page).copied().flatten() else {
+    let mut deferred = Vec::<(usize, Vec<(LineRef, f64)>)>::new();
+    for (page, refs) in lines.pages() {
+        let Some(separator) = separators.get(page).copied().flatten() else {
             continue;
         };
-        let height = lines.pages[*page].height;
+        let height = lines.lines.pages[page].height;
         if height <= 0.0 {
             continue;
         }
-        let rule = separator / height;
-        let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
+        let floor = separator / height + SEPARATOR_Y_TOLERANCE;
         let mut band_top_below = None::<f64>;
-        let mut ladder = Vec::<(usize, i64)>::new();
+        // The page's note ladder: each entry's place, label, and the candidate it is, if it is one.
+        let mut ladder = Vec::<(usize, i64, Option<usize>)>::new();
         for (position, &line) in refs.iter().enumerate() {
-            let text = folded(lines.text(line));
-            if !lines.is_note(line) || text.is_empty() || !marker_match(&text) {
-                continue;
-            }
-            let y = lines.y_ratio(line);
-            if y > rule + SEPARATOR_Y_TOLERANCE {
+            let (text, y) = (folded(lines.text(line)), lines.y_ratio(line));
+            if lines.is_note(line) && marker_match(&text) && y > floor {
                 band_top_below = Some(band_top_below.map_or(y, |top| top.min(y)));
-                if let Marker::Numeric(label) = marker_label(&text) {
-                    ladder.push((position, label));
-                }
+                ladder.extend(marker_number(&text).map(|label| (position, label, None)));
             }
         }
         let mut band_lines = Vec::<(f64, String)>::new();
-        let mut continuations = Vec::<Candidate>::new();
+        let mut continuations = Vec::<(LineRef, f64)>::new();
+        // Each candidate's place, line, height on the page, label and whether the ladder drops it.
         let mut candidates = Vec::<(usize, LineRef, f64, Option<i64>, bool)>::new();
         for (position, &line) in refs.iter().enumerate() {
-            let y = lines.y_ratio(line);
-            if y <= rule + SEPARATOR_Y_TOLERANCE {
+            let (text, y) = (lines.text(line), lines.y_ratio(line));
+            if y <= floor {
                 continue;
             }
             if lines.is_note(line) {
-                band_lines.push((y, lines.text(line).to_owned()));
+                band_lines.push((y, text.to_owned()));
                 continue;
             }
-            if !lines.mutable(line) || lines.body_type(line) {
+            if !lines.mutable(line) || lines.body_type(line) || text.is_empty() {
                 continue;
             }
-            let text = lines.text(line);
             let fold = folded(text);
-            if text.is_empty() || !marker_match(&fold) {
-                if !text.is_empty() {
-                    continuations.push(Candidate { line, y });
-                }
-                continue;
-            }
-            if reserved.contains(&line) {
+            if !marker_match(&fold) {
+                continuations.push((line, y));
                 continue;
             }
             match marker_label(&fold) {
-                Marker::Symbol(rest) if !rest.chars().any(char::is_alphabetic) => continue,
+                _ if reserved.contains(&line) => {}
+                Marker::Symbol(rest) if !rest.chars().any(char::is_alphabetic) => {}
                 Marker::Numeric(label) => candidates.push((position, line, y, Some(label), false)),
                 _ => candidates.push((position, line, y, None, false)),
             }
         }
-        let numeric = candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.3.is_some())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if !numeric.is_empty() {
-            let mut entries = ladder
-                .iter()
-                .map(|(position, label)| (*position, *label, None))
-                .chain(numeric.iter().map(|index| {
-                    (
-                        candidates[*index].0,
-                        candidates[*index].3.unwrap(),
-                        Some(*index),
-                    )
-                }))
-                .collect::<Vec<_>>();
+        let numbered = candidates.iter().enumerate().filter_map(|(index, candidate)| Some((candidate.0, candidate.3?, Some(index))));
+        let mut entries = ladder.into_iter().chain(numbered).collect::<Vec<_>>();
+        if entries.iter().any(|entry| entry.2.is_some()) && entries.len() > 1 {
             entries.sort_by_key(|entry| (entry.0, entry.1));
-            if entries.len() > 1 {
-                let consensus =
-                    ladder_consensus(&entries.iter().map(|entry| entry.1).collect::<Vec<_>>());
-                if consensus.len() * 2 <= entries.len() {
-                    for index in &numeric {
-                        candidates[*index].4 = true;
-                    }
-                } else {
-                    for (position, entry) in entries.iter().enumerate() {
-                        if let Some(index) = entry.2 {
-                            if !consensus.contains(&position) {
-                                candidates[index].4 = true;
-                            }
-                        }
-                    }
+            let consensus = ladder_consensus(&entries.iter().map(|entry| entry.1).collect::<Vec<_>>());
+            let drop_all = consensus.len() * 2 <= entries.len();
+            for (position, entry) in entries.iter().enumerate() {
+                if let Some(index) = entry.2.filter(|_| drop_all || !consensus.contains(&position)) {
+                    candidates[index].4 = true;
                 }
             }
         }
-        for &(_, line, y, label, dropped) in &candidates {
-            if dropped {
-                continue;
-            }
-            findings.promoted.push(Promotion { line, label });
+        for &(_, line, y, label, _) in candidates.iter().filter(|candidate| !candidate.4) {
+            promoted.push(Promotion { line, label });
             band_lines.push((y, lines.text(line).to_owned()));
         }
         if !continuations.is_empty() {
-            let tops = band_top_below
-                .into_iter()
-                .chain(
-                    candidates
-                        .iter()
-                        .filter(|candidate| !candidate.4)
-                        .map(|candidate| candidate.2),
-                )
-                .collect::<Vec<_>>();
+            let tops = band_top_below.into_iter().chain(candidates.iter().filter(|candidate| !candidate.4).map(|candidate| candidate.2)).collect::<Vec<_>>();
             if tops.is_empty() {
-                deferred.push((*page, continuations));
+                deferred.push((page, continuations));
             } else {
-                let top = tops.iter().copied().fold(f64::INFINITY, f64::min);
-                let nearest_above = continuations
-                    .iter()
-                    .filter(|candidate| candidate.y < top - SEPARATOR_Y_TOLERANCE)
-                    .max_by(|left, right| left.y.total_cmp(&right.y))
-                    .map(|candidate| candidate.line);
+                let top = tops.into_iter().fold(f64::INFINITY, f64::min) - SEPARATOR_Y_TOLERANCE;
+                let nearest_above = continuations.iter().filter(|(_, y)| *y < top).max_by(|left, right| left.1.total_cmp(&right.1)).map(|(line, _)| *line);
                 let mut above = Vec::new();
-                for candidate in continuations {
-                    if reserved.contains(&candidate.line) {
-                        continue;
+                for (line, y) in continuations.into_iter().filter(|(line, _)| !reserved.contains(line)) {
+                    if y < top && (nearest_above != Some(line) || !citation_shaped(lines.text(line))) {
+                        above.push((line, y));
+                    } else {
+                        band_lines.push((y, lines.text(line).to_owned()));
+                        promoted.push(Promotion { line, label: None });
                     }
-                    let above_top = candidate.y < top - SEPARATOR_Y_TOLERANCE;
-                    if above_top
-                        && (nearest_above != Some(candidate.line)
-                            || !citation_shaped(lines.text(candidate.line)))
-                    {
-                        above.push(candidate);
-                        continue;
-                    }
-                    band_lines.push((candidate.y, lines.text(candidate.line).to_owned()));
-                    findings.promoted.push(Promotion {
-                        line: candidate.line,
-                        label: None,
-                    });
                 }
                 if !above.is_empty() {
-                    deferred.push((*page, above));
+                    deferred.push((page, above));
                 }
             }
         }
-        let tail = band_lines
-            .iter()
-            .max_by(|left, right| left.0.total_cmp(&right.0))
-            .cloned();
-        states.insert(
-            lines.pages[*page].index,
-            (
-                !band_lines.is_empty(),
-                tail.as_ref().map_or(0.0, |tail| tail.0),
-                tail.map_or(String::new(), |tail| tail.1),
-            ),
-        );
+        let (y, text) = band_lines.iter().max_by(|left, right| left.0.total_cmp(&right.0)).cloned().unwrap_or_default();
+        states.insert(lines.lines.pages[page].index, (!band_lines.is_empty(), y, text));
     }
-    deferred.sort_by_key(|(page, _)| lines.pages[*page].index);
+    deferred.sort_by_key(|(page, _)| lines.lines.pages[*page].index);
     for (page, candidates) in deferred {
-        let index = lines.pages[page].index;
-        let Some(previous) = index
-            .checked_sub(1)
-            .and_then(|previous| states.get(&previous))
-            .cloned()
-        else {
+        let index = lines.lines.pages[page].index;
+        let Some(previous) = index.checked_sub(1).and_then(|previous| states.get(&previous)) else {
             continue;
         };
-        if !previous.0 || super::sentence_ended(&previous.2) {
+        if !previous.0 || sentence_ended(&previous.2) {
             continue;
         }
         let mut tail = None::<(f64, String)>;
-        let mut emitted = false;
-        for candidate in candidates {
-            if reserved.contains(&candidate.line) {
-                continue;
-            }
-            findings.promoted.push(Promotion {
-                line: candidate.line,
-                label: None,
-            });
-            emitted = true;
-            if tail.as_ref().is_none_or(|tail| candidate.y > tail.0) {
-                tail = Some((candidate.y, lines.text(candidate.line).to_owned()));
+        for (line, y) in candidates.into_iter().filter(|(line, _)| !reserved.contains(line)) {
+            promoted.push(Promotion { line, label: None });
+            if tail.as_ref().is_none_or(|tail| y > tail.0) {
+                tail = Some((y, lines.text(line).to_owned()));
             }
         }
-        if emitted {
+        if let Some(tail) = tail {
             let state = states.entry(index).or_insert((false, 0.0, String::new()));
-            if let Some(tail) = tail.filter(|tail| !state.0 || tail.0 > state.1) {
-                state.1 = tail.0;
-                state.2 = tail.1;
+            if !state.0 || tail.0 > state.1 {
+                (state.1, state.2) = tail;
             }
             state.0 = true;
         }
     }
-    findings
+    promoted
 }
 
 /// Runs of lines in the document's note type the separator lanes could not anchor: on a page with
@@ -764,116 +504,54 @@ fn note_band(
 /// Type alone never makes a note (a block quotation can share it): a run needs a label that takes
 /// the document's next note number, a dense chain of labels of its own, a symbol label on a worded
 /// note, or a note beside it. A contents page is no note's.
-fn font_role_strands(
-    lines: &DocumentLines<'_>,
-    separators: &[Option<f64>],
-    reserved: &HashSet<LineRef>,
-    band: &BandFindings,
-) -> Vec<LineRef> {
+fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &BTreeSet<LineRef>, band: &[Promotion]) -> Vec<LineRef> {
     if lines.note_sizes.iter().all(Option::is_none) {
         return Vec::new();
     }
-    let promoted = band
-        .promoted
-        .iter()
-        .map(|promotion| promotion.line)
-        .collect::<HashSet<_>>();
+    let promoted = band.iter().map(|promotion| promotion.line).collect::<HashSet<_>>();
     let mut promoted_labels = HashMap::<usize, Vec<i64>>::new();
-    for promotion in &band.promoted {
-        if let Some(label) = promotion.label {
-            promoted_labels
-                .entry(promotion.line.0)
-                .or_default()
-                .push(label);
-        }
+    for promotion in band {
+        promoted_labels.entry(promotion.line.0).or_default().extend(promotion.label);
     }
-    let mut ladder_last = None::<i64>;
-    let mut claims = Vec::new();
-    let mut claimed = HashSet::new();
-    for (page, slots) in lines.order {
-        let refs = slots.iter().map(|slot| (*page, *slot)).collect::<Vec<_>>();
-        let advance = |label: i64, last: &mut Option<i64>| {
-            if last.is_none_or(|last| label > last) {
-                *last = Some(label);
-            }
-        };
-        for &line in &refs {
-            let text = folded(lines.text(line));
-            if lines.is_note(line) && marker_match(&text) {
-                if let Marker::Numeric(label) = marker_label(&text) {
-                    advance(label, &mut ladder_last);
-                }
-            }
+    let (mut ladder_last, mut claims, mut claimed) = (None::<i64>, Vec::new(), HashSet::new());
+    for (page, refs) in lines.pages() {
+        for &line in refs.iter().filter(|line| lines.is_note(**line)) {
+            ladder_last = ladder_last.max(marker_number(&folded(lines.text(line))));
         }
-        for label in promoted_labels.get(page).into_iter().flatten() {
-            advance(*label, &mut ladder_last);
+        for label in promoted_labels.get(&page).into_iter().flatten() {
+            ladder_last = ladder_last.max(Some(*label));
         }
         let page_ladder_start = ladder_last;
-        let rule = separators
-            .get(*page)
-            .copied()
-            .flatten()
-            .filter(|_| lines.pages[*page].height > 0.0)
-            .map(|separator| separator / lines.pages[*page].height);
-        let texts = refs
-            .iter()
-            .map(|line| lines.text(*line))
-            .collect::<Vec<_>>();
-        if texts
-            .iter()
-            .filter(|text| pdf_inspector::markdown::has_dot_leaders(text))
-            .count()
-            >= 3
-            || texts
-                .iter()
-                .filter(|text| trailing_page_number_re().is_match(text))
-                .count()
-                >= 3
+        let height = lines.lines.pages[page].height;
+        let rule = separators.get(page).copied().flatten().filter(|_| height > 0.0).map(|separator| separator / height);
+        let texts = refs.iter().map(|line| lines.text(*line)).collect::<Vec<_>>();
+        if texts.iter().filter(|text| pdf_inspector::markdown::has_dot_leaders(text)).count() >= 3
+            || texts.iter().filter(|text| regex!(r"\s\d{1,4}$").is_match(text)).count() >= 3
         {
             continue;
         }
-        let below = |line: LineRef| {
-            rule.is_none_or(|rule| lines.y_ratio(line) > rule + SEPARATOR_Y_TOLERANCE)
+        let open = |line: LineRef| {
+            !lines.text(line).is_empty() && lines.mutable(line) && rule.is_none_or(|rule| lines.y_ratio(line) > rule + SEPARATOR_Y_TOLERANCE)
         };
         let base = refs
             .iter()
-            .map(|&line| {
-                !lines.text(line).is_empty()
-                    && lines.mutable(line)
-                    && !lines.paragraph_label(line)
-                    && below(line)
-                    && (lines.matches_note_type(line) || bare_label(lines.text(line)).is_some())
-            })
+            .map(|&line| open(line) && !lines.paragraph_label(line) && (lines.matches_note_type(line) || bare_label(lines.text(line)).is_some()))
             .collect::<Vec<_>>();
         let mut expanded = refs
             .iter()
             .zip(&base)
-            .map(|(&line, &member)| {
-                member
-                    || (!lines.text(line).is_empty()
-                        && lines.mutable(line)
-                        && !lines.paragraph_label(line)
-                        && below(line)
-                        && marker_match(&folded(lines.text(line))))
-            })
+            .map(|(&line, &member)| member || (open(line) && !lines.paragraph_label(line) && marker_match(&folded(lines.text(line)))))
             .collect::<Vec<_>>();
         for index in 1..refs.len().saturating_sub(1) {
-            if !expanded[index]
-                && expanded[index - 1]
-                && expanded[index + 1]
-                && !lines.text(refs[index]).is_empty()
-                && lines.mutable(refs[index])
-                && below(refs[index])
-            {
+            if !expanded[index] && expanded[index - 1] && expanded[index + 1] && open(refs[index]) {
                 expanded[index] = true;
             }
         }
-        let page_promoted = refs.iter().any(|line| promoted.contains(line));
-        let mut passes = vec![("base", base.clone())];
-        if expanded != base || page_promoted {
-            passes.push(("expanded", expanded));
-        }
-        for (pass, members) in passes {
+        let expand = expanded != base || refs.iter().any(|line| promoted.contains(line));
+        for (expanded_pass, members) in [(false, base), (true, expanded)] {
+            if expanded_pass && !expand {
+                continue;
+            }
             let mut position = 0;
             while position < refs.len() {
                 if !members[position] {
@@ -888,77 +566,45 @@ fn font_role_strands(
                 if !run.iter().any(|line| lines.matches_note_type(*line)) {
                     continue;
                 }
-                let bottom_terminal = refs[position..].iter().all(|line| {
-                    lines.furniture(*line) || lines.text(*line).is_empty()
-                });
-                let position_ok = rule.is_some() || bottom_terminal;
-                let adjacent_note = (start > 0 && lines.is_note(refs[start - 1]))
-                    || (position < refs.len() && lines.is_note(refs[position]));
-                let separator_anchor = pass == "expanded"
-                    && rule.is_some()
-                    && run.iter().any(|line| promoted.contains(line));
-                let mut labels = Vec::new();
-                for &line in run {
-                    let text = folded(lines.text(line));
-                    if let Some(Some(label)) = bare_label(&text) {
-                        labels.push(label);
-                    } else if marker_match(&text) {
-                        if let Marker::Numeric(label) = marker_label(&text) {
-                            labels.push(label);
-                        }
-                    }
-                }
+                let bottom_terminal = refs[position..].iter().all(|line| lines.flagged(*line, LANE_FURNITURE) || lines.text(*line).is_empty());
+                let adjacent_note = (start > 0 && lines.is_note(refs[start - 1])) || refs.get(position).is_some_and(|line| lines.is_note(*line));
+                let separator_anchor = expanded_pass && rule.is_some() && run.iter().any(|line| promoted.contains(line));
+                let mut labels = run
+                    .iter()
+                    .filter_map(|line| {
+                        let text = folded(lines.text(*line));
+                        bare_label(&text).flatten().or_else(|| marker_number(&text))
+                    })
+                    .collect::<Vec<_>>();
                 let head_text = folded(lines.text(run[0]));
-                let head = match bare_label(&head_text) {
-                    Some(label) => Some(label),
-                    None if marker_match(&head_text) => match marker_label(&head_text) {
-                        Marker::Symbol(rest) if rest.chars().any(char::is_alphabetic) => Some(None),
-                        Marker::Numeric(label) => Some(Some(label)),
-                        _ => None,
-                    },
-                    None => None,
-                };
+                let head = bare_label(&head_text).or_else(|| match marker_label(&head_text) {
+                    Marker::Symbol(rest) if marker_match(&head_text) && rest.chars().any(char::is_alphabetic) => Some(None),
+                    Marker::Numeric(label) if marker_match(&head_text) => Some(Some(label)),
+                    _ => None,
+                });
                 if let Some(Some(label)) = head {
                     if !labels.contains(&label) {
                         labels.insert(0, label);
                     }
                 }
-                let confirmed = if adjacent_note || separator_anchor {
-                    true
-                } else if !position_ok {
-                    false
-                } else {
-                    match head {
-                        Some(None) => run.iter().any(|line| {
-                            lines.matches_note_type(*line)
-                                && lines.text(*line).chars().any(char::is_alphabetic)
-                        }),
-                        Some(Some(label)) => {
-                            let anchor = if pass == "expanded" {
-                                page_ladder_start
-                            } else {
-                                ladder_last
-                            };
-                            let expected = anchor.map_or(1, |anchor| anchor + 1);
-                            (expected..expected + MAX_NUMERIC_LABEL_STEP).contains(&label)
-                                || dense(&labels)
-                        }
-                        None => dense(&labels),
-                    }
-                };
+                let confirmed = adjacent_note
+                    || separator_anchor
+                    || ((rule.is_some() || bottom_terminal)
+                        && match head {
+                            Some(None) => run.iter().any(|line| lines.matches_note_type(*line) && lines.text(*line).chars().any(char::is_alphabetic)),
+                            Some(Some(label)) => {
+                                let expected = if expanded_pass { page_ladder_start } else { ladder_last }.map_or(1, |anchor| anchor + 1);
+                                (expected..expected + MAX_NUMERIC_LABEL_STEP).contains(&label) || dense(&labels)
+                            }
+                            None => dense(&labels),
+                        });
                 if !confirmed {
                     continue;
                 }
-                if pass == "base" {
-                    for label in &labels {
-                        advance(*label, &mut ladder_last);
-                    }
+                if !expanded_pass {
+                    ladder_last = labels.iter().copied().fold(ladder_last, |last, label| last.max(Some(label)));
                 }
-                for &line in run {
-                    if claimed.insert(line) && !reserved.contains(&line) {
-                        claims.push(line);
-                    }
-                }
+                claims.extend(run.iter().copied().filter(|line| claimed.insert(*line) && !reserved.contains(line)));
             }
         }
     }

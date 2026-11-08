@@ -94,16 +94,12 @@ pub struct Decision {
 /// starting above its first paragraph, takes no paragraph's number from the count).
 fn readings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
     let mut chosen: Vec<Option<(u32, u32)>> = vec![None; count];
-    let rank = |r: usize, k: usize| (runs.runs[r].members[k].marker[0].offset, grammar_rank(runs.runs[r].grammar));
+    let rank = |(r, k): (u32, u32)| (runs.runs[r as usize].members[k as usize].marker[0].offset, grammar_rank(runs.runs[r as usize].grammar));
     for (r, run) in runs.runs.iter().enumerate() {
-        for (k, member) in run.members.iter().enumerate() {
-            if !member.counted || member.kind.is_none() || quoted(member) {
-                continue;
-            }
-            let at = member.slot.index();
-            let better = chosen[at].is_none_or(|(r0, k0)| rank(r, k) < rank(r0 as usize, k0 as usize));
-            if better {
-                chosen[at] = Some((r as u32, k as u32));
+        for (k, member) in run.members.iter().enumerate().filter(|(_, member)| member.counted && member.kind.is_some() && !quoted(member)) {
+            let (at, reading) = (member.slot.index(), (r as u32, k as u32));
+            if chosen[at].is_none_or(|chosen| rank(reading) < rank(chosen)) {
+                chosen[at] = Some(reading);
             }
         }
     }
@@ -119,22 +115,17 @@ pub fn body_like(role: Role) -> bool {
 fn cited_share(evidence: &Evidence, slot: Slot, length: usize) -> f64 {
     let mut ranges: Vec<(u32, u32)> = evidence.citations_of(slot).iter().map(|cited| cited.range).collect();
     ranges.sort_unstable();
-    let (mut covered, mut reach) = (0, 0);
-    for (start, end) in ranges {
+    let (covered, _) = ranges.into_iter().fold((0, 0), |(covered, reach), (start, end)| {
         let start = start.max(reach);
-        if end > start {
-            covered += end - start;
-            reach = end;
-        }
-    }
+        if end > start { (covered + end - start, end) } else { (covered, reach) }
+    });
     if length == 0 { 0.0 } else { f64::from(covered) / length as f64 }
 }
 
 /// A line opening a provision's subsection or a clause's term: "(3) For the purposes", "4 (1)
 /// Every", "(a) the".
 fn subsection(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*(?:\d{1,4}(?:\.\d{1,3})*\s*)?\((?:\d{1,3}|[a-z]{1,4})\)\s+\S").unwrap()).is_match(text)
+    legal_pdf_core::regex!(r"^\s*(?:\d{1,4}(?:\.\d{1,3})*\s*)?\((?:\d{1,3}|[a-z]{1,4})\)\s+\S").is_match(text)
 }
 
 /// A colon closing a lead-in on a small joining word: "ORDERS THAT:", "PURPOSE OF:", "APPEARING on:".
@@ -151,55 +142,33 @@ impl Decision {
     /// Gives an open line a role by a strong rule; a line another rule decided keeps its own, and
     /// where the roles differ the two rules are noted.
     fn claim(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
-        if self.hearing {
-            return self.hear_rule(slot, role, rule);
+        let filled = self.fill(slot, role, rule);
+        if !filled && !self.hearing && self.role[slot.index()] != role {
+            self.conflicts.push((self.rule[slot.index()], rule, slot));
         }
-        let at = slot.index();
-        if self.role[at] == Role::Open {
-            self.role[at] = role;
-            self.rule[at] = rule;
-            return true;
-        }
-        if self.role[at] != role {
-            self.conflicts.push((self.rule[at], rule, slot));
-        }
-        false
+        filled
     }
 
-    /// Gives an open line a role; a decided line keeps its own.
+    /// Gives an open line a role; a decided line keeps its own. While the rules are heard, it is a rule's reading of a
+    /// line no fence took, for the one decision on it, and the line's first reading stands for the rules that ask what
+    /// is around them.
     fn fill(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
-        if self.hearing {
-            return self.hear_rule(slot, role, rule);
-        }
         let at = slot.index();
+        if self.hearing && !self.free[at] {
+            return false;
+        }
+        if self.hearing {
+            self.heard.push(Heard { slot, role, rule, weight: 0.0, joined: false });
+        }
         let open = self.role[at] == Role::Open;
         if open {
-            self.role[at] = role;
-            self.rule[at] = rule;
+            (self.role[at], self.rule[at]) = (role, rule);
         }
-        open
+        self.hearing || open
     }
 
     fn open(&self, slot: Slot) -> bool {
-        if self.hearing {
-            return self.free[slot.index()];
-        }
-        self.role[slot.index()] == Role::Open
-    }
-
-    /// A rule's reading of a line no fence took, for the one decision on it; the line's first reading stands for the
-    /// rules that ask what is around them.
-    fn hear_rule(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
-        let at = slot.index();
-        if !self.free[at] {
-            return false;
-        }
-        self.heard.push(Heard { slot, role, rule, weight: 0.0, joined: false });
-        if self.role[at] == Role::Open {
-            self.role[at] = role;
-            self.rule[at] = rule;
-        }
-        true
+        if self.hearing { self.free[slot.index()] } else { self.role[slot.index()] == Role::Open }
     }
 
     /// The reading just heard goes on with the line above it, or does not.
@@ -241,24 +210,8 @@ impl Decision {
 
     /// The rules heard, none deciding: every reading each gives a line no fence took, in `heard`, for the one decision on
     /// each line; `finish` follows it.
-    pub fn hear(
-        analysis: &dyn StructureAnalysis,
-        pages: &[Page],
-        slots: &Slots,
-        evidence: &Evidence,
-        fences: &Fences,
-        runs: &Runs,
-        notes: &Notes,
-        outline: &[PdfOutlineEntry],
-        geometry: &Geometry,
-        traced: bool,
-    ) -> Self {
-        Self::read(analysis, pages, slots, evidence, fences, runs, notes, outline, geometry, traced)
-    }
-
-    /// The rules up to and through the residual.
     #[allow(clippy::too_many_arguments)]
-    fn read(
+    pub fn hear(
         analysis: &dyn StructureAnalysis,
         pages: &[Page],
         slots: &Slots,
@@ -414,7 +367,7 @@ impl Decision {
             let Some((r, k)) = self.reading[at] else { continue };
             let member = &runs.runs[r as usize].members[k as usize];
             let Some(kind) = member.kind else { continue };
-            let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
+            let role = unit_role(kind);
             if self.unit[at].is_none() && self.fill(member.slot, role, Rule::Opener) {
                 self.unit[at] = Some((r, kind));
                 self.join(member.text, role, Rule::Opener);
@@ -515,7 +468,7 @@ impl Decision {
                 }
                 let Some(kind) = member.kind else { continue };
                 if member.carries_prose {
-                    let role = if kind == UnitRole::Item { Role::ListItem } else { Role::Body };
+                    let role = unit_role(kind);
                     if self.claim(member.slot, role, Rule::Opener) {
                         self.unit[at] = Some((r as u32, kind));
                         self.join(member.text, role, Rule::Opener);
@@ -692,13 +645,7 @@ impl Decision {
                     openers.iter().filter(|(place, other, _)| *place >= at && *place < next && *other <= depth).count() == 1
                 })
                 .collect();
-            let look = |slot: Slot| {
-                let page = &pages[slots.page(slot)];
-                let line = slots.line(pages, slot);
-                let width = page.width.max(1.0);
-                let centred = (((line.bbox[0] + line.bbox[2]) / 2.0 - width / 2.0) / width).abs() < 0.03;
-                (evidence.look[slot.index()] & LOOK_BOLD != 0, evidence.half_points[slot.index()], centred)
-            };
+            let look = |slot: Slot| (evidence.look[slot.index()] & LOOK_BOLD != 0, evidence.half_points[slot.index()], centred(pages, slots, slot));
             let mut groups: Vec<((bool, u16, bool), usize, usize)> = Vec::new();
             for ((caption, _), &one) in captions.iter().zip(&governs) {
                 let key = look(caption[0]);
@@ -816,9 +763,7 @@ impl Decision {
                 }
                 let line = slots.line(pages, slot);
                 let measure = measure(slot);
-                let width = pages[slots.page(slot)].width.max(1.0);
-                let centred = (((line.bbox[0] + line.bbox[2]) / 2.0 - width / 2.0) / width).abs() < 0.03
-                    && line.bbox[2] - line.bbox[0] < 0.8 * (measure.right - measure.left);
+                let centred = centred(pages, slots, slot) && line.bbox[2] - line.bbox[0] < 0.8 * (measure.right - measure.left);
                 let caps = all_caps(line.text.trim());
                 let larger = measure.size > 0.0 && f64::from(evidence.half_points[at]) / 2.0 >= measure.size * 1.1;
                 let set = cue || evidence.title_shaped[at] && (centred && (caps || larger) || larger && !caps);
@@ -858,6 +803,17 @@ impl Decision {
             self.diagnostics.push(diagnostic);
         }
     }
+}
+
+/// A line centred on its page.
+fn centred(pages: &[Page], slots: &Slots, slot: Slot) -> bool {
+    let (line, width) = (slots.line(pages, slot), pages[slots.page(slot)].width.max(1.0));
+    (((line.bbox[0] + line.bbox[2]) / 2.0 - width / 2.0) / width).abs() < 0.03
+}
+
+/// The role of the line a marker opens a unit of its kind on.
+fn unit_role(kind: UnitRole) -> Role {
+    if kind == UnitRole::Item { Role::ListItem } else { Role::Body }
 }
 
 /// A quotation's own number: the quoted text's, none of the document's.

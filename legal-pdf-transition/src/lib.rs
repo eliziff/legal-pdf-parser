@@ -45,7 +45,7 @@ use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use legal_pdf_decide::{Decision, Fences, Notes};
 use legal_pdf_structure_model::evidence::{MarkerReading, WORD_SPEAKER};
 use legal_pdf_structure_model::{Evidence, Runs, Slot, Slots};
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::OnceLock};
 
 pub use legal_pdf_machine::lines::*;
 pub use legal_pdf_machine::machine::*;
@@ -57,12 +57,10 @@ mod stylesheet;
 pub use stylesheet::*;
 mod joint;
 #[cfg(feature = "encoder")]
+#[macro_use]
 mod encoder;
 mod doc;
 pub use legal_pdf_tier0 as tier0;
-
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 /// A class the local scores hold below this probability competes only where the state proposes it: a
 /// guard on the parse's cost, not a judgement.
@@ -112,22 +110,23 @@ fn settings() -> &'static Settings {
     SETTINGS.get_or_init(Settings::from_environment)
 }
 
+/// What a model read from the environment's settings holds, its error written where it could not be read.
+fn loaded<T>(read: Result<T, String>) -> Option<T> {
+    read.map_err(|e| eprintln!("transition parser: {e}")).ok()
+}
+
 impl Settings {
     /// The settings the LEGALPDF_TRANSITION_ names in the environment give.
     fn from_environment() -> Self {
         let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
-        let forest = |path: PathBuf, width: usize, classes: usize| Forest::read(&path, width, classes).map_err(|e| eprintln!("transition parser: {e}")).ok();
+        let forest = |path: PathBuf| loaded(Forest::read(&path, ALL, CLASSES));
         let local = match (var("LEGALPDF_TRANSITION_LOCAL"), var("LEGALPDF_TRANSITION_LOCAL_FOLDS")) {
             #[cfg(feature = "encoder")]
-            _ if var("LEGALPDF_TRANSITION_ENCODER").is_some() => var("LEGALPDF_TRANSITION_ENCODER")
-                .and_then(|dir| encoder::Encoder::load(&dir).map_err(|e| eprintln!("transition parser: {e}")).ok()).map(LocalScores::Encoder),
+            _ if var("LEGALPDF_TRANSITION_ENCODER").is_some() => var("LEGALPDF_TRANSITION_ENCODER").and_then(|dir| loaded(encoder::Encoder::load(&dir))).map(LocalScores::Encoder),
             _ if var("LEGALPDF_TRANSITION_LOCAL_SCORES").is_some() => var("LEGALPDF_TRANSITION_LOCAL_SCORES").map(LocalScores::Precomputed),
-            (Some(path), _) => forest(path, ALL, CLASSES).map(LocalScores::One),
-            (None, Some(folder)) => {
-                let folds: Vec<Forest> = (0..).map(|k| folder.join(format!("fold{k}.txt"))).take_while(|path| path.exists())
-                    .filter_map(|path| forest(path, ALL, CLASSES)).collect();
-                (!folds.is_empty()).then_some(LocalScores::Folds(folds))
-            }
+            (Some(path), _) => forest(path).map(LocalScores::One),
+            (None, Some(folder)) => Some((0..).map(|k| folder.join(format!("fold{k}.txt"))).take_while(|path| path.exists()).filter_map(forest).collect::<Vec<Forest>>())
+                .filter(|folds| !folds.is_empty()).map(LocalScores::Folds),
             (None, None) => None,
         };
         Settings {
@@ -138,12 +137,9 @@ impl Settings {
             labels: var("LEGALPDF_TRANSITION_LABELS"),
             doc_oracle: std::env::var_os("LEGALPDF_TRANSITION_DOC_ORACLE").is_some(),
             #[cfg(feature = "encoder")]
-            doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| {
-                let reorder = std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on");
-                let times = std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some();
-                doc::Reader::load(&dir, reorder, times).map_err(|e| eprintln!("transition parser: {e}")).ok()
-            }),
-            grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| grammar::Grammar::read(&path).map_err(|e| eprintln!("transition parser: {e}")).ok()),
+            doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| loaded(doc::Reader::load(&dir, std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"),
+                std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some()))),
+            grammar: var("LEGALPDF_TRANSITION_GRAMMAR").and_then(|path| loaded(grammar::Grammar::read(&path))),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
         }
     }
@@ -151,10 +147,13 @@ impl Settings {
 
 /// Whether the transition parser runs on this parse.
 pub fn enabled() -> bool {
-    let s = settings();
-    s.dump.is_some() || s.labels.is_some()
+    settings().dump.is_some() || settings().labels.is_some()
 }
 
+/// Little-endian 32-bit floats, four bytes each.
+fn f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+}
 
 /// The confusion table at `path`: each misread character's meant ones, likeliest first.
 fn read_confusions(path: &Path) -> HashMap<char, Vec<(char, f32)>> {
@@ -183,20 +182,21 @@ fn read_gold(path: &Path) -> GoldLabels {
         let (mut per_piece, mut ranks) = (HashMap::new(), HashMap::new());
         for (id, label) in ids.iter().zip(labels) {
             let piece = id.as_str().unwrap_or_default().to_owned();
-            let mut l = [-1i64; 8];
-            for (k, cell) in l.iter_mut().enumerate() {
-                *cell = label.get(k).and_then(serde_json::Value::as_i64).unwrap_or(-1);
-            }
-            if let Some(rank) = label.get(8).and_then(serde_json::Value::as_i64).filter(|&r| r >= 0) {
-                ranks.insert(piece.clone(), rank);
-            }
-            per_piece.insert(piece, l);
+            let cell = |k: usize| label.get(k).and_then(serde_json::Value::as_i64);
+            if let Some(rank) = cell(8).filter(|&r| r >= 0) { ranks.insert(piece.clone(), rank); }
+            per_piece.insert(piece, std::array::from_fn::<i64, 8, _>(|k| cell(k).unwrap_or(-1)));
         }
         found.0.insert(sha.to_owned(), per_piece);
         found.1.insert(sha.to_owned(), ranks);
         found.2.insert(sha.to_owned(), ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect());
     }
     found
+}
+
+/// The regions a gold row's region allows: a gold that does not tell its text from a quotation or a list item set
+/// in it (A2AJ's, its body prose unmarked: `UNMARKED_BODY`) takes any of the three.
+fn gold_regions(region: &i64) -> &[i64] {
+    if *region == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(region) }
 }
 
 /// The move the gold makes at a line, among `candidates`: of those of the gold's region and opening,
@@ -206,9 +206,7 @@ fn read_gold(path: &Path) -> GoldLabels {
 fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidates: &[Move]) -> Option<usize> {
     let here = &gold[k];
     let (region, opens) = (here[0], here[1] == 1);
-    if region < 0 {
-        return None;
-    }
+    if region < 0 { return None; }
     let disagreements = |m: &Move| -> u32 {
         let made = state.clone().apply(line, m);
         let mut wrong = 0;
@@ -227,15 +225,9 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         // A document the gold opens here, or none it does not.
         wrong += 4 * u32::from(m.starts != (here[2] == 1));
         // A body unit's depth weighs above its marker: the gold's nesting is the print's.
-        if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 {
-            wrong += (made.depth_step - here[7]).unsigned_abs() as u32 * 3;
-        }
-        if m.opens && m.region != NOTE {
-            wrong += 2 * u32::from(m.reading.is_some() != (here[5] == 1));
-        }
-        if !m.opens {
-            wrong += 2 * u32::from(m.resume != (here[1] == 2));
-        }
+        if m.opens && RANKED_BODY.contains(&m.region) && here[7] > 0 { wrong += (made.depth_step - here[7]).unsigned_abs() as u32 * 3; }
+        if m.opens && m.region != NOTE { wrong += 2 * u32::from(m.reading.is_some() != (here[5] == 1)); }
+        if !m.opens { wrong += 2 * u32::from(m.resume != (here[1] == 2)); }
         // A note counts on its number where the gold's note prints one (its marker), and on none where it
         // prints none.
         if m.opens && m.region == NOTE {
@@ -249,9 +241,7 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
         }
         wrong
     };
-    // A gold that does not tell its text from a quotation or a list item set in it (A2AJ's, its body
-    // prose unmarked: `UNMARKED_BODY`) takes any of the three.
-    let regions: &[i64] = if region == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(&region) };
+    let regions = gold_regions(&region);
     // Ties go to the depth the numbering gives (a gold without depths: A2AJ's), then to the plain move.
     let tie = |m: &Move| (m.depth > 0 && usize::from(m.depth) != state.stack_depth(line, m), m.reading.is_some());
     (0..candidates.len())
@@ -290,15 +280,8 @@ fn ranked_features(state: &State, line: &LineView, row: &[f32], local: &Local, c
 /// the oracle always has the gold's move and the ranker sees it among the candidates.
 fn classes_of(state: &State, line: &LineView, local: &Local, gold: Option<&[i64; 8]>) -> Vec<usize> {
     let mut classes: Vec<usize> = local.ranked.iter().copied().filter(|&c| local.probabilities[c] >= FLOOR).collect();
-    let golden = gold.filter(|g| g[0] >= 0).map(|g| {
-        let regions: &[i64] = if g[0] == UNMARKED_BODY { &[1, 4, 2] } else { std::slice::from_ref(&g[0]) };
-        regions.iter().map(|&r| r as usize * 2 + usize::from(g[1] == 1)).collect::<Vec<_>>()
-    });
-    for c in state.proposed(line).into_iter().chain(golden.into_iter().flatten()) {
-        if c < CLASSES && !classes.contains(&c) {
-            classes.push(c);
-        }
-    }
+    let golden = gold.filter(|g| g[0] >= 0).map(|g| gold_regions(&g[0]).iter().map(|&r| r as usize * 2 + usize::from(g[1] == 1)).collect::<Vec<_>>());
+    state.proposed(line).into_iter().chain(golden.into_iter().flatten()).for_each(|c| if c < CLASSES && !classes.contains(&c) { classes.push(c); });
     classes
 }
 
@@ -309,10 +292,8 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
     let heading = usize::from(HEADING) * 2 + 1;
     let mut looks: HashMap<u32, (f64, usize, usize)> = HashMap::new();
     for (k, local) in locals.iter().enumerate() {
-        let entry = looks.entry(table.looks[k]).or_default();
-        entry.0 += local.probabilities[heading];
-        entry.1 += 1;
-        entry.2 += usize::from(local.probabilities[heading] > 0.5);
+        let (p, entry) = (local.probabilities[heading], looks.entry(table.looks[k]).or_default());
+        *entry = (entry.0 + p, entry.1 + 1, entry.2 + usize::from(p > 0.5));
     }
     // The openings the constituents reader names, and each line's place among its page's lines.
     let proposed: HashMap<&str, u8> = fences.starts.iter().map(|start| (start.line_id.as_str(), start.kind_code())).collect();
@@ -320,72 +301,55 @@ fn views_of<'a>(s: &'a Settings, pages: &[Page], slots: &Slots, evidence: &Evide
     tier0::line_views(pages, slots, evidence, fences, table).into_iter().enumerate().map(|(k, view)| {
         let (sum, lines, likely) = looks[&table.looks[k]];
         let slot = table.order[k];
-        let page_place = {
-            let seen = on_page.entry(slots.page(slot)).or_default();
-            *seen += 1;
-            *seen - 1
-        };
-        let start_kind = proposed.get(slots.line(pages, slot).id.as_str()).copied().unwrap_or(0);
+        let seen = on_page.entry(slots.page(slot)).or_default();
+        *seen += 1;
+        let text = &slots.line(pages, slot).text;
+        let word = grammar::first_word(text, !table.readings[k].is_empty());
         LineView {
             // The source's own document opens on its first line; any later line's opening may open another
             // (a letter mid-page, the next message of an email chain).
             may_start: k > 0,
-            start_kind,
-            page_place,
+            start_kind: proposed.get(slots.line(pages, slot).id.as_str()).copied().unwrap_or(0),
+            page_place: *seen - 1,
             grammar,
-            heading_words: {
-                let word = grammar::first_word(&slots.line(pages, slot).text, !table.readings[k].is_empty());
-                let odds = |tables: &Tables| tables.heading_word(&word).unwrap_or(0.0);
-                grammar.map_or([0.0; 2], |g| [odds(&g.instruments), odds(&g.others)])
-            },
+            heading_words: grammar.map_or([0.0; 2], |g| [&g.instruments, &g.others].map(|tables: &Tables| tables.heading_word(&word).unwrap_or(0.0))),
             look_heading: (sum / lines.max(1) as f64) as f32,
             look_heading_lines: (1.0 + likely as f32).ln(),
             template: *sheet.of(k),
             anchor: sheet.anchor[k],
             listed: sheet.listed[k],
             regime: sheet.regime[k],
-            title_key: {
-                let text = &slots.line(pages, slot).text;
-                if text.chars().count() <= 160 { legal_pdf_headings::headings::bookmarks::normalize_title(text) } else { String::new() }
-            },
+            title_key: if text.chars().count() <= 160 { legal_pdf_headings::headings::bookmarks::normalize_title(text) } else { String::new() },
             contents_title: sheet.contents_titles[k].clone(),
-            left: table.row(k)[LINE_FEATURES.iter().position(|n| *n == "x0").unwrap_or(0)],
+            left: table.row(k)[feature("x0")],
             ..view
         }
     }).collect()
-}
-
-/// The walk over tier 0's reading of a document (its notes and decision, read once by `tier0::output`): its lines read
-/// (`LineTable`, the decision among their evidence), its stylesheet (`Stylesheet`), and the moves they make in reading
-/// order (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide), read twice: a first
-/// greedy reading, whose reading of each template the second reads; and, as its environment asks, what the scorer is
-/// fitted on and the labels the grader reads.
-#[allow(clippy::too_many_arguments)]
-fn run(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], sha256: &str,
-    notes: &Notes, decision: &Decision) -> (LineTable, Vec<Local>, Stylesheet, Vec<Move>) {
-    let s = settings();
-    let table = LineTable::read(pages, slots, evidence, fences, notes, decision, &runs.before, &s.confusions);
-    let locals = locals_of(s, pages, slots, &table, sha256);
-    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
-    let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
-    (table, locals, sheet, moves)
 }
 
 /// The walk, where it is asked for: the moves the DOC tier reads of the document, where its reader is given
 /// (LEGALPDF_TRANSITION_DOC), with each line's marker readings the moves' `reading` names; and what the scorer is fitted
 /// on and the grader's labels, where those are asked (`enabled`). None where DOC is not given. The output is tier 0's
 /// all the same (`tier0::output`).
+///
+/// The walk over tier 0's reading of a document (its notes and decision, read once by `tier0::output`): its lines read
+/// (`LineTable`, the decision among their evidence), its stylesheet (`Stylesheet`), and the moves they make in reading
+/// order (greedily, or by a beam of whole readings where LEGALPDF_TRANSITION_BEAM says how wide), read twice: a first
+/// greedy reading, whose reading of each template the second reads; and, as its environment asks, what the scorer is
+/// fitted on and the labels the grader reads.
 #[allow(clippy::too_many_arguments)]
 pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry],
     sha256: &str, notes: &Notes, decision: &Decision) -> Option<(Vec<Move>, Vec<Vec<MarkerReading>>)> {
+    let s = settings();
     #[cfg(feature = "encoder")]
-    let doc = settings().doc.is_some();
+    let doc = s.doc.is_some();
     #[cfg(not(feature = "encoder"))]
     let doc = false;
-    if !doc && !enabled() {
-        return None;
-    }
-    let (table, _, _, moves) = run(pages, slots, evidence, fences, runs, outline, sha256, notes, decision);
+    if !doc && !enabled() { return None; }
+    let table = LineTable::read(pages, slots, evidence, fences, notes, decision, &runs.before, &s.confusions);
+    let locals = locals_of(s, pages, slots, &table, sha256);
+    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, outline, &table, &locals);
+    let moves = parse(s, pages, slots, evidence, fences, sha256, &table, &locals, &mut sheet);
     doc.then(|| (moves, table.readings))
 }
 
@@ -395,40 +359,29 @@ fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, table: &LineTable, sha
     let n = table.order.len();
     // Another tier's probabilities, where they cover the document's lines.
     let read = |path: PathBuf, width: usize| -> Option<Vec<f32>> {
-        let values = std::fs::read(&path).ok().map(|bytes| bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<f32>>());
-        let fits = values.filter(|values| values.len() == n * width);
-        if fits.is_none() {
-            eprintln!("transition parser: no local scores for {} lines at {}", n, path.display());
-        }
+        let fits = std::fs::read(&path).ok().map(|bytes| f32s(&bytes)).filter(|values| values.len() == n * width);
+        if fits.is_none() { eprintln!("transition parser: no local scores for {} lines at {}", n, path.display()); }
         fits
     };
     let (precomputed, levels): (Option<Vec<f32>>, Option<Vec<f32>>) = match &s.local {
         #[cfg(feature = "encoder")]
         Some(LocalScores::Encoder(model)) => {
             let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
-            match model.probabilities(table, &texts) {
-                Ok((classes, levels)) => (Some(classes), Some(levels)),
-                Err(e) => {
-                    eprintln!("transition parser {sha256}: {e}");
-                    (None, None)
-                }
-            }
+            model.probabilities(table, &texts).map_or_else(|e| {
+                eprintln!("transition parser {sha256}: {e}");
+                (None, None)
+            }, |(classes, levels)| (Some(classes), Some(levels)))
         }
         Some(LocalScores::Precomputed(folder)) => (read(folder.join(format!("{sha256}.local.f32")), CLASSES), read(folder.join(format!("{sha256}.levels.f32")), LEVEL_CLASSES)),
         _ => (None, None),
     };
-    let probabilities = |k: usize, row: &[f32]| -> Vec<f64> {
-        match &s.local {
-            Some(LocalScores::One(forest)) => forest.probabilities(row),
-            Some(LocalScores::Folds(folds)) => folds[fold_of(sha256, folds.len())].probabilities(row),
-            _ if precomputed.is_some() => {
-                precomputed.as_ref().unwrap()[k * CLASSES..(k + 1) * CLASSES].iter().map(|&p| f64::from(p)).collect()
-            }
-            _ => vec![1.0 / CLASSES as f64; CLASSES],
-        }
-    };
     (0..n).map(|k| {
-        let probabilities = probabilities(k, table.row(k));
+        let probabilities = match (&s.local, &precomputed) {
+            (Some(LocalScores::One(forest)), _) => forest.probabilities(table.row(k)),
+            (Some(LocalScores::Folds(folds)), _) => folds[fold_of(sha256, folds.len())].probabilities(table.row(k)),
+            (_, Some(precomputed)) => precomputed[k * CLASSES..(k + 1) * CLASSES].iter().map(|&p| f64::from(p)).collect(),
+            _ => vec![1.0 / CLASSES as f64; CLASSES],
+        };
         let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
         ranked.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]).then(a.cmp(&b)));
         let levels = levels.as_ref().map(|levels| levels[k * LEVEL_CLASSES..(k + 1) * LEVEL_CLASSES].to_vec());
@@ -465,10 +418,8 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
         let candidates = state.candidates(line, &classes_of(&state, line, local, gold.map(|g| &g[k])));
         let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
         let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
-        let choice = best_oracle.unwrap_or_else(|| {
-            candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1 && !m.resume && !m.starts
-                && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0)
-        });
+        let choice = best_oracle.unwrap_or_else(|| candidates.iter().position(|m| m.class() == local.ranked[0] && m.reading.is_none() && m.note.is_none() && m.level <= 1
+            && !m.resume && !m.starts && (m.depth == 0 || usize::from(m.depth) == state.stack_depth(line, m))).unwrap_or(0));
         if record.is_some_and(|(sha256, share)| drawn(sha256, k, share)) {
             for (c, f) in features.iter().enumerate() {
                 recorded.rows.extend_from_slice(f);
@@ -483,17 +434,15 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
     (moves, recorded)
 }
 
-/// Each line's reading rank in the gold, -1 for none.
-fn ids_ranks(s: &Settings, sha256: &str, order: &[Slot], pages: &[Page], slots: &Slots) -> Vec<i64> {
-    let ranks = s.gold.as_ref().and_then(|g| g.1.get(sha256));
-    order.iter().map(|&slot| ranks.and_then(|r| r.get(&format!("{}@0", slots.line(pages, slot).id))).copied().unwrap_or(-1)).collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sha256: &str, table: &LineTable, locals: &[Local], sheet: &mut Stylesheet) -> Vec<Move> {
     let n = table.order.len();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));
-    let ranks_of = || -> Vec<i64> { ids_ranks(s, sha256, &table.order, pages, slots) };
+    // Each line's reading rank in the gold, -1 for none.
+    let ranks_of = || -> Vec<i64> {
+        let ranks = s.gold.as_ref().and_then(|g| g.1.get(sha256));
+        table.order.iter().map(|&slot| ranks.and_then(|r| r.get(&format!("{}@0", slots.line(pages, slot).id))).copied().unwrap_or(-1)).collect()
+    };
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     // A row's pointer names a row of the gold's pieces (a line may hold several): here, the place of that piece's line.
     let place: HashMap<&str, i64> = ids.iter().enumerate().map(|(k, id)| (id.as_str(), k as i64)).collect();
@@ -509,63 +458,41 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
     let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
     let line_pages: Vec<usize> = table.order.iter().map(|&slot| slots.page(slot)).collect();
     // Detect-Order-Construct's decoding from the gold's answers: what it can hold.
-    if s.doc_oracle && gold.is_some() {
-        let moves = doc::oracle(&gold_rows, &ranks_of(), &views, &texts, &line_pages);
+    let read = (s.doc_oracle && gold.is_some()).then(|| doc::oracle(&gold_rows, &ranks_of(), &views, &texts, &line_pages));
+    // Detect-Order-Construct's reading, where its stages are given.
+    #[cfg(feature = "encoder")]
+    let read = read.or_else(|| s.doc.as_ref().and_then(|reader| {
+        reader.read(table, &views, &texts, &line_pages, &doc::Style::of(sheet, table)).map_err(|error| eprintln!("transition parser DOC {sha256}: {error}")).ok()
+    }));
+    if let Some(moves) = read {
         write_labels(s, sha256, &ids, &views, &moves);
         return moves;
     }
-    // Detect-Order-Construct's reading, where its stages are given.
-    #[cfg(feature = "encoder")]
-    if let Some(reader) = &s.doc {
-        match reader.read(table, &views, &texts, &line_pages, &doc::Style::of(sheet, table)) {
-            Ok(moves) => {
-                write_labels(s, sha256, &ids, &views, &moves);
-                return moves;
-            }
-            Err(error) => eprintln!("transition parser DOC {sha256}: {error}"),
-        }
-    }
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
-    let first = walk(table, &views, locals, None, None).0;
-    sheet.read_back(&first);
+    sheet.read_back(&walk(table, &views, locals, None, None).0);
     let views = views_of(s, pages, slots, evidence, fences, table, locals, sheet);
-    let moves = {
-        {
-            let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
-            let (move_rows, move_lines, move_classes, move_oracle) = (recorded.rows, recorded.lines, recorded.classes, recorded.oracle);
-            if let Some(folder) = &s.dump {
-                let write = || -> std::io::Result<()> {
-                    std::fs::create_dir_all(folder)?;
-                    let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
-                    std::fs::write(folder.join(format!("{sha256}.lines.f32")), bytes(&table.features))?;
-                    std::fs::write(folder.join(format!("{sha256}.moves.f32")), bytes(&move_rows))?;
-                    let meta = serde_json::json!({
-                        "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
-                        "texts": table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect::<Vec<_>>(),
-                        "looks": &table.looks,
-                        "pages": table.order.iter().map(|&slot| slots.page(slot)).collect::<Vec<_>>(),
-                        "references": &table.references,
-                        "ranks": ranks_of(),
-                        "templates": &sheet.template,
-                        "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
-                        "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(),
-                        "anchors": &sheet.anchor,
-                        "t0": &table.t0,
-                        "note_numbers": (0..n).map(|k| doc::note_number(&views[k], &slots.line(pages, table.order[k]).text).map_or(-1, i64::from)).collect::<Vec<_>>(),
-                        "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
-                        "gold": gold_rows, "move_lines": move_lines, "move_classes": move_classes, "move_oracle": move_oracle,
-                        "chosen": moves.iter().map(Move::class).collect::<Vec<_>>(),
-                    });
-                    std::fs::write(folder.join(format!("{sha256}.json")), serde_json::to_vec(&meta)?)
-                };
-                if let Err(error) = write() {
-                    eprintln!("transition parser dump {sha256}: {error}");
-                }
-            }
-            moves
-        }
-    };
+    let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
+    if let Some(folder) = &s.dump {
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(folder)?;
+            let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+            std::fs::write(folder.join(format!("{sha256}.lines.f32")), bytes(&table.features))?;
+            std::fs::write(folder.join(format!("{sha256}.moves.f32")), bytes(&recorded.rows))?;
+            let meta = serde_json::json!({
+                "sha256": sha256, "ids": ids, "lines": n, "line_width": ALL, "move_width": RANKED,
+                "texts": texts, "looks": &table.looks, "pages": line_pages, "references": &table.references, "ranks": ranks_of(), "templates": &sheet.template,
+                "template_rows": joint::template_rows(sheet, table), "held": joint::held_templates(sheet),
+                "openers": (0..n).map(|k| opener(table, k)).collect::<Vec<_>>(), "anchors": &sheet.anchor, "t0": &table.t0,
+                "note_numbers": (0..n).map(|k| doc::note_number(&views[k], texts[k]).map_or(-1, i64::from)).collect::<Vec<_>>(),
+                "regions": REGIONS, "line_features": LINE_FEATURES, "candidate_features": CANDIDATE,
+                "gold": gold_rows, "move_lines": recorded.lines, "move_classes": recorded.classes, "move_oracle": recorded.oracle,
+                "chosen": moves.iter().map(Move::class).collect::<Vec<_>>(),
+            });
+            std::fs::write(folder.join(format!("{sha256}.json")), serde_json::to_vec(&meta)?)
+        };
+        write().unwrap_or_else(|error| eprintln!("transition parser dump {sha256}: {error}"));
+    }
     write_labels(s, sha256, &ids, &views, &moves);
     moves
 }
@@ -574,9 +501,8 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
 fn write_labels(s: &Settings, sha256: &str, ids: &[String], views: &[LineView], moves: &[Move]) {
     let Some(folder) = &s.labels else { return };
     let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labelled(views, moves)});
-    if let Err(error) = std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string())) {
-        eprintln!("transition parser labels {sha256}: {error}");
-    }
+    std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string()))
+        .unwrap_or_else(|error| eprintln!("transition parser labels {sha256}: {error}"));
 }
 
 /// The moves as the grader's labels, the state replayed over them: region, opening, document start,
@@ -590,23 +516,18 @@ fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
     for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
         let key = (state.ctx(line, chosen.starts), stream_of(chosen.region));
         let stands = streams.stands(key, chosen);
-        if chosen.region != 0 {
-            streams.step(key, chosen.region, stands, k);
-        }
-        let starts_document = chosen.starts;
+        if chosen.region != 0 { streams.step(key, chosen.region, stands, k); }
         let made = state.apply(line, chosen);
         // A mark may stand after its note: its line is labelled once every line is.
         paired_lines.extend(made.paired.into_iter().chain(made.also.into_iter().flatten()).map(|(line, ..)| line as usize));
-        let marked = chosen.opens && chosen.reading.is_some();
         let (start, pointer) = match stands {
             Stands::Resumes(first) => (2, first as i64),
             _ => (i64::from(chosen.opens), -1),
         };
-        labels.push([i64::from(chosen.region), start, i64::from(starts_document), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
+        let marked = chosen.opens && chosen.reading.is_some();
+        labels.push([i64::from(chosen.region), start, i64::from(chosen.starts), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
     }
-    for line in paired_lines {
-        labels[line][3] = 1;
-    }
+    paired_lines.into_iter().for_each(|line| labels[line][3] = 1);
     labels
 }
 
@@ -615,9 +536,7 @@ fn fold_of(sha256: &str, folds: usize) -> usize {
     let mut crc = 0xffff_ffffu32;
     for byte in sha256.bytes() {
         crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
-        }
+        (0..8).for_each(|_| crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 });
     }
     (!crc as usize) % folds.max(1)
 }
