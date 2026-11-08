@@ -196,14 +196,13 @@ pub struct LineView<'a> {
     pub look_heading: f32,
     pub look_heading_lines: f32,
     /// The document's stylesheet: the line's template, the level the document's outline names it at
-    /// (0 for none), whether a contents list holds it, and the document's regime (`Stylesheet`).
+    /// (0 for none), and the document's regime (`Stylesheet`).
     pub template: TemplateView,
     pub anchor: u16,
-    pub listed: bool,
     pub regime: [f32; 4],
     /// The line's text normalized as a title is matched (`bookmarks::normalize_title`, empty for a long
-    /// line); read as a contents list's row, its title so normalized where it prints a locator, and where
-    /// it starts on its page (a share of the page's width).
+    /// line); read as a contents list's row (a contents list holds it), its title so normalized where it
+    /// prints a locator, and where it starts on its page (a share of the page's width).
     pub title_key: String,
     pub contents_title: Option<String>,
     pub left: f32,
@@ -644,7 +643,7 @@ impl State {
         f[56] = against(t.read_level);
         f[57] = flag(line.anchor > 0);
         f[58] = f32::from(line.anchor);
-        f[59] = flag(line.listed);
+        f[59] = flag(line.contents_title.is_some());
         f[60..64].copy_from_slice(&line.regime);
         f[64] = flag(stream.quoting && !candidate.starts);
         f[65] = t.beside;

@@ -22,10 +22,9 @@ pub struct Stylesheet {
     pub templates: Vec<TemplateView>,
     /// Each line the outline names: its level there (0 for none).
     pub anchor: Vec<u16>,
-    /// Each line a contents list holds.
-    pub listed: Vec<bool>,
     /// Each line opening a row that reads as a contents list's (a title and the locator it prints, the
-    /// row the lines on one baseline): the title, normalized as titles are matched.
+    /// row the lines on one baseline): the title, normalized as titles are matched. A contents list
+    /// holds the lines that have one.
     pub contents_titles: Vec<Option<String>>,
     /// Each line's regime: the shares of its document's lines opening on a bracketed number, on a
     /// section's number, on a transcript's line number, on a speaker's label; its document the whole
@@ -108,7 +107,6 @@ impl Stylesheet {
         }
         // A line on a row that reads as a contents list's: a title and the locator it prints.
         let contents_titles = contents_rows(pages, slots, table);
-        let listed: Vec<bool> = contents_titles.iter().map(Option::is_some).collect();
         // Each template's measures.
         let heading_class = usize::from(HEADING) * 2 + 1;
         let mut views = vec![TemplateView::default(); count];
@@ -167,7 +165,7 @@ impl Stylesheet {
                 evidence.words[at] & WORD_SPEAKER != 0,
             ]
         }).collect();
-        let mut sheet = Self { template, templates: views, anchor, listed, contents_titles, regime: vec![[0.0; 4]; n], opens };
+        let mut sheet = Self { template, templates: views, anchor, contents_titles, regime: vec![[0.0; 4]; n], opens };
         sheet.regimes(&[]);
         sheet
     }
