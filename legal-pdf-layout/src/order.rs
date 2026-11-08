@@ -87,7 +87,7 @@ pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pd
     }
     // Hyphenated words left broken: those ending lines, less those the next line goes on from.
     let broken = |(candidates, satisfied): (usize, usize)| candidates.saturating_sub(satisfied);
-    if model.kind == "two_column" {
+    if model.kind == ColumnKind::Two {
         let source_switches = column_switches(lines, body, model, page_width);
         let source_run = median_column_run(lines, body, model, page_width);
         let source_hyphens = hyphen_join_score(lines, body);
@@ -124,7 +124,7 @@ pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pd
         }
         return source_switches > 2;
     }
-    if model.kind != "single" {
+    if model.kind != ColumnKind::Single {
         return false;
     }
     let (source_regressions, source_hyphens) = (y_regressions(lines, body), hyphen_join_score(lines, body));

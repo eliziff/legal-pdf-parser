@@ -75,7 +75,7 @@ pub fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &legal_pdf
         }
     }
     let columns = note_column_model(lines, note, items, number);
-    let right = |slot: &usize| columns.kind == "two_column" && line_center_x(&lines[*slot]) >= columns.split_x;
+    let right = |slot: &usize| columns.kind == ColumnKind::Two && line_center_x(&lines[*slot]) >= columns.split_x;
     let (mut left_column, mut right_column): (Vec<usize>, Vec<usize>) = note.iter().copied().partition(|slot| !right(slot));
     read_rows(lines, &mut left_column, |slot| tops[&slot]);
     read_rows(lines, &mut right_column, |slot| tops[&slot]);
@@ -95,9 +95,9 @@ pub fn weave_note_columns(lines: &[Line], mut body: Vec<usize>, note: Vec<usize>
         kept[slot] = true;
     }
     let body_model = columns_of(lines, body.iter().copied(), &kept_items(items, |slot| kept[slot]), number);
-    let split_x = if note_columns.kind == "two_column" {
+    let split_x = if note_columns.kind == ColumnKind::Two {
         note_columns.split_x
-    } else if body_model.kind == "two_column" {
+    } else if body_model.kind == ColumnKind::Two {
         body_model.split_x
     } else {
         body.extend(note);

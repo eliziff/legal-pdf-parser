@@ -23,32 +23,23 @@ pub mod regions;
 pub use regions::*;
 
 
-#[derive(Debug, Clone, Copy)]
+/// What a page's columns are: one, two of like width, a body beside a narrower margin's, or more than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ColumnKind {
+    Single,
+    Two,
+    Margin,
+    Multi,
+}
+
+/// A page's columns: their kind, where they split, and the lines on either side.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ColumnModel {
-    pub kind: &'static str,
+    pub kind: ColumnKind,
     pub split_x: f64,
     pub left_count: usize,
     pub right_count: usize,
 }
-
-/// A column model as its kind's name, its split and its two columns' line counts.
-impl serde::Serialize for ColumnModel {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(&(self.kind, self.split_x, self.left_count, self.right_count), serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ColumnModel {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let (kind, split_x, left_count, right_count): (String, f64, usize, usize) = serde::Deserialize::deserialize(deserializer)?;
-        let kind = ["single", "two_column", "margin_column", "multi_column"]
-            .into_iter()
-            .find(|known| *known == kind)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown column model kind {kind}")))?;
-        Ok(Self { kind, split_x, left_count, right_count })
-    }
-}
-
 
 pub fn line_width(line: &Line) -> f64 {
     line.bbox[2] - line.bbox[0]

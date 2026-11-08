@@ -692,7 +692,7 @@ impl Decision {
     fn margin_caption(&self, pages: &[Page], slots: &Slots, fences: &Fences, opener: Slot, shaped: &impl Fn(Slot) -> bool) -> Vec<Slot> {
         let page_slot = slots.page(opener);
         let columns = fences.columns[page_slot];
-        if columns.kind != "margin_column" {
+        if columns.kind != legal_pdf_layout::ColumnKind::Margin {
             return Vec::new();
         }
         let left = columns.left_count < columns.right_count;

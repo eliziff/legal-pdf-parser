@@ -30,17 +30,17 @@ pub fn columns_of(lines: &[Line], members: impl Iterator<Item = usize>, items: &
         })
         .collect();
     let [left, right, ..] = regions.as_slice() else {
-        return ColumnModel { kind: "single", split_x: 0.0, left_count: 0, right_count: 0 };
+        return ColumnModel { kind: ColumnKind::Single, split_x: 0.0, left_count: 0, right_count: 0 };
     };
     let split_x = f64::from(left.x_max + right.x_min) / 2.0;
     let left_count = members.iter().filter(|line| line_center_x(line) < split_x).count();
     let (left_width, right_width) = (left.x_max - left.x_min, right.x_max - right.x_min);
     let kind = if regions.len() > 2 {
-        "multi_column"
+        ColumnKind::Multi
     } else if left_width.min(right_width) >= 0.5 * left_width.max(right_width) {
-        "two_column"
+        ColumnKind::Two
     } else {
-        "margin_column"
+        ColumnKind::Margin
     };
     ColumnModel { kind, split_x, left_count, right_count: members.len() - left_count }
 }
@@ -155,7 +155,7 @@ pub fn margin_note_model(
                 return None;
             };
             let (left_count, right_count) = if right { (prose.len(), lane.len()) } else { (lane.len(), prose.len()) };
-            Some((lane.len(), ColumnModel { kind: "margin_column", split_x, left_count, right_count }))
+            Some((lane.len(), ColumnModel { kind: ColumnKind::Margin, split_x, left_count, right_count }))
         })
         .max_by_key(|(count, _)| *count)
         .map(|(_, model)| model)
@@ -172,8 +172,8 @@ pub fn note_column_model(lines: &[Line], members: &[usize], items: &legal_pdf_ta
     let crossing = |line: &Line| {
         has_valid_bbox(line) && line.text.chars().filter(|character| !character.is_whitespace()).count() >= 8 && line.bbox[0] < model.split_x && line.bbox[2] > model.split_x
     };
-    if model.kind == "two_column" && members.iter().any(|&slot| crossing(&lines[slot])) {
-        model.kind = "margin_column";
+    if model.kind == ColumnKind::Two && members.iter().any(|&slot| crossing(&lines[slot])) {
+        model.kind = ColumnKind::Margin;
     }
     model
 }

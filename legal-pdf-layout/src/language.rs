@@ -55,7 +55,7 @@ pub fn translation_lines(views: &[PageView], models: &[ColumnModel], set_aside: 
     let splits = views
         .iter()
         .zip(models)
-        .map(|(view, model)| (model.kind == "two_column").then_some(model.split_x).or_else(|| by_lines(view)))
+        .map(|(view, model)| (model.kind == ColumnKind::Two).then_some(model.split_x).or_else(|| by_lines(view)))
         .collect::<Vec<_>>();
     let side = |line: &Line, split: f64| {
         // (A split a list's hang pulled into a column leaves that column's lines just over it.)
