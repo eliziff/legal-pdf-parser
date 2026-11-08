@@ -121,18 +121,6 @@ pub fn write_lines(
         .collect()
 }
 
-/// Each page's lines, standing in their slots' order, put in reading order.
-pub fn in_reading_order(pages: &mut [Page], slots: &Slots, fences: &Fences) {
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        let range = slots.on(page_slot);
-        let mut lines: Vec<Option<Line>> = std::mem::take(&mut page.lines).into_iter().map(Some).collect();
-        page.lines = fences.order[range.start as usize..range.end as usize]
-            .iter()
-            .filter_map(|slot| lines[(slot.0 - range.start) as usize].take())
-            .collect();
-    }
-}
-
 /// Whether two lines of a page stand on one row.
 fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
     let row = evidence.row(slots, a);

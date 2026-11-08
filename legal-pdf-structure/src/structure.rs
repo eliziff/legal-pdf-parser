@@ -111,7 +111,7 @@ pub fn derive_cached(pages: &mut [Page],
     }
     // The document's type, where known (the caller's profile): an instrument numbers its provisions.
     let instrument = identity.profile == Some(legal_structure_model::DetectionProfile::Instrument);
-    let (slots, normalized) = measure("derive.normalize", || normalize(pages));
+    let (mut slots, normalized) = measure("derive.normalize", || normalize(pages));
     let cached = cache
         .and_then(|path| legal_pdf_core::read_gzip_json::<Measured>(path).ok())
         .filter(|measured| measured.evidence.size.len() == slots.len());
@@ -142,7 +142,7 @@ pub fn derive_cached(pages: &mut [Page],
     };
     // The output is tier 0's; the transition walk over its reading (the DOC tier where it is given, the scorer's fitting)
     // runs inside it, once (`tier0::output`).
-    measure("derive.machine", || output(pages, &slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
+    measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
 }
 
 /// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
@@ -151,7 +151,7 @@ pub fn derive_cached(pages: &mut [Page],
 /// fitting asks (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's
 /// in their place where it is given) and emitted as the structure graph (`legal_pdf_emit`).
 fn output(pages: &mut [Page],
-    slots: &Slots,
+    slots: &mut Slots,
     evidence: &Evidence,
     mut fences: Fences,
     runs: &Runs,
@@ -173,10 +173,11 @@ fn output(pages: &mut [Page],
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
-    let decided = decided(pages, slots, &fences);
     let heading_sources = write_lines(pages, slots, evidence, &fences, &notes, &decision);
-    // The pairer reads each page's lines in reading order.
-    in_reading_order(pages, slots, &fences);
+    // The lines are read in reading order from here on, the pairer's and the output's: each page's put in it once.
+    slots.read_in_order(pages, &fences.order);
+    let slots: &Slots = slots;
+    let decided = decided(pages, slots, &fences);
     build_regions(pages);
     diagnostics.extend(text_flow_faults(pages));
     let index = PdfTextIndex::from_pages(pages);
@@ -192,10 +193,8 @@ fn output(pages: &mut [Page],
     // A tier scores the moves, the output stays this one: the walk takes the DOC tier's move for each line, but for the
     // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
     // reading of a marker names one of this reading's.
-    tier0::in_slot_order(pages, slots);
     let settled = Settled { index: &index, notes, runs, opened, within };
     let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &views, &moves, doc, identity, settled)?;
     diagnostics.extend(note_crossrefs(&structure_graph, &decided));
-    in_reading_order(pages, slots, &fences);
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph, heading_sources })
 }

@@ -14,13 +14,14 @@ impl Slot {
     }
 }
 
-/// Where each slot stands in the pages: each page's first slot, each slot's page, and each line
-/// id's slot (the first line's, where two lines share an id).
+/// Where each slot stands in the pages: each page's first slot, each slot's page and its line's place among its page's
+/// lines, and each line id's slot (the first line's, where two lines share an id).
 #[derive(Debug, Default)]
 pub struct Slots {
     /// Each page's first slot, by page slot, and the number of lines after the last.
     starts: Vec<u32>,
     pages: Vec<u32>,
+    places: Vec<u32>,
     ids: HashMap<String, Slot>,
 }
 
@@ -39,7 +40,22 @@ impl Slots {
             }
         }
         starts.push(next);
-        Self { starts, pages: of_page, ids }
+        let places = of_page.iter().enumerate().map(|(slot, &page)| slot as u32 - starts[page as usize]).collect();
+        Self { starts, pages: of_page, places, ids }
+    }
+
+    /// Each page's lines put in `order` (slots, a page's together), each slot keeping its line's new place: the pages are
+    /// read in reading order from here on, and a slot still names its line.
+    pub fn read_in_order(&mut self, pages: &mut [Page], order: &[Slot]) {
+        for (page_slot, page) in pages.iter_mut().enumerate() {
+            let range = self.starts[page_slot]..self.starts[page_slot + 1];
+            let mut lines: Vec<Option<Line>> = std::mem::take(&mut page.lines).into_iter().map(Some).collect();
+            let ordered = &order[range.start as usize..range.end as usize];
+            page.lines = ordered.iter().filter_map(|slot| lines[self.places[slot.index()] as usize].take()).collect();
+            for (place, slot) in ordered.iter().enumerate() {
+                self.places[slot.index()] = place as u32;
+            }
+        }
     }
 
     /// The number of lines.
@@ -64,14 +80,12 @@ impl Slots {
 
     /// The slot's line.
     pub fn line<'p>(&self, pages: &'p [Page], slot: Slot) -> &'p Line {
-        let page = self.page(slot);
-        &pages[page].lines[(slot.0 - self.starts[page]) as usize]
+        &pages[self.page(slot)].lines[self.places[slot.index()] as usize]
     }
 
     /// The slot's line, to change.
     pub fn line_mut<'p>(&self, pages: &'p mut [Page], slot: Slot) -> &'p mut Line {
-        let page = self.page(slot);
-        &mut pages[page].lines[(slot.0 - self.starts[page]) as usize]
+        &mut pages[self.page(slot)].lines[self.places[slot.index()] as usize]
     }
 
     /// The slot of the line holding the id.

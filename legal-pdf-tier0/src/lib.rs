@@ -283,13 +283,6 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
     (moves, opened, within)
 }
 
-/// Each page's lines back in their slots, which `emit` addresses them by.
-pub fn in_slot_order(pages: &mut [Page], slots: &Slots) {
-    for page in pages {
-        page.lines.sort_by_cached_key(|line| slots.of_id(&line.id));
-    }
-}
-
 /// The notes and the one decision on each line.
 #[allow(clippy::too_many_arguments)]
 pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, views: &[LineView], traced: bool) -> (Notes, Decision) {
