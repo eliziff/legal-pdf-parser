@@ -327,7 +327,7 @@ pub fn structure_graph(pages: &mut [Page],
         // that paragraph in the other language (`paragraph_printings`), as the stage's nodes say.
         node.grammar = if region == "contents" {
             Some("contents".to_owned())
-        } else if (kind == NodeKind::Paragraph || kind == NodeKind::Prose) && unit.lines.iter().all(|&k| views[k].translation) {
+        } else if matches!(kind, NodeKind::Paragraph | NodeKind::Prose | NodeKind::Section) && unit.lines.iter().all(|&k| views[k].translation) {
             Some("translation".to_owned())
         } else {
             None
@@ -355,6 +355,7 @@ pub fn structure_graph(pages: &mut [Page],
             own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
             own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
+            own.grammar.clone_from(&nodes[holder].grammar);
             own.content_start = scalar(member.content);
             own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
             if kind == NodeKind::Section {
