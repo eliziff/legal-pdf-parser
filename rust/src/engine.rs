@@ -365,7 +365,6 @@ fn cache_key(
 
 fn derive_extracted(
     extracted: &mut ExtractedPdf,
-    document_id: &str,
     source_hash: &str,
     cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
@@ -382,7 +381,6 @@ fn derive_extracted(
         &extracted.separators,
         &extracted.outline,
         StructureIdentity {
-            document_id: document_id.to_owned(),
             source_sha256: source_hash.to_owned(),
             profile: semantic_profile,
             page_labels: extracted.metadata.embedded_page_labels.clone(),
@@ -438,13 +436,12 @@ fn derive_document(
     semantic_profile: Option<DetectionProfile>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    let document_id = format!("doc-{}", &source_hash[..20]);
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, &document_id, source_hash, cache_root, semantic_profile)
+        derive_extracted(&mut extracted, source_hash, cache_root, semantic_profile)
     })?;
     profile::measure("build.validate_document", || {
-        validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.structure_graph)
+        validate_pdf_components(&extracted.pages, &derived.structure_graph)
     })?;
     let document_status = status(&extracted.diagnostics, &extracted.pages);
     if let Some(pages) = pages {
@@ -539,10 +536,9 @@ pub fn gold_structure_document(
 /// A cached extraction through the structure stage, as a parse reads it, checked: the pages as the stage left them and the
 /// structure, its revision taken, with the extraction's diagnostics.
 fn corpus_structure(source_hash: &str, mut extracted: ExtractedPdf) -> Result<(ExtractedPdf, DocumentStructure)> {
-    let document_id = format!("doc-{}", &source_hash[..20]);
-    let mut derived = derive_extracted(&mut extracted, &document_id, source_hash, None, None)?;
+    let mut derived = derive_extracted(&mut extracted, source_hash, None, None)?;
     derived.structure_graph.refresh_revision()?;
-    profile::measure("build.validate_document", || validate_pdf_components(&document_id, source_hash, &extracted.pages, &derived.structure_graph))?;
+    profile::measure("build.validate_document", || validate_pdf_components(&extracted.pages, &derived.structure_graph))?;
     Ok((extracted, derived.structure_graph))
 }
 

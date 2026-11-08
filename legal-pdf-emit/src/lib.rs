@@ -414,13 +414,13 @@ pub fn structure_graph(pages: &[Page],
         constituents::Start::new(id, &kind)
     }).collect();
     nodes.extend(constituents::constituents(index, pages, &starts));
-    let mut structure = DocumentStructure::new(identity.document_id.clone(), "local-pdf", index.text().to_owned(), ORIGIN);
+    let mut structure = DocumentStructure::new(identity.document_id(), "local-pdf", index.text().to_owned(), ORIGIN);
     structure.origins.push(Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() });
     structure.source_sha256 = Some(identity.source_sha256.clone());
     structure.nodes = nodes;
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
-    let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, decided);
+    let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &structure.document_id.clone(), index, decided);
     legal_pdf_graph::graph::assemble_outline(&mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
     // A provision's path from the outermost provision it stands in ("12(1)(a)"), by the parents the outline kept, after
     // its printing's alias where it has one: each unit's printed label along the chain.

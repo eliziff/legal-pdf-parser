@@ -90,8 +90,6 @@ pub fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {
 }
 
 pub fn validate_pdf_components(
-    document_id: &str,
-    source_sha256: &str,
     pages: &[Page],
     structure_graph: &DocumentStructure,
 ) -> Result<()> {
@@ -99,9 +97,6 @@ pub fn validate_pdf_components(
     let known_pages = pages.iter().map(|page| page.index).collect::<HashSet<_>>();
     let unknown_line = |line: &String| !known_lines.contains(line.as_str());
     let unknown_page = |page: &usize| !known_pages.contains(page);
-    if structure_graph.document_id != document_id || structure_graph.source_sha256.as_deref() != Some(source_sha256) {
-        return invalid("structure graph identity disagrees with the document");
-    }
     // The structure's ranges stand in its text.
     let text_length = utf16_len(&structure_graph.text);
     let mut node_ids = HashSet::new();

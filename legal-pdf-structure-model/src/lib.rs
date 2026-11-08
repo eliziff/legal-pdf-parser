@@ -23,8 +23,14 @@ pub const TRANSITION_ORIGIN: &str = "legal-pdf-transition.v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureIdentity {
     pub profile: Option<legal_structure_model::DetectionProfile>,
-    pub document_id: String,
     pub source_sha256: String,
     /// The page labels the PDF declares (`/PageLabels`), by page index; empty where it has none.
     pub page_labels: Vec<Option<String>>,
+}
+
+impl StructureIdentity {
+    /// The document's id: its source's hash, named.
+    pub fn document_id(&self) -> String {
+        format!("doc-{}", &self.source_sha256[..20])
+    }
 }
