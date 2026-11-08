@@ -10,6 +10,6 @@ mod projection;
 #[cfg(feature = "ppdoc")]
 pub use ppdoc::{PPDocDetection, PPDocLayout, PPDocOptions};
 pub use projection::{
-    numeric_range, PdfDocument, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
+    numeric_range, PdfDocument, PdfLookupPage,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PrintedParagraph,
 };
