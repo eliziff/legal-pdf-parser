@@ -1,0 +1,156 @@
+//! A document's decision traced, for fitting its weights on the gold: given a folder, each document's `<source sha256>.trace.json.gz` there holds each line's id and
+//! page, what each stage read of it (the evidence, fences and runs, the notes, the decision), and
+//! each weighed choice with the evidence it weighed (`ResidualRecord`). The parse is the same with a
+//! trace or without one.
+
+use super::*;
+
+/// One residual candidate as the residual weighed it: its lines (slots), its reading context and look
+/// (an index among the context's looks), the indicators its own log-odds sum (`OWN`, in order), the
+/// measures they were read from, the vetoes that bar it (`VETO_*`), its look's signs (`LOOK`, in
+/// order) and members, and the scores and outcome.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ResidualRecord {
+    pub lines: Vec<u32>,
+    pub context: u32,
+    pub look: u32,
+    pub terms: [bool; OWN.len()],
+    pub alone: bool,
+    pub above: f64,
+    pub below: Option<f64>,
+    pub words: u32,
+    pub caps: bool,
+    pub body: bool,
+    pub larger: bool,
+    pub numbered: bool,
+    pub vetoes: u16,
+    pub signs: [bool; LOOK.len()],
+    pub members: u32,
+    pub own: f64,
+    pub score: f64,
+    pub heading: bool,
+}
+
+/// A testimony's line, or a transcript's on a page of speakers' turns or a turn or event itself.
+pub const VETO_TESTIMONY: u16 = 1;
+/// A marker alone whose text goes on into the next line, or ends a sentence.
+pub const VETO_RUNS_ON: u16 = 1 << 1;
+/// An editorial line (`numbered_paragraphs::editorial_line`).
+pub const VETO_EDITORIAL: u16 = 1 << 2;
+/// Ending on a period, comma or semicolon.
+pub const VETO_ENDS: u16 = 1 << 3;
+/// A label (`rules::label`) or a date alone.
+pub const VETO_LABEL: u16 = 1 << 4;
+/// Over twenty words.
+pub const VETO_WORDS: u16 = 1 << 5;
+/// Tagged a heading by its source, but no numbered one, of several lines, in the body's type in
+/// capitals, or not larger with more space under it than over it.
+pub const VETO_TAGGED: u16 = 1 << 6;
+
+#[derive(serde::Serialize)]
+struct NotesTrace<'a> {
+    note: &'a [Option<NoteKind>],
+    paragraph_label: &'a [bool],
+    suppressed: &'a [bool],
+    running_head: &'a [bool],
+    heading: &'a [bool],
+}
+
+#[derive(serde::Serialize)]
+struct DecisionTrace<'a> {
+    role: &'a [Role],
+    rule: &'a [Rule],
+    unit: &'a [Option<Opening>],
+    joined: &'a [bool],
+    given: &'a [u8],
+    level: &'a [u8],
+    anchor: &'a [u32],
+}
+
+/// A line as a decoder fitted on the trace reads it: its text; its opening marker's readings by the
+/// numbering grammar (family, value and dotted prefix), read alone and, where a letter is also a
+/// roman numeral, as the letter after the one before it, and a division word's number ("PART II")
+/// under the word; and its reference marks' values (0 for a note symbol), raised or detached.
+#[derive(serde::Serialize)]
+struct LineTrace<'a> {
+    text: &'a str,
+    readings: Vec<(String, u32, Vec<u32>)>,
+    references: Vec<u32>,
+}
+
+/// The readings of a line's opening token, and of the number after any word (`marker_readings`).
+fn readings(text: &str) -> Vec<(String, u32, Vec<u32>)> {
+    marker_readings(text, true).into_iter().map(|r| (r.family, r.value, r.prefix)).collect()
+}
+
+#[derive(serde::Serialize)]
+struct Trace<'a> {
+    source_sha256: &'a str,
+    ids: Vec<&'a str>,
+    pages: Vec<u32>,
+    lines: Vec<LineTrace<'a>>,
+    evidence: &'a Evidence,
+    fences: &'a Fences,
+    runs: &'a Runs,
+    notes: NotesTrace<'a>,
+    decision: DecisionTrace<'a>,
+    residual: &'a [ResidualRecord],
+}
+
+/// Writes the document's trace into `folder`; a trace that cannot be written is reported on stderr
+/// and the parse goes on.
+#[allow(clippy::too_many_arguments)]
+pub fn write_trace(
+    folder: &std::path::Path,
+    source_sha256: &str,
+    pages: &[Page],
+    slots: &Slots,
+    evidence: &Evidence,
+    fences: &Fences,
+    runs: &Runs,
+    notes: &Notes,
+    decision: &Decision,
+) {
+    let all = (0..slots.len()).map(|at| Slot(at as u32));
+    let trace = Trace {
+        source_sha256,
+        ids: all.clone().map(|slot| slots.line(pages, slot).id.as_str()).collect(),
+        pages: all.clone().map(|slot| slots.page(slot) as u32).collect(),
+        lines: all
+            .map(|slot| {
+                let line = slots.line(pages, slot);
+                LineTrace {
+                    text: &line.text,
+                    readings: readings(&line.text),
+                    references: reference_values(line, evidence.size[slot.index()]),
+                }
+            })
+            .collect(),
+        evidence,
+        fences,
+        runs,
+        notes: NotesTrace {
+            note: &notes.note,
+            paragraph_label: &notes.paragraph_label,
+            suppressed: &notes.suppressed,
+            running_head: &notes.running_head,
+            heading: &notes.heading,
+        },
+        decision: DecisionTrace {
+            role: &decision.role,
+            rule: &decision.rule,
+            unit: &decision.unit,
+            joined: &decision.joined,
+            given: &decision.given,
+            level: &decision.level,
+            anchor: &decision.anchor,
+        },
+        residual: &decision.residual,
+    };
+    let path = folder.join(format!("{source_sha256}.trace.json.gz"));
+    if let Err(error) = std::fs::create_dir_all(folder).map_err(|e| e.to_string()).and_then(|()| {
+        legal_pdf_core::write_gzip_json(&path, &trace).map_err(|e| e.to_string())
+    }) {
+        eprintln!("decision trace {}: {error}", path.display());
+    }
+}

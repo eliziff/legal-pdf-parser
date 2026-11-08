@@ -1,0 +1,13 @@
+[package]
+name = "legal-pdf-pages"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A PDF's page map: each page's printed number from what its pages print, their sequence, the PDF's own labels and a citation's first page"
+
+# Data in, numbers out: no PDF reading, no structure stage. An edit here rebuilds this crate and relinks.
+[dependencies]
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+# page-map-score reads its evidence and key
+serde_json = "1.0"

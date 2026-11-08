@@ -1,0 +1,18 @@
+[package]
+name = "legal-pdf-headings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A PDF's headings, contents lists and captions as the structure stage reads them"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-text = { path = "../legal-pdf-text" }
+legal-pdf-layout = { path = "../legal-pdf-layout" }
+legal-pdf-tables = { path = "../legal-pdf-tables" }
+legal-structure-model = { workspace = true }
+pdf-inspector = { workspace = true }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,0 +1,32 @@
+[package]
+name = "legal-pdf-transition"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The transition parser's walk over tier 0's reading and its fitted readers: DOC (with `encoder`) and the walker's"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-text = { path = "../legal-pdf-text" }
+legal-pdf-layout = { path = "../legal-pdf-layout" }
+legal-pdf-headings = { path = "../legal-pdf-headings" }
+legal-pdf-notes = { path = "../legal-pdf-notes" }
+legal-pdf-constituents = { path = "../legal-pdf-constituents" }
+legal-pdf-graph = { path = "../legal-pdf-graph" }
+legal-pdf-decide = { path = "../legal-pdf-decide" }
+legal-pdf-machine = { path = "../legal-pdf-machine" }
+legal-pdf-tier0 = { path = "../legal-pdf-tier0" }
+legal-pdf-emit = { path = "../legal-pdf-emit" }
+legal-structure-model = { workspace = true }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
+# The DOC reader's text model (doc.rs): Hugging Face's tokenizer, its regular expressions in Rust.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
+
+[features]
+# Tier 1's and tier 2's document encoder, and Detect-Order-Construct's stages (encoder.rs, doc.rs).
+encoder = ["dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]

@@ -1,0 +1,15 @@
+[package]
+name = "legal-pdf-diagnostics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A PDF parse's diagnostics: text-flow faults, its status, and the checks every page and component passes"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-text = { path = "../legal-pdf-text" }
+legal-pdf-furniture = { path = "../legal-pdf-furniture" }
+legal-pdf-constituents = { path = "../legal-pdf-constituents" }
+legal-pdf-support = { path = "../legal-pdf-support" }
+legal-structure-model = { workspace = true }

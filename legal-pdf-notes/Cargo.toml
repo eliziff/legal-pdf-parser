@@ -1,0 +1,19 @@
+[package]
+name = "legal-pdf-notes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A PDF's notes as the structure stage reads them: the note band, its lanes, note context and the pairer"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-text = { path = "../legal-pdf-text" }
+legal-pdf-layout = { path = "../legal-pdf-layout" }
+legal-pdf-headings = { path = "../legal-pdf-headings" }
+legal-pdf-tables = { path = "../legal-pdf-tables" }
+legal-structure-model = { workspace = true }
+pdf-inspector = { workspace = true }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

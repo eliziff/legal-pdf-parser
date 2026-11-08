@@ -19,6 +19,12 @@ pub use contract::{
 #[cfg(feature = "pdf")]
 pub use engine::RecognitionProgress;
 #[cfg(feature = "pdf")]
+mod page_map;
+#[cfg(feature = "pdf")]
+pub use page_map::{page_evidence, page_map, EdgeLine, PageEvidence, PdfPageBinding};
+#[cfg(feature = "ocr")]
+pub use page_map::page_evidence_read;
+#[cfg(feature = "pdf")]
 #[cfg(feature = "pdf")]
 #[doc(hidden)]
 pub use engine::{corpus_check_cached_extraction, gold_inputs_identity, gold_structure_document};

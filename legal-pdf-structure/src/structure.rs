@@ -1,177 +1,55 @@
-//! The structure stage: a PDF's extracted pages and lines in, its paragraphs, notes, headings and
-//! structure graph out. Every line's role is decided once (`decide`), in stages:
+//! The structure stage's orchestrator: a PDF's extracted pages and lines in, its paragraphs, notes, headings and
+//! structure graph out. Each stage is a crate of its own over the contract (`legal_pdf_structure_model`); this calls
+//! them in order and caches what the first three read:
 //!
-//! 0. The pages normalized (`normalize`): a transcript's line numbers parted from the lines they
-//!    were read into, a table's rulings cleared from under its words, each line given its slot.
-//! 1. Measured (`Evidence`): each page's words, rows and note separator; each line's type, its
-//!    source's tag, its marker, note label, reference tokens, words and citations; the document's
-//!    bookmarks and whether it is an instrument.
-//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, furniture and folios
-//!    (`furniture`), each page's columns, contents lists (`contents_lists`), tables
-//!    (`legal_pdf_tables`), the note band under a separator, the body's type, the constituent
-//!    documents (`constituents`) and their own furniture, the transcripts, the reading order,
-//!    quotations and reading contexts, and each line's continuation of the one before.
+//! 0. The pages normalized (`legal_pdf_decide::evidence::normalize`): a transcript's line numbers parted from the lines
+//!    they were read into, a table's rulings cleared from under its words, each line given its slot.
+//! 1. Measured (`Evidence`): each page's words, rows and note separator; each line's type, its source's tag, its marker,
+//!    note label, reference tokens, words and citations; the document's bookmarks and whether it is an instrument.
+//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, furniture and folios (`legal_pdf_furniture`), each
+//!    page's columns, contents lists (`legal_pdf_headings`), tables, the note band under a separator, the body's type,
+//!    the constituent documents (`legal_pdf_constituents`), the reading order, quotations and reading contexts, and each
+//!    line's continuation of the one before.
 //! 3. Numbered (`Runs`): each reading context's numbering runs, read and resolved by the engine.
 //!
 //!    What these stages read is cached by the input pages (`derive_cached`).
-//! 4. Notes (`Notes`): each document's note band (`notes::band`) and the lanes that take more lines
-//!    for notes against it (`notes::lanes`).
-//! 5. Decided (`transition::tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in reading
-//!    order against what is open (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
-//! 6. Written once (`write_lines`): each line's region, note mode, block and place in its page's reading order, each page's
-//!    printed label.
-//! 7. Derived from what was written: regions (`crate::layout::build_regions`), notes paired (`note_pairing`, the engine's
-//!    pairer), propositions and cross-references (`note_context`), and the moves the decided lines make (`moves_of`) emitted as
-//!    the structure graph (`transition::emit`) with its outline assembled (`graph::assemble_outline`).
+//! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`legal_pdf_notes`).
+//! 5. Decided (`transition::tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
+//!    reading order (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
+//! 6. Written once (`write_lines`): each line's region, note mode, block and place in its page's reading order.
+//! 7. Derived from what was written: regions (`legal_pdf_layout::build_regions`), notes paired (the engine's pairer,
+//!    `legal_pdf_notes::note_pairing`), propositions and cross-references (`note_context`), and the moves the decided
+//!    lines make emitted as the structure graph (`transition::emit`, `legal_pdf_graph`).
 //!
-//! Measure a change on the structure gold with `experiments/legal-structure-gold/grade/prove.ps1`
-//! (with `STRUCTURE_GOLD_ORACLE_LAYOUT=1` as an arm, as a perfect layout model reads), the PDF
-//! footnote benchmark with `experiments/footnote-gold/score.py`, and provider text with the A2AJ
-//! census (`a2aj_corpus`).
+//! Measure a change with the grader's digest (`structure-gold digest`): every parse hashed, two builds compared.
 
-mod captions;
-mod constituents;
-mod contents_lists;
-mod furniture;
-mod graph;
-mod heading_ladder;
-mod headings;
-mod notes;
-use notes::*;
-mod note_pairing;
-mod text;
-mod joining;
-use joining::*;
-mod note_context;
-use note_context::*;
-mod diagnostics;
-pub use diagnostics::*;
-mod decide;
+pub use legal_pdf_structure_model::StructureIdentity;
+use legal_pdf_decide as decide;
 pub(crate) use decide::*;
-/// The machine: tier 0 read as one decision on each line, and the transition parser's fitted readers (DOC with `encoder`).
-mod transition;
-/// The origin of the transition parser's nodes.
-const TRANSITION_ORIGIN: &str = "legal-pdf-transition.v1";
-
-use crate::layout::*;
-use furniture::*;
-use headings::*;
-use text::*;
-pub(crate) use legal_structure_model::text::{
-    is_note_symbol, label_prefix, line_start_label_prefix, normalize_label, LabelPrefix, MAX_SYMBOL_LABEL_LEN,
-};
+pub use legal_pdf_diagnostics::*;
+use legal_pdf_graph::graph;
 pub use graph::PdfTextIndex;
+use legal_pdf_layout::build_regions;
+use legal_pdf_notes::{note_context, note_pairing};
+use note_context::*;
+/// The transition parser's walk over tier 0's reading, and its fitted readers (DOC with `encoder`).
+use legal_pdf_transition as transition;
+use legal_pdf_tier0 as tier0;
+use legal_pdf_emit::Settled;
+use legal_pdf_machine::lines::LineTable;
+use legal_pdf_machine::machine::{MARGIN, OPENING};
+use legal_pdf_structure_model::regions::{NOTE, NOTE_QUOTE};
+use std::path::Path;
 
 /// The transition parser's whole reading trained on whole documents (`transition::train_whole`).
 pub fn train_whole_reading(problems: &std::path::Path, out: &std::path::Path, epochs: usize) -> std::result::Result<String, String> {
     transition::train_whole(problems, out, epochs)
 }
 use graph::map_note_pairs;
-use legal_pdf_core::model::{
-    Diagnostic, Footnote, FootnoteCrossref, Line, Page, Paragraph,
-    ParagraphAnchor, PdfOutlineEntry, Span,
-};
-use legal_pdf_support::LegalDocument;
-use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median, off_grid_sizes, quantile, Anchor, Error, Result, BOLD};
-use heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
-use legal_structure_model::{
-    utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange, ScalarText, StructureAnalysis,
-};
-use regex::Regex;
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
-use pdf_inspector::markdown::has_dot_leaders as has_dot_leader;
-
-const HARD_DIAGNOSTICS: &[&str] = &[
-    "COLUMN_ORDER_UNCERTAIN",
-    "FOOTNOTE_UNMATCHED_LABEL",
-    "FOOTNOTE_UNMATCHED_REFERENCE",
-    "FOOTNOTE_REGION_UNCERTAIN",
-    "TEXT_QUALITY_LOW",
-];
-
-/// A document or embedded reading and its parallel sequence; primary text is (0, false).
-pub(super) type DocumentContext = (usize, bool);
-
-/// The decision as the derivation reads it, by line id: each line's document and language, its
-/// reading context, role, quotation and heading level; and the document's contents pages and
-/// tables.
-pub(super) struct Decided<'a> {
-    slots: &'a Slots,
-    fences: &'a Fences,
-    /// Each quotation's id ("quotation:" and its first line's id), by its number less one.
-    quotations: Vec<String>,
-}
-
-impl<'a> Decided<'a> {
-    /// The decision on the pages as `write` finds them, before their lines move into reading order.
-    fn of(pages: &[Page], slots: &'a Slots, fences: &'a Fences) -> Self {
-        let count = fences.quotation.iter().copied().max().unwrap_or(0);
-        let mut first: Vec<Option<Slot>> = vec![None; usize::from(count)];
-        for &slot in &fences.order {
-            let quotation = usize::from(fences.quotation[slot.index()]);
-            if quotation > 0 && first[quotation - 1].is_none() {
-                first[quotation - 1] = Some(slot);
-            }
-        }
-        let quotations = first
-            .into_iter()
-            .map(|slot| slot.map_or_else(String::new, |slot| format!("quotation:{}", slots.line(pages, slot).id)))
-            .collect();
-        Self { slots, fences, quotations }
-    }
-
-    fn slot(&self, id: &str) -> Option<Slot> {
-        self.slots.of_id(id)
-    }
-
-    /// The line's constituent document and language.
-    pub(super) fn document_context(&self, id: &str) -> DocumentContext {
-        self.slot(id).map_or((0, false), |slot| {
-            (usize::from(self.fences.document[slot.index()]), self.fences.translation[slot.index()])
-        })
-    }
-
-    /// The line's reading context (its document, language and quotation) and language.
-    pub(super) fn reading_context(&self, id: &str) -> DocumentContext {
-        self.slot(id).map_or((0, false), |slot| {
-            (usize::from(self.fences.ctx[slot.index()]), self.fences.translation[slot.index()])
-        })
-    }
-
-    /// The document context of a note's first line.
-    pub(super) fn note_context(&self, note: &Footnote) -> DocumentContext {
-        note.body_line_ids
-            .first()
-            .map_or((0, false), |id| self.document_context(id))
-    }
-
-    /// The line is in the French column of a parallel English and French text.
-    pub(super) fn translated(&self, id: &str) -> bool {
-        self.slot(id).is_some_and(|slot| self.fences.translation[slot.index()])
-    }
-
-    /// The numbered paragraphs the line's text holds: each one's language, number and UTF-16 span of the line.
-    pub(super) fn held(&self, id: &str) -> &[Held] {
-        self.slot(id).map_or(&[], |slot| self.fences.paragraphs.held[slot.index()].as_slice())
-    }
-
-    /// The id of the quotation holding the line.
-    pub(super) fn quotation(&self, id: &str) -> Option<&str> {
-        let quotation = usize::from(self.fences.quotation[self.slot(id)?.index()]);
-        (quotation > 0).then(|| self.quotations[quotation - 1].as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StructureIdentity {
-    pub profile: Option<legal_structure_model::DetectionProfile>,
-    pub document_id: String,
-    pub source_sha256: String,
-    /// The page labels the PDF declares (`/PageLabels`), by page index; empty where it has none.
-    pub page_labels: Vec<Option<String>>,
-}
+use legal_pdf_core::model::{Diagnostic, Footnote, Page, Paragraph, PdfOutlineEntry};
+use legal_pdf_core::{Error, Result};
+use legal_structure_model::{DocumentStructure, StructureAnalysis};
+use std::collections::{HashMap, HashSet};
 
 pub struct StructureOutput {
     pub paragraphs: Vec<Paragraph>,
@@ -181,20 +59,6 @@ pub struct StructureOutput {
     /// Each heading line, and each line taken from the headings, with the rule that decided it
     /// ("+anchor", "-marginal_note").
     pub heading_sources: HashMap<String, String>,
-}
-
-pub(super) fn scalar_suffix(value: &str, start: usize) -> &str {
-    if value.is_ascii() {
-        return &value[start.min(value.len())..];
-    }
-    let end = value.len();
-    let byte = value.char_indices().nth(start).map_or(end, |at| at.0);
-    &value[byte..]
-}
-
-/// Whether a page layout model labelled the line: its region is one of the model's.
-pub(super) fn layout_labelled(line: &Line) -> bool {
-    line.region_id.contains("-ppdoc-r")
 }
 
 /// What the measuring, fencing and numbering of a document read, cached by its input pages: the
@@ -246,7 +110,7 @@ pub fn derive_cached(
     cache: Option<&std::path::Path>,
     trace: Option<&std::path::Path>,
 ) -> Result<StructureOutput> {
-    use legal_pdf_support::profile::measure;
+    use legal_pdf_core::profile::measure;
     if separators.len() != pages.len() {
         return Err(Error::Message(
             "common input must contain one separator value per page".to_owned(),
@@ -281,10 +145,78 @@ pub fn derive_cached(
             measured
         }
     };
-    // The transition parser's walk, read beside the output while it is fitted and measured (its dumps and labels).
-    // The output is tier 0's alone; a tier scores its moves (`tier0::output`, the DOC tier where it is given).
-    if transition::enabled() {
-        measure("derive.transition", || transition::run(analysis, pages, &slots, &evidence, &fences, &runs, outline, &identity.source_sha256));
+    // The output is tier 0's; the transition walk over its reading (the DOC tier where it is given, the scorer's fitting)
+    // runs inside it, once (`tier0::output`).
+    measure("derive.machine", || output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
+}
+
+/// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
+#[allow(clippy::too_many_arguments)]
+/// Tier 0's reading of the document written: its decision (`tier0::decide`), the walk over it where DOC or the scorer's
+/// fitting asks (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's
+/// in their place where it is given) and emitted as the structure graph (`legal_pdf_emit`).
+fn output(
+    analysis: &dyn StructureAnalysis,
+    pages: &mut [Page],
+    slots: &Slots,
+    evidence: &Evidence,
+    mut fences: Fences,
+    runs: &Runs,
+    outline: &[PdfOutlineEntry],
+    identity: &StructureIdentity,
+    trace: Option<&Path>,
+) -> Result<StructureOutput> {
+    let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, &HashMap::new());
+    let views = tier0::line_views(pages, slots, evidence, &fences, &table);
+    let (mut notes, mut decision) = tier0::decide(analysis, pages, slots, evidence, &fences, runs, outline, &table, &views, trace.is_some());
+    // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
+    // came, before this reading writes and orders them.
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, runs, outline, &identity.source_sha256, &notes, &decision);
+    let mut diagnostics = std::mem::take(&mut fences.diagnostics);
+    diagnostics.append(&mut notes.diagnostics);
+    diagnostics.append(&mut decision.diagnostics);
+    if let Some(folder) = trace {
+        write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
-    measure("derive.machine", || transition::tier0::output(analysis, pages, &slots, &evidence, fences, &runs, outline, &identity, trace))
+    let decided = decided(pages, slots, &fences);
+    let heading_sources = write_lines(pages, slots, evidence, &fences, &notes, &decision);
+    // The pairer reads each page's lines in reading order.
+    in_reading_order(pages, slots, &fences);
+    build_regions(pages);
+    diagnostics.extend(text_flow_faults(pages));
+    let index = PdfTextIndex::from_pages(pages);
+    let citations = graph::citation_spans(pages, slots, evidence);
+    let pairing = note_pairing::pair_notes(analysis, pages, &decided, &citations, &index);
+    let (claims, graph_diagnostics) = map_note_pairs(&index, &pairing.pair_claims)?;
+    let anchors = pairing.anchors;
+    let footnotes = pairing.footnotes;
+    diagnostics.extend(pairing.diagnostics);
+    if give_back(pages, &footnotes) {
+        build_regions(pages);
+    }
+    let (mut moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &footnotes);
+    // A tier scores the moves, the output stays this one: the DOC tier's move for each line, but for the notes, the
+    // pairer's (a line either reads as a note keeps this reading's move).
+    // DOC's reading of a marker is the one of this reading's views that counts as it does (DOC's line table reads the
+    // recognizer's misreadings too, so its readings may be more or in another order).
+    if let Some((read, readings)) = doc.filter(|(read, _)| read.len() == moves.len()) {
+        for (k, mut chosen) in read.into_iter().enumerate() {
+            if matches!(moves[k].region, NOTE | NOTE_QUOTE) || matches!(chosen.region, NOTE | NOTE_QUOTE) {
+                continue;
+            }
+            if let Some(r) = chosen.reading.filter(|&r| r != MARGIN && r != OPENING) {
+                chosen.reading = readings[k].get(usize::from(r)).map(|want| views[k].readings.iter()
+                    .position(|own| own.family == want.family && own.value == want.value).map_or(OPENING, |at| at as u8));
+            }
+            moves[k] = chosen;
+        }
+    }
+    tier0::in_slot_order(pages, slots);
+    let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
+    let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
+    diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
+    attach_propositions(&mut footnotes, &paragraphs, &decided);
+    attach_crossrefs(analysis, &mut footnotes, &mut diagnostics, &decided);
+    in_reading_order(pages, slots, &fences);
+    Ok(StructureOutput { paragraphs, footnotes, diagnostics, structure_graph, heading_sources })
 }
