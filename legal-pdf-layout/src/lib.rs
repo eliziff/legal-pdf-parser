@@ -22,12 +22,6 @@ pub use note_lines::*;
 pub mod regions;
 pub use regions::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderRepair {
-    None,
-    Column,
-    Geometry,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnModel {
@@ -55,24 +49,6 @@ impl<'de> serde::Deserialize<'de> for ColumnModel {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct OrderDecision {
-    pub repair: OrderRepair,
-    source_switches: usize,
-    strategy: &'static str,
-    pub reason: &'static str,
-}
-
-impl OrderDecision {
-    const fn keep(reason: &'static str) -> Self {
-        Self {
-            repair: OrderRepair::None,
-            source_switches: 0,
-            strategy: "kraken-native",
-            reason,
-        }
-    }
-}
 
 pub fn line_width(line: &Line) -> f64 {
     line.bbox[2] - line.bbox[0]

@@ -74,15 +74,16 @@ pub fn y_regressions(lines: &[Line], members: &[usize]) -> usize {
 
 /// The body's order (`body`, slots of the page's lines): the source's, unless the page's columns
 /// (`columns`) read interleaved where pdf-inspector's order of the page's `items` reads them
-/// through, or a single column's lines run up the page where their geometry reads down it.
-pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pdf_tables::PageItems, model: ColumnModel) -> OrderDecision {
+/// through, or a single column's lines run up the page where their geometry reads down it. Whether the order is
+/// uncertain: the source's kept on two columns it crosses more than twice.
+pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pdf_tables::PageItems, model: ColumnModel) -> bool {
     let (lines, page_width, page_height) = (&page.lines, page.width, page.height);
     let boxed = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot])).count();
     if body.len() < 8 || boxed * 5 < body.len() * 4 || page_width <= 0.0 || page_height <= 0.0 {
-        return OrderDecision::keep("insufficient_geometry");
+        return false;
     }
     if has_table_caption(body.iter().map(|&slot| &lines[slot])) {
-        return OrderDecision::keep("table_grid");
+        return false;
     }
     // Hyphenated words left broken: those ending lines, less those the next line goes on from.
     let broken = |(candidates, satisfied): (usize, usize)| candidates.saturating_sub(satisfied);
@@ -119,12 +120,12 @@ pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pd
                 && broken(challenger_hyphens) <= broken(source_hyphens)
         {
             *body = challenger;
-            return OrderDecision { repair: OrderRepair::Column, source_switches, strategy: "column-geometry", reason: "column_interleave_repair" };
+            return false;
         }
-        return OrderDecision { repair: OrderRepair::None, source_switches, strategy: "kraken-native", reason: "two_column_kraken_coherent" };
+        return source_switches > 2;
     }
     if model.kind != "single" {
-        return OrderDecision::keep("non_two_column");
+        return false;
     }
     let (source_regressions, source_hyphens) = (y_regressions(lines, body), hyphen_join_score(lines, body));
     let mut challenger = body.clone();
@@ -136,9 +137,8 @@ pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &legal_pd
         && broken(challenger_hyphens) < broken(source_hyphens)
     {
         *body = challenger;
-        return OrderDecision { repair: OrderRepair::Geometry, source_switches: 0, strategy: "geometry", reason: "kraken_order_scrambled" };
     }
-    OrderDecision::keep("single_column_kraken_coherent")
+    false
 }
 
 /// A drop cap (a single large letter beside the start of its paragraph) moved to before the line it
@@ -205,25 +205,22 @@ pub fn page_order(
     }
     repair_drop_caps(lines, &mut body);
     let contents = table_page && contents && !has_table_caption(body.iter().map(|&slot| &lines[slot]));
-    let decision = if contents && y_regressions(lines, &body) > 0 {
+    let uncertain = if contents && y_regressions(lines, &body) > 0 {
         geometry_order(lines, &mut body);
-        OrderDecision { repair: OrderRepair::Geometry, source_switches: 0, strategy: "table-row-geometry", reason: "table_source_order_scrambled" }
+        false
     } else if table_page {
-        OrderDecision::keep("table_grid")
+        false
     } else {
         // A law report's margin numbers are no column's lines: the columns' order is read without them, and they
         // stand after it (`Fences::read_margin_numbers` reads each before its row).
         // (A transcript's line numbers are its rows': they stay where they stand.)
         let lane: Vec<usize> = margin_lane(lines, &body, page.width).into_iter().filter(|&slot| !line_label(slot)).collect();
         body.retain(|slot| !lane.contains(slot));
-        let decision = arbitrate_body_order(page, &mut body, items, columns);
+        let uncertain = arbitrate_body_order(page, &mut body, items, columns);
         body.extend(lane);
-        decision
+        uncertain
     };
-    let diagnostics = (decision.repair == OrderRepair::None && decision.source_switches > 2)
-        .then(|| Diagnostic::new("COLUMN_ORDER_UNCERTAIN", Some(page.index)))
-        .into_iter()
-        .collect();
+    let diagnostics = uncertain.then(|| Diagnostic::new("COLUMN_ORDER_UNCERTAIN", Some(page.index))).into_iter().collect();
     order_note_lines(lines, &mut note, items, number);
     // A running head and foot read row by row.
     read_rows(lines, &mut header, |slot| band_geometry_top(&lines[slot]));
