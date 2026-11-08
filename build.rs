@@ -99,6 +99,13 @@ fn inspector_inputs(root: &Path, skip: &[&str]) -> Vec<PathBuf> {
 /// stage reads tables), its vision models or its Python bindings.
 const NOT_EXTRACTION: &[&str] = &["markdown", "tables", "vision", "python.rs"];
 
+/// The structure stage's crates: its orchestrator and every crate it reads with, so an edit to any of them is a
+/// new structure (and a new reader and document key).
+const STRUCTURE_STAGE: &[&str] = &[
+    "structure", "structure-model", "constituents", "decide", "diagnostics", "emit", "evidence", "fences", "furniture", "graph",
+    "headings", "layout", "machine", "notes", "runs", "tables", "text", "tier0", "transition",
+];
+
 fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
     let owner = root.join(format!("legal-pdf-{name}"));
     let mut inputs = vec![owner.join("Cargo.toml"), owner.join("src")];
@@ -176,8 +183,9 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     // The structure stage reads pdf-inspector's layout too (columns, furniture, leaders, words'
     // joins, heading tiers, tables).
     document.extend(inspector_inputs(root, &[]));
-    document.extend(crate_inputs(root, "structure"));
-    document.extend(crate_inputs(root, "tables"));
+    for name in STRUCTURE_STAGE {
+        document.extend(crate_inputs(root, name));
+    }
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",
@@ -216,14 +224,18 @@ fn main() {
         (pdf, "extraction-processor"),
         (enabled("LANGUAGE"), "language"),
         (enabled("OCR"), "ocr"),
-        (pdf, "structure"),
-        (pdf, "tables"),
         (pdf, "support"),
+        (enabled("TAGGER"), "tagger"),
     ] {
         if !active {
             continue;
         }
         inputs.extend(crate_inputs(&root, name));
+    }
+    if pdf {
+        for name in STRUCTURE_STAGE {
+            inputs.extend(crate_inputs(&root, name));
+        }
     }
     let mut features: Vec<_> = env::vars_os()
         .filter_map(|(name, _)| {
@@ -272,7 +284,7 @@ fn main() {
             root.join("legal-pdf-core/src/model.rs"),
             root.join("legal-pdf-core/src/lib.rs"),
         ];
-        for name in ["structure", "tables", "support"] {
+        for name in STRUCTURE_STAGE.iter().chain(&["support"]) {
             reader.extend(crate_inputs(&root, name));
         }
         reader.extend(inspector_inputs(&root, &[]));
