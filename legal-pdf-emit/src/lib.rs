@@ -28,15 +28,11 @@ mod rendered;
 use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
-/// its notes the pairer's: their nodes, the projection's notes, the claims left aside; and the run member each unit opens
-/// on, by the unit's first line (`runs`).
+/// its notes the pairer's: their nodes, the projection's notes, the claims left aside; and the runs its moves open on.
 pub struct Settled<'a> {
     pub index: &'a PdfTextIndex,
     pub notes: Vec<StructureNode>,
     pub runs: &'a Runs,
-    pub opened: HashMap<usize, (u32, u32)>,
-    /// The further markers a unit's first line opens on, a unit each under it.
-    pub within: HashMap<usize, Vec<(u32, u32)>>,
 }
 
 struct Unit {
@@ -76,27 +72,27 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
     Some((figures.parse().ok()?, (start, start + length)))
 }
 
-/// The document's structure from its lines (`table`, `views`) and the moves they make, in one walk: each line's move is
+/// The document's structure from its lines (`table`) and the moves they make, in one walk: each line's move is
 /// DOC's reading where it read one (`doc`), but for the notes, which are tier 0's (`tier0`), a body unit tier 0 opens
 /// taking its numbering's depth (`State::stack_depth`). As a line joins its unit the walk writes the seam with the unit's
 /// line before it (`joining::seam`): a dropped hyphen a manuscript edit, a join with no space a join, a page crossed a
 /// continuation; and each hyphen inside a line that splits a word (`joining::split_words`) an edit. What tier 0 wrote and
 /// paired before its moves (`settled`) stands. With the authority units read off the rendered text, and the notes.
-pub fn structure_graph(pages: &mut [Page],
+pub fn structure_graph(pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
     decided: &Decided,
     table: &LineTable,
-    views: &[LineView],
     tier0: &[Move],
     doc: Option<Vec<Move>>,
     identity: &StructureIdentity,
     mut settled: Settled,
 ) -> Result<(DocumentStructure, Vec<legal_pdf_core::AuthorityTextUnit>)> {
     let index = settled.index;
-    let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
-    let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
+    let views = LineView::all(pages, slots, evidence, fences, table, None);
+    let texts: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
+    let ids: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let text_of = |k: usize| texts[k].clone();
     let id_of = |k: usize| ids[k].clone();
     // Each line's source fragment (UTF-16) and page, what a seam is written in.
@@ -119,13 +115,14 @@ pub fn structure_graph(pages: &mut [Page],
     // The lines the parser opened a constituent document on; a start on a line of no region passes to the next unit.
     let mut started: Vec<usize> = Vec::new();
     for (k, line) in views.iter().enumerate() {
-        let read = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&tier0[k])).copied();
-        let mut chosen = read.unwrap_or(tier0[k]);
-        if read.is_none() && chosen.opens && RANKED_BODY.contains(&chosen.region) {
+        let read = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&tier0[k])).cloned();
+        let walked = read.is_none();
+        let mut chosen = read.unwrap_or_else(|| tier0[k].clone());
+        if walked && chosen.opens && RANKED_BODY.contains(&chosen.region) {
             chosen.depth = state.stack_depth(line, &chosen).min(9) as u8;
         }
         moves.push(chosen);
-        let chosen = &chosen;
+        let chosen = &moves[k];
         let made = state.apply(line, chosen);
         if chosen.starts {
             started.push(k);
@@ -144,7 +141,7 @@ pub fn structure_graph(pages: &mut [Page],
             u
         } else {
             // A unit counting on the margin's number prints its marker on the margin's line.
-            let marker_line = match (chosen.reading, line.margin) {
+            let marker_line = match (chosen.reading, line.margin()) {
                 (Some(MARGIN), Some((margin, _))) => margin as usize,
                 _ => k,
             };
@@ -154,7 +151,7 @@ pub fn structure_graph(pages: &mut [Page],
             // figures its opening token starts on ("27" of "27Ibid"); a note counting on none has none.
             let marker = if chosen.region == NOTE {
                 chosen.note.and_then(|value| {
-                    let found = evidence.label[table.order[k].index()].filter(|label| label.value == value);
+                    let found = evidence.label[fences.order[k].index()].filter(|label| label.value == value);
                     found.and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1))))
                         .or_else(|| leading_figures(&text).filter(|&(figures, _)| figures == value).map(|(_, range)| range))
                 })
@@ -255,8 +252,10 @@ pub fn structure_graph(pages: &mut [Page],
         let Some(envelope) = ranges.iter().map(|r| r.start).min().zip(ranges.iter().map(|r| r.end).max()) else { continue };
         let range = ScalarRange { start: envelope.0, end: envelope.1 };
         let region = if unit.region == TABLE { "text" } else { REGIONS[usize::from(unit.region)] };
-        // The member a settled unit opens on; a heading numbering a provision is that provision, a heading still.
-        let member = settled.opened.get(&unit.lines[0]).map(|&(run, at)| &settled.runs.runs[run as usize].members[at as usize]);
+        // The member a settled unit opens on (tier 0's move at its first line); a heading numbering a provision is that
+        // provision, a heading still.
+        let opening = &tier0[unit.lines[0]];
+        let member = opening.member.map(|(run, at)| &settled.runs.runs[run as usize].members[at as usize]);
         let (kind, role) = match region {
             "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),
             "heading" => (NodeKind::Heading, None),
@@ -327,7 +326,7 @@ pub fn structure_graph(pages: &mut [Page],
         // that paragraph in the other language (`paragraph_printings`), as the stage's nodes say.
         node.grammar = if region == "contents" {
             Some("contents".to_owned())
-        } else if matches!(kind, NodeKind::Paragraph | NodeKind::Prose | NodeKind::Section) && unit.lines.iter().all(|&k| views[k].translation) {
+        } else if matches!(kind, NodeKind::Paragraph | NodeKind::Prose | NodeKind::Section) && unit.lines.iter().all(|&k| views[k].translation()) {
             Some("translation".to_owned())
         } else {
             None
@@ -336,9 +335,8 @@ pub fn structure_graph(pages: &mut [Page],
         // A further marker on the unit's first line opens a unit under it, to the unit's end, the unit before it left with what
         // stands before that marker: "2(1) The Court has ...", the section "2" and its subsection.
         let mut holder = nodes.len() - 1;
-        let within = settled.within.get(&unit.lines[0]).map(|members| (settled.runs, members));
-        for (&(run, at), runs) in within.into_iter().flat_map(|(runs, members)| members.iter().map(move |pair| (pair, runs))) {
-            let member = &runs.runs[run as usize].members[at as usize];
+        for &(run, at) in &opening.within {
+            let member = &settled.runs.runs[run as usize].members[at as usize];
             let scalar = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
             let (Some((start, end)), Some(role)) = (scalar(member.marker[0]).zip(scalar(member.marker[1])), member.kind) else { continue };
             let kind = match role {

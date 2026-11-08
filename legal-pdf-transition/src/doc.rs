@@ -119,7 +119,7 @@ fn is_note(region: u8) -> bool {
 /// paragraph, nor does the number.
 fn margin_links(links: &mut [usize], margin_rows: &HashMap<usize, (usize, Option<usize>)>, views: &[LineView]) {
     let mut opened: HashSet<usize> = margin_rows.iter().flat_map(|(&margin, &(row, twin))| [margin, row].into_iter().chain(twin)).collect();
-    opened.extend((0..views.len()).filter(|&k| views[k].count.is_some()));
+    opened.extend((0..views.len()).filter(|&k| views[k].count().is_some()));
     links.iter_mut().enumerate().filter(|(k, next)| opened.contains(*next) && !margin_rows.contains_key(k)).for_each(|(k, next)| *next = k);
     margin_rows.iter().for_each(|(&margin, &(row, _))| links[margin] = row);
 }
@@ -132,9 +132,9 @@ fn margin_links(links: &mut [usize], margin_rows: &HashMap<usize, (usize, Option
 fn goes_on_in_column(before: &mut [Option<usize>], regions: &Regions, line_roles: &[usize], views: &[LineView]) {
     let mut last: HashMap<(u8, bool), usize> = HashMap::new();
     for (i, &first) in regions.firsts.iter().enumerate() {
-        let key = (regions.role(i), views[first].translation);
-        if before[i].is_none() && BODY.contains(&key.0) && line_roles[first] % 2 == 0 && views[first].margin.is_none() && views[first].count.is_none() {
-            before[i] = last.get(&key).copied().filter(|&earlier| views[regions.firsts[earlier]].page + 1 >= views[first].page);
+        let key = (regions.role(i), views[first].translation());
+        if before[i].is_none() && BODY.contains(&key.0) && line_roles[first] % 2 == 0 && views[first].margin().is_none() && views[first].count().is_none() {
+            before[i] = last.get(&key).copied().filter(|&earlier| views[regions.firsts[earlier]].page() + 1 >= views[first].page());
         }
         last.insert(key, i);
     }
@@ -167,8 +167,8 @@ fn insert(parent: &[f32], sibling: &[f32], gaps: &[usize], n: usize, resets: &[b
 /// its text opens on ("27" of "27 Ibid", as the gold's notes are numbered), else 0 for a note symbol, as a reference
 /// mark's value is (`reference_spans`).
 pub fn note_number(line: &LineView, text: &str) -> Option<u32> {
-    line.label
-        .or_else(|| line.readings.iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
+    line.label()
+        .or_else(|| line.readings().iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
         .or_else(|| super::emit::leading_figures(text).map(|(figures, _)| figures))
         .or_else(|| text.trim_start().starts_with(['*', '\u{2020}', '\u{2021}', '\u{a7}']).then_some(0))
 }
@@ -200,10 +200,10 @@ fn moves_of(lines: &Lines, regions: &Regions, units: &Units, views: &[LineView],
         mv.region = region;
         if let Stands::Resumes(first) = stands { (mv.resume, mv.resumes) = (true, Some(first as u32)); }
         if !matches!(stands, Stands::Opens) { continue; }
-        let open = stacks.entry(doc_id.saturating_mul(2) + u16::from(views[k].translation)).or_default();
+        let open = stacks.entry(doc_id.saturating_mul(2) + u16::from(views[k].translation())).or_default();
         open.opens(region);
         // DOC's own pick among several readings: the one that goes on from an open frame (the next number of its family).
-        let chosen_reading = (!is_note(region) && lines.marked[k]).then(|| views[k].opening(|| (views[k].readings.len() > 1).then(|| views[k].readings.iter().position(|r| {
+        let chosen_reading = (!is_note(region) && lines.marked[k]).then(|| views[k].opening(|| (views[k].readings().len() > 1).then(|| views[k].readings().iter().position(|r| {
             open.frames().iter().rev().any(|f| f.family == r.family && r.value == f.value + 1)
         })).flatten()));
         if let Some(reading) = views[k].reading(chosen_reading) { open.count(reading, region); }
@@ -220,7 +220,7 @@ fn moves_of(lines: &Lines, regions: &Regions, units: &Units, views: &[LineView],
         let Some(value) = moves[first].opens.then_some(moves[first].note).flatten() else { continue };
         // Of the region's marks of its number, those on the lines `only` names, where it names any (the gold's).
         let marks: Vec<(u32, u32, u32)> = target.iter().flat_map(|&target| &regions.lines[regions.read[target]]).filter(|&&k| only.is_none_or(|lines| lines[k]))
-            .flat_map(|&k| views[k].references.iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, e)| (views[k].place, s, e)))
+            .flat_map(|&k| views[k].references().iter().filter(move |&&(v, ..)| v == value).map(move |&(_, s, e)| (views[k].place, s, e)))
             .take(4).collect();
         // A note the heads pair with no mark answers none, not the last of its number the text set.
         if marks.is_empty() { moves[first].answers[0] = Some((u32::MAX, 0, 0)); }
@@ -349,8 +349,8 @@ pub fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts: &[&st
     let note = regions.firsts.iter().enumerate().map(|(i, &k)| {
         if !is_note(regions.role(i)) || before[i].is_some() { return None; }
         let value = note_number(&views[k], texts[k])?;
-        let paired = |j: &usize| gold[*j][3] == 1 && !taken.contains(&(*j, value)) && region_of[*j] != usize::MAX && views[*j].references.iter().any(|&(v, ..)| v == value);
-        let same = |j: &usize| views[*j].translation == views[k].translation;
+        let paired = |j: &usize| gold[*j][3] == 1 && !taken.contains(&(*j, value)) && region_of[*j] != usize::MAX && views[*j].references().iter().any(|&(v, ..)| v == value);
+        let same = |j: &usize| views[*j].translation() == views[k].translation();
         let found = (0..k).rev().filter(paired).find(same).or_else(|| (k + 1..n).filter(paired).find(same))
             .or_else(|| (0..k).rev().find(paired)).or_else(|| (k + 1..n).find(paired));
         if let Some(j) = found { taken.insert((j, value)); }
@@ -523,7 +523,7 @@ mod model {
         }
 
         fn read_with(&self, sessions: &mut Sessions, table: &LineTable, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
-            let n = table.order.len();
+            let n = views.len();
             let (d, m) = (self.meta.d, &self.meta);
             if n == 0 { return Ok(Vec::new()); }
             let features: Vec<f32> = table.features.iter().enumerate().map(|(at, &v)| ((v - m.mean[at % ALL]) / m.std[at % ALL]).clamp(-8.0, 8.0)).collect();
@@ -576,7 +576,7 @@ mod model {
             lap(1, &mut since);
             margin_links(&mut lines.links, &table.margin_rows, views);
             // A line t0 reads opening a numbered paragraph on a number it prints opens on that marker.
-            lines.marked.iter_mut().enumerate().for_each(|(k, marked)| *marked |= views[k].count.is_some_and(|number| views[k].readings.iter().any(|r| r.value == number)));
+            lines.marked.iter_mut().enumerate().for_each(|(k, marked)| *marked |= views[k].count().is_some_and(|number| views[k].readings().iter().any(|r| r.value == number)));
             let regions = Regions::of(&lines);
             let (count, firsts, role) = (regions.read.len(), &regions.firsts, |i: usize| regions.role(i));
             if count == 0 {
@@ -598,7 +598,7 @@ mod model {
                     region_boxes[i * 4 + c] = region_boxes[i * 4 + c].min(boxes[k * 4 + c]);
                     region_boxes[i * 4 + c + 2] = region_boxes[i * 4 + c + 2].max(boxes[k * 4 + c + 2]);
                 }
-                if REFERRING.contains(&role(i)) { marks[i].extend(views[k].references.iter().map(|&(v, ..)| v)); }
+                if REFERRING.contains(&role(i)) { marks[i].extend(views[k].references().iter().map(|&(v, ..)| v)); }
             }
             let mut region_pages: Vec<i64> = firsts.iter().map(|&k| pages[k] as i64).collect();
             let number: Vec<Option<u32>> = firsts.iter().enumerate().map(|(i, &k)| is_note(role(i)).then(|| note_number(&views[k], texts[k])).flatten()).collect();
@@ -684,7 +684,7 @@ mod model {
             let (mut before, mut after) = (vec![None; count], vec![false; count]);
             for (i, j, _) in links {
                 // A paragraph the margin numbers, or t0 reads opening, or in a different stream, opens: it goes on in no earlier one.
-                let opens = views[firsts[j]].margin.is_some() || views[firsts[j]].count.is_some();
+                let opens = views[firsts[j]].margin().is_some() || views[firsts[j]].count().is_some();
                 let same_stream = stream_of(role(i)) == stream_of(role(j)) && (role(i) == HEADING) == (role(j) == HEADING) && !(firsts[i] + 1..=firsts[j]).any(|k| lines.starts[k]);
                 if before[j].is_none() && !after[i] && !opens && same_stream { (before[j], after[i]) = (Some(i), true); }
             }

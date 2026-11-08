@@ -22,10 +22,8 @@ use legal_pdf_notes::notes::{
 use legal_pdf_text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
 use legal_pdf_text::text::{all_caps, enumerated, sentence_ended};
 use legal_structure_model::text::{label_prefix, line_start_label_prefix, normalize_label};
-use legal_structure_model::StructureAnalysis;
 use pdf_inspector::markdown::has_dot_leaders as has_dot_leader;
 use legal_pdf_core::regex;
-use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 
 use legal_pdf_evidence::*;

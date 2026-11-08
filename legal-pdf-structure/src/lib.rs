@@ -39,6 +39,7 @@ use legal_pdf_transition as transition;
 use legal_pdf_tier0 as tier0;
 use legal_pdf_emit::Settled;
 use legal_pdf_machine::lines::LineTable;
+use legal_pdf_machine::machine::LineView;
 use std::path::Path;
 
 use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
@@ -148,14 +149,14 @@ fn output(pages: &mut [Page],
     identity: &StructureIdentity,
     trace: Option<&Path>,
 ) -> Result<StructureOutput> {
+    let mut diagnostics = std::mem::take(&mut fences.diagnostics);
+    let fences = fences;
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
-    let views = tier0::line_views(pages, slots, evidence, &fences, &table);
-    let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, &views, trace.is_some());
+    let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, trace.is_some());
     // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
     // came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, &views);
-    let mut diagnostics = std::mem::take(&mut fences.diagnostics);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table);
     diagnostics.append(&mut notes.diagnostics);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
@@ -175,11 +176,13 @@ fn output(pages: &mut [Page],
         build_regions(pages);
     }
     diagnostics.extend(unmatched_reference_diagnostics(pages, &notes, &index, &decided));
-    let (moves, opened, within) = tier0::moves_of(slots, &fences, runs, &table, &views, &decision, &tier0::reading_regions(pages, &decided), &notes);
+    let pages: &[Page] = pages;
+    let views = LineView::all(pages, slots, evidence, &fences, &table, None);
+    let moves = tier0::moves_of(slots, &fences, runs, &views, &decision, &tier0::reading_regions(pages, &decided), &notes);
     // A tier scores the moves, the output stays this one: the walk takes the DOC tier's move for each line, but for the
     // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
     // reading of a marker names one of this reading's.
-    let settled = Settled { index: &index, notes, runs, opened, within };
-    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &views, &moves, doc, identity, settled)?;
+    let settled = Settled { index: &index, notes, runs };
+    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &moves, doc, identity, settled)?;
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })
 }

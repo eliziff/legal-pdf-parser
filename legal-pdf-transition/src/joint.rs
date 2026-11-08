@@ -19,7 +19,7 @@ const HELD: usize = 16;
 pub fn template_rows(sheet: &Stylesheet, table: &LineTable) -> Vec<[f32; PRIOR]> {
     let count = sheet.templates.len();
     let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
-    let n = table.order.len();
+    let n = table.readings.len();
     let (mut sums, mut lines, mut first) = (vec![[0f32; 8]; count], vec![0f32; count], vec![None; count]);
     for k in 0..n {
         let t = sheet.template[k] as usize;

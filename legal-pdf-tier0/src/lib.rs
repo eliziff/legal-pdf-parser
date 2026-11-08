@@ -21,7 +21,7 @@ use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
 use legal_pdf_fences::Fences;
 use legal_pdf_graph::graph;
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{LineView, Move, State, TemplateView, CANDIDATE};
+use legal_pdf_machine::machine::{LineView, Move, State, CANDIDATE};
 use legal_pdf_structure_model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
 use legal_pdf_structure_model::{Decided, DocumentContext, Evidence, Role, Rule, Runs, Slot, Slots};
 use std::collections::{HashMap, HashSet};
@@ -64,50 +64,11 @@ fn worth(heard: &Heard, chosen: &Move) -> f32 {
     }
 }
 
-
-
-/// Each line as the state reads it, in reading order. No fitted reader runs here, so nothing asks for its stylesheet or
-/// its words' tables (the walk's views are these with what they measure, `views_of`).
-pub fn line_views<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, table: &'a LineTable) -> Vec<LineView<'a>> {
-    (0..table.order.len())
-        .map(|k| {
-            let slot = table.order[k];
-            let at = slot.index();
-            LineView {
-                translation: fences.translation[at],
-                may_start: false,
-                start_kind: 0,
-                page_place: 0,
-                readings: &table.readings[k],
-                label: evidence.label[at].map(|label| label.value),
-                line_number: slots.line(pages, slot).text.trim().parse::<u32>().ok().filter(|_| evidence.line_number[at]),
-                look: table.looks[k],
-                references: &table.references[k],
-                place: k as u32,
-                grammar: None,
-                heading_words: [0.0; 2],
-                operative: evidence.operative,
-                look_heading: 0.0,
-                look_heading_lines: 0.0,
-                template: TemplateView::default(),
-                anchor: 0,
-                regime: [0.0; 4],
-                title_key: String::new(),
-                contents_title: None,
-                left: 0.0,
-                page: slots.page(slot) as u32,
-                margin: table.margins.get(&k).and_then(|&margin| Some((margin as u32, table.readings[margin].first()?))),
-                count: fences.paragraphs.count[at],
-            }
-        })
-        .collect()
-}
-
 /// The reading a unit opening on the line's marker counts on (`LineView::opening`), tier 0 picking the run member's.
 fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Option<u8> {
     let (run, member) = reading?;
     let value = runs.runs[run as usize].members[member as usize].value;
-    Some(view.opening(|| view.readings.iter().position(|reading| reading.value == value)))
+    Some(view.opening(|| view.readings().iter().position(|reading| reading.value == value)))
 }
 
 /// A reading of the line as the move it would make: a unit's opening on its marker, a labelled note's opening on its
@@ -115,7 +76,7 @@ fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Opti
 fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, reading: Option<(u32, u32)>, level: u8, joined: bool) -> Move {
     let chosen = Move { reading: kind.and_then(|_| reading_of(view, runs, reading)), ..Move::plain(region_of(role, kind), kind.is_some()) };
     match role {
-        Role::Note => Move { opens: view.label.is_some(), note: view.label, ..chosen },
+        Role::Note => Move { opens: view.label().is_some(), note: view.label(), ..chosen },
         Role::Heading => Move { opens: !joined, level: level.clamp(1, 9) as i8, ..chosen },
         _ => chosen,
     }
@@ -144,7 +105,7 @@ fn fit(state: &State, view: &LineView, chosen: &Move) -> f32 {
 /// more than one speaks and no paragraph number is at stake, how it fits what is open (`fit`); the state moved by the
 /// winner. A heading the residual weighed over several lines goes on only from its own first line: where that line went
 /// another way, the rest stand as they would alone. A line no rule read stays open, for `Decision::finish`.
-fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &mut Decision) {
+fn settle(fences: &Fences, runs: &Runs, views: &[LineView], decision: &mut Decision) {
     let weighing = !legal_structure_model::ablated("machine_fit");
     let mut heard = std::mem::take(&mut decision.heard);
     heard.sort_by_key(|reading| reading.slot);
@@ -158,8 +119,8 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
     }
     // Each reading context: whether its last line is a heading the residual weighed.
     let mut weighed = vec![false; fences.contexts.len()];
-    for (k, view) in views.iter().enumerate() {
-        let slot = table.order[k];
+    for view in views {
+        let slot = view.slot();
         let at = slot.index();
         let chosen = if fences.role[at] == Role::Open {
             let context = usize::from(fences.ctx[at]);
@@ -197,12 +158,12 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
 /// a unit further down it (a page's leading may not part them); its other lines go on in the unit they follow by name, and
 /// a region going on from the last (`Fences::continues`) goes on in the numbered unit that region ended in, over a page. A contents
 /// list's lines, nearly all of a region or a page wholly a list's, are the list's. Each note the pairer made is a unit. Any
-/// other line stands alone; a body unit's depth is the walk's to read (`emit`). With the moves, the run member each unit
-/// opens on, by the unit's first line: a marker the decision lets open its unit (`opens_units`).
-pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[StructureNode]) -> (Vec<Move>, HashMap<usize, (u32, u32)>, HashMap<usize, Vec<(u32, u32)>>) {
+/// other line stands alone; a body unit's depth is the walk's to read (`emit`). A unit's first line's move carries the
+/// run member the unit opens on, a marker the decision lets open its unit (`opens_units`), and the further markers the
+/// line opens on, a unit each.
+pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[StructureNode]) -> Vec<Move> {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
-    let mut opened = HashMap::new();
     // A marker any run gives a unit opens it, where the decision read the line by no run of its own.
     let mut marked = HashMap::<Slot, Vec<(u32, u32)>>::new();
     for (r, run) in runs.runs.iter().enumerate() {
@@ -210,8 +171,6 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
             marked.entry(member.slot).or_default().push((r as u32, at as u32));
         }
     }
-    // The further markers a line opens on, a unit each: "2(1) The Court has ...".
-    let mut within = HashMap::<usize, Vec<(u32, u32)>>::new();
     // The pairer's lines are its notes', a line it took from the body among them.
     for note in notes {
         let places: Vec<usize> = note.line_ids.iter().filter_map(|id| place(id)).collect();
@@ -231,19 +190,21 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
         places.sort_unstable();
         let Some(&first) = places.first() else { continue };
         let listed = places.iter().filter(|&&k| {
-            let slot = table.order[k];
+            let slot = fences.order[k];
             decision.role[slot.index()] == Role::Contents || fences.contents_pages[slots.page(slot)]
         }).count();
         let contents = listed * 5 >= places.len() * 4;
-        let context = fences.ctx[table.order[first].index()];
-        let body = matches!(decision.role[table.order[first].index()], Role::Open | Role::Body);
-        let carried = numbered.get(&context).copied().filter(|_| body && !contents && fences.continues[table.order[first].index()].is_some());
+        let first_at = fences.order[first].index();
+        let context = fences.ctx[first_at];
+        let body = matches!(decision.role[first_at], Role::Open | Role::Body);
+        let carried = numbered.get(&context).copied().filter(|_| body && !contents && fences.continues[first_at].is_some());
         let mut open = carried.unwrap_or((first, 0));
         for &k in &places {
-            let at = table.order[k].index();
+            let slot = fences.order[k];
+            let at = slot.index();
             // A line of the note band the pairer gave back is the body's.
             let role = if decision.role[at] == Role::Note { Role::Body } else { decision.role[at] };
-            let reading = decision.reading[at].or_else(|| marked.get(&table.order[k]).and_then(|members| members.first().copied()));
+            let reading = decision.reading[at].or_else(|| marked.get(&slot).and_then(|members| members.first().copied()));
             let member = reading.filter(|&(run, _)| graph::opens_units(role, decision.rule[at], &runs.runs[run as usize]));
             let kind = member.and_then(|(run, at)| runs.runs[run as usize].members[at as usize].kind);
             if k == first && carried.is_none() || kind.is_some() && !contents {
@@ -251,43 +212,40 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
                 if !matches!(opening.region, HEADING | TITLE | MARGINAL_NOTE) && contents {
                     opening = Move::plain(CONTENTS, true);
                 } else if let Some(member) = member.filter(|_| kind.is_some()) {
-                    opened.insert(k, member);
                     let mark = |(run, at): (u32, u32)| runs.runs[run as usize].members[at as usize].marker[0];
-                    let mut further: Vec<(u32, u32)> = marked.get(&table.order[k]).into_iter().flatten().copied()
+                    let mut further: Vec<(u32, u32)> = marked.get(&slot).into_iter().flatten().copied()
                         .filter(|&other| other != member && mark(other).offset > mark(member).offset && graph::opens_units(role, decision.rule[at], &runs.runs[other.0 as usize])).collect();
                     further.sort_by_key(|&other| mark(other).offset);
                     further.dedup_by_key(|other| mark(*other).offset);
-                    if !further.is_empty() {
-                        within.insert(k, further);
-                    }
+                    opening.member = Some(member);
+                    opening.within = further;
                 }
                 opening.opens = true;
-                moves[k] = Some(opening);
                 open = (k, opening.region);
+                moves[k] = Some(opening);
             } else {
                 moves[k] = Some(Move { resumes: Some(open.0 as u32), ..Move::plain(open.1, false) });
             }
         }
-        if opened.contains_key(&open.0) {
+        if moves[open.0].as_ref().is_some_and(|opening| opening.member.is_some()) {
             numbered.insert(context, open);
         } else {
             numbered.remove(&context);
         }
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
-    let moves = moves.into_iter().enumerate().map(|(k, chosen)| Move {
+    moves.into_iter().enumerate().map(|(k, chosen)| Move {
         starts: starts.contains(&k),
-        ..chosen.unwrap_or_else(|| Move::plain(region_of(decision.role[table.order[k].index()], None), true))
-    }).collect();
-    (moves, opened, within)
+        ..chosen.unwrap_or_else(|| Move::plain(region_of(decision.role[fences.order[k].index()], None), true))
+    }).collect()
 }
 
 /// The notes and the one decision on each line.
 #[allow(clippy::too_many_arguments)]
-pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, views: &[LineView], traced: bool) -> (Notes, Decision) {
+pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
     let notes = Notes::read(pages, slots, evidence, fences, runs);
     let mut decision = Decision::hear(pages, slots, evidence, fences, runs, &notes, outline, geometry, traced);
-    settle(fences, runs, table, views, &mut decision);
+    settle(fences, runs, &LineView::all(pages, slots, evidence, fences, table, None), &mut decision);
     decision.finish(pages, slots, evidence, fences, runs, geometry);
     (notes, decision)
 }

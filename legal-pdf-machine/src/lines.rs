@@ -200,7 +200,6 @@ fn marker_variants(text: &str) -> Vec<String> {
 /// line, then `ALL` with the lines around it and the document's shape.
 #[derive(Clone)]
 pub struct LineTable {
-    pub order: Vec<Slot>,
     pub readings: Vec<Vec<MarkerReading>>,
     /// Each line's reference marks: value, first and past-last character (`reference_spans`).
     pub references: Vec<Vec<(u32, u32, u32)>>,
@@ -224,7 +223,7 @@ impl LineTable {
 
     /// Each line's features and t0 row, measured over the table both tiers read (`plain`), for the DOC reader.
     pub fn measure(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) {
-        let (order, readings, margin_rows, margins) = (&self.order, &self.readings, &self.margin_rows, &self.margins);
+        let (order, readings, margin_rows, margins) = (&fences.order, &self.readings, &self.margin_rows, &self.margins);
         let n = order.len();
         let measures: Vec<(&legal_pdf_core::PageMeasure, &legal_pdf_core::Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().enumerate().map(|(p, page)| {
             let (measure, columns) = geometry.page(pages, p);
@@ -235,7 +234,7 @@ impl LineTable {
         }).collect();
         let off_grid: Vec<usize> = pages.iter().map(|page| legal_pdf_core::off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
         let looks = Looks::tally(pages, slots, evidence);
-        let repeated = repeated_at_edges(pages, slots, &order);
+        let repeated = repeated_at_edges(pages, slots, order);
         let page_count = pages.len().max(1) as f64;
         let mut own = vec![0f32; n * WIDTH];
         for (k, &slot) in order.iter().enumerate() {
@@ -396,17 +395,17 @@ impl LineTable {
     /// margin number. `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
     /// markers' readings stand beside the repaired text's, the parser's to choose between.
     pub fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
-        let order: Vec<Slot> = fences.order.clone();
+        let order = &fences.order;
         let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
         let readings: Vec<Vec<MarkerReading>> = order.iter().map(|&slot| {
             let word = evidence.words[slot.index()] & WORD_DIVISION != 0;
             line_readings(slots.line(pages, slot), word, recognized.get(&slot).copied(), confusions)
         }).collect();
         let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), evidence.size[slot.index()])).collect();
-        unmarked_notes(&order, slots, pages, evidence, &mut references);
+        unmarked_notes(order, slots, pages, evidence, &mut references);
         let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
-        let (margin_rows, margins) = margin_lines(&order, &readings, fences);
-        Self { order, readings, references, looks, features: Vec::new(), margin_rows, margins, t0: Vec::new() }
+        let (margin_rows, margins) = margin_lines(order, &readings, fences);
+        Self { readings, references, looks, features: Vec::new(), margin_rows, margins, t0: Vec::new() }
     }
 }
 

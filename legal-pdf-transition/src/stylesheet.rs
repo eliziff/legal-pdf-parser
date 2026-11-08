@@ -52,7 +52,7 @@ pub fn template_ids(table: &LineTable) -> Vec<u32> {
     let counts: Vec<usize> = ["count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet"]
         .iter().map(|name| feature(name)).collect();
     let mut ids: HashMap<(u32, u8, u8), u32> = HashMap::new();
-    (0..table.order.len()).map(|k| {
+    (0..table.readings.len()).map(|k| {
         let row = table.row(k);
         let place = if row[centre].abs() < 0.04 && row[width] < 0.85 { 3 } else if row[indent] > 0.4 && row[right] < 0.05 { 4 }
             else if row[indent] < 0.02 { 0 } else if row[indent] < 0.08 { 1 } else { 2 };
@@ -65,15 +65,15 @@ pub fn template_ids(table: &LineTable) -> Vec<u32> {
 /// Each line opening a row read as a contents list's (`contents_lists::row_of` over the lines one baseline
 /// band holds on its page, in reading order): its title normalized as titles are matched
 /// (`bookmarks::normalize_title`), three characters or more.
-pub fn contents_rows(pages: &[Page], slots: &Slots, table: &LineTable) -> Vec<Option<String>> {
+pub fn contents_rows(pages: &[Page], slots: &Slots, fences: &Fences) -> Vec<Option<String>> {
     use legal_pdf_headings::contents_lists::{row_bands, row_of};
-    let n = table.order.len();
-    let line = |at: usize| slots.line(pages, table.order[at]);
+    let n = fences.order.len();
+    let line = |at: usize| slots.line(pages, fences.order[at]);
     let mut titles = vec![None; n];
     let mut k = 0;
     while k < n {
-        let page = slots.page(table.order[k]);
-        let end = (k..n).find(|&e| slots.page(table.order[e]) != page).unwrap_or(n);
+        let page = slots.page(fences.order[k]);
+        let end = (k..n).find(|&e| slots.page(fences.order[e]) != page).unwrap_or(n);
         for band in row_bands(&(k..end).collect::<Vec<usize>>(), |at| line(at).bbox) {
             let row = row_of(band.iter().map(|&at| line(at)).collect());
             let title = row.locator.is_some().then(|| legal_pdf_headings::headings::bookmarks::normalize_title(&row.title));
@@ -93,7 +93,7 @@ pub fn opener(table: &LineTable, k: usize) -> bool {
 impl Stylesheet {
     /// The stylesheet of the lines `table` reads, each line's template `template` (`template_ids`).
     pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, template: Vec<u32>, locals: &[Local]) -> Self {
-        let n = table.order.len();
+        let n = table.readings.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
@@ -106,7 +106,7 @@ impl Stylesheet {
             }
         }
         // A line on a row that reads as a contents list's: a title and the locator it prints.
-        let contents_titles = contents_rows(pages, slots, table);
+        let contents_titles = contents_rows(pages, slots, fences);
         // Each template's measures.
         let heading_class = usize::from(HEADING) * 2 + 1;
         let mut views = vec![TemplateView::default(); count];
@@ -123,7 +123,7 @@ impl Stylesheet {
             view.heading += locals[k].probabilities[heading_class] as f32;
             view.edge += row[edge];
             view.beside += row[beside];
-            page_sets[t].insert(slots.page(table.order[k]));
+            page_sets[t].insert(slots.page(fences.order[k]));
             if anchor[k] > 0 {
                 view.anchored += 1.0;
                 *anchor_levels[t].entry(anchor[k]).or_default() += 1;
@@ -156,7 +156,7 @@ impl Stylesheet {
         }
         // The regime: what the lines open on.
         let opens: Vec<[bool; 4]> = (0..n).map(|k| {
-            let at = table.order[k].index();
+            let at = fences.order[k].index();
             let first = table.readings[k].first();
             [
                 first.is_some_and(|r| r.family.contains("[]")),

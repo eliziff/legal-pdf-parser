@@ -78,7 +78,7 @@ impl Encoder {
     /// Each line's class probabilities (`CLASSES` a line) and heading-level probabilities
     /// (`LEVEL_CLASSES` a line), lines in reading order.
     pub fn probabilities(&self, table: &LineTable, texts: &[&str], template: &[u32]) -> std::result::Result<(Vec<f32>, Vec<f32>), String> {
-        let (n, m) = (table.order.len(), &self.meta);
+        let (n, m) = (table.readings.len(), &self.meta);
         let features: Vec<f32> = table.features.iter().enumerate()
             .map(|(at, &value)| ((value - m.mean[at % ALL]) / m.std[at % ALL]).clamp(-8.0, 8.0)).collect();
         let mut chars = vec![0i64; n * m.chars];

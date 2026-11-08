@@ -18,6 +18,4 @@ use legal_pdf_notes::notes::{
     reference_wrapped_onto, separator_beside_tables, separator_tolerance,
 };
 use legal_pdf_text::text::sentence_ended;
-use legal_structure_model::StructureAnalysis;
-use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};

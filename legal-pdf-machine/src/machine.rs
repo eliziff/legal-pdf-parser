@@ -10,6 +10,7 @@
 //! depth step.
 
 use super::*;
+use crate::lines::LineTable;
 
 pub use legal_pdf_structure_model::regions::*;
 /// Regions whose units count on a marker.
@@ -24,7 +25,7 @@ const LEVELS: i8 = 9;
 
 /// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
 /// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Move {
     pub region: u8,
     pub opens: bool,
@@ -51,12 +52,16 @@ pub struct Move {
     /// character, where the reading chose them, wherever they stand (none: the marks of its number the text set
     /// last; a place of `u32::MAX` alone: no mark).
     pub answers: [Option<(u32, u32, u32)>; 4],
+    /// Tier 0's opening: the run member the unit opens on (a run and its member), and the further markers its line
+    /// opens on, each a unit under it ("2(1) The Court has ...": the section and its subsection).
+    pub member: Option<(u32, u32)>,
+    pub within: Vec<(u32, u32)>,
 }
 
 impl Move {
     /// A move making nothing but its region and whether it opens.
     pub fn plain(region: u8, opens: bool) -> Self {
-        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4] }
+        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
     }
 
     /// The move's class among the region-and-opening moves the local scores rank (`region * 2 +
@@ -166,54 +171,37 @@ impl Default for State {
     }
 }
 
-/// A line as the state reads it: whether it reads in a parallel translation's column, what speaks to its
-/// opening a constituent document, its marker's readings, its note label's value, its transcript line
-/// number, its look, the reference marks it sets, and its place in reading order.
-#[derive(Clone)]
-pub struct LineView<'a> {
-    pub translation: bool,
-    /// Whether the line may open a constituent document (near its page's top, or one the constituents
-    /// reader names), the kind the reader names it (`constituents::KINDS`, 0 for none), and its place
-    /// among its page's lines.
-    pub may_start: bool,
-    pub start_kind: u8,
-    pub page_place: u32,
-    pub readings: &'a [MarkerReading],
-    pub label: Option<u32>,
-    pub line_number: Option<u32>,
-    pub look: u32,
-    pub references: &'a [(u32, u32, u32)],
-    pub place: u32,
-    /// The grammar tables (`grammar::Grammar`), and how far the line's first word is a heading's by the
-    /// instruments' and the others'; and the document's operative words in a thousand of its words, which
-    /// of the two a move should go by.
+/// What the walk reads of the document's lines beyond tier 0's records, by place in reading order: the grammar
+/// tables (`grammar::Grammar`); the stylesheet's reading of each line, borrowed (`Stylesheet`: its template among the
+/// templates, the level the document's outline names it at, its document's regime, its contents list's title); how
+/// far each line's first word is a heading's by the instruments' tables and the others'; each look's view before any
+/// move (the mean probability its lines open a heading by the local scores, and how many of its lines they hold
+/// likelier a heading's opening than not, log); and each line's text normalized as a title is matched
+/// (`bookmarks::normalize_title`, empty for a long line).
+pub struct Walked<'a> {
     pub grammar: Option<&'a Grammar>,
-    pub heading_words: [f32; 2],
-    pub operative: f32,
-    /// The document's view of the line's look before any move: the mean probability its lines open a
-    /// heading by the local scores, and how many lines of it they hold likelier a heading's opening than
-    /// not (log).
-    pub look_heading: f32,
-    pub look_heading_lines: f32,
-    /// The document's stylesheet: the line's template, the level the document's outline names it at
-    /// (0 for none), and the document's regime (`Stylesheet`).
-    pub template: TemplateView,
-    pub anchor: u16,
-    pub regime: [f32; 4],
-    /// The line's text normalized as a title is matched (`bookmarks::normalize_title`, empty for a long
-    /// line); read as a contents list's row (a contents list holds it), its title so normalized where it
-    /// prints a locator, and where it starts on its page (a share of the page's width).
-    pub title_key: String,
-    pub contents_title: Option<String>,
-    pub left: f32,
-    pub page: u32,
-    /// The paragraph number the margin prints beside the line's row, numbering the paragraph the line opens in
-    /// its column (`Fences::read_margin_numbers`: in both columns of a parallel report): the margin line's place
-    /// and its number's reading. A move counts on it as `MARGIN`.
-    pub margin: Option<(u32, &'a MarkerReading)>,
-    /// The paragraph number the decide stage's judgment reader reads the line opening (`Fences::count`): t0's
-    /// reading of the document's numbered paragraphs, which DOC's decoding works from.
-    pub count: Option<u32>,
+    pub template: &'a [u32],
+    pub templates: &'a [TemplateView],
+    pub anchor: &'a [u16],
+    pub regime: &'a [[f32; 4]],
+    pub contents_titles: &'a [Option<String>],
+    pub heading_words: Vec<[f32; 2]>,
+    pub looks: HashMap<u32, [f32; 2]>,
+    pub title_keys: Vec<String>,
+}
+
+/// A line as the state reads it: its place in reading order, and what holds what is read of it, borrowed: its pages
+/// and slots, the evidence, the fences, the line table (`LineTable`), and, where the walk reads the document, what the
+/// walk reads (`Walked`).
+#[derive(Clone, Copy)]
+pub struct LineView<'a> {
+    pub place: u32,
+    pub pages: &'a [Page],
+    pub slots: &'a Slots,
+    pub evidence: &'a Evidence,
+    pub fences: &'a Fences,
+    pub table: &'a LineTable,
+    pub walked: Option<&'a Walked<'a>>,
 }
 
 /// How a move stands to the units of its stream.
@@ -272,12 +260,145 @@ pub const MARGIN: u8 = u8::MAX;
 pub const OPENING: u8 = u8::MAX - 1;
 
 impl<'a> LineView<'a> {
+    /// Every line of the document as tier 0 reads it, in reading order: nothing the walk reads.
+    pub fn all(pages: &'a [Page], slots: &'a Slots, evidence: &'a Evidence, fences: &'a Fences, table: &'a LineTable, walked: Option<&'a Walked<'a>>) -> Vec<Self> {
+        (0..fences.order.len()).map(|k| Self { place: k as u32, pages, slots, evidence, fences, table, walked }).collect()
+    }
+
+    fn k(&self) -> usize {
+        self.place as usize
+    }
+
+    /// The line's slot.
+    pub fn slot(&self) -> Slot {
+        self.fences.order[self.k()]
+    }
+
+    /// The line.
+    pub fn line(&self) -> &'a Line {
+        self.slots.line(self.pages, self.slot())
+    }
+
+    /// Whether the line reads in a parallel translation's column.
+    pub fn translation(&self) -> bool {
+        self.fences.translation[self.slot().index()]
+    }
+
+    /// The line's marker's readings (`LineTable::readings`).
+    pub fn readings(&self) -> &'a [MarkerReading] {
+        &self.table.readings[self.k()]
+    }
+
+    /// The value of the note label the line opens with.
+    pub fn label(&self) -> Option<u32> {
+        self.evidence.label[self.slot().index()].map(|label| label.value)
+    }
+
+    /// The transcript line number the line is.
+    pub fn line_number(&self) -> Option<u32> {
+        self.evidence.line_number[self.slot().index()].then(|| self.line().text.trim().parse().ok()).flatten()
+    }
+
+    /// The line's look (`LineTable::looks`).
+    pub fn look(&self) -> u32 {
+        self.table.looks[self.k()]
+    }
+
+    /// The reference marks the line sets (`LineTable::references`).
+    pub fn references(&self) -> &'a [(u32, u32, u32)] {
+        &self.table.references[self.k()]
+    }
+
+    /// The page slot of the line.
+    pub fn page(&self) -> u32 {
+        self.slots.page(self.slot()) as u32
+    }
+
+    /// The paragraph number the margin prints beside the line's row, numbering the paragraph the line opens in its
+    /// column (`Fences::read_margin_numbers`: in both columns of a parallel report): the margin line's place and its
+    /// number's reading. A move counts on it as `MARGIN`.
+    pub fn margin(&self) -> Option<(u32, &'a MarkerReading)> {
+        let margin = *self.table.margins.get(&self.k())?;
+        Some((margin as u32, self.table.readings[margin].first()?))
+    }
+
+    /// The paragraph number the decide stage's judgment reader reads the line opening (`Fences::paragraphs`): t0's
+    /// reading of the document's numbered paragraphs, which DOC's decoding works from.
+    pub fn count(&self) -> Option<u32> {
+        self.fences.paragraphs.count[self.slot().index()]
+    }
+
+    /// Whether the line may open a constituent document, where the walk reads it: the source's own document opens on
+    /// its first line, and any later line's opening may open another (a letter mid-page, an email chain's next message).
+    pub fn may_start(&self) -> bool {
+        self.walked.is_some() && self.place > 0
+    }
+
+    /// The kind the constituents reader names the line's opening (`constituents::KINDS`, 0 for none), where the walk
+    /// reads it.
+    pub fn start_kind(&self) -> u8 {
+        let Some(_) = self.walked else { return 0 };
+        let id = self.line().id.as_str();
+        self.fences.starts.iter().find(|start| start.line_id == id).map_or(0, |start| start.kind_code())
+    }
+
+    /// The line's place among its page's lines, where the walk reads it.
+    pub fn page_place(&self) -> u32 {
+        self.walked.map_or(0, |_| self.place - self.slots.on(self.page() as usize).start)
+    }
+
+    /// The grammar tables, where the walk reads them.
+    pub fn grammar(&self) -> Option<&'a Grammar> {
+        self.walked.and_then(|walked| walked.grammar)
+    }
+
+    /// How far the line's first word is a heading's by the instruments' tables and the others'.
+    pub fn heading_words(&self) -> [f32; 2] {
+        self.walked.map_or([0.0; 2], |walked| walked.heading_words[self.k()])
+    }
+
+    /// The line's look before any move: its lines' mean probability of opening a heading, and how many they hold
+    /// likelier a heading's opening than not (log).
+    pub fn look_heading(&self) -> [f32; 2] {
+        self.walked.and_then(|walked| walked.looks.get(&self.look()).copied()).unwrap_or([0.0; 2])
+    }
+
+    /// The line's template in the document's stylesheet.
+    pub fn template(&self) -> TemplateView {
+        self.walked.map_or_else(TemplateView::default, |walked| walked.templates[walked.template[self.k()] as usize])
+    }
+
+    /// The level the document's outline names the line at (0 for none).
+    pub fn anchor(&self) -> u16 {
+        self.walked.map_or(0, |walked| walked.anchor[self.k()])
+    }
+
+    /// The line's document's regime (`Stylesheet::regime`).
+    pub fn regime(&self) -> [f32; 4] {
+        self.walked.map_or([0.0; 4], |walked| walked.regime[self.k()])
+    }
+
+    /// The line's text normalized as a title is matched.
+    pub fn title_key(&self) -> &'a str {
+        self.walked.map_or("", |walked| walked.title_keys[self.k()].as_str())
+    }
+
+    /// The title of the contents list's row the line opens, normalized as a title is matched, where it prints a locator.
+    pub fn contents_title(&self) -> Option<&'a str> {
+        self.walked.and_then(|walked| walked.contents_titles[self.k()].as_deref())
+    }
+
+    /// Where the line starts on its page, a share of the page's width (`LineTable::row`'s x0), where the walk reads it.
+    pub fn left(&self) -> f32 {
+        self.walked.map_or(0.0, |_| self.table.row(self.k())[0])
+    }
+
     /// The reading a move's `reading` names: one of the line's own, the margin's number (`MARGIN`), or none (`OPENING`).
     pub fn reading(&self, reading: Option<u8>) -> Option<&'a MarkerReading> {
         match reading? {
             OPENING => None,
-            MARGIN => self.margin.map(|(_, reading)| reading),
-            r => self.readings.get(usize::from(r)),
+            MARGIN => self.margin().map(|(_, reading)| reading),
+            r => self.readings().get(usize::from(r)),
         }
     }
 
@@ -286,8 +407,9 @@ impl<'a> LineView<'a> {
     /// run member's for tier 0, the open stack's next number for DOC); else the line's first; a marker no reading makes
     /// out (a recognizer's "(2]") its opening token.
     pub fn opening(&self, next: impl FnOnce() -> Option<usize>) -> u8 {
-        let counted = self.count.and_then(|count| self.readings.iter().position(|reading| reading.value == count));
-        match (self.margin, counted.or_else(next), self.readings.is_empty()) {
+        let readings = self.readings();
+        let counted = self.count().and_then(|count| readings.iter().position(|reading| reading.value == count));
+        match (self.margin(), counted.or_else(next), readings.is_empty()) {
             (Some(_), ..) => MARGIN,
             (_, Some(at), _) => at as u8,
             (_, _, false) => 0,
@@ -368,7 +490,7 @@ impl State {
     /// The context a line reads in: its document and whether it is a translation's (a quotation in it is
     /// read as the parser reads it, not as the fences part it); after `starts`, the next document's.
     pub fn ctx(&self, line: &LineView, starts: bool) -> u16 {
-        (self.document + u16::from(starts)).saturating_mul(2) + u16::from(line.translation)
+        (self.document + u16::from(starts)).saturating_mul(2) + u16::from(line.translation())
     }
 
     fn open(&self, ctx: u16) -> Option<&Open> {
@@ -425,18 +547,18 @@ impl State {
             out.push(opening(TITLE));
         }
         // A heading where the line is set as a heading of its document was set before.
-        if self.outline(self.outline_key(false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
+        if self.outline(self.outline_key(false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look())) {
             out.push(opening(HEADING));
         }
         if let Some(open) = self.open(ctx) {
-            let values: Vec<u32> = line.label.into_iter().chain(line.readings.iter().map(|r| r.value)).collect();
+            let values: Vec<u32> = line.label().into_iter().chain(line.readings().iter().map(|r| r.value)).collect();
             if values.iter().any(|&v| open.note.is_some_and(|last| v == last + 1) || open.unanswered.iter().any(|&(r, ..)| r == v)) {
                 out.push(opening(NOTE));
             }
-            if line.line_number.is_some_and(|v| open.line_number.is_some_and(|last| v == last + 1)) {
+            if line.line_number().is_some_and(|v| open.line_number.is_some_and(|last| v == last + 1)) {
                 out.push(opening(LINE_LABEL));
             }
-            for reading in line.readings {
+            for reading in line.readings() {
                 if let Some(frame) = open.frames().iter().rev().find(|f| f.family == reading.family && reading.value == f.value + 1) {
                     out.push(opening(frame.region));
                 }
@@ -465,13 +587,13 @@ impl State {
             if opens && region == NOTE {
                 // A note counts on a number: its label's, or an arabic reading's (a lettered note answers no
                 // figure in the text).
-                let mut values: Vec<u32> = line.label.into_iter().collect();
-                values.extend(line.readings.iter().filter(|r| count_class(&r.family) == 0.0).map(|r| r.value).filter(|v| Some(*v) != line.label));
-                bases.extend(values.into_iter().take(3).map(|v| Move { note: Some(v), ..plain }));
+                let mut values: Vec<u32> = line.label().into_iter().collect();
+                values.extend(line.readings().iter().filter(|r| count_class(&r.family) == 0.0).map(|r| r.value).filter(|v| Some(*v) != line.label()));
+                bases.extend(values.into_iter().take(3).map(|v| Move { note: Some(v), ..plain.clone() }));
             } else if opens && NUMBERED.contains(&region) {
-                bases.extend((0..line.readings.len().min(3)).map(|r| Move { reading: Some(r as u8), ..plain }));
+                bases.extend((0..line.readings().len().min(3)).map(|r| Move { reading: Some(r as u8), ..plain.clone() }));
             }
-            bases.push(plain);
+            bases.push(plain.clone());
             let key = (self.ctx(line, false), stream_of(region));
             if !opens && self.interrupted.get(&key) == Some(&region) && self.open_regions.get(&key) != Some(&region) {
                 bases.push(Move { resume: true, ..plain });
@@ -481,7 +603,7 @@ impl State {
                 // under a chapter's heading).
                 let deepest = (heading.max(1) + 3).min(LEVELS);
                 for base in bases {
-                    out.extend((1..=deepest).map(|level| Move { level, ..base }));
+                    out.extend((1..=deepest).map(|level| Move { level, ..base.clone() }));
                 }
             } else if opens && RANKED_BODY.contains(&region) {
                 for base in bases {
@@ -490,15 +612,15 @@ impl State {
                     if !tried.contains(&by_stack) {
                         tried.push(by_stack);
                     }
-                    out.extend(tried.into_iter().map(|depth| Move { depth, ..base }));
+                    out.extend(tried.into_iter().map(|depth| Move { depth, ..base.clone() }));
                 }
             } else {
                 out.extend(bases);
             }
         }
         // A constituent document opens on a unit's opening, its first heading or body unit at the top.
-        if line.may_start {
-            let starting: Vec<Move> = out.iter().filter(|m| m.opens && !m.resume && m.depth <= 1 && m.level <= 2).map(|m| Move { starts: true, ..*m }).collect();
+        if line.may_start() {
+            let starting: Vec<Move> = out.iter().filter(|m| m.opens && !m.resume && m.depth <= 1 && m.level <= 2).map(|m| Move { starts: true, ..m.clone() }).collect();
             out.extend(starting);
         }
         out
@@ -514,11 +636,11 @@ impl State {
             }
         }
         // A contents list's own row answers none: it is an entry, not the heading one names.
-        let found = (line.contents_title.is_none() && line.title_key.chars().count() >= 3).then(|| self.entries.get(&self.document)).flatten().and_then(|(entries, _)| {
-            let key = line.title_key.as_str();
+        let found = (line.contents_title().is_none() && line.title_key().chars().count() >= 3).then(|| self.entries.get(&self.document)).flatten().and_then(|(entries, _)| {
+            let key = line.title_key();
             // A part of a title matches where it holds half of the other or more.
             let (length, half) = (key.chars().count(), |of: &str| of.chars().count().div_ceil(2));
-            entries.iter().position(|entry| !entry.answered && entry.page < line.page && (entry.key == key
+            entries.iter().position(|entry| !entry.answered && entry.page < line.page() && (entry.key == key
                 || (length >= 8 && length >= half(&entry.key) && (entry.key.starts_with(key) || entry.key.ends_with(key)))
                 || (entry.key.chars().count() >= 8 && entry.key.chars().count() >= half(key) && key.ends_with(entry.key.as_str()))))
                 .map(|at| (at, entries[at].level))
@@ -539,9 +661,9 @@ impl State {
         let mut f = [0f32; CANDIDATES];
         f[0] = f32::from(candidate.region);
         f[1] = flag(candidate.opens);
-        f[2] = self.previous.map_or(-1.0, |m| f32::from(m.region));
-        f[3] = flag(self.previous.is_some_and(|m| m.opens));
-        f[4] = flag(self.previous.is_some_and(|m| m.region == candidate.region));
+        f[2] = self.previous.as_ref().map_or(-1.0, |m| f32::from(m.region));
+        f[3] = flag(self.previous.as_ref().is_some_and(|m| m.opens));
+        f[4] = flag(self.previous.as_ref().is_some_and(|m| m.region == candidate.region));
         f[5] = (self.since[usize::from(candidate.region)] as f32).min(500.0);
         f[7] = 9.0;
         f[14] = -1.0;
@@ -578,7 +700,7 @@ impl State {
         }
         f[19] = stream.unanswered.len().min(30) as f32;
         if candidate.region == LINE_LABEL {
-            if let Some(value) = line.line_number {
+            if let Some(value) = line.line_number() {
                 f[21] = flag(stream.line_number.is_some_and(|last| value == last + 1));
                 f[22] = flag(value == 1);
             }
@@ -587,7 +709,7 @@ impl State {
             let level = candidate.level;
             f[23] = f32::from(level - outline.heading.max(1));
             f[24] = f32::from(level);
-            let looked = outline.look_levels.iter().find(|(look, _)| *look == line.look).map(|&(_, l)| l);
+            let looked = outline.look_levels.iter().find(|(look, _)| *look == line.look()).map(|&(_, l)| l);
             f[25] = flag(looked.is_some());
             f[26] = looked.map_or(-9.0, |l| f32::from(level - l));
             // A numbered heading's level against the headings it would sit under on the stack.
@@ -599,7 +721,7 @@ impl State {
         // How likely the move's numbering is in real legal text, by the instruments' tables and by the
         // others' (1 where the tables say nothing of it), the document's operative words beside them.
         let top = frames.last().map_or("", |frame| frame.family.as_str());
-        let tables = line.grammar.map(|g| [&g.instruments, &g.others]);
+        let tables = line.grammar().map(|g| [&g.instruments, &g.others]);
         for (i, at) in [30, 35].into_iter().enumerate() {
             f[at] = 1.0;
             f[at + 1] = 1.0;
@@ -615,36 +737,36 @@ impl State {
                 if !frames.iter().any(|frame| frame.family == reading.family) {
                     f[at + 1] = tables.child(top, &reading.family).unwrap_or(1.0);
                 }
-            } else if candidate.opens && NUMBERED.contains(&candidate.region) && !line.readings.is_empty() {
+            } else if candidate.opens && NUMBERED.contains(&candidate.region) && !line.readings().is_empty() {
                 f[at] = tables.relation(top, grammar::NONE).unwrap_or(1.0);
             }
             if candidate.opens && candidate.region == HEADING {
-                f[at + 2] = line.heading_words[i];
+                f[at + 2] = line.heading_words()[i];
             }
         }
-        f[33] = line.look_heading;
-        f[34] = line.look_heading_lines;
-        f[38] = line.operative.min(100.0);
+        f[33] = line.look_heading()[0];
+        f[34] = line.look_heading()[1];
+        f[38] = line.evidence.operative.min(100.0);
         f[28] = flag(candidate.resume);
         f[29] = self.interrupted.get(&(self.ctx(line, candidate.starts), stream_of(candidate.region))).map_or(-1.0, |&region| f32::from(region));
         f[39] = flag(candidate.starts);
-        f[40] = f32::from(line.start_kind);
-        f[41] = line.page_place.min(50) as f32;
+        f[40] = f32::from(line.start_kind());
+        f[41] = line.page_place().min(50) as f32;
         f[42] = (1.0 + self.document_lines as f32).ln();
         f[43] = f32::from(self.document.min(50));
         // The stylesheet: the line's template, the outline's word on the line, the document's regime;
         // and a heading's level against the level its template takes, the outline names, and its
         // template's lines took on the first reading.
-        let t = &line.template;
+        let t = line.template();
         f[44..54].copy_from_slice(&[t.lines, t.pages, t.heading, t.monotone, t.anchored, t.anchor_level, t.level, t.edge, t.read_heading, t.read_level]);
         let against = |level: f32| if candidate.opens && candidate.region == HEADING && level > 0.0 { f32::from(candidate.level) - level } else { -9.0 };
         f[54] = against(t.level);
-        f[55] = against(if line.anchor > 0 { f32::from(line.anchor) } else { t.anchor_level });
+        f[55] = against(if line.anchor() > 0 { f32::from(line.anchor()) } else { t.anchor_level });
         f[56] = against(t.read_level);
-        f[57] = flag(line.anchor > 0);
-        f[58] = f32::from(line.anchor);
-        f[59] = flag(line.contents_title.is_some());
-        f[60..64].copy_from_slice(&line.regime);
+        f[57] = flag(line.anchor() > 0);
+        f[58] = f32::from(line.anchor());
+        f[59] = flag(line.contents_title().is_some());
+        f[60..64].copy_from_slice(&line.regime());
         f[64] = flag(stream.quoting && !candidate.starts);
         f[65] = t.beside;
         // The document's contents entries: whether the line answers one a heading has not, at what level,
@@ -656,7 +778,7 @@ impl State {
             Some((_, level)) if candidate.opens && candidate.region == HEADING => f32::from(candidate.level) - f32::from(level),
             _ => -9.0,
         };
-        f[69] = flag(line.contents_title.is_some());
+        f[69] = flag(line.contents_title().is_some());
         let (entries, unanswered) = self.entries.get(&self.document).map_or((0, 0), |(e, _)| (e.len(), e.iter().filter(|e| !e.answered).count()));
         f[70] = (1.0 + entries as f32).ln();
         f[71] = (1.0 + unanswered as f32).ln();
@@ -687,17 +809,17 @@ impl State {
         // A contents list's row the parser reads in the list waits for the heading that answers it; a heading
         // answers the first entry its title matches.
         if chosen.region == CONTENTS {
-            if let Some(title) = &line.contents_title {
+            if let Some(title) = line.contents_title() {
                 let (entries, lefts) = self.entries.entry(self.document).or_default();
-                let tier = match lefts.iter().position(|&left| (left - line.left).abs() < 0.012) {
+                let tier = match lefts.iter().position(|&left| (left - line.left()).abs() < 0.012) {
                     Some(at) => at,
                     None => {
-                        lefts.push(line.left);
+                        lefts.push(line.left());
                         lefts.sort_by(f32::total_cmp);
-                        lefts.iter().position(|&left| (left - line.left).abs() < 0.012).unwrap_or(0)
+                        lefts.iter().position(|&left| (left - line.left()).abs() < 0.012).unwrap_or(0)
                     }
                 };
-                entries.push(Entry { key: title.clone(), level: (tier + 1).min(9) as u8, answered: false, page: line.page });
+                entries.push(Entry { key: title.to_owned(), level: (tier + 1).min(9) as u8, answered: false, page: line.page() });
             }
         } else if chosen.opens && chosen.region == HEADING {
             if let Some((at, _)) = self.answering(line) {
@@ -739,14 +861,14 @@ impl State {
                 }
             }
         }
-        if REFERRING.contains(&chosen.region) && !line.references.is_empty() {
-            stream.unanswered.retain(|(r, ..)| !line.references.iter().any(|(v, ..)| v == r));
-            stream.unanswered.extend(line.references.iter().map(|&(v, start, end)| (v, line.place, start, end)));
+        if REFERRING.contains(&chosen.region) && !line.references().is_empty() {
+            stream.unanswered.retain(|(r, ..)| !line.references().iter().any(|(v, ..)| v == r));
+            stream.unanswered.extend(line.references().iter().map(|&(v, start, end)| (v, line.place, start, end)));
             let excess = stream.unanswered.len().saturating_sub(30);
             stream.unanswered.drain(..excess);
         }
         if chosen.region == LINE_LABEL {
-            if let Some(value) = line.line_number {
+            if let Some(value) = line.line_number() {
                 stream.line_number = Some(value);
             }
         }
@@ -754,9 +876,9 @@ impl State {
         if chosen.opens && chosen.region == HEADING {
             made.level_step = 10 + i64::from(chosen.level - outline.heading.max(1));
             outline.heading = chosen.level;
-            match outline.look_levels.iter_mut().find(|(look, _)| *look == line.look) {
+            match outline.look_levels.iter_mut().find(|(look, _)| *look == line.look()) {
                 Some(entry) => entry.1 = chosen.level,
-                None => outline.look_levels.push((line.look, chosen.level)),
+                None => outline.look_levels.push((line.look(), chosen.level)),
             }
         } else if chosen.opens && RANKED_BODY.contains(&chosen.region) {
             let depth = usize::from(chosen.depth.max(1));
@@ -778,7 +900,7 @@ impl State {
             }
             self.open_regions.insert(key, chosen.region);
         }
-        self.previous = Some(*chosen);
+        self.previous = Some(chosen.clone());
         made
     }
 }
