@@ -669,7 +669,7 @@ fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> Foot
 }
 
 /// Return body paragraphs followed by Word footnotes in citation-review order.
-pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
+pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::AuthorityTextUnit>> {
     let files = read_docx_files(bytes, Some(&["word/document.xml", "word/footnotes.xml", "word/_rels/footnotes.xml.rels", "word/settings.xml"]))?;
     let document = parse_xml(file_bytes(&files, "word/document.xml").ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?)?;
     let body = document.root()?.child("body").ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
@@ -747,23 +747,29 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         }
     }
     let mut units = Vec::with_capacity(body_units.len() + footnotes.len());
-    units.extend(body_units.into_iter().map(|(ordinal, text, references, _, path)| {
-        let references = references.into_iter().map(|(id, offset, _)| serde_json::json!([footnote_numbers.get(&id).copied().map_or(id, |id| id as i64), offset])).collect::<Vec<_>>();
-        serde_json::json!({
-            "key": format!("body:{ordinal}"), "kind": "body", "ordinal": ordinal, "footnote_id": serde_json::Value::Null,
-            "page_numbers": [], "text": text, "footnote_refs": references, "path": path,
-        })
+    units.extend(body_units.into_iter().map(|(ordinal, text, references, _, path)| legal_pdf_core::AuthorityTextUnit {
+        key: format!("body:{ordinal}"),
+        kind: "body".to_owned(),
+        ordinal,
+        text,
+        footnote_refs: references.into_iter().map(|(id, offset, _)| (footnote_numbers.get(&id).copied().map_or(id, |id| id as i64), offset)).collect(),
+        path: Some(path),
+        ..Default::default()
     }));
     units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text, links)| {
         let (number, sequence, mark) = note_numbers.get(&raw_id).cloned().unwrap_or((None, 0, None));
-        let mut unit = serde_json::json!({
-            "key": format!("footnote:{raw_id}"), "kind": "footnote", "ordinal": ordinal, "footnote_id": ordinal, "note_number": number,
-            "note_mark": mark, "restart_sequence": sequence, "page_numbers": [], "text": text, "footnote_refs": [],
-        });
-        if !links.is_empty() {
-            unit["links"] = serde_json::json!(links);
+        legal_pdf_core::AuthorityTextUnit {
+            key: format!("footnote:{raw_id}"),
+            kind: "footnote".to_owned(),
+            ordinal,
+            footnote_id: Some(ordinal),
+            note_number: number,
+            note_mark: mark,
+            restart_sequence: Some(sequence as usize),
+            text,
+            links,
+            ..Default::default()
         }
-        unit
     }));
     Ok(units)
 }

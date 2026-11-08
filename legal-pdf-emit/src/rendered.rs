@@ -3,10 +3,10 @@
 //! each node's place in it; and the authority units read off it.
 
 use legal_pdf_core::model::Page;
+use legal_pdf_core::{AuthoritySource, AuthorityTextUnit, SourceMapping};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText, StructureNode};
-use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 /// A stretch of the rendered text that is a source line's text unchanged: where it stands in each (UTF-16), and the line.
@@ -190,9 +190,10 @@ fn project(runs: &[Run], by_source: &[usize], rendered: &ScalarText, source: &[S
 }
 
 /// A unit's text from its stretches of the rendered text, each after the first after a space, with the stretches in
-/// `cuts` (a note's reference mark) left out: the text, its mappings to the source, and where each cut stood in it.
+/// `cuts` (a note's reference mark, by the note's ordinal) left out: the text, its runs that are the source unchanged, and
+/// where each cut stood in it.
 fn unit_text(structure: &DocumentStructure, runs: &[Run], rendered: &ScalarText, pieces: &[ScalarRange], cuts: &[(ScalarRange, usize)])
-    -> (String, Vec<Value>, Vec<Value>) {
+    -> (String, Vec<SourceMapping>, Vec<(i64, usize)>) {
     let (mut text, mut length, mut mappings, mut references) = (String::new(), 0, Vec::new(), Vec::new());
     let mut segment = |text: &mut String, length: &mut usize, a: usize, b: usize| {
         if a >= b {
@@ -204,8 +205,8 @@ fn unit_text(structure: &DocumentStructure, runs: &[Run], rendered: &ScalarText,
             let (start, end) = (a.max(run.target.start), b.min(run.target.end));
             if start < end {
                 let source = run.source.start + start - run.target.start;
-                mappings.push(json!({"start": *length + start - a, "end": *length + end - a, "sourceStart": source,
-                    "sourceEnd": source + end - start, "lineId": structure.source_fragments[run.fragment].id}));
+                mappings.push(SourceMapping { start: *length + start - a, end: *length + end - a, source_start: source,
+                    source_end: source + end - start, line_id: structure.source_fragments[run.fragment].id.clone() });
             }
         }
         *length += b - a;
@@ -216,9 +217,9 @@ fn unit_text(structure: &DocumentStructure, runs: &[Run], rendered: &ScalarText,
             length += 1;
         }
         let mut cursor = piece.start;
-        for (cut, ordinal) in cuts.iter().filter(|(cut, _)| piece.start <= cut.start && cut.end <= piece.end) {
+        for &(cut, ordinal) in cuts.iter().filter(|(cut, _)| piece.start <= cut.start && cut.end <= piece.end) {
             segment(&mut text, &mut length, cursor, cut.start.max(cursor));
-            references.push(json!([ordinal, length]));
+            references.push((ordinal as i64, length));
             cursor = cursor.max(cut.end);
         }
         segment(&mut text, &mut length, cursor, piece.end);
@@ -226,15 +227,21 @@ fn unit_text(structure: &DocumentStructure, runs: &[Run], rendered: &ScalarText,
     (text, mappings, references)
 }
 
-fn source_of(structure: &DocumentStructure, node: &StructureNode, mappings: &[Value]) -> Value {
-    let ranges: Vec<Value> = mappings.iter().map(|m| json!({"start": m["sourceStart"], "end": m["sourceEnd"]})).collect();
-    json!({"documentId": structure.document_id, "textSha256": structure.text_sha256, "coordinateSpace": "source_utf16",
-        "nodeIds": [node.id], "lineIds": node.line_ids, "ranges": ranges, "mappings": mappings})
+fn source_of(structure: &DocumentStructure, node: &StructureNode, mappings: Vec<SourceMapping>) -> AuthoritySource {
+    AuthoritySource {
+        document_id: structure.document_id.clone(),
+        text_sha256: structure.text_sha256.clone(),
+        coordinate_space: "source_utf16".to_owned(),
+        node_ids: vec![node.id.clone()],
+        line_ids: node.line_ids.clone(),
+        ranges: mappings.iter().map(|mapping| ScalarRange { start: mapping.source_start, end: mapping.source_end }).collect(),
+        mappings,
+    }
 }
 
 /// The authority units: each body unit's text, its notes' marks left out and where each stood; then each note's body, a
 /// note with its own mark (an author's "*") keeping the mark as the document prints it.
-pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<Value> {
+pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<AuthorityTextUnit> {
     let rendered = ScalarText::new(structure.rendered_text.as_deref().unwrap_or(&structure.text));
     let by_source = by_source(runs);
     let notes: Vec<&StructureNode> = structure.nodes.iter().filter(|node| note(node)).collect();
@@ -247,11 +254,18 @@ pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<Value
             && !matches!(node.role, Some(PrimaryRole::Furniture | PrimaryRole::PageLabel | PrimaryRole::LineLabel)))
         .collect();
     body.sort_by_key(|node| node.rendered_membership[0].start);
-    let mut units: Vec<Value> = body.iter().enumerate().map(|(at, node)| {
-        let (text, mappings, references) = unit_text(structure, runs, &rendered, &node.rendered_membership, &cuts);
-        json!({"key": format!("body:{at}"), "source": source_of(structure, node, &mappings), "kind": "body", "ordinal": at,
-            "footnote_id": Value::Null, "page_numbers": node.page_indexes.first().map(|page| vec![page + 1]).unwrap_or_default(),
-            "text": text, "footnote_refs": references})
+    let mut units: Vec<AuthorityTextUnit> = body.iter().enumerate().map(|(at, node)| {
+        let (text, mappings, footnote_refs) = unit_text(structure, runs, &rendered, &node.rendered_membership, &cuts);
+        AuthorityTextUnit {
+            key: format!("body:{at}"),
+            kind: "body".to_owned(),
+            ordinal: at,
+            page_numbers: node.page_indexes.first().map(|page| vec![page + 1]).unwrap_or_default(),
+            text,
+            footnote_refs,
+            source: Some(source_of(structure, node, mappings)),
+            ..AuthorityTextUnit::default()
+        }
     }).collect();
     units.extend(notes.iter().enumerate().map(|(at, node)| {
         let ordinal = at + 1;
@@ -265,13 +279,22 @@ pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<Value
             let prefix = utf16_len(label) + 1;
             text = format!("{label} {text}");
             for mapping in &mut mappings {
-                mapping["start"] = json!(mapping["start"].as_u64().unwrap_or(0) as usize + prefix);
-                mapping["end"] = json!(mapping["end"].as_u64().unwrap_or(0) as usize + prefix);
+                mapping.start += prefix;
+                mapping.end += prefix;
             }
         }
-        json!({"key": format!("footnote:{ordinal}"), "source": source_of(structure, node, &mappings), "kind": "footnote",
-            "ordinal": ordinal, "footnote_id": ordinal, "note_number": number, "restart_sequence": node.series.parse::<usize>().unwrap_or(0),
-            "page_numbers": node.page_indexes.iter().map(|page| page + 1).collect::<Vec<_>>(), "text": text, "footnote_refs": []})
+        AuthorityTextUnit {
+            key: format!("footnote:{ordinal}"),
+            kind: "footnote".to_owned(),
+            ordinal,
+            footnote_id: Some(ordinal),
+            note_number: number,
+            restart_sequence: Some(node.series.parse().unwrap_or(0)),
+            page_numbers: node.page_indexes.iter().map(|page| page + 1).collect(),
+            text,
+            source: Some(source_of(structure, node, mappings)),
+            ..AuthorityTextUnit::default()
+        }
     }));
     units
 }

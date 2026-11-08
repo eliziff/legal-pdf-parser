@@ -1,6 +1,7 @@
 mod analysis;
 mod asset;
 mod error;
+pub mod authority;
 pub mod model;
 pub mod profile;
 mod ocr_contract;
@@ -14,6 +15,7 @@ pub use analysis::{install_layout_analysis, layout_analysis};
 pub use analysis::CHECKOUT_ENGINE;
 pub use asset::provider_asset_sha256;
 pub use error::{Error, Result};
+pub use authority::{AuthoritySource, AuthorityTextUnit, SourceMapping};
 pub use model::*;
 pub use ocr_markers::{associate_ocr_markers, merge_marker_lines};
 pub use ocr_contract::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};

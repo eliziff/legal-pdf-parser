@@ -5,7 +5,7 @@ use super::*;
 #[derive(Deserialize, Serialize)]
 pub struct PdfDocument {
     pub(crate) structure: legal_structure_model::DocumentStructure,
-    pub(crate) authority_text_units: Vec<Value>,
+    pub(crate) authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
     pub(crate) summary: PdfSummary,
     /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines.
     pub(crate) evidence: Arc<Vec<PdfTextPage>>,
@@ -142,7 +142,7 @@ impl PdfDocument {
         metadata: PdfExtractionMetadata,
         page_text_quality: Vec<f64>,
         evidence: Arc<Vec<PdfTextPage>>,
-        authority_text_units: Vec<Value>,
+        authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
         structure: DocumentStructure,
     ) -> Self {
         let summary = summary(source_sha256, cache_key, page_text_quality, status, metadata);
@@ -214,7 +214,7 @@ impl PdfDocument {
         &self.summary
     }
 
-    pub fn authority_text_units(&self) -> &[Value] {
+    pub fn authority_text_units(&self) -> &[legal_pdf_core::AuthorityTextUnit] {
         &self.authority_text_units
     }
 

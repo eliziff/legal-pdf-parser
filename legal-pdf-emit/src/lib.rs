@@ -21,7 +21,6 @@ use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, 
 use legal_pdf_structure_model::{Decided, Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
 use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{ContinuationKind, NodeKind, ScalarRange, SourceContinuation, SourceJoin};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 mod rendered;
@@ -94,7 +93,7 @@ pub fn structure_graph(pages: &mut [Page],
     doc: Option<Vec<Move>>,
     identity: &StructureIdentity,
     mut settled: Settled,
-) -> Result<(DocumentStructure, Vec<Value>)> {
+) -> Result<(DocumentStructure, Vec<legal_pdf_core::AuthorityTextUnit>)> {
     let index = settled.index;
     let texts: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = table.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();

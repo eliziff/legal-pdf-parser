@@ -2,6 +2,7 @@
 //! cross-references to other notes, and the references no note answers.
 
 use legal_pdf_core::model::{Diagnostic, Page};
+use legal_pdf_core::AuthorityTextUnit;
 use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, StructureNode};
 use legal_pdf_core::regex;
@@ -10,14 +11,6 @@ use legal_structure_model::text::normalize_label;
 use regex::Regex;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-
-pub fn marker_re() -> &'static Regex {
-    regex!(r"⟦FN:[^⟧]+⟧")
-}
-
-pub fn clean_markers(value: &str) -> String {
-    marker_re().replace_all(value, "").trim().to_owned()
-}
 
 /// Each sentence's end in `chars`: its stop and the quotes or brackets closing it, where a space, a
 /// note's marker or the text's end follows.
@@ -53,7 +46,7 @@ pub fn sentence_at_boundaries(chars: &[char], boundaries: &[(usize, usize)], off
             boundaries.iter().find(|(boundary_start, _)| *boundary_start >= offset).map_or(chars.len(), |(_, boundary_end)| *boundary_end),
         ),
     };
-    clean_markers(&chars[start..end].iter().collect::<String>())
+    chars[start..end].iter().collect::<String>().trim().to_owned()
 }
 
 /// The document's notes in order, each its node.
@@ -70,23 +63,21 @@ pub fn note_text(structure: &DocumentStructure, node: &StructureNode) -> String 
 /// Each note's sentence and the passage since the note before it, read off the body authority units: their text, their
 /// notes' marks left out, and where each mark stood (`footnote_refs`, each a note's ordinal and a UTF-16 offset). Each is
 /// a property of the note's node ("sentence", "passage").
-pub fn attach_propositions(structure: &mut DocumentStructure, units: &[serde_json::Value], decided: &Decided) {
+pub fn attach_propositions(structure: &mut DocumentStructure, units: &[AuthorityTextUnit], decided: &Decided) {
     let ordered: Vec<usize> = structure.nodes.iter().enumerate()
         .filter(|(_, node)| matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)).map(|(at, _)| at).collect();
     let mut tails = HashMap::<DocumentContext, String>::new();
-    for unit in units.iter().filter(|unit| unit["kind"] == "body") {
-        let context = unit["source"]["lineIds"].get(0).and_then(serde_json::Value::as_str).map_or((0, false), |id| decided.document_context(id));
+    for unit in units.iter().filter(|unit| unit.kind == "body") {
+        let context = unit.source.as_ref().and_then(|source| source.line_ids.first()).map_or((0, false), |id| decided.document_context(id));
         let previous_tail = tails.entry(context).or_default();
-        let text = unit["text"].as_str().unwrap_or_default();
-        let coordinates = ScalarText::new(text);
-        let chars: Vec<char> = text.chars().collect();
+        let coordinates = ScalarText::new(&unit.text);
+        let chars: Vec<char> = unit.text.chars().collect();
         let boundaries = sentence_boundaries(&chars);
         let mut previous_offset = 0;
-        for reference in unit["footnote_refs"].as_array().into_iter().flatten() {
-            let (Some(ordinal), Some(offset)) = (reference[0].as_u64(), reference[1].as_u64()) else { continue };
-            let Some(offset) = coordinates.scalar_at_utf16(offset as usize) else { continue };
-            let Some(&at) = (ordinal as usize).checked_sub(1).and_then(|at| ordered.get(at)) else { continue };
-            let passage = clean_markers(&chars[previous_offset.min(offset)..offset].iter().collect::<String>());
+        for &(ordinal, offset) in &unit.footnote_refs {
+            let Some(offset) = coordinates.scalar_at_utf16(offset) else { continue };
+            let Some(&at) = usize::try_from(ordinal).ok().and_then(|ordinal| ordinal.checked_sub(1)).and_then(|at| ordered.get(at)) else { continue };
+            let passage = chars[previous_offset.min(offset)..offset].iter().collect::<String>().trim().to_owned();
             let properties = &mut structure.nodes[at].properties;
             properties.insert("sentence".to_owned(), sentence_at_boundaries(&chars, &boundaries, offset).trim().to_owned());
             properties.insert("passage".to_owned(), if passage.is_empty() { previous_tail.clone() } else { passage });

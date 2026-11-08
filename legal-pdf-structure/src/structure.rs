@@ -50,7 +50,7 @@ use std::collections::{HashMap, HashSet};
 
 pub struct StructureOutput {
     /// The authority units, read off the rendered text (`emit`).
-    pub authority_text_units: Vec<serde_json::Value>,
+    pub authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
     pub diagnostics: Vec<Diagnostic>,
     pub structure_graph: DocumentStructure,
 }
