@@ -488,7 +488,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
         ocr_identity: ocr.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned())),
         ocr,
         #[cfg(feature = "ppdoc")]
-        ppdoc: options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose()?,
+        ppdoc: options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?,
     };
     recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
 }
@@ -630,7 +630,6 @@ fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocum
             && summary.parser_version == PARSER_VERSION
             && summary.cache_key == key
             && summary.page_count == cached.page_count()
-            && summary.projection_page_count == cached.page_count()
     };
     let Some(cached) = cached.filter(current) else {
         let _ = fs::remove_file(path);
@@ -674,7 +673,7 @@ pub(crate) fn parse_pdf(
     #[cfg(not(feature = "ocr"))]
     let ocr_identity: Option<(String, String)> = None;
     #[cfg(feature = "ppdoc")]
-    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::prepare).transpose())?;
+    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::new).transpose())?;
     #[cfg(feature = "ppdoc")]
     let ppdoc_identity = ppdoc_prepared.as_ref().map(|provider| provider.identity().to_owned());
     #[cfg(not(feature = "ppdoc"))]
@@ -720,7 +719,7 @@ struct Providers {
     #[cfg(feature = "ocr")]
     ocr: Option<PreparedOcrProvider>,
     #[cfg(feature = "ppdoc")]
-    ppdoc: Option<legal_pdf_support::PreparedPPDoc>,
+    ppdoc: Option<PPDocLayout>,
 }
 
 /// A PDF's pages as the structure stage receives them: extracted through the extraction cache under
@@ -732,7 +731,7 @@ fn recognized_extraction(
     source_hash: &str,
     options: &ParseOptions,
     cache_root: Option<&Path>,
-    providers: Providers,
+    mut providers: Providers,
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
 ) -> Result<ExtractedPdf> {
     #[cfg(feature = "ocr")]
@@ -796,11 +795,7 @@ fn recognized_extraction(
     let rasters = BTreeMap::new();
     finish_recognition(&mut extracted.pages, rasters);
     #[cfg(feature = "ppdoc")]
-    let mut ppdoc = profile::measure("provider_runtime_ppdoc", || {
-        options.ppdoc.as_ref().zip(providers.ppdoc).map(|(options, prepared)| PPDocLayout::from_prepared(options, prepared)).transpose()
-    })?;
-    #[cfg(feature = "ppdoc")]
-    if let Some(provider) = ppdoc.as_mut() {
+    if let Some(provider) = providers.ppdoc.as_mut() {
         extracted.diagnostics.extend(profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))?);
     }
     Ok(extracted)
