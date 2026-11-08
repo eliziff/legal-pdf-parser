@@ -63,6 +63,8 @@ pub struct PdfLookupUnit {
     pub text: String,
     /// The pages (from 1) it stands on (`page_numbers`).
     pub pages: Vec<u32>,
+    /// The spans of the document's query text its node holds (`DocumentStructure::query_ranges`).
+    pub ranges: Vec<ScalarRange>,
     pub confidence: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub printings: Vec<StructureNode>,
@@ -74,7 +76,7 @@ pub struct PdfLookupUnit {
 
 impl PdfLookupUnit {
     fn new(node: &StructureNode, text: String, confidence: Option<f64>) -> Self {
-        Self { node: node.clone(), text, pages: Vec::new(), confidence, printings: Vec::new(), occurrence: None, reference_page: None }
+        Self { node: node.clone(), text, pages: Vec::new(), ranges: Vec::new(), confidence, printings: Vec::new(), occurrence: None, reference_page: None }
     }
 
     /// The pages (from 1) the unit stands on: its note's first call's, then its node's and its printings'.
@@ -480,6 +482,7 @@ where
     let mut unit_at = |index| {
         let mut unit = unit_at(index);
         unit.pages = unit.page_numbers();
+        unit.ranges = document.structure.query_ranges(&unit.node).into_owned();
         unit
     };
     let before: Vec<_> = (selected_start.saturating_sub(input.context_blocks)..selected_start)
