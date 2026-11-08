@@ -222,7 +222,7 @@ fn oracle(gold: &[[i64; 8]], k: usize, state: &State, line: &LineView, candidate
             } else {
                 // A gold without levels (A2AJ's): the level the line's look last took in its document,
                 // else the open heading's.
-                let outline = state.outlines.get(&state.outline_key(line, m.starts));
+                let outline = state.outlines.get(&state.outline_key(m.starts));
                 let looked = outline.and_then(|o| o.look_levels.iter().find(|(look, _)| *look == line.look)).map(|&(_, l)| l);
                 let preferred = looked.unwrap_or_else(|| outline.map_or(1, |o| o.heading.max(1)));
                 wrong += u32::from((m.level - preferred).unsigned_abs());

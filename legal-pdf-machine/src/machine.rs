@@ -382,7 +382,7 @@ impl State {
     /// The outline a line's headings and body units go in: its document's, a quotation's headings and
     /// units stepping in it as the gold steps them (the quotation's numbering is its own); after
     /// `starts`, the next document's.
-    pub fn outline_key(&self, _line: &LineView, starts: bool) -> u16 {
+    pub fn outline_key(&self, starts: bool) -> u16 {
         self.document + u16::from(starts)
     }
 
@@ -425,7 +425,7 @@ impl State {
             out.push(opening(TITLE));
         }
         // A heading where the line is set as a heading of its document was set before.
-        if self.outline(self.outline_key(line, false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
+        if self.outline(self.outline_key(false)).is_some_and(|outline| outline.look_levels.iter().any(|(look, _)| *look == line.look)) {
             out.push(opening(HEADING));
         }
         if let Some(open) = self.open(ctx) {
@@ -450,7 +450,7 @@ impl State {
     /// one to two below the open heading's; a note opening on its label's value or a reading's or on
     /// none; on a line that may open a constituent document, each of those opening it too.
     pub fn candidates(&self, line: &LineView, classes: &[usize]) -> Vec<Move> {
-        let outline = self.outline(self.outline_key(line, false));
+        let outline = self.outline(self.outline_key(false));
         let heading = outline.map_or(0, |outline| outline.heading);
         // The depths a body opening is tried at: the top, and from two above the last body unit's to two
         // below it; the numbering's depth among them (`stack_depth`).
@@ -533,7 +533,7 @@ impl State {
         let empty = Open::default();
         let stream = self.open(self.ctx(line, candidate.starts)).unwrap_or(&empty);
         let blank = Outline::default();
-        let outline = self.outline(self.outline_key(line, candidate.starts)).unwrap_or(&blank);
+        let outline = self.outline(self.outline_key(candidate.starts)).unwrap_or(&blank);
         let frames = stream.frames();
         let flag = |b: bool| f32::from(u8::from(b));
         let mut f = [0f32; CANDIDATES];
@@ -707,7 +707,7 @@ impl State {
             }
         }
         *self.answering.borrow_mut() = None;
-        let outline_key = self.outline_key(line, false);
+        let outline_key = self.outline_key(false);
         let stream = self.streams.entry(ctx).or_default();
         if let Some(reading) = line.reading(chosen.reading) {
             stream.count(reading, chosen.region);
