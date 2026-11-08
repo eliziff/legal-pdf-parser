@@ -10,7 +10,7 @@ use legal_pdf_support::{profile, PdfDocument};
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use legal_structure_model::{DetectionProfile, DocumentStructure, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes};

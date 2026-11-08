@@ -29,7 +29,6 @@ use legal_pdf_evidence::{normalize, Evidence};
 use legal_pdf_fences::{decided, Fences};
 use legal_pdf_structure_model::{Runs, Slots};
 pub(crate) use decide::*;
-use legal_pdf_diagnostics::*;
 use legal_pdf_graph::graph;
 pub use graph::PdfTextIndex;
 use legal_pdf_layout::build_regions;
@@ -46,7 +45,7 @@ use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub struct StructureOutput {
     /// The authority units, read off the rendered text (`emit`).
@@ -152,7 +151,7 @@ fn output(pages: &mut [Page],
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let views = tier0::line_views(pages, slots, evidence, &fences, &table);
-    let (mut notes, mut decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, &views, trace.is_some());
+    let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, &views, trace.is_some());
     // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
     // came, before this reading writes and orders them.
     let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, &views);
