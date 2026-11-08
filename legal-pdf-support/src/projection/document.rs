@@ -70,6 +70,9 @@ pub struct PdfSummary {
     pub parser_version: String,
     pub cache_key: String,
     pub page_count: usize,
+    /// How far each page's text is to be trusted, from 0 to 1, by page index.
+    #[serde(default)]
+    pub page_text_quality: Vec<f64>,
     pub status: String,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
@@ -87,9 +90,9 @@ pub(crate) fn page_number(page: &StructureNode) -> u32 {
     page.printed_label().parse().unwrap_or(0)
 }
 
-/// How far a page's text is to be trusted, from 0 to 1.
-pub(crate) fn page_confidence(page: &StructureNode) -> f64 {
-    page.properties.get("text_quality").and_then(|quality| quality.parse::<f64>().ok()).unwrap_or(0.0).clamp(0.0, 1.0)
+/// How far a page's text is to be trusted, from 0 to 1, of the pages' qualities (`PdfSummary::page_text_quality`).
+pub(crate) fn page_confidence(quality: &[f64], page: &StructureNode) -> f64 {
+    quality.get(page_index(page)).copied().unwrap_or(0.0).clamp(0.0, 1.0)
 }
 
 /// Where a page's text was read from ("unknown" where it does not say).
@@ -112,7 +115,7 @@ pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
 pub(crate) fn summary(
     sha256: &str,
     cache_key: &str,
-    page_count: usize,
+    page_text_quality: Vec<f64>,
     status: String,
     pdf_metadata: PdfExtractionMetadata,
 ) -> PdfSummary {
@@ -121,7 +124,8 @@ pub(crate) fn summary(
         sha256: sha256.to_owned(),
         parser_version: PARSER_VERSION.to_owned(),
         cache_key: cache_key.to_owned(),
-        page_count,
+        page_count: page_text_quality.len(),
+        page_text_quality,
         status,
         pages_needing_ocr: pdf_metadata.pages_needing_ocr,
         ocr_routed_pages: pdf_metadata.ocr_routed_pages,
@@ -136,12 +140,12 @@ impl PdfDocument {
         cache_key: &str,
         status: String,
         metadata: PdfExtractionMetadata,
-        page_count: usize,
+        page_text_quality: Vec<f64>,
         evidence: Arc<Vec<PdfTextPage>>,
         authority_text_units: Vec<Value>,
         structure: DocumentStructure,
     ) -> Self {
-        let summary = summary(source_sha256, cache_key, page_count, status, metadata);
+        let summary = summary(source_sha256, cache_key, page_text_quality, status, metadata);
         Self {
             evidence,
             printed: OnceLock::new(),

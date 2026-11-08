@@ -233,7 +233,7 @@ pub fn structure_graph(pages: &mut [Page],
     }).collect();
     let node_id = |u: usize| unit_ids[u].clone();
     // Each page a node: its text's range (an empty one where its text would open, where it prints none), its index, and
-    // where its text was read from and how far it is to be trusted.
+    // where its text was read from.
     let mut page_end = 0;
     for page in pages.iter() {
         let range = index.page_range(page.index).unwrap_or(ScalarRange { start: page_end, end: page_end });
@@ -245,7 +245,6 @@ pub fn structure_graph(pages: &mut [Page],
         node.line_ids = page.lines.iter().map(|l| l.id.clone()).collect();
         node.page_indexes = vec![page.index];
         node.properties.insert("source".to_owned(), page.source.clone());
-        node.properties.insert("text_quality".to_owned(), page.text_quality.to_string());
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {

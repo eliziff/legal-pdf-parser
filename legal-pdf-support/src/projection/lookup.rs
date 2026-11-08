@@ -199,7 +199,7 @@ pub(crate) fn printed_unit(
         locator: format!("paragraph {number}"),
         text: range_text(text, &ranges),
         page_numbers,
-        confidence: page.map(page_confidence),
+        confidence: page.map(|page| page_confidence(&document.summary.page_text_quality, page)),
         confidence_basis: if page.is_some() {
             "page_text_quality"
         } else {
@@ -211,14 +211,14 @@ pub(crate) fn printed_unit(
     }
 }
 
-pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, page: &StructureNode) -> PdfLookupUnit {
+pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, quality: &[f64], page: &StructureNode) -> PdfLookupUnit {
     PdfLookupUnit {
         id: page.id.clone(),
         kind: "page",
         locator: format!("[page {}]", page_number(page)),
         text: rendered_slice(text, document, page),
         page_numbers: vec![page_number(page)],
-        confidence: Some(page_confidence(page)),
+        confidence: Some(page_confidence(quality, page)),
         confidence_basis: "page_text_quality",
         provenance: page_provenance(page),
         proposition: None,
@@ -316,6 +316,7 @@ pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes
 pub(crate) fn section_unit(
     document: &DocumentStructure,
     text: &ScalarText<'_>,
+    quality: &[f64],
     pages: &HashMap<usize, &StructureNode>,
     section: &StructureNode,
     index: usize,
@@ -327,8 +328,8 @@ pub(crate) fn section_unit(
             if !page_numbers.contains(&page_number(page)) {
                 page_numbers.push(page_number(page));
             }
-            let quality = page_confidence(page);
-            confidence = Some(confidence.map_or(quality, |value| value.min(quality)));
+            let trusted = page_confidence(quality, page);
+            confidence = Some(confidence.map_or(trusted, |value| value.min(trusted)));
         }
     }
     PdfLookupUnit {
@@ -615,7 +616,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
                 locator: format!("page {}, line {number}", self::page_number(page)),
                 text: words.clone(),
                 page_numbers: vec![self::page_number(page)],
-                confidence: Some(page_confidence(page)),
+                confidence: Some(page_confidence(&document.summary.page_text_quality, page)),
                 confidence_basis: "page_text_quality",
                 provenance: page_provenance(page),
                 proposition: None,
@@ -639,7 +640,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
                 return result(input, PdfLookupStatus::NotFound, None);
             };
             return finish(document, &text, input, pages.len(), start, end, |index| {
-                page_unit(&document.structure, &text, pages[index])
+                page_unit(&document.structure, &text, &document.summary.page_text_quality, pages[index])
             });
         }
         if end_number - start_number >= MAX_UNITS {
@@ -729,6 +730,6 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
     };
     let pages: HashMap<_, _> = document.page_nodes().map(|page| (page_index(page), page)).collect();
     finish(document, &text, input, sections.len(), index, index, |index| {
-        section_unit(&document.structure, &text, &pages, sections[index], index)
+        section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, sections[index], index)
     })
 }
