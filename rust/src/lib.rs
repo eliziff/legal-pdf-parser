@@ -64,7 +64,7 @@ pub use legal_pdf_ocr::{
 pub use legal_pdf_ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_support::{
-    PdfLookupNote, PdfLookupPage, PdfLookupProposition,
+    PdfLookupPage,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup,
 };
 #[cfg(feature = "ppdoc")]
