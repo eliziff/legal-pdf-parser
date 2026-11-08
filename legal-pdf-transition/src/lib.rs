@@ -417,12 +417,12 @@ fn drawn(sha256: &str, k: usize, share: f64) -> bool {
 /// where `gold` is given and reachable (the first round's rollout), else the local scores' best class,
 /// counting on nothing. With `record` (the document's sha256 and the share of its lines
 /// drawn), each drawn line's candidates as the scorer is fitted on them.
-fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded) {
-    let mut state = State::default();
+fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[[i64; 8]]>, record: Option<(&str, f64)>) -> (Vec<Move>, Recorded, Reading) {
+    let mut reading = Reading::default();
     let mut moves = Vec::with_capacity(views.len());
     let mut recorded = Recorded::default();
     for k in 0..views.len() {
-        let (line, local) = (&views[k], &locals[k]);
+        let (line, local, state) = (&views[k], &locals[k], &reading.state);
         let candidates = state.candidates(line, &classes_of(&state, line, local, gold.map(|g| &g[k])));
         let features: Vec<[f32; RANKED]> = candidates.iter().map(|m| ranked_features(&state, line, table.row(k), local, m)).collect();
         let best_oracle = gold.and_then(|gold| oracle(gold, k, &state, line, &candidates));
@@ -436,10 +436,56 @@ fn walk(table: &LineTable, views: &[LineView], locals: &[Local], gold: Option<&[
                 recorded.oracle.push(u8::from(Some(c) == best_oracle));
             }
         }
-        state.apply(line, &candidates[choice]);
+        reading.step(k, line, &candidates[choice]);
         moves.push(candidates[choice]);
     }
-    (moves, recorded)
+    (moves, recorded, reading)
+}
+
+/// The parse's state as the moves step it, and each move's label for the grader as it is made: region, opening (2 where
+/// it takes up another unit), document start, paired reference (a line a note answered), a heading's level step, a
+/// marker, the first line of the unit it takes up, a body unit's depth step.
+#[derive(Default)]
+struct Reading {
+    state: State,
+    streams: Streams,
+    labels: Vec<[i64; 8]>,
+    /// The lines whose marks the notes answered: a mark may stand after its note, so its line is labelled at the end.
+    paired: Vec<usize>,
+}
+
+impl Reading {
+    /// The reading over `moves` made elsewhere (DOC's).
+    fn over(views: &[LineView], moves: &[Move]) -> Self {
+        let mut reading = Self::default();
+        for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
+            reading.step(k, line, chosen);
+        }
+        reading
+    }
+
+    /// The reading after line `k` makes `chosen`.
+    fn step(&mut self, k: usize, line: &LineView, chosen: &Move) {
+        let key = (self.state.ctx(line, chosen.starts), stream_of(chosen.region));
+        let stands = self.streams.stands(key, chosen);
+        if chosen.region != 0 { self.streams.step(key, chosen.region, stands, k); }
+        let made = self.state.apply(line, chosen);
+        self.paired.extend(made.paired.into_iter().chain(made.also.into_iter().flatten()).map(|(line, ..)| line as usize));
+        let (start, pointer) = match stands {
+            Stands::Resumes(first) => (2, first as i64),
+            _ => (i64::from(chosen.opens), -1),
+        };
+        let marked = chosen.opens && chosen.reading.is_some();
+        self.labels.push([i64::from(chosen.region), start, i64::from(chosen.starts), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
+    }
+
+    /// Each line's label, its marks' answers set.
+    fn labels(mut self) -> Vec<[i64; 8]> {
+        for line in self.paired {
+            self.labels[line][3] = 1;
+        }
+        self.labels
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,14 +519,16 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
         reader.read(table, &views, &texts, &line_pages, &doc::Style::of(sheet, table)).map_err(|error| eprintln!("transition parser DOC {sha256}: {error}")).ok()
     }));
     if let Some(moves) = read {
-        write_labels(s, sha256, &ids, &views, &moves);
+        if s.labels.is_some() {
+            write_labels(s, sha256, &ids, Reading::over(&views, &moves).labels());
+        }
         return moves;
     }
     // The first reading, never the oracle's (the gold would read into the second's view of the
     // templates); each template then carries how it read.
     sheet.read_back(&walk(table, &views, locals, None, None).0);
     let views = views_of(s, pages, slots, evidence, fences, table, locals, sheet);
-    let (moves, recorded) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
+    let (moves, recorded, reading) = walk(table, &views, locals, gold.map(|_| &gold_rows[..]), s.dump.is_some().then_some((sha256, s.dump_lines)));
     if let Some(folder) = &s.dump {
         let write = || -> std::io::Result<()> {
             std::fs::create_dir_all(folder)?;
@@ -501,42 +549,16 @@ fn parse(s: &Settings, pages: &[Page], slots: &Slots, evidence: &Evidence, fence
         };
         write().unwrap_or_else(|error| eprintln!("transition parser dump {sha256}: {error}"));
     }
-    write_labels(s, sha256, &ids, &views, &moves);
+    write_labels(s, sha256, &ids, reading.labels());
     moves
 }
 
-/// The moves as the grader's labels, written to LEGALPDF_TRANSITION_LABELS (`<sha>.labels.json`) where set.
-fn write_labels(s: &Settings, sha256: &str, ids: &[String], views: &[LineView], moves: &[Move]) {
+/// The moves' labels for the grader (`Reading`), written to LEGALPDF_TRANSITION_LABELS (`<sha>.labels.json`) where set.
+fn write_labels(s: &Settings, sha256: &str, ids: &[String], labels: Vec<[i64; 8]>) {
     let Some(folder) = &s.labels else { return };
-    let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labelled(views, moves)});
+    let body = serde_json::json!({"sha256": sha256, "ids": ids.iter().map(|id| format!("{id}@0")).collect::<Vec<_>>(), "labels": labels});
     std::fs::create_dir_all(folder).and_then(|()| std::fs::write(folder.join(format!("{sha256}.labels.json")), body.to_string()))
         .unwrap_or_else(|error| eprintln!("transition parser labels {sha256}: {error}"));
-}
-
-/// The moves as the grader's labels, the state replayed over them: region, opening, document start,
-/// paired reference (a line a note answered), a heading's level step, a marker, no resumption, a body
-/// unit's depth step.
-fn labelled(views: &[LineView], moves: &[Move]) -> Vec<[i64; 8]> {
-    let mut state = State::default();
-    let mut labels: Vec<[i64; 8]> = Vec::with_capacity(moves.len());
-    let mut paired_lines: Vec<usize> = Vec::new();
-    let mut streams = Streams::default();
-    for (k, (line, chosen)) in views.iter().zip(moves).enumerate() {
-        let key = (state.ctx(line, chosen.starts), stream_of(chosen.region));
-        let stands = streams.stands(key, chosen);
-        if chosen.region != 0 { streams.step(key, chosen.region, stands, k); }
-        let made = state.apply(line, chosen);
-        // A mark may stand after its note: its line is labelled once every line is.
-        paired_lines.extend(made.paired.into_iter().chain(made.also.into_iter().flatten()).map(|(line, ..)| line as usize));
-        let (start, pointer) = match stands {
-            Stands::Resumes(first) => (2, first as i64),
-            _ => (i64::from(chosen.opens), -1),
-        };
-        let marked = chosen.opens && chosen.reading.is_some();
-        labels.push([i64::from(chosen.region), start, i64::from(chosen.starts), 0, made.level_step, i64::from(marked), pointer, made.depth_step]);
-    }
-    paired_lines.into_iter().for_each(|line| labels[line][3] = 1);
-    labels
 }
 
 /// Which of `folds` folds a source falls in: the CRC-32 of its sha256 (zlib's), modulo `folds`.

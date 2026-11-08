@@ -168,12 +168,6 @@ pub struct NotePair {
     pub note: Option<usize>,
 }
 
-/// A numbered unit of the parser's is a list item when the parser located it as one; numbered
-/// paragraphs, sections and clauses are not, however the number is written.
-pub fn parser_list_item(block: &FrameBlock) -> bool {
-    block.attributes.get("locator_kind").and_then(Value::as_str) == Some("list_item")
-}
-
 pub const V4: &str = "legal-structure-gold.v4";
 
 /// The scorer's kinds for typed regions; the rest are running text (block quotes, notes and
@@ -528,15 +522,7 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
         .collect();
     let prepared = crate::parser_frame(structure, &sources)?;
     let index: HashMap<String, usize> = lines.iter().enumerate().map(|(n, l)| (l.id.clone(), n)).collect();
-    let mut groups = prepared.groups;
-    // A node that states its region (a tagger's, the transition parser's: its grammar `region:<name>`)
-    // is read so; reading list items off the locator (parser_list_item) is for the stage parser's nodes.
-    let tagged: HashMap<&str, &str> = structure.nodes.iter().filter_map(|n| region_of(n).map(|region| (n.id.as_str(), region))).collect();
-    for group in &mut groups {
-        if let Some(region) = group.attributes.get("native_id").and_then(Value::as_str).and_then(|id| tagged.get(id)) {
-            group.attributes.insert("region".into(), json!(region));
-        }
-    }
+    let groups = prepared.groups;
     // The parser's blocks in the gold's frame (`projected`): a block split at each page and at each
     // line of another block that comes between, its parts linked as a unit's parts are. The
     // composition keeps a paragraph that runs over a page as one block; the gold writes it as parts
@@ -583,7 +569,7 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
                 layer.insert(heads[heads.len() - 1].clone(), onward);
             }
         }
-        link_parts(&mut continuations, &heads, kind, parser_list_item(&g));
+        link_parts(&mut continuations, &heads, kind, g.attributes.get("region").and_then(Value::as_str) == Some("list_item"));
         for (k, spans) in parts.into_iter().enumerate() {
             let mut part = g.clone();
             // A later part is known by its first span, as the links to it name it.
@@ -631,9 +617,4 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
     }
     let reading_order = (0..lines.len()).collect();
     Ok(State { lines, index, reading_order, span_rank: HashMap::new(), groups: parted, annotations, continuations })
-}
-
-/// The region a node states it reads as, from `grammar: region:<name>` (the transition parser's nodes).
-pub fn region_of(node: &legal_structure_model::StructureNode) -> Option<&str> {
-    node.grammar.as_deref().and_then(|grammar| grammar.strip_prefix("region:"))
 }
