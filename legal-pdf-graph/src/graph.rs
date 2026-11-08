@@ -5,7 +5,7 @@
 //! (`contexts`), and the outline its units hang in (`outline`).
 
 use legal_pdf_structure_model::{Decided, Evidence, Role, Rule, Run, Slots};
-use legal_pdf_core::model::{Page, ScalarRange};
+use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
     CandidateGrammar, Derivation, NodeKind, ScalarRange, ScalarText, StructureNode,
