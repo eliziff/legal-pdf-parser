@@ -36,9 +36,9 @@ pub(crate) fn page_index(page: &StructureNode) -> usize {
     page.page_indexes[0]
 }
 
-/// A page node's page number, its label's ("page12").
+/// A page node's page number, its label.
 pub(crate) fn page_number(page: &StructureNode) -> u32 {
-    page.printed_label().parse().unwrap_or(0)
+    page.label.as_deref().unwrap_or("").parse().unwrap_or(0)
 }
 
 /// How far a page's text is to be trusted, from 0 to 1, of the pages' qualities (`PdfSummary::page_text_quality`).

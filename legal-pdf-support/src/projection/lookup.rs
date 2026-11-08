@@ -366,7 +366,7 @@ fn page_at(document: &PdfDocument, offset: usize) -> Option<u32> {
 /// was printed before it and once more, its numbering's restart, and its proposition.
 pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes: &[&StructureNode], at: usize) -> PdfLookupUnit {
     let note = notes[at];
-    let label = note.printed_label();
+    let label = note.label.as_deref().unwrap_or("");
     let reference_page = note.calls.first().and_then(|call| page_at(document, call.start));
     let body_pages: Vec<u32> = note.page_indexes.iter().map(|page| *page as u32 + 1).collect();
     let mut page_numbers: Vec<u32> = reference_page.into_iter().collect();
@@ -385,7 +385,7 @@ pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes
         proposition: Some(PdfLookupProposition { sentence: property("sentence"), passage_since_prior_note: property("passage") }),
         note: Some(PdfLookupNote {
             label: label.to_owned(),
-            occurrence: notes[..=at].iter().filter(|other| other.printed_label() == label).count(),
+            occurrence: notes[..=at].iter().filter(|other| other.label.as_deref().unwrap_or("") == label).count(),
             restart_sequence: note.series.parse().unwrap_or(0),
             reference_page,
             body_pages,
@@ -522,8 +522,8 @@ pub(crate) fn exact_footnotes(document: &PdfDocument, notes: &[&StructureNode], 
     let query = normalize_footnote(locator);
     (0..notes.len()).filter(|&at| {
         let note = notes[at];
-        let label = note.printed_label();
-        input.occurrence.is_none_or(|number| notes[..=at].iter().filter(|other| other.printed_label() == label).count() == number)
+        let label = note.label.as_deref().unwrap_or("");
+        input.occurrence.is_none_or(|number| notes[..=at].iter().filter(|other| other.label.as_deref().unwrap_or("") == label).count() == number)
             && input.page.is_none_or(|number| note.calls.first().and_then(|call| page_at(document, call.start)) == Some(number)
                 || note.page_indexes.iter().any(|page| *page as u32 + 1 == number))
             && (normalize_footnote(&note.id) == query || normalize_footnote(label) == query)
