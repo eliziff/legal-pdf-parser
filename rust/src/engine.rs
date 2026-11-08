@@ -345,7 +345,7 @@ fn cache_key(
     ocr_pages: Option<&[usize]>,
     semantic_profile: Option<DetectionProfile>,
 ) -> Result<String> {
-    let mut value = json!({
+    let value = json!({
         "source_sha256": source_hash,
         "schema_version": SCHEMA_VERSION,
         "parser_version": PARSER_VERSION,
@@ -361,8 +361,6 @@ fn cache_key(
         "ocr_pages": ocr_pages,
         "profile": semantic_profile,
     });
-    // (A reading of the machine's, by the key those cached have.)
-    value["reader"] = json!("machine");
     serialization_sha256(&value)
 }
 
@@ -625,11 +623,9 @@ fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocum
     let current = |cached: &PdfDocument| {
         let (structure, summary) = (cached.structure(), cached.summary());
         structure.schema_version.as_ref() == DOCUMENT_STRUCTURE_SCHEMA
-            && structure.source_sha256.as_deref() == Some(source_hash)
             && summary.sha256 == source_hash
             && summary.parser_version == PARSER_VERSION
             && summary.cache_key == key
-            && summary.page_count == cached.page_count()
     };
     let Some(cached) = cached.filter(current) else {
         let _ = fs::remove_file(path);
