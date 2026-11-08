@@ -380,7 +380,10 @@ pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
     let stripped = prefix.replace(value, "");
     let captures = legal_pdf_core::regex!(r"(?i)^(\d{1,6})\s*(?:-|–|—|\.\.|to)\s*(\d{1,6})$")
         .captures(&stripped)?;
-    Some((captures[1].parse().ok()?, captures[2].parse().ok()?))
+    // An end shorter than its start keeps the start's leading figures: "142-54" runs to 154, "138-9" to 139.
+    let (first, end) = (&captures[1], &captures[2]);
+    let last = if end.len() < first.len() { format!("{}{end}", &first[..first.len() - end.len()]) } else { end.to_owned() };
+    Some((first.parse().ok()?, last.parse().ok()?))
 }
 
 pub(crate) fn normalize_footnote(raw: &str) -> String {
